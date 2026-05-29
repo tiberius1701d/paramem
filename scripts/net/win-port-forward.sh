@@ -79,13 +79,19 @@ for PORT in "${PORTS[@]}"; do
     fi
 
     # Firewall rules — scope RemoteAddress when PARAMEM_NAS_IP is set.
+    # New-NetFirewallRule MUST carry -ErrorAction Stop: rule creation needs
+    # elevation, and a non-elevated access-denied is a *non-terminating* error
+    # by default. Without Stop, powershell.exe exits 0 even on failure, so the
+    # non-elevated→elevated `||` fallback below never fires and the "created"
+    # message prints falsely. Stop makes the failure terminating (exit≠0) so the
+    # elevated retry actually runs.
     if [ -n "$NAS_IP" ]; then
         # Scoped rule: remove any pre-existing unscoped rule first, then create scoped.
         PS_COMMANDS+="Get-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
-        PS_COMMANDS+="New-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -Direction Inbound -LocalPort $PORT -Protocol TCP -RemoteAddress $NAS_IP -Action Allow | Out-Null; "
+        PS_COMMANDS+="New-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -Direction Inbound -LocalPort $PORT -Protocol TCP -RemoteAddress $NAS_IP -Action Allow -ErrorAction Stop | Out-Null; "
         PS_COMMANDS+="Write-Host 'Firewall rule (scoped to $NAS_IP) created for port $PORT'; "
     else
-        PS_COMMANDS+="if (-not (Get-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -Direction Inbound -LocalPort $PORT -Protocol TCP -Action Allow | Out-Null; Write-Host 'Firewall rule (unscoped) created for port $PORT' } else { Write-Host 'Firewall rule exists for port $PORT' }; "
+        PS_COMMANDS+="if (-not (Get-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -Direction Inbound -LocalPort $PORT -Protocol TCP -Action Allow -ErrorAction Stop | Out-Null; Write-Host 'Firewall rule (unscoped) created for port $PORT' } else { Write-Host 'Firewall rule exists for port $PORT' }; "
     fi
 done
 
