@@ -1570,3 +1570,350 @@ def test_refresh_config_from_disk_arms_mode_switch():
         app_module._live_reload_base_model(refresh_config_from_disk=True)
 
         mock_arm.assert_called_once_with(new_config)
+
+
+# ---------------------------------------------------------------------------
+# Voice drain/restore invariant in _live_reload_base_model
+# ---------------------------------------------------------------------------
+
+
+def test_voice_drain_called_before_release_when_gpu():
+    """When voice_profile=='gpu', _set_voice_pipeline_profile('cpu') is called
+    before _release_base_model_in_process (entry drain).
+
+    The drain must fire regardless of refresh_config_from_disk (tested here on
+    the partial path).  It is not called when voice_profile is already 'cpu'
+    (idempotent guard inside _set_voice_pipeline_profile).
+    """
+    from paramem.server import app as app_module
+
+    call_order = []
+
+    def _fake_set_voice(profile, *, lock_held=False):
+        call_order.append(("voice", profile, lock_held))
+
+    def _fake_release():
+        call_order.append("release")
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": None,
+        "boot_degraded": None,
+        "voice_profile": "gpu",
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
+        patch.object(app_module, "_release_base_model_in_process", side_effect=_fake_release),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=False, lock_held=False)
+
+    # voice drain must appear before release
+    voice_drain_idx = next(
+        (i for i, e in enumerate(call_order) if e == ("voice", "cpu", False)), None
+    )
+    release_idx = next((i for i, e in enumerate(call_order) if e == "release"), None)
+    assert voice_drain_idx is not None, (
+        "voice drain to cpu must be called when voice_profile=='gpu'"
+    )
+    assert release_idx is not None, "release must be called"
+    assert voice_drain_idx < release_idx, (
+        f"voice drain must precede release; got order {call_order}"
+    )
+
+
+def test_voice_drain_not_called_when_already_cpu():
+    """When voice_profile=='cpu', the entry drain is skipped (idempotent guard).
+
+    Callers already cloud-only (voice on CPU) must not incur a no-op STT unload.
+    """
+    from paramem.server import app as app_module
+
+    drain_calls = []
+
+    def _fake_set_voice(profile, *, lock_held=False):
+        drain_calls.append(profile)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": None,
+        "boot_degraded": None,
+        "voice_profile": "cpu",
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=False)
+
+    assert "cpu" not in drain_calls, (
+        f"drain must not fire when voice_profile is already 'cpu'; calls={drain_calls}"
+    )
+
+
+def test_voice_restore_called_on_partial_success():
+    """On a successful partial reload (refresh_config_from_disk=False),
+    _set_voice_pipeline_profile('gpu') is called after mode becomes 'local'.
+
+    This is the partial-path restore; lock_held is forwarded correctly.
+    """
+    from paramem.server import app as app_module
+
+    voice_calls = []
+
+    def _fake_set_voice(profile, *, lock_held=False):
+        voice_calls.append((profile, lock_held))
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": fake_assessment,
+        "boot_degraded": None,
+        "voice_profile": "gpu",
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=True),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=False, lock_held=True)
+
+        # Read _state inside the with block so patch.dict hasn't restored the
+        # pre-patch values yet.  Outside the block, patch.dict(clear=False)
+        # restores "mode" to whatever it was before the patch — which varies
+        # across test orderings and causes a spurious isolation failure.
+        assert app_module._state["mode"] == "local"
+
+    assert ("gpu", True) in voice_calls, (
+        f"voice restore to gpu with lock_held=True expected on partial success; calls={voice_calls}"
+    )
+
+
+def test_voice_not_restored_on_full_path():
+    """On the full-rebuild path (refresh_config_from_disk=True), the primitive
+    does NOT restore voice to gpu — _build_config_derived_state handles it.
+
+    Adding a restore here would double-load the STT/TTS pair.
+    """
+    from paramem.server import app as app_module
+
+    gpu_restore_calls = []
+
+    def _fake_set_voice(profile, *, lock_held=False):
+        if profile == "gpu":
+            gpu_restore_calls.append(profile)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "config_path": "configs/server.yaml",
+        "topology_assessment": None,
+        "boot_degraded": None,
+        "voice_profile": "gpu",
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "load_server_config", return_value=_server_config()),
+        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+        patch.object(app_module, "_arm_active_store_migration", return_value=False),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=True, lock_held=True)
+
+    assert not gpu_restore_calls, (
+        "primitive must NOT restore voice to gpu on the full path "
+        f"(_build_config_derived_state owns that); calls={gpu_restore_calls}"
+    )
+
+
+def test_voice_not_restored_on_failure_paths():
+    """On failure branches (gate declined, load failed, rebuild failed),
+    voice stays on CPU — the entry drain put it there; do not restore.
+    """
+    from paramem.server import app as app_module
+
+    gpu_restore_calls = []
+
+    def _fake_set_voice(profile, *, lock_held=False):
+        if profile == "gpu":
+            gpu_restore_calls.append(profile)
+
+    fake_assessment = MagicMock(name="assessment")
+    fake_assessment.required_bytes = int(6 * 2**30)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": fake_assessment,
+        "boot_degraded": None,
+        "voice_profile": "gpu",
+    }
+
+    # Gate declined path (insufficient_vram).
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch("paramem.server.app.torch.cuda.is_available", return_value=True),
+        patch.object(app_module, "_wait_for_gpu_drain", return_value=False),
+        patch.object(app_module, "_load_model_into_state") as mock_load,
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=False)
+
+    mock_load.assert_not_called()
+    assert not gpu_restore_calls, (
+        "voice must not be restored to gpu when gate declines (insufficient_vram); "
+        f"calls={gpu_restore_calls}"
+    )
+
+
+def test_voice_not_restored_on_load_failure():
+    """On the load-failure branch (app.py:4258-4264), voice stays on CPU.
+
+    When ``_load_model_into_state`` raises after the preflight passes,
+    the primitive sets cloud_only_reason="reload_failed" and returns without
+    calling ``_set_voice_pipeline_profile("gpu")``.  The entry drain already
+    moved voice to CPU; leaving it there is correct (cloud-only server should
+    hold ~0 GiB).
+    """
+    from paramem.server import app as app_module
+
+    gpu_restore_calls = []
+
+    def _fake_set_voice(profile, *, lock_held=False):
+        if profile == "gpu":
+            gpu_restore_calls.append(profile)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": None,  # skip preflight gate
+        "boot_degraded": None,
+        "voice_profile": "gpu",
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(
+            app_module,
+            "_load_model_into_state",
+            side_effect=RuntimeError("simulated OOM"),
+        ),
+        patch.object(app_module, "_build_config_derived_state") as mock_build,
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=False)
+
+        # Assertions inside the with block so patch.dict hasn't restored _state yet.
+        mock_build.assert_not_called()
+        assert not gpu_restore_calls, (
+            "voice must not be restored to gpu when load fails (reload_failed); "
+            f"calls={gpu_restore_calls}"
+        )
+        assert app_module._state["cloud_only_reason"] == "reload_failed"
+
+
+def test_voice_not_restored_on_rebuild_failure_partial_path():
+    """On the rebuild-failure branch of the partial path (app.py:4340-4344), voice stays on CPU.
+
+    When ``_build_config_derived_state`` raises after a successful model load on
+    the ``refresh_config_from_disk=False`` path, the primitive releases the
+    partial allocation and returns without calling ``_set_voice_pipeline_profile("gpu")``.
+    The server ends cloud-only with reason="reload_failed".
+    """
+    from paramem.server import app as app_module
+
+    gpu_restore_calls = []
+
+    def _fake_set_voice(profile, *, lock_held=False):
+        if profile == "gpu":
+            gpu_restore_calls.append(profile)
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": None,  # skip preflight gate
+        "boot_degraded": None,
+        "voice_profile": "gpu",
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(app_module, "_load_model_into_state"),  # load succeeds
+        patch.object(
+            app_module,
+            "_build_config_derived_state",
+            side_effect=RuntimeError("simulated rebuild failure"),
+        ),
+    ):
+        app_module._live_reload_base_model(refresh_config_from_disk=False)
+
+        # Assertions inside the with block so patch.dict hasn't restored _state yet.
+        assert not gpu_restore_calls, (
+            "voice must not be restored to gpu when rebuild fails (partial path, reload_failed); "
+            f"calls={gpu_restore_calls}"
+        )
+        assert app_module._state["cloud_only_reason"] == "reload_failed"
+
+
+def test_lock_held_forwarded_to_voice_drain():
+    """lock_held parameter is forwarded to _set_voice_pipeline_profile on drain."""
+    from paramem.server import app as app_module
+
+    voice_calls_with_lock = []
+
+    def _fake_set_voice(profile, *, lock_held=False):
+        voice_calls_with_lock.append((profile, lock_held))
+
+    state_patch = {
+        "mode": "cloud-only",
+        "cloud_only_reason": "released",
+        "config": _server_config(),
+        "topology_assessment": None,
+        "boot_degraded": None,
+        "voice_profile": "gpu",
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=_fake_set_voice),
+        patch.object(app_module, "_release_base_model_in_process"),
+        patch.object(app_module, "_load_model_into_state"),
+        patch.object(app_module, "_build_config_derived_state"),
+    ):
+        app_module._live_reload_base_model(lock_held=True)
+
+    # Drain must have been called with lock_held=True.
+    drain = next((c for c in voice_calls_with_lock if c[0] == "cpu"), None)
+    assert drain is not None, f"drain call not found in {voice_calls_with_lock}"
+    assert drain[1] is True, f"lock_held=True must be forwarded to drain; got {drain}"

@@ -1377,6 +1377,10 @@ class TestBaseSwapOrchestrationSlice2:
         per-tier migrate() loop leaves the in-RAM PeftModel mounted in the
         last tier's transient shape; without a final reload the published
         ``adapter_available`` topology stays stale until a systemctl restart.
+
+        Voice drain/restore is now owned by _live_reload_base_model (the
+        primitive), not by step 6 directly.  The step-6 ordering assertion
+        is: reload fires after Phase B and before status=pass.
         """
         state = self._make_state(tmp_path)
         call_order, gates_received, state_dir = self._run_orchestration_with_reload_tracking(

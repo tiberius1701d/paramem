@@ -34,9 +34,11 @@ def _call_gpu_acquire() -> object:
 
 
 def test_acquire_in_defer_mode_reloads_and_switches_voice():
-    """defer_model=True + cloud-only: reloads model in-process and switches voice to gpu.
+    """defer_model=True + cloud-only: reloads model in-process; voice restore is inside primitive.
 
-    Assert ordering: _live_reload_base_model called, THEN _set_voice_pipeline_profile("gpu").
+    Voice drain/restore is now owned by _live_reload_base_model (the primitive),
+    so /gpu/acquire no longer calls _set_voice_pipeline_profile("gpu") on success.
+    Assert: _live_reload_base_model is called and mode is local after.
     """
     from paramem.server import app as app_module
 
@@ -46,15 +48,9 @@ def test_acquire_in_defer_mode_reloads_and_switches_voice():
         "cloud_only_reason": "training",
     }
 
-    call_order = []
-
-    def fake_reload():
-        call_order.append("reload")
+    def fake_reload(**_kw):
         # Simulate successful reload setting mode to local.
         app_module._state["mode"] = "local"
-
-    def fake_profile(profile):
-        call_order.append(f"profile:{profile}")
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
@@ -64,14 +60,18 @@ def test_acquire_in_defer_mode_reloads_and_switches_voice():
             "_get_hold_state",
             return_value={"hold_active": True, "owner_pid": 1234, "owner_alive": True},
         ),
-        patch.object(app_module, "_live_reload_base_model", side_effect=fake_reload),
-        patch.object(app_module, "_set_voice_pipeline_profile", side_effect=fake_profile),
+        patch.object(app_module, "_live_reload_base_model", side_effect=fake_reload) as mock_reload,
+        patch.object(app_module, "_set_voice_pipeline_profile") as mock_profile,
     ):
         result = _call_gpu_acquire()
 
     assert result["reloaded_live"] is True
-    assert call_order == ["reload", "profile:gpu"], (
-        f"Expected reload then voice switch; got {call_order}"
+    mock_reload.assert_called_once()
+    # Voice restore is owned by the primitive; /gpu/acquire must NOT call it on success.
+    gpu_calls = [c for c in mock_profile.call_args_list if c.args and c.args[0] == "gpu"]
+    assert not gpu_calls, (
+        "acquire must NOT call _set_voice_pipeline_profile('gpu') — primitive owns that; "
+        f"calls={mock_profile.call_args_list}"
     )
 
 
@@ -107,10 +107,12 @@ def test_acquire_in_local_mode_is_noop():
 
 
 def test_acquire_after_release_reloads_and_switches_voice():
-    """cloud_only_reason="released" + cloud-only: acquire reloads + voice→gpu.
+    """cloud_only_reason="released" + cloud-only: acquire reloads; voice handled by primitive.
 
     Standard reclaim path: external consumer called /gpu/release, operator
     (or the consumer when done) calls /gpu/acquire to give GPU back to ParaMem.
+    Voice drain/restore is owned by _live_reload_base_model — /gpu/acquire
+    must NOT call _set_voice_pipeline_profile("gpu") on success.
     """
     from paramem.server import app as app_module
 
@@ -120,7 +122,7 @@ def test_acquire_after_release_reloads_and_switches_voice():
         "cloud_only_reason": "released",
     }
 
-    def _flip_mode_local():
+    def _flip_mode_local(**_kw):
         app_module._state["mode"] = "local"
 
     with (
@@ -139,7 +141,12 @@ def test_acquire_after_release_reloads_and_switches_voice():
         result = _call_gpu_acquire()
 
     mock_reload.assert_called_once()
-    mock_profile.assert_called_once_with("gpu")
+    # Voice restore is owned by the primitive; /gpu/acquire must NOT call it on success.
+    gpu_calls = [c for c in mock_profile.call_args_list if c.args and c.args[0] == "gpu"]
+    assert not gpu_calls, (
+        "acquire must NOT call _set_voice_pipeline_profile('gpu') — primitive owns that; "
+        f"calls={mock_profile.call_args_list}"
+    )
     assert result["reloaded_live"] is True
 
 
@@ -740,7 +747,7 @@ def test_session_delta_sets_rebuild_session_buffer_true():
 
     rebuild_buf_log: list[bool] = []
 
-    def fake_reload(refresh_config_from_disk=False, rebuild_session_buffer=False):
+    def fake_reload(refresh_config_from_disk=False, rebuild_session_buffer=False, lock_held=False):
         rebuild_buf_log.append(rebuild_session_buffer)
         # Simulate success so the result dict is built.
         app_module._state["mode"] = "local"
@@ -782,7 +789,7 @@ def test_no_session_delta_keeps_rebuild_session_buffer_false():
 
     rebuild_buf_log: list[bool] = []
 
-    def fake_reload(refresh_config_from_disk=False, rebuild_session_buffer=False):
+    def fake_reload(refresh_config_from_disk=False, rebuild_session_buffer=False, lock_held=False):
         rebuild_buf_log.append(rebuild_session_buffer)
         app_module._state["mode"] = "local"
         app_module._state["cloud_only_reason"] = None
@@ -822,7 +829,7 @@ def test_debug_delta_sets_rebuild_session_buffer_true():
 
     rebuild_buf_log: list[bool] = []
 
-    def fake_reload(refresh_config_from_disk=False, rebuild_session_buffer=False):
+    def fake_reload(refresh_config_from_disk=False, rebuild_session_buffer=False, lock_held=False):
         rebuild_buf_log.append(rebuild_session_buffer)
         app_module._state["mode"] = "local"
         app_module._state["cloud_only_reason"] = None

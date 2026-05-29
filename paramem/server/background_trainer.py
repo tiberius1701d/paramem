@@ -412,6 +412,23 @@ class BackgroundTrainer:
             on_shutdown_check=_shutdown_or_abort,
         )
 
+    def release(self) -> None:
+        """Stop the worker and drop base-model references so the model can be freed.
+
+        Called by :func:`paramem.server.app._release_base_model_in_process`.
+        Breaks the worker cycle (via :meth:`_stop_callable_worker`, which now
+        nulls ``_worker_thread`` after joining) and then nulls
+        ``model``/``tokenizer``/``_current_job`` so no live attribute on this
+        object retains a reference to the base model.
+
+        Idempotent: safe to call on an instance whose worker was never started
+        or that has already been stopped.
+        """
+        self._stop_callable_worker()
+        self.model = None
+        self.tokenizer = None
+        self._current_job = None
+
     def close(self, timeout: float = 5.0) -> None:
         """Stop the ephemeral callable-worker thread and release its resources.
 
@@ -444,6 +461,15 @@ class BackgroundTrainer:
         thread exits cleanly.  Safe to call even if no worker has ever been
         started.
 
+        After joining, nulls ``self._worker_thread`` so the
+        ``bt ↔ Thread._target (bound method)`` cycle dissolves on stop.
+        CPython only deletes ``Thread._target`` after ``run()`` exits, and
+        never clears our handle — without explicit nulling ``bt`` (and its
+        ``bt.model`` = base model) remains reachable through the joined
+        thread handle even after the queue is drained.  Setting the handle
+        to ``None`` here is safe because :meth:`submit` lazily re-creates
+        the worker when ``self._worker_thread is None``.
+
         Args:
             timeout: Seconds to wait for the worker thread to join.  If the
                 thread is still alive after the timeout a warning is logged and
@@ -459,3 +485,5 @@ class BackgroundTrainer:
                 "Callable worker did not exit within %.1fs; will be killed on process exit",
                 timeout,
             )
+        # Null our handle so the bt ↔ Thread._target cycle dissolves on stop.
+        self._worker_thread = None

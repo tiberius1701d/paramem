@@ -223,6 +223,9 @@ class ConsolidationLoop:
         # the same operator policy as inference-time cloud egress.  ``None``
         # falls back to the primitive default in ``extractor.py``
         # (``{person, place}``) for back-compat with experiment scripts.
+        # BASE-MODEL HOLDER (loop.extraction.model): ExtractionPipeline stores
+        # model on self.extraction.model; released via loop.release() →
+        # self.extraction.model = None.
         self.extraction = ExtractionPipeline(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -386,6 +389,29 @@ class ConsolidationLoop:
             on_epoch_persist=on_epoch_persist,
             on_save_persist=on_save_persist,
         )
+
+    def release(self) -> None:
+        """Drop all base-model references this loop holds so the model can be freed.
+
+        Called by :func:`paramem.server.app._release_base_model_in_process`.
+        Nulls ``model``/``tokenizer``/``_bg_trainer``/``extraction`` (and
+        ``extraction.model``) so no live attribute on this object (or on the
+        :class:`~paramem.graph.extraction_pipeline.ExtractionPipeline` it owns)
+        retains a reference to the base model.
+
+        ``ExtractionPipeline`` stores only ``self.model`` and
+        ``self.tokenizer`` at the top level; there are no deeper sub-object
+        holders, so nulling ``extraction.model`` is sufficient.
+
+        Idempotent: safe to call multiple times or on a partially-constructed
+        loop.
+        """
+        self.model = None
+        self.tokenizer = None
+        self._bg_trainer = None
+        if getattr(self, "extraction", None) is not None:
+            self.extraction.model = None  # BASE-MODEL HOLDER: ExtractionPipeline.model
+            self.extraction = None
 
     def guard_trial_state(self, state: dict | None) -> None:
         """Raise TrialActiveError when a migration TRIAL is in progress.

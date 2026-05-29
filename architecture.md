@@ -401,7 +401,12 @@ final `migrate()` returns and before the `status=pass` marker (Step 6 in the
 sequence at `paramem/server/app.py::_run_base_swap_orchestration`). The
 reload tears down the PeftModel and rebuilds it from disk, picking up every
 tier's promoted adapter cleanly so `/debug/recall`'s `adapter_available`
-topology matches disk without a systemctl restart. The reload is best-effort:
+topology matches disk without a systemctl restart. For the reload to fit on
+8 GiB the release first drops every base-model holder — `BackgroundTrainer.model`
+(pinned by the worker-thread bound-method cycle) and
+`ConsolidationLoop.model`/`.extraction.model` — via `BackgroundTrainer.release()`
+and `ConsolidationLoop.release()`; otherwise the just-retrained base stays
+resident (~2.8 GiB) and the reload defers to cloud-only. The reload is best-effort:
 if it fails internally the server lands in cloud-only with
 `cloud_only_reason` set and the swap is still marked complete (weights are
 already on disk); the next `/gpu/acquire` recovers. Consolidation does NOT

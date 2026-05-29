@@ -394,7 +394,8 @@ class TestApplyPathIsolation:
             state["cloud_only_reason"] = None
             marker = tmp_data / "smoke_apply_marker.txt"
             marker.write_text("apply-ran")
-            reload_called.append(True)
+            # Capture lock_held so the assertion below can verify the kwarg was forwarded.
+            reload_called.append(lock_held)
 
         monkeypatch.setattr(app_module, "_live_reload_base_model", _mock_reload)
         # Patch _set_voice_pipeline_profile so it does not try to load STT/TTS.
@@ -415,6 +416,14 @@ class TestApplyPathIsolation:
         # _live_reload_base_model was called.
         assert reload_called, (
             "_live_reload_base_model was not called — test setup error or unexpected code path"
+        )
+        # _apply_config_live holds gpu_lock_sync and must forward lock_held=True so the
+        # primitive's internal _set_voice_pipeline_profile calls do not re-acquire the
+        # non-reentrant lock (deadlock).  Dropping lock_held=True from the caller would
+        # make this assertion fail.
+        assert reload_called[0] is True, (
+            "_apply_config_live must call _live_reload_base_model(lock_held=True) — "
+            f"got lock_held={reload_called[0]!r}"
         )
         # Marker is in tmp, NOT in live.
         assert (tmp_data / "smoke_apply_marker.txt").exists(), (
