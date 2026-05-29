@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-PORTS=(8420 10300 10301)  # REST API + Wyoming STT + Wyoming TTS
+PORTS=(8420 10300 10301 2222)  # REST API + Wyoming STT + Wyoming TTS + SSH
 WSL_IP=$(hostname -I | awk '{print $1}')
 
 if [ -z "$WSL_IP" ]; then
