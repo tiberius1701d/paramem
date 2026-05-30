@@ -77,7 +77,7 @@ All lifecycle commands are per-file atomic + idempotent + resumable via a crash-
 - **Theft of a powered-off host IF the passphrase is not co-located** (depends on operator discipline — typically a weak defense because `.env` lives on the same disk).
 
 **In scope beyond data-at-rest:**
-- LAN-adjacent attackers sending unauthenticated requests — mitigated by `PARAMEM_API_TOKEN`.
+- LAN-adjacent attackers sending unauthenticated requests — mitigated by the bearer-token auth layer (see §4.1).
 - Prompt-injection attempts via voice input.
 - Careless maintainers, accidental commits, screenshots of on-disk state.
 
@@ -92,7 +92,7 @@ All lifecycle commands are per-file atomic + idempotent + resumable via a crash-
 ## 3. Trust boundaries
 
 - **User voice → STT.** Raw audio arrives on a Wyoming protocol port. Transcript + speaker embedding cross into the FastAPI process on the shared asyncio event loop.
-- **Home Assistant ↔ ParaMem.** A thin HA custom component POSTs to the `/chat` endpoint over HTTP on the LAN. Bearer-token authentication is opt-in via the `PARAMEM_API_TOKEN` environment variable. When unset, the server accepts any LAN request — this is announced at startup as an explicit open posture, not a silent one.
+- **Home Assistant ↔ ParaMem.** A thin HA custom component POSTs to the `/chat` endpoint over HTTP on the LAN. Bearer-token authentication has four postures governed by `PARAMEM_API_TOKEN` and `mobile_pwa.enabled` — see §4.1 for the full model. When auth is OFF the server accepts any LAN request, announced at startup as an explicit open posture, not a silent one.
 - **ParaMem → cloud.** Sanitized queries (and speaker name, as persona anchor) may be sent to a configured cloud agent for escalation or SOTA enrichment. This path is opt-in via config; nothing is sent without an active cloud configuration. The cloud-egress sanitizer has two arms: a known-entity scrub against the speaker's graph entities (language-agnostic) and an encoder-based "is this about the speaker?" classifier with multilingual exemplars under `configs/personal_referent/`, falling back to an English token-set when the encoder isn't loaded. Coverage scales with the exemplar files; see §6 and §7 for the operator's responsibility and the residual risk.
 - **Routing-time intent classifier (privacy property).** The intent classifier in `paramem/server/intent.py` runs *before* any retrieval and *outside* the PA reasoning path. Under `intent.mode: llm` (default) the local Mistral 7B is invoked with the focused classifier section of `configs/prompts/pa_voice.txt` only — `_personalize_prompt` is **not** applied, so the speaker name is not injected into the classifier system message and the query is classified on content alone. Under `intent.mode: embeddings` the sentence-encoder cosine match never receives speaker identity. Either path keeps routing-time classification orthogonal to personal-context exposure: the speaker-name leak surface is the *response-time* PA path (which intentionally uses `_personalize_prompt`), gated by the cloud-egress sanitizer above.
 - **Adapter files at rest.** The on-disk artifacts listed in §1 live under the configured data directory. At-rest encryption is governed by the binary switch in §4.
@@ -117,6 +117,28 @@ No key material is loaded. All infrastructure metadata is plaintext on disk. Thi
 SECURITY: OFF (no key — all infrastructure metadata is plaintext on disk)
 ```
 and surfaces `encryption: off` on the `/status` endpoint. The server does not silently degrade between modes: if the daily identity is loaded but on-disk files are plaintext (or vice versa), startup refuses with an actionable message.
+
+### 4.1 Authentication postures
+
+The auth layer is independent of the encryption mode — it governs which REST requests are accepted, not how data is written to disk.  Two knobs interact: `PARAMEM_API_TOKEN` (environment variable; shared bearer token) and `mobile_pwa.enabled` (config; per-user bearer tokens).  The startup log always emits exactly one `AUTH:` line naming the active posture:
+
+| Posture | Condition | Effect |
+|---------|-----------|--------|
+| **OFF** | Neither configured | All REST endpoints accept any request without credentials. Startup emits a loud `AUTH: OFF` warning. Default for new installs. |
+| **ON-shared** | `PARAMEM_API_TOKEN` set | All endpoints require the single shared bearer token. Requests are authenticated but **unattributed** — no `speaker_id` is attached. |
+| **ON-per-user** | `mobile_pwa.enabled: true` | All endpoints require a per-user opaque bearer token. **Fail-closed:** a wired store with zero active tokens denies every request until at least one token is minted. Authorized requests carry a `speaker_id` bound at mint time — the only path for a text-only `/chat` call to carry a real speaker identity (voice still uses embedding-based identification). |
+| **ON-both** | Both configured | Shared token checked first; per-user store is the fallback. |
+
+The shared token covers legacy deployments (HA custom component with a fixed key in `.env`). The per-user path covers the mobile PWA, where each device is issued its own token that resolves to a speaker identity on every request.
+
+**Per-user token properties:**
+
+- Tokens are opaque random secrets. The plaintext token is displayed once at mint time (via `paramem mint-user-token`; see `README.md`) and never stored or logged. Only the `sha256(token)` hash is persisted on disk, in `user_tokens.json`.
+- `user_tokens.json` follows the deployment-wide encryption posture: plaintext under Security OFF, age-encrypted when the daily key is loaded. It is covered by the startup mode-consistency check — a plaintext credential file alongside a loaded key is refused at startup.
+- **Revocation** is per-token or per-speaker and takes effect immediately on the next request. Revoking the last active token in the store keeps the auth layer fail-closed rather than silently reverting to open access.
+- **Token carriers:** `Authorization: Bearer <token>` HTTP header, or an `httpOnly; Secure; SameSite=Strict` cookie set by the server during the PWA onboarding flow (same-origin — the PWA is served from the ParaMem server itself). Header takes precedence over cookie.
+
+**Path exemptions:** the PWA shell (`/` and `/app`) and the web app manifest (`/manifest.json`) are exempt from token checks so the login page loads before a token exists. All other endpoints enforce the active posture.
 
 ### Fail-loud opt-in: `security.require_encryption`
 
@@ -198,7 +220,7 @@ ParaMem is a single-admin service. The operator — the person running the serve
 
 - Generating and storing key material. Run `paramem generate-key` to mint the daily identity (stored passphrase-wrapped on this host) and the recovery identity (printed once — save it offline). Do not rely on a single storage location for the only copy of the recovery bech32.
 - Scoping LAN exposure. Set `PARAMEM_LISTEN_IP` to the specific host interface that should accept incoming requests, and `PARAMEM_NAS_IP` to scope the Windows Firewall rule to the Home Assistant source host. Unset values default to an open posture with a loud startup warning.
-- Setting `PARAMEM_API_TOKEN` to require bearer-token authentication on all REST endpoints. When unset, the server accepts any request from a reachable peer.
+- Choosing the appropriate auth posture (§4.1) for the deployment. Set `PARAMEM_API_TOKEN` to protect the server with a single shared token; enable `mobile_pwa.enabled: true` for per-user tokens that carry speaker identity. When neither is configured the server accepts any request from a reachable peer, with a loud startup warning.
 - Managing `.env` and per-secret files under `~/.config/paramem/secrets/` with file mode `0600` and directory mode `0700`. The server refuses to start if permissions are looser.
 - Scoping the Home Assistant long-lived access token to a dedicated, minimal-privilege HA user — not to a full admin.
 - Handling backups. A backup that captures the data directory but not the master-key source defeats the encryption.
@@ -213,7 +235,7 @@ The security properties are honest, not aspirational. The following are the limi
 - **Runtime exposure is identical to RAG.** While the server is reasoning over a recalled fact, that fact lives as plaintext in GPU / CPU RAM inside the server process. Any system reasoning over private data has this property; we isolate it to one process behind a local API rather than streaming recalled context to external tools.
 - **Extraction-stage SOTA enrichment narrows but does not eliminate PII egress.** When `consolidation.extraction_noise_filter` is set to a SOTA provider (default `""` = disabled), the extraction pipeline runs a local-anonymization pass on person names — replacing them with placeholders (`{Person_N}`) — before sending the anonymized transcript and facts to the cloud for coreference resolution, compound splitting, and dedup. A forward-path verification step (`verify_anonymization`, default on) blocks the cloud call when a real name leaked past the local anonymizer. The default cloud-egress scope is `{"person"}`; place names, organization names, phone numbers, email addresses, and free-form secrets (API keys, passwords, tokens) flow to the SOTA provider inside the anonymized payload. The scope is configurable via `consolidation.extraction_pii_scope`, but broadening it strips the structured context a personal assistant relies on to be useful — privacy-vs-utility is the operator's call, made consciously and per deployment. Document ingestion goes through the same pipeline; for documents that may contain machine credentials, keep `extraction_noise_filter=""` or scrub credentials before ingest.
 - **Cloud escalation can leak.** The sanitizer applied before escalation has two arms: a known-entity scrub (substitution against the speaker's graph entities) and a self-reference gate (encoder-based "is this about the speaker?" classifier with multilingual exemplars under `configs/personal_referent/`, falling back to an English token-set when the encoder isn't loaded). The self-reference gate fires only when an identified `speaker_id` is present — voice-resolved or post-greeting. Residual risk: the encoder operates on lexical/semantic shape; the local model can still rewrite a query in a form that embeds a personal fact while passing the gate. Cross-lingual transfer in the multilingual encoder lifts coverage past the languages with explicit exemplars (en/de today) but is not guaranteed for every locale or idiom — adding `<class>.<lang>.txt` exemplar files for production languages tightens the bound. Speaker name is sent structurally to SOTA persona and is not scrubbed by default.
-- **LAN authentication is operator-provisioned.** When `PARAMEM_API_TOKEN` is unset, the REST endpoints are accessible to any LAN peer. Wyoming STT / TTS ports do not support protocol-level auth at all and rely on network-layer scoping (firewall rule) for access control.
+- **LAN authentication is operator-provisioned.** When neither `PARAMEM_API_TOKEN` nor `mobile_pwa.enabled` is configured, the REST endpoints are accessible to any LAN peer (Security OFF posture). Wyoming STT / TTS ports do not support protocol-level auth at all and rely on network-layer scoping (firewall rule) for access control.
 - **Key loss is total.** No backdoor, no recovery service, no escrow. The recovery key *is* the backdoor; losing it is losing the data.
 - **Biometrics are convenience, not security.** Biometric unlock binds to specific hardware and specific OS sessions. A new device or a TPM clear invalidates the daily path. Biometrics cannot be rotated if compromised and are not cryptographic secrets.
 - **Supply chain pinning is not auditing.** Dependency versions are pinned in `pyproject.toml`, including the CUDA-specific `bitsandbytes` development wheel required for RTX 50-series hardware. Pinning prevents silent updates but does not constitute a reviewed supply chain.
@@ -238,5 +260,5 @@ ParaMem is research software maintained by a single author. There is no formal S
 
 - `README.md` — project overview, configuration, setup
 - `spec.md` — architecture + design decisions, including the F5.4 privacy/security feature track
-- `paramem/server/auth.py`, `paramem/server/secret_store.py` — runtime entry points for the boundaries described above
+- `paramem/server/auth.py`, `paramem/server/user_tokens.py`, `paramem/server/secret_store.py` — runtime entry points for the boundaries described above
 - The internal hardening plan and empirical probe results live outside the public repository; enquiries should be routed through the disclosure channel in §8.

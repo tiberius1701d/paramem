@@ -25,12 +25,16 @@ import uuid
 from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from paramem.server.user_tokens import UserTokenStore
 
 import torch
 from dotenv import load_dotenv
-from fastapi import FastAPI, Response
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # Migration / backup imports at module level so tests can patch them.
@@ -117,6 +121,7 @@ _state = {
     "model": None,
     "tokenizer": None,
     "config": None,
+    "user_token_store": None,
     "session_buffer": None,
     "router": None,
     "sota_agent": None,
@@ -1552,6 +1557,36 @@ def _compute_topology_assessment(config, base_pred: int | None):
 # --- Lifespan ---
 
 
+def _build_user_token_store(config) -> "UserTokenStore | None":
+    """Return a :class:`~paramem.server.user_tokens.UserTokenStore` when per-user
+    auth is opted in, or ``None`` when it is not.
+
+    The store is constructed only when ``config.mobile_pwa.enabled`` is
+    ``True``.  Leaving it ``None`` keeps the middleware in OFF mode for
+    default deployments that have neither a shared token nor the PWA enabled —
+    restoring the original open-by-default behavior.
+
+    The decision logic is extracted here so it can be unit-tested without
+    starting the full app lifespan.
+
+    Parameters
+    ----------
+    config:
+        A :class:`~paramem.server.config.ServerConfig` instance.
+
+    Returns
+    -------
+    UserTokenStore | None
+        A wired store (potentially empty) when ``mobile_pwa.enabled``, else
+        ``None``.
+    """
+    if not config.mobile_pwa.enabled:
+        return None
+    from paramem.server.user_tokens import UserTokenStore as _UserTokenStore
+
+    return _UserTokenStore(config.paths.data / "user_tokens.json")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
@@ -1614,6 +1649,16 @@ async def lifespan(app: FastAPI):
         logger.warning(_line)
     _state["encryption"] = "on" if _is_on else "off"
     _state["daily_loadable"] = _daily_ok
+
+    # Per-user token store — opt-in via mobile_pwa.enabled.  Only constructed
+    # when the PWA slice is active so a default deployment (no shared token,
+    # mobile_pwa.enabled=false) leaves the store None and the middleware OFF.
+    _state["user_token_store"] = _build_user_token_store(config)
+    if _state["user_token_store"] is not None:
+        logger.info(
+            "User token store ready — %d entries",
+            len(_state["user_token_store"].list()),
+        )
 
     # --- Crash recovery: inspect disk state BEFORE drift init ---
     # This ensures _state["migration"] reflects any partially-completed
@@ -2203,6 +2248,32 @@ async def lifespan(app: FastAPI):
 
     logger.info("ParaMem server ready — mode: %s, model: %s", _state["mode"], config.model_name)
 
+    # PWA static mount — opt-in via config.mobile_pwa.enabled.  Mounted at a
+    # sub-path (/app) so it cannot shadow API routes.  Deferred to lifespan so
+    # config is available and the mount is skipped in headless/API-only mode.
+    if config.mobile_pwa.enabled:
+        _pwa_dir = (
+            Path(config.mobile_pwa.static_dir)
+            if config.mobile_pwa.static_dir
+            else Path(__file__).parent.parent / "web" / "static"
+        )
+        app.mount("/app", StaticFiles(directory=str(_pwa_dir), html=True), name="pwa")
+        logger.info("PWA static mount active — serving %s at /app", _pwa_dir)
+
+    # Auth startup posture — logged once here after the store is wired so the
+    # message accurately reflects runtime state.  Supersedes the import-time
+    # call (which was always AUTH: OFF because the store was not yet assigned).
+    # per_user_active is keyed on store presence (matching the middleware
+    # enablement rule), so a wired-but-empty store logs ON-per-user (fail-closed)
+    # rather than OFF.
+    _posture_store = _state.get("user_token_store")
+    _n_user_tokens = len(_posture_store.list()) if _posture_store is not None else 0
+    log_startup_posture(
+        _api_token,
+        n_user_tokens=_n_user_tokens,
+        per_user_active=_posture_store is not None,
+    )
+
     yield
 
     # Shutdown — flush deferred speaker profile writes
@@ -2242,7 +2313,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
 
 # Bearer-token auth on all REST endpoints when PARAMEM_API_TOKEN is set.
-# No-op when unset (loud WARN at startup).
+# No-op when unset (loud WARN emitted from lifespan after store is wired).
 from paramem.server.auth import (  # noqa: E402
     BearerTokenMiddleware,
     load_token_from_env,
@@ -2250,16 +2321,42 @@ from paramem.server.auth import (  # noqa: E402
 )
 
 _api_token = load_token_from_env()
-app.add_middleware(BearerTokenMiddleware, token=_api_token)
-log_startup_posture(_api_token)
+app.add_middleware(
+    BearerTokenMiddleware,
+    token=_api_token,
+    user_token_getter=lambda: _state.get("user_token_store"),
+    cookie_name_getter=lambda: (
+        _state["config"].mobile_pwa.cookie_name if _state.get("config") else None
+    ),
+    # "/app" added so a bare /app request reaches the StaticFiles 307→/app/
+    # redirect instead of being 401'd before the mount can handle it.
+    exempt_paths=("/", "/app"),
+    exempt_prefixes=("/app/",),
+)
 
 
 # --- Endpoints ---
 
 
+@app.get("/")
+async def root_redirect():
+    """Redirect the bare root to the PWA shell.
+
+    The ``/`` path is exempt from bearer-token auth so the browser can
+    follow the redirect before a session cookie exists.  The ``/app/``
+    prefix is also exempt, so the shell and its static assets load freely.
+    """
+    return RedirectResponse("/app/")
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """Handle a conversation turn with speaker identification."""
+async def chat(request: ChatRequest, http_request: Request):
+    """Handle a conversation turn with speaker identification.
+
+    *http_request* is injected by FastAPI for access to per-request state
+    (e.g. ``speaker_id`` set by BearerTokenMiddleware on authenticated
+    per-user requests).  It is NOT parsed as a JSON body.
+    """
     _state["last_chat_time"] = datetime.now(timezone.utc)
     # Monotonic stamp for debounce — immune to NTP wall-clock steps.
     # Both writes happen on the asyncio event loop thread (cooperative
@@ -2267,10 +2364,17 @@ async def chat(request: ChatRequest):
     _state["last_chat_monotonic"] = time.monotonic()
     buffer = _state["session_buffer"]
 
+    # Authenticated speaker from per-user bearer token (set by
+    # BearerTokenMiddleware on ON-per-user requests).  None for legacy shared
+    # token calls (no speaker attribution) and unauthenticated mode.
+    auth_speaker_id: str | None = getattr(http_request.state, "speaker_id", None)
+
     # Forced routing — bypass normal routing for direct provider testing.
     # Supports: "ha", "sota", "sota:anthropic", "sota:openai", "sota:google"
     if request.route and request.route.startswith(("ha", "sota")):
-        _speaker_id, speaker = _resolve_speaker(request, buffer, _state.get("speaker_store"))
+        _speaker_id, speaker = _resolve_speaker(
+            request, buffer, _state.get("speaker_store"), auth_speaker_id=auth_speaker_id
+        )
         loop = asyncio.get_running_loop()
 
         result = None
@@ -2346,10 +2450,12 @@ async def chat(request: ChatRequest):
             detected_language_prob = text_prob
             logger.info("Text-side lang_id: %s (prob=%.2f)", text_lang, text_prob)
 
-    # Speaker resolution: embedding → session history → anonymous.
+    # Speaker resolution: auth token → embedding → session history → anonymous.
     # Never let speaker ID failure kill the request — proceed as anonymous.
     try:
-        speaker_id, speaker = _resolve_speaker(request, buffer, _state.get("speaker_store"))
+        speaker_id, speaker = _resolve_speaker(
+            request, buffer, _state.get("speaker_store"), auth_speaker_id=auth_speaker_id
+        )
     except Exception:
         logger.exception("Speaker resolution failed — proceeding as anonymous")
         speaker_id, speaker = None, None
@@ -2644,16 +2750,47 @@ def _match_unknown_speaker(embedding: list[float]) -> str | None:
     return best_id
 
 
-def _resolve_speaker(request: ChatRequest, buffer, speaker_store) -> tuple[str | None, str | None]:
+def _resolve_speaker(
+    request: ChatRequest,
+    buffer,
+    speaker_store,
+    auth_speaker_id: str | None = None,
+) -> tuple[str | None, str | None]:
     """Resolve speaker identity from multiple sources.
 
     Returns (speaker_id, speaker_name) tuple.
 
     Priority:
+    0. Authenticated token identity — authoritative (cryptographic).  When
+       *auth_speaker_id* is set and is known to the speaker store (or when the
+       store is absent/unavailable), this identity is returned immediately
+       without consulting voice embeddings.  A per-user bearer token is a
+       stronger signal than a probabilistic voice match; overriding it would
+       allow a voice impersonation to bypass token-based auth.
     1. Voice embedding match (via SpeakerStore, high confidence only)
     2. Session history (previously identified in this conversation)
     3. Anonymous (None, None)
+
+    Parameters
+    ----------
+    request:
+        The incoming chat request (provides speaker_embedding, conversation_id).
+    buffer:
+        Active SessionBuffer for session-level speaker tracking.
+    speaker_store:
+        Optional SpeakerStore for voice-embedding based identification.
+    auth_speaker_id:
+        Speaker ID from the bearer token, attached by BearerTokenMiddleware.
+        When set, this identity is authoritative and returned before the
+        voice/session resolution path.
     """
+    # 0. Authenticated token identity — authoritative.
+    if auth_speaker_id is not None:
+        speaker_name: str | None = None
+        if speaker_store is not None:
+            speaker_name = speaker_store.get_name(auth_speaker_id)
+        return auth_speaker_id, speaker_name
+
     # 1. Voice embedding match
     if request.speaker_embedding and speaker_store:
         match = speaker_store.match(request.speaker_embedding)

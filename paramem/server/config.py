@@ -1288,6 +1288,28 @@ class TextLangDetectionConfig:
 
 
 @dataclass
+class MobilePwaConfig:
+    """Progressive Web App (PWA) configuration for the mobile client.
+
+    ``enabled``: serve the static PWA bundle and activate cookie-based
+    authentication for the mobile web client.  False by default so existing
+    API-key deployments are unaffected until the mobile slice is wired in.
+
+    ``static_dir``: filesystem path to the compiled static bundle.  Empty
+    string defers resolution to the mount point (``paramem/web/static``)
+    configured in a later slice.
+
+    ``cookie_name``: name of the session cookie the mobile client will send
+    on every request.  Must match whatever the SPA sets after login.
+    """
+
+    enabled: bool = False
+    # Empty → paramem/web/static (resolved by the static-mount slice).
+    static_dir: str = ""
+    cookie_name: str = "paramem_token"
+
+
+@dataclass
 class InferenceConfig:
     """Inference-time options that govern the per-query probe path.
 
@@ -1352,6 +1374,7 @@ class ServerConfig:
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
     text_lang_detection: TextLangDetectionConfig = field(default_factory=TextLangDetectionConfig)
+    mobile_pwa: MobilePwaConfig = field(default_factory=MobilePwaConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     vram: VramConfig = field(default_factory=VramConfig)
     process: ProcessConfig = field(default_factory=ProcessConfig)
@@ -1742,6 +1765,10 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     text_lang_raw = raw.get("text_lang_detection", {})
     if text_lang_raw:
         config.text_lang_detection = TextLangDetectionConfig(**text_lang_raw)
+
+    mobile_pwa_raw = raw.get("mobile_pwa", {})
+    if mobile_pwa_raw:
+        config.mobile_pwa = MobilePwaConfig(**mobile_pwa_raw)
 
     inference_raw = raw.get("inference", {})
     if inference_raw:

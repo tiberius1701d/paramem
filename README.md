@@ -413,6 +413,7 @@ options. A short map of the top-level sections:
 | `sentence_type` | Encoder-based interrogative-vs-non-interrogative classifier with exemplars under `configs/sentence_types/<class>.<lang>.txt`. Adding a language is one new file pair, no code change. Falls back to terminal-punctuation + English first-word lexicon when the encoder isn't available. |
 | `personal_referent` | Encoder-based about-speaker-vs-not-about-speaker classifier with exemplars under `configs/personal_referent/<class>.<lang>.txt`. Closes the multilingual hole in the sanitizer: German / Mandarin / Spanish / etc. self-referential queries are blocked at the cloud-egress gate even though the legacy English token-set wouldn't match. Falls back to that token-set when the encoder isn't available. |
 | `text_lang_detection` | fastText `lid.176` detector for the text-only `/chat` path. STT carries Whisper's language signal on audio; pure-text requests had no equivalent and fell through to English regardless of input language. Eager-loaded at server startup when `enabled` is true (CPU-only, ~126 MB resident, zero VRAM cost). One-time setup: `bash scripts/setup/download-langid-model.sh`. Disabled by default so deployments without the model file do not warn. |
+| `mobile_pwa` | Progressive Web App configuration. `enabled` (default `false`): serve the static PWA shell at `/app` and activate per-user cookie/bearer-token auth (see `SECURITY.md §4.1`). `static_dir` (default: bundled `paramem/web/static`): filesystem path to the compiled static bundle. `cookie_name` (default: `paramem_token`): name of the `httpOnly; Secure; SameSite=Strict` session cookie the PWA sets after onboarding. |
 | `voice` | Voice prompt file, per-speaker greeting cadence, per-language greeting text (`voice.greetings`). |
 | `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
 | `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |
@@ -529,6 +530,34 @@ paramem migrate-cancel      # discard a staged candidate (before confirm)
 > **Base-model swaps.** A `model:` change runs a dedicated base-swap migration (flagged Destructive in preview): each tier's graph is captured from the live adapters (Phase A), the base model is reloaded in-process to the candidate, and every adapter is retrained on the new base and gated at 100% recall before the swap commits (Phase B) — the candidate is exercised end to end. It is resumable across restarts and revertible from the pre-swap snapshot bundle (`POST /backup/restore` with `restore_config: true`; see [`SECURITY.md`](SECURITY.md)). The pre-swap bundle is **retention-immune** (same protection class as pre-migration snapshots — it survives pruning for 30 days even after a rollback clears the trial marker) and carries a `server.yaml.candidate` sidecar so the operator can pull the candidate config and retry later. The gate proves recall parity, not extraction/reasoning quality on the new base — validate those separately before adopting a new base permanently. Exercised Mistral 7B → Qwen3-4B.
 
 Encryption key lifecycle (`paramem generate-key` / `rotate-daily` / `rotate-recovery` / `restore` / `encrypt-infra`) is documented in [`SECURITY.md`](SECURITY.md).
+
+### Per-user token management
+
+When `mobile_pwa.enabled: true`, each device that should access the server must be issued its own bearer token. Tokens are minted offline via the CLI, which prints a QR code for one-tap onboarding on mobile devices.
+
+```bash
+paramem mint-user-token <speaker_id> \
+    [--label LABEL] \
+    [--server-url URL] \
+    [--config PATH] \
+    [--png FILE]
+```
+
+- `speaker_id` — the speaker this token authenticates (e.g. `Speaker0`). Every request carrying this token sets `speaker_id` to this value on the server.
+- `--label` — human-readable device or purpose label stored with the token (e.g. `phone`).
+- `--server-url` — base URL encoded into the QR payload (e.g. `https://<your-host>.<your-tailnet>.ts.net`). The PWA is reachable at `/app` on this URL when `mobile_pwa.enabled` is on.
+- `--config` — server config path (default: `configs/server.yaml`), used to resolve the data directory.
+- `--png` — also save the QR as a PNG file.
+
+The command prints a terminal QR encoding `{"server_url": "...", "token": "..."}` plus a text fallback, then exits. The plaintext token is never written to any log file. Example:
+
+```bash
+paramem mint-user-token Speaker0 \
+    --label phone \
+    --server-url "https://<your-host>.<your-tailnet>.ts.net"
+```
+
+**Encryption note.** If `PARAMEM_DAILY_PASSPHRASE` is set and the daily key is loaded (Security ON), `user_tokens.json` is age-encrypted; the passphrase must be available when running this command. Without a daily key the store is written in plaintext (Security OFF). See [`SECURITY.md §4.1`](SECURITY.md) for the full token-store encryption contract.
 
 ### GPU Lifecycle
 
@@ -657,7 +686,9 @@ Under Security ON (operator-configured daily age identity loaded), ParaMem envel
 
 - **Two-identity age X25519 model.** A **daily** identity lives on the host, passphrase-wrapped at `~/.config/paramem/daily_key.age` (mode `0600`). A **recovery** identity is printed once at setup time and stored offline by the operator; only its public recipient (`~/.config/paramem/recovery.pub`) persists on the device. Every on-disk envelope lists both recipients so hardware loss is recoverable from the printed paper alone.
 - **Startup posture.** The server emits one of three `SECURITY:` log lines at startup (age+recovery, age alone, OFF) and surfaces `encryption: on|off` on `/status`. Mode mismatches (plaintext alongside age envelopes, or age files with the daily identity missing) refuse startup with an actionable message rather than degrade silently. Operators who want the *absence* of a key to also fail loud — not only a mismatch — can set `security.require_encryption: true` in `configs/server.yaml`; the server then refuses to start unless the daily identity is loadable.
-- **Required env vars for Security-ON:** `PARAMEM_DAILY_PASSPHRASE` (operator-chosen; unlocks the daily age key). Optional: `PARAMEM_API_TOKEN` (bearer token on all REST endpoints; unset = open LAN posture with a loud startup warning), `PARAMEM_LISTEN_IP` / `PARAMEM_NAS_IP` (scope network exposure).
+- **Required env vars for Security-ON:** `PARAMEM_DAILY_PASSPHRASE` (operator-chosen; unlocks the daily age key). Optional: `PARAMEM_API_TOKEN` (shared bearer token on all REST endpoints; unset = open LAN posture with a loud startup warning), `PARAMEM_LISTEN_IP` / `PARAMEM_NAS_IP` (scope network exposure).
+- **Authentication postures.** The auth layer has four states gated by `PARAMEM_API_TOKEN` (shared token) and `mobile_pwa.enabled` (per-user tokens). **OFF** — neither set, all endpoints open with a loud warning. **ON-shared** — `PARAMEM_API_TOKEN` set, single unattributed bearer token. **ON-per-user** — `mobile_pwa.enabled: true`, per-user tokens each bound to a `speaker_id`, fail-closed until at least one token is minted. **ON-both** — both configured. Per-user tokens are the only mechanism that lets a text `/chat` request carry a real speaker identity (voice uses embedding-based identification instead). See [`SECURITY.md §4.1`](SECURITY.md) for the full model.
+- **Per-user token management.** Mint tokens with `paramem mint-user-token` (see CLI section below). Tokens are stored only as SHA-256 hashes in `user_tokens.json`; the plaintext is shown once at mint time and never stored or logged.
 
 Key lifecycle is driven by the `paramem generate-key` / `change-passphrase` / `rotate-daily` / `rotate-recovery` / `restore` / `dump` commands — see [`SECURITY.md`](SECURITY.md) for the first-run walkthrough, threat model, operator responsibilities, and known limitations.
 
