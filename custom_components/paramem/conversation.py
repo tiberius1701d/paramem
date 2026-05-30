@@ -15,7 +15,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import intent
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DEFAULT_FALLBACK_AGENT, DEFAULT_TIMEOUT, DOMAIN
+from .const import CONF_API_TOKEN, DEFAULT_FALLBACK_AGENT, DEFAULT_TIMEOUT, DOMAIN
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ async def async_setup_entry(
                 config_entry=config_entry,
                 server_url=data["server_url"],
                 timeout=data.get("timeout", DEFAULT_TIMEOUT),
+                api_token=data.get(CONF_API_TOKEN, ""),
             )
         ]
     )
@@ -43,15 +44,21 @@ class ParaMemConversationEntity(ConversationEntity):
 
     _attr_has_entity_name = True
     _attr_name = "ParaMem"
+    # A conversation agent is request/response — it has no pollable state.
+    # Declaring this stops HA's default 30s entity poll (which otherwise
+    # health-checks the server every cycle).
+    _attr_should_poll = False
 
     def __init__(
         self,
         config_entry: ConfigEntry,
         server_url: str,
         timeout: int,
+        api_token: str = "",
     ) -> None:
         self._server_url = server_url
         self._timeout = timeout
+        self._api_token = api_token
         self._attr_unique_id = config_entry.entry_id
 
     @property
@@ -80,11 +87,15 @@ class ParaMemConversationEntity(ConversationEntity):
             "history": history,
         }
 
+        headers = (
+            {"Authorization": f"Bearer {self._api_token}"} if self._api_token else {}
+        )
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{self._server_url}/chat",
                     json=payload,
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=self._timeout),
                 ) as resp:
                     resp.raise_for_status()
