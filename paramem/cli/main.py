@@ -35,6 +35,7 @@ from paramem.cli import (
     migrate_cancel,
     migrate_rollback,
     migrate_status,
+    mint_user_token,
     restore,
     rotate_daily,
     rotate_recovery,
@@ -243,6 +244,9 @@ def _build_parser() -> argparse.ArgumentParser:
     restore.add_parser(subparsers)
     change_passphrase.add_parser(subparsers)
 
+    # --- user token management ---
+    mint_user_token.add_parser(subparsers)
+
     return parser
 
 
@@ -323,6 +327,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "change-passphrase":
         return change_passphrase.run(args)
+
+    if args.command == "mint-user-token":
+        return mint_user_token.run(args)
 
     # Unreachable after subparsers.required = True, but keeps mypy happy.
     parser.print_help(sys.stderr)

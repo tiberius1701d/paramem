@@ -574,6 +574,11 @@ text_lang_detection:
   confidence_threshold: 0.65
   # model_path: ""
 
+mobile_pwa:
+  enabled: false
+  static_dir: ""
+  cookie_name: "paramem_token"
+
 # ============================================================================
 # PROCESS
 # ============================================================================

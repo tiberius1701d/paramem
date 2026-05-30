@@ -270,6 +270,8 @@ def infra_paths(data_dir: Path) -> list[Path]:
       restore trumps the marginal info hiding.
 
     Included (full-file encryption):
+    - ``user_tokens.json`` — per-user bearer-token store (SHA-256-hashed
+      credentials; must never exist in plaintext).
     - ``adapters/<tier>/graph.json`` — canonical structured persistence
       written by ``commit_tier_slot`` in both simulate and train modes.
     - ``adapters/<tier>/<slot>/adapter_model.safetensors`` (and any
@@ -297,6 +299,7 @@ def infra_paths(data_dir: Path) -> list[Path]:
         data_dir / "indexed_key_registry.json",
         data_dir / "registry" / "key_metadata.json",
         data_dir / "speaker_profiles.json",
+        data_dir / "user_tokens.json",
         data_dir / "adapters" / "post_session_queue.json",
     ]
     # Per-tier adapter registry + simhash + graph (unified layout:

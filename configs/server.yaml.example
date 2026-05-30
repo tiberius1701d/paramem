@@ -608,6 +608,22 @@ text_lang_detection:
   # model_path: ""
 
 # ============================================================================
+# MOBILE PWA
+# ============================================================================
+# Progressive Web App (PWA) support for the mobile client.
+#
+# enabled:      serve the static bundle and activate cookie-based auth.
+#               Disabled by default; enable after running the mobile-client
+#               build (a later slice).
+# static_dir:   path to the compiled static bundle.  Empty → resolved to
+#               paramem/web/static by the static-mount slice.
+# cookie_name:  session cookie name the SPA sets after login.
+mobile_pwa:
+  enabled: false
+  static_dir: ""
+  cookie_name: "paramem_token"
+
+# ============================================================================
 # PROCESS
 # ============================================================================
 # systemd restart policy for the paramem-server service.
