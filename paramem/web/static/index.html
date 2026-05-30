@@ -2,30 +2,389 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#1a1a2e" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <link rel="manifest" href="/app/manifest.json" />
+  <link rel="apple-touch-icon" href="/app/icon-192.png" />
   <title>ParaMem</title>
   <style>
-    body {
-      margin: 0;
-      background: #1a1a2e;
-      color: #e0e0e0;
-      font-family: system-ui, sans-serif;
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #1a1a2e;
+      --surface: #16213e;
+      --surface2: #0f3460;
+      --accent: #e94560;
+      --text: #e0e0e0;
+      --text-muted: #888;
+      --border: #2a2a4a;
+      --radius: 12px;
+      --header-h: 56px;
+      --input-h: 64px;
+      --safe-top: env(safe-area-inset-top, 0px);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+      --safe-left: env(safe-area-inset-left, 0px);
+      --safe-right: env(safe-area-inset-right, 0px);
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f5f5f5;
+        --surface: #ffffff;
+        --surface2: #e8eaf6;
+        --accent: #e94560;
+        --text: #1a1a2e;
+        --text-muted: #666;
+        --border: #ddd;
+      }
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 16px;
+      line-height: 1.5;
+      overflow: hidden;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      padding-top: var(--safe-top);
+      padding-left: var(--safe-left);
+      padding-right: var(--safe-right);
+    }
+
+    /* Header */
+    #header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: var(--header-h);
+      padding: 0 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    #header h1 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+    }
+
+    #settings-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 1.4rem;
+      cursor: pointer;
+      padding: 8px;
+      border-radius: 8px;
+      line-height: 1;
+    }
+    #settings-btn:hover { background: var(--surface2); color: var(--text); }
+
+    /* Message log */
+    #log {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .msg {
+      max-width: 82%;
+      padding: 10px 14px;
+      border-radius: var(--radius);
+      word-break: break-word;
+      font-size: 0.95rem;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: var(--accent);
+      color: #fff;
+      border-bottom-right-radius: 3px;
+    }
+    .msg.assistant {
+      align-self: flex-start;
+      background: var(--surface);
+      border-bottom-left-radius: 3px;
+      border: 1px solid var(--border);
+    }
+    .msg.error {
+      align-self: center;
+      background: transparent;
+      border: 1px solid #c0392b;
+      color: #e74c3c;
+      font-size: 0.85rem;
+      max-width: 94%;
+    }
+    .msg.system {
+      align-self: center;
+      color: var(--text-muted);
+      font-size: 0.82rem;
+      background: transparent;
+      max-width: 94%;
+      text-align: center;
+    }
+
+    /* Typing indicator */
+    .typing { display: flex; gap: 4px; padding: 14px; }
+    .typing span {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--text-muted);
+      animation: blink 1.2s infinite;
+    }
+    .typing span:nth-child(2) { animation-delay: 0.2s; }
+    .typing span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes blink {
+      0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+      40% { opacity: 1; transform: scale(1); }
+    }
+
+    /* Input row */
+    #input-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+      padding: 8px 12px;
+      padding-bottom: calc(8px + var(--safe-bottom));
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    #text-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      color: var(--text);
+      font-size: 0.95rem;
+      font-family: inherit;
+      padding: 10px 16px;
+      resize: none;
+      min-height: 40px;
+      max-height: 120px;
+      overflow-y: auto;
+      outline: none;
+      line-height: 1.4;
+    }
+    #text-input:focus { border-color: var(--accent); }
+    #text-input::placeholder { color: var(--text-muted); }
+
+    #send-btn, #mic-btn {
+      width: 40px; height: 40px;
+      border: none;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 1rem;
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
+      flex-shrink: 0;
     }
-    .shell { text-align: center; }
-    h1 { font-size: 2rem; letter-spacing: 0.05em; }
-    p { color: #888; }
+    #send-btn {
+      background: var(--accent);
+      color: #fff;
+    }
+    #send-btn:disabled { background: var(--border); cursor: default; }
+    #mic-btn {
+      background: var(--surface2);
+      color: var(--text-muted);
+      cursor: default;
+    }
+
+    /* Settings overlay */
+    #settings-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.5);
+      z-index: 100;
+      display: none;
+      align-items: flex-end;
+    }
+    #settings-overlay.open { display: flex; }
+
+    #settings-drawer {
+      background: var(--surface);
+      border-radius: var(--radius) var(--radius) 0 0;
+      padding: 20px 20px calc(20px + var(--safe-bottom));
+      width: 100%;
+      max-width: 520px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    #settings-drawer h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 2px;
+    }
+
+    .field-label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .settings-input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.92rem;
+      font-family: inherit;
+      padding: 10px 12px;
+      outline: none;
+    }
+    .settings-input:focus { border-color: var(--accent); }
+
+    .btn-row { display: flex; gap: 10px; margin-top: 4px; }
+
+    .btn {
+      flex: 1;
+      padding: 11px;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.92rem;
+      font-family: inherit;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-secondary { background: var(--surface2); color: var(--text); }
+    .btn:disabled { opacity: 0.4; cursor: default; }
+
+    #qr-btn { display: none; }
+
+    /* Camera scanner */
+    #scanner-overlay {
+      position: fixed;
+      inset: 0;
+      background: #000;
+      z-index: 200;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    #scanner-overlay.open { display: flex; }
+    #scanner-video { width: 100%; max-width: 400px; border-radius: 8px; }
+    #scanner-cancel {
+      margin-top: 16px;
+      color: #fff;
+      background: none;
+      border: 1px solid rgba(255,255,255,0.4);
+      border-radius: 8px;
+      padding: 10px 24px;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    #scanner-hint {
+      color: rgba(255,255,255,0.7);
+      font-size: 0.85rem;
+      margin-top: 10px;
+      text-align: center;
+      padding: 0 20px;
+    }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <h1>ParaMem</h1>
-    <p>Parametric memory assistant</p>
+  <div id="app">
+    <header id="header">
+      <h1>ParaMem</h1>
+      <button id="settings-btn" title="Settings" aria-label="Open settings">&#9881;</button>
+    </header>
+
+    <main id="log" role="log" aria-live="polite" aria-label="Conversation"></main>
+
+    <div id="input-row">
+      <textarea
+        id="text-input"
+        rows="1"
+        placeholder="Ask something…"
+        aria-label="Message input"
+      ></textarea>
+      <button id="send-btn" aria-label="Send message" title="Send">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
+      <button
+        id="mic-btn"
+        aria-label="Voice input (coming soon)"
+        title="Voice coming in a later update"
+        disabled
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+          <line x1="12" y1="19" x2="12" y2="23"></line>
+          <line x1="8" y1="23" x2="16" y2="23"></line>
+        </svg>
+      </button>
+    </div>
   </div>
+
+  <!-- Settings drawer -->
+  <div id="settings-overlay" role="dialog" aria-modal="true" aria-label="Settings">
+    <div id="settings-drawer">
+      <h2>Settings</h2>
+
+      <div>
+        <div class="field-label">Server URL (leave blank for same-origin)</div>
+        <input
+          id="server-url-input"
+          class="settings-input"
+          type="url"
+          placeholder="https://your-server.ts.net"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <div>
+        <div class="field-label">Bearer token</div>
+        <input
+          id="token-input"
+          class="settings-input"
+          type="password"
+          placeholder="Paste token here"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <div class="btn-row">
+        <button id="save-btn" class="btn btn-primary">Save</button>
+        <button id="cancel-btn" class="btn btn-secondary">Cancel</button>
+      </div>
+      <button id="qr-btn" class="btn btn-secondary">Scan QR code</button>
+    </div>
+  </div>
+
+  <!-- QR camera scanner -->
+  <div id="scanner-overlay" aria-label="QR scanner">
+    <video id="scanner-video" autoplay playsinline muted></video>
+    <div id="scanner-hint">Point the camera at a ParaMem onboarding QR code</div>
+    <button id="scanner-cancel">Cancel</button>
+  </div>
+
+  <script type="module" src="/app/app.js"></script>
 </body>
 </html>

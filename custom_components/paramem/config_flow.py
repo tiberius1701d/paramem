@@ -6,7 +6,7 @@ import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
 
-from .const import DEFAULT_SERVER_URL, DEFAULT_TIMEOUT, DOMAIN
+from .const import CONF_API_TOKEN, DEFAULT_SERVER_URL, DEFAULT_TIMEOUT, DOMAIN
 
 
 class ParaMemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -24,7 +24,11 @@ class ParaMemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             server_url = user_input["server_url"].rstrip("/")
             user_input["server_url"] = server_url
 
-            if await self._test_connection(server_url, user_input.get("timeout", DEFAULT_TIMEOUT)):
+            if await self._test_connection(
+                server_url,
+                user_input.get("timeout", DEFAULT_TIMEOUT),
+                user_input.get(CONF_API_TOKEN, ""),
+            ):
                 return self.async_create_entry(
                     title=f"ParaMem ({server_url})",
                     data=user_input,
@@ -39,17 +43,26 @@ class ParaMemConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Optional("timeout", default=DEFAULT_TIMEOUT): vol.All(
                         vol.Coerce(int), vol.Range(min=1, max=120)
                     ),
+                    vol.Optional(CONF_API_TOKEN, default=""): str,
                 }
             ),
             errors=errors,
         )
 
-    async def _test_connection(self, server_url: str, timeout: int) -> bool:
-        """Test that the ParaMem server is reachable."""
+    async def _test_connection(
+        self, server_url: str, timeout: int, api_token: str = ""
+    ) -> bool:
+        """Test that the ParaMem server is reachable.
+
+        Sends ``Authorization: Bearer <token>`` when *api_token* is non-empty so
+        the connection test works against an auth-enabled ParaMem server.
+        """
+        headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{server_url}/status",
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as resp:
                     return resp.status == 200
