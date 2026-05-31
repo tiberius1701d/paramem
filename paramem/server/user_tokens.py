@@ -15,10 +15,15 @@ On-disk schema (one mandatory tier, no optional buckets):
                 "speaker_id": "Speaker0",
                 "label": "Alice iPad",
                 "created": "<iso8601 utc>",
-                "revoked": false
+                "revoked": false,
+                "scope": "chat"
             }
         }
     }
+
+The ``scope`` field is optional for backward compatibility with Phase-1 records.
+Missing ``scope`` is read as ``"chat"`` at runtime (secure default).  New tokens
+are always minted with an explicit scope.
 
 The store is written via :func:`paramem.backup.encryption.write_infra_bytes`
 (age-encrypted when a daily identity is loaded) and read via
@@ -57,6 +62,8 @@ from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, daily_identity_load
 logger = logging.getLogger(__name__)
 
 _STORE_VERSION = 1
+_ALLOWED_SCOPES = ("admin", "chat")
+_DEFAULT_SCOPE = "chat"
 
 
 def _sha256hex(value: str) -> str:
@@ -83,10 +90,13 @@ class UserTokenStore:
 
     def __init__(self, store_path: Path | str) -> None:
         self.store_path = Path(store_path)
-        # sha256hex → {"speaker_id": str, "label": str, "created": str, "revoked": bool}
+        # sha256hex → {"speaker_id": str|None, "label": str, "created": str,
+        #               "revoked": bool, "scope": str}
         self._tokens: dict[str, dict] = {}
         self._lock = threading.Lock()
+        self._mtime: int | None = None
         self._load()
+        self._mtime = self._current_mtime()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -111,6 +121,37 @@ class UserTokenStore:
 
         self._tokens = data.get("tokens", {})
         logger.info("Loaded user-token store: %d entries", len(self._tokens))
+
+    def _current_mtime(self) -> int | None:
+        """Return the store file's mtime_ns, or None if the file is absent.
+
+        Boundary I/O — OSError (e.g. file not found) returns None, mirroring
+        the tolerant ``_load`` "missing file ignored" stance.
+        """
+        try:
+            return self.store_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _maybe_reload(self) -> None:
+        """Reload the token store from disk if the file mtime has changed.
+
+        Called at the top of :meth:`resolve` (and through delegation, at the
+        top of :meth:`lookup`) so that out-of-process writes (CLI mint/revoke)
+        take effect on the running server without a restart.
+
+        Stat + compare + reload are performed inside a single critical section
+        to avoid a TOCTOU race where two threads each read a changed mtime and
+        both reload simultaneously.
+
+        Self-writes via :meth:`_save` stamp ``self._mtime`` under the lock they
+        already hold, so the next call here is a no-op (mtime matches).
+        """
+        with self._lock:
+            disk_mtime = self._current_mtime()
+            if disk_mtime is not None and disk_mtime != self._mtime:
+                self._load()
+                self._mtime = disk_mtime
 
     def _save(self) -> None:
         """Atomically persist the token store to disk, encrypted when possible.
@@ -155,8 +196,11 @@ class UserTokenStore:
                     self.store_path.unlink(missing_ok=True)
                 except OSError:
                     pass
-                # Clear in-memory state so RAM does not stay out of sync with
-                # the now-deleted on-disk file.
+                # Wipe self._tokens — intended fail-loud, fail-closed
+                # behaviour: the server goes fail-closed (all auth fails) until
+                # the store is rebuilt by a fresh CLI mint.  Leaving stale RAM
+                # tokens in place would be silently dangerous after an
+                # encryption-key eviction race.
                 self._tokens = {}
                 raise RuntimeError(
                     "user-token store written in plaintext — aborting. "
@@ -164,13 +208,16 @@ class UserTokenStore:
                     "check and the write.  File removed.  "
                     "Re-set PARAMEM_DAILY_PASSPHRASE and retry."
                 )
+        # Stamp the in-process mtime so the self-write does not trigger a
+        # spurious reload on the next resolve() / lookup() call.
+        self._mtime = self._current_mtime()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def mint(self, speaker_id: str, label: str) -> str:
-        """Mint a new opaque bearer token for *speaker_id*.
+    def mint(self, speaker_id: str | None, label: str, scope: str = _DEFAULT_SCOPE) -> str:
+        """Mint a new opaque bearer token.
 
         The plaintext token is returned **once** and is not stored.  Internal
         storage and all disk I/O use only the SHA-256 hash of the token.
@@ -178,9 +225,17 @@ class UserTokenStore:
         Parameters
         ----------
         speaker_id:
-            The speaker this token authenticates (e.g. ``"Speaker0"``).
+            The speaker this token authenticates (e.g. ``"Speaker0"``), or
+            ``None`` for an unattributed token (shared device that identifies
+            speakers by voice embedding at request time).
         label:
             Human-readable device or purpose label (e.g. ``"Alice iPad"``).
+        scope:
+            Capability scope: ``"chat"`` (conversational endpoints only, the
+            secure default) or ``"admin"`` (all endpoints, including operational
+            ones like ``/gpu/*``, ``/consolidate``, ``/backup/*``).  Validated
+            against :data:`_ALLOWED_SCOPES`; raises :exc:`ValueError` on an
+            unrecognised value.
 
         Returns
         -------
@@ -190,10 +245,14 @@ class UserTokenStore:
 
         Raises
         ------
+        ValueError
+            If *scope* is not one of the allowed values.
         RuntimeError
             In Security ON mode only: if a key-eviction race causes the store
             to be written in plaintext (see :meth:`_save`).
         """
+        if scope not in _ALLOWED_SCOPES:
+            raise ValueError(f"Invalid scope {scope!r}; must be one of {_ALLOWED_SCOPES}")
         token = secrets.token_urlsafe(32)
         key = _sha256hex(token)
         entry: dict = {
@@ -201,22 +260,29 @@ class UserTokenStore:
             "label": label,
             "created": datetime.now(timezone.utc).isoformat(),
             "revoked": False,
+            "scope": scope,
         }
         with self._lock:
             self._tokens[key] = entry
             self._save()
         logger.info(
-            "Minted token for speaker_id=%s label=%r",
+            "Minted token for speaker_id=%s label=%r scope=%r",
             speaker_id,
             label,
+            scope,
         )
         return token
 
     def lookup(self, token: str) -> str | None:
         """Look up the ``speaker_id`` for a presented bearer token.
 
-        Computes ``sha256(token)`` and does a direct dict lookup — no
-        iteration, no constant-time loop needed (the hash key leaks nothing).
+        Delegates to :meth:`resolve` so the live-reload hook fires here too.
+        Returns the ``speaker_id`` (a string) for an attributed, active token;
+        returns ``None`` for unknown, revoked, or **unattributed** tokens
+        (``speaker_id=None``).  The ``None`` return for unattributed tokens is
+        intentional — :meth:`lookup` preserves its historic contract
+        (``str | None`` where ``None`` means "no speaker") and is not the auth
+        primitive for unattributed tokens.  :meth:`resolve` is used for that.
 
         Parameters
         ----------
@@ -227,9 +293,42 @@ class UserTokenStore:
         Returns
         -------
         str | None
-            The ``speaker_id`` if the token is known and not revoked;
-            ``None`` otherwise.
+            The ``speaker_id`` if the token is known, not revoked, and
+            attributed; ``None`` otherwise (unknown, revoked, or unattributed).
         """
+        record = self.resolve(token)
+        if record is None:
+            return None
+        _authenticated, speaker_id, _scope = record
+        # speaker_id may be None for unattributed tokens — return None per
+        # the existing contract (callers that only care about attributed tokens
+        # see no change; the middleware switches to resolve() for unattributed).
+        return speaker_id
+
+    def resolve(self, token: str) -> tuple[bool, str | None, str] | None:
+        """Resolve a presented token to ``(authenticated, speaker_id, scope)``.
+
+        This is the single auth/validity primitive used by the middleware.
+        Unlike :meth:`lookup` it distinguishes a valid unattributed token
+        (``speaker_id=None``) from an unknown/revoked token (returns ``None``).
+
+        Also triggers the mtime-based live-reload so out-of-process writes
+        (CLI mint / revoke) take effect without a server restart.
+
+        Parameters
+        ----------
+        token:
+            The plaintext bearer token.
+
+        Returns
+        -------
+        tuple[bool, str | None, str] | None
+            ``(True, speaker_id_or_None, scope)`` for a valid, non-revoked
+            token, where ``scope`` defaults to :data:`_DEFAULT_SCOPE` for
+            records minted before the scope field existed (Phase-1 records).
+            ``None`` when the token is unknown or revoked.
+        """
+        self._maybe_reload()
         key = _sha256hex(token)
         with self._lock:
             entry = self._tokens.get(key)
@@ -237,10 +336,14 @@ class UserTokenStore:
             return None
         if entry.get("revoked") is True:
             return None
-        return entry["speaker_id"]
+        return (True, entry.get("speaker_id"), entry.get("scope", _DEFAULT_SCOPE))
 
     def revoke_token(self, token: str) -> bool:
         """Revoke exactly the token whose plaintext value is *token*.
+
+        Note: assumes a freshly-loaded store (the CLI constructs a new
+        ``UserTokenStore`` per invocation) and does not call
+        ``_maybe_reload()`` before mutating.
 
         Parameters
         ----------
@@ -274,10 +377,20 @@ class UserTokenStore:
     def revoke_speaker(self, speaker_id: str) -> int:
         """Revoke all non-revoked tokens belonging to *speaker_id*.
 
+        Note: assumes a freshly-loaded store (the CLI constructs a new
+        ``UserTokenStore`` per invocation) and does not call
+        ``_maybe_reload()`` before mutating.
+
+        Skips entries whose ``speaker_id`` is ``None`` (unattributed tokens)
+        so a ``None == None`` match cannot bulk-revoke all unattributed tokens.
+        Use :meth:`revoke_label` to revoke unattributed tokens by their label.
+
         Parameters
         ----------
         speaker_id:
-            The speaker whose tokens should all be revoked.
+            The speaker whose tokens should all be revoked.  Must not be
+            ``None`` — raises :exc:`ValueError` to prevent accidental
+            bulk-revocation of unattributed tokens.
 
         Returns
         -------
@@ -286,13 +399,28 @@ class UserTokenStore:
 
         Raises
         ------
+        ValueError
+            If *speaker_id* is ``None``.
         RuntimeError
             In Security ON mode only: if a key-eviction race causes the store
             to be written in plaintext (see :meth:`_save`).
         """
+        if speaker_id is None:
+            raise ValueError(
+                "revoke_speaker(None) is not allowed — it would match all "
+                "unattributed tokens.  Use revoke_label() to revoke an "
+                "unattributed token by its label instead."
+            )
         count = 0
         with self._lock:
             for entry in self._tokens.values():
+                # Skip unattributed entries (speaker_id is None) so they are
+                # never accidentally matched by this method.
+                if entry.get("speaker_id") is None:
+                    continue
+                # Comparison is intentionally EXACT (case-sensitive): normalising
+                # would risk merging distinct speakers.  Use
+                # ``revoke-user-token --list`` to see canonical IDs.
                 if entry["speaker_id"] == speaker_id and not entry["revoked"]:
                     entry["revoked"] = True
                     count += 1
@@ -305,9 +433,10 @@ class UserTokenStore:
     def list(self) -> list[dict]:
         """Return a public view of all token entries.
 
-        Each dict contains ``speaker_id``, ``label``, ``created``, and
-        ``revoked``.  The SHA-256 hash and any plaintext token are never
-        included.
+        Each dict contains ``speaker_id``, ``label``, ``created``, ``revoked``,
+        and ``scope``.  The SHA-256 hash and any plaintext token are never
+        included.  Pre-scope-field records (Phase-1) surface ``scope="chat"``
+        (secure read-time default).
 
         Returns
         -------
@@ -321,12 +450,17 @@ class UserTokenStore:
                     "label": e["label"],
                     "created": e["created"],
                     "revoked": e["revoked"],
+                    "scope": e.get("scope", _DEFAULT_SCOPE),
                 }
                 for e in self._tokens.values()
             ]
 
     def revoke_label(self, label: str) -> int:
         """Revoke all non-revoked tokens whose device label matches *label* exactly.
+
+        Note: assumes a freshly-loaded store (the CLI constructs a new
+        ``UserTokenStore`` per invocation) and does not call
+        ``_maybe_reload()`` before mutating.
 
         Parameters
         ----------

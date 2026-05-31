@@ -62,11 +62,14 @@ def _make_config_yaml(tmp_path: Path, data_dir: Path) -> Path:
 
 def _make_args(
     config: Path,
-    speaker_id: str = "Speaker0",
+    speaker_id: str | None = "Speaker0",
     *,
     label: str = "",
     server_url: str = "",
     png: str | None = None,
+    scope: str = "chat",
+    unattributed: bool = False,
+    force_admin: bool = False,
 ) -> argparse.Namespace:
     """Build a Namespace matching the parser's output for mint-user-token."""
     return argparse.Namespace(
@@ -75,6 +78,9 @@ def _make_args(
         server_url=server_url,
         config=str(config),
         png=png,
+        scope=scope,
+        unattributed=unattributed,
+        force_admin=force_admin,
     )
 
 
@@ -309,3 +315,192 @@ class TestCliRegistration:
         with pytest.raises(SystemExit) as exc_info:
             parser.parse_args(["mint-user-token", "--help"])
         assert exc_info.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# Scope and unattributed
+# ---------------------------------------------------------------------------
+
+
+class TestScopeAndUnattributed:
+    def test_scope_admin_stored_in_record(self, tmp_path: Path) -> None:
+        """--scope admin → stored record has scope == 'admin'."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        rc = mint_user_token.run(_make_args(cfg, "Speaker0", scope="admin"))
+        assert rc == 0
+
+        store = UserTokenStore(data_dir / "user_tokens.json")
+        entries = store.list()
+        assert entries[0]["scope"] == "admin"
+
+    def test_default_scope_is_chat(self, tmp_path: Path) -> None:
+        """Default scope (no --scope) → stored record has scope == 'chat'."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        rc = mint_user_token.run(_make_args(cfg, "Speaker0"))
+        assert rc == 0
+
+        store = UserTokenStore(data_dir / "user_tokens.json")
+        entries = store.list()
+        assert entries[0]["scope"] == "chat"
+
+    def test_unattributed_mints_null_speaker_chat_token(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """--unattributed → speaker_id=None, scope='chat' in store; prints <unattributed>."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        rc = mint_user_token.run(_make_args(cfg, speaker_id=None, scope="chat", unattributed=True))
+        assert rc == 0
+
+        store = UserTokenStore(data_dir / "user_tokens.json")
+        entries = store.list()
+        assert len(entries) == 1
+        assert entries[0]["speaker_id"] is None
+        assert entries[0]["scope"] == "chat"
+
+        out = capsys.readouterr().out
+        assert "<unattributed>" in out, "Text fallback must print <unattributed> for no speaker_id"
+
+    def test_unattributed_with_speaker_id_returns_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """--unattributed combined with a positional SPEAKER_ID → exit 1."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        rc = mint_user_token.run(_make_args(cfg, speaker_id="Speaker0", unattributed=True))
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "cannot be combined" in err or "SPEAKER_ID" in err
+
+    def test_no_speaker_id_no_unattributed_returns_1(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Neither positional SPEAKER_ID nor --unattributed → exit 1."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        rc = mint_user_token.run(_make_args(cfg, speaker_id=None, unattributed=False))
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "SPEAKER_ID" in err or "required" in err
+
+    def test_scope_admin_unattributed_refused_without_force_admin(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """--scope admin --unattributed without --force-admin → exit 1 with warning."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        rc = mint_user_token.run(
+            _make_args(cfg, speaker_id=None, scope="admin", unattributed=True, force_admin=False)
+        )
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "force-admin" in err or "--force-admin" in err
+
+    def test_scope_admin_unattributed_with_force_admin_succeeds(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """--scope admin --unattributed --force-admin → mint succeeds + warning to stderr."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        rc = mint_user_token.run(
+            _make_args(cfg, speaker_id=None, scope="admin", unattributed=True, force_admin=True)
+        )
+        assert rc == 0
+        err = capsys.readouterr().err
+        # A warning must be printed.
+        assert "WARNING" in err or "unattributed admin" in err.lower()
+
+        store = UserTokenStore(data_dir / "user_tokens.json")
+        entries = store.list()
+        assert entries[0]["speaker_id"] is None
+        assert entries[0]["scope"] == "admin"
+
+    def test_scope_line_in_text_fallback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """The text fallback includes a 'scope' line."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        mint_user_token.run(_make_args(cfg, "Speaker0", scope="admin"))
+        out = capsys.readouterr().out
+        assert any("scope" in ln for ln in out.splitlines()), (
+            "Text fallback must include a 'scope' line"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Parser: new flags accepted by argparse
+# ---------------------------------------------------------------------------
+
+
+class TestNonTtyWarning:
+    """Verify that a WARNING is printed to stderr when stdout is not a TTY."""
+
+    def test_warning_emitted_to_stderr_when_not_a_tty(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """run() emits a WARNING to stderr when sys.stdout is not a TTY.
+
+        Under pytest, sys.stdout.isatty() is always False (capsys pipes
+        stdout), so the warning fires unconditionally in tests — the test
+        verifies the warning text reaches stderr.
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        rc = mint_user_token.run(_make_args(cfg, "Speaker0"))
+        assert rc == 0
+
+        err = capsys.readouterr().err
+        assert "WARNING" in err, "A WARNING must be printed to stderr when stdout is not a TTY"
+        assert "plaintext" in err.lower(), (
+            "The warning must mention that the plaintext token is being written"
+        )
+
+
+class TestNewParserFlags:
+    def test_scope_flag_accepted(self) -> None:
+        """--scope is accepted by the parser."""
+        from paramem.cli.main import _build_parser
+
+        parser = _build_parser()
+        args = parser.parse_args(["mint-user-token", "Speaker0", "--scope", "admin"])
+        assert args.scope == "admin"
+
+    def test_unattributed_flag_accepted(self) -> None:
+        """--unattributed is accepted as a flag (no positional required by parser)."""
+        from paramem.cli.main import _build_parser
+
+        parser = _build_parser()
+        args = parser.parse_args(["mint-user-token", "--unattributed"])
+        assert args.unattributed is True
+        assert args.speaker_id is None
+
+    def test_force_admin_flag_accepted(self) -> None:
+        """--force-admin is accepted as a flag."""
+        from paramem.cli.main import _build_parser
+
+        parser = _build_parser()
+        args = parser.parse_args(
+            ["mint-user-token", "--unattributed", "--scope", "admin", "--force-admin"]
+        )
+        assert args.force_admin is True

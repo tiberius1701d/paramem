@@ -27,10 +27,10 @@ The token store follows the deployment-wide AUTO encryption mode:
 
 Take-effect note
 ----------------
-The CLI writes the revocation to ``user_tokens.json`` on disk.  A running
-server loads the token store **once at startup** and holds it in memory; the
-in-process store is not reloaded from disk between requests.  A server
-restart is required for the revocation to take effect on the live server.
+The CLI writes the revocation to ``user_tokens.json`` on disk.  The running
+server re-reads ``user_tokens.json`` on the next authenticated request when
+the file's mtime has changed (mtime-triggered live reload), so revocation
+takes effect immediately — no server restart required.
 
 Exit codes:
     0  success (or ``--list`` completed)
@@ -60,9 +60,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "Use --speaker to revoke all tokens for a speaker, "
             "--label to revoke tokens by device label, "
             "or --list to print the current token table without modifying it. "
-            "A running server must be restarted for the revocation to take effect — "
-            "the in-memory token store is loaded once at startup and is not refreshed "
-            "between requests. "
+            "Revocation takes effect immediately on the running server — "
+            "the server re-reads user_tokens.json on the next request when the "
+            "file's mtime changes (no restart required). "
             "When PARAMEM_DAILY_PASSPHRASE is set and a daily key is loaded, "
             "the store is read and written as an age envelope (Security ON). "
             "Without a daily key the store is read and written in plaintext (Security OFF)."
@@ -134,8 +134,8 @@ def run(args: argparse.Namespace) -> int:
     For ``--speaker`` and ``--label``, a confirmation prompt is shown unless
     ``--yes`` is passed.
 
-    After a successful revocation the operator is reminded that the running
-    server must be restarted for the change to take effect.
+    After a successful revocation the operator is notified that the
+    revocation takes effect immediately on the running server (live reload).
 
     Parameters
     ----------
@@ -196,7 +196,7 @@ def run(args: argparse.Namespace) -> int:
 
         count = store.revoke_speaker(args.speaker)
         print(f"Revoked {count} token(s) for speaker '{args.speaker}'.")
-        print("NOTE: restart the server for this revocation to take effect on the live service.")
+        print("NOTE: revocation takes effect immediately (live reload on next request).")
         return 0
 
     # --label: revoke all tokens carrying the named label.
@@ -225,7 +225,7 @@ def run(args: argparse.Namespace) -> int:
 
         count = store.revoke_label(args.label)
         print(f"Revoked {count} token(s) with label '{args.label}'.")
-        print("NOTE: restart the server for this revocation to take effect on the live service.")
+        print("NOTE: revocation takes effect immediately (live reload on next request).")
         return 0
 
     # Unreachable: argparse requires one of the mutually exclusive options.

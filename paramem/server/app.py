@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 import torch
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -2038,7 +2038,10 @@ async def lifespan(app: FastAPI):
         derived_period or "<manual only>",
     )
     try:
-        msg = systemd_timer.reconcile(derived_period)
+        msg = systemd_timer.reconcile(
+            derived_period,
+            project_root=str(Path(__file__).resolve().parent.parent.parent),
+        )
         logger.info("%s", msg)
     except Exception:
         logger.exception("Failed to reconcile consolidation timer — continuing without schedule")
@@ -2355,6 +2358,39 @@ app.add_middleware(
     exempt_paths=("/", "/app"),
     exempt_prefixes=("/app/",),
 )
+
+
+# --- Admin-scope gate ---
+
+
+def require_admin(request: Request) -> None:
+    """Admin-scope gate; 403 unless ``request.state.scope == 'admin'``.
+
+    Used as a FastAPI dependency (``dependencies=[Depends(require_admin)]``) on
+    every privileged/operational endpoint.  Generalises the former one-off
+    ``PARAMEM_API_TOKEN`` check at ``/admin/assign-orphans`` into a single,
+    fail-closed guard.
+
+    Accept condition: ``request.state.scope == "admin"`` — default-deny.
+    Fail-closed: a chat-scope per-user token has ``scope == "chat"`` and is
+    denied.  In auth-OFF mode (no shared token AND no user-token store) the
+    server is open by design — ``BearerTokenMiddleware`` stamps
+    ``scope == "admin"`` on every pass-through request (see
+    ``auth.py`` OFF branch), so admin endpoints stay reachable, preserving the
+    prior open-in-OFF behaviour.  The gate therefore enforces only in ON mode
+    (shared token set OR user-token store wired), where a chat-scope token 403s.
+
+    Raising ``HTTPException`` is FastAPI-idiomatic boundary rejection — NOT a
+    suppressing try/except.
+    """
+    if getattr(request.state, "scope", None) != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "status": "admin_scope_required",
+                "detail": "This endpoint requires an admin-scope token.",
+            },
+        )
 
 
 # --- Endpoints ---
@@ -3924,7 +3960,7 @@ async def status():
     )
 
 
-@app.get("/integrity", response_model=IntegrityResponse)
+@app.get("/integrity", response_model=IntegrityResponse, dependencies=[Depends(require_admin)])
 async def integrity_check():
     """Run the infrastructure integrity check and return the report.
 
@@ -3955,7 +3991,7 @@ async def integrity_check():
     )
 
 
-@app.post("/gpu/acquire")
+@app.post("/gpu/acquire", dependencies=[Depends(require_admin)])
 async def gpu_acquire():
     """Reclaim the GPU in-process and switch to local mode.
 
@@ -5749,7 +5785,7 @@ async def _apply_config_live_guarded() -> dict:
     return apply_result
 
 
-@app.post("/gpu/release")
+@app.post("/gpu/release", dependencies=[Depends(require_admin)])
 async def gpu_release():
     """Release the GPU model in-process; switch to cloud-only mode.
 
@@ -5808,7 +5844,7 @@ async def gpu_release():
     return {"mode": "cloud-only", "released": True, "reason": "released"}
 
 
-@app.post("/refresh-ha")
+@app.post("/refresh-ha", dependencies=[Depends(require_admin)])
 async def refresh_ha():
     """Rebuild the HA entity graph from the HA API.
 
@@ -5844,7 +5880,7 @@ async def refresh_ha():
     }
 
 
-@app.post("/admin/assign-orphans")
+@app.post("/admin/assign-orphans", dependencies=[Depends(require_admin)])
 async def admin_assign_orphans(speaker_id: str | None = None):
     """Operator-only: permanently attribute orphan sessions to a single speaker.
 
@@ -5854,11 +5890,13 @@ async def admin_assign_orphans(speaker_id: str | None = None):
     non-polluting probing of a speaker↔transcript combination, use
     ``/debug/probe`` instead.
 
-    **Auth:** requires ``PARAMEM_API_TOKEN`` to be set (i.e. bearer-token
-    auth active).  The token check itself happens in
-    :class:`BearerTokenMiddleware`; this endpoint refuses to operate at
-    all when auth is disabled — admin actions must not be reachable
-    anonymously, regardless of ``config.debug``.
+    **Auth:** gated by the ``require_admin`` dependency — requires an
+    admin-scope token (either the shared ``PARAMEM_API_TOKEN`` or a per-user
+    token minted with ``--scope admin``).  The endpoint is unreachable in
+    auth-OFF mode (no token configured) and with chat-scope tokens, so admin
+    actions are never reachable anonymously regardless of ``config.debug``.
+    A per-user admin token is accepted, allowing it to be reached without the
+    shared env token when ``mobile_pwa.enabled: true``.
 
     Body: optional ``speaker_id`` query parameter — defaults to the first
     enrolled profile when omitted.  When ``buffer.debug=True`` the on-disk
@@ -5868,14 +5906,6 @@ async def admin_assign_orphans(speaker_id: str | None = None):
     durable medium changes with the deployment posture, the operation is
     the same.
     """
-    if not _api_token:
-        return JSONResponse(
-            {
-                "status": "admin_auth_required",
-                "detail": "Admin endpoints require PARAMEM_API_TOKEN to be set.",
-            },
-            status_code=403,
-        )
     store = _state.get("speaker_store")
     buffer = _state.get("session_buffer")
     if store is None or buffer is None:
@@ -5930,7 +5960,7 @@ class DebugProbeRequest(BaseModel):
     history: list[dict] | None = None
 
 
-@app.post("/debug/probe", response_model=ChatResponse)
+@app.post("/debug/probe", response_model=ChatResponse, dependencies=[Depends(require_admin)])
 async def debug_probe(request: DebugProbeRequest):
     """Single-call /chat-equivalent probe with operator-supplied speaker_id.
 
@@ -6049,7 +6079,11 @@ class DebugRecallResponse(BaseModel):
     adapter_available: list[str]
 
 
-@app.post("/debug/recall", response_model=DebugRecallResponse)
+@app.post(
+    "/debug/recall",
+    response_model=DebugRecallResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def debug_recall(request: DebugRecallRequest):
     """Run *request.text* through the model with *request.adapter* active.
 
@@ -6208,7 +6242,7 @@ class DebugDumpResponse(BaseModel):
     tiers: dict[str, int]  # tier name → entry count
 
 
-@app.get("/debug/dump", response_model=DebugDumpResponse)
+@app.get("/debug/dump", response_model=DebugDumpResponse, dependencies=[Depends(require_admin)])
 async def debug_dump():
     """Dump every (tier, key, entry) the live ``MemoryStore`` holds.
 
@@ -6251,22 +6285,26 @@ async def debug_dump():
 # --------------------------------------------------------------------------
 
 
-@app.post("/calibrate/extract")
+@app.post("/calibrate/extract", dependencies=[Depends(require_admin)])
 async def calibrate_extract_route(req: calibrate_module.CalibrateExtractRequest):
     return calibrate_module.calibrate_extract(_state, req)
 
 
-@app.post("/calibrate/anonymize")
+@app.post("/calibrate/anonymize", dependencies=[Depends(require_admin)])
 async def calibrate_anonymize_route(req: calibrate_module.CalibrateAnonymizeRequest):
     return calibrate_module.calibrate_anonymize(_state, req)
 
 
-@app.post("/calibrate/plausibility")
+@app.post("/calibrate/plausibility", dependencies=[Depends(require_admin)])
 async def calibrate_plausibility_route(req: calibrate_module.CalibratePlausibilityRequest):
     return calibrate_module.calibrate_plausibility(_state, req)
 
 
-@app.post("/scheduled-tick", response_model=ConsolidateResponse)
+@app.post(
+    "/scheduled-tick",
+    response_model=ConsolidateResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def scheduled_tick():
     """Systemd user-timer entrypoint (paramem-consolidate.timer).
 
@@ -6299,7 +6337,7 @@ async def scheduled_tick():
     return ConsolidateResponse(status=status)
 
 
-@app.post("/consolidate", response_model=ConsolidateResponse)
+@app.post("/consolidate", response_model=ConsolidateResponse, dependencies=[Depends(require_admin)])
 async def consolidate():
     """Trigger consolidation manually — alias for the scheduled tick.
 
@@ -6338,7 +6376,11 @@ async def consolidate():
 # --- Document ingest endpoints ---
 
 
-@app.post("/ingest-sessions", response_model=IngestSessionsResponse)
+@app.post(
+    "/ingest-sessions",
+    response_model=IngestSessionsResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def ingest_sessions(request: IngestSessionsRequest):
     """Queue pre-chunked document segments for consolidation.
 
@@ -6489,7 +6531,11 @@ async def ingest_sessions(request: IngestSessionsRequest):
     )
 
 
-@app.post("/ingest-sessions/cancel", response_model=IngestCancelResponse)
+@app.post(
+    "/ingest-sessions/cancel",
+    response_model=IngestCancelResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def ingest_sessions_cancel(request: IngestCancelRequest):
     """Discard queued ingest sessions without running consolidation.
 
@@ -6520,7 +6566,11 @@ async def ingest_sessions_cancel(request: IngestCancelRequest):
 # --- Migration endpoints ---
 
 
-@app.post("/migration/preview", response_model=PreviewResponse)
+@app.post(
+    "/migration/preview",
+    response_model=PreviewResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def migration_preview(request: PreviewRequest):
     """Stage a candidate ``server.yaml`` and return a preview diff.
 
@@ -6753,7 +6803,11 @@ async def migration_preview(request: PreviewRequest):
     return PreviewResponse(**payload)
 
 
-@app.post("/migration/cancel", response_model=MigrationCancelResponse)
+@app.post(
+    "/migration/cancel",
+    response_model=MigrationCancelResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def migration_cancel():
     """Clear the staged candidate and return to LIVE state.
 
@@ -6786,7 +6840,11 @@ async def migration_cancel():
     return MigrationCancelResponse(state="LIVE", cleared_path=cleared_path)
 
 
-@app.post("/migration/confirm", response_model=ConfirmResponse)
+@app.post(
+    "/migration/confirm",
+    response_model=ConfirmResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def migration_confirm(request: ConfirmRequest):
     """Atomically transition from STAGING to TRIAL.
 
@@ -8347,7 +8405,11 @@ async def _update_trial_gates(gates: dict) -> None:
 _ACCEPT_ELIGIBLE_STATUSES: frozenset[str] = frozenset({"pass", "no_new_sessions"})
 
 
-@app.get("/migration/status", response_model=MigrationStatusResponse)
+@app.get(
+    "/migration/status",
+    response_model=MigrationStatusResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def migration_status():
     """Return the current migration state and server metadata.
 
@@ -8431,7 +8493,11 @@ async def migration_status():
     )
 
 
-@app.get("/migration/diff", response_model=MigrationDiffResponse)
+@app.get(
+    "/migration/diff",
+    response_model=MigrationDiffResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def migration_diff():
     """Return the diff for the currently-staged candidate.
 
@@ -8465,7 +8531,7 @@ async def migration_diff():
 _RESTART_HINT: str = "systemctl --user restart paramem-server"
 
 
-@app.post("/migration/accept", response_model=AcceptResponse)
+@app.post("/migration/accept", response_model=AcceptResponse, dependencies=[Depends(require_admin)])
 async def migration_accept():
     """Promote trial config B to live, archive the trial adapter, and clear trial state.
 
@@ -8813,7 +8879,7 @@ async def migration_accept():
         )
 
 
-@app.post("/migration/rollback")
+@app.post("/migration/rollback", dependencies=[Depends(require_admin)])
 async def migration_rollback():
     """Restore config A from backup, archive trial adapter, clear trial state.
 
@@ -9639,7 +9705,7 @@ class BackupPruneResponse(BaseModel):
     dry_run: bool
 
 
-@app.get("/backup/list", response_model=BackupListResponse)
+@app.get("/backup/list", response_model=BackupListResponse, dependencies=[Depends(require_admin)])
 async def backup_list(kind: str | None = None):
     """Enumerate backups across all kinds, newest-first.
 
@@ -9729,7 +9795,11 @@ async def backup_list(kind: str | None = None):
     )
 
 
-@app.post("/backup/create", response_model=BackupCreateResponse)
+@app.post(
+    "/backup/create",
+    response_model=BackupCreateResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def backup_create(req: BackupCreateRequest):
     """Take an immediate backup of the requested artifacts.
 
@@ -9867,7 +9937,11 @@ async def backup_create(req: BackupCreateRequest):
     )
 
 
-@app.post("/backup/restore", response_model=BackupRestoreResponse)
+@app.post(
+    "/backup/restore",
+    response_model=BackupRestoreResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def backup_restore(req: BackupRestoreRequest):
     """Restore a backup atop the live store.
 
@@ -10245,7 +10319,11 @@ async def backup_restore(req: BackupRestoreRequest):
     )
 
 
-@app.post("/backup/prune", response_model=BackupPruneResponse)
+@app.post(
+    "/backup/prune",
+    response_model=BackupPruneResponse,
+    dependencies=[Depends(require_admin)],
+)
 async def backup_prune(req: BackupPruneRequest):
     """Apply the 5-rule retention policy.
 

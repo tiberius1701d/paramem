@@ -378,6 +378,271 @@ class TestOnDiskSecurity:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Scope field
+# ---------------------------------------------------------------------------
+
+
+class TestScope:
+    def test_mint_admin_scope_resolve_returns_admin(self, tmp_path, monkeypatch, store_path):
+        """mint(..., scope='admin') → resolve() returns scope 'admin'."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        token = store.mint("Speaker0", "Admin Device", scope="admin")
+
+        result = store.resolve(token)
+        assert result is not None
+        _auth, _sid, scope = result
+        assert scope == "admin"
+
+    def test_mint_default_scope_resolve_returns_chat(self, tmp_path, monkeypatch, store_path):
+        """mint() with default scope → resolve() returns scope 'chat'."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        token = store.mint("Speaker0", "Phone")
+
+        result = store.resolve(token)
+        assert result is not None
+        _auth, _sid, scope = result
+        assert scope == "chat"
+
+    def test_missing_scope_on_disk_defaults_to_chat(self, tmp_path, monkeypatch, store_path):
+        """A Phase-1 record without a 'scope' field reads as 'chat' (secure default)."""
+        import json
+
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        token = store.mint("Speaker0", "OldDevice")
+
+        # Directly strip the scope field from the on-disk JSON to simulate a
+        # Phase-1 record minted before the scope field existed.
+        from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
+
+        raw = json.loads(read_maybe_encrypted(store_path).decode("utf-8"))
+        for entry in raw["tokens"].values():
+            entry.pop("scope", None)
+        write_infra_bytes(store_path, json.dumps(raw).encode("utf-8"))
+
+        # Load a fresh store (simulates a server restart reading an old file).
+        store2 = UserTokenStore(store_path)
+        result = store2.resolve(token)
+        assert result is not None
+        _auth, _sid, scope = result
+        assert scope == "chat", f"Expected 'chat' for Phase-1 record, got {scope!r}"
+
+    def test_unattributed_token_resolve_returns_none_speaker(
+        self, tmp_path, monkeypatch, store_path
+    ):
+        """Unattributed token (speaker_id=None) → resolve() returns (True, None, scope)."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        token = store.mint(None, "Shared Device", scope="chat")
+
+        result = store.resolve(token)
+        assert result is not None
+        authenticated, speaker_id, scope = result
+        assert authenticated is True
+        assert speaker_id is None
+        assert scope == "chat"
+
+    def test_unattributed_token_distinguishable_from_unknown(
+        self, tmp_path, monkeypatch, store_path
+    ):
+        """An unattributed token is distinguishable from an unknown token via resolve()."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        _token = store.mint(None, "Shared Device", scope="chat")
+
+        # An unknown token returns None, not (True, None, ...).
+        result = store.resolve("completely-bogus-token-value")
+        assert result is None
+
+    def test_invalid_scope_raises_value_error(self, tmp_path, monkeypatch, store_path):
+        """mint(..., scope='bogus') raises ValueError."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+
+        with pytest.raises(ValueError, match="Invalid scope"):
+            store.mint("Speaker0", "Device", scope="bogus")
+
+    def test_list_includes_scope(self, tmp_path, monkeypatch, store_path):
+        """list() entries include a 'scope' key."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        store.mint("Speaker0", "Admin iPad", scope="admin")
+        store.mint("Speaker1", "Chat Phone", scope="chat")
+
+        entries = store.list()
+        assert len(entries) == 2
+        scopes = {e["scope"] for e in entries}
+        assert scopes == {"admin", "chat"}
+
+    def test_list_phase1_record_surfaces_chat(self, tmp_path, monkeypatch, store_path):
+        """list() surfaces 'chat' scope for Phase-1 records without a scope field."""
+        import json
+
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        store.mint("Speaker0", "OldDevice")
+
+        from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
+
+        raw = json.loads(read_maybe_encrypted(store_path).decode("utf-8"))
+        for entry in raw["tokens"].values():
+            entry.pop("scope", None)
+        write_infra_bytes(store_path, json.dumps(raw).encode("utf-8"))
+
+        store2 = UserTokenStore(store_path)
+        entries = store2.list()
+        assert len(entries) == 1
+        assert entries[0]["scope"] == "chat"
+
+    def test_lookup_unchanged_contract_unattributed_returns_none(
+        self, tmp_path, monkeypatch, store_path
+    ):
+        """lookup() returns None for an unattributed token (preserves str|None contract)."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        token = store.mint(None, "Shared Device")
+
+        # lookup() returns None for unattributed (speaker_id is None).
+        assert store.lookup(token) is None
+
+    def test_revoke_speaker_none_raises(self, tmp_path, monkeypatch, store_path):
+        """revoke_speaker(None) raises ValueError (prevents bulk-revoke of unattributed tokens)."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+
+        with pytest.raises(ValueError, match="revoke_speaker.*None"):
+            store.revoke_speaker(None)  # type: ignore[arg-type]
+
+    def test_revoke_speaker_skips_unattributed_entries(self, tmp_path, monkeypatch, store_path):
+        """revoke_speaker() skips entries whose speaker_id is None."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        unattributed_token = store.mint(None, "Shared Device")
+        attributed_token = store.mint("Speaker0", "Personal Phone")
+
+        # Revoke Speaker0 — should NOT revoke the unattributed token.
+        count = store.revoke_speaker("Speaker0")
+        assert count == 1
+        # The unattributed token remains valid.
+        result = store.resolve(unattributed_token)
+        assert result is not None, "Unattributed token should not be revoked by revoke_speaker"
+        # The attributed token is revoked.
+        assert store.lookup(attributed_token) is None
+
+    def test_revoke_label_revokes_unattributed_token(self, tmp_path, monkeypatch, store_path):
+        """revoke_label() is the correct revocation path for unattributed tokens."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        token = store.mint(None, "Shared Kitchen Tablet")
+
+        count = store.revoke_label("Shared Kitchen Tablet")
+        assert count == 1
+        assert store.resolve(token) is None
+
+
+# ---------------------------------------------------------------------------
+# Live-reload (mtime-triggered)
+# ---------------------------------------------------------------------------
+
+
+class TestLiveReload:
+    def test_second_store_sees_new_token_after_mtime_change(
+        self, tmp_path, monkeypatch, store_path
+    ):
+        """store_b loaded before mint; after mtime advances, store_b.resolve() sees the new token.
+
+        Two UserTokenStore instances on the same file path (simulating the
+        running server's store vs. a CLI mint out of process).
+        """
+        import os
+        import time
+
+        _setup_daily(tmp_path, monkeypatch)
+        store_a = UserTokenStore(store_path)
+        # store_b is loaded before any mint — empty.
+        store_b = UserTokenStore(store_path)
+
+        token = store_a.mint("Speaker0", "New Device")
+
+        # Ensure the mtime actually advanced by at least 1 ns.
+        # On most filesystems write_infra_bytes does an atomic replace so
+        # mtime updates are guaranteed; still bump if same second.
+        new_mtime = store_a._current_mtime()
+        if new_mtime == store_b._mtime:
+            # Force a distinct mtime via os.utime.
+            time.sleep(0.01)
+            os.utime(str(store_path), None)
+
+        # store_b's resolve() should trigger mtime reload and find the token.
+        result = store_b.resolve(token)
+        assert result is not None, (
+            "store_b.resolve() must find the token after mtime-triggered reload "
+            "(live-reload not working)"
+        )
+
+    def test_second_store_sees_revocation_after_mtime_change(
+        self, tmp_path, monkeypatch, store_path
+    ):
+        """store_b loaded before revoke; resolve() returns None after mtime reload."""
+        import os
+        import time
+
+        _setup_daily(tmp_path, monkeypatch)
+        store_a = UserTokenStore(store_path)
+        token = store_a.mint("Speaker0", "Device")
+
+        store_b = UserTokenStore(store_path)
+        # Both stores currently see the token.
+        assert store_b.resolve(token) is not None
+
+        store_a.revoke_token(token)
+
+        # Ensure mtime advanced.
+        new_mtime = store_a._current_mtime()
+        if new_mtime == store_b._mtime:
+            time.sleep(0.01)
+            os.utime(str(store_path), None)
+
+        # store_b must now reflect the revocation.
+        result = store_b.resolve(token)
+        assert result is None, "store_b.resolve() must return None after revocation + reload"
+
+    def test_self_write_does_not_trigger_spurious_reload(self, tmp_path, monkeypatch, store_path):
+        """After an in-process mint, the mtime is stamped so the next resolve
+        is NOT a reload (verify _mtime matches disk after _save)."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        token = store.mint("Speaker0", "Device")
+
+        # _mtime should equal the current disk mtime (no spurious reload).
+        disk_mtime = store._current_mtime()
+        assert store._mtime == disk_mtime, (
+            "_mtime not stamped after _save — would cause spurious reload on next resolve()"
+        )
+
+        # Calling resolve again must not error.
+        result = store.resolve(token)
+        assert result is not None
+
+    def test_missing_file_midlife_is_noop(self, tmp_path, monkeypatch, store_path):
+        """If the store file disappears, _maybe_reload is a no-op and RAM state is kept."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        token = store.mint("Speaker0", "Device")
+
+        # Delete the file.
+        store_path.unlink()
+
+        # resolve() should not crash and should still find the token in RAM.
+        result = store.resolve(token)
+        assert result is not None, (
+            "resolve() must not crash or lose RAM state when the file disappears"
+        )
+
+
 class TestToctouClearsMemory:
     def test_toctou_guard_clears_in_memory_tokens(self, tmp_path, monkeypatch, store_path):
         """When the TOCTOU guard fires, in-memory tokens are reset.

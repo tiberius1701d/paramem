@@ -201,6 +201,159 @@ class TestRenderTimerUnitCalendar:
         assert "Persistent=true" not in text
 
 
+class TestRenderServiceUnitAuth:
+    """Verify the generated service unit sends the Authorization header securely."""
+
+    _PROJECT_ROOT = "/srv/paramem"
+
+    def _render(self, endpoint: str = systemd_timer.DEFAULT_ENDPOINT) -> str:
+        return systemd_timer.render_service_unit(endpoint, project_root=self._PROJECT_ROOT)
+
+    def test_environment_file_uses_project_root(self):
+        """EnvironmentFile must be derived from project_root, not hardcoded."""
+        text = self._render()
+        assert f"EnvironmentFile=-{self._PROJECT_ROOT}/.env" in text, (
+            "EnvironmentFile must use the passed project_root, not a literal username path"
+        )
+
+    def test_no_home_literal_in_unit(self):
+        """No literal /home/<user> path must appear in the rendered unit."""
+        import re
+
+        text = self._render()
+        assert not re.search(r"/home/[^/]+/", text), (
+            "Unit must not contain a hardcoded /home/<username>/ path"
+        )
+
+    def test_token_not_in_argv(self):
+        """The PARAMEM_API_TOKEN value must not appear as a literal in ExecStart argv.
+
+        The rendered unit must reference $PARAMEM_API_TOKEN symbolically so the
+        token is expanded from the EnvironmentFile at runtime, not logged in the
+        journal as part of the ExecStart command.
+        """
+        text = self._render()
+        # The symbolic reference must be present.
+        assert "$PARAMEM_API_TOKEN" in text, (
+            "ExecStart must reference $PARAMEM_API_TOKEN symbolically"
+        )
+        # The header must be piped via stdin (-H @-) so it is not in argv.
+        assert "-H @-" in text, (
+            "curl must read the Authorization header from stdin (-H @-) "
+            "so the token is not in process argv or the journalled ExecStart"
+        )
+
+    def test_no_literal_token_in_execstart(self):
+        """ExecStart must not contain a 20+-char alphanumeric token literal after 'Bearer'."""
+        import re
+
+        text = self._render()
+        # If "Bearer" appears directly in ExecStart (not via stdin pipe), it must
+        # only be in the printf argument, not as a bare argv word.
+        for m in re.finditer(r"Bearer\s+([A-Za-z0-9_\-]{20,})", text):
+            matched = m.group(1)
+            assert "$" in matched or "{" in matched, (
+                f"Looks like a literal token after Bearer: {matched!r}"
+            )
+
+    def test_fail_with_body_present_and_no_bare_f_flag(self):
+        """curl must use --fail-with-body (not -f or -sSf) so error bodies are logged."""
+        text = self._render()
+        assert "--fail-with-body" in text, (
+            "curl must use --fail-with-body so HTTP error bodies surface in the journal"
+        )
+        # -sSf and bare -f conflict with --fail-with-body; neither must appear.
+        assert "-sSf" not in text, (
+            "Conflicting -f inside -sSf must not appear with --fail-with-body"
+        )
+        import re
+
+        # A bare -f flag (space-separated, not part of --fail-with-body) must not appear.
+        assert not re.search(r"\s-f\b", text), (
+            "Bare -f flag conflicts with --fail-with-body and must be absent"
+        )
+
+    def test_execstart_is_single_logical_line(self):
+        """ExecStart must be a single physical line (no backslash line-continuations)."""
+        text = self._render()
+        execstart_lines = [ln for ln in text.splitlines() if ln.startswith("ExecStart=")]
+        assert len(execstart_lines) == 1, (
+            f"Expected exactly one ExecStart= line, got {len(execstart_lines)}: {execstart_lines}"
+        )
+        assert not execstart_lines[0].endswith("\\"), (
+            "ExecStart must not end with a backslash continuation"
+        )
+
+    def test_environment_file_in_unit(self):
+        """EnvironmentFile must be present so PARAMEM_API_TOKEN is available at runtime."""
+        text = self._render()
+        assert "EnvironmentFile=" in text, (
+            "Service unit must include EnvironmentFile to source PARAMEM_API_TOKEN"
+        )
+
+
+class TestReconcileProjectRoot:
+    """Verify project_root is threaded through reconcile() into the service unit."""
+
+    def _mock_run(self, *args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    def test_reconcile_passes_project_root_to_service_unit(self, tmp_path, monkeypatch):
+        """The rendered service file must contain the project_root passed to reconcile()."""
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
+        svc_path = tmp_path / "paramem-consolidate.service"
+        monkeypatch.setattr(systemd_timer, "SERVICE_PATH", svc_path)
+        custom_root = "/opt/myparamem"
+        with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
+            systemd_timer.reconcile("every 12h", project_root=custom_root)
+        svc_text = svc_path.read_text()
+        assert f"EnvironmentFile=-{custom_root}/.env" in svc_text, (
+            "Service unit EnvironmentFile must reflect the project_root passed to reconcile()"
+        )
+        import re
+
+        assert not re.search(r"/home/[^/]+/", svc_text), (
+            "Rendered service unit must not contain a hardcoded /home/<user>/ path"
+        )
+
+
+class TestRenderServiceUnitEndpointValidation:
+    """Verify that render_service_unit() rejects non-localhost endpoints."""
+
+    def test_localhost_endpoint_accepted(self):
+        """http://localhost endpoint passes validation."""
+        text = systemd_timer.render_service_unit(
+            "http://localhost:8420/scheduled-tick", project_root="/srv/paramem"
+        )
+        assert "localhost:8420" in text
+
+    def test_127_0_0_1_endpoint_accepted(self):
+        """http://127.0.0.1 endpoint passes validation."""
+        text = systemd_timer.render_service_unit(
+            systemd_timer.DEFAULT_ENDPOINT, project_root="/srv/paramem"
+        )
+        assert "127.0.0.1" in text
+
+    def test_non_localhost_endpoint_raises_value_error(self):
+        """An external endpoint raises ValueError to prevent shell-injection."""
+        import pytest
+
+        with pytest.raises(ValueError, match="http://127.0.0.1.*http://localhost"):
+            systemd_timer.render_service_unit(
+                "https://evil.example.com/inject", project_root="/srv/paramem"
+            )
+
+    def test_https_localhost_not_accepted(self):
+        """https://127.0.0.1 (not http://) is rejected — the guard is strict."""
+        import pytest
+
+        with pytest.raises(ValueError):
+            systemd_timer.render_service_unit(
+                "https://127.0.0.1:8420/tick", project_root="/srv/paramem"
+            )
+
+
 class TestReconcileDetailString:
     def _mock_run(self, *args, **kwargs):
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")

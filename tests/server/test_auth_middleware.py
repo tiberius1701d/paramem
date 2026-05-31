@@ -242,6 +242,25 @@ class TestCookieToken:
         resp = client.get("/ping")
         assert resp.status_code == 401
 
+    def test_whitespace_only_cookie_is_unauthenticated(self, tmp_path, monkeypatch):
+        """A cookie whose value is all whitespace is treated as absent (fail-closed).
+
+        An all-spaces morsel.value must not reach the token comparison — it must
+        be normalised to None so the request returns 401 rather than matching
+        against any stored token.
+        """
+        _setup_daily(tmp_path, monkeypatch)
+        store = _make_store(tmp_path)
+        store.mint("Speaker0", "Device")
+
+        app = _make_app(user_token_getter=lambda: store)
+        client = TestClient(app, cookies={"paramem_token": "   "})
+
+        resp = client.get("/ping")
+        assert resp.status_code == 401, (
+            "Whitespace-only cookie value must be treated as absent (401), not as a token"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Legacy shared token still works
@@ -717,3 +736,98 @@ class TestCookieNameGetter:
         resp = client.get("/ping")
         assert resp.status_code == 200
         assert resp.json()["speaker_id"] == "Speaker0"
+
+
+# ---------------------------------------------------------------------------
+# Scope surfaced on request.state
+# ---------------------------------------------------------------------------
+
+
+def _make_scope_app(
+    shared_token: str = "",
+    user_token_getter=None,
+) -> FastAPI:
+    """Minimal app that exposes request.state.scope in the /ping response."""
+    app = FastAPI()
+    app.add_middleware(
+        BearerTokenMiddleware,
+        token=shared_token,
+        user_token_getter=user_token_getter,
+    )
+
+    @app.get("/ping")
+    def ping(request: Request) -> dict:
+        sid = getattr(request.state, "speaker_id", None)
+        scope = getattr(request.state, "scope", None)
+        return {"ok": True, "speaker_id": sid, "scope": scope}
+
+    return app
+
+
+class TestScopeOnRequestState:
+    def test_per_user_admin_token_sets_admin_scope(self, tmp_path, monkeypatch):
+        """A per-user admin token sets request.state.scope = 'admin'."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = _make_store(tmp_path)
+        token = store.mint("Speaker0", "Admin", scope="admin")
+
+        app = _make_scope_app(user_token_getter=lambda: store)
+        client = TestClient(app)
+
+        resp = client.get("/ping", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json()["scope"] == "admin"
+        assert resp.json()["speaker_id"] == "Speaker0"
+
+    def test_per_user_chat_token_sets_chat_scope(self, tmp_path, monkeypatch):
+        """A per-user chat token sets request.state.scope = 'chat'."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = _make_store(tmp_path)
+        token = store.mint("Speaker0", "Phone", scope="chat")
+
+        app = _make_scope_app(user_token_getter=lambda: store)
+        client = TestClient(app)
+
+        resp = client.get("/ping", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json()["scope"] == "chat"
+
+    def test_shared_token_sets_admin_scope(self):
+        """The shared env token sets request.state.scope = 'admin'."""
+        app = _make_scope_app(shared_token="shared-secret")
+        client = TestClient(app)
+
+        resp = client.get("/ping", headers={"Authorization": "Bearer shared-secret"})
+        assert resp.status_code == 200
+        assert resp.json()["scope"] == "admin"
+        # Shared token does not set speaker_id (unattributed).
+        assert resp.json()["speaker_id"] is None
+
+    def test_unattributed_chat_token_sets_chat_scope_no_speaker(self, tmp_path, monkeypatch):
+        """An unattributed chat token → scope='chat', speaker_id absent on state."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = _make_store(tmp_path)
+        token = store.mint(None, "Shared Kitchen Tablet", scope="chat")
+
+        app = _make_scope_app(user_token_getter=lambda: store)
+        client = TestClient(app)
+
+        resp = client.get("/ping", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json()["scope"] == "chat"
+        assert resp.json()["speaker_id"] is None
+
+    def test_off_mode_stamps_admin_scope(self):
+        """OFF mode (no token, no store) → handler runs, scope stamped 'admin'.
+
+        OFF is the deliberate open posture (SECURITY.md): the middleware stamps
+        admin scope on pass-through requests so the ``require_admin`` gate stays
+        a pure ``scope == 'admin'`` check and every endpoint stays reachable
+        without credentials.
+        """
+        app = _make_scope_app(shared_token="", user_token_getter=None)
+        client = TestClient(app)
+
+        resp = client.get("/ping")
+        assert resp.status_code == 200  # OFF mode passes through
+        assert resp.json()["scope"] == "admin"
