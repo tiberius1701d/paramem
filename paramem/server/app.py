@@ -1662,6 +1662,26 @@ async def lifespan(app: FastAPI):
             len(_state["user_token_store"].list()),
         )
 
+    # VAPID keypair — opt-in via mobile_pwa.push_enabled.  Generated once and
+    # persisted as vapid_keys.json (age-encrypted when a daily key is loaded).
+    # Loaded after assert_mode_consistency so the write lands in the validated
+    # encryption mode.  Skipped when push_enabled=false so default deployments
+    # hold zero VAPID state.
+    _state["vapid"] = None
+    _state["push_store"] = None
+    if config.mobile_pwa.enabled and config.mobile_pwa.push_enabled:
+        from paramem.server.push import PushSubscriptionStore
+        from paramem.server.vapid import application_server_key, ensure_vapid_keypair
+
+        _data_dir = Path(config.paths.data)
+        _vapid_handle = ensure_vapid_keypair(_data_dir)
+        _state["vapid"] = _vapid_handle
+        _state["push_store"] = PushSubscriptionStore(_data_dir / "push_subscriptions.json")
+        logger.info(
+            "Web Push ready — public key: %s",
+            application_server_key(_vapid_handle),
+        )
+
     # --- Crash recovery: inspect disk state BEFORE drift init ---
     # This ensures _state["migration"] reflects any partially-completed
     # /migration/confirm before any request handler can observe stale state.
@@ -3233,6 +3253,116 @@ async def voice(http_request: Request):
         audio_format=audio_fmt,
         follow_up=_resolved.follow_up,
     )
+
+
+# ---------------------------------------------------------------------------
+# Web Push endpoints  (mobile_pwa.push_enabled=true)
+# ---------------------------------------------------------------------------
+
+
+class PushSubscribeRequest(BaseModel):
+    """Request body for POST /push/subscribe.
+
+    Fields mirror the browser ``PushSubscription.toJSON()`` shape:
+    ``endpoint`` is the push relay URL; ``keys`` holds the ECDH public key
+    (``p256dh``) and the authentication secret (``auth``) in unpadded
+    base64url encoding.
+
+    No ``speaker_id`` field is accepted — identity is taken exclusively from
+    the per-user bearer token (``request.state.speaker_id``).  Any
+    ``speaker_id`` key in the request body is silently discarded by Pydantic's
+    ``extra="ignore"`` model default.
+    """
+
+    model_config = {"extra": "ignore"}
+
+    endpoint: str
+    keys: dict
+
+
+@app.get("/push/vapid-public-key")
+async def push_vapid_public_key():
+    """Return the VAPID application server public key.
+
+    Used by the PWA to call ``PushManager.subscribe({applicationServerKey})``.
+    The key is the unpadded base64url-encoded uncompressed EC P-256 point
+    (65 bytes, ``0x04`` prefix).
+
+    Returns
+    -------
+    JSON
+        ``{"key": "<base64url>"}`` on success.
+    HTTP 503
+        When ``push_enabled`` is false or the VAPID handle is not initialised.
+    """
+    config = _state.get("config")
+    vapid = _state.get("vapid")
+
+    if config is None or not config.mobile_pwa.push_enabled or vapid is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "push_not_enabled"},
+        )
+
+    from paramem.server.vapid import application_server_key
+
+    return {"key": application_server_key(vapid)}
+
+
+@app.post("/push/subscribe")
+async def push_subscribe(body: PushSubscribeRequest, http_request: Request):
+    """Register a push subscription for the authenticated speaker.
+
+    The subscription is persisted under the speaker_id bound to the
+    per-user bearer token (set by
+    :class:`~paramem.server.auth.BearerTokenMiddleware`).  Shared-token or
+    unauthenticated requests are rejected with HTTP 403.  The endpoint is
+    deduplicated per speaker — re-subscribing the same endpoint is a no-op.
+
+    Request body (``application/json``) must be the browser
+    ``PushSubscription.toJSON()`` shape::
+
+        {
+            "endpoint": "https://web.push.apple.com/...",
+            "keys": {"p256dh": "...", "auth": "..."}
+        }
+
+    Returns
+    -------
+    JSON
+        ``{"status": "subscribed"}`` on success (new or duplicate).
+    HTTP 403
+        When no per-user speaker_id is attached to the request (shared token
+        or unauthenticated).
+    HTTP 503
+        When ``push_enabled`` is false or the push store is not initialised.
+    """
+    config = _state.get("config")
+    push_store = _state.get("push_store")
+
+    if config is None or not config.mobile_pwa.push_enabled or push_store is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "push_not_enabled"},
+        )
+
+    # Require a per-user token — shared tokens do not bind to a speaker_id.
+    auth_speaker_id: str | None = getattr(http_request.state, "speaker_id", None)
+    if auth_speaker_id is None:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "per_user_token_required"},
+        )
+
+    subscription = {"endpoint": body.endpoint, "keys": body.keys}
+    try:
+        push_store.add(auth_speaker_id, subscription)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "invalid_subscription", "detail": str(exc)},
+        )
+    return {"status": "subscribed"}
 
 
 def _match_unknown_speaker(embedding: list[float]) -> str | None:

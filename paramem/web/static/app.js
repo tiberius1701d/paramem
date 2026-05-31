@@ -15,7 +15,8 @@
  * Auth: Authorization: Bearer <token>  (app.py:2352, auth.py:30)
  * Same-origin by default (StaticFiles at /app, API at same origin).
  *
- * Phase 5: push notifications — not implemented.
+ * Phase 5: push notifications — register after auth.
+ * registerPush() is called once credentials are confirmed (token present, SW active).
  */
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,9 @@ let micRecorder = null;       // active MediaRecorder instance while recording
 let micChunks = [];           // audio chunks collected during capture
 let micStream = null;         // getUserMedia stream (stopped on release)
 let micVoiceSupported = null; // null = unchecked, true/false after first attempt
+
+// Push notification state
+let pushRegistered = false;   // true once registerPush() has succeeded
 
 // ---------------------------------------------------------------------------
 // DOM refs (resolved after DOMContentLoaded)
@@ -78,6 +82,9 @@ function init() {
   ensureConversationId();
   registerServiceWorker();
   wireEvents();
+  // Attempt push registration after credentials are loaded.  Safe to call
+  // before the SW is active — registerPush() waits for the SW to be ready.
+  registerPush();
 
   if (!token) {
     openSettings();
@@ -138,6 +145,130 @@ function registerServiceWorker() {
       console.warn("SW registration failed:", err);
     });
   }
+}
+
+/**
+ * Requests permission and subscribes to Web Push if supported.
+ *
+ * Idempotent: returns immediately if already subscribed (pushRegistered).
+ * Requires a token to be set — skips silently when no credentials are present.
+ *
+ * Flow:
+ *   1. Feature-detect serviceWorker + PushManager.
+ *   2. Request Notification.requestPermission().  Gracefully handles denied /
+ *      unsupported (logs to console, does not throw).
+ *   3. GET /push/vapid-public-key — if the server returns 503 (push disabled),
+ *      silently skip; this allows the client to run against a server that has
+ *      push_enabled=false without errors.
+ *   4. registration.pushManager.subscribe({userVisibleOnly, applicationServerKey}).
+ *   5. POST /push/subscribe with the subscription JSON.
+ */
+async function registerPush() {
+  if (pushRegistered) return;
+  if (!token) return; // no credentials yet
+
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+    console.info("Web Push not supported in this browser.");
+    return;
+  }
+
+  // Request notification permission.  A denied result is not an error.
+  let permission;
+  try {
+    permission = await Notification.requestPermission();
+  } catch (err) {
+    console.warn("Notification.requestPermission() failed:", err);
+    return;
+  }
+  if (permission !== "granted") {
+    console.info("Push notifications not permitted (status:", permission, ")");
+    return;
+  }
+
+  // Fetch the VAPID public key.  503 means push is not enabled server-side.
+  let vapidKey;
+  try {
+    const base = serverUrl || "";
+    const resp = await fetch(`${base}/push/vapid-public-key`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (resp.status === 503) {
+      // push_enabled=false on the server — silently skip.
+      return;
+    }
+    if (!resp.ok) {
+      console.warn("GET /push/vapid-public-key failed:", resp.status);
+      return;
+    }
+    const data = await resp.json();
+    vapidKey = data.key;
+  } catch (err) {
+    console.warn("Could not fetch VAPID public key:", err);
+    return;
+  }
+
+  // Convert unpadded base64url string to Uint8Array for PushManager.subscribe.
+  const keyBytes = _base64urlToUint8Array(vapidKey);
+
+  let registration;
+  try {
+    registration = await navigator.serviceWorker.ready;
+  } catch (err) {
+    console.warn("SW not ready:", err);
+    return;
+  }
+
+  let subscription;
+  try {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: keyBytes,
+    });
+  } catch (err) {
+    console.warn("pushManager.subscribe() failed:", err);
+    return;
+  }
+
+  // POST the subscription to the server.
+  try {
+    const base = serverUrl || "";
+    const resp = await fetch(`${base}/push/subscribe`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(subscription.toJSON()),
+    });
+    if (!resp.ok) {
+      console.warn("POST /push/subscribe failed:", resp.status);
+      return;
+    }
+    pushRegistered = true;
+    console.info("Push subscription registered.");
+  } catch (err) {
+    console.warn("Could not register push subscription:", err);
+  }
+}
+
+/**
+ * Converts an unpadded base64url string to a Uint8Array.
+ * Required to pass the VAPID public key to PushManager.subscribe().
+ *
+ * @param {string} base64url - Unpadded base64url-encoded string.
+ * @returns {Uint8Array}
+ */
+function _base64urlToUint8Array(base64url) {
+  // Re-pad to a multiple of 4 for atob.
+  const padded = base64url.replace(/-/g, "+").replace(/_/g, "/");
+  const padding = (4 - (padded.length % 4)) % 4;
+  const base64 = padded + "=".repeat(padding);
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +445,7 @@ function closeSettings() {
 /**
  * Saves server URL and token from the settings fields to localStorage
  * and updates module-level state, then closes the drawer.
+ * Re-attempts push registration so a newly-entered token can subscribe.
  */
 function saveSettings() {
   serverUrl = serverUrlInput.value.trim();
@@ -321,6 +453,9 @@ function saveSettings() {
   localStorage.setItem(KEY_SERVER_URL, serverUrl);
   localStorage.setItem(KEY_TOKEN, token);
   closeSettings();
+  // Reset push state so a new token triggers a fresh subscription attempt.
+  pushRegistered = false;
+  registerPush();
 }
 
 // ---------------------------------------------------------------------------

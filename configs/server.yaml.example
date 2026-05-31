@@ -612,16 +612,31 @@ text_lang_detection:
 # ============================================================================
 # Progressive Web App (PWA) support for the mobile client.
 #
-# enabled:      serve the static bundle and activate cookie-based auth.
-#               Disabled by default; enable after running the mobile-client
-#               build (a later slice).
-# static_dir:   path to the compiled static bundle.  Empty → resolved to
-#               paramem/web/static by the static-mount slice.
-# cookie_name:  session cookie name the SPA sets after login.
+# enabled:       serve the static bundle and activate cookie-based auth.
+#                Disabled by default; enable after running the mobile-client
+#                build (a later slice).
+# static_dir:    path to the compiled static bundle.  Empty → resolved to
+#                paramem/web/static by the static-mount slice.
+# cookie_name:   session cookie name the SPA sets after login.
+# push_enabled:  enable Web Push notifications.  When true, a VAPID EC P-256
+#                keypair is auto-generated on first startup and persisted as
+#                vapid_keys.json (age-encrypted when a daily key is loaded).
+#                The /push/vapid-public-key and /push/subscribe endpoints become
+#                active.  Requires per-user bearer tokens — shared-token or
+#                unauthenticated subscribe requests are rejected with 403.
+#                False by default (opt-in).  Set to true after confirming
+#                mobile_pwa.enabled=true and per-user tokens are minted.
+# vapid_contact: JWT sub claim sent to push relays for abuse-contact purposes.
+#                Must be a mailto: URI.  Replace with your own address.
+#                IMPORTANT: "mailto:admin@localhost" is a placeholder — real push
+#                relays reject it.  Set to a real reachable mailto: or https:
+#                contact before enabling push_enabled.
 mobile_pwa:
   enabled: false
   static_dir: ""
   cookie_name: "paramem_token"
+  push_enabled: false
+  vapid_contact: "mailto:admin@localhost"
 
 # ============================================================================
 # PROCESS
