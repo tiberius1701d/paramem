@@ -13,7 +13,7 @@
  * // Phase 5: push — add push event handler here.
  */
 
-const CACHE_VERSION = "v1";
+const CACHE_VERSION = "v3";
 const CACHE_NAME = `paramem-shell-${CACHE_VERSION}`;
 
 /** Shell assets to precache on install. */

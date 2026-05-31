@@ -23,6 +23,7 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -66,6 +67,7 @@ from paramem.server.trial_state import (
     read_trial_marker,
     write_trial_marker,
 )
+from paramem.server.voice_pipeline import process_utterance
 from paramem.server.vram_guard import (
     VramExhausted,
     apply_process_cap,
@@ -2450,17 +2452,126 @@ async def chat(request: ChatRequest, http_request: Request):
             detected_language_prob = text_prob
             logger.info("Text-side lang_id: %s (prob=%.2f)", text_lang, text_prob)
 
+    _resolved = await _resolve_and_enroll_speaker(
+        request=request,
+        auth_speaker_id=auth_speaker_id,
+        buffer=buffer,
+        store=_state.get("speaker_store"),
+        detected_language=detected_language,
+        detected_language_prob=detected_language_prob,
+    )
+    speaker_id, speaker, display_speaker = (
+        _resolved.speaker_id,
+        _resolved.speaker,
+        _resolved.display_speaker,
+    )
+    follow_up, greeting_prefix, detected_language = (
+        _resolved.follow_up,
+        _resolved.greeting_prefix,
+        _resolved.effective_language,
+    )
+
+    result, spoken_text = await _run_chat_turn(
+        text=request.text,
+        conversation_id=request.conversation_id,
+        speaker_id=speaker_id,
+        speaker=speaker,
+        display_speaker=display_speaker,
+        history=request.history,
+        speaker_embedding=request.speaker_embedding,
+        language=detected_language,
+        greeting_prefix=greeting_prefix,
+    )
+    return ChatResponse(
+        text=spoken_text,
+        escalated=result.escalated,
+        speaker=speaker,
+        follow_up=follow_up,
+    )
+
+
+@dataclass(frozen=True)
+class ResolvedSpeaker:
+    """Speaker resolution result shared by POST /chat and POST /voice.
+
+    Attributes
+    ----------
+    speaker_id:
+        Canonical speaker identifier (e.g. ``"Speaker0"``), or ``None``
+        when resolution failed or the caller is fully anonymous.
+    speaker:
+        Display name returned by the speaker store (used in ChatResponse).
+    display_speaker:
+        Anonymization-safe name for system-prompt injection and greeting.
+        ``None`` when the speaker is anonymous (``is_anonymous`` is true)
+        so the robotic ``Speaker{N}`` label is suppressed until disclosure.
+    follow_up:
+        Server-initiated follow-up prompt (e.g. "What's your name?") when
+        the voice is unknown.  ``None`` after successful disclosure or for
+        the token-authoritative path.
+    greeting_prefix:
+        Time-gated greeting string (e.g. ``"Good morning, Alice. "``), or
+        ``None`` when no greeting is due.
+    effective_language:
+        Resolved language code for this request (Whisper → stored preference
+        → ``None``).  Rebinds ``detected_language`` in the caller.
+    """
+
+    speaker_id: str | None
+    speaker: str | None
+    display_speaker: str | None
+    follow_up: str | None
+    greeting_prefix: str | None
+    effective_language: str | None
+
+
+async def _resolve_and_enroll_speaker(
+    *,
+    request: "ChatRequest",
+    auth_speaker_id: str | None,
+    buffer,
+    store,
+    detected_language: str | None,
+    detected_language_prob: float,
+) -> ResolvedSpeaker:
+    """Resolve speaker identity and run deferred enrollment.
+
+    Extracted verbatim from the POST /chat inline block so POST /voice can
+    share the same enrollment/greeting/language-resolution path when the
+    device carries a shared token (``auth_speaker_id is None``).
+
+    Parameters
+    ----------
+    request:
+        Incoming :class:`ChatRequest`.  ``request.speaker_embedding`` is
+        used for embedding-based resolution and enrollment when present.
+    auth_speaker_id:
+        Speaker ID attached by :class:`~paramem.server.auth.BearerTokenMiddleware`
+        for per-user tokens.  ``None`` on the shared-token path.
+    buffer:
+        Active :class:`~paramem.server.session_buffer.SessionBuffer`.
+    store:
+        :class:`~paramem.server.speaker.SpeakerStore` instance, or ``None``.
+    detected_language:
+        Language code from STT or text-side detector (may be ``None``).
+    detected_language_prob:
+        Confidence score for *detected_language* (0.0 when unknown).
+
+    Returns
+    -------
+    ResolvedSpeaker
+        All six resolution outputs; callers destructure as needed.
+    """
     # Speaker resolution: auth token → embedding → session history → anonymous.
     # Never let speaker ID failure kill the request — proceed as anonymous.
     try:
         speaker_id, speaker = _resolve_speaker(
-            request, buffer, _state.get("speaker_store"), auth_speaker_id=auth_speaker_id
+            request, buffer, store, auth_speaker_id=auth_speaker_id
         )
     except Exception:
         logger.exception("Speaker resolution failed — proceeding as anonymous")
         speaker_id, speaker = None, None
     follow_up = None
-    store = _state.get("speaker_store")
 
     # Deferred enrollment: unknown voice → group by embedding, prompt on first
     # encounter for each group, then re-prompt after per-group cooldown.
@@ -2564,8 +2675,6 @@ async def chat(request: ChatRequest, http_request: Request):
         effective_language = store.get_preferred_language(speaker_id)
     else:
         effective_language = None
-    # Replace detected_language with the resolved effective language
-    detected_language = effective_language
 
     # User-facing salutation: suppress the canonical "Speaker{N}" token for
     # voice-promoted but undisclosed profiles. Internal speaker_id is kept
@@ -2584,7 +2693,7 @@ async def chat(request: ChatRequest, http_request: Request):
             speaker_id,
             greeting_interval,
             _state["config"].voice.greetings,
-            language=detected_language or "en",
+            language=effective_language or "en",
         )
         if greeting:
             if display_speaker:
@@ -2593,31 +2702,98 @@ async def chat(request: ChatRequest, http_request: Request):
                 greeting_prefix = f"{greeting}. "
             store.confirm_greeting(speaker_id)
 
-    # Cloud-only mode — route via HA graph + SOTA, no local model
+    return ResolvedSpeaker(
+        speaker_id=speaker_id,
+        speaker=speaker,
+        display_speaker=display_speaker,
+        follow_up=follow_up,
+        greeting_prefix=greeting_prefix,
+        effective_language=effective_language,
+    )
+
+
+async def _run_chat_turn(
+    *,
+    text: str,
+    conversation_id: str,
+    speaker_id: str | None,
+    speaker: str | None,
+    display_speaker: str | None,
+    history: list[dict] | None,
+    speaker_embedding: list[float] | None,
+    language: str | None,
+    greeting_prefix: str | None,
+) -> tuple[ChatResult, str]:
+    """Execute a single conversation turn (shared by POST /chat and POST /voice).
+
+    Encapsulates the post-speaker-resolution orchestration that is identical
+    for text and voice turns: the scheduler debounce stamps, training-abort,
+    cloud-only vs local routing, session buffer appends, post-session training
+    enqueue, and greeting prefix application.
+
+    Both ``/chat`` and ``/voice`` callers are responsible for resolving
+    *display_speaker* (anonymization check) and *greeting_prefix* before
+    calling this function.
+
+    Parameters
+    ----------
+    text:
+        The user's message text (already transcribed for voice turns).
+    conversation_id:
+        Conversation / session identifier.
+    speaker_id:
+        Resolved canonical speaker ID, or ``None`` for anonymous turns.
+    speaker:
+        Display name of the speaker (resolved by ``_resolve_speaker``), or
+        ``None``.
+    display_speaker:
+        User-facing salutation: ``None`` when the speaker is anonymous (suppress
+        the canonical ``Speaker{N}`` token); otherwise same as *speaker*.
+    history:
+        Prior conversation turns to pass to ``handle_chat``, or ``None``.
+    speaker_embedding:
+        Float embedding to attach to the user buffer entry, or ``None``.
+    language:
+        Resolved BCP-47 language code for this turn, or ``None``.
+    greeting_prefix:
+        Greeting string to prepend to the assistant reply (e.g. ``"Good
+        morning, Alice. "``), or ``None``.
+
+    Returns
+    -------
+    tuple[ChatResult, str]
+        ``(result, spoken_text)`` where *result* is the raw
+        :class:`~paramem.server.inference.ChatResult` and *spoken_text* is
+        ``result.text`` with *greeting_prefix* prepended when applicable.
+    """
+    buffer = _state["session_buffer"]
+
+    # Debounce stamps — monotonic for scheduler, wall-clock for /status display.
+    # Both writes run on the asyncio event-loop thread (cooperative scheduling),
+    # so no lock is needed.
+    _state["last_chat_time"] = datetime.now(timezone.utc)
+    _state["last_chat_monotonic"] = time.monotonic()
+
+    # Cloud-only mode — route via HA graph + SOTA, no local model.
     if _state["mode"] == "cloud-only":
         result = _cloud_only_route(
-            text=request.text,
+            text=text,
             speaker=display_speaker,
-            history=request.history,
+            history=history,
             config=_state["config"],
             router=_state.get("router"),
             ha_client=_state.get("ha_client"),
             sota_agent=_state.get("sota_agent"),
-            language=detected_language,
+            language=language,
         )
-        buffer.append(
-            request.conversation_id,
-            "user",
-            request.text,
-            embedding=request.speaker_embedding,
-        )
+        buffer.append(conversation_id, "user", text, embedding=speaker_embedding)
         cloud_text = result.text
-        buffer.append(request.conversation_id, "assistant", cloud_text)
+        buffer.append(conversation_id, "assistant", cloud_text)
         spoken_text = f"{greeting_prefix}{cloud_text}" if greeting_prefix else cloud_text
-        return ChatResponse(text=spoken_text, escalated=True, speaker=speaker, follow_up=follow_up)
+        return result, spoken_text
 
-    # Local mode — normal inference with entity routing
-    # Abort background training if active, then acquire GPU lock.
+    # Local mode — normal inference with entity routing.
+    # Abort background training if active, then acquire the GPU lock.
     # abort_for_inference() sets the per-job abort flag and waits up to 30 s
     # for training to stop at the next step boundary and release the GPU lock.
     # _active_quiesced is set OUTSIDE gpu_lock_sync so the caller's
@@ -2641,18 +2817,18 @@ async def chat(request: ChatRequest, http_request: Request):
         result: ChatResult = await loop.run_in_executor(
             None,
             lambda: handle_chat(
-                text=request.text,
-                conversation_id=request.conversation_id,
+                text=text,
+                conversation_id=conversation_id,
                 speaker=display_speaker,
                 speaker_id=speaker_id,
-                history=request.history,
+                history=history,
                 model=_state["model"],
                 tokenizer=_state["tokenizer"],
                 config=_state["config"],
                 router=_state["router"],
                 sota_agent=_state.get("sota_agent"),
                 ha_client=_state.get("ha_client"),
-                language=detected_language,
+                language=language,
                 # Active-store migration override: when a mode-switch is in
                 # progress or interrupted, the inference path falls back to
                 # the source mode's store. None == use config.consolidation.mode.
@@ -2661,14 +2837,9 @@ async def chat(request: ChatRequest, http_request: Request):
             ),
         )
 
-    buffer.append(
-        request.conversation_id,
-        "user",
-        request.text,
-        embedding=request.speaker_embedding,
-    )
+    buffer.append(conversation_id, "user", text, embedding=speaker_embedding)
     response_text = result.text
-    buffer.append(request.conversation_id, "assistant", response_text)
+    buffer.append(conversation_id, "assistant", response_text)
 
     # Post-conversation training: after each assistant response, enqueue a
     # background job to extract and train onto the current interim adapter.
@@ -2684,7 +2855,7 @@ async def chat(request: ChatRequest, http_request: Request):
         and _state.get("consolidation_loop") is not None
         and _state["config"].consolidation.post_session_train_enabled
     ):
-        transcript_turns = buffer.get_session_turns(request.conversation_id)
+        transcript_turns = buffer.get_session_turns(conversation_id)
         if transcript_turns:
             transcript_text = "\n".join(
                 f"{t.get('role', 'user')}: {t.get('text', '')}" for t in transcript_turns
@@ -2696,14 +2867,14 @@ async def chat(request: ChatRequest, http_request: Request):
             if _psq is not None:
                 _psq.enqueue(
                     {
-                        "session_id": request.conversation_id,
+                        "session_id": conversation_id,
                         "transcript": transcript_text,
                         "speaker_id": speaker_id,
                         "speaker_name": speaker,
                     }
                 )
             enqueue_post_session_train(
-                conversation_id=request.conversation_id,
+                conversation_id=conversation_id,
                 transcript=transcript_text,
                 speaker_id=speaker_id,
                 speaker_name=speaker,
@@ -2718,11 +2889,349 @@ async def chat(request: ChatRequest, http_request: Request):
     # from the checkpoint automatically via the resume_state.json path.
 
     spoken_text = f"{greeting_prefix}{response_text}" if greeting_prefix else response_text
-    return ChatResponse(
-        text=spoken_text,
-        escalated=result.escalated,
-        speaker=speaker,
-        follow_up=follow_up,
+    return result, spoken_text
+
+
+# ---------------------------------------------------------------------------
+# POST /voice  — mobile-PWA voice endpoint
+# ---------------------------------------------------------------------------
+
+
+class VoiceResponse(BaseModel):
+    """Response body for POST /voice.
+
+    Attributes
+    ----------
+    transcript:
+        The transcribed text.  Empty string when the audio was silent or
+        STT produced no output.
+    reply:
+        The assistant's reply text.  Empty string when the transcript was
+        empty (nothing to reply to).
+    audio:
+        Base64-encoded WAV (RIFF/PCM int16 mono) of the synthesized reply.
+        Empty string when TTS is unavailable or synthesis failed — callers
+        must treat this as optional and fall back to text-only rendering.
+    audio_format:
+        Container format of ``audio``; always ``"wav"`` when ``audio`` is
+        non-empty, empty string otherwise.
+    follow_up:
+        Server-initiated follow-up prompt sent after the reply (e.g. an
+        enrollment "What's your name?" message on the shared-token path).
+        ``None`` when no follow-up is needed.
+    """
+
+    transcript: str
+    reply: str
+    audio: str = ""
+    audio_format: str = ""
+    follow_up: str | None = None
+
+
+def _build_wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
+    """Wrap raw int16 mono PCM in a minimal RIFF/WAV container.
+
+    Prepends the standard 44-byte WAV header so browsers and audio players
+    can decode the result directly without an external decoder.
+
+    Parameters
+    ----------
+    pcm:
+        Raw 16-bit signed integer PCM samples, mono, little-endian.
+    sample_rate:
+        Sample rate in Hz (e.g. 22050, 24000).
+
+    Returns
+    -------
+    bytes
+        44-byte RIFF header + ``pcm``.
+    """
+    import struct
+
+    num_channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+    data_size = len(pcm)
+    chunk_size = 36 + data_size  # RIFF chunk body = header tail (36) + data
+
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        chunk_size,
+        b"WAVE",
+        b"fmt ",
+        16,  # PCM sub-chunk size
+        1,  # PCM format tag
+        num_channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
+    )
+    return header + pcm
+
+
+def _decode_audio_to_pcm(audio_bytes: bytes, content_type: str) -> bytes:
+    """Decode a container audio blob to 16 kHz int16 mono PCM via ffmpeg.
+
+    Supports ``audio/mp4``, ``audio/webm``, ``audio/webm;codecs=opus``,
+    ``audio/ogg``, and any format ffmpeg can sniff from the byte stream.
+    Raw PCM (``audio/L16``) is returned as-is.
+
+    Parameters
+    ----------
+    audio_bytes:
+        Raw bytes from the HTTP request body.
+    content_type:
+        ``Content-Type`` header value.  Used to select a fast passthrough
+        path for already-canonical PCM and to write the temporary file with
+        the right extension so ffmpeg can apply a demuxer hint.
+
+    Returns
+    -------
+    bytes
+        16 kHz int16 mono PCM.
+
+    Raises
+    ------
+    subprocess.CalledProcessError
+        When ffmpeg exits non-zero.
+    RuntimeError
+        When ffmpeg produces empty output (silent or unreadable input), or
+        when ffmpeg does not complete within 30 seconds.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    # Fast path: raw 16 kHz int16 PCM — no decoding needed.
+    base_ct = content_type.split(";")[0].strip().lower()
+    if base_ct in ("audio/l16", "audio/pcm", "audio/x-raw"):
+        return audio_bytes
+
+    # Determine file extension for the temporary file so ffmpeg gets a
+    # demuxer hint for formats that require it (e.g. WebM, MP4).
+    _CT_EXT = {
+        "audio/mp4": ".mp4",
+        "audio/m4a": ".m4a",
+        "audio/webm": ".webm",
+        "audio/ogg": ".ogg",
+        "audio/mpeg": ".mp3",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+    }
+    ext = _CT_EXT.get(base_ct, ".audio")
+
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    try:
+        cmd = [
+            "/usr/bin/ffmpeg",
+            "-y",
+            "-i",
+            tmp_path,
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-",
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, check=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"ffmpeg timed out after 30 s for content-type={content_type!r}"
+            ) from exc
+        pcm = result.stdout
+        if not pcm:
+            raise RuntimeError(
+                f"ffmpeg produced empty output for content-type={content_type!r}. "
+                f"stderr: {result.stderr.decode(errors='replace')}"
+            )
+        return pcm
+    finally:
+        os.unlink(tmp_path)
+
+
+_VOICE_BODY_MAX_BYTES = 25 * 1024 * 1024  # 25 MB — generous for push-to-talk clips
+
+
+@app.post("/voice", response_model=VoiceResponse)
+async def voice(http_request: Request):
+    """Handle a voice utterance from the mobile PWA.
+
+    Accepts a raw audio blob (``audio/mp4``, ``audio/webm``, ``audio/L16``…),
+    decodes it to 16 kHz int16 mono PCM, runs Whisper STT, then routes the
+    transcript through :func:`_run_chat_turn` — the same shared orchestration
+    as ``POST /chat``.
+
+    **Token-type selector:**
+
+    - **Per-user token** (``request.state.speaker_id`` set by
+      :class:`~paramem.server.auth.BearerTokenMiddleware`): identity is
+      authoritative from the token.  Voice embedding is NOT computed (cheap
+      path).  A stable per-conversation-id from the ``x-conversation-id``
+      header (or ``"voice-default"``) is used.
+
+    - **Shared token / no attributed identity** (``auth_speaker_id is None``):
+      the voice embedding IS computed and passed through
+      :func:`_resolve_and_enroll_speaker` — the same enrollment/greeting/
+      name-disclosure path as ``POST /chat``.  A fresh per-utterance
+      ``conversation_id`` is generated on each request (one POST = one
+      push-to-talk press).  The session-buffer retro-claim propagates identity
+      across conversation_ids by embedding so two-turn enrollment still works.
+
+    Returns ``{"transcript": "", "reply": ""}`` when the audio is silent or
+    the STT returned no text.
+
+    Returns HTTP 404 when ``mobile_pwa.enabled`` is ``False``.
+    Returns HTTP 413 when the request body exceeds :data:`_VOICE_BODY_MAX_BYTES`.
+    Returns HTTP 503 when the STT model is not loaded (cloud-only mode).
+    """
+    config = _state.get("config")
+    if config is None or not config.mobile_pwa.enabled:
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+
+    stt = _state.get("stt")
+    if stt is None or not stt.is_loaded:
+        return JSONResponse(status_code=503, content={"error": "stt_unavailable"})
+
+    # Reject oversized uploads before reading the body — push-to-talk clips are
+    # tiny; 25 MB is generous.  Check Content-Length first (O(1)); fall back to
+    # a bounded read when the header is absent.
+    content_length_str = http_request.headers.get("content-length")
+    if content_length_str is not None:
+        try:
+            if int(content_length_str) > _VOICE_BODY_MAX_BYTES:
+                return JSONResponse(status_code=413, content={"error": "audio_too_large"})
+        except ValueError:
+            pass  # malformed header — let the bounded read handle it
+
+    audio_bytes = await http_request.body()
+    if len(audio_bytes) > _VOICE_BODY_MAX_BYTES:
+        return JSONResponse(status_code=413, content={"error": "audio_too_large"})
+
+    if not audio_bytes:
+        return VoiceResponse(transcript="", reply="")
+
+    content_type = http_request.headers.get("content-type", "audio/webm")
+
+    # Decode the container audio to raw PCM (boundary — bad audio = clear error).
+    try:
+        pcm_bytes = await asyncio.get_running_loop().run_in_executor(
+            None, _decode_audio_to_pcm, audio_bytes, content_type
+        )
+    except Exception:
+        logger.warning("POST /voice: audio decode failed", exc_info=True)
+        return JSONResponse(
+            status_code=400,
+            content={"error": "audio_decode_failed"},
+        )
+
+    # Resolve speaker from bearer token before transcription: when the device
+    # carries a per-user token, identity is authoritative and no embedding is
+    # needed (cheap path).  On the shared-token path (auth_speaker_id is None)
+    # the voice embedding is required for identification and enrollment.
+    auth_speaker_id: str | None = getattr(http_request.state, "speaker_id", None)
+
+    # Compute embedding only on the shared-token path; skip on per-user token
+    # (saves CPU cost and avoids unnecessary WeSpeaker inference).
+    compute_embedding = auth_speaker_id is None
+
+    # Transcribe and optionally compute voice embedding.
+    utterance = await process_utterance(
+        pcm_bytes,
+        16000,
+        2,
+        1,
+        stt=stt,
+        compute_embedding=compute_embedding,
+    )
+
+    text = utterance.text
+    if not text:
+        return VoiceResponse(transcript="", reply="")
+
+    # Per-utterance conversation_id on the shared-token path: each push-to-talk
+    # press is an independent POST /voice call, so a fresh id ensures the session
+    # buffer does not conflate turns from different speakers on the same device.
+    # The retro-claim in session_buffer.claim_sessions_for_speaker works across
+    # conversation_ids by embedding, so two-turn enrollment still works.
+    # On the per-user path, a stable id allows multi-turn context.
+    if auth_speaker_id is None:
+        conversation_id = f"voice-{uuid.uuid4().hex[:12]}"
+    else:
+        conversation_id = http_request.headers.get("x-conversation-id", "voice-default")
+
+    buffer = _state["session_buffer"]
+    chat_req = ChatRequest(
+        text=text,
+        conversation_id=conversation_id,
+        speaker_embedding=utterance.embedding,
+    )
+
+    # Shared resolution + enrollment seam: runs the same enrollment/greeting/
+    # language-resolution logic as POST /chat (verbatim body).
+    _resolved = await _resolve_and_enroll_speaker(
+        request=chat_req,
+        auth_speaker_id=auth_speaker_id,
+        buffer=buffer,
+        store=_state.get("speaker_store"),
+        detected_language=utterance.language,
+        detected_language_prob=utterance.language_probability,
+    )
+
+    # Route through the shared turn orchestrator.  Use the resolved effective
+    # language (Whisper → stored preference → None) for routing and TTS.
+    result, spoken_text = await _run_chat_turn(
+        text=text,
+        conversation_id=conversation_id,
+        speaker_id=_resolved.speaker_id,
+        speaker=_resolved.speaker,
+        display_speaker=_resolved.display_speaker,
+        history=None,
+        speaker_embedding=utterance.embedding,
+        language=_resolved.effective_language,
+        greeting_prefix=_resolved.greeting_prefix,
+    )
+
+    # Synthesize the reply to speech if TTS is available.
+    # Use the resolved effective language for consistent voice selection.
+    # Boundary: any synthesis failure is non-fatal — the response falls back to
+    # text-only with audio="" so the PWA still renders the reply.
+    audio_b64 = ""
+    audio_fmt = ""
+    tts_manager = _state.get("tts_manager")
+    if tts_manager is not None and tts_manager.is_loaded and spoken_text:
+        import base64
+
+        try:
+            loop = asyncio.get_running_loop()
+            pcm_bytes, sample_rate = await loop.run_in_executor(
+                None, tts_manager.synthesize, spoken_text, _resolved.effective_language
+            )
+            if pcm_bytes:
+                wav_bytes = _build_wav_bytes(pcm_bytes, sample_rate)
+                audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+                audio_fmt = "wav"
+        except Exception:
+            logger.warning("POST /voice: TTS synthesis failed — returning text-only", exc_info=True)
+
+    return VoiceResponse(
+        transcript=text,
+        reply=spoken_text,
+        audio=audio_b64,
+        audio_format=audio_fmt,
+        follow_up=_resolved.follow_up,
     )
 
 
