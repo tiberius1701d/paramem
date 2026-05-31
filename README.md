@@ -536,16 +536,22 @@ Encryption key lifecycle (`paramem generate-key` / `rotate-daily` / `rotate-reco
 When `mobile_pwa.enabled: true`, each device that should access the server must be issued its own bearer token. Tokens are minted offline via the CLI, which prints a QR code for one-tap onboarding on mobile devices. For a **personal device**, mint a per-user token (bound to `speaker_id`) via `paramem mint-user-token` — identity is resolved from the token on every request. For a **shared device**, provision it with the existing shared token via the same `#token=` / `Authorization` path — the server then identifies speakers by voice embedding and runs the enrollment flow automatically.
 
 ```bash
-paramem mint-user-token <speaker_id> \
+paramem mint-user-token [SPEAKER_ID] \
     [--label LABEL] \
     [--server-url URL] \
     [--config PATH] \
-    [--png FILE]
+    [--png FILE] \
+    [--scope {chat,admin}] \
+    [--unattributed] \
+    [--force-admin]
 ```
 
-- `speaker_id` — the speaker this token authenticates (e.g. `Speaker0`). Every request carrying this token sets `speaker_id` to this value on the server.
+- `SPEAKER_ID` — the speaker this token authenticates (e.g. `Speaker0`). Required unless `--unattributed` is given.
+- `--scope` — token capability: `chat` (conversational endpoints `/chat`, `/voice`, `/push/*`, `/status` only — the secure default) or `admin` (all endpoints, including operational ones like `/gpu/*`, `/consolidate`, `/backup/*`). Default: `chat`.
+- `--unattributed` — mint a token with no bound speaker (for shared devices that identify speakers by voice embedding). Cannot be combined with a positional `SPEAKER_ID`.
+- `--force-admin` — required when combining `--scope admin` with `--unattributed`. Prints a warning: an unattributed admin token cannot be revoked by speaker; use `revoke-user-token --label` to revoke it.
 - `--label` — human-readable device or purpose label stored with the token (e.g. `phone`).
-- `--server-url` — base URL encoded into the QR payload (e.g. `https://<your-host>.<your-tailnet>.ts.net`). The PWA is reachable at `/app` on this URL when `mobile_pwa.enabled` is on.
+- `--server-url` — base URL encoded into the QR payload (e.g. `https://<your-host>.<your-tailnet>.ts.net`).
 - `--config` — server config path (default: `configs/server.yaml`), used to resolve the data directory.
 - `--png` — also save the QR as a PNG file.
 
@@ -566,16 +572,23 @@ A device used by more than one person — e.g. a kitchen tablet — is **not** g
 1. Open the PWA at `/app` and paste the shared token into Settings, or open a `#token=<shared-token>` deep-link on the device. The token is stored in `localStorage` and sent as `Authorization: Bearer` on every request — the same transport as a per-user token.
 2. Because the shared token attaches no `speaker_id` (`auth_speaker_id` is absent), `POST /voice` computes a voice embedding and identifies each speaker by voice, running the enrollment / greeting / name-disclosure flow automatically. A fresh `conversation_id` per push-to-talk press keeps multiple speakers on one device correctly attributed.
 
-**Privilege caveat.** The shared token is the gateway credential — it grants access to *every* REST endpoint, including the operational ones (`/gpu/release`, `/consolidate`, `/backup`). A device holding it therefore has full administrative reach, and there is no scoped-unattributed token class today. Restrict exposure at the network layer (the server is reached over Tailscale / LAN, never the public internet) rather than relying on token scope.
+**Privilege note.** The shared token is the gateway credential — it has `admin` scope and grants access to all REST endpoints, including the operational ones (`/gpu/release`, `/consolidate`, `/backup/*`). For a shared device that should have *conversational access only* (no administrative reach), mint a scoped unattributed token instead:
+
+```bash
+paramem mint-user-token --unattributed --scope chat --label "Kitchen Tablet"
+```
+
+This token reaches `/chat`, `/voice`, `/push/*`, and `/status` but gets 403 on every operational endpoint. Restrict access at the network layer (Tailscale / LAN — never the public internet) as the outer defence; token scope provides the inner defence.
 
 #### Household topology quick guide
 
 | Scenario | Token to issue | Identity source |
 |----------|---------------|-----------------|
-| Personal phone / tablet (one person) | Per-user token (`mint-user-token`) | Token binding — cheap, no embedding |
-| Shared device (kitchen tablet, multiple speakers) | Shared token (`PARAMEM_API_TOKEN`) | Voice embedding — enrollment flow runs automatically |
+| Personal phone / tablet (one person) | Per-user token (`mint-user-token <speaker_id> --scope chat`) | Token binding — cheap, no embedding |
+| Shared device, restricted (chat only) | Unattributed chat token (`mint-user-token --unattributed --scope chat`) | Voice embedding — enrollment flow runs automatically |
+| Shared device, full admin reach | Shared token (`PARAMEM_API_TOKEN`) or `--unattributed --scope admin --force-admin` | Voice embedding |
 
-When in doubt, issue a per-user token for every person who has their own device. Reserve the shared token for devices where you genuinely cannot predict who is speaking in advance.
+When in doubt, issue a per-user token for every person who has their own device. For shared devices, prefer `--unattributed --scope chat` (least privilege) over the shared env token (admin scope). Reserve the shared token for devices where you need admin reach from a shared terminal.
 
 #### PWA installation
 
@@ -643,7 +656,7 @@ paramem revoke-user-token --speaker Speaker0 --yes --config configs/server.yaml
 
 The command reads and writes `user_tokens.json` via the same encrypted-store path as `mint-user-token` — no manual decrypt/re-encrypt step is needed. If `PARAMEM_DAILY_PASSPHRASE` is set and the daily key is loaded (Security ON), the store is read and written as an age envelope automatically.
 
-**Restart required.** The running server loads the token store once at startup and holds it in memory; the in-process store is not refreshed from disk between requests. After running `revoke-user-token`, restart the server with `systemctl --user restart paramem-server` for the revocation to take effect on the live service.
+**Takes effect immediately.** Revocation (and scope changes via re-mint + revoke) takes effect on the next request — the running server re-reads `user_tokens.json` whenever the file's mtime changes (mtime-triggered live reload). No server restart is required.
 
 A revoked token causes a `401 Unauthorized` response; the PWA reopens the Settings drawer automatically.
 

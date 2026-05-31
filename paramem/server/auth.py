@@ -152,6 +152,11 @@ class BearerTokenMiddleware:
         )
         enabled = bool(self._token) or (store is not None)
         if not enabled:
+            # Security OFF — the whole server is open by design (no credential
+            # configured; see SECURITY.md).  Stamp admin scope so the
+            # ``require_admin`` gate stays a pure ``scope == "admin"`` check and
+            # OFF-mode requests reach every endpoint as before.
+            scope.setdefault("state", {})["scope"] = "admin"
             await self.app(scope, receive, send)
             return
 
@@ -170,14 +175,20 @@ class BearerTokenMiddleware:
 
         # Shared (legacy) token — constant-time comparison.
         if self._token and hmac.compare_digest(presented, self._token):
+            # Shared token always has admin scope.  No speaker_id is attached
+            # (legacy unattributed semantics).
+            scope.setdefault("state", {})["scope"] = "admin"
             await self.app(scope, receive, send)
             return
 
         # Per-user token — sha256 dict lookup (no iteration).
         if store is not None:
-            sid = store.lookup(presented)
-            if sid is not None:
-                scope.setdefault("state", {})["speaker_id"] = sid
+            record = store.resolve(presented)
+            if record is not None:
+                _authenticated, sid, scope_val = record
+                scope.setdefault("state", {})["scope"] = scope_val
+                if sid is not None:
+                    scope["state"]["speaker_id"] = sid
                 await self.app(scope, receive, send)
                 return
 
@@ -225,7 +236,10 @@ def _extract_token(scope: dict, cookie_name: str) -> str | None:
             jar.load(raw_cookie.decode("latin-1"))
             morsel = jar.get(cookie_name)
             if morsel is not None:
-                return morsel.value or None
+                # Normalise whitespace-only cookie values to None so they
+                # are treated as absent (fail-closed) rather than flowing
+                # to the token comparison as an all-spaces string.
+                return (morsel.value or "").strip() or None
         except http.cookies.CookieError:
             pass
 

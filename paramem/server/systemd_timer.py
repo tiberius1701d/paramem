@@ -151,15 +151,61 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
     return None
 
 
-def render_service_unit(endpoint: str) -> str:
-    return f"""[Unit]
-Description=ParaMem consolidation tick (curl /scheduled-tick)
-After=paramem-server.service
+def render_service_unit(endpoint: str, project_root: str) -> str:
+    """Render the systemd .service unit that curls ``/scheduled-tick``.
 
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/curl -sS -X POST --max-time 10 {endpoint}
-"""
+    The curl includes an ``Authorization: Bearer`` header sourced from the
+    ``PARAMEM_API_TOKEN`` environment variable at service-execution time.
+    The token is never written as a literal into the unit file; instead the
+    service sources ``PARAMEM_API_TOKEN`` from the project ``.env`` file
+    (``{project_root}/.env``).  The main ``paramem-server.service`` unit
+    sources GPU environment from ``%t/paramem-gpu.env`` (rendered by
+    ``gpu-guard``), not from the project ``.env``; the two units share the
+    same token value but source it from different files.
+
+    The curl command is wrapped in ``/bin/sh -c`` with ``-H @-`` so that the
+    ``Authorization`` header is piped via stdin rather than appearing in
+    process argv (visible via ``ps``/``/proc/<pid>/cmdline``) or in the
+    systemd journal's logged ``ExecStart``.  Only the literal string
+    ``$PARAMEM_API_TOKEN`` appears in the unit file; the token value is
+    expanded from the ``EnvironmentFile`` at service-execution time.
+
+    ``--fail-with-body`` (curl 7.76+) causes a non-zero exit on HTTP errors
+    (e.g. 401 / 403) so a future misconfiguration surfaces as a failed
+    systemd unit rather than a silent no-op.
+
+    Parameters
+    ----------
+    endpoint:
+        The URL to POST to (e.g. ``http://127.0.0.1:8420/scheduled-tick``).
+        Must begin with ``http://127.0.0.1`` or ``http://localhost`` to prevent
+        shell-metacharacter injection into the ``/bin/sh -c`` ExecStart line.
+    project_root:
+        Absolute path to the project root.  Used to derive the
+        ``EnvironmentFile`` path so no username is hardcoded.
+
+    Raises
+    ------
+    ValueError
+        If *endpoint* does not start with ``http://127.0.0.1`` or
+        ``http://localhost``.
+    """
+    _ALLOWED_ENDPOINT_PREFIXES = ("http://127.0.0.1", "http://localhost")
+    if not any(endpoint.startswith(p) for p in _ALLOWED_ENDPOINT_PREFIXES):
+        raise ValueError(
+            f"endpoint must start with 'http://127.0.0.1' or 'http://localhost', got {endpoint!r}"
+        )
+    return (
+        "[Unit]\n"
+        "Description=ParaMem consolidation tick (curl /scheduled-tick)\n"
+        "After=paramem-server.service\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"EnvironmentFile=-{project_root}/.env\n"
+        'ExecStart=/bin/sh -c \'printf "%s" "Authorization: Bearer $PARAMEM_API_TOKEN"'
+        f" | /usr/bin/curl -sS --fail-with-body -X POST --max-time 10 -H @- {endpoint}'\n"
+    )
 
 
 def render_timer_unit(spec: TimerSpec) -> str:
@@ -210,12 +256,31 @@ def _write_if_changed(path: Path, content: str) -> bool:
     return True
 
 
-def reconcile(schedule: str, endpoint: str = DEFAULT_ENDPOINT) -> str:
+def reconcile(
+    schedule: str,
+    endpoint: str = DEFAULT_ENDPOINT,
+    project_root: str = str(Path(__file__).resolve().parent.parent.parent),
+) -> str:
     """Reconcile the systemd user timer with the configured schedule.
 
     Returns a short human-readable description of the action taken, which the
     caller logs. Never raises on systemd errors — logs and returns a notice so
     the server still starts.
+
+    Parameters
+    ----------
+    schedule:
+        The derived consolidation period string (e.g. ``"every 12h"``).
+    endpoint:
+        URL the timer curls.  Defaults to
+        ``http://127.0.0.1:8420/scheduled-tick``.
+    project_root:
+        Absolute path to the project root used to derive the
+        ``EnvironmentFile`` path in the rendered service unit.  Defaults to
+        the project root inferred from this module's location so the server
+        lifespan can rely on the default; the ``app.py`` call site passes it
+        explicitly via ``str(Path(__file__).resolve().parent.parent.parent)``
+        for clarity and testability.
     """
     spec = parse_schedule(schedule)
     if spec is None:
@@ -239,7 +304,7 @@ def reconcile(schedule: str, endpoint: str = DEFAULT_ENDPOINT) -> str:
             changed = True
         return "consolidation timer: disabled" + (" (removed)" if changed else "")
 
-    svc_changed = _write_if_changed(SERVICE_PATH, render_service_unit(endpoint))
+    svc_changed = _write_if_changed(SERVICE_PATH, render_service_unit(endpoint, project_root))
     tmr_changed = _write_if_changed(TIMER_PATH, render_timer_unit(spec))
 
     if svc_changed or tmr_changed:

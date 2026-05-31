@@ -124,10 +124,23 @@ The auth layer is independent of the encryption mode — it governs which REST r
 
 | Posture | Condition | Effect |
 |---------|-----------|--------|
-| **OFF** | Neither configured | All REST endpoints accept any request without credentials. Startup emits a loud `AUTH: OFF` warning. Default for new installs. |
-| **ON-shared** | `PARAMEM_API_TOKEN` set | All endpoints require the single shared bearer token. Requests are authenticated but **unattributed** — no `speaker_id` is attached. |
-| **ON-per-user** | `mobile_pwa.enabled: true` | All endpoints require a per-user opaque bearer token. **Fail-closed:** a wired store with zero active tokens denies every request until at least one token is minted. Authorized requests carry a `speaker_id` bound at mint time — the only path for a text-only `/chat` call to carry a real speaker identity (the HA satellite voice path still identifies speakers by voice embedding; the PWA's `/voice` path carries the same per-user token). A `/voice` request arriving on the shared-token path (no per-user token; `auth_speaker_id` absent) identifies the speaker by voice embedding — a probabilistic assertion equivalent to satellite-level trust, weaker than a cryptographic per-user-token identity. |
-| **ON-both** | Both configured | Shared token checked first; per-user store is the fallback. |
+| **OFF** | Neither configured | All REST endpoints — conversational and admin (`/gpu/*`, `/consolidate`, `/backup/*`, etc.) — accept any request without credentials. The server is open by design: the auth middleware stamps **admin** scope on every pass-through request, so `require_admin` allows. Startup emits a loud `AUTH: OFF` warning. Default for new installs. |
+| **ON-shared** | `PARAMEM_API_TOKEN` set | All endpoints require the single shared bearer token. The shared token always carries **admin** scope (full reach). Requests are **unattributed** — no `speaker_id` is attached. |
+| **ON-per-user** | `mobile_pwa.enabled: true` | All endpoints require a per-user opaque bearer token. **Fail-closed.** Each token carries a **scope** — `chat` (the secure default, including pre-scope-field tokens) or `admin`. Admin scope is required for operational endpoints. The `chat` scope reaches `/chat`, `/voice`, `/push/*`, and `/status`. |
+| **ON-both** | Both configured | Shared token (admin scope) checked first; per-user store is the fallback. |
+
+**Token scope dimension.** Within ON-shared / ON-per-user / ON-both, every accepted token additionally carries a capability scope:
+
+| Scope | Endpoints reached | How to mint |
+|-------|------------------|-------------|
+| `admin` | All endpoints (conversational + operational) | Shared `PARAMEM_API_TOKEN`, or `mint-user-token <speaker> --scope admin`, or `--unattributed --scope admin --force-admin` |
+| `chat` | `/chat`, `/voice`, `/push/*`, `/status` only | `mint-user-token <speaker> --scope chat` (the default), or `--unattributed --scope chat` |
+
+Secure defaults: missing `scope` field in a pre-existing token record reads as `chat` at runtime. In an ON posture a `chat`-scope (or otherwise non-admin) request is denied by `require_admin`. Auth-OFF mode is the deliberate open posture — the middleware stamps `admin` scope on pass-through requests so all endpoints stay reachable without credentials.
+
+**Live reload.** Revocation and scope changes (re-mint + revoke) take effect on the running server without a restart: `UserTokenStore` re-reads `user_tokens.json` on the next authenticated request when the file's mtime changes. Encryption mode (Security ON/OFF) is honoured on reload. Accepted cross-process revocation race window: the narrow in-flight window between a revoke write and the next request; not a meaningful attack surface for typical deployment cadences.
+
+**Revoking unattributed tokens.** `revoke_speaker()` skips entries whose `speaker_id` is `None` and raises `ValueError` if called with `None` — preventing accidental bulk-revocation. Use `revoke-user-token --label <label>` to revoke an unattributed token by its device label.
 
 The shared token covers legacy deployments (HA custom component with a fixed key in `.env`). The per-user path covers the mobile PWA, where each device is issued its own token that resolves to a speaker identity on every request.
 

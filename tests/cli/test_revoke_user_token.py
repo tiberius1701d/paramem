@@ -209,8 +209,8 @@ class TestRevokeBySpeaker:
         err = capsys.readouterr().err
         assert "Speaker99" in err or "No active tokens" in err
 
-    def test_prints_restart_note(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-        """Successful --speaker revocation prints a restart-required note."""
+    def test_prints_live_reload_note(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+        """Successful --speaker revocation prints a live-reload note (no restart needed)."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
@@ -219,7 +219,10 @@ class TestRevokeBySpeaker:
         revoke_user_token.run(_make_args(cfg, speaker="Speaker0"))
 
         out = capsys.readouterr().out
-        assert "restart" in out.lower(), "output must mention that a server restart is needed"
+        # Revocation now takes effect immediately via mtime-triggered live reload.
+        assert "immediately" in out.lower() or "live reload" in out.lower(), (
+            "output must mention that revocation takes effect immediately"
+        )
 
     def test_exits_zero_on_success(self, tmp_path: Path) -> None:
         """--speaker with a matching speaker exits 0."""

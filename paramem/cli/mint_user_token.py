@@ -56,7 +56,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "speaker_id",
         metavar="SPEAKER_ID",
-        help="Speaker this token authenticates (e.g. Speaker0).",
+        nargs="?",
+        default=None,
+        help=(
+            "Speaker this token authenticates (e.g. Speaker0).  "
+            "Required unless --unattributed is given."
+        ),
     )
     p.add_argument(
         "--label",
@@ -84,6 +89,35 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default=None,
         metavar="PATH",
         help="Also save the QR as a PNG file at this path.",
+    )
+    p.add_argument(
+        "--scope",
+        choices=("chat", "admin"),
+        default="chat",
+        help=(
+            "Token capability: 'chat' (conversational endpoints only, the secure default) "
+            "or 'admin' (all endpoints, including operational ones like /gpu/*, "
+            "/consolidate, /backup/*).  Default: chat."
+        ),
+    )
+    p.add_argument(
+        "--unattributed",
+        action="store_true",
+        help=(
+            "Mint a token with no bound speaker_id (identity resolved by voice "
+            "embedding at request time).  Designed for shared devices.  "
+            "Cannot be combined with a positional SPEAKER_ID.  "
+            "Use --scope chat (the default) for a least-privilege shared device."
+        ),
+    )
+    p.add_argument(
+        "--force-admin",
+        action="store_true",
+        help=(
+            "Required when combining --scope admin with --unattributed.  "
+            "An unattributed admin token cannot be revoked by speaker; "
+            "use 'revoke-user-token --label' to revoke it."
+        ),
     )
 
 
@@ -131,11 +165,50 @@ def run(args: argparse.Namespace) -> int:
     Returns
     -------
     int
-        0 on success; 1 on error (config not found, I/O error, mint failure).
+        0 on success; 1 on error (config not found, I/O error, mint failure,
+        conflicting arguments).
     """
     import segno
 
     from paramem.server.user_tokens import UserTokenStore
+
+    # --- Argument validation (boundary checks before any I/O) ---
+    unattributed = getattr(args, "unattributed", False)
+    scope = getattr(args, "scope", "chat")
+    force_admin = getattr(args, "force_admin", False)
+
+    if unattributed and args.speaker_id is not None:
+        print(
+            "ERROR: --unattributed cannot be combined with a positional SPEAKER_ID.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not unattributed and args.speaker_id is None:
+        print(
+            "ERROR: SPEAKER_ID is required unless --unattributed is given.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if unattributed and scope == "admin" and not force_admin:
+        print(
+            "ERROR: --scope admin --unattributed requires --force-admin.\n"
+            "WARNING: An unattributed admin token cannot be revoked by speaker; "
+            "use 'revoke-user-token --label' to revoke it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if unattributed and scope == "admin" and force_admin:
+        print(
+            "WARNING: Minting an unattributed admin token.  This token cannot be "
+            "revoked by speaker — use 'revoke-user-token --label' to revoke it.",
+            file=sys.stderr,
+        )
+
+    # Resolve effective speaker_id: None for unattributed tokens.
+    effective_speaker: str | None = None if unattributed else args.speaker_id
 
     data_dir = _resolve_data_dir(args)
     if data_dir is None:
@@ -144,7 +217,7 @@ def run(args: argparse.Namespace) -> int:
     store_path = Path(data_dir) / "user_tokens.json"
 
     store = UserTokenStore(store_path)
-    token = store.mint(args.speaker_id, args.label)
+    token = store.mint(effective_speaker, args.label, scope=scope)
 
     payload = {"server_url": args.server_url, "token": token}
     json_str = json.dumps(payload)
@@ -167,8 +240,16 @@ def run(args: argparse.Namespace) -> int:
             return 1
 
     # Text fallback — operator reads this if the QR scan fails.
-    print(f"speaker_id : {args.speaker_id}")
+    speaker_display = "<unattributed>" if effective_speaker is None else effective_speaker
+    if not sys.stdout.isatty():
+        print(
+            "WARNING: plaintext token is being written to a non-terminal "
+            "(pipe or redirect); the token may be captured in a file or process substitution.",
+            file=sys.stderr,
+        )
+    print(f"speaker_id : {speaker_display}")
     print(f"server_url : {args.server_url}")
+    print(f"scope      : {scope}")
     print(f"token      : {token}")
 
     return 0
