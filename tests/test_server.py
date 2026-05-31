@@ -11,8 +11,15 @@ from paramem.server.config import MODEL_REGISTRY, ServerConfig, load_server_conf
 from paramem.server.escalation import detect_escalation
 from paramem.server.session_buffer import SessionBuffer
 
+_OPERATOR_CONFIG = Path("configs/server.yaml")
+_SKIP_NO_OPERATOR = pytest.mark.skipif(
+    not _OPERATOR_CONFIG.exists(),
+    reason="operator-local configs/server.yaml absent (CI / fresh clone)",
+)
+
 
 class TestConfig:
+    @_SKIP_NO_OPERATOR
     def test_load_default_config(self):
         config = load_server_config("configs/server.yaml")
         assert config.model_name in MODEL_REGISTRY
@@ -85,6 +92,7 @@ class TestConfig:
         config = load_server_config(config_file)
         assert config.sota_agent.api_key == ""
 
+    @_SKIP_NO_OPERATOR
     def test_prompts_path_loaded(self):
         config = load_server_config("configs/server.yaml")
         assert config.paths.prompts == Path("configs/prompts").resolve()

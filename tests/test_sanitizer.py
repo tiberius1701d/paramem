@@ -16,6 +16,10 @@ speaker actually has a "dentist" entity.  A query like "Did Pat call?"
 is personal once Pat is enrolled or graphed.
 """
 
+from pathlib import Path
+
+import pytest
+
 from paramem.server.sanitizer import check_personal_content, sanitize_for_cloud
 
 # ---------------------------------------------------------------------------
@@ -407,6 +411,10 @@ class TestSanitizationConfigCloudMode:
         assert config.sanitization.mode == "warn"
         assert config.sanitization.cloud_mode == "block"  # dataclass default
 
+    @pytest.mark.skipif(
+        not Path("configs/server.yaml").exists(),
+        reason="operator-local configs/server.yaml absent (CI / fresh clone)",
+    )
     def test_project_server_yaml_loads_cleanly(self):
         """The shipped configs/server.yaml parses without validator errors."""
         from paramem.server.config import load_server_config
