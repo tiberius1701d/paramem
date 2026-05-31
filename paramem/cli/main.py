@@ -37,6 +37,7 @@ from paramem.cli import (
     migrate_status,
     mint_user_token,
     restore,
+    revoke_user_token,
     rotate_daily,
     rotate_recovery,
 )
@@ -246,6 +247,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # --- user token management ---
     mint_user_token.add_parser(subparsers)
+    revoke_user_token.add_parser(subparsers)
 
     return parser
 
@@ -330,6 +332,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "mint-user-token":
         return mint_user_token.run(args)
+
+    if args.command == "revoke-user-token":
+        return revoke_user_token.run(args)
 
     # Unreachable after subparsers.required = True, but keeps mypy happy.
     parser.print_help(sys.stderr)

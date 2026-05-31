@@ -13,7 +13,7 @@ On-disk schema (one mandatory tier, no optional buckets):
         "tokens": {
             "<sha256hex>": {
                 "speaker_id": "Speaker0",
-                "label": "Tobias iPad",
+                "label": "Alice iPad",
                 "created": "<iso8601 utc>",
                 "revoked": false
             }
@@ -180,7 +180,7 @@ class UserTokenStore:
         speaker_id:
             The speaker this token authenticates (e.g. ``"Speaker0"``).
         label:
-            Human-readable device or purpose label (e.g. ``"Tobias iPad"``).
+            Human-readable device or purpose label (e.g. ``"Alice iPad"``).
 
         Returns
         -------
@@ -324,6 +324,37 @@ class UserTokenStore:
                 }
                 for e in self._tokens.values()
             ]
+
+    def revoke_label(self, label: str) -> int:
+        """Revoke all non-revoked tokens whose device label matches *label* exactly.
+
+        Parameters
+        ----------
+        label:
+            The exact device or purpose label to match (e.g. ``"Alice iPad"``).
+
+        Returns
+        -------
+        int
+            Number of tokens newly marked as revoked.
+
+        Raises
+        ------
+        RuntimeError
+            In Security ON mode only: if a key-eviction race causes the store
+            to be written in plaintext (see :meth:`_save`).
+        """
+        count = 0
+        with self._lock:
+            for entry in self._tokens.values():
+                if entry["label"] == label and not entry["revoked"]:
+                    entry["revoked"] = True
+                    count += 1
+            if count:
+                self._save()
+        if count:
+            logger.info("Revoked %d token(s) with label=%r", count, label)
+        return count
 
     def has_active_tokens(self) -> bool:
         """Return ``True`` if any entry has ``revoked == False``.

@@ -177,6 +177,42 @@ class TestRevoke:
 
         assert count == 0
 
+    def test_revoke_label_revokes_matching_entries(self, tmp_path, monkeypatch, store_path):
+        """revoke_label() revokes all non-revoked tokens with that exact label."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        t_phone0 = store.mint("Speaker0", "phone")
+        t_phone1 = store.mint("Speaker1", "phone")
+        t_tablet = store.mint("Speaker0", "tablet")
+
+        count = store.revoke_label("phone")
+
+        assert count == 2
+        assert store.lookup(t_phone0) is None
+        assert store.lookup(t_phone1) is None
+        assert store.lookup(t_tablet) == "Speaker0"
+
+    def test_revoke_label_unknown_returns_zero(self, tmp_path, monkeypatch, store_path):
+        """revoke_label() with an unknown label returns 0."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        store.mint("Speaker0", "tablet")
+
+        count = store.revoke_label("no-such-label")
+
+        assert count == 0
+
+    def test_revoke_label_already_revoked_returns_zero(self, tmp_path, monkeypatch, store_path):
+        """revoke_label() on an already-revoked label returns 0 (idempotent)."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        store.mint("Speaker0", "phone")
+        store.revoke_label("phone")
+
+        count = store.revoke_label("phone")
+
+        assert count == 0
+
 
 # ---------------------------------------------------------------------------
 # list() — never exposes hashes or plaintext tokens
