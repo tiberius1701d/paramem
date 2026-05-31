@@ -15,6 +15,7 @@ Tests cover:
 
 import os
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -595,6 +596,10 @@ class TestRunExtractGraphHelper:
     depends only on the local model.
     """
 
+    @pytest.mark.skipif(
+        not Path("configs/server.yaml").exists(),
+        reason="operator-local configs/server.yaml absent (CI / fresh clone)",
+    )
     def test_helper_runs_with_production_config(self, model_and_tokenizer, tmp_path):
         """Run ``loop.extraction.run`` with the exact flags from configs/server.yaml.
 
@@ -760,6 +765,10 @@ class TestVRAMBudget:
             except Exception:  # noqa: BLE001 — best-effort teardown
                 pass
 
+    @pytest.mark.skipif(
+        not Path("configs/server.yaml").exists(),
+        reason="operator-local configs/server.yaml absent (CI / fresh clone)",
+    )
     def test_fitting_config_math_and_reality(self, model_and_tokenizer):
         """Full production chain fits: validator passes AND real VRAM confirms.
 

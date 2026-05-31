@@ -13,6 +13,7 @@ short-circuit logic. This test exercises the real sanitizer and real
 YAML loader end-to-end.
 """
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -108,6 +109,10 @@ class TestSanitizerPrecondition:
         assert sanitized is not None, f"sanitizer should not block {query!r}"
 
 
+@pytest.mark.skipif(
+    not Path("configs/server.yaml").exists(),
+    reason="operator-local configs/server.yaml absent (CI / fresh clone)",
+)
 class TestAbstentionEndToEnd:
     def test_where_do_i_live_returns_canned_response(
         self, server_config, empty_adapter_router, exploding_model

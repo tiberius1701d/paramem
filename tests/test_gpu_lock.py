@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -356,6 +357,10 @@ class TestConsolidateGuard:
         assert config.training_temp_limit == 0
         assert config.training_temp_check_interval == 5
 
+    @pytest.mark.skipif(
+        not Path("configs/server.yaml").exists(),
+        reason="operator-local configs/server.yaml absent (CI / fresh clone)",
+    )
     def test_consolidation_config_from_yaml(self):
         from paramem.server.config import load_server_config
 

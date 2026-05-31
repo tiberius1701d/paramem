@@ -7,7 +7,10 @@ base model, which would otherwise confabulate plausible-sounding personal
 data (observed: untrained adapter + "Where do I live?" → "New York City").
 """
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from paramem.memory.store import MemoryStore as _MS
 from paramem.server.config import (
@@ -79,6 +82,10 @@ class TestAbstentionConfig:
             == "I'm still getting to know you, but I don't have that information yet."
         )
 
+    @pytest.mark.skipif(
+        not Path("configs/server.yaml").exists(),
+        reason="operator-local configs/server.yaml absent (CI / fresh clone)",
+    )
     def test_project_server_yaml_has_abstention_enabled(self):
         config = load_server_config("configs/server.yaml")
         assert config.abstention.enabled is True
