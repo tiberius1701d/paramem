@@ -1301,12 +1301,27 @@ class MobilePwaConfig:
 
     ``cookie_name``: name of the session cookie the mobile client will send
     on every request.  Must match whatever the SPA sets after login.
+
+    ``push_enabled``: enable Web Push notifications.  When true, the server
+    auto-generates a VAPID EC P-256 keypair on first startup (persisted as
+    ``vapid_keys.json`` in the data directory, age-encrypted when a daily key
+    is loaded) and activates the ``/push/vapid-public-key`` and
+    ``/push/subscribe`` endpoints.  Requires per-user bearer tokens (the
+    subscribe endpoint returns 403 for shared-token or unauthenticated
+    requests).  False by default (opt-in).
+
+    ``vapid_contact``: the ``sub`` claim in the VAPID JWT.  Must be a
+    ``mailto:`` URI identifying the server operator; sent to push relays for
+    abuse-contact purposes.  A sane default is provided; operators should
+    replace it with their own address.
     """
 
     enabled: bool = False
     # Empty → paramem/web/static (resolved by the static-mount slice).
     static_dir: str = ""
     cookie_name: str = "paramem_token"
+    push_enabled: bool = False
+    vapid_contact: str = "mailto:admin@localhost"
 
 
 @dataclass

@@ -335,3 +335,44 @@ class TestOnDiskSecurity:
         store2 = UserTokenStore(store_path)
 
         assert store2.lookup(token) == "Speaker0"
+
+
+# ---------------------------------------------------------------------------
+# TOCTOU guard clears in-memory state
+# ---------------------------------------------------------------------------
+
+
+class TestToctouClearsMemory:
+    def test_toctou_guard_clears_in_memory_tokens(self, tmp_path, monkeypatch, store_path):
+        """When the TOCTOU guard fires, in-memory tokens are reset.
+
+        After the RuntimeError is raised, lookup() and list() must reflect
+        cleared state — not the stale in-memory token that was inserted into
+        _tokens before _save() raised.
+        """
+        from unittest.mock import patch
+
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+
+        # Capture the token value before mint() raises so we can verify lookup.
+        known_token = "fixed-token-value-for-toctou-test"
+        monkeypatch.setattr(
+            "paramem.server.user_tokens.secrets.token_urlsafe", lambda n: known_token
+        )
+
+        def _plaintext_write(path: Path, payload: bytes) -> None:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_bytes(payload)
+
+        with patch("paramem.server.user_tokens.write_infra_bytes", side_effect=_plaintext_write):
+            with pytest.raises(RuntimeError, match="written in plaintext"):
+                store.mint("Speaker0", "TestDevice")
+
+        # After the guard fires, in-memory state must be cleared — the minted
+        # token must not authenticate even though it was inserted into _tokens
+        # before _save() raised.
+        assert store.lookup(known_token) is None, (
+            "lookup() must return None after TOCTOU guard clears in-memory state"
+        )
+        assert store.list() == [], "list() must return [] after TOCTOU guard clears in-memory state"

@@ -300,6 +300,13 @@ def infra_paths(data_dir: Path) -> list[Path]:
         data_dir / "registry" / "key_metadata.json",
         data_dir / "speaker_profiles.json",
         data_dir / "user_tokens.json",
+        # Web Push Tier-2 infra files — same posture as user_tokens.json.
+        # vapid_keys.json holds the VAPID EC private key PEM; effectively
+        # immutable once browsers have subscribed (rotation invalidates all
+        # subscriptions).  push_subscriptions.json holds per-speaker push
+        # endpoint registrations.
+        data_dir / "vapid_keys.json",
+        data_dir / "push_subscriptions.json",
         data_dir / "adapters" / "post_session_queue.json",
     ]
     # Per-tier adapter registry + simhash + graph (unified layout:

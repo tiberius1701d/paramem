@@ -155,6 +155,9 @@ class UserTokenStore:
                     self.store_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+                # Clear in-memory state so RAM does not stay out of sync with
+                # the now-deleted on-disk file.
+                self._tokens = {}
                 raise RuntimeError(
                     "user-token store written in plaintext — aborting. "
                     "The daily encryption key was evicted between the pre-write "

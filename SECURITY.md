@@ -135,6 +135,13 @@ The shared token covers legacy deployments (HA custom component with a fixed key
 
 - Tokens are opaque random secrets. The plaintext token is displayed once at mint time (via `paramem mint-user-token`; see `README.md`) and never stored or logged. Only the `sha256(token)` hash is persisted on disk, in `user_tokens.json`.
 - `user_tokens.json` follows the deployment-wide encryption posture: plaintext under Security OFF, age-encrypted when the daily key is loaded. It is covered by the startup mode-consistency check — a plaintext credential file alongside a loaded key is refused at startup.
+
+**Web Push infrastructure files (when `mobile_pwa.push_enabled: true`):**
+
+- `vapid_keys.json` — EC P-256 VAPID private key (PEM). Auto-generated on first startup when push is enabled; auto-loaded on subsequent startups. Both files follow the same encryption posture as `user_tokens.json`: plaintext under Security OFF, age-encrypted under Security ON, covered by the startup mode-consistency scan via `infra_paths()`.
+- `push_subscriptions.json` — per-speaker Web Push endpoint registrations. Schema: `{"version":1, "subscriptions": {"<speaker_id>": [{endpoint, keys:{p256dh,auth}}...]}}`.
+- **VAPID key stability:** rotating `vapid_keys.json` invalidates all existing browser push subscriptions (browsers will not receive notifications until they re-subscribe). Treat the keypair as effectively immutable once browsers have subscribed. Key rotation is intentionally out of scope.
+- **Notification-only ping posture:** no personal content passes through the push relay. The push payload is intentionally empty (or carries only a generic title); real content is fetched by the client after the user taps the notification.
 - **Revocation** is per-token or per-speaker and takes effect immediately on the next request. Revoking the last active token in the store keeps the auth layer fail-closed rather than silently reverting to open access.
 - **Token carriers:** `Authorization: Bearer <token>` HTTP header, or an `httpOnly; Secure; SameSite=Strict` cookie set by the server during the PWA onboarding flow (same-origin — the PWA is served from the ParaMem server itself). Header takes precedence over cookie.
 
