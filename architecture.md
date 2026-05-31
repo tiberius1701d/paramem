@@ -263,6 +263,13 @@ Language detection flows from two sources, both feeding the same resolver in `/c
 
 `_language_instruction()` injects "Respond in {language}" into system prompts for non-English input. Speaker profiles persist `preferred_language` for cross-session consistency on the voice path; the text path has no speaker-preference fallback (text `/chat` cannot identify a speaker without a voice embedding), so the detector's confidence threshold is conservative.
 
+**Transport-agnostic STT/embedding seam.** STT transcription and optional voice-embedding extraction are factored into `process_utterance` (`paramem/server/voice_pipeline.py`), called by both the Wyoming satellite handler and the `POST /voice` endpoint. The two callers differ only in how they establish speaker identity:
+
+- **Wyoming satellite path:** `process_utterance` runs STT **and** computes the voice embedding (`compute_embedding=True`). The embedding is matched against enrolled speaker profiles to identify the caller.
+- **`POST /voice` (mobile PWA) — token-type selector:** when the device carries a per-user bearer token (`auth_speaker_id` set), `process_utterance` runs STT only (`compute_embedding=False`) and identity is resolved from the token. When the device carries the shared token (`auth_speaker_id is None`), `compute_embedding=True` and the embedding is passed through `_resolve_and_enroll_speaker` — the same async helper called by `POST /chat` — which runs deferred enrollment, name-disclosure, language-preference update, anonymization, and greeting. A fresh per-utterance `conversation_id` is generated on each shared-token request (one POST = one push-to-talk press); `session_buffer.claim_sessions_for_speaker` propagates identity across conversation_ids by embedding so two-turn enrollment is preserved.
+
+Both paths feed the transcript into `_run_chat_turn` — the same turn-orchestrator as `POST /chat` (debounce, routing, post-session training, greeting, language detection). The reply is synthesised through `TTSManager` using the per-language voice configured in `server.yaml` (e.g. Kokoro `af_heart` for English). The `/voice` response body is `{transcript, reply, audio, audio_format, follow_up}`: `audio` is a base64-encoded RIFF/PCM int16 mono WAV (or `""` when TTS is unavailable, caller falls back to text-only); `follow_up` carries the enrollment/greeting prompt when one is pending, else `null`. Status codes: `503` when STT is not loaded (cloud-only mode), `413` for payloads over 25 MB, `400` for audio-decode failure, `404` when `mobile_pwa.enabled` is false.
+
 ### AD-19: Intent Classification — LLM-Default with Encoder Fallback
 
 Routing in `/chat` dispatches on a single `Intent` value

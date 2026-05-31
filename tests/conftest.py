@@ -44,9 +44,25 @@ if not _gpu_explicitly_requested(sys.argv):
     # acquisition is what actually contends).
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+# ``_api_token`` in app.py is captured at import time (module-level
+# ``load_token_from_env()``).  Some test modules (e.g.
+# ``test_dataset_probe_commit.py``) import experiment scripts that call
+# ``load_dotenv`` at module level during pytest collection, re-seeding
+# ``PARAMEM_API_TOKEN`` from ``.env`` AFTER conftest's module-level code but
+# BEFORE app.py is first imported.  This causes BearerTokenMiddleware to be
+# constructed with a real token and then 401 every test client that doesn't
+# include it.
+#
+# Fix: pop the env var AND force-import app.py here so the middleware is
+# constructed while the token is absent.  Python caches the module in
+# ``sys.modules``; the later ``load_dotenv`` call sets the env var but the
+# already-built middleware retains ``self._token = ""``.
+os.environ.pop("PARAMEM_API_TOKEN", None)
+
 # ---------------------------------------------------------------------------
 
-import pytest  # noqa: E402  (must follow the CUDA gate above)
+import pytest  # noqa: E402,I001  (must follow the CUDA gate above)
+import paramem.server.app as _app_preload  # noqa: E402,F401  # force pre-collection import
 
 
 def pytest_addoption(parser):

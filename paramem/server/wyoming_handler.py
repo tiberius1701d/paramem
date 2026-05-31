@@ -27,6 +27,7 @@ from wyoming.tts import (
 )
 
 from paramem.server.config import ISO_LANGUAGE_NAMES
+from paramem.server.voice_pipeline import process_utterance
 
 if TYPE_CHECKING:
     from paramem.server.tts import TTSManager
@@ -93,93 +94,48 @@ class SpeakerSTTHandler(AsyncEventHandler):
         return True
 
     async def _process_audio(self) -> None:
-        """Transcribe accumulated audio and return result."""
-        if not self._audio_buffer:
-            logger.warning("Empty audio buffer — nothing to transcribe")
-            await async_write_event(Transcript(text="").event(), self.writer)
-            return
+        """Transcribe accumulated audio and dispatch Wyoming + ParaMem callbacks.
 
-        # Check if STT is still loaded (may have been released for GPU)
-        if self._stt is None or not self._stt.is_loaded:
-            logger.warning("STT model not loaded — returning empty transcript")
-            await async_write_event(Transcript(text="").event(), self.writer)
-            return
-
+        The GPU/CPU core (empty-buffer guard, STT-not-loaded guard, transcription
+        under the GPU lock, and optional speaker-embedding computation) is
+        delegated to :func:`~paramem.server.voice_pipeline.process_utterance`.
+        This method handles only the Wyoming-specific parts: writing the
+        ``Transcript`` event to the TCP stream and invoking the server-state
+        callbacks (language detection, embedding store, chat forwarding).
+        The callback / write order is preserved:
+          1. Language callback (propagate detected language to server state).
+          2. Embedding callback (store latest embedding in server state).
+          3. ``Transcript`` write (send result back via Wyoming protocol).
+          4. Chat callback (forward transcript + embedding to ParaMem /chat).
+        """
         audio_bytes = bytes(self._audio_buffer)
-        duration = len(audio_bytes) / (self._sample_rate * self._sample_width * self._channels)
-        logger.info(
-            "Processing %d bytes of audio (%.1fs at %dHz)",
-            len(audio_bytes),
-            duration,
+
+        utterance = await process_utterance(
+            audio_bytes,
             self._sample_rate,
+            self._sample_width,
+            self._channels,
+            self._stt,
+            compute_embedding=self._speaker_store is not None,
+            min_embedding_duration_seconds=self._min_embedding_duration_seconds,
         )
 
-        # Validate audio format
-        if self._sample_width != 2:
-            logger.warning(
-                "Unexpected sample width %d (expected 2 for int16)",
-                self._sample_width,
-            )
-        if self._channels != 1:
-            logger.warning(
-                "Unexpected channel count %d (expected 1 for mono)",
-                self._channels,
-            )
+        text = utterance.text
 
-        # Transcribe with GPU lock to prevent concurrent GPU access with LLM/training
-        loop = asyncio.get_running_loop()
-        async with _gpu_lock():
-            result = await loop.run_in_executor(
-                None, self._stt.transcribe, audio_bytes, self._sample_rate
-            )
-
-        text = result.text
-        logger.info(
-            "Transcript: '%s' (lang=%s, prob=%.2f)",
-            text[:100] if text else "(empty)",
-            result.language,
-            result.language_probability,
-        )
-
-        # Propagate detected language to server state
+        # 1. Propagate detected language to server state
         if self._language_callback and text:
-            self._language_callback(result.language, result.language_probability)
+            self._language_callback(utterance.language, utterance.language_probability)
 
-        # Compute speaker embedding on CPU (no GPU lock needed)
-        embedding = None
-        if self._speaker_store is not None:
-            embedding = await loop.run_in_executor(None, self._compute_embedding, audio_bytes)
-            if embedding and self._embedding_callback:
-                self._embedding_callback(embedding)
+        # 2. Store latest embedding in server state
+        if utterance.embedding is not None and self._embedding_callback:
+            self._embedding_callback(utterance.embedding)
 
-        # Send transcript back via Wyoming protocol
+        # 3. Send transcript back via Wyoming protocol
         await async_write_event(Transcript(text=text or "").event(), self.writer)
 
-        # If we have a chat callback, forward transcript + embedding to ParaMem
+        # 4. Forward transcript + embedding to ParaMem
         if self._chat_callback and text:
-            await self._chat_callback(text, embedding)
-
-    def _compute_embedding(self, audio_bytes: bytes) -> list[float] | None:
-        """Compute speaker embedding from audio on CPU.
-
-        Duration filtering is delegated to compute_speaker_embedding() via
-        min_duration_seconds so the gate is based on audio length, not word count.
-        """
-        try:
-            from paramem.server.speaker_embedding import compute_speaker_embedding
-
-            embedding = compute_speaker_embedding(
-                audio_bytes,
-                self._sample_rate,
-                min_duration_seconds=self._min_embedding_duration_seconds,
-            )
-            return embedding if embedding else None
-        except ImportError:
-            logger.debug("Speaker embedding not available — install paramem[speaker]")
-            return None
-        except Exception:
-            logger.warning("Speaker embedding computation failed", exc_info=True)
-            return None
+            await self._chat_callback(text, utterance.embedding)
 
     async def _send_info(self) -> None:
         """Respond to Describe event with service info."""

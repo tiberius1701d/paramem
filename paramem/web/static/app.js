@@ -5,10 +5,16 @@
  *   POST /chat  { text: string, conversation_id: string }
  *               → { text: string, escalated?: boolean, speaker?: string, follow_up?: string }
  *
+ * Voice path:
+ *   POST /voice  body = raw audio Blob (audio/mp4 on iOS, audio/webm;codecs=opus on Android)
+ *               headers: Authorization, Content-Type, x-conversation-id
+ *               → { transcript: string, reply: string, audio?: string, audio_format?: string, follow_up?: string }
+ *   Push-to-talk: pointerdown → getUserMedia → MediaRecorder start
+ *                 pointerup/pointercancel → stop recorder → POST /voice → render
+ *
  * Auth: Authorization: Bearer <token>  (app.py:2352, auth.py:30)
  * Same-origin by default (StaticFiles at /app, API at same origin).
  *
- * Phase 4: voice capture — not implemented.
  * Phase 5: push notifications — not implemented.
  */
 
@@ -29,6 +35,12 @@ let conversationId = "";
 let inFlight = false;
 let scannerStream = null;
 let barcodeDetector = null;
+
+// Voice / push-to-talk state
+let micRecorder = null;       // active MediaRecorder instance while recording
+let micChunks = [];           // audio chunks collected during capture
+let micStream = null;         // getUserMedia stream (stopped on release)
+let micVoiceSupported = null; // null = unchecked, true/false after first attempt
 
 // ---------------------------------------------------------------------------
 // DOM refs (resolved after DOMContentLoaded)
@@ -156,10 +168,8 @@ function wireEvents() {
     textInput.style.height = textInput.scrollHeight + "px";
   });
 
-  // Mic: stubbed — Phase 4
-  micBtn.addEventListener("click", () => {
-    appendMessage("system", "Voice is coming in a later update.");
-  });
+  // Mic: push-to-talk — hold to record, release to send.
+  wireMicButton();
 
   scannerCancel.addEventListener("click", stopScanner);
 
@@ -231,13 +241,19 @@ async function handleSend() {
 }
 
 /**
- * Toggles the in-flight state and disables/enables the send button.
+ * Toggles the in-flight state and disables/enables interactive controls.
+ * Disabling the mic button while a text request is in flight prevents
+ * concurrent submissions; re-enabling restores it unless it was already
+ * marked unsupported.
  *
  * @param {boolean} state - true while a request is in progress.
  */
 function setInFlight(state) {
   inFlight = state;
   sendBtn.disabled = state;
+  if (!micBtn.classList.contains("unsupported")) {
+    micBtn.disabled = state;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +321,202 @@ function saveSettings() {
   localStorage.setItem(KEY_SERVER_URL, serverUrl);
   localStorage.setItem(KEY_TOKEN, token);
   closeSettings();
+}
+
+// ---------------------------------------------------------------------------
+// Voice capture (push-to-talk, MediaRecorder → POST /voice)
+// ---------------------------------------------------------------------------
+
+/**
+ * Wires push-to-talk events onto the mic button.
+ *
+ * Uses pointer events (covers both mouse and touch with a single listener
+ * pair). pointerdown starts capture; pointerup / pointercancel stops it and
+ * submits.  If getUserMedia or MediaRecorder is unavailable the button is
+ * marked unsupported once and further presses are ignored.
+ */
+function wireMicButton() {
+  micBtn.addEventListener("pointerdown", handleMicDown);
+  micBtn.addEventListener("pointerup", handleMicUp);
+  micBtn.addEventListener("pointercancel", handleMicUp);
+}
+
+/**
+ * Starts audio capture when the mic button is pressed.
+ * Requests the mic, creates a MediaRecorder, and begins collecting chunks.
+ * Marks the button unsupported if getUserMedia / MediaRecorder is absent.
+ *
+ * @param {PointerEvent} e
+ */
+async function handleMicDown(e) {
+  e.preventDefault(); // prevent ghost click on touch devices
+
+  if (inFlight || micRecorder) return;
+
+  // One-time capability check
+  if (micVoiceSupported === false) return;
+  if (
+    typeof navigator.mediaDevices === "undefined" ||
+    typeof MediaRecorder === "undefined"
+  ) {
+    micVoiceSupported = false;
+    micBtn.classList.add("unsupported");
+    micBtn.disabled = true;
+    micBtn.setAttribute("title", "Voice not supported in this context");
+    micBtn.setAttribute("aria-label", "Voice not supported in this context");
+    appendMessage("system", "Voice input is not available in this browser or context.");
+    return;
+  }
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+  } catch (err) {
+    micVoiceSupported = false;
+    micBtn.classList.add("unsupported");
+    micBtn.disabled = true;
+    appendMessage("error", `Microphone access denied: ${err.message || String(err)}`);
+    return;
+  }
+
+  micVoiceSupported = true;
+  micChunks = [];
+
+  micRecorder = new MediaRecorder(micStream);
+  micRecorder.addEventListener("dataavailable", (ev) => {
+    if (ev.data && ev.data.size > 0) micChunks.push(ev.data);
+  });
+  micRecorder.start();
+
+  micBtn.classList.add("recording");
+  micBtn.setAttribute("aria-label", "Recording… release to send");
+}
+
+/**
+ * Stops audio capture when the mic button is released (or the pointer leaves).
+ * Assembles the recorded Blob and POSTs it to /voice.
+ * Does nothing if no recording is in progress.
+ *
+ * @param {PointerEvent} e
+ */
+async function handleMicUp(e) {
+  e.preventDefault();
+
+  if (!micRecorder) return;
+
+  const recorder = micRecorder;
+  const stream = micStream;
+  micRecorder = null;
+  micStream = null;
+
+  micBtn.classList.remove("recording");
+  micBtn.setAttribute("aria-label", "Hold to record voice input");
+
+  // Stop recorder and await the final dataavailable + stop events.
+  await new Promise((resolve) => {
+    recorder.addEventListener("stop", resolve, { once: true });
+    recorder.stop();
+  });
+
+  // Stop all mic tracks so the browser indicator clears.
+  for (const track of stream.getTracks()) track.stop();
+
+  const mimeType = recorder.mimeType || "audio/webm";
+  const blob = new Blob(micChunks, { type: mimeType });
+  micChunks = [];
+
+  // Guard: too-short / empty captures (e.g. accidental tap)
+  if (blob.size < 1000) {
+    appendMessage("system", "Recording too short — hold the button while speaking.");
+    return;
+  }
+
+  await submitVoice(blob, mimeType);
+}
+
+/**
+ * POSTs a recorded audio Blob to POST /voice and renders the result.
+ * Reuses the same token / serverUrl / conversationId as the text path.
+ * On success renders the transcript as a user bubble and the reply as an
+ * assistant bubble via appendMessage (same helper as handleSend).
+ *
+ * Error handling:
+ *   401 → auth failed message + openSettings
+ *   503 (stt_unavailable in body) → "voice isn't available right now"
+ *   other non-2xx → readable server error
+ *   network failure → readable network error
+ *
+ * @param {Blob} blob - The recorded audio data.
+ * @param {string} mimeType - MIME type reported by MediaRecorder (e.g. "audio/mp4").
+ */
+async function submitVoice(blob, mimeType) {
+  if (inFlight) return;
+  setInFlight(true);
+  const typingEl = appendTyping();
+
+  try {
+    const base = serverUrl || "";
+    const resp = await fetch(`${base}/voice`, {
+      method: "POST",
+      headers: {
+        "Content-Type": mimeType,
+        ...(token ? { "Authorization": `Bearer ${token}` } : {}),
+        "x-conversation-id": conversationId,
+      },
+      body: blob,
+    });
+
+    typingEl.remove();
+
+    if (resp.status === 401) {
+      appendMessage("error", "Authentication failed — re-enter your token in Settings.");
+      openSettings();
+      return;
+    }
+
+    if (resp.status === 503) {
+      appendMessage("system", "Voice isn't available right now — try text instead.");
+      return;
+    }
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      appendMessage("error", `Server error ${resp.status}${body ? ": " + body.slice(0, 120) : ""}`);
+      return;
+    }
+
+    const data = await resp.json();
+    // VoiceResponse shape: { transcript, reply, audio?, audio_format?, follow_up? }
+    if (data.transcript) {
+      appendMessage("user", data.transcript);
+    }
+    if (data.reply) {
+      appendMessage("assistant", data.reply);
+    }
+    if (data.follow_up) {
+      appendMessage("assistant", data.follow_up);
+    }
+    // Play synthesized audio when the server provided a WAV payload.
+    // The play() call sits inside the user-gesture chain (pointer-up → submitVoice)
+    // so autoplay is permitted on iOS/Android.  If play() rejects (e.g. the page
+    // was backgrounded) we swallow the error — the text reply is already rendered.
+    if (data.audio) {
+      try {
+        const wavBytes = Uint8Array.from(atob(data.audio), c => c.charCodeAt(0));
+        const wavBlob = new Blob([wavBytes], { type: "audio/wav" });
+        const url = URL.createObjectURL(wavBlob);
+        const audioEl = new Audio(url);
+        audioEl.addEventListener("ended", () => URL.revokeObjectURL(url), { once: true });
+        audioEl.play().catch(() => URL.revokeObjectURL(url));
+      } catch (_e) {
+        // Audio playback is best-effort; text reply already shown above.
+      }
+    }
+  } catch (err) {
+    typingEl.remove();
+    appendMessage("error", `Network error: ${err.message || String(err)}`);
+  } finally {
+    setInFlight(false);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -202,7 +202,15 @@
     #mic-btn {
       background: var(--surface2);
       color: var(--text-muted);
-      cursor: default;
+    }
+    #mic-btn:disabled { opacity: 0.4; cursor: default; }
+    #mic-btn.recording {
+      background: var(--accent);
+      color: #fff;
+    }
+    #mic-btn.unsupported {
+      opacity: 0.4;
+      cursor: not-allowed;
     }
 
     /* Settings overlay */
@@ -327,9 +335,8 @@
       </button>
       <button
         id="mic-btn"
-        aria-label="Voice input (coming soon)"
-        title="Voice coming in a later update"
-        disabled
+        aria-label="Hold to record voice input"
+        title="Hold to speak"
       >
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
