@@ -568,6 +568,112 @@ A device used by more than one person — e.g. a kitchen tablet — is **not** g
 
 **Privilege caveat.** The shared token is the gateway credential — it grants access to *every* REST endpoint, including the operational ones (`/gpu/release`, `/consolidate`, `/backup`). A device holding it therefore has full administrative reach, and there is no scoped-unattributed token class today. Restrict exposure at the network layer (the server is reached over Tailscale / LAN, never the public internet) rather than relying on token scope.
 
+#### Household topology quick guide
+
+| Scenario | Token to issue | Identity source |
+|----------|---------------|-----------------|
+| Personal phone / tablet (one person) | Per-user token (`mint-user-token`) | Token binding — cheap, no embedding |
+| Shared device (kitchen tablet, multiple speakers) | Shared token (`PARAMEM_API_TOKEN`) | Voice embedding — enrollment flow runs automatically |
+
+When in doubt, issue a per-user token for every person who has their own device. Reserve the shared token for devices where you genuinely cannot predict who is speaking in advance.
+
+#### PWA installation
+
+**iOS / iPadOS (Safari only)**
+
+1. Open `https://<your-host>.<your-tailnet>.ts.net/app` in **Safari** (Chrome on iOS does not support PWA install or Web Push).
+2. Tap the Share button (the box-with-arrow icon in the toolbar).
+3. Scroll down and tap **Add to Home Screen**.
+4. Accept the default name or rename it, then tap **Add**.
+5. Launch the app from the Home Screen icon — it opens full-screen without the Safari chrome.
+
+Web Push requires iOS/iPadOS 16.4 or later. The PWA must be launched from the Home Screen icon (not opened in Safari) to receive push notifications.
+
+**Android (Chrome)**
+
+1. Open `https://<your-host>.<your-tailnet>.ts.net/app` in Chrome.
+2. Chrome shows a banner or a small install icon in the address bar; tap **Install** (or use the three-dot menu → **Add to Home Screen**).
+3. Tap **Install** in the confirmation dialog.
+4. Launch from the Home Screen icon.
+
+#### Per-user onboarding walkthrough
+
+This is the flow for adding a household member (e.g. "Alice's iPhone") to an existing deployment.
+
+**Admin side (run once per device)**
+
+```bash
+paramem mint-user-token Speaker1 \
+    --label "Alice iPhone" \
+    --server-url "https://<your-host>.<your-tailnet>.ts.net" \
+    --png /tmp/alice-iphone-qr.png
+```
+
+The command prints a terminal QR code and a text fallback line (`token: <value>`). The QR encodes `{"server_url": "...", "token": "..."}`. Hand the QR (or the PNG) to the member — the plaintext token is never stored on disk.
+
+**Member side (one-time setup on their device)**
+
+1. Open the PWA URL in Safari (iOS) or Chrome (Android).
+2. Tap the gear icon (top-right) to open Settings.
+3. Enter the server URL in the **Server URL** field.
+4. Paste the token into the **Bearer token** field, or tap **Scan QR code** (Android Chrome only — requires `BarcodeDetector` support) and point the camera at the QR.
+5. Tap **Save**. The PWA stores the token in `localStorage` and sends it as `Authorization: Bearer` on every subsequent request.
+6. Grant microphone permission when prompted (for voice), and notification permission when prompted (for Web Push, if enabled).
+7. The app is now paired. Text and voice queries carry the member's `speaker_id` automatically.
+
+Deep-link alternative: if you encode the QR payload into a URL (`https://<host>/app#token=<token>&url=<server-url>`), the member can tap the link in a message and the PWA processes the `#token=` fragment on load, storing credentials without manual entry.
+
+#### Token revocation
+
+Use `paramem revoke-user-token` to revoke tokens without manually editing the encrypted store:
+
+```bash
+# List current tokens (speaker_id, label, created, revoked):
+paramem revoke-user-token --list --config configs/server.yaml
+
+# Revoke all tokens for a speaker (e.g. lost device, access change):
+paramem revoke-user-token --speaker Speaker0 --config configs/server.yaml
+
+# Revoke by device label (e.g. revoke a specific device only):
+paramem revoke-user-token --label "phone" --config configs/server.yaml
+
+# Skip the confirmation prompt in scripts:
+paramem revoke-user-token --speaker Speaker0 --yes --config configs/server.yaml
+```
+
+The command reads and writes `user_tokens.json` via the same encrypted-store path as `mint-user-token` — no manual decrypt/re-encrypt step is needed. If `PARAMEM_DAILY_PASSPHRASE` is set and the daily key is loaded (Security ON), the store is read and written as an age envelope automatically.
+
+**Restart required.** The running server loads the token store once at startup and holds it in memory; the in-process store is not refreshed from disk between requests. After running `revoke-user-token`, restart the server with `systemctl --user restart paramem-server` for the revocation to take effect on the live service.
+
+A revoked token causes a `401 Unauthorized` response; the PWA reopens the Settings drawer automatically.
+
+#### Enabling Web Push
+
+Web Push is opt-in and off by default. To enable it:
+
+1. In `configs/server.yaml`, set `mobile_pwa.push_enabled: true` and update `mobile_pwa.vapid_contact` to a real `mailto:` address (the default `mailto:admin@localhost` is valid but browsers may reject it as non-canonical).
+2. Restart the server. A VAPID EC P-256 keypair is auto-generated on the first start with push enabled and persisted to `<paths.data>/vapid_keys.json`.
+3. Each PWA client subscribes automatically on the next launch after the token is saved — the client calls `GET /push/vapid-public-key`, then `POST /push/subscribe`, and the server stores the endpoint in `<paths.data>/push_subscriptions.json`.
+
+The VAPID keypair must remain stable: rotating it invalidates all existing browser subscriptions (they will not receive notifications until they re-open the app and re-subscribe). The PWA must be installed to the Home Screen and launched from there — a browser tab does not receive push notifications on iOS.
+
+Push payloads carry no personal content. The notification is a generic ping; the member opens the app to read the actual reply.
+
+#### Troubleshooting
+
+- **The PWA URL shows a bearer-token prompt / raw API JSON instead of the chat UI.** Either `mobile_pwa.enabled` is `false` in the server config (check `/status`), or you navigated to `/` instead of `/app`. The PWA shell is served at `/app`.
+- **"Enter your bearer token in Settings to get started" appears on every launch.** The token was not saved — tap the gear icon, paste the token, and tap **Save**.
+- **Push notifications do not arrive.**
+  - The PWA must be installed to the Home Screen and launched from the icon, not opened as a browser tab.
+  - On iOS, check Settings → Notifications → ParaMem and confirm notifications are allowed.
+  - On Android, long-press the Home Screen icon → App info → Notifications.
+  - Verify `mobile_pwa.push_enabled: true` and that the VAPID contact is a valid `mailto:` address.
+- **Voice (mic button) has no effect or shows "unsupported".**
+  - iOS: microphone access for the PWA must be granted in Settings → Privacy & Security → Microphone → Safari.
+  - Android: allow microphone in the site permissions (tap the lock icon in the Chrome address bar).
+  - The PWA must be served over HTTPS — `getUserMedia` is not available on plain HTTP.
+- **401 on every request after revoking a token.** Open Settings in the PWA, clear the token field, and paste a newly minted token.
+
 ### GPU Lifecycle
 
 The server shares the GPU with ML workloads.  Release is brokered by
