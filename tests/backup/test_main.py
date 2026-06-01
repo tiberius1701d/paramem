@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import types
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from paramem.backup import __main__ as backup_main
+from paramem.cli import http_client
 
 
 def _fake_config(tmp_path: Path, *, schedule: str = "daily 04:00", port: int = 8420):
@@ -50,9 +52,10 @@ def test_delegates_to_server_when_reachable(config_file, monkeypatch):
     cfg_path, _ = config_file
     calls = {}
 
-    def fake_post(url, body, *, timeout):
+    def fake_post(url, body, *, timeout, token=None):
         calls["url"] = url
         calls["body"] = body
+        calls["token"] = token
         return {
             "success": True,
             "tier": "daily",
@@ -85,7 +88,7 @@ def test_falls_back_to_degraded_state_when_unreachable(config_file, monkeypatch)
     cfg_path, _ = config_file
     from paramem.cli import http_client
 
-    def fake_post(url, body, *, timeout):
+    def fake_post(url, body, *, timeout, token=None):
         raise http_client.ServerUnreachable("connection refused")
 
     monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
@@ -117,7 +120,7 @@ def test_falls_back_to_degraded_state_when_endpoint_missing(config_file, monkeyp
     cfg_path, _ = config_file
     from paramem.cli import http_client
 
-    def fake_post(url, body, *, timeout):
+    def fake_post(url, body, *, timeout, token=None):
         raise http_client.ServerUnavailable("404 from /backup/create")
 
     monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
@@ -161,7 +164,7 @@ def test_delegated_failure_returns_1(config_file, monkeypatch):
     """Server returns success=False (e.g. disk pressure) → exit 1."""
     cfg_path, _ = config_file
 
-    def fake_post(url, body, *, timeout):
+    def fake_post(url, body, *, timeout, token=None):
         return {
             "success": False,
             "tier": "daily",
@@ -185,7 +188,7 @@ def test_server_http_error_returns_1_without_fallback(config_file, monkeypatch):
     cfg_path, _ = config_file
     from paramem.cli import http_client
 
-    def fake_post(url, body, *, timeout):
+    def fake_post(url, body, *, timeout, token=None):
         raise http_client.ServerHTTPError(500, f"{url}", "boom")
 
     monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
@@ -203,3 +206,119 @@ def test_missing_config_returns_1(tmp_path):
     """Nonexistent config path → exit 1 before any work."""
     rc = backup_main.main(["--config", str(tmp_path / "nope.yaml")])
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# http_client.post_json — token / Authorization header
+# ---------------------------------------------------------------------------
+
+
+class TestPostJsonToken:
+    """Unit tests for the token parameter added to http_client.post_json."""
+
+    def _make_mock_response(self, status_code=200, json_body=None):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.json.return_value = json_body or {"ok": True}
+        resp.text = ""
+        return resp
+
+    def test_token_sets_authorization_header(self):
+        """post_json(token='abc') → Authorization: Bearer abc sent to httpx."""
+        captured_headers = {}
+
+        def fake_post(url, *, json=None, headers=None):
+            captured_headers.update(headers or {})
+            return self._make_mock_response()
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = lambda s: mock_client
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post = fake_post
+
+        with patch("paramem.cli.http_client.httpx.Client", return_value=mock_client):
+            http_client.post_json("http://127.0.0.1:8420/test", token="my-token")
+
+        assert captured_headers.get("Authorization") == "Bearer my-token"
+
+    def test_no_token_sends_no_authorization_header(self):
+        """post_json() with no token → no Authorization header."""
+        captured_headers = {}
+
+        def fake_post(url, *, json=None, headers=None):
+            captured_headers.update(headers or {})
+            return self._make_mock_response()
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = lambda s: mock_client
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post = fake_post
+
+        with patch("paramem.cli.http_client.httpx.Client", return_value=mock_client):
+            http_client.post_json("http://127.0.0.1:8420/test")
+
+        assert "Authorization" not in captured_headers
+
+    def test_token_none_explicit_sends_no_header(self):
+        """post_json(token=None) → no Authorization header (backward-compatible)."""
+        captured_headers = {}
+
+        def fake_post(url, *, json=None, headers=None):
+            captured_headers.update(headers or {})
+            return self._make_mock_response()
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = lambda s: mock_client
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post = fake_post
+
+        with patch("paramem.cli.http_client.httpx.Client", return_value=mock_client):
+            http_client.post_json("http://127.0.0.1:8420/test", token=None)
+
+        assert "Authorization" not in captured_headers
+
+
+def test_token_passed_to_post_json_when_env_set(config_file, monkeypatch):
+    """PARAMEM_API_TOKEN in env → token forwarded to post_json as Authorization bearer."""
+    cfg_path, _ = config_file
+    monkeypatch.setenv("PARAMEM_API_TOKEN", "test-secret-token")
+    calls = {}
+
+    def fake_post(url, body, *, timeout, token=None):
+        calls["token"] = token
+        return {
+            "success": True,
+            "tier": "daily",
+            "written_slots": {},
+            "skipped_artifacts": [],
+            "error": None,
+        }
+
+    monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
+    monkeypatch.setattr("paramem.backup.runner.run_scheduled_backup", lambda **k: None)
+
+    backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+    assert calls.get("token") == "test-secret-token"
+
+
+def test_token_is_none_when_env_unset(config_file, monkeypatch):
+    """PARAMEM_API_TOKEN absent → token=None (unauthenticated, preserves auth-OFF behaviour)."""
+    cfg_path, _ = config_file
+    monkeypatch.delenv("PARAMEM_API_TOKEN", raising=False)
+    calls = {}
+
+    def fake_post(url, body, *, timeout, token=None):
+        calls["token"] = token
+        return {
+            "success": True,
+            "tier": "daily",
+            "written_slots": {},
+            "skipped_artifacts": [],
+            "error": None,
+        }
+
+    monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
+    monkeypatch.setattr("paramem.backup.runner.run_scheduled_backup", lambda **k: None)
+
+    backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+    assert calls.get("token") is None

@@ -46,6 +46,16 @@ class TestRenderServiceUnit:
         assert "/my/python" in content
         assert "/my/project" in content
 
+    def test_render_service_unit_contains_environment_file(self):
+        """render_service_unit must include EnvironmentFile so PARAMEM_API_TOKEN is available."""
+        content = render_service_unit("/usr/bin/python", "/opt/paramem")
+        assert "EnvironmentFile=-/opt/paramem/.env" in content
+
+    def test_render_service_unit_environment_file_uses_project_root(self):
+        """EnvironmentFile path is derived from project_root, not hardcoded."""
+        content = render_service_unit("/usr/bin/python", "/custom/root")
+        assert "EnvironmentFile=-/custom/root/.env" in content
+
 
 # ---------------------------------------------------------------------------
 # render_timer_unit
