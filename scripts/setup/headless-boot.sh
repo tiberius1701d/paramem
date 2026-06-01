@@ -75,6 +75,12 @@ if $IS_WSL; then
     elif echo "$OUT" | grep -qi "Access is denied"; then
         echo "headless-boot: a restricted (legacy SYSTEM-owned) '$TASK_NAME' exists; will replace it on reconcile." >&2
     fi
+    # ParaMem-Port-Forward is co-registered with TASK_NAME (same elevated payload).
+    # If either is absent, treat TASK_NOW=false so the reconcile path registers both.
+    if $TASK_NOW && ! schtasks.exe /Query /TN 'ParaMem-Port-Forward' >/dev/null 2>&1; then
+        echo "headless-boot: 'ParaMem-Port-Forward' task absent — will register alongside '$TASK_NAME'." >&2
+        TASK_NOW=false
+    fi
     # .wslconfig keepalive present? (both managed keys set to -1)
     CFG=$(powershell.exe -NoProfile -Command "\$p=Join-Path \$env:USERPROFILE '.wslconfig'; if (Test-Path \$p) { Get-Content -Raw \$p }" 2>/dev/null | tr -d '\r')
     if echo "$CFG" | grep -qi 'instanceIdleTimeout=-1' && echo "$CFG" | grep -qi 'vmIdleTimeout=-1'; then
@@ -298,15 +304,30 @@ if $IS_WSL; then
                 # Supersede the hand-rolled 'Start WSL' workaround (logon-trigger,
                 # no delay/retry) now that the correct startup task exists.
                 PS+="Unregister-ScheduledTask -TaskName 'Start WSL' -Confirm:\$false -ErrorAction SilentlyContinue;"
-                PS+="Write-Host 'Task $TASK_NAME registered (principal $WIN_USER / S4U); legacy ''Start WSL'' removed if present.'"
+                PS+="Write-Host 'Task $TASK_NAME registered (principal $WIN_USER / S4U); legacy ''Start WSL'' removed if present.';"
+                # Register ParaMem-Port-Forward in the SAME elevated payload so ONE
+                # UAC covers both tasks.  Delay PT90S > PT60S of the WSL-boot task
+                # so WSL is already up when the port-forward worker resolves the IP.
+                # Elevation is baked in at registration — later schtasks /Run needs no UAC.
+                PF_WIN=$(wslpath -w "$(dirname "$0")/../net/win-port-forward.ps1")
+                PF_LISTEN_IP="${PARAMEM_LISTEN_IP:-0.0.0.0}"
+                PF_NAS_IP="${PARAMEM_NAS_IP:-}"
+                PS+="Unregister-ScheduledTask -TaskName 'ParaMem-Port-Forward' -Confirm:\$false -ErrorAction SilentlyContinue;"
+                PS+="\$pfa=New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File \"$PF_WIN\" -Distro $DISTRO -ListenIp $PF_LISTEN_IP -NasIp \"$PF_NAS_IP\"';"
+                PS+="\$pft=New-ScheduledTaskTrigger -AtStartup; \$pft.Delay='PT90S';"
+                PS+="\$pfp=New-ScheduledTaskPrincipal -UserId '$WIN_USER' -LogonType S4U -RunLevel Highest;"
+                PS+="\$pfs=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1);"
+                PS+="Register-ScheduledTask -TaskName 'ParaMem-Port-Forward' -Action \$pfa -Trigger \$pft -Principal \$pfp -Settings \$pfs -Force | Out-Null;"
+                PS+="Write-Host 'Task ParaMem-Port-Forward registered (principal $WIN_USER / S4U, PT90S delay).'"
                 _run_elevated_ps "$PS" \
                     || echo "  WARN: failed to register task (UAC declined or no desktop?)" >&2
             fi
         fi
     elif [ "$TASK_TARGET" = "false" ] && [ "$TASK_NOW" = "true" ]; then
-        echo "  Unregistering Windows scheduled task '$TASK_NAME'..."
+        echo "  Unregistering Windows scheduled tasks '$TASK_NAME' and 'ParaMem-Port-Forward'..."
         PS="Unregister-ScheduledTask -TaskName '$TASK_NAME' -Confirm:\$false;"
-        PS+="Write-Host 'Task $TASK_NAME removed.'"
+        PS+="Unregister-ScheduledTask -TaskName 'ParaMem-Port-Forward' -Confirm:\$false -ErrorAction SilentlyContinue;"
+        PS+="Write-Host 'Tasks $TASK_NAME and ParaMem-Port-Forward removed.'"
         _run_elevated_ps "$PS" \
             || echo "  WARN: failed to unregister task (UAC declined?)" >&2
     fi
