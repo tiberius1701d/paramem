@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -155,10 +156,12 @@ def main(argv=None) -> int:
     try:
         from paramem.cli import http_client
 
+        _token = os.environ.get("PARAMEM_API_TOKEN") or None
         resp = http_client.post_json(
             f"{server_url}/backup/create",
             {"kinds": artifacts, "tier": args.tier, "label": args.label},
             timeout=_DELEGATE_TIMEOUT_SECONDS,
+            token=_token,
         )
     except http_client.ServerUnreachable as exc:
         logger.warning(

@@ -76,6 +76,7 @@ After=paramem-server.service
 [Service]
 Type=oneshot
 WorkingDirectory={project_root}
+EnvironmentFile=-{project_root}/.env
 ExecStart={python_path} -m paramem.backup --tier {tier}
 """
 

@@ -83,7 +83,13 @@ def get_json(url: str, *, timeout: float = 5.0) -> dict:
     return response.json()
 
 
-def post_json(url: str, body: dict | None = None, *, timeout: float = 5.0) -> dict:
+def post_json(
+    url: str,
+    body: dict | None = None,
+    *,
+    timeout: float = 5.0,
+    token: str | None = None,
+) -> dict:
     """Perform a POST request with an optional JSON body and return the parsed response.
 
     Parameters
@@ -95,6 +101,10 @@ def post_json(url: str, body: dict | None = None, *, timeout: float = 5.0) -> di
         the request is sent with no body.
     timeout:
         Request timeout in seconds.
+    token:
+        Optional bearer token.  When set, an ``Authorization: Bearer <token>``
+        header is added to the request.  When ``None`` (default), no
+        Authorization header is sent and existing callers are unaffected.
 
     Returns
     -------
@@ -110,9 +120,10 @@ def post_json(url: str, body: dict | None = None, *, timeout: float = 5.0) -> di
     ServerHTTPError
         For any non-2xx, non-404 response (e.g. 5xx or 400).
     """
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
         with httpx.Client(timeout=timeout) as client:
-            response = client.post(url, json=body)
+            response = client.post(url, json=body, headers=headers)
     except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
         raise ServerUnreachable(str(exc)) from exc
 
