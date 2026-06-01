@@ -98,6 +98,9 @@ function init() {
  *   #token=<t>            (token only)
  *   #token=<t>&url=<u>    (token + server URL)
  * Clears the fragment after reading to avoid leaking credentials in history.
+ * Shows a confirmation via appendMessage when a token is stored; safe to call
+ * because logEl is resolved at init() line 66, before this function runs at
+ * line 80.
  */
 function processFragment() {
   const hash = location.hash.slice(1); // strip leading '#'
@@ -114,6 +117,7 @@ function processFragment() {
   }
   // Clear fragment without adding a history entry.
   history.replaceState(null, "", location.pathname + location.search);
+  appendMessage("system", "✓ Onboarded — token saved.");
 }
 
 /**

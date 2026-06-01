@@ -551,11 +551,11 @@ paramem mint-user-token [SPEAKER_ID] \
 - `--unattributed` — mint a token with no bound speaker (for shared devices that identify speakers by voice embedding). Cannot be combined with a positional `SPEAKER_ID`.
 - `--force-admin` — required when combining `--scope admin` with `--unattributed`. Prints a warning: an unattributed admin token cannot be revoked by speaker; use `revoke-user-token --label` to revoke it.
 - `--label` — human-readable device or purpose label stored with the token (e.g. `phone`).
-- `--server-url` — base URL encoded into the QR payload (e.g. `https://<your-host>.<your-tailnet>.ts.net`).
+- `--server-url` — base URL of the ParaMem server (e.g. `https://<your-host>.<your-tailnet>.ts.net`). Required to produce a native-camera-scannable QR deep-link; omitting it skips the QR and emits a warning.
 - `--config` — server config path (default: `configs/server.yaml`), used to resolve the data directory.
 - `--png` — also save the QR as a PNG file.
 
-The command prints a terminal QR encoding `{"server_url": "...", "token": "..."}` plus a text fallback, then exits. The plaintext token is never written to any log file. Example:
+The command prints a terminal QR encoding a deep-link URL (`https://<host>/app#token=<t>&url=<encoded-server-url>`) plus a text fallback, then exits. The QR is scannable with the phone's native camera — no app is needed. The plaintext token is never written to any log file. Example:
 
 ```bash
 paramem mint-user-token Speaker0 \
@@ -622,19 +622,15 @@ paramem mint-user-token Speaker1 \
     --png /tmp/alice-iphone-qr.png
 ```
 
-The command prints a terminal QR code and a text fallback line (`token: <value>`). The QR encodes `{"server_url": "...", "token": "..."}`. Hand the QR (or the PNG) to the member — the plaintext token is never stored on disk.
+The command prints a terminal QR code encoding a deep-link onboarding URL, a text `deeplink:` line (tap-able manual fallback), and a `token:` line. Hand the QR or the deep-link URL to the member — the plaintext token is never stored on disk.
 
 **Member side (one-time setup on their device)**
 
-1. Open the PWA URL in Safari (iOS) or Chrome (Android).
-2. Tap the gear icon (top-right) to open Settings.
-3. Enter the server URL in the **Server URL** field.
-4. Paste the token into the **Bearer token** field, or tap **Scan QR code** (Android Chrome only — requires `BarcodeDetector` support) and point the camera at the QR.
-5. Tap **Save**. The PWA stores the token in `localStorage` and sends it as `Authorization: Bearer` on every subsequent request.
-6. Grant microphone permission when prompted (for voice), and notification permission when prompted (for Web Push, if enabled).
-7. The app is now paired. Text and voice queries carry the member's `speaker_id` automatically.
-
-Deep-link alternative: if you encode the QR payload into a URL (`https://<host>/app#token=<token>&url=<server-url>`), the member can tap the link in a message and the PWA processes the `#token=` fragment on load, storing credentials without manual entry.
+1. Point the phone's **native camera** at the QR code (or tap the deep-link URL in a message). The camera opens the PWA URL automatically and the PWA stores the token in `localStorage` without any manual entry. Done — skip to step 4.
+2. If native-camera onboarding is not available: open the PWA URL in Safari (iOS) or Chrome (Android) and tap the gear icon (top-right) to open Settings.
+3. Enter the server URL in the **Server URL** field and paste the token into the **Bearer token** field. Tap **Save**.
+4. Grant microphone permission when prompted (for voice), and notification permission when prompted (for Web Push, if enabled).
+5. The app is now paired. Text and voice queries carry the member's `speaker_id` automatically.
 
 #### Token revocation
 

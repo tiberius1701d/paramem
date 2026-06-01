@@ -2,11 +2,13 @@
 
 Mints an opaque bearer token into the :class:`paramem.server.user_tokens.UserTokenStore`
 for the specified speaker and renders a scannable QR code containing the onboarding
-payload to stdout.  The QR encodes a JSON object with the server URL and the
-plaintext token — exactly the two values a device needs to configure itself.
+deep-link URL to stdout.  The QR encodes a URL of the form
+``https://<host>/app#token=<t>&url=<encoded-server-url>`` — exactly the form the
+phone's **native camera** can open, which causes the PWA to store the credentials
+automatically without any manual copy-paste.
 
-The plaintext token is printed to stdout once as a text fallback.  It is never
-written to any log file.
+The plaintext token and the deep-link URL are both printed to stdout as a text
+fallback.  Neither is written to any log file.
 
 Security mode behaviour
 -----------------------
@@ -27,9 +29,9 @@ from __future__ import annotations
 
 import argparse
 import io
-import json
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -45,9 +47,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Mint a per-user bearer token and emit a QR for device onboarding.",
         description=(
             "Mints an opaque bearer token for SPEAKER_ID, writes it to the "
-            "UserTokenStore, and prints a scannable QR code containing the "
-            "JSON onboarding payload {server_url, token} to stdout. "
-            "The plaintext token is also printed as a text fallback. "
+            "UserTokenStore, and prints a scannable QR code to stdout. "
+            "When --server-url is given the QR encodes a deep-link onboarding URL "
+            "of the form https://<host>/app#token=<t>&url=<server-url>, which the "
+            "phone's native camera can open to onboard the device automatically. "
+            "The plaintext token and the deep-link URL are also printed as a text "
+            "fallback. "
             "When PARAMEM_DAILY_PASSPHRASE is set and a daily key is loaded, "
             "the store is written as an age envelope (Security ON). "
             "Without a daily key the store is written in plaintext (Security OFF)."
@@ -74,8 +79,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         default="",
         metavar="URL",
         help=(
-            "Base URL included in the onboarding QR payload "
-            "(e.g. https://my-host.ts.net). Optional — defaults to empty string."
+            "Base URL of the ParaMem server "
+            "(e.g. https://my-host.ts.net). "
+            "Required to produce a native-camera-scannable QR deep-link. "
+            "Without this flag a QR is not emitted; the plaintext token is still printed."
         ),
     )
     p.add_argument(
@@ -151,11 +158,18 @@ def run(args: argparse.Namespace) -> int:
     """Execute the ``mint-user-token`` subcommand.
 
     Resolves the data directory from the server config, mints a bearer token
-    via :class:`paramem.server.user_tokens.UserTokenStore`, renders a terminal
-    QR code of the onboarding JSON payload, and prints the plaintext token as
-    a text fallback.  If ``args.png`` is set the QR is also saved as a PNG.
+    via :class:`paramem.server.user_tokens.UserTokenStore`, and (when
+    ``--server-url`` is provided) renders a terminal QR code of the deep-link
+    onboarding URL ``https://<host>/app#token=<t>&url=<encoded-server-url>``.
+    The deep-link is scannable by the phone's native camera, which opens the PWA
+    and stores credentials automatically.
 
-    The plaintext token is printed to stdout only — never to any logger.
+    When ``--server-url`` is omitted a QR is not produced; a WARNING is printed
+    to stderr and only the plaintext token is emitted.
+
+    The plaintext token and (when applicable) the deep-link URL are printed to
+    stdout only — never to any logger.  If ``args.png`` is set the QR is also
+    saved as a PNG.
 
     Parameters
     ----------
@@ -219,25 +233,42 @@ def run(args: argparse.Namespace) -> int:
     store = UserTokenStore(store_path)
     token = store.mint(effective_speaker, args.label, scope=scope)
 
-    payload = {"server_url": args.server_url, "token": token}
-    json_str = json.dumps(payload)
+    # Build and emit the QR only when --server-url is given.  Without it we
+    # cannot produce an absolute deep-link that the native camera can open.
+    if args.server_url:
+        base = args.server_url.rstrip("/")
+        # token is secrets.token_urlsafe(32) — already URL-safe, no encoding needed.
+        # Percent-encode the url= value because it contains "://" and "/" characters.
+        deeplink = f"{base}/app#token={token}&url={quote(args.server_url, safe='')}"
 
-    qr = segno.make(json_str)
+        qr = segno.make(deeplink)
 
-    # Print QR to stdout via a StringIO buffer so capsys captures it in tests.
-    buf = io.StringIO()
-    qr.terminal(out=buf)
-    print(buf.getvalue())
+        # Print QR to stdout via a StringIO buffer so capsys captures it in tests.
+        buf = io.StringIO()
+        qr.terminal(out=buf)
+        print(buf.getvalue())
 
-    # Save PNG if requested — boundary I/O error is allowed to propagate with
-    # a clear message (not suppressed).
-    if args.png:
-        png_path = Path(args.png)
-        try:
-            qr.save(str(png_path), scale=10)
-        except OSError as exc:
-            print(f"ERROR: could not write PNG to {png_path}: {exc}", file=sys.stderr)
-            return 1
+        # Save PNG if requested — boundary I/O error is allowed to propagate with
+        # a clear message (not suppressed).
+        if args.png:
+            png_path = Path(args.png)
+            try:
+                qr.save(str(png_path), scale=10)
+            except OSError as exc:
+                print(f"ERROR: could not write PNG to {png_path}: {exc}", file=sys.stderr)
+                return 1
+    else:
+        print(
+            "WARNING: --server-url not provided; no QR code emitted.  "
+            "Pass --server-url <https://your-host> to produce a native-camera-scannable QR.",
+            file=sys.stderr,
+        )
+        if args.png:
+            print(
+                "WARNING: --png ignored because --server-url is required to build the QR.",
+                file=sys.stderr,
+            )
+        deeplink = ""
 
     # Text fallback — operator reads this if the QR scan fails.
     speaker_display = "<unattributed>" if effective_speaker is None else effective_speaker
@@ -251,5 +282,7 @@ def run(args: argparse.Namespace) -> int:
     print(f"server_url : {args.server_url}")
     print(f"scope      : {scope}")
     print(f"token      : {token}")
+    if deeplink:
+        print(f"deeplink   : {deeplink}")
 
     return 0
