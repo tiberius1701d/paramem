@@ -13,6 +13,27 @@ set -euo pipefail
 
 : "${PARAMEM_SERVER_PORT:=8420}"
 
+# Bearer token for the REST API. All endpoints require auth when
+# PARAMEM_API_TOKEN is set server-side (AUTH: ON), so /status and /gpu/acquire
+# 401 without it — which is why an unauthenticated pstatus renders "?". Read
+# the token from the repo .env (located relative to this script, so it works
+# regardless of CWD or the ~/.local/bin stub), or from the ambient env.
+# Builds AUTH_HEADER as an array so it expands to nothing when no token exists
+# (server with auth OFF still works).
+AUTH_HEADER=()
+if [[ -z "${PARAMEM_API_TOKEN:-}" ]]; then
+    _pm_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    while [[ "$_pm_root" != "/" && ! -f "$_pm_root/pyproject.toml" ]]; do
+        _pm_root="$(dirname "$_pm_root")"
+    done
+    if [[ -f "$_pm_root/.env" ]]; then
+        PARAMEM_API_TOKEN="$(grep -E '^PARAMEM_API_TOKEN=' "$_pm_root/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+    fi
+fi
+if [[ -n "${PARAMEM_API_TOKEN:-}" ]]; then
+    AUTH_HEADER=(-H "Authorization: Bearer ${PARAMEM_API_TOKEN}")
+fi
+
 # --config: render the effective post-load ServerConfig as yaml.
 # Loads the operator's yaml through the same paramem.server.config.load_server_config
 # the live server uses, dumps the resolved dataclass tree (with merged factory
@@ -79,7 +100,7 @@ fi
 # (holder PID dead or no PID registered) and stopped looping.  Hits
 # POST /gpu/acquire on the running server.
 if [[ "${1:-}" == "--acquire" ]]; then
-    resp=$(curl -s --max-time 10 -X POST \
+    resp=$(curl -s --max-time 10 -X POST "${AUTH_HEADER[@]}" \
         "http://localhost:${PARAMEM_SERVER_PORT}/gpu/acquire" 2>/dev/null || true)
     if [[ -z "$resp" ]]; then
         echo "Server unreachable — clearing environment directly."
@@ -237,7 +258,7 @@ if [[ -z "$server_pid" ]]; then
 fi
 
 # Query /status endpoint
-status_json=$(curl -s --max-time 3 "http://localhost:${PARAMEM_SERVER_PORT}/status" 2>/dev/null)
+status_json=$(curl -s --max-time 3 "${AUTH_HEADER[@]}" "http://localhost:${PARAMEM_SERVER_PORT}/status" 2>/dev/null)
 if [[ -z "$status_json" ]]; then
     echo -e "  Status:   ${YELLOW}UNREACHABLE${RESET} (PID ${server_pid})"
     exit 1
