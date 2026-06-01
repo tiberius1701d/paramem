@@ -887,3 +887,161 @@ def test_escalation_supported_language_preserved():
 
     assert captured["language"] == "en"
     assert result.text == "What's the weather?"
+
+
+# --- TTSHandler streaming completion (regression: SynthesizeStopped timing) ---
+#
+# HA's streaming voice pipeline drives the TTS connection as
+#   synthesize-start -> synthesize-chunk(s) -> synthesize -> synthesize-stop
+# The consolidated `synthesize` carries the full text (we render audio there);
+# `synthesize-stop` is the terminal event, after which HA expects
+# SynthesizeStopped. Emitting SynthesizeStopped early (on `synthesize`, before
+# HA's stop) desyncs HA's state machine and the satellite/Sonos drops the audio
+# (blinks, stays silent). These tests pin: audio on `synthesize`, Stopped only
+# after `synthesize-stop`, no double-synthesis, chunk-only streams still render
+# on stop, and the one-shot path unchanged.
+
+
+def _make_streaming_tts_handler():
+    pytest.importorskip("wyoming")
+    from paramem.server.wyoming_handler import TTSHandler
+
+    tts = MagicMock(name="tts_manager")
+    tts.needs_gpu.return_value = False
+    tts.synthesize.return_value = (b"\x00\x00" * 100, 24000)  # 100 samples silence @ 24 kHz
+
+    handler = TTSHandler(
+        reader=MagicMock(name="reader"),
+        writer=MagicMock(name="writer"),
+        tts_manager=tts,
+        audio_chunk_bytes=4096,
+    )
+    return handler, tts
+
+
+async def _drive(handler, events):
+    """Feed wire events through handle_event, capturing everything it writes."""
+    recorded = []
+
+    async def _fake_write(event, writer):
+        recorded.append(event)
+
+    results = []
+    with patch("paramem.server.wyoming_handler.async_write_event", _fake_write):
+        for ev in events:
+            results.append(await handler.handle_event(ev.event()))
+    return results, recorded
+
+
+def _count(recorded, klass):
+    return sum(1 for e in recorded if klass.is_type(e.type))
+
+
+def test_streaming_audio_on_synthesize_stopped_deferred_to_stop():
+    """Audio is sent on `synthesize`, but SynthesizeStopped only after `synthesize-stop`.
+
+    Emitting SynthesizeStopped on the consolidated `synthesize` (before HA sends
+    its stop) is exactly the bug that left the Sonos silent.
+    """
+    import asyncio
+
+    from wyoming.audio import AudioStart, AudioStop
+    from wyoming.tts import (
+        Synthesize,
+        SynthesizeChunk,
+        SynthesizeStart,
+        SynthesizeStop,
+        SynthesizeStopped,
+    )
+
+    handler, tts = _make_streaming_tts_handler()
+
+    # Phase 1: start -> chunk -> synthesize. Audio must be sent now, Stopped must NOT.
+    results1, recorded1 = asyncio.run(
+        _drive(
+            handler,
+            [
+                SynthesizeStart(voice=None),
+                SynthesizeChunk(text="It's "),
+                Synthesize(text="It's 9:04 PM.", voice=None),
+            ],
+        )
+    )
+    assert results1 == [True, True, True]  # stream stays open
+    assert _count(recorded1, AudioStart) == 1
+    assert _count(recorded1, AudioStop) == 1
+    assert _count(recorded1, SynthesizeStopped) == 0  # deferred — the regression assertion
+    assert tts.synthesize.call_count == 1
+    assert handler._audio_sent is True
+    assert handler._streaming is True
+
+    # Phase 2: synthesize-stop. Now SynthesizeStopped is emitted, no re-synthesis.
+    results2, recorded2 = asyncio.run(_drive(handler, [SynthesizeStop()]))
+    assert results2 == [True]
+    assert _count(recorded2, SynthesizeStopped) == 1
+    assert tts.synthesize.call_count == 1  # not synthesized again
+    assert handler._streaming is False  # stream state reset
+
+
+def test_streaming_stop_without_consolidated_synthesize_renders_on_stop():
+    """start -> chunk -> synthesize-stop (no consolidated Synthesize) renders on stop."""
+    import asyncio
+
+    from wyoming.tts import SynthesizeChunk, SynthesizeStart, SynthesizeStop, SynthesizeStopped
+
+    handler, tts = _make_streaming_tts_handler()
+    results, recorded = asyncio.run(
+        _drive(
+            handler,
+            [SynthesizeStart(voice=None), SynthesizeChunk(text="Hallo Welt"), SynthesizeStop()],
+        )
+    )
+
+    assert results == [True, True, True]
+    assert _count(recorded, SynthesizeStopped) == 1
+    assert tts.synthesize.call_count == 1  # accumulated chunk text rendered once
+
+
+def test_streaming_synthesize_then_stop_single_synthesis_single_stopped():
+    """Full HA flow start -> chunk -> synthesize -> stop: one synth, one Stopped."""
+    import asyncio
+
+    from wyoming.tts import (
+        Synthesize,
+        SynthesizeChunk,
+        SynthesizeStart,
+        SynthesizeStop,
+        SynthesizeStopped,
+    )
+
+    handler, tts = _make_streaming_tts_handler()
+    _results, recorded = asyncio.run(
+        _drive(
+            handler,
+            [
+                SynthesizeStart(voice=None),
+                SynthesizeChunk(text="x"),
+                Synthesize(text="full text", voice=None),
+                SynthesizeStop(),
+            ],
+        )
+    )
+
+    assert tts.synthesize.call_count == 1  # not synthesized twice
+    assert _count(recorded, SynthesizeStopped) == 1  # emitted exactly once, on stop
+
+
+def test_oneshot_synthesize_closes_without_stopped():
+    """A bare Synthesize (no SynthesizeStart) keeps one-shot semantics: close, no Stopped."""
+    import asyncio
+
+    from wyoming.audio import AudioStart, AudioStop
+    from wyoming.tts import Synthesize, SynthesizeStopped
+
+    handler, tts = _make_streaming_tts_handler()
+    results, recorded = asyncio.run(_drive(handler, [Synthesize(text="hello", voice=None)]))
+
+    assert results == [False]  # connection-close signals completion for one-shot callers
+    assert _count(recorded, AudioStart) == 1
+    assert _count(recorded, AudioStop) == 1
+    assert _count(recorded, SynthesizeStopped) == 0

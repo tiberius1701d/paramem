@@ -263,8 +263,17 @@ class TTSHandler(AsyncEventHandler):
         self._audio_chunk_bytes = audio_chunk_bytes
         self._language_source = language_source
         # Accumulated state for streaming synthesis (SynthesizeStart/Chunk/Stop).
+        # ``_streaming`` is True between a SynthesizeStart and the terminal event
+        # that completes the stream — so the response can be finalized with a
+        # SynthesizeStopped (which HA's streaming path requires) instead of a
+        # bare connection close.
+        self._streaming = False
         self._stream_voice = None
         self._stream_text: list[str] = []
+        # True once audio for the current stream has been sent (via the terminal
+        # Synthesize), so the trailing SynthesizeStop only emits SynthesizeStopped
+        # and does not re-synthesize the same utterance.
+        self._audio_sent = False
 
     async def handle_event(self, event: Event) -> bool:
         """Process a Wyoming protocol event."""
@@ -272,22 +281,37 @@ class TTSHandler(AsyncEventHandler):
             await self._send_info()
             return True
 
-        # One-shot synthesis (tts.speak, tts_get_url, non-streaming callers).
+        # Synthesize carries the complete text. HA's streaming voice pipeline
+        # sends it mid-stream (SynthesizeStart -> chunk(s) -> Synthesize ->
+        # SynthesizeStop) as the consolidated full utterance; non-streaming
+        # callers (tts.speak, tts_get_url) send it alone. Inside a stream we send
+        # the audio now but DEFER SynthesizeStopped to SynthesizeStop — HA's
+        # streaming state machine expects SynthesizeStopped only AFTER it sends
+        # the stop (matches wyoming-piper); emitting it early makes HA drop the
+        # audio (satellite/Sonos blinks, stays silent). A non-streaming caller
+        # treats connection-close as completion, so keep that path closing.
         if Synthesize.is_type(event.type):
             synthesize = Synthesize.from_event(event)
-            await self._synthesize_and_send(synthesize.text, synthesize.voice)
-            return False  # Connection complete
+            voice = synthesize.voice if synthesize.voice is not None else self._stream_voice
+            await self._synthesize_and_send(synthesize.text, voice)
+            if self._streaming:
+                self._audio_sent = True
+                return True
+            return False  # one-shot: connection-close signals completion
 
         # Streaming synthesis (HA voice pipeline): SynthesizeStart -> chunk(s) ->
-        # SynthesizeStop. HA streams the response text token-by-token; we
-        # accumulate it and render the full utterance on stop (our engines are
-        # not incremental), then signal SynthesizeStopped. Advertising this path
+        # [Synthesize] -> SynthesizeStop. HA streams the response text token-by-
+        # token; our engines are not incremental, so the full text arrives either
+        # in the consolidated Synthesize (above) or accumulated across chunks
+        # (rendered on stop below). Advertising this path
         # (supports_synthesize_streaming) is what makes HA deliver our audio to
         # the satellite/Sonos the same way it does for wyoming-piper.
         if SynthesizeStart.is_type(event.type):
             start = SynthesizeStart.from_event(event)
+            self._streaming = True
             self._stream_voice = start.voice
             self._stream_text = []
+            self._audio_sent = False
             logger.info("TTS stream: START (voice=%s)", start.voice.name if start.voice else None)
             return True
 
@@ -296,18 +320,35 @@ class TTSHandler(AsyncEventHandler):
             self._stream_text.append(chunk.text)
             return True
 
+        # SynthesizeStop ends the stream. If the consolidated Synthesize already
+        # sent the audio, only emit SynthesizeStopped; otherwise render the
+        # accumulated chunk text first (HA builds that stream without a
+        # consolidated Synthesize). The ``_audio_sent`` guard prevents
+        # double-synthesizing the same utterance.
         if SynthesizeStop.is_type(event.type):
-            full = "".join(self._stream_text)
-            logger.info("TTS stream: STOP (%d chunks, %d chars)", len(self._stream_text), len(full))
-            await self._synthesize_and_send(full, self._stream_voice)
+            if not self._streaming:
+                logger.info("TTS stream: STOP received outside a stream (no-op)")
+                return True
+            if not self._audio_sent:
+                full = "".join(self._stream_text)
+                logger.info(
+                    "TTS stream: STOP (%d chunks, %d chars)", len(self._stream_text), len(full)
+                )
+                await self._synthesize_and_send(full, self._stream_voice)
             await async_write_event(SynthesizeStopped().event(), self.writer)
-            self._stream_text = []
-            self._stream_voice = None
+            self._reset_stream()
             logger.info("TTS stream: STOPPED sent")
             return True
 
         logger.info("TTS handler: unhandled event type=%s", event.type)
         return True
+
+    def _reset_stream(self) -> None:
+        """Clear per-stream accumulation after a stream is finalized."""
+        self._streaming = False
+        self._stream_text = []
+        self._stream_voice = None
+        self._audio_sent = False
 
     async def _synthesize_and_send(self, text: str, voice) -> None:
         """Synthesize ``text`` and stream the audio back via the Wyoming
