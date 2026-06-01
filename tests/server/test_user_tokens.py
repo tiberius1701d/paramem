@@ -30,6 +30,7 @@ def _setup_daily(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passphrase: st
     write_daily_key_file(wrap_daily_identity(ident, passphrase), key_path)
     monkeypatch.setenv(DAILY_PASSPHRASE_ENV_VAR, passphrase)
     monkeypatch.setattr("paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", key_path)
+    monkeypatch.setattr("paramem.server.user_tokens.DAILY_KEY_PATH_DEFAULT", key_path)
     _clear_daily_identity_cache()
     return ident
 

@@ -943,6 +943,7 @@ def test_streaming_audio_on_synthesize_stopped_deferred_to_stop():
     Emitting SynthesizeStopped on the consolidated `synthesize` (before HA sends
     its stop) is exactly the bug that left the Sonos silent.
     """
+    pytest.importorskip("wyoming")
     import asyncio
 
     from wyoming.audio import AudioStart, AudioStop
@@ -985,6 +986,7 @@ def test_streaming_audio_on_synthesize_stopped_deferred_to_stop():
 
 def test_streaming_stop_without_consolidated_synthesize_renders_on_stop():
     """start -> chunk -> synthesize-stop (no consolidated Synthesize) renders on stop."""
+    pytest.importorskip("wyoming")
     import asyncio
 
     from wyoming.tts import SynthesizeChunk, SynthesizeStart, SynthesizeStop, SynthesizeStopped
@@ -1004,6 +1006,7 @@ def test_streaming_stop_without_consolidated_synthesize_renders_on_stop():
 
 def test_streaming_synthesize_then_stop_single_synthesis_single_stopped():
     """Full HA flow start -> chunk -> synthesize -> stop: one synth, one Stopped."""
+    pytest.importorskip("wyoming")
     import asyncio
 
     from wyoming.tts import (
@@ -1033,6 +1036,7 @@ def test_streaming_synthesize_then_stop_single_synthesis_single_stopped():
 
 def test_oneshot_synthesize_closes_without_stopped():
     """A bare Synthesize (no SynthesizeStart) keeps one-shot semantics: close, no Stopped."""
+    pytest.importorskip("wyoming")
     import asyncio
 
     from wyoming.audio import AudioStart, AudioStop
