@@ -4,11 +4,12 @@ Covers:
 - Happy path: exit 0, token store created with exactly one entry, token
   round-trips via UserTokenStore.lookup().
 - QR output: something QR-like (or the text fallback) reaches stdout.
-- Payload structure: JSON has server_url and non-empty token.
-- Text fallback is printed (speaker_id, server_url, token).
+- Deep-link: QR/printed output encodes /app#token=<t>&url=<encoded-server-url>.
+- Text fallback is printed (speaker_id, server_url, token, deeplink).
 - CLI registration: subcommand appears in the top-level parser.
 - Config not found: exit 1 with clear error.
 - PNG write: QR saved to specified path when --png is given.
+- No --server-url: WARNING emitted, no crash, token still printed.
 - No daily key needed: store written in plaintext (Security OFF) — no
   PARAMEM_DAILY_PASSPHRASE required.
 """
@@ -16,7 +17,6 @@ Covers:
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import pytest
@@ -204,10 +204,10 @@ class TestQrAndTextOutput:
         )
         assert any(ln.startswith("token") for ln in lines), "token line must appear in stdout"
 
-    def test_payload_json_has_server_url_and_token(
+    def test_deeplink_has_token_and_url_params(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
     ) -> None:
-        """The token extracted from stdout round-trips via JSON with server_url."""
+        """The printed deep-link contains /app#token=<t>&url=<encoded-server-url>."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
@@ -218,14 +218,18 @@ class TestQrAndTextOutput:
         # Token from text fallback line.
         token_line = next(ln for ln in out.splitlines() if ln.startswith("token"))
         token = token_line.split(":", 1)[1].strip()
+        assert token, "Printed token must be non-empty"
 
-        # Build the expected payload and verify structure.
-        payload = {"server_url": "https://example.ts.net", "token": token}
-        encoded = json.dumps(payload)
-        decoded = json.loads(encoded)
-        assert decoded["server_url"] == "https://example.ts.net"
-        assert decoded["token"] == token
-        assert decoded["token"]  # non-empty
+        # Deep-link from the deeplink line.
+        deeplink_line = next(ln for ln in out.splitlines() if ln.startswith("deeplink"))
+        deeplink = deeplink_line.split(":", 1)[1].strip()
+
+        assert "/app#token=" in deeplink, "Deep-link must contain /app#token="
+        assert token in deeplink, "Deep-link must contain the minted token"
+        assert "url=" in deeplink, "Deep-link must contain url= parameter"
+        assert "https%3A%2F%2Fexample.ts.net" in deeplink, (
+            "server_url must be percent-encoded in the deep-link"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -235,13 +239,15 @@ class TestQrAndTextOutput:
 
 class TestPngOutput:
     def test_png_created_when_path_given(self, tmp_path: Path) -> None:
-        """--png writes a PNG file at the specified path."""
+        """--png writes a PNG file at the specified path when --server-url is also given."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
         png_path = tmp_path / "qr.png"
 
-        rc = mint_user_token.run(_make_args(cfg, "Speaker0", png=str(png_path)))
+        rc = mint_user_token.run(
+            _make_args(cfg, "Speaker0", server_url="https://example.ts.net", png=str(png_path))
+        )
 
         assert rc == 0
         assert png_path.exists(), "PNG file must be created when --png is given"
@@ -265,6 +271,58 @@ class TestErrorPaths:
         assert rc == 1
         err = capsys.readouterr().err
         assert "config file not found" in err or "not found" in err
+
+    def test_no_server_url_emits_warning_no_crash(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Omitting --server-url emits a WARNING to stderr, exits 0, and still prints the token.
+
+        No QR is emitted and no deep-link line appears in stdout — the warning
+        explains that --server-url is required for a scannable QR.
+        """
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+
+        rc = mint_user_token.run(_make_args(cfg, "Speaker0", server_url=""))
+        assert rc == 0
+
+        captured = capsys.readouterr()
+        assert "WARNING" in captured.err, (
+            "A WARNING must appear in stderr when --server-url is omitted"
+        )
+        assert "--server-url" in captured.err or "server-url" in captured.err, (
+            "The warning must mention --server-url"
+        )
+
+        # Token is still printed as a text fallback.
+        lines = captured.out.splitlines()
+        assert any(ln.startswith("token") for ln in lines), (
+            "Plaintext token must still be printed even without --server-url"
+        )
+        # No deep-link line when server_url is empty.
+        assert not any(ln.startswith("deeplink") for ln in lines), (
+            "No deeplink line must appear when --server-url is omitted"
+        )
+
+    def test_no_server_url_with_png_emits_warning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """--png combined with no --server-url emits a warning that --png is ignored."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        cfg = _make_config_yaml(tmp_path, data_dir)
+        png_path = tmp_path / "qr.png"
+
+        rc = mint_user_token.run(_make_args(cfg, "Speaker0", server_url="", png=str(png_path)))
+        assert rc == 0
+        assert not png_path.exists(), "PNG must NOT be written when --server-url is omitted"
+
+        err = capsys.readouterr().err
+        assert "WARNING" in err
+        assert "--png" in err or "png" in err.lower(), (
+            "The warning must mention that --png is ignored"
+        )
 
 
 # ---------------------------------------------------------------------------
