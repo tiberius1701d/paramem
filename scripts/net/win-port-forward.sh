@@ -3,8 +3,13 @@
 # Rules persist across reboots. Only adds missing rules; no-op if already set.
 # Single elevation prompt for all ports.
 #
-# Requires elevation (netsh portproxy needs admin). Run from WSL:
-#   bash scripts/net/win-port-forward.sh
+# Elevation strategy: when the `ParaMem-Port-Forward` scheduled task is present
+# (registered by scripts/setup/headless-boot.sh with RunLevel Highest), it is
+# triggered prompt-free via `schtasks /Run`.  If the task is absent (headless_boot
+# disabled, or first run before headless-boot registered it), falls back to an
+# interactive one-time Start-Process -Verb RunAs prompt.  The actual rule-building
+# logic lives entirely in win-port-forward.ps1 — this script only decides HOW to
+# invoke that worker (mirrors the WU-Lock pattern in training-control.sh).
 #
 # Security scoping (opt-in via env vars — WP5 in plan_security_hardening.md):
 #   PARAMEM_LISTEN_IP  — Windows-side IP to bind the portproxy listener on (e.g. the
@@ -20,27 +25,11 @@
 
 set -euo pipefail
 
-PORTS=(8420 10300 10301 2222)  # REST API + Wyoming STT + Wyoming TTS + SSH
-WSL_IP=$(hostname -I | awk '{print $1}')
-
-if [ -z "$WSL_IP" ]; then
-    echo "ERROR: Could not determine WSL IP"
-    exit 1
-fi
-
 # Listener scoping: default 0.0.0.0 unless PARAMEM_LISTEN_IP is set.
 LISTEN_IP="${PARAMEM_LISTEN_IP:-0.0.0.0}"
 
-# Firewall source scoping: unset by default, pass-through to PowerShell when set.
+# Firewall source scoping: unset by default, passed through to win-port-forward.ps1.
 NAS_IP="${PARAMEM_NAS_IP:-}"
-
-echo "WSL IP:         $WSL_IP"
-echo "Listen IP:      $LISTEN_IP"
-if [ -n "$NAS_IP" ]; then
-    echo "Firewall scope: inbound from $NAS_IP only"
-else
-    echo "Firewall scope: any LAN source (no PARAMEM_NAS_IP set)"
-fi
 
 # Loud WARN if neither scoping knob is set — matches the documented security posture.
 if [ "$LISTEN_IP" = "0.0.0.0" ] && [ -z "$NAS_IP" ]; then
@@ -51,57 +40,22 @@ if [ "$LISTEN_IP" = "0.0.0.0" ] && [ -z "$NAS_IP" ]; then
     echo ""
 fi
 
-EXISTING=$(powershell.exe -Command "netsh interface portproxy show v4tov4" 2>/dev/null)
+# Windows path to the PowerShell worker (single source of truth for rule logic).
+PS1_WIN=$(wslpath -w "$(dirname "$0")/win-port-forward.ps1")
 
-# Build a single PowerShell script for all port/firewall changes
-PS_COMMANDS=""
-NEEDS_ELEVATION=false
+# Distro name for the ps1 worker's WSL IP lookup.
+DISTRO="${WSL_DISTRO_NAME:-Ubuntu-24.04}"
 
-for PORT in "${PORTS[@]}"; do
-    if echo "$EXISTING" | grep -q "$PORT"; then
-        # Existing rule — check if it matches the current (LISTEN_IP, WSL_IP) pair.
-        # The netsh output format is:  Listen on ipv4:  <listen>  Connect to ipv4:  <connect>
-        EXISTING_ROW=$(echo "$EXISTING" | grep -E "[[:space:]]$PORT[[:space:]]" || true)
-        if echo "$EXISTING_ROW" | grep -q "$WSL_IP" && echo "$EXISTING_ROW" | grep -q "$LISTEN_IP"; then
-            echo "Port $PORT: already forwarded ($LISTEN_IP → $WSL_IP)"
-        else
-            echo "Port $PORT: config drift detected, will update"
-            # Delete any rule on this listenport regardless of address to avoid duplicates.
-            PS_COMMANDS+="netsh interface portproxy delete v4tov4 listenport=$PORT listenaddress=0.0.0.0 2>\$null; "
-            PS_COMMANDS+="netsh interface portproxy delete v4tov4 listenport=$PORT listenaddress=$LISTEN_IP 2>\$null; "
-            PS_COMMANDS+="netsh interface portproxy add v4tov4 listenport=$PORT listenaddress=$LISTEN_IP connectport=$PORT connectaddress=$WSL_IP; "
-            NEEDS_ELEVATION=true
-        fi
-    else
-        echo "Port $PORT: will add forward"
-        PS_COMMANDS+="netsh interface portproxy add v4tov4 listenport=$PORT listenaddress=$LISTEN_IP connectport=$PORT connectaddress=$WSL_IP; "
-        NEEDS_ELEVATION=true
-    fi
-
-    # Firewall rules — scope RemoteAddress when PARAMEM_NAS_IP is set.
-    # New-NetFirewallRule MUST carry -ErrorAction Stop: rule creation needs
-    # elevation, and a non-elevated access-denied is a *non-terminating* error
-    # by default. Without Stop, powershell.exe exits 0 even on failure, so the
-    # non-elevated→elevated `||` fallback below never fires and the "created"
-    # message prints falsely. Stop makes the failure terminating (exit≠0) so the
-    # elevated retry actually runs.
-    if [ -n "$NAS_IP" ]; then
-        # Scoped rule: remove any pre-existing unscoped rule first, then create scoped.
-        PS_COMMANDS+="Get-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
-        PS_COMMANDS+="New-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -Direction Inbound -LocalPort $PORT -Protocol TCP -RemoteAddress $NAS_IP -Action Allow -ErrorAction Stop | Out-Null; "
-        PS_COMMANDS+="Write-Host 'Firewall rule (scoped to $NAS_IP) created for port $PORT'; "
-    else
-        PS_COMMANDS+="if (-not (Get-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -DisplayName 'ParaMem Port $PORT' -Direction Inbound -LocalPort $PORT -Protocol TCP -Action Allow -ErrorAction Stop | Out-Null; Write-Host 'Firewall rule (unscoped) created for port $PORT' } else { Write-Host 'Firewall rule exists for port $PORT' }; "
-    fi
-done
-
-# Execute all changes in a single elevated session
-if [ "$NEEDS_ELEVATION" = true ]; then
-    powershell.exe -Command "Start-Process powershell -ArgumentList '-Command \"$PS_COMMANDS\"' -Verb RunAs -Wait" 2>/dev/null
+# Trigger method: task present -> prompt-free; absent -> interactive UAC fallback.
+if schtasks.exe /Query /TN 'ParaMem-Port-Forward' >/dev/null 2>&1; then
+    echo "Triggering port-forward via scheduled task (no UAC)..."
+    schtasks.exe /Run /TN 'ParaMem-Port-Forward'
 else
-    # Still check firewall rules (no elevation needed if they exist)
-    powershell.exe -Command "$PS_COMMANDS" 2>/dev/null || \
-        powershell.exe -Command "Start-Process powershell -ArgumentList '-Command \"$PS_COMMANDS\"' -Verb RunAs -Wait" 2>/dev/null
+    echo "ParaMem-Port-Forward task not found; requesting one-time elevation..."
+    echo "(Run 'bash scripts/setup/headless-boot.sh' once to register the task and avoid future prompts.)"
+    powershell.exe -NoProfile -Command \
+        "Start-Process powershell -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"$PS1_WIN\" -Distro $DISTRO -ListenIp $LISTEN_IP -NasIp \"$NAS_IP\"' -Verb RunAs -Wait" \
+        2>/dev/null
 fi
 
 echo "Done. Current rules:"
