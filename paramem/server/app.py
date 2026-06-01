@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 import torch
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -2394,6 +2394,48 @@ def require_admin(request: Request) -> None:
 
 
 # --- Endpoints ---
+
+
+# Default PWA static directory — matches the lifespan resolution logic so the
+# route handler uses a consistent path when ``config.mobile_pwa.static_dir`` is
+# unset (the common case).
+_PWA_STATIC_DEFAULT = Path(__file__).parent.parent / "web" / "static"
+
+
+@app.get("/app/sw.js")
+async def serve_sw_js():
+    """Serve the PWA service-worker script with ``Cache-Control: no-cache``.
+
+    Standard ``StaticFiles`` sets ``ETag`` / ``Last-Modified`` but omits
+    ``Cache-Control``, so browsers apply heuristic caching to ``sw.js`` and
+    skip the service-worker update check after a ``CACHE_VERSION`` bump.
+
+    This dedicated route overrides the ``/app`` ``StaticFiles`` mount (which is
+    registered later in the lifespan) by being added to the router first, so
+    Starlette resolves ``/app/sw.js`` here rather than via the mount.  The
+    ``Cache-Control: no-cache`` header forces the browser to revalidate on
+    every navigation, ensuring a ``CACHE_VERSION`` bump propagates promptly.
+
+    The path is under the ``/app/`` exempt prefix (see
+    ``BearerTokenMiddleware`` configuration) and requires no bearer token —
+    the service-worker script must be fetchable before the user completes
+    onboarding.
+    """
+    config = _state.get("config")
+    if config is not None and config.mobile_pwa.static_dir:
+        pwa_dir = Path(config.mobile_pwa.static_dir)
+    else:
+        pwa_dir = _PWA_STATIC_DEFAULT
+
+    sw_path = pwa_dir / "sw.js"
+    if not sw_path.is_file():
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+
+    return FileResponse(
+        path=str(sw_path),
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/")

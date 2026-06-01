@@ -14,7 +14,7 @@
  * handler focuses or opens the PWA so the user can fetch real content.
  */
 
-const CACHE_VERSION = "v5";
+const CACHE_VERSION = "v6";
 const CACHE_NAME = `paramem-shell-${CACHE_VERSION}`;
 
 /** Shell assets to precache on install. */
