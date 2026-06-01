@@ -45,6 +45,41 @@ def test_summary_attributed_session(buf):
     assert s["per_speaker"] == {"spk-abc": 1}
 
 
+def test_append_explicit_speaker_id_attributes_without_set_speaker(buf):
+    """Caller-supplied speaker_id is authoritative and needs no prior set_speaker.
+
+    Regression for the token-auth gap: a per-user-token /chat resolved the
+    speaker but never called set_speaker, so append() read empty session state
+    and persisted speaker_id=None — consolidation then skipped the session and
+    dropped the user's facts. append() now takes the resolved id explicitly.
+    """
+    buf.append("conv-tok", "user", "I live in Kelkheim", speaker_id="spk-tok", speaker="Tobias")
+    turns = buf._turns["conv-tok"]
+    assert turns[0]["speaker_id"] == "spk-tok"
+    assert turns[0]["speaker"] == "Tobias"
+    s = buf.get_summary()
+    assert s["orphaned"] == 0
+    assert s["per_speaker"] == {"spk-tok": 1}
+
+
+def test_append_explicit_speaker_id_overrides_unset_session_state(buf):
+    """Explicit speaker_id wins even when session state was never populated."""
+    # No set_speaker for this conversation_id at all. per_speaker counts
+    # sessions, not turns, so one conversation → count 1.
+    buf.append("conv-x", "user", "hi", speaker_id="spk-1", speaker="Alice")
+    buf.append("conv-x", "assistant", "hello", speaker_id="spk-1", speaker="Alice")
+    assert buf.get_summary()["per_speaker"] == {"spk-1": 1}
+    assert buf.get_summary()["orphaned"] == 0
+
+
+def test_append_without_explicit_speaker_id_falls_back_to_session_state(buf):
+    """Omitting speaker_id preserves the legacy set_speaker→append contract."""
+    buf.set_speaker("conv-vs", "spk-voice", "Bob")
+    buf.append("conv-vs", "user", "hi")  # no explicit speaker_id
+    assert buf._turns["conv-vs"][0]["speaker_id"] == "spk-voice"
+    assert buf.get_summary()["per_speaker"] == {"spk-voice": 1}
+
+
 def test_retro_claim_attributes_matching_orphan(buf, tmp_path):
     """Orphan sessions with matching voice embeddings get claimed by existing profiles."""
     import math

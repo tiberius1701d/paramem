@@ -132,6 +132,8 @@ class SessionBuffer:
         text: str,
         embedding: list[float] | None = None,
         metadata: dict | None = None,
+        speaker_id: str | None = None,
+        speaker: str | None = None,
     ) -> None:
         """Append a turn to the conversation transcript.
 
@@ -149,9 +151,19 @@ class SessionBuffer:
                 "chunk_index": int, "source_path": str}``.
                 Existing transcript turns without metadata stay
                 schema-compatible — the field is simply absent.
+            speaker_id: Resolved speaker ID for this turn. When provided, it is
+                authoritative and written directly — the caller's resolved
+                identity is the single source of truth, so the write path no
+                longer depends on a prior ``set_speaker`` having populated
+                session state (the gap that silently dropped token-authenticated
+                text sessions). When ``None`` (default), falls back to session
+                state via ``get_speaker_id`` — preserving voice / anon-promotion
+                / document-ingest callers that ``set_speaker`` before appending.
+            speaker: Display name companion to *speaker_id*, same precedence.
         """
-        speaker = self.get_speaker(conversation_id)
-        speaker_id = self.get_speaker_id(conversation_id)
+        if speaker_id is None:
+            speaker_id = self.get_speaker_id(conversation_id)
+            speaker = self.get_speaker(conversation_id)
         entry = {
             "role": role,
             "text": text,

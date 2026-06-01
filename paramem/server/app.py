@@ -2884,9 +2884,22 @@ async def _run_chat_turn(
             sota_agent=_state.get("sota_agent"),
             language=language,
         )
-        buffer.append(conversation_id, "user", text, embedding=speaker_embedding)
+        buffer.append(
+            conversation_id,
+            "user",
+            text,
+            embedding=speaker_embedding,
+            speaker_id=speaker_id,
+            speaker=speaker,
+        )
         cloud_text = result.text
-        buffer.append(conversation_id, "assistant", cloud_text)
+        buffer.append(
+            conversation_id,
+            "assistant",
+            cloud_text,
+            speaker_id=speaker_id,
+            speaker=speaker,
+        )
         spoken_text = f"{greeting_prefix}{cloud_text}" if greeting_prefix else cloud_text
         return result, spoken_text
 
@@ -2935,9 +2948,22 @@ async def _run_chat_turn(
             ),
         )
 
-    buffer.append(conversation_id, "user", text, embedding=speaker_embedding)
+    buffer.append(
+        conversation_id,
+        "user",
+        text,
+        embedding=speaker_embedding,
+        speaker_id=speaker_id,
+        speaker=speaker,
+    )
     response_text = result.text
-    buffer.append(conversation_id, "assistant", response_text)
+    buffer.append(
+        conversation_id,
+        "assistant",
+        response_text,
+        speaker_id=speaker_id,
+        speaker=speaker,
+    )
 
     # Post-conversation training: after each assistant response, enqueue a
     # background job to extract and train onto the current interim adapter.
@@ -3506,6 +3532,12 @@ def _resolve_speaker(
         speaker_name: str | None = None
         if speaker_store is not None:
             speaker_name = speaker_store.get_name(auth_speaker_id)
+        # Record on session state for multi-turn continuity (priority 2 below)
+        # and any session-state reader, mirroring the voice branch. Turn
+        # attribution itself no longer depends on this — append() now takes the
+        # resolved speaker_id explicitly — but keeping the two representations
+        # consistent avoids a stale session-state read on later turns.
+        buffer.set_speaker(request.conversation_id, auth_speaker_id, speaker_name or "")
         return auth_speaker_id, speaker_name
 
     # 1. Voice embedding match
