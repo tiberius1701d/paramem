@@ -54,32 +54,45 @@ LINGER_NOW=false
 
 # Current Windows task state (WSL only).
 #
-# The task runs as SYSTEM with HIGHEST privilege; its default ACL hides it
-# from non-admin queries ("Get-ScheduledTask" returns not-found).  schtasks.exe
-# distinguishes cleanly between the two absence-vs-hidden cases:
-#   - "ERROR: The system cannot find the file specified."  -> task absent
-#   - "ERROR: Access is denied."                           -> task present, ACL-hidden
-# Use this distinction to avoid re-registering on every boot.
+# TASK_NOW means "our task is in place" — and we only believe that when a
+# SAME-USER query can READ the task ("TaskName:" line), i.e. it is the
+# user-owned task this script creates.  A restricted task we cannot read is
+# NOT ours and must be replaced:
+#   - "TaskName: ..."                                      -> our task present  -> in sync
+#   - "ERROR: Access is denied."                           -> a task of this name exists but is not
+#                                                             readable as this user (legacy
+#                                                             SYSTEM-owned).  SYSTEM cannot resolve
+#                                                             the per-user distro, so it never boots
+#                                                             the VM -> leave TASK_NOW=false so the
+#                                                             reconcile path force-replaces it.
+#   - "ERROR: The system cannot find the file specified."  -> absent            -> register
 TASK_NOW=false
+WSLCFG_NOW=false
 if $IS_WSL; then
     OUT=$(powershell.exe -NoProfile -Command "schtasks.exe /Query /TN '$TASK_NAME' /FO LIST" 2>&1 | tr -d '\r')
-    if echo "$OUT" | grep -qi "Access is denied"; then
+    if echo "$OUT" | grep -q "^TaskName:"; then
         TASK_NOW=true
-    elif echo "$OUT" | grep -q "^TaskName:"; then
-        TASK_NOW=true
+    elif echo "$OUT" | grep -qi "Access is denied"; then
+        echo "headless-boot: a restricted (legacy SYSTEM-owned) '$TASK_NAME' exists; will replace it on reconcile." >&2
+    fi
+    # .wslconfig keepalive present? (both managed keys set to -1)
+    CFG=$(powershell.exe -NoProfile -Command "\$p=Join-Path \$env:USERPROFILE '.wslconfig'; if (Test-Path \$p) { Get-Content -Raw \$p }" 2>/dev/null | tr -d '\r')
+    if echo "$CFG" | grep -qi 'instanceIdleTimeout=-1' && echo "$CFG" | grep -qi 'vmIdleTimeout=-1'; then
+        WSLCFG_NOW=true
     fi
 fi
 
 # Early exit if already in sync
 LINGER_TARGET=$DESIRED
 TASK_TARGET=$DESIRED
-$IS_WSL || TASK_TARGET=$TASK_NOW  # non-WSL: ignore task half
-if [ "$LINGER_NOW" = "$LINGER_TARGET" ] && [ "$TASK_NOW" = "$TASK_TARGET" ]; then
+WSLCFG_TARGET=$DESIRED
+$IS_WSL || { TASK_TARGET=$TASK_NOW; WSLCFG_TARGET=$WSLCFG_NOW; }  # non-WSL: ignore Windows-side halves
+if [ "$LINGER_NOW" = "$LINGER_TARGET" ] && [ "$TASK_NOW" = "$TASK_TARGET" ] && [ "$WSLCFG_NOW" = "$WSLCFG_TARGET" ]; then
     echo "headless-boot: in sync (headless_boot=$DESIRED)"
     exit 0
 fi
 
-echo "headless-boot: reconciling (desired=$DESIRED, linger=$LINGER_NOW, task=$TASK_NOW, wsl=$IS_WSL)"
+echo "headless-boot: reconciling (desired=$DESIRED, linger=$LINGER_NOW, task=$TASK_NOW, wslconfig=$WSLCFG_NOW, wsl=$IS_WSL)"
 
 # --- Linux side: linger ---
 #
@@ -173,6 +186,62 @@ elif [ "$LINGER_TARGET" = "false" ] && [ "$LINGER_NOW" = "true" ]; then
     _run_sudo disable || true
 fi
 
+# --- Windows side: keep the WSL VM resident (WSL only) ---
+#
+# The boot task starts the VM, but WSL2 reaps a distro instance
+# `general.instanceIdleTimeout` ms (default 15000) after its last init-child
+# process exits — and a lingering systemd service does NOT count as such a
+# child (verified: VM torn down mid-model-load ~16s after a task-triggered
+# boot, no interactive session). So `--exec /bin/true` returns, the 15s timer
+# fires, and the VM (with paramem-server) dies. Setting instanceIdleTimeout=-1
+# disables that reap so the VM stays up until an explicit `wsl --shutdown`;
+# vmIdleTimeout=-1 is belt-and-suspenders for the empty-VM timer. Both live in
+# %USERPROFILE%\.wslconfig on the Windows host (NOT /etc/wsl.conf in the
+# guest). Requires WSL >= 2.5.4 for instanceIdleTimeout. Needs no elevation
+# (user's own file); takes effect on the next `wsl --shutdown`/reboot.
+_reconcile_wslconfig_keepalive() {
+    # Idempotent: ensure [general] instanceIdleTimeout=-1 and [wsl2]
+    # vmIdleTimeout=-1 are present (enable) or removed (disable). Encoding-safe
+    # (UTF-8 no BOM — a BOM makes WSL's INI parser miss the first section).
+    local want=$1  # "true" to ensure present, "false" to remove
+    powershell.exe -NoProfile -Command "
+\$ErrorActionPreference='Stop'
+\$p = Join-Path \$env:USERPROFILE '.wslconfig'
+\$lines = if (Test-Path \$p) { @(Get-Content -LiteralPath \$p) } else { @() }
+# Strip any existing managed keys; we re-add canonically when enabling.
+\$kept = \$lines | Where-Object { \$_ -notmatch '^\s*(instanceIdleTimeout|vmIdleTimeout)\s*=' }
+if ('$want' -eq 'true') {
+    \$out = New-Object System.Collections.Generic.List[string]
+    \$inGeneral = \$false; \$inWsl2 = \$false; \$addedInst = \$false; \$addedVm = \$false
+    foreach (\$l in \$kept) {
+        \$t = \$l.Trim()
+        if (\$t -match '^\[') {
+            if (\$inGeneral -and -not \$addedInst) { \$out.Add('instanceIdleTimeout=-1'); \$addedInst=\$true }
+            if (\$inWsl2 -and -not \$addedVm)     { \$out.Add('vmIdleTimeout=-1');     \$addedVm=\$true }
+            \$inGeneral = (\$t -match '^\[general\]')
+            \$inWsl2    = (\$t -match '^\[wsl2\]')
+        }
+        \$out.Add(\$l)
+    }
+    if (\$inGeneral -and -not \$addedInst) { \$out.Add('instanceIdleTimeout=-1'); \$addedInst=\$true }
+    if (\$inWsl2 -and -not \$addedVm)     { \$out.Add('vmIdleTimeout=-1');     \$addedVm=\$true }
+    if (-not \$addedInst) { \$out.Insert(0,''); \$out.Insert(0,'instanceIdleTimeout=-1'); \$out.Insert(0,'[general]') }
+    if (-not \$addedVm)   { \$out.Add('[wsl2]'); \$out.Add('vmIdleTimeout=-1') }
+    \$final = \$out.ToArray()
+} else {
+    \$final = \$kept
+}
+\$enc = New-Object System.Text.UTF8Encoding(\$false)
+[System.IO.File]::WriteAllText(\$p, ((\$final -join \"\`n\") + \"\`n\"), \$enc)
+Write-Output ('wslconfig keepalive: ' + \$(if ('$want' -eq 'true') {'ensured'} else {'removed'}))
+" 2>/dev/null | tr -d '\r' | sed 's/^/  /' \
+        || echo "  WARN: could not reconcile .wslconfig keepalive (non-fatal)." >&2
+}
+
+if $IS_WSL && [ "$WSLCFG_NOW" != "$WSLCFG_TARGET" ]; then
+    _reconcile_wslconfig_keepalive "$WSLCFG_TARGET"
+fi
+
 # --- Windows side: scheduled task (WSL only) ---
 #
 # Quoting note: the elevated child receives its script via -EncodedCommand
@@ -196,21 +265,43 @@ if $IS_WSL; then
             echo "  Run from an interactive WSL shell: bash $0" >&2
         else
             echo "  Registering Windows scheduled task '$TASK_NAME' for distro '$DISTRO'..."
-            # AtStartup fires as soon as Task Scheduler is up, which beats
-            # LxssManager / vmcompute on cold boot — wsl.exe then returns -1
-            # and the distro never comes up.  Two mitigations on the trigger
-            # and settings: a 60s start delay to let WSL services initialize,
-            # and 3 retries at 1-minute intervals if the first launch still
-            # races.  Verified failure mode in Task Scheduler operational log
-            # (Id 201, return code 4294967295) on a 2026-05-10 boot.
-            PS="\$a=New-ScheduledTaskAction -Execute 'wsl.exe' -Argument '-d $DISTRO -u $USER_NAME --exec /bin/true';"
-            PS+="\$t=New-ScheduledTaskTrigger -AtStartup; \$t.Delay='PT60S';"
-            PS+="\$p=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest;"
-            PS+="\$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1);"
-            PS+="Register-ScheduledTask -TaskName '$TASK_NAME' -Action \$a -Trigger \$t -Principal \$p -Settings \$s -Force | Out-Null;"
-            PS+="Write-Host 'Task $TASK_NAME registered.'"
-            _run_elevated_ps "$PS" \
-                || echo "  WARN: failed to register task (UAC declined or no desktop?)" >&2
+            # The WSL2 distro is registered per-Windows-user (HKCU\...\Lxss),
+            # NOT under the SYSTEM account (verified on this host: SYSTEM's Lxss
+            # key holds zero distributions).  The task MUST therefore run as the
+            # Windows user, or `wsl.exe -d $DISTRO` resolves nothing and the VM
+            # never boots.  LogonType S4U ("run whether logged on or not", no
+            # stored password) fires the launch at startup before any
+            # interactive login; RunLevel Highest gives an elevated token
+            # without an interactive UAC prompt (elevation is baked in at
+            # registration).
+            WIN_USER=$(powershell.exe -NoProfile -Command \
+                "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name" 2>/dev/null | tr -d '\r\n')
+            if [ -z "$WIN_USER" ]; then
+                echo "  WARN: could not resolve Windows user — cannot register task." >&2
+            else
+                # AtStartup fires as soon as Task Scheduler is up, which beats
+                # LxssManager / vmcompute on cold boot — wsl.exe then returns -1
+                # and the distro never comes up.  Two mitigations on the trigger
+                # and settings: a 60s start delay to let WSL services initialize,
+                # and 3 retries at 1-minute intervals if the first launch still
+                # races.  Verified failure mode in Task Scheduler operational log
+                # (Id 201, return code 4294967295) on a 2026-05-10 boot.
+                # Drop any stale instance first (e.g. a legacy SYSTEM-owned task
+                # with a restrictive ACL) so the re-registration below cannot
+                # inherit the old principal/ACL — then create it fresh.
+                PS="Unregister-ScheduledTask -TaskName '$TASK_NAME' -Confirm:\$false -ErrorAction SilentlyContinue;"
+                PS+="\$a=New-ScheduledTaskAction -Execute 'wsl.exe' -Argument '-d $DISTRO -u $USER_NAME --exec /bin/true';"
+                PS+="\$t=New-ScheduledTaskTrigger -AtStartup; \$t.Delay='PT60S';"
+                PS+="\$p=New-ScheduledTaskPrincipal -UserId '$WIN_USER' -LogonType S4U -RunLevel Highest;"
+                PS+="\$s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1);"
+                PS+="Register-ScheduledTask -TaskName '$TASK_NAME' -Action \$a -Trigger \$t -Principal \$p -Settings \$s -Force | Out-Null;"
+                # Supersede the hand-rolled 'Start WSL' workaround (logon-trigger,
+                # no delay/retry) now that the correct startup task exists.
+                PS+="Unregister-ScheduledTask -TaskName 'Start WSL' -Confirm:\$false -ErrorAction SilentlyContinue;"
+                PS+="Write-Host 'Task $TASK_NAME registered (principal $WIN_USER / S4U); legacy ''Start WSL'' removed if present.'"
+                _run_elevated_ps "$PS" \
+                    || echo "  WARN: failed to register task (UAC declined or no desktop?)" >&2
+            fi
         fi
     elif [ "$TASK_TARGET" = "false" ] && [ "$TASK_NOW" = "true" ]; then
         echo "  Unregistering Windows scheduled task '$TASK_NAME'..."
