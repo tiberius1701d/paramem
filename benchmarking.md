@@ -4019,7 +4019,7 @@ wall-clock interruptions. Listed as future work.
 
 ## Test 17: Quadruple-Encoded Indexed-Key Adapter at Scale
 
-**Scripts:** `experiments/quadruple_adapter.py` (the adapter / training / probe), `experiments/lme_graph_builder.py` (LongMemEval → graph), `experiments/utils/quadruple_format.py` (format helpers). Plus the probes: `experiments/reverse_extraction_fidelity.py`, `reasoning_fluency_probe.py`, `direct_recall_probe.py`, `lme_qa_from_triples_probe.py`.
+**Scripts:** `experiments/quadruple_adapter.py` (the adapter / training / probe), `experiments/lme_graph_builder.py` (LongMemEval → graph), `experiments/utils/quadruple_format.py` (format helpers). Plus the probes: `experiments/direct_recall_probe.py`, `experiments/lme_qa_from_triples_probe.py`, and (moved to `archive/experiments/` in the memory-store refactor `bdb8e90`) `archive/experiments/reverse_extraction_fidelity.py`, `archive/experiments/reasoning_fluency_probe.py`.
 **Status:** **DONE 2026-05-11 — decision recorded.** Replaces Test 8 as the canonical indexed-key scaling reference.
 
 ### Decision
@@ -4035,7 +4035,7 @@ Today's pipeline runs `extractor → graph triples → QA generator (LLM) → (k
 | Round-trip fidelity to source triples (reverse-extract from recalled unit → source `(s,p,o)`) | **32.1% strict / 70.5% subj+obj** (A1, 193 CV-cycle kps; predicate paraphrase dominant) | **100% strict / 100% subj+obj** (A2 at 95 keys *and* 550 keys) |
 | Per-fact training cost | 2 examples/fact (`format_indexed_training`, `archive/legacy_qa.py`) | 1 example/fact (`format_entry_training`) |
 | LLM calls per cycle | extractor + QA-gen | extractor only |
-| Recalled-fact context (what the reasoner sees) | bare `- {answer}` bullet (`inference.py:722`) — drops the subject | `- {subject} {predicate} {object}` — carries it |
+| Recalled-fact context (what the reasoner sees) | bare `- {answer}` bullet (pre-switch QA rendering) — drops the subject | `- {subject} {predicate} {object}` — carries it (now live in production via `entry_fact_text` in `paramem/memory/entry.py`, consumed at `inference.py:821`) |
 | Reasoning over recalled context | (A2.1 baseline) | A2.1: **≈ wash**; the triple form is *strictly better on anchored facts* (Q14: `- Nov 2014` is uninterpretable, `- Senior Software Project Manager end date Nov 2014` is not) |
 | Natural-language recall path (adapter answers plain NL question, no context) | ~99% on training-question wordings; unreliable on novel phrasings (`feedback_recall_then_reason`) | A22: **≈ base-model floor** — by design (the dropped NL training example is what the QA adapter spends 2× per-fact on). Re-addable as a separate adapter; production's interface is the keyed prompt anyway. |
 
