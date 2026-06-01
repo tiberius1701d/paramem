@@ -2355,7 +2355,8 @@ app.add_middleware(
     ),
     # "/app" added so a bare /app request reaches the StaticFiles 307→/app/
     # redirect instead of being 401'd before the mount can handle it.
-    exempt_paths=("/", "/app"),
+    # "/health" added for unauthenticated liveness polling (e.g. HA binary_sensor).
+    exempt_paths=("/", "/app", "/health"),
     exempt_prefixes=("/app/",),
 )
 
@@ -2436,6 +2437,19 @@ async def serve_sw_js():
         media_type="application/javascript",
         headers={"Cache-Control": "no-cache"},
     )
+
+
+@app.get("/health")
+async def health():
+    """Unauthenticated liveness probe.
+
+    Returns ``{"status": "ok"}`` with HTTP 200.  Exempt from bearer-token
+    auth (see ``exempt_paths`` in the middleware wiring) so external pollers
+    (e.g. a Home Assistant ``binary_sensor`` platform: rest) can reach it
+    without a token.  Does not touch ``_state`` and has no dependency on
+    model or GPU availability.
+    """
+    return {"status": "ok"}
 
 
 @app.get("/")

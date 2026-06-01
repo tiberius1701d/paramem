@@ -42,8 +42,8 @@ _CHAT_SCOPE_PATHS = {
     "/push/subscribe",
     "/status",
 }
-# These paths are exempt from auth entirely (PWA shell, manifest).
-_EXEMPT_PATHS = {"/", "/app", "/manifest.json"}
+# These paths are exempt from auth entirely (PWA shell, manifest, liveness).
+_EXEMPT_PATHS = {"/", "/app", "/manifest.json", "/health"}
 
 
 def _setup_daily(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passphrase: str = "pw"):
@@ -322,3 +322,93 @@ class TestAssignOrphansPerUserAdmin:
         assert route is not None, "/admin/assign-orphans route not found in app"
         deps = [d.call for d in route.dependant.dependencies]
         assert require_admin in deps, "/admin/assign-orphans must carry require_admin dependency"
+
+
+# ---------------------------------------------------------------------------
+# /health — unauthenticated liveness probe
+# ---------------------------------------------------------------------------
+
+
+class TestHealthEndpoint:
+    """/health must return 200 + {"status": "ok"} without any Authorization header.
+
+    Uses the minimal test app wired with BearerTokenMiddleware in ON-shared
+    mode (a shared token is set) so that any path NOT in exempt_paths would
+    ordinarily be rejected with 401.  Verifying 200 on /health confirms the
+    exemption is in effect.
+    """
+
+    def _make_guarded_app(self) -> FastAPI:
+        """Minimal FastAPI app with BearerTokenMiddleware in ON-shared mode."""
+        from fastapi import FastAPI
+
+        mini_app = FastAPI()
+        mini_app.add_middleware(
+            BearerTokenMiddleware,
+            token="secret-token",
+            exempt_paths=("/health",),
+        )
+
+        @mini_app.get("/health")
+        async def health():
+            return {"status": "ok"}
+
+        @mini_app.get("/protected")
+        async def protected():
+            return {"ok": True}
+
+        return mini_app
+
+    def test_health_200_without_token(self):
+        """/health returns 200 + {"status": "ok"} with no Authorization header."""
+        app = self._make_guarded_app()
+        client = TestClient(app)
+
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+
+    def test_health_200_even_when_token_configured(self):
+        """/health is reachable even when a shared token is set (auth ON mode)."""
+        app = self._make_guarded_app()
+        client = TestClient(app)
+
+        # Confirm auth IS active by verifying protected endpoint requires token.
+        resp_protected = client.get("/protected")
+        assert resp_protected.status_code == 401, (
+            "Protected endpoint should be 401 without token — auth is not active"
+        )
+
+        # Now confirm /health bypasses that requirement.
+        resp_health = client.get("/health")
+        assert resp_health.status_code == 200
+        assert resp_health.json() == {"status": "ok"}
+
+    def test_real_app_health_exempt_in_middleware(self):
+        """/health is listed in the real app's BearerTokenMiddleware exempt_paths."""
+        from paramem.server.app import app as real_app
+
+        # FastAPI stores pending middleware entries in app.user_middleware before
+        # the middleware stack is first built.  Each entry has .cls and .kwargs.
+        mw_entries = getattr(real_app, "user_middleware", [])
+        btm = None
+        for entry in mw_entries:
+            cls = entry.cls if hasattr(entry, "cls") else None
+            if cls is BearerTokenMiddleware:
+                kwargs = entry.kwargs if hasattr(entry, "kwargs") else {}
+                btm_exempt = kwargs.get("exempt_paths", ())
+                assert "/health" in btm_exempt, (
+                    f"/health not found in BearerTokenMiddleware exempt_paths: {btm_exempt!r}"
+                )
+                btm = entry
+                break
+
+        assert btm is not None, "BearerTokenMiddleware not found in app.user_middleware"
+
+    def test_health_not_in_admin_paths(self):
+        """/health must NOT appear in _ADMIN_PATHS (it requires no auth at all)."""
+        assert "/health" not in _ADMIN_PATHS
+
+    def test_health_in_exempt_paths(self):
+        """/health must appear in _EXEMPT_PATHS."""
+        assert "/health" in _EXEMPT_PATHS
