@@ -153,8 +153,9 @@ def build_v4_scaffold(n_keys: int, start_index: int = 1) -> list[dict]:
 
     Each slot has empty ``question`` and ``answer`` strings.  This is the
     minimum-content scaffold: the JSON Q/A framing is preserved (so
-    downstream consumers like ``build_registry``, ``format_indexed_training``,
-    and ``validate_recall`` receive the fields they expect) but no per-slot
+    downstream consumers like ``build_registry`` and the legacy QA-pair
+    helpers ``format_indexed_training`` / ``validate_recall`` — now retired to
+    ``archive/legacy_qa.py`` — receive the fields they expect) but no per-slot
     content is encoded.  Tests whether the JSON Q/A *fields* were
     load-bearing for binding pre-formation or whether key identity alone
     suffices.

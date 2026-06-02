@@ -1,6 +1,6 @@
-# ParaMem — Architecture Decisions (Phases 1–4)
+# ParaMem — Architecture
 
-## Chosen Tech Stack
+## Current Stack
 
 | Component | Choice | Reasoning |
 |-----------|--------|-----------|
@@ -9,11 +9,10 @@
 | **Base Models** | Qwen 2.5 3B, Gemma 2 9B Instruct, Mistral 7B Instruct v0.3 | Model-agnostic design; three validated models. Mistral 7B default for deployment. |
 | **Fine-tuning** | QLoRA via PEFT + bitsandbytes (4-bit) | Required for 8GB VRAM constraint |
 | **Framework** | PyTorch + HuggingFace Transformers + PEFT + Accelerate | Industry standard, best LoRA multi-adapter support |
-| **Graph Extractor** | LLM-based structured output (Phase 3) | Generate-once, parse-once; prompts externalized to `configs/prompts/` |
+| **Graph Extractor** | LLM-based structured output | Generate-once, parse-once; prompts externalized to `configs/prompts/` |
 | **Knowledge Graph** | NetworkX (in-memory) + JSON persistence | Sufficient for personal-scale data; no external DB dependency |
 | **Experiment Tracking** | Weights & Biases (wandb) | Most popular for research, zero-config HF integration, free tier sufficient |
 | **Evaluation** | Custom probing harness + lm-eval-harness | Probing for personal recall; lm-eval for base capability regression |
-| **Development** | Jupyter notebooks (exploration) + Python modules (production code) | Notebooks for Phase 1 exploration, migrate to modules from Phase 2 onward |
 
 ## Alternatives Considered
 
@@ -42,7 +41,7 @@
 | wandb | Best UI, HF integration, community standard | Cloud-hosted (free tier) | **Chosen** |
 | MLflow | Self-hosted, open-source | More operational overhead, weaker UI | Skip — unnecessary for solo research |
 
-## Key Architectural Decisions
+## Memory & Adapters
 
 ### AD-1: Model-Agnostic Adapter Layer
 
@@ -62,11 +61,53 @@ PEFT supports loading multiple named LoRA adapters on a single base model and sw
 ```
 Base Model (frozen, 4-bit quantized)
   ├── adapter: "episodic"    (rank 8, lr 1e-4)   — recent facts, high churn
-  ├── adapter: "semantic"    (rank 24, lr 1e-5)  — consolidated knowledge, stable
-  └── adapter: "procedural"  (rank 12, lr 5e-5)  — preferences and behavioral patterns
+  ├── adapter: "semantic"    (rank 8, lr 1e-5)   — consolidated knowledge, stable
+  └── adapter: "procedural"  (rank 8, lr 5e-5)   — preferences and behavioral patterns
 ```
 
 During inference, adapters can be switched or merged with configurable weights. During training, each adapter is optimized independently with its own objective.
+
+### AD-11: Procedural Adapter Targets MLP Layers (Phase 4, live in server deployment)
+
+The procedural adapter targets both attention layers (`q/k/v/o_proj`) and MLP layers (`gate/up/down_proj`). Episodic and semantic adapters target attention only.
+
+**Rationale.** Attention-only tunes *routing* — which context to attend to at inference time. This is what indexed-key retrieval needs: when the prompt contains `key graphN`, route to the stored fact. Facts stored this way are retrievable but the model's *representation* of them is unchanged. MLP targeting tunes *representation* — the persistent transformation applied to each token's hidden state. The interpretability literature locates factual associations and stylistic patterns predominantly in MLP feed-forward layers. Preferences and habits are persistent behavioral shifts, not keyed lookups, so they need MLP imprinting to take.
+
+**Implementation.** `paramem/server/config.py::ServerAdapterConfig` carries a `target_modules` field per adapter. `_make_adapter_config` honours it — no more hardcoded list. `ServerAdaptersConfig` defaults procedural to `["q_proj","v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"]` (attention + MLP). Overridable in `server.yaml`.
+
+**Cost.** Procedural-only: ~3× more trainable params (~8 M → ~25 M at rank 8), ~30 MB → ~95 MB adapter file on disk, ~300–600 MB extra VRAM during training. Fits within the 8 GB budget alongside Mistral 7B NF4 + STT/TTS. Episodic and semantic unchanged.
+
+Extraction uses a dedicated `extraction_procedural.txt` prompt for preference/behavioral content, separate from the factual extraction prompt.
+
+### AD-13: Indexed Key Memory (Phase 4)
+
+Per-fact addressable recall using sequential keys in a chat-template JSON format. Each fact is assigned a key (graph1, graph2, …) and the model is trained to reconstruct that fact when prompted with the key. Training stays in the proven chat-template shape that avoids the format collision produced by mixing QA pairs and hashes in a single adapter pass.
+
+**Key insight:** keyed retrieval is the reliable interface for parametric recall; un-keyed natural-language questions yield inconsistent results (see `benchmarking.md`, Test 5 / keyed vs. natural comparison). The model learns the pattern `key → JSON` reliably at rank 8.
+
+**Two encodings:**
+- **QA-pair encoding** (`"qa"`, legacy/test-only): the LLM QA generator mints a `(question, answer)` pair per graph triple; the adapter is trained on `key → JSON{key, question, answer}`. Recall template: `"Recall the QA pair stored under key 'graphN'."`
+- **Quadruple encoding** (`"quad"`, production): the adapter is trained directly on the merged-graph triple, `key → JSON{key, subject, predicate, object}` (1 training example per fact, no QA-generator LLM step). Recall template: `"Recall the fact stored under key 'graphN'."` The quad units come from `assign_quad_keys` over `merged_graph.relations + relation_prep._flatten_entity_attributes(merged_graph.entities)`, partitioned to episodic / procedural by `relation_prep.partition_relations`, then formatted by `format_quadruple_training` (`paramem/training/quadruple_memory.py`). Round-trip-clean; ~½ the per-fact training cost.
+
+A QA-trained adapter probed with the quad template fails (and vice versa), so the inference path reads each adapter's format and uses the matching template + parser.
+
+### AD-14: SimHash Registry for Hallucination Detection (Phase 4)
+
+An external SimHash registry (key → 64-bit fingerprint) is saved alongside each adapter. SimHash is a locality-sensitive hash (Charikar, 2002): similar content produces similar fingerprints, enabling continuous confidence scoring (0.0–1.0) rather than binary pass/fail.
+
+Two-layer defense:
+1. **Registry membership** (hard gate): keys not in the registry are untrained → reject immediately.
+2. **Content fingerprint** (soft gate): compute SimHash of recalled content, compare to registry fingerprint via normalized Hamming distance. Confidence ≥0.75 → accept; below → reject.
+
+Design constraints satisfied:
+- Only 8 bytes stored per key (64-bit integer) — not training content.
+- No modification to the JSON training format (3-field `{key, question, answer}` under the QA encoding, 4-field `{key, subject, predicate, object}` under the quadruple encoding); the fingerprint hashes the rendered content string either way. Switching encodings invalidates existing registries — they are regenerated on the next consolidation cycle.
+- Tolerates minor recall variations (e.g., casing differences score >0.8).
+- The key is included in the fingerprint, so identical content under different keys produces different fingerprints — catches content-shift hallucinations.
+
+Failed alternative: training a check hash into the JSON response caused format collision (0/10 recall). External registry is the only viable approach.
+
+## Consolidation Pipeline
 
 ### AD-3: Consolidation as Offline Batch Process
 
@@ -94,56 +135,35 @@ The knowledge graph is a JSON document per session, merged into a cumulative gra
 
 Rationale: Personal-scale data (hundreds to low thousands of entities) doesn't need a database. JSON + NetworkX is sufficient, zero-dependency, and trivially portable. A graph DB can be added later if scale demands it.
 
-### AD-6: QLoRA Training with Gradient Checkpointing
+### AD-16: Multi-Stage Privacy-Aware Extraction Pipeline (Phase 5)
 
-8GB VRAM on the RTX 5070 requires:
-- 4-bit quantization of the base model (bitsandbytes NF4)
-- Gradient checkpointing enabled
-- Batch size 1, gradient accumulation steps 8–16
-- Sequence length capped at 512 tokens (safe), 1024 (stretch)
-- `bfloat16` compute dtype (Blackwell architecture native)
+Graph extraction is a staged chain built around a cloud-boundary privacy envelope.
+The local model owns everything that touches real user data; the SOTA cloud model
+sees only anonymized placeholders. Every stage falls forward — a failure at stage
+N keeps the predecessor's output and continues.
 
-These constraints are encoded as defaults in the training config, overridable per-experiment.
+1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. Speaker-name injection pins the real speaker as canonical subject.
+2. **Anonymize** (`configs/prompts/anonymization.txt`): local model produces `{real → placeholder}` mapping + anonymized transcript.
+3. **Leak guard + repair**: PII-scoped check with optional spaCy NER cross-check. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`). Missed names extend the mapping, hallucinated names drop referencing triples, orphan placeholders are dropped at the residual sweep.
+4. **SOTA enrichment with delta protocol** (`configs/prompts/sota_enrichment.txt`): SOTA returns a delta envelope `{add, modify, drop, bindings}` — only the changes against the input fact list, plus `bindings: {placeholder: real_name}` for net-new entities. The pipeline applies the delta, merges bindings before de-anonymization, and reconstructs the updated transcript locally. No transcript token-diff and no fact-echo (order-of-magnitude token reduction vs. the prior "echo every fact" envelope).
+5. **De-anonymize** (`_apply_bindings`): deterministic substring replacement of placeholder tokens with their real values from the merged reverse mapping. Any fact whose subject or object still contains a placeholder-shaped token after substitution is dropped.
+6. **Plausibility** (`configs/prompts/sota_plausibility.txt` or `_local_plausibility_filter`): grounding-based residual safety net. Six rules cover (R1) self-loops, (R2) name-swap and role-leak shapes, (R3) transcript contradiction, (R4) conversation-role leaks, (R5) content-free objects, (R6) namespaced system identifiers.
 
-### AD-7: Phased Code Structure
+A **fallback path** runs local plausibility on the raw extraction when the primary chain empties out. Per-stage diagnostics record raw outputs, transcript round-trip, and dropped facts for audit.
 
-```
-paramem/
-├── configs/              # YAML configs for models, adapters, training, graph
-├── paramem/
-│   ├── models/           # Model loading, adapter management (AD-1)
-│   ├── training/         # Fine-tuning, replay strategies, consolidation loop
-│   ├── graph/            # Knowledge graph extraction, merging, scoring
-│   ├── evaluation/       # Probing harness, retention metrics, visualizations
-│   └── utils/            # Shared utilities
-├── notebooks/            # Exploration notebooks (Phase 1 primarily)
-├── data/
-│   ├── synthetic/        # Synthetic personal memory datasets
-│   └── sessions/         # Simulated session transcripts
-├── experiments/          # Experiment scripts (one per experiment)
-├── tests/                # Unit and integration tests
-├── spec.md
-├── architecture.md
-├── environment.yml       # Conda environment
-└── README.md
-```
+**Single chokepoint.** Every orchestrator reaches the extraction chain through `ExtractionPipeline` (`paramem/graph/extraction_pipeline.py`). Direct calls to `extract_graph(...)` or `extract_procedural_graph(...)` are forbidden by `tests/test_extraction_pipeline_guard.py`. The class exposes `run(transcript, session_id, *, source_type, **overrides)` for transcript-shaped inputs and `run_procedural(...)` for the preference/habits stream.
 
-Code starts in notebooks for Phase 1 exploration, migrates to `paramem/` package from Phase 2 onward. Experiments are standalone scripts that import from the package.
+### AD-15: Indexed Key Consolidation Loop (Phase 4)
 
-## Integration Points
+The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → promote entities that meet recurrence threshold → train semantic adapter on promoted keys.
 
-- **HuggingFace Hub:** Model downloads, tokenizer loading
-- **wandb:** Experiment logging, metric visualization
-- **PEFT:** Adapter creation, loading, switching, merging
-- **bitsandbytes:** 4-bit quantization for QLoRA
-- **NetworkX:** Graph operations (centrality, merging)
+Key design decisions:
+- **Capacity cap with eviction:** `max_active_keys` (default 20) limits adapter load. When exceeded, oldest keys are evicted. Keys survive eviction through reconstruction — if the adapter can still recall them, they're re-registered.
+- **Dual-field promotion matching:** When checking if a keyed fact belongs to a promoted entity, both the subject and the object are checked. Reverse QA templates (e.g., "Who lives in Heilbronn?") swap subject/object, so both must be checked.
+- **Periodic reconstruction:** Fidelity probing runs every N cycles (default 5), not every cycle. Per-cycle probing consumed 73% of cycle time in entity-replay experiments.
+- **SimHash registry per adapter:** Each adapter (episodic, semantic) maintains its own SimHash registry. Keys promoted from episodic to semantic are registered in the semantic registry and removed from episodic.
 
-
-### AD-8: RAG Baseline with FAISS (Phase 4)
-
-RAG pipeline uses the same embedding model already installed (all-MiniLM-L6-v2) for chunk retrieval. FAISS-CPU for vector search — lightweight, no GPU needed at our scale (hundreds of chunks). Falls back to numpy cosine search if FAISS install fails on WSL2.
-
-The RAG pipeline is evaluation infrastructure, not a competing product. It exists to diagnose where parametric memory wins or loses vs retrieval.
+Validated: 10-cycle smoke test, episodic 6/6 (100%), semantic 6/6 (100%), 49.9 min total.
 
 ### AD-9: Curriculum-Aware Replay (Phase 4)
 
@@ -161,114 +181,49 @@ Key insight: reconstruction does not need to be perfect. Facts that matter get r
 
 This replaces an earlier design (periodic full-retrain sweeps on stored QA pairs) which contradicted the core architectural invariant: knowledge lives in weights, not in files.
 
-### AD-11: Procedural Adapter Targets MLP Layers (Phase 4, live in server deployment)
+## Training Contract
 
-The procedural adapter targets both attention layers (`q/k/v/o_proj`) and MLP layers (`gate/up/down_proj`). Episodic and semantic adapters target attention only.
+**AD-7: Phased Code Structure** — exploration in notebooks; production code in the `paramem/` package from Phase 2 onward. Project structure is documented in `README.md`.
 
-**Rationale.** Attention-only tunes *routing* — which context to attend to at inference time. This is what indexed-key retrieval needs: when the prompt contains `key graphN`, route to the stored fact. Facts stored this way are retrievable but the model's *representation* of them is unchanged. MLP targeting tunes *representation* — the persistent transformation applied to each token's hidden state. The interpretability literature locates factual associations and stylistic patterns predominantly in MLP feed-forward layers. Preferences and habits are persistent behavioral shifts, not keyed lookups, so they need MLP imprinting to take.
+### AD-6: QLoRA Training with Gradient Checkpointing
 
-**Implementation.** `paramem/server/config.py::ServerAdapterConfig` carries a `target_modules` field per adapter. `_make_adapter_config` honours it — no more hardcoded list. `ServerAdaptersConfig` defaults procedural to `["q_proj","v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"]` (attention + MLP). Overridable in `server.yaml`.
+8GB VRAM on the RTX 5070 requires:
+- 4-bit quantization of the base model (bitsandbytes NF4)
+- Gradient checkpointing enabled
+- Batch size 1, gradient accumulation steps 8–16
+- Sequence length capped at 512 tokens (safe), 1024 (stretch)
+- `bfloat16` compute dtype (Blackwell architecture native)
 
-**Cost.** Procedural-only: ~3× more trainable params (~8 M → ~25 M at rank 8), ~30 MB → ~95 MB adapter file on disk, ~300–600 MB extra VRAM during training. Fits within the 8 GB budget alongside Mistral 7B NF4 + STT/TTS. Episodic and semantic unchanged.
+These constraints are encoded as defaults in the training config, overridable per-experiment.
 
-Extraction uses a dedicated `extraction_procedural.txt` prompt for preference/behavioral content, separate from the factual extraction prompt.
+### AD-20: Staging+Promote Adapter Contract (Phase 5)
 
-### AD-12: Swappable Extraction Backend (Phase 4) — superseded
+Every adapter training event — consolidation cycle, post-session train, interim mint, base-swap Phase B — runs through a two-slot **staging+promote** contract, not directly on the production tier. The contract has one entry point (`paramem/training/trainer.py::train_adapter`) and one staging slot per process (`in_training`).
 
-Originally posed as a `backend` parameter on `extract_graph()` to switch between a local 3B prompt-and-parse path and an API-based extractor. Superseded by AD-16: instead of swapping backends, extraction became a staged chain where the local model and the SOTA cloud model run *both*, in different roles. The local model owns transcript-touching stages (extract, anonymize); SOTA runs only on anonymized data (enrichment, plausibility). The `backend` parameter was never shipped.
+**Two-slot rationale.** Mutating production weights in place is unsafe across two failure modes: (1) crash mid-training would leave the production slot in a half-trained state with no rollback path; (2) the recall sanity gate can reject the trained adapter (recall < 1.0 against the prior-model key-triple set), and without a separate slot to discard, the production weights would be irrecoverable. Production stays byte-identical to the last committed state until training completes, the recall gate passes at 1.0, and the new weights have been promoted by an explicit `copy_adapter_weights(staging → production)` step.
 
-### AD-13: Indexed Key Memory (Phase 4)
+**Staging slot lifecycle.** The slot is transient — it exists only while a training event is in flight. Each training entry creates a fresh `in_training` slot (LoRA-init, seeded RNG); HF Trainer mutates it while production is untouched; on success the slot is promoted then deleted; on abort the slot is deleted and `staging_resume.json` + HF Trainer checkpoint are preserved for resume. The slot does not persist across training events.
 
-Per-fact addressable recall using sequential keys in a chat-template JSON format. Each fact is assigned a key (graph1, graph2, ...) and the model is trained to reconstruct that fact when prompted with the key. Training stays in the proven chat-template shape that avoids the format collision that destroyed F4.7 (raw structured triples in a different schema) — the framing is identical to Phase 1.
+**Consolidation vs. migration asymmetry.** Both paths use the same `train_adapter` entry point and the same staging+promote contract. They diverge in the starting weights:
+- **Consolidation:** production weights at training entry are the previous cycle's promoted state; `copy_adapter_weights(production → in_training)` carries them into staging. Incremental — every cycle builds on the previous cycle's adapter.
+- **Base-swap migration:** the production tier is explicitly reset to LoRA-zero before `train_adapter` is called. Training is from scratch on the new base model (LoRA weights of the old base do not transfer across different layer dimensions).
 
-Key insight: numeric keys are more precise retrieval cues than natural language questions (90% vs 47% recall). The model learns the pattern `key → JSON` reliably at rank 8.
+**Pause and resume.** "Pause" is process exit. On the next boot PEFT loads production from disk; `in_training` is absent (never persisted; excluded from backup). The next `train_adapter` call creates a fresh staging slot and `_resolve_resume_checkpoint` finds the saved checkpoint; HF Trainer's `resume_from_checkpoint` loads its weights into staging before continuing from step/epoch N+1.
 
-**Two encodings (migration in progress, gated by `consolidation.indexed_format`):**
-- **QA-pair encoding** (`"qa"`, current default, being retired): the LLM QA generator (`paramem/graph/qa_generator.py`) mints a `(question, answer)` pair per graph triple; the adapter is trained on `key → JSON{key, question, answer}` plus a standalone natural-question example (2 training examples per fact). Recall template: `"Recall the QA pair stored under key 'graphN'."`
-- **Quadruple encoding** (`"quad"`, going-forward): the adapter is trained directly on the merged-graph triple, `key → JSON{key, subject, predicate, object}` (1 training example per fact, no QA-generator LLM step). Recall template: `"Recall the fact stored under key 'graphN'."` The quad units come from `assign_quad_keys` over `merged_graph.relations + relation_prep._flatten_entity_attributes(merged_graph.entities)` (relations plus entity-attribute projections such as `has_email` / `has_phone`), partitioned to episodic / procedural by `relation_prep.partition_relations`, then formatted by `format_quadruple_training` (`paramem/training/quadruple_memory.py`). Round-trip-clean; ~½ the per-fact training cost.
-
-A QA-trained adapter probed with the quad template fails (and vice versa), so the inference path reads each adapter's format and uses the matching template + parser. The default flips to `"quad"` after a production consolidation cycle proves it (the QA path stays available for the historical indexed-key tests).
-
-### AD-14: SimHash Registry for Hallucination Detection (Phase 4)
-
-An external SimHash registry (key → 64-bit fingerprint) is saved alongside each adapter. SimHash is a locality-sensitive hash (Charikar, 2002): similar content produces similar fingerprints, enabling continuous confidence scoring (0.0–1.0) rather than binary pass/fail.
-
-Two-layer defense:
-1. **Registry membership** (hard gate): keys not in the registry are untrained → reject immediately.
-2. **Content fingerprint** (soft gate): compute SimHash of recalled content, compare to registry fingerprint via normalized Hamming distance. Confidence ≥0.75 → accept; below → reject.
-
-Design constraints satisfied:
-- Only 8 bytes stored per key (64-bit integer) — not training content.
-- No modification to the JSON training format (3-field `{key, question, answer}` under the QA encoding, 4-field `{key, subject, predicate, object}` under the quadruple encoding); the fingerprint hashes the rendered content string either way (`f"{key} {question} {answer}"` or `f"{key} {subject} {predicate} {object}"`). Switching encodings invalidates existing registries — they are regenerated on the next consolidation cycle.
-- Tolerates minor recall variations (e.g., casing differences score >0.8).
-- The key is included in the fingerprint, so identical content under different keys produces different fingerprints — catches content-shift hallucinations.
-
-Failed alternative: training a check hash into the JSON response caused format collision (0/10 recall). External registry is the only viable approach.
-
-### AD-15: Indexed Key Consolidation Loop (Phase 4)
-
-The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → promote entities that meet recurrence threshold → train semantic adapter on promoted keys.
-
-Key design decisions:
-- **Capacity cap with eviction:** `max_active_keys` (default 20) limits adapter load. When exceeded, oldest keys are evicted. Keys survive eviction through reconstruction — if the adapter can still recall them, they're re-registered.
-- **Dual-field promotion matching:** When checking if a keyed fact belongs to a promoted entity, both the subject and the object are checked (`source_subject` / `source_object` under the QA encoding, `subject` / `object` under the quadruple encoding). Reverse QA templates (e.g., "Who lives in Heilbronn?") swap subject/object, so both must be checked.
-- **Periodic reconstruction:** Fidelity probing runs every N cycles (default 5), not every cycle. Per-cycle probing consumed 73% of cycle time in entity-replay experiments.
-- **SimHash registry per adapter:** Each adapter (episodic, semantic) maintains its own SimHash registry. Keys promoted from episodic to semantic are registered in the semantic registry and removed from episodic.
-
-Validated: 10-cycle smoke test, episodic 6/6 (100%), semantic 6/6 (100%), 49.9 min total.
-
-### AD-16: Multi-Stage Privacy-Aware Extraction Pipeline (Phase 5)
-
-Graph extraction is a staged chain built around a cloud-boundary privacy envelope.
-The local model owns everything that touches real user data; the SOTA cloud model
-sees only anonymized placeholders. Every stage falls forward — a failure at stage
-N keeps the predecessor's output and continues.
-
-1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. Speaker-name injection pins the real speaker as canonical subject.
-2. **Anonymize** (`configs/prompts/anonymization.txt`): local model produces `{real → placeholder}` mapping + anonymized transcript.
-3. **Leak guard + repair** (`verify_anonymization_completeness`, `_check_mapping_totality`, `_repair_anonymization_leaks`): PII-scoped check with optional spaCy NER cross-check. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`); the prefix is derived from the upstream NER/extractor type via PascalCase rather than picked from a fixed lexicon. Missed names extend the mapping, hallucinated names drop referencing triples, and orphan placeholders are dropped at the residual sweep — the prior position-based pairing (`anon_facts[i] ↔ original_relations[i]`) was retired in favour of the totality diagnostic.
-4. **SOTA enrichment with delta protocol** (`configs/prompts/sota_enrichment.txt`, `_filter_with_sota`): SOTA returns a delta envelope `{add, modify, drop, bindings}` — only the changes against the input fact list, plus `bindings: {placeholder: real_name}` for any net-new entities it introduced. The pipeline applies the delta to the input facts, merges bindings into the reverse mapping before de-anonymization, and reconstructs the updated transcript locally from the bindings. No transcript token-diff and no fact-echo: this replaced the prior "echo every fact + full transcript" envelope (≈ order-of-magnitude token reduction on small inputs).
-5. **De-anonymize via state-machine substitution** (`_apply_bindings`): deterministic substring replacement of placeholder tokens with their real values from the merged reverse mapping. Zero local-LLM cost. Any fact whose subject or object still contains a placeholder-shaped token after substitution is dropped (residual-fact filter preserved, just no longer fronted by an LLM call).
-6. **Plausibility** (`configs/prompts/sota_plausibility.txt` or `_local_plausibility_filter`): residual safety net. Grounding-based — every rule asks the judge to ground each fact against the transcript before deciding. Six rules cover (R1) self-loops, (R2) name-swap and role-leak shapes, (R3) transcript contradiction, (R4) conversation-role leaks (`Assistant`/`User`/...), (R5) content-free objects (`Unknown`/`None`/...), (R6) namespaced system identifiers (`media_player.X`). R3–R6 are described as categories rather than fixed token-lists, so the judge can extend them when the transcript supports the call. The closed-vocabulary R4 of the prior version was removed when the placeholder vocabulary opened up.
-
-A **fallback path** (`_fallback_plausibility_on_raw`) runs local plausibility on the raw extraction when the primary chain empties out. Per-stage diagnostics (`SessionGraph.diagnostics`) record raw outputs, transcript round-trip, and dropped facts for audit.
-
-**Single chokepoint.** Every orchestrator (training consolidation, calibration endpoint, experiments, tests) reaches the extraction chain through `ExtractionPipeline` (`paramem/graph/extraction_pipeline.py`) — one class that owns kwarg assembly, prompt-filename resolution, adapter guard, and gradient-checkpointing discipline. Direct calls to `extract_graph(...)` or `extract_procedural_graph(...)` are forbidden by `tests/test_extraction_pipeline_guard.py`. The class exposes `run(transcript, session_id, *, source_type, **overrides)` for transcript-shaped inputs and `run_procedural(...)` for the preference/habits stream; `kwargs(*, source_type, **overrides)` returns the resolved kwarg dict for callers that need to invoke `extract_graph` indirectly (e.g. legacy fixtures in the grandfathered list).
+**Live-reload after base-swap final tier.** After the final `migrate()` returns, the orchestrator calls `_live_reload_base_model` before marking `status=pass`. The reload tears down the PeftModel and rebuilds it from disk, picking up every tier's promoted adapter so the running server serves the new base without a systemctl restart. For the reload to fit on 8 GiB, all base-model holders (`BackgroundTrainer.model`, `ConsolidationLoop.model/.extraction.model`) are released via their encapsulated `release()` methods before the reload.
 
 ### AD-17: Background Training with Inference Pause (Phase 5)
 
 Consolidation supports two code paths:
 
 - **Blocking:** `run_consolidation` — extracts all sessions then trains under a single GPU lock. Used for manual `POST /consolidate`.
-- **Scheduled (cooperative):** `_extract_and_start_training` spawns a `BackgroundTrainer` that releases the GPU lock per step so voice turns interleave. Driven by a systemd user timer whose period is derived from `consolidation.refresh_cadence × consolidation.max_interim_count`. `refresh_cadence` is the only user-facing knob — accepts `"HH:MM"` (daily), `"every Nh"`/`"every Nm"` (interval), `"daily"`, or `""`/`"off"` (manual only). `GracefulShutdownCallback` stops training at epoch boundaries on shutdown; a failed interim cycle is logged and the pending sessions are left for retry on the next tick. Optionally, `RecallEarlyStopCallback` (gated by `consolidation.recall_early_stopping`, default OFF) runs co-resident with `GracefulShutdownCallback` at the same `on_epoch_end` hook and fires `should_training_stop` once the staged adapter has memorized its full per-tier key set. The callback is constructed inside `ConsolidationLoop._maybe_make_recall_callback` and attached at every production-reachable `train_adapter` call site (4 in `paramem/training/consolidation.py`, 1 in `paramem/server/active_store_migration.py`).
+- **Scheduled (cooperative):** `_extract_and_start_training` spawns a `BackgroundTrainer` that releases the GPU lock per step so voice turns interleave. Driven by a systemd user timer derived from `consolidation.refresh_cadence × consolidation.max_interim_count`. `refresh_cadence` accepts `"HH:MM"` (daily), `"every Nh"`/`"every Nm"` (interval), `"daily"`, or `""`/`"off"` (manual only).
 
-Batch consolidation processes sessions as: `extract_session()` for all pending sessions, then `train_adapters()` once.
+`GracefulShutdownCallback` stops training at epoch boundaries on shutdown; a failed interim cycle is logged and pending sessions are left for retry on the next tick. `RecallEarlyStopCallback` (gated by `consolidation.recall_early_stopping`, default OFF) fires `should_training_stop` once the staged adapter has memorized its full per-tier key set.
 
-A **simulation mode** (`consolidation.mode: simulate`) persists the knowledge graph to disk as `graph.json` under `<adapter_dir>/<tier>/` instead of training LoRA weights. Both modes write to the same unified layout; the distinction is whether timestamped weight slot subdirectories are present alongside the graph. `DiskMemorySource` reads `graph.json` for simulate-mode recall; `WeightMemorySource` probes adapter weights for train-mode recall. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall — the source store is kept until the target is verified, so an interrupted migration falls back cleanly to the former mode (see `paramem/server/active_store_migration.py`). The same simulate↔train mechanism backs the online **base-model swap**: Phase A captures each tier's graph from the live adapters (`train→simulate`) and deletes the old weight slots, the base model is reloaded in-process, and Phase B relearns each tier on the new base (`simulate→train`) under the same 100% recall gate. The pre-swap snapshot bundle is retention-immune and carries a non-restored `server.yaml.candidate` sidecar so a rolled-back swap can be retried (operational flow in [`README.md`](README.md); revert path in [`SECURITY.md`](SECURITY.md)).
+A **simulation mode** (`consolidation.mode: simulate`) persists the knowledge graph to disk instead of training LoRA weights. Switching `consolidation.mode` between `train` and `simulate` triggers a per-tier active-store migration on next startup, gated by 100% recall. The same simulate↔train mechanism backs the online **base-model swap**: Phase A captures each tier's graph from the live adapters (`train→simulate`) and deletes the old weight slots; Phase B relearns each tier on the new base (`simulate→train`) under the same 100% recall gate.
 
-### AD-18: Multi-Engine Multilingual TTS (Phase 5, F5.7)
-
-Local text-to-speech via pluggable engines (`ENGINE_REGISTRY`) behind a common `TTSEngine` ABC:
-
-- **Piper** (ONNX runtime): fast, high-quality voices for well-supported languages (en, de, fr, es). Sub-second synthesis on CPU.
-- **MMS-TTS** (HuggingFace VitsModel): broader language coverage (e.g. Tagalog) where Piper has no voice model.
-- **Kokoro-82M** (optional, opt-in per voice): higher-quality neural voices for en/fr/es and others (no German). Apache-2.0, CPU-capable.
-
-`TTSManager` routes synthesis requests by language code to the configured engine/voice from `server.yaml` (per-voice device, CPU default). Exposed as a Wyoming protocol server (port 10301): it advertises `supports_synthesize_streaming` and handles `SynthesizeStart`/`Chunk`/`Stop`, which is what lets HA's streaming voice pipeline deliver the audio to satellites/Sonos (engines that don't advertise streaming get a degraded delivery path).
-
-Language detection flows from two sources, both feeding the same resolver in `/chat`:
-
-- **Voice path:** Whisper STT → `TranscriptionResult.language` → `_state["latest_language_detection"]` → `/chat` handler.
-- **Text path:** fastText `lid.176` (`paramem/server/lang_id.py`) eager-loaded at server lifespan startup when `text_lang_detection.enabled`. Invoked on the request text only when no STT-derived signal is present and the request carries no voice embedding. CPU-only, zero VRAM cost; the 126 MB model is fetched once via `scripts/setup/download-langid-model.sh` into `~/.cache/paramem/lang_id/`. Disabled by default in the example config so deployments without the model file do not warn.
-
-`_language_instruction()` injects "Respond in {language}" into system prompts for non-English input. Speaker profiles persist `preferred_language` for cross-session consistency on the voice path; the text path has no speaker-preference fallback (text `/chat` cannot identify a speaker without a voice embedding), so the detector's confidence threshold is conservative.
-
-**Transport-agnostic STT/embedding seam.** STT transcription and optional voice-embedding extraction are factored into `process_utterance` (`paramem/server/voice_pipeline.py`), called by both the Wyoming satellite handler and the `POST /voice` endpoint. The two callers differ only in how they establish speaker identity:
-
-- **Wyoming satellite path:** `process_utterance` runs STT **and** computes the voice embedding (`compute_embedding=True`). The embedding is matched against enrolled speaker profiles to identify the caller.
-- **`POST /voice` (mobile PWA) — token-type selector:** when the device carries a per-user bearer token (`auth_speaker_id` set), `process_utterance` runs STT only (`compute_embedding=False`) and identity is resolved from the token. When the device carries the shared token (`auth_speaker_id is None`), `compute_embedding=True` and the embedding is passed through `_resolve_and_enroll_speaker` — the same async helper called by `POST /chat` — which runs deferred enrollment, name-disclosure, language-preference update, anonymization, and greeting. A fresh per-utterance `conversation_id` is generated on each shared-token request (one POST = one push-to-talk press); `session_buffer.claim_sessions_for_speaker` propagates identity across conversation_ids by embedding so two-turn enrollment is preserved.
-
-Both paths feed the transcript into `_run_chat_turn` — the same turn-orchestrator as `POST /chat` (debounce, routing, post-session training, greeting, language detection). The reply is synthesised through `TTSManager` using the per-language voice configured in `server.yaml` (e.g. Kokoro `af_heart` for English). The `/voice` response body is `{transcript, reply, audio, audio_format, follow_up}`: `audio` is a base64-encoded RIFF/PCM int16 mono WAV (or `""` when TTS is unavailable, caller falls back to text-only); `follow_up` carries the enrollment/greeting prompt when one is pending, else `null`. Status codes: `503` when STT is not loaded (cloud-only mode), `413` for payloads over 25 MB, `400` for audio-decode failure, `404` when `mobile_pwa.enabled` is false.
+## Inference & Serving
 
 ### AD-19: Intent Classification — LLM-Default with Encoder Fallback
 
@@ -318,126 +273,49 @@ PERSONAL" short-circuit caused imperatives from enrolled speakers
 to misroute into the PA path). The router scopes keys by speaker
 but lets the classifier decide intent.
 
-### AD-20: Staging+Promote Adapter Contract (Phase 5)
+### AD-18: Multi-Engine Multilingual TTS (Phase 5)
 
-Every adapter training event — consolidation cycle, post-session train, interim
-mint, base-swap Phase B — runs through a two-slot **staging+promote** contract,
-not directly on the production tier. The contract has one entry point
-(`paramem/training/trainer.py::train_adapter`) and one staging slot per process
-(`in_training`).
+Local text-to-speech via pluggable engines (`ENGINE_REGISTRY`) behind a common `TTSEngine` ABC:
 
-**Two-slot rationale.** Mutating production weights in place is unsafe across
-two failure modes: (1) crash mid-training would leave the production slot in a
-half-trained state with no rollback path; (2) the recall sanity gate at the end
-of training can reject the trained adapter (recall < 1.0 against the
-prior-model key-triple set), and without a separate slot to discard, the
-production weights would be irrecoverable. The staging+promote contract
-isolates both. Production stays byte-identical to the last committed state
-until the training has completed, the recall gate has passed at 1.0 against
-the prior-model entries, and the new weights have been promoted by an
-explicit `copy_adapter_weights(staging → production)` step.
+- **Piper** (ONNX runtime): fast, high-quality voices for well-supported languages (en, de, fr, es). Sub-second synthesis on CPU.
+- **MMS-TTS** (HuggingFace VitsModel): broader language coverage (e.g. Tagalog) where Piper has no voice model.
+- **Kokoro-82M** (optional, opt-in per voice): higher-quality neural voices for en/fr/es and others (no German). Apache-2.0, CPU-capable.
 
-**The staging slot is transient — it exists only while a training event is in
-flight.** Lifecycle:
+`TTSManager` routes synthesis requests by language code to the configured engine/voice from `server.yaml` (per-voice device, CPU default). Exposed as a Wyoming protocol server (port 10301): it advertises `supports_synthesize_streaming` and handles `SynthesizeStart`/`Chunk`/`Stop`, which is what lets HA's streaming voice pipeline deliver audio to satellites/Sonos.
 
-| Phase | Action | Owner |
-|---|---|---|
-| Training entry | `_ensure_staging_slot` creates `in_training` (fresh LoRA-init, seeded RNG) | `trainer.py::train_adapter` |
-| Training body | HF Trainer mutates `in_training`; production untouched | HF Trainer |
-| Promote | `copy_adapter_weights(in_training → production)` | `trainer.py::train_adapter` success path |
-| Cleanup | `delete_adapter("in_training")` — fires inside both success and abort branches at training exit | `trainer.py::train_adapter` (single-owner) |
-| Recall gate | `_run_recall_sanity_probe(production, entries, threshold=1.0)` against the prior-model key-triple set | caller (`active_store_migration.migrate` / `consolidation._save_adapters`) |
-| Durable save | `atomic_save_adapter(production)` writes the slot dir | caller |
+Language detection flows from two sources, both feeding the same resolver in `/chat`:
 
-The slot does not persist across training events. Each new training event
-re-enters the first-time branch of `_ensure_staging_slot`. This is the
-"created from scratch per training, deleted on success" invariant.
+- **Voice path:** Whisper STT → `TranscriptionResult.language` → `_state["latest_language_detection"]` → `/chat` handler.
+- **Text path:** fastText `lid.176` (`paramem/server/lang_id.py`) eager-loaded at server lifespan startup when `text_lang_detection.enabled`. Invoked on the request text only when no STT-derived signal is present and the request carries no voice embedding. CPU-only, zero VRAM cost; fetched once via `scripts/setup/download-langid-model.sh` into `~/.cache/paramem/lang_id/`. Disabled by default in the example config so deployments without the model file do not warn.
 
-**Consolidation vs. migration — what differs is the production tier's starting
-weights, not the staging mechanism.** Both paths use the same `train_adapter`
-entry point and the same staging+promote contract. They diverge in one step
-before the call:
+`_language_instruction()` injects "Respond in {language}" into system prompts for non-English input. Speaker profiles persist `preferred_language` for cross-session consistency on the voice path.
 
-- **Consolidation** (`consolidation.py::_train_adapter_with_replay`,
-  `_run_indexed_key_semantic`, …): the production tier is left untouched. Its
-  weights at training entry are the previous cycle's promoted state.
-  `copy_adapter_weights(production → in_training)` carries the prior trained
-  weights into staging, training continues from there. This is incremental
-  learning — every cycle builds on the previous cycle's adapter.
+**Transport-agnostic STT/embedding seam.** STT transcription and optional voice-embedding extraction are factored into `process_utterance` (`paramem/server/voice_pipeline.py`), called by both the Wyoming satellite handler and the `POST /voice` endpoint. The two callers differ only in how they establish speaker identity:
 
-- **Base-swap migration** (`paramem/server/active_store_migration.py:585-589`):
-  the production tier is explicitly `delete_adapter` + `create_adapter` reset
-  to LoRA-zero before `train_adapter` is called.
-  `copy_adapter_weights(production → in_training)` then copies LoRA-zero into
-  staging. Training is from scratch on the new base model.
+- **Wyoming satellite path:** `process_utterance` runs STT and computes the voice embedding (`compute_embedding=True`). The embedding is matched against enrolled speaker profiles to identify the caller.
+- **`POST /voice` (mobile PWA) — token-type selector:** when the device carries a per-user bearer token (`auth_speaker_id` set), `process_utterance` runs STT only (`compute_embedding=False`) and identity is resolved from the token. When the device carries the shared token (`auth_speaker_id is None`), `compute_embedding=True` and the embedding is passed through `_resolve_and_enroll_speaker`.
 
-The asymmetry is by design: migration starts fresh because the LoRA weights of
-the old base model do not transfer to a new base model (different layer
-dimensions); consolidation continues from prior weights because that is what
-makes online incremental learning work.
+Both paths feed the transcript into `_run_chat_turn` — the same turn-orchestrator as `POST /chat`.
 
-**No cross-talk between training events.** The post-save `delete_adapter`
-guarantees that no LoRA tensor from one training event survives into the next.
-The next training event enters `_ensure_staging_slot` with the slot absent and
-creates a byte-fresh staging adapter. Even when two consecutive training
-events use the same adapter shape (rank + target modules), the second event's
-staging weights are not influenced by the first.
+## Evaluation Infrastructure
 
-**Pause and resume.** "Pause" is process exit. The crash branch of
-`train_adapter` preserves `staging_resume.json` (dataset + config fingerprints
-+ pointer to the latest HF Trainer checkpoint) and the
-`bg_checkpoint_epoch/checkpoint-N/` tree. On the next process boot, PEFT loads
-production from disk; `in_training` is absent (never persisted to disk; the
-backup runner excludes it explicitly at `paramem/backup/backup.py:482,484`).
-The next `train_adapter` call creates a fresh staging slot, and
-`_resolve_resume_checkpoint` finds the saved checkpoint and HF Trainer's
-`resume_from_checkpoint` loads its weights into the staging slot before
-continuing from step/epoch N+1. Resume continues training; it does not start
-from scratch.
+### AD-8: RAG Baseline with FAISS (Phase 4)
 
-**Live-reload after the final tier (base-swap only).** Base-swap migration
-iterates `migrate()` over every adapter tier; each tier passes through
-`delete_adapter` + `create_adapter` (LoRA-zero reset) → `train_adapter` →
-`copy_adapter_weights(staging → production)` → `delete_adapter("in_training")`.
-The production weights for every tier land on disk, but the in-RAM
-`PeftModel` is mounted in whatever shape the last tier wrapped it in — a
-LoRA-zero reset for the final tier hides its just-promoted weights from
-inference until the wrapper is rebuilt. The orchestrator closes this gap by
-calling `_live_reload_base_model(refresh_config_from_disk=False)` after the
-final `migrate()` returns and before the `status=pass` marker (Step 6 in the
-sequence at `paramem/server/app.py::_run_base_swap_orchestration`). The
-reload tears down the PeftModel and rebuilds it from disk, picking up every
-tier's promoted adapter cleanly so `/debug/recall`'s `adapter_available`
-topology matches disk without a systemctl restart. For the reload to fit on
-8 GiB the release first drops every base-model holder — `BackgroundTrainer.model`
-(pinned by the worker-thread bound-method cycle) and
-`ConsolidationLoop.model`/`.extraction.model` — via `BackgroundTrainer.release()`
-and `ConsolidationLoop.release()`; otherwise the just-retrained base stays
-resident (~2.8 GiB) and the reload defers to cloud-only. The reload is best-effort:
-if it fails internally the server lands in cloud-only with
-`cloud_only_reason` set and the swap is still marked complete (weights are
-already on disk); the next `/gpu/acquire` recovers. Consolidation does NOT
-require this addendum — its `train_adapter` calls share the existing
-PeftModel without per-tier reshape, and the staging→promote step already
-leaves the in-RAM tier in its post-promotion shape.
+RAG pipeline uses the same embedding model already installed (all-MiniLM-L6-v2) for chunk retrieval. FAISS-CPU for vector search — lightweight, no GPU needed at our scale (hundreds of chunks). Falls back to numpy cosine search if FAISS install fails on WSL2.
 
-## Known Constraints and Risks
+The RAG pipeline is evaluation infrastructure, not a competing product. It exists to diagnose where parametric memory wins or loses vs retrieval.
+
+## Superseded Decisions
+
+**AD-12: Swappable Extraction Backend** — superseded by AD-16. The `backend` parameter on `extract_graph()` was never shipped; the single-backend staged chain of AD-16 replaced it.
+
+## Known Constraints
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | 8GB VRAM limits batch size and sequence length | Slower training, potential quality impact | QLoRA + gradient checkpointing + gradient accumulation; monitor for quality issues |
 | WSL2 CUDA memory reporting can be inaccurate | Unexpected OOM during training | Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; keep training data on Linux filesystem |
 | Multi-adapter simultaneous training not natively batched in PEFT | Must train adapters sequentially per consolidation cycle | Acceptable for PoC; each adapter trains independently anyway |
-| Graph extractor quality depends on base model capability | Poor extraction → poor consolidation signal | Evaluate extraction quality early in Phase 3; consider separate extractor model if needed |
-| Catastrophic forgetting in the episodic adapter during consolidation | Core technical risk — the thing we're trying to solve | Phase 2 is entirely dedicated to understanding and mitigating this |
-| Promotion threshold tuning is empirical | Wrong thresholds → too much or too little promotion | Phase 3 includes sensitivity analysis; all thresholds configurable |
-| RAG outperforms parametric on all metrics | Undermines project thesis | Expected for factual recall; parametric value is in compression and style — measure both |
-| Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Cap active keys at 50; retire empty keys; consolidate session keys into topic keys on promotion |
+| Graph extractor quality depends on base model capability | Poor extraction → poor consolidation signal | Evaluate extraction quality early; consider separate extractor model if needed |
+| Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Cap active keys at 20 (`max_active_keys`); retire empty keys; consolidate session keys into topic keys on promotion |
 | Curriculum probing adds latency | Slows iteration cycle | Cap probe to 50 items, cache results, skip on smoke test runs |
-
-## WSL2-Specific Configuration
-
-- CUDA toolkit installed via conda (`nvidia::cuda-toolkit`), not system packages
-- All data and code on Linux filesystem (`/home/...`), never `/mnt/c/...`
-- Windows NVIDIA driver ≥560 required for WSL2 CUDA support
-- Set environment variable: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
