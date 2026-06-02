@@ -46,7 +46,7 @@ class ServerHTTPError(Exception):
         super().__init__(f"HTTP {status_code} from {url}")
 
 
-def get_json(url: str, *, timeout: float = 5.0) -> dict:
+def get_json(url: str, *, timeout: float = 5.0, token: str | None = None) -> dict:
     """Perform a GET request and return the parsed JSON body.
 
     Parameters
@@ -55,6 +55,10 @@ def get_json(url: str, *, timeout: float = 5.0) -> dict:
         Absolute URL to request.
     timeout:
         Request timeout in seconds.
+    token:
+        Optional bearer token.  When set, an ``Authorization: Bearer <token>``
+        header is sent (required for admin-gated GET endpoints such as
+        ``/status``).  When ``None``, no Authorization header is sent.
 
     Returns
     -------
@@ -71,8 +75,9 @@ def get_json(url: str, *, timeout: float = 5.0) -> dict:
         For any non-2xx, non-404 response (e.g. 5xx or 400).
     """
     try:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
         with httpx.Client(timeout=timeout) as client:
-            response = client.get(url)
+            response = client.get(url, headers=headers)
     except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
         raise ServerUnreachable(str(exc)) from exc
 
