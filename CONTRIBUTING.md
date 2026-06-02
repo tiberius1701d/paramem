@@ -61,10 +61,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Smoke test (~4 min)
 python experiments/phase4_indexed_keys_smoke.py --num-epochs 30
 
-# Examples (~4-10 min each)
+# Post-install REST smoke (needs a running server, debug: true, PARAMEM_API_TOKEN)
 python examples/quick_start.py
-python examples/incremental_learning.py
-python examples/two_adapter_promotion.py
 ```
 
 ## Pull Request Process

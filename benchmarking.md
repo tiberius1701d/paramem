@@ -7,6 +7,14 @@ moved from the LLM-generated `(key, question, answer)` form to the
 `(key, subject, predicate, object)` quadruple form — see Test 17; Tests 1–16
 were run on the QA-pair encoding and their numbers stand as recorded.)
 
+
+> **Paper snapshot note:** The paper (`paper/main.tex`, tag `v1.0-arxiv`) is a
+> frozen 2026-03 snapshot at the 100-key scale. This document supersedes it with
+> the current 550-key / quadruple-encoding results. Where the paper and this
+> document disagree, this document is authoritative.
+
+---
+
 ## Benchmark Models
 
 | Model | Params | Quantization | CPU Offload | Config Key |
@@ -15,6 +23,8 @@ were run on the QA-pair encoding and their numbers stand as recorded.)
 | Mistral 7B Instruct v0.3 | 7B | NF4 4-bit | No | `--model mistral` |
 
 Without `--model`, tests run both models sequentially for direct comparison.
+
+---
 
 ## Running the Suite
 
@@ -47,18 +57,62 @@ python archive/experiments/test2_contradictions.py --model mistral
 
 Results go to `outputs/testN_*/{model}/{timestamp}/results.json`.
 
+---
+
 ## Test Suite Overview
 
-| Test | Name | Key Question | Expected Outcome | Data |
-|------|------|-------------|------------------|------|
-| 1 | Scale Expansion | Does recall degrade at 10→100 keys? | ≥95% recall, linear time scaling | PerLTQA dialogues (on-the-fly distillation) |
-| 2 | Contradiction Resolution | Can temporal fact updates be detected and resolved? | Graph normalization detects all same-predicate contradictions | Synthetic fact chains (3 temporal versions each) |
-| 2b | Incremental Contradictions | Does forgetting work with a persistent adapter? | Immediate overwrite, zero catastrophic forgetting | Same data as Test 2, single persistent adapter |
-| 3 | Reasoning Quality Parity | Does PM match RAG for multi-hop reasoning? | Quality parity; PM offers latency/privacy/compression benefits | ~50 PerLTQA facts + LLM-generated inference questions |
-| 4 | Pipeline Robustness | Does cumulative train-delete-retrain stay reliable? | Stable recall as facts grow from 3 to 30 across 10 sessions | 30 synthetic facts across 10 sessions |
-| 5 | Natural Recall | How much knowledge is accessible without indexed keys? | Limited — motivates the key mechanism | 50 QA pairs + 10 open-ended probes |
-| 6 | Storage Footprint | What is the storage cost vs. RAG at scale? | Adapter is O(1); RAG index scales linearly | Adapters at 10/25/50/100 keys |
-| 7 | Second Persona | Does the architecture generalize beyond one user? | Similar recall across personas with minimal cross-contamination | 2 personas × 50 QA pairs |
+Grouped index of all tests. See Part headers below for context.
+
+**Part 1 — Core capability & scale:**
+[Qwen Dev Experiments](#qwen-25-3b-development-experiments) ·
+[Test 1 — Scale Expansion](#test-1-scale-expansion) ·
+[Test 8 — Large-Scale Incremental (550 keys)](#test-8-large-scale-incremental-550-keys-no-ceiling-observed) ·
+[Test 5 — Natural Recall](#test-5-natural-recall) ·
+[Test 9 — Natural Recall Emergence](#test-9-natural-recall-emergence) ·
+[Test 3 — Reasoning Quality Parity with RAG](#test-3-reasoning-quality-parity-with-rag) ·
+[Test 6 — Parametric vs RAG Head-to-Head](#test-6-parametric-vs-rag-head-to-head) ·
+[Test 4 — Multi-Session Pipeline Robustness](#test-4-multi-session-pipeline-robustness) ·
+[Test 7 — Second Persona](#test-7-second-persona)
+
+**Part 2 — Continual learning & retention:**
+[Test 2 — Contradiction Resolution](#test-2-contradiction-resolution) ·
+[Test 2b — Incremental Contradiction Resolution](#test-2b-incremental-contradiction-resolution) ·
+[Test 4b — Incremental Learning Without Full Replay](#test-4b-incremental-learning-without-full-replay) ·
+[Test 13 — Placeholder Generalization (Journal-Scaffold)](#test-13-placeholder-generalization-journal-scaffold) ·
+[Test 13b — Retention-Curve Re-Run](#test-13b-retention-curve-re-run-completed-2026-04-23) ·
+[Test 14 — Content-Free Scaffold, Multi-Round Early-Stop](#test-14-content-free-scaffold-with-multi-round-early-stop-at-scale) ·
+[Test 15 — Retention Multi-Seed (Scaffold-Fill vs Answer-Swap)](#test-15-retention-multi-seed-scaffold-fill-vs-answer-swap-production-early-stop) ·
+[Test 16 — Repair-Loop Sensitivity Sweep](#test-16-repair-loop-sensitivity-sweep)
+
+**Part 3 — Generalization boundaries:**
+[Test 10 — Generalization Boundaries](#test-10-generalization-boundaries-of-parametric-memory) ·
+[Test 10b — Diverse Rephrasing Probe](#test-10b-diverse-rephrasing-probe)
+
+**Part 4 — Encoding format:**
+[Test 17 — Quadruple-Encoded Indexed-Key Adapter at Scale](#test-17-quadruple-encoded-indexed-key-adapter-at-scale)
+
+**Part 5 — Multi-adapter:**
+[Test 7b — Multi-Adapter Composition](#test-7b-multi-adapter-composition-exploratory)
+
+**Part 6 — Pipeline & extraction:**
+[Test 11 — Extraction Pipeline Configuration](#test-11-extraction-pipeline-configuration) ·
+[6-Model Extraction Comparison](#6-model-extraction-comparison-2026-04-14) ·
+[Extraction Probe Sweep](#extraction-probe-sweep-2026-04-17) ·
+[Extraction Pipeline Evolution](#extraction-pipeline-evolution)
+
+**Part 7 — Deployment & operations:**
+[HA Pipeline Latency](#ha-pipeline-latency-2026-03-27) ·
+[Dual-Escalation Routing](#dual-escalation-routing-2026-03-30) ·
+[HA Deployment Results](#ha-deployment-results-2026-03-25) ·
+[Speaker Identification](#speaker-identification-2026-04-08)
+
+**Part 8 — Infrastructure, data & meta:**
+[Early Stopping](#early-stopping) ·
+[Data Sources](#data-sources) ·
+[Output Structure](#output-structure) ·
+[Security Considerations](#security-considerations) ·
+[LLM-Assisted Adversarial Review](#llm-assisted-adversarial-review-2026-03-21) ·
+[Archived dead-ends](#archived-dead-ends)
 
 ### Design principles
 
@@ -70,21 +124,25 @@ Results go to `outputs/testN_*/{model}/{timestamp}/results.json`.
 
 ---
 
-## Qwen 2.5 3B Development Experiments (§5.1-5.5)
+## Part 1 — Core Capability & Scale
+
+---
+
+## Qwen 2.5 3B Development Experiments
 
 **Model:** Qwen/Qwen2.5-3B (base model, NF4 4-bit, no CPU offload)
 **Re-verified:** 2026-03-21, all scripts updated with timestamped output + raw capture, temperature=0.0
 
 These use pre-defined synthetic QA pairs (no distillation pipeline). Qwen is a base model, not instruct — unsuitable for the LLM-based graph extraction required by Tests 1-7b.
 
-| Experiment | Script | Result | Loss | Time | Output |
-|---|---|---|---|---|---|
-| §5.1 Per-fact recall (10 keys) | `phase4_indexed_keys_smoke.py` | 10/10 (100%) | 1.268 | 225s | `outputs/phase4_indexed_keys/qwen2.5-3b/20260321_211658/` |
-| §5.2 Capacity (20 keys) | `f4_9c_test1_capacity.py` | 20/20 (100%) | 1.051 | 438s | `outputs/f4_9c_test1_capacity/qwen2.5-3b/20260321_214101/` |
-| §5.3 Incremental (10+5) | `f4_9c_test2_incremental.py` | 15/15 (100%) | 1.271→0.817 | 227s+164s | `outputs/f4_9c_test2_incremental/qwen2.5-3b/20260321_221343/` |
-| §5.4 Two-adapter (30ep retrain) | `f4_9c_test3_two_adapter.py` | 10/10 ep + 5/5 sem | 1.268/1.319/0.809 | 617s | `outputs/f4_9c_test3_two_adapter/qwen2.5-3b/20260321_225957/` |
-| §5.4 Two-adapter (15ep retrain) | `f4_9c_test3_two_adapter.py --retrain-epochs 15` | 7/10 ep + 5/5 sem | — | 482s | `outputs/f4_9c_test3_two_adapter/qwen2.5-3b/20260321_223824/` |
-| §5.5 Consolidation (10 cycles) | `f4_10_indexed_consolidation.py` | 8/8 ep + 2/2 sem (100%) | — | 42.7 min | `outputs/f4_10_indexed_consolidation/qwen2.5-3b/20260321_233723/` |
+| Experiment | Result | Loss | Time |
+|---|---|---|---|
+| Per-fact recall (10 keys) | 10/10 (100%) | 1.268 | 225s |
+| Capacity (20 keys) | 20/20 (100%) | 1.051 | 438s |
+| Incremental (10+5) | 15/15 (100%) | 1.271→0.817 | 227s+164s |
+| Two-adapter (30ep retrain) | 10/10 ep + 5/5 sem | 1.268/1.319/0.809 | 617s |
+| Two-adapter (15ep retrain) | 7/10 ep + 5/5 sem | — | 482s |
+| Consolidation (10 cycles) | 8/8 ep + 2/2 sem (100%) | — | 42.7 min |
 
 Key findings:
 - All experiments achieve 100% recall at their respective scales
@@ -241,32 +299,6 @@ from dialogue text alone. Improving extraction density is a model optimization
 task — outside the scope of the first paper, which validates the memory
 mechanism itself.
 
-### Methodology update (2026-03-18)
-
-Critical design review identified and fixed the following issues:
-
-1. **keyed_pairs now persisted alongside adapters.** `train_indexed_keys` saves
-   `keyed_pairs.json` in the output directory for every training run. Enables
-   post-hoc re-evaluation and independent verification of results.
-
-2. **Unified scoring metric for PM vs RAG comparison.** Both parametric and RAG
-   recall are now scored by embedding similarity (`all-MiniLM-L6-v2` cosine) with
-   a 0.75 match threshold, in addition to SimHash confidence for parametric.
-   This enables apples-to-apples comparison in the summary table.
-
-3. **Unified max_new_tokens.** RAG evaluation now uses `max_new_tokens=200`
-   (previously hardcoded at 150 in the library function). Parametric uses 256
-   due to JSON wrapper overhead — noted in results metadata.
-
-4. **RAG indexes distilled keyed_pairs**, not original QA pairs. Same data as
-   parametric training, ensuring the only variable is the storage mechanism.
-
-5. **Design note:** Scale points use nested subsets (scale N = first N pairs from
-   single distillation). This mirrors real usage (accumulating facts over time)
-   but means scale points are not independent observations.
-
-**Rerun completed 2026-03-19. Results above supersede previous run.**
-
 ### Key takeaways
 
 1. **Gemma achieves 100% recall across all scales (10-100 keys).** The indexed
@@ -296,166 +328,640 @@ Critical design review identified and fixed the following issues:
 
 ---
 
-## Early Stopping
+## Test 8: Large-Scale Incremental (550 Keys, No Ceiling Observed)
 
-**Status:** IMPLEMENTED, NOT ACTIVE — **not recommended** based on exploration results
+**Script:** `experiments/test8_large_scale.py`
+**Status:** CLOSED 2026-05-11 — scaling target (550 keys) reached at cycle 56, 100% recall, no ceiling indicator observed in the training signal. Test 8 used the QA-pair encoding with incremental full-replay (56 cycles, 280 sessions across 11 characters, multi-day wall time). The closure answers the immediate research question (does the indexed-key mechanism scale past 100 keys under the legacy QA-pair encoding? — yes) and is not a negative result on Test 8. Test 17 is a separate scaling effort under the production quadruple encoding on a different source graph (LongMemEval); it settled the production-encoding decision and is the canonical reference for the quadruple path. Test 8 remains the reference for the QA-pair path. The capacity ceiling remains unmeasured and is open future work.
 
-### Implementation
 
-Loss-based early stopping using epoch-average loss (not per-step):
-- **Threshold:** avg epoch loss < 0.01
-- **Floor:** 10 epochs minimum
-- **Patience:** 2 consecutive epochs below threshold
-- **Hard cap:** 30 epochs
+### What it tests
 
-Implemented in `LossEarlyStoppingCallback` (`paramem/training/trainer.py`).
-Configurable via `TrainingConfig`. Defaults to off (`early_stopping=False`).
+Can indexed key retrieval scale to 500+ keys using the full automated consolidation
+pipeline? This is the paper's primary scaling claim — everything beyond 100 keys is
+new territory. Uses multi-character PerLTQA data processed through the complete
+pipeline: session transcript → graph extraction → graph merge → QA generation →
+indexed key training with full replay.
 
-### Early validation (scale=25, PerLTQA data, loss-based)
+### Design
 
-| Metric | 30-epoch baseline | Early stopping | Delta |
-|--------|-------------------|----------------|-------|
-| Gemma recall | 24/25 (96%) | 24/25 (96%) | No change |
-| Gemma epoch reached | 30 | 19 | -37% |
-| Gemma training time | 17.4 min | 11.0 min | -37% |
-| Mistral recall | 25/25 (100%) | 22/25 (88%) | **-3 keys** |
-| Mistral epoch reached | 30 | 22 | -27% |
-| Mistral training time | 13.9 min | 8.9 min | -36% |
+- **Model:** Mistral 7B Instruct v0.3, NF4 4-bit, rank 8
+- **Cycle structure:** 5 sessions per cycle, full replay (retrain all keys from scratch each cycle)
+- **Training:** 30 epochs per cycle, batch_size=1, gradient_accumulation=2
+- **QA regeneration:** Full regeneration from cumulative graph each cycle (no cache — verifies pipeline integrity as adapter weights change the extraction landscape)
+- **Data source:** Multi-character PerLTQA (~11 characters queued for 500 keys)
+- **Pause/resume:** `tpause`/`tresume` commands, state.json + cumulative graph persisted at cycle boundaries
+- **Monitoring:** Per-epoch recall probing every 5 epochs via `ScaleRecallCallback`, `tstatus` command
+- **Disk:** ~35 MB/cycle (adapter weights only, no Trainer checkpoints), ~2 GB total
 
-Note: The smoke tests ran with the distillation pipeline fixes (extractor null
-handling, QA generator `A:` format instruction, markdown cleaning) that were
-applied after the Test 1 full runs. Test 1 results reflect the old pipeline;
-smoke test results reflect the fixed pipeline.
+### Results (2026-04-08, cycles 1-56 complete)
 
-### Early Stopping Exploration (2026-03-23)
+| Cycle | Keys | Recall | Loss | QA Yield/Session | Cycle Time | Notes |
+|-------|------|--------|------|------------------|------------|-------|
+| 1 | 21 | 21/21 (100%) | 0.172 | 4.2 | 20 min | |
+| 2–20 | 31–168 | 100% each | 0.159–0.180 | 0.0–4.6 | varies | Old pipeline; cycles 5,11,13,20 skipped (no new triples) |
+| 21 | 168 | 168/168 (100%) | 0.164 | 1.6 | ~128 min | Last cycle before extraction fix |
+| 22 | 180 | 180/180 (100%) | 0.165 | 2.4 | ~151 min | **New extraction pipeline** |
+| 23 | 214 | 214/214 (100%) | 0.160 | 6.8 | ~182 min | Best single-cycle yield (34 new) |
+| 24–55 | 220–536 | 100% each | 0.148–0.166 | 0.0–35 | varies | Continued growth; 14 more skip cycles across this range |
+| 56 | 550 | 550/550 (100%) | 0.156 | 14 | — | Final cycle (Zou Min, 14 new keys); 550-key target reached |
+**500-key milestone passed at cycle 49. 100% keyed recall at every scale point
+from 21 to 550 keys.** Eleven characters processed (Deng Yu, Liang Xin, Xia Yu,
+Zhao Li, shili, Bao Jun, Cai Xiuying, Ye Jie, He Xiaohong, Ruan Wenting, Zou Min).
+Adapter size: 27 MB (fixed, independent of key count). Graph: 623 nodes, 550
+edges. Loss stable at 0.148-0.156, no upward trend through 5× the original
+100-key validated scale.
 
-**Script:** `archive/experiments/test_early_stopping.py` (archived previously; QA-shape format retired)
-**Status:** COMPLETE — Mistral, both local and Claude extraction
+### Extraction pipeline improvement (cycles 22-23)
 
-Per-epoch recall probing at scales 25 and 50 using a single HF Trainer call
-with a custom `RecallProbingCallback` (preserves optimizer state across epochs).
+Cycles 1-21 used the old extraction pipeline (Outlines fallback, ~12% success rate).
+Cycles 22-23 used the new generate-once parse-once pipeline:
 
-**Critical bug found and fixed:** An earlier version used separate Trainer
-instances per epoch, which reset optimizer state (Adam momentum/variance) and
-learning rate schedule. This caused recall to plateau at 72-80% with the
-identical data that reaches 100% in a single Trainer call. The fix uses
-`TrainerCallback.on_epoch_end` within a single training run.
+| Metric | Old pipeline (cycles 1-21) | New pipeline (cycles 22-23) |
+|--------|---------------------------|----------------------------|
+| QA yield/session | 1.6 avg | 2.4-6.8 |
+| New keys/cycle | 0-8 | 12-34 |
+| Extraction success | ~12% | ~40-60% |
+| Extraction time/session | ~70s (two generations) | ~35s (one generation) |
 
-#### Results: Local extraction (Mistral 7B, rank 8, 30 epochs)
+The yield increase accelerated progress toward 500 keys. At the new rate (~20-30 keys/cycle), ~10-12 more cycles were needed vs ~42 at the old rate.
 
-Data: 54 QA pairs from 25 sessions (Liang Xin), yield 2.2 QA/session.
+### Key observations
 
-**Scale 25:**
+1. **Loss was flat at ~0.15-0.16** across all scales (21-550 keys). Brief near-zero dip at 295-324 keys normalized back to 0.150-0.152 at 441-510 keys. No upward trend was observed at 5× the original 100-key scale — the adapter had capacity headroom.
 
-| Epoch | Loss | Recall | Rate | Confidence |
-|-------|------|--------|------|------------|
-| 1 | 2.388 | 0/25 | 0% | 0.000 |
-| 5 | 0.382 | 0/25 | 0% | 0.031 |
-| 10 | 0.175 | 2/25 | 8% | 0.110 |
-| 15 | 0.086 | 15/25 | 60% | 0.630 |
-| 19 | 0.001 | 24/25 | 96% | 0.960 |
-| **20** | **0.001** | **25/25** | **100%** | **1.000** |
-| 25 | 0.000 | 25/25 | 100% | 1.000 |
-| 30 | 0.000 | 25/25 | 100% | 1.000 |
+2. **Epoch convergence was stable but borderline.** Most cycles (30/34) reached 100% at epoch 25. Four cycles needed the full 30 epochs (cycles 31, 34, 37, 45) — these were not correlated with scale but represented ~12% of training cycles hitting the budget ceiling with zero margin. Mid-training recall (E15) fluctuated between 8–74% with no monotonic trend. 30 epochs was sufficient but not conservative — any cycle that needed 31+ would have failed the budget. See "Key ID interleaving" below for the root cause.
 
-First 100%: epoch 20. Stable through epoch 30 (11 consecutive perfect).
+3. **QA yield varied 0-6.8 per session.** Conversations were not uniformly information-dense. Yield was highest at character transitions (fresh entity graph) and lowest when a character's sessions were nearly exhausted (dedup filters most triples). The extraction pipeline fix (cycle 22+) significantly improved yield.
 
-**Scale 50:**
+4. **Cycle time scaled linearly** — ~0.89 min/key at the observed scales. At 489 keys, cycle time was ~7.3 hours (projected from linear trend). Projected: ~7.4 hours/cycle at 500 keys. Training dominated (~91% of cycle time).
 
-| Epoch | Loss | Recall | Rate | Confidence |
-|-------|------|--------|------|------------|
-| 1 | 1.426 | 0/50 | 0% | 0.000 |
-| 5 | 0.256 | 0/50 | 0% | 0.030 |
-| 10 | 0.084 | 4/50 | 8% | 0.112 |
-| 15 | 0.000 | 35/50 | 70% | 0.731 |
-| 18 | 0.000 | 48/50 | 96% | 0.976 |
-| **19** | **0.001** | **50/50** | **100%** | **1.000** |
-| 25 | 0.000 | 50/50 | 100% | 1.000 |
-| 30 | 0.000 | 50/50 | 100% | 1.000 |
+5. **Zero-yield cycles (5, 11, 13, 20, 26, 27, 29, 30, 32, 33, 36, 38, 41, 47)** skipped training entirely. Dedup on triple identity `(subject, predicate, object)` correctly detects no new information. Skipped cycles are recorded in state.json. Ruan Wenting (10th character) started cycle 48 with 28 new keys.
 
-First 100%: epoch 19. Stable through epoch 30 (12 consecutive perfect).
+### Key ID interleaving and epoch convergence
 
-#### Results: Claude Sonnet extraction (Mistral 7B training, rank 8, 30 epochs)
+**Finding:** The 4 cycles that needed 30 epochs (31, 34, 37, 45) all have a disproportionate number of new keys assigned to low key IDs — IDs that interleave with keys learned in much earlier cycles. 59% of new keys in borderline cycles had IDs below the 50th percentile of total keys, vs only 7% in clean (E25) cycles.
 
-Data: 56 QA pairs from 5 sessions (Liang Xin), yield 11.2 QA/session.
-Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
+**Mechanism:** The QA generator assigns key IDs sequentially per-entity, not globally. When a new character's entity (e.g. "Li Ming" in He Xiaohong's sessions) shares a name with an entity from an earlier character, the QA generator fills gaps in the existing ID range. This places new keys in ID-space neighborhoods where the adapter weights are already tightly optimized from 40+ cycles of full-replay training.
 
-**Scale 25:** First 100% at epoch 21. Stable through epoch 30 (10 consecutive).
-**Scale 50:** First 100% at epoch 25. Stable through epoch 30 (6 consecutive).
+**Example (cycle 45, 441 keys):** New keys graph58–60 were inserted between graph57 (cycle 43, "User curious about Fish Fillet") and graph61 (cycle 3, "Li Ming has a friend named Xiaoyu"). New keys graph95–101 were inserted between graph93–94 (cycle 31, Li Ming/Law Department) and graph102–103 (cycle 3, Cheng Ping/Media Company, Everything Is Good/Tsinghua). The adapter must carve out new distinctions in regions where weights have been reinforced for dozens of cycles.
 
-#### Extraction yield comparison
+**Contrast (cycle 42, 408 keys, converged at E25):** 35 new keys were mostly assigned graph353–408 — a fresh, unoccupied range with no existing weight patterns to work around.
 
-| Metric | Mistral (local) | Claude Sonnet (API) |
-|--------|-----------------|---------------------|
-| Sessions needed for 50+ QA | 25 | 5 |
-| QA yield per session | 2.2 | 11.2 |
-| Sessions with zero extraction | 16/25 (64%) | 0/5 (0%) |
-| Distillation time | 1032s (17 min) | 134s (2 min) |
-| Final recall (both scales) | 100% | 100% |
+**Implication:** Epoch budget pressure was driven by key ID distribution, not key count. A mitigation would be to assign globally sequential IDs rather than per-entity IDs, ensuring new keys always land in fresh ID-space. However, this is an observation from the closed run — the 30-epoch budget did not fail within Test 8's 56 cycles.
 
-#### Key findings
+### Cohort tracking
 
-1. **Loss does NOT predict recall.** Loss converges by epoch 5-10 but recall
-   requires 19-25 epochs. The gap is 10-15 epochs. Loss-based early stopping
-   at any threshold would terminate too early.
+Per-key `first_seen_cycle` and `source_character` metadata enables post-hoc analysis of:
+- Catastrophic forgetting (do early keys degrade as new ones are added?)
+- Per-character recall (do some characters' facts train better than others?)
+- Cross-character entity collision (does graph merging across characters cause issues?)
 
-2. **Recall convergence is a phase transition.** Keys are either 1.000 confidence
-   or 0.000 — no gradual improvement. The transition from 0% to 100% happens
-   in a ~5 epoch window (epochs 15-20), not gradually across all 30 epochs.
+Data was captured; analysis was deferred past closure and is open future work.
 
-3. **30 epochs provides adequate margin.** Recall reaches 100% at epoch 19-25
-   depending on extraction source and scale. 30 epochs gives 5-11 epochs of
-   stability margin. Early stopping saves at most ~35% time — a minor
-   optimization that adds complexity without meaningful benefit.
+### Weight Diff Analysis (2026-03-26)
 
-4. **Extraction quality is the real bottleneck.** Mistral fails to extract from
-   64% of sessions. Claude extracts from 100% with 5x higher yield. Both
-   produce QA that trains to 100% recall — the storage mechanism is not the
-   constraint. This quantitatively confirms the paper's extraction bottleneck
-   limitation.
+**Question:** To what extent does adding a single key perturb the adapter weight
+landscape under full-replay training?
 
-5. **Optimizer state preservation is critical.** Separate Trainer instances per
-   epoch (resetting Adam momentum) causes recall to plateau at 72-80%.
-   A single Trainer call with callback-based probing reaches 100%. This is a
-   training methodology issue, not an adapter capacity issue.
+**Method:** Two fresh rank-8 adapters trained with identical hyperparameters (30
+epochs, seed 42) on the same base model — one on 108 keys (cycle 11 data), one
+on 109 keys (108 + 1 synthetic). Per-parameter L2 delta, sparsity, and
+row-level norms computed across all LoRA matrices.
 
-#### Status (2026-05-07)
+**Results:**
+- Overall relative weight change: **141%** (the delta is larger than the original weights)
+- Sparsity: **3.3%** near-zero — 97% of all parameters change significantly
+- Uniform across all 32 layers and all 4 target modules (q/k/v/o)
+- Both adapters achieve 100% recall
 
-- **Closed:** loss-based early stopping. No threshold is both safe and useful
-  given the ~10–15 epoch gap between loss convergence and the recall phase
-  transition. The fixed-budget setting remains correct when the recall gate
-  is OFF.
-- **Shipped (experiment scripts):** recall-probing early stopping at
-  `paramem/training/early_stop.py` (lifted from `experiments/utils/early_stop.py`,
-  which is now a re-export shim) — `EarlyStopPolicy` +
-  `RecallEarlyStopCallback` fire `control.should_training_stop` after
-  `window` consecutive 100% probes past `signal_from_epoch`. Test 14's
-  multi-seed batch ran on this callback (policy:
-  `probe_from_epoch=1, signal_from_epoch=10, window=3`); all 9
-  (V1/V2/V3 × 3 seeds) cells terminated cleanly between e18 and e26
-  inside the 50-epoch budget. Test 13b uses the same callback's optional
-  retention probe path. Test 15 (`test15_retention_multiseed`) uses
-  `RecallEarlyStopCallback` with the same `ANALYSIS_POLICY` for
-  production-realistic retention measurement (per-seed step counts may
-  differ; the headline retention is sampled at each seed's stop epoch).
-- **Shipped (production):** `ConsolidationLoop._maybe_make_recall_callback`
-  constructs the callback at every production-reachable `train_adapter`
-  call site (4 in `paramem/training/consolidation.py`: lines 1529, 1770,
-  2588, 3429; 1 in `paramem/server/active_store_migration.py:420`).
-  Gated by `consolidation.recall_early_stopping` in `server.yaml` —
-  default OFF in `configs/server.yaml.example`. Five YAML knobs:
-  `recall_early_stopping`, `recall_window` (default 2 — stop one probe past
-  first_perfect), `recall_probe_every_n_epochs`, `recall_signal_from_epoch`,
-  `recall_probe_batch_size` (probe-time generate batch width — default 16,
-  validated at 137/137 recall parity vs serial at ~4.75× per-probe speedup
-  and ~346 MiB peak delta on RTX 5070 8 GB; multi-cycle retention parity
-  confirmed in production conditions). Validated by a live smoke on Mistral 7B
-  with N=5 keys (stop fired at epoch 16, recall 5/5, gradient_checkpointing
-  state preserved, 4 min wall). A structural AST test
-  (`tests/test_consolidation_recall_early_stop.py:Class F`) scans both
-  production modules at PR-CI and asserts the helper appears in the
-  same `FunctionDef` body as every `train_adapter` call — the gate that
-  prevents architectural-mismatch regressions of the v1 class.
+**Observations:**
+1. Full replay causes near-total weight reorganization even for a single key
+   addition. The encoding is distributed — facts do not occupy stable subspaces.
+2. This confirms that full replay is a structural requirement for unconstrained
+   LoRA: any new key shifts the entire weight landscape, making incremental
+   addition without replay impossible.
+3. Consistent with the Test 7b merging failure — independently trained adapters
+   converge to incompatible weight configurations.
+4. Constrained approaches (O-LoRA, OSRM) enforce orthogonal subspaces by
+   construction and are not addressed by this experiment.
+
+**Script:** `experiments/weight_diff_analysis.py`
+**Raw data:** `outputs/weight_diff_analysis/results.json`, `row_level_diffs.json`
+
+### Probing Experiments (2026-03-24)
+
+Interactive probing of the 140-key adapter revealed four findings about the inference architecture:
+
+#### Finding 1: Keyed recall is the only reliable interface
+
+Keyed recall achieves 140/140 (100%). Without the key prefix, the adapter
+exhibits emergent direct-recall behavior for some questions but it is
+inconsistent and degrades with phrasing distance from training data. Novel
+natural language questions that were not in the training set produce
+hallucinations. The adapter encodes key→QA associations, not general semantic
+knowledge.
+
+**Takeaway:** Keyed retrieval is the only reliable interface for production use.
+The enumerate→reconstruct→reason pipeline is the correct inference architecture.
+Security implications of the emergent recall behavior are analyzed in
+internal security notes kept outside the public repository.
+
+#### Finding 2: Adapter OFF for reasoning produces richer output
+
+Compared identical reasoning questions over 50 recalled facts with adapter active vs disabled:
+
+| Condition | Answer quality |
+|-----------|---------------|
+| Adapter ON | Terse, correct but minimal (biased toward key→value format) |
+| Adapter OFF (base model) | Rich, detailed, cites evidence, synthesizes across facts |
+
+The adapter's training objective (produce JSON for keyed recall) biases all output toward terse structured responses, degrading reasoning quality.
+
+**Optimal inference architecture:** Adapter ON for keyed retrieval → Adapter OFF for reasoning over recalled context. Memory and intelligence are separate roles that should not be mixed.
+
+#### Finding 3: Enumerate → Reconstruct → Reason pipeline works end-to-end
+
+Full pipeline test: recall all 140 keys (adapter on), assemble as context, reason (adapter off).
+
+| Question | Answer |
+|----------|--------|
+| "Which characters are connected to the Chinese Women's Volleyball Team?" | "Xiaoyu and Wang Chao" (correct, with evidence) |
+| "What do Wang Chao and Xiaoyu have in common?" | Lists movie, volleyball, date, celebration, mutual friend |
+| "Which characters seem to be in a romantic relationship?" | "Wang Chao and Xiaoyu" — cites date as evidence |
+
+All answers factually correct and grounded in recalled facts. The base model reasons effectively over parametric memory output when facts are provided as explicit context.
+
+#### Finding 4: Memory/intelligence separation enables portable knowledge
+
+The adapter stores facts. The base model reasons over them. These are independently swappable:
+- A small fast model (e.g. Qwen 2.5 3B) could handle retrieval
+- A larger model (70B, or cloud API) could handle reasoning
+- The adapter (27 MB) is the portable knowledge artifact
+
+This is a novel framing: LoRA adapters as structured storage with explicit retrieval, not as fine-tuning for task improvement.
+
+### Security implications
+
+| State | Parametric Memory | RAG |
+|-------|-------------------|-----|
+| At rest | Facts in LoRA weights — not human-readable, requires model + retrieval prompt | Facts in plain text (vector DB, documents) |
+| During inference | Recalled facts in RAM as text context | Retrieved documents in RAM as text context |
+| After inference | Ephemeral — discarded with context | Same |
+
+Parametric memory reduces the at-rest attack surface. Runtime exposure during reasoning is identical to RAG and inherent to any agent that processes private data. A tool-boundary architecture (PM server as a function call) limits exposure to query results, not the full knowledge base.
+
+### Scaling status
+
+500-key target reached at cycle 49 (2026-04-02). Run closed at cycle 56 with 550 keys:
+- **550 keys at 100% recall** (cycle 56, 280 sessions, 11 characters, 623 graph nodes)
+- Final training loss: 0.156, QA yield: 2.8/session
+- Test 9 confirmed at 550 keys: keyed 100%, direct 99.6%, open-ended 32.2% — all metrics stable
+- Zero degradation observed from 21 to 550 keys — no ceiling indicator in the training signal at closure
+- Additional characters remained in PerLTQA data; further scaling is open future work
+
+Capacity ceiling beyond 550 keys remains unmeasured and is planned for follow-up work.
+
+---
+
+## Test 5: Natural Recall
+
+**Script:** `archive/experiments/test5_natural_recall.py` (archived 2026-05-28; QA-shape format retired)
+**Status:** COMPLETE — both models (2026-03-21)
+
+**Objective:** Quantify how much stored knowledge is recoverable through
+natural-language prompts alone (without indexed keys), motivating the key
+mechanism.
+
+**Design:** Train adapter on 50 QA pairs with indexed keys (rank 8, 30 epochs).
+Verify keyed recall (control), then probe with 10 open-ended natural-language
+prompts — broad ("List everything you know about the user") to narrow ("What do
+you know about the user's daily routine?"). Count unique facts surfaced across
+all probes (deduplicated). No RAG comparison — test focuses on the keyed vs.
+natural recall gap.
+
+**Key metrics:** Keyed recall rate, natural recall rate (unique facts / total
+facts), per-prompt fact count.
+
+### Results (2026-03-21, final run)
+
+| Metric | Gemma 2 9B | Mistral 7B |
+|---|---|---|
+| Keyed recall (SimHash) | 49/50 (conf=0.980) | 49/50 (conf=0.980) |
+| Keyed recall (embedding) | 49/50 (sim=0.980) | 49/50 (sim=0.980) |
+| Per-question natural | 50/50 (sim=1.000) | 50/50 (sim=1.000) |
+| Broad natural (unique) | 22/50 | 32/50 |
+
+**Per-question natural recall** asks each training question directly (without
+the key wrapper). 50/50 on both models means the adapter encodes facts well
+enough for direct question-answer recall — the key mechanism adds
+*addressability and verification*, not the ability to recall.
+
+**Broad natural probes** ("Tell me everything you know") surface only 22-32
+of 50 facts. The model selectively activates a subset of stored knowledge.
+Mistral surfaces more (32 vs 22) — more informative in open-ended responses.
+
+**One keyed recall miss (graph23):** SimHash confidence 0.734, below the 0.75
+threshold. The model recalled the correct content but paraphrased it (different
+word order). Embedding similarity was 0.994 — a SimHash strictness issue, not
+a recall failure. Identical on both models.
+
+**Indexed keys close the gap** by providing deterministic, exhaustive, verifiable
+access to all stored facts — addressing the 56-78% of facts that broad probes
+miss.
+
+---
+
+## Test 9: Natural Recall Emergence
+
+**Script:** `experiments/test9_natural_recall.py`
+**Status:** COMPLETE — Mistral 7B, 41 cycles evaluated (21→550 keys). Latest run 2026-04-08.
+
+### Objective
+
+Track how natural recall (without keyed retrieval prompts) emerges as
+adapter knowledge density grows. Uses Test 8's cycle checkpoints to
+measure recall across scale.
+
+### Design
+
+Three probe passes per Test 8 cycle checkpoint:
+
+| Pass | Probe style | Difficulty |
+|------|------------|------------|
+| 1. Keyed retrieval | "Recall the QA pair stored under key 'graphN'." | Baseline (structured) |
+| 2. Direct question | Natural question from keyed_pairs (no key prefix) | Medium |
+| 3. Open-ended | "What do you know about {entity}?" — one per unique entity | Hardest |
+
+- **Keyed retrieval** uses `probe_key()` — the standard pipeline (SimHash verified)
+- **Direct questions** use the training questions asked naturally, scored by token overlap against expected answer (threshold 0.4)
+- **Open-ended** asks one question per unique entity, scored against all known facts for that entity. Reports both fact-level recall and entity hit rate.
+
+One model load, adapter swapped per cycle. Incremental per-cycle results saved.
+
+### Resumability
+
+`--resume` skips completed cycles and merges results. Re-runnable after
+Test 8 advances — picks up new cycle checkpoints automatically.
+
+### Results — Mistral 7B (41 cycles, 550 keys, 107 entities)
+
+| Cycle | Keys | Entities | Keyed | Direct | Overlap | Open Facts | Entity Hit | Time |
+|------:|-----:|---------:|------:|-------:|--------:|-----------:|-----------:|-----:|
+| 1 | 21 | 8 | 100% | 95.2% | 0.954 | 33.3% | 37.5% | 1.7m |
+| 2 | 31 | 9 | 100% | 100% | 0.969 | 29.0% | 44.4% | 2.3m |
+| 3 | 38 | 12 | 100% | 100% | 0.958 | 28.9% | 50.0% | 2.6m |
+| 4 | 61 | 17 | 100% | 98.4% | 0.972 | 32.8% | 52.9% | 4.0m |
+| 5 | 61 | 17 | 100% | 100% | 0.975 | 29.5% | 58.8% | 4.1m |
+| 6 | 67 | 20 | 100% | 97.0% | 0.971 | 32.8% | 50.0% | 4.4m |
+| 7 | 76 | 22 | 100% | 100% | 0.980 | 26.3% | 50.0% | 5.0m |
+| 8 | 84 | 25 | 100% | 98.8% | 0.979 | 25.0% | 44.0% | 5.4m |
+| 9 | 96 | 26 | 100% | 97.9% | 0.970 | 34.4% | 61.5% | 6.0m |
+| 10 | 108 | 28 | 100% | 100% | 0.994 | 36.1% | 71.4% | 6.7m |
+| 11 | 108 | 28 | 100% | 100% | 0.994 | 36.1% | 71.4% | 7.4m |
+| 12 | 118 | 28 | 100% | 99.2% | 0.983 | 30.5% | 60.7% | 7.9m |
+| 13 | 118 | 28 | 100% | 99.2% | 0.980 | 13.6% | 35.7% | 7.6m |
+| 14 | 140 | 30 | 100% | 100% | 0.989 | 32.1% | 53.3% | 8.8m |
+| 15 | 140 | 30 | 100% | 100% | 0.988 | 32.9% | 56.7% | 8.6m |
+| 16 | 140 | 30 | 100% | 100% | 0.993 | 36.4% | 66.7% | 8.8m |
+| 17 | 150 | 32 | 100% | 99.3% | 0.981 | 32.7% | 59.4% | 9.7m |
+| 18 | 160 | 39 | 100% | 99.4% | 0.984 | 35.6% | 53.8% | 10.1m |
+| 19 | 160 | 39 | 100% | 99.4% | 0.989 | 35.6% | 59.0% | 10.3m |
+| 21 | 168 | 39 | 100% | 100% | 0.997 | 30.9% | 48.7% | 10.8m |
+| 22 | 180 | 43 | 100% | 100% | 0.993 | 33.9% | 51.2% | 12.1m |
+| 23 | 214 | 50 | 100% | 100% | 0.989 | 33.2% | 54.0% | 13.5m |
+| 24 | 220 | 51 | 100% | 99.6% | 0.994 | 32.7% | 49.0% | 14.1m |
+| 25 | 233 | 53 | 100% | 100% | 0.998 | 37.3% | 54.7% | 15.0m |
+| 28 | 256 | 56 | 100% | 100% | 0.996 | 28.9% | 39.3% | 16.2m |
+| 31 | 274 | 56 | 100% | 100% | 0.993 | 33.9% | 53.6% | 16.4m |
+| 34 | 295 | 61 | 100% | 99.7% | 0.996 | 31.5% | 49.2% | 17.6m |
+| 35 | 324 | 64 | 100% | 100% | 0.997 | 33.6% | 51.6% | 19.8m |
+| 37 | 334 | 65 | 100% | 100% | 0.997 | 33.2% | 49.2% | 24.4m |
+| 39 | 347 | 67 | 100% | 99.7% | 0.992 | 35.7% | 50.7% | 21.7m |
+| 40 | 373 | 73 | 100% | 99.7% | 0.995 | 37.3% | 52.0% | 23.2m |
+| 42 | 408 | 77 | 100% | 100% | 0.996 | 33.8% | 49.4% | 25.1m |
+| 43 | 420 | 79 | 100% | 100% | 0.997 | 35.2% | 51.9% | 26.0m |
+| 44 | 431 | 85 | 100% | 100% | 0.998 | 35.0% | 50.6% | 26.4m |
+| 45 | 441 | 87 | 100% | 100% | 0.999 | 37.2% | 51.7% | 26.4m |
+| 46 | 461 | 88 | 100% | 100% | 0.999 | 35.4% | 51.1% | 27.7m |
+| 48 | 489 | 96 | 100% | 100% | 0.997 | 35.0% | 51.0% | 29.3m |
+| 49 | 510 | 101 | 100% | 100% | 0.998 | 33.5% | 49.5% | 31.4m |
+| 50 | 528 | 105 | 100% | 99.8% | 0.998 | 33.0% | 47.6% | 32.2m |
+| 53 | 536 | 106 | 100% | 100% | 0.998 | 33.0% | 47.2% | 30.9m |
+| 56 | 550 | 107 | 100% | 99.6% | 0.995 | 32.2% | 47.7% | 33.7m |
+
+### Summary
+
+| Metric | Final (550 keys) | Range across 41 cycles |
+|--------|------------------|---------------------|
+| Keyed retrieval | **100%** | 100% every cycle |
+| Direct questions | **99.6%** | 95.2% – 100% |
+| Direct overlap | **0.995** | 0.954 – 0.998 |
+| Open-ended facts | **32.2%** | 13.6% – 37.3% |
+| Open-ended entity hit | **47.7%** | 35.7% – 71.4% |
+
+### Analysis
+
+**Keyed retrieval is perfect at all scales.** 100% across 41 cycles from
+21 to 550 keys. The indexed key mechanism shows no degradation with scale.
+
+**Direct questions (natural language, no key cue) achieve 95–100%.** The
+model reliably retrieves parametrically stored facts when asked the training
+question in natural form. Token overlap with expected answers averages 0.99+.
+This confirms that parametric recall is not limited to the keyed retrieval
+prompt — natural language works. The occasional misses (1–5% at small scales,
+<1% at larger scales) show no trend with key count.
+
+**Open-ended recall plateaus around 1/3 of facts.** The "What do you know
+about X?" probe style does not show an upward trend with scale. Fact recall
+fluctuates between 25–37% from 21 keys to 550 keys. Entity hit rate is
+similarly flat around 48% (half the entities produce at least one correct
+fact).
+
+**Cycle 13 outlier (13.6%) is a scoring artifact, not a recall regression.**
+Compared to adjacent cycles (12: 30.5%, 14: 32.1%), cycle 13's adapter
+produces terser refusal responses ("I don't have specific knowledge about X")
+instead of verbose ones that leak training-format language ("Information
+about X is not available in this knowledge graph triple..."). The verbose
+format incidentally overlaps more content words with expected answers,
+inflating the overlap score. Keyed (100%) and direct (99.2%) recall are
+identical across cycles 12 and 13, confirming the knowledge is intact.
+
+**Interpretation:** The adapter encodes facts with high fidelity (100% keyed,
+99%+ direct), but maximally vague open-ended questions do not reliably trigger
+full recall. The model needs some specificity in the query to activate the
+right weight patterns. The enumerate→reconstruct→reason pipeline remains the
+right interface for complete recall. Open-ended recall is a bonus, not the
+primary retrieval mechanism.
+
+### Runtime
+
+- 39 cycles, ~9h total on RTX 5070 (8GB, QLoRA 4-bit)
+- Per-cycle time scales linearly: ~1.7m at 21 keys → ~32m at 528 keys
+- Dominated by keyed retrieval pass at larger scales
+
+---
+
+## Test 3: Reasoning Quality Parity with RAG
+
+**Script:** `experiments/test3_inference.py`
+**Status:** COMPLETE — both models (2026-03-20)
+
+**Objective:** Verify that reasoning over parametrically recalled facts achieves
+comparable quality to RAG with equivalent context. Reasoning is a base model
+capability — the claim is quality parity with better operational properties.
+
+**Design:** ~50 QA pairs distilled from PerLTQA dialogues, trained as indexed
+keys. The LLM generates 14-15 inference questions requiring 2+ facts. Three
+evaluation conditions:
+
+- **PM Recall+Reason:** Adapter active. Enumerate all keys → reconstruct all
+  facts → feed as context → answer.
+- **PM Adapter-Only:** Adapter active. Ask directly, no explicit retrieval.
+  Diagnostic baseline — different system prompt, not directly comparable.
+- **RAG all facts:** Adapter disabled (base model). All facts loaded from
+  store → feed as context → answer. Fair comparison to PM Recall+Reason.
+
+**Key comparison:** PM Recall+Reason vs RAG all facts — both have all facts in
+context, identical prompt format and system prompt. The only difference is the
+source: parametric recall from adapter weights vs loaded from external store.
+
+### Results (2026-03-20)
+
+| Condition | Gemma OK | Gemma sim | Gemma gen/q | Mistral OK | Mistral sim | Mistral gen/q |
+|-----------|----------|-----------|-------------|------------|-------------|---------------|
+| PM Recall+Reason | 13/14 | 0.687 | 2.40s | 9/14 | 0.566 | 1.76s |
+| PM Adapter-Only | 12/14 | 0.633 | 2.98s | 7/14 | 0.446 | 1.12s |
+| RAG all facts | 12/14 | 0.679 | 2.26s | 9/14 | 0.525 | 1.71s |
+
+**One-time reconstruction overhead:** Gemma 162s (11.56s amortized over 14
+questions), Mistral 121s (8.64s amortized). Reconstruction happens once per
+session, not per query.
+
+**Config:** rank=8, alpha=16, 30 epochs, temperature=0.0.
+
+### Key findings
+
+1. **PM matches or exceeds RAG.** PM Recall+Reason vs RAG all facts:
+   Gemma 0.687 vs 0.679 (1.2% gap), Mistral 0.566 vs 0.525 (7.8% gap).
+   PM is at least as good as RAG on both models, slightly better on Mistral.
+   The adapter-tuned model reasoning over recalled facts performs at least as
+   well as the base model reasoning over loaded facts.
+
+2. **Per-query generation is equivalent.** PM 2.40s vs RAG 2.26s (Gemma),
+   PM 1.76s vs RAG 1.71s (Mistral). Once context is built, both approaches
+   have the same generation cost.
+
+3. **PM has a one-time reconstruction overhead.** 162s (Gemma) to enumerate
+   and probe all keys. This amortizes across queries in a session. RAG's
+   equivalent cost (loading facts from store) is negligible at 50 facts but
+   grows with scale.
+
+4. **RAG latency excludes retrieval overhead.** The measured 2.26s is
+   generation only — embedding the query, searching the index, and ranking
+   results are not included. At 50 facts this is milliseconds; at production
+   scale it becomes significant. PM's retrieval mechanism (key enumeration +
+   probing) is a different cost structure — one-time reconstruction amortized
+   across queries, rather than per-query embedding + search.
+
+5. **Adapter-Only is the production PM path for direct queries.** No
+   reconstruction, no context — the model answers from weights. 2.98s (Gemma),
+   1.12s (Mistral). This is how PM serves simple factual questions.
+
+### Scale caveat
+
+At 50 facts (~300 tokens of context), exhaustive recall is cheap. At 1000+
+facts, injecting all facts would be expensive. Selective enumeration by entity,
+topic, or recency would be needed at larger scales.
+
+---
+
+## Test 6: Parametric vs RAG Head-to-Head
+
+**Script:** `experiments/test6_footprint.py`
+**Status:** COMPLETE — both models (2026-03-21)
+
+**Objective:** Head-to-head comparison of parametric retrieval (indexed keys)
+vs RAG on the same fact set at multiple scales. Three dimensions: storage
+footprint, inference latency, and recall quality.
+
+**Design (redesigned):**
+- **Data:** PerLTQA eval QA pairs (character "Liang Xin"), 2x input buffer
+  for distillation loss. Distill once at max scale, subset for smaller scales.
+- **Scales:** 10, 25, 50, 100 keys (default).
+- **Storage:** Final adapter weights only (via `selected_adapters`), not
+  training checkpoints. RAG total includes embedding model (~87 MB) for fair
+  comparison. Breakdown separates fixed costs (adapter, embedding model) from
+  per-fact variable costs (registry, index).
+- **Latency:** Three conditions (bare model, parametric, RAG), all with
+  `max_new_tokens=200`, 3 warm-up queries discarded before timing. Query count
+  capped to available keys minus warm-up.
+- **Recall:** Both systems scored by embedding similarity (`compute_similarity`,
+  `all-MiniLM-L6-v2` cosine, 0.75 threshold). SimHash confidence retained as
+  secondary diagnostic for parametric. Both evaluated on identical keyed_pairs.
+- **RAG note:** Indexes pre-extracted QA pairs (upper bound on RAG performance).
+
+**Methodology fixes applied:**
+1. PerLTQA data with 2x buffer (was: 20-fact synthetic, scales capped)
+2. Final adapter only for storage (was: all checkpoints, 94x overestimate)
+3. Same questions for PM and RAG (was: distilled vs original)
+4. Same scoring metric (was: SimHash vs embedding similarity)
+5. Same max_new_tokens (was: 256 vs 150)
+6. Warm-up queries (was: none)
+7. Single distillation, nested subsets (was: per-scale distillation)
+8. `selected_adapters` in save_pretrained (was: saving all accumulated adapters)
+
+### Results (2026-03-21, final run)
+
+**Gemma 2 9B:**
+
+| Scale | PM Recall | RAG Recall | PM Size | RAG Size | PM Latency | RAG Latency |
+|-------|-----------|------------|---------|----------|------------|-------------|
+| 10 | 10/10 | 6/10 | 35 MB | 89 MB | 4819ms | 1805ms |
+| 25 | 25/25 | 16/25 | 35 MB | 89 MB | 4341ms | 1515ms |
+| 50 | 49/50 | 36/50 | 35 MB | 89 MB | 4380ms | 1546ms |
+| 100 | 99/100 | 78/100 | 35 MB | 89 MB | 4437ms | 1546ms |
+
+**Mistral 7B:**
+
+| Scale | PM Recall | RAG Recall | PM Size | RAG Size | PM Latency | RAG Latency |
+|-------|-----------|------------|---------|----------|------------|-------------|
+| 10 | 10/10 | 10/10 | 27 MB | 89 MB | 3532ms | 1932ms |
+| 25 | 25/25 | 25/25 | 27 MB | 89 MB | 3160ms | 1271ms |
+| 50 | 49/50 | 50/50 | 27 MB | 89 MB | 2732ms | 1242ms |
+| 100 | 99/100 | 96/100 | 27 MB | 89 MB | 2931ms | 1218ms |
+
+### Key findings
+
+1. **PM storage is constant (O(1)).** 35 MB (Gemma) / 27 MB (Mistral)
+   regardless of fact count. RAG is 89 MB (includes embedding model). PM is
+   smaller at all scales tested; RAG's per-fact variable cost would overtake
+   PM at ~20K facts.
+
+2. **PM recall exceeds RAG on Gemma.** 99/100 vs 78/100 at scale 100. The
+   RAG pipeline (top-3 retrieval + generation) loses recall quality as scale
+   grows. Mistral's RAG is stronger (96/100) due to cleaner generation.
+
+3. **RAG is faster per query.** 1.2-1.9s vs 2.7-4.8s for PM. RAG benefits
+   from disabled adapter (simpler forward pass) and focused context (top-3
+   facts). PM generates from full adapter weights with no context assistance.
+
+4. **PM latency is faster than bare model.** The adapter produces more
+   confident, concise answers than the unassisted base model (4.4s vs 6.7s
+   on Gemma). The adapter adds knowledge, not overhead.
+
+5. **RAG latency excludes retrieval overhead.** The measured times are
+   generation only. Embedding the query and searching the index add
+   milliseconds at 100 facts but grow linearly at production scale.
+
+---
+
+## Test 4: Multi-Session Pipeline Robustness
+
+**Script:** `archive/experiments/test4_reinforcement.py` (archived 2026-05-28; QA-shape format retired)
+**Status:** COMPLETE — both models (2026-03-20)
+
+**Objective:** Test whether cumulative fact recall remains reliable across 10
+train-delete-retrain cycles as facts accumulate from 3 to 30.
+
+**Design:** 30 facts in three frequency tiers:
+- 10 reinforced (appear in 3-4 of 10 sessions)
+- 10 mentioned twice
+- 10 single mention
+
+Each session adds new facts to a cumulative pool (overwrite-by-fact_id).
+Uses `skip_distill=True` — clean synthetic QA pairs bypass graph extraction.
+Fresh adapter per session trained on all cumulative facts.
+
+### Results (2026-03-20, final run)
+
+| Metric | Gemma 2 9B | Mistral 7B |
+|--------|-----------|------------|
+| Final recall (session 10) | 30/30 (100%) | 30/30 (100%) |
+| Reinforced (3-4 mentions) | 10/10, conf=1.000 | 10/10, conf=1.000 |
+| Mentioned twice | 10/10, conf=1.000 | 10/10, conf=1.000 |
+| Single mention | 10/10, conf=1.000 | 10/10, conf=1.000 |
+| RAG similarity (reinforced) | 1.000 | 1.000 |
+| RAG similarity (mentioned twice) | 0.988 | 0.993 |
+| RAG similarity (single mention) | 1.000 | 1.000 |
+| Time | 173 min | 132 min |
+
+**Config:** rank=8, alpha=16, 30 epochs, lr=1e-4, temperature=0.0,
+repetition_penalty=1.1.
+
+### Key findings
+
+1. **Perfect recall on both models.** 30/30 across all frequency tiers, all
+   10 sessions. The adapter unwrap fix (replacing `delete_adapter` with base
+   model unwrap) eliminated the cross-key contamination failures from the
+   previous run (Gemma was 28/30).
+
+2. **No frequency effect.** All tiers (reinforced, mentioned twice, single
+   mention) achieve identical 100% recall and 1.000 confidence. The cumulative
+   pool overwrites by fact_id — frequency has no effect on training data.
+
+3. **The mechanism is model-agnostic.** Both models produce identical results.
+
+4. **Cumulative training is robust.** 10 train-delete-retrain cycles with
+   facts accumulating from 7 to 30 — no degradation at any point.
+
+---
+
+## Test 7: Second Persona
+
+**Script:** `experiments/test7_second_persona.py`
+**Status:** COMPLETE — both models (2026-03-20)
+
+**Objective:** Validate that the architecture generalizes beyond a single user
+persona, and that separate adapters maintain isolation on the same base model.
+
+**Design (redesigned):**
+- **Data:** Two PerLTQA characters (selected by eval QA count, excluding
+  "Liang Xin" for independence from Tests 1-5). 50 QA pairs each.
+- **Key namespaces:** Non-overlapping. Persona A: `graph1..graphN`,
+  Persona B: `graph1001..graph1000+N`. Ensures cross-contamination probes
+  test true isolation, not namespace collision.
+- **Training:** `skip_distill=True` — eval QA pairs used directly as indexed
+  keys to isolate persona generalization from distillation quality.
+- **Evaluations:**
+  1. Per-persona recall (should be comparable)
+  2. Re-evaluation of persona A after persona B training (isolation check)
+  3. Cross-contamination: probe persona A keys with persona B adapter
+     (and vice versa) — should fail on untrained keys
+- **Fallback:** Synthetic persona B (20 facts), both personas capped equally.
+
+**Methodology fixes applied:**
+1. Non-overlapping key namespaces (was: both used graph1..N)
+2. skip_distill=True (was: lossy distillation round-trip on eval QA)
+3. Character selection filters by eval QA count (was: dialogue count)
+4. Re-evaluation of persona A after persona B (was: missing)
+5. Excludes "Liang Xin" (was: likely selected as persona A)
+6. Equal persona sizes in fallback mode (was: 50 vs 20)
+
+### Results (2026-03-19, Gemma)
+
+| Metric | Gemma 2 9B |
+|--------|-----------|
+| Persona A (Cai Xiuying) recall | 50/50 (1.000) |
+| Persona B (Xiong Fei) recall | 50/50 (1.000) |
+| Persona A after B training | 50/50 (zero degradation) |
+| Cross-contamination A→B | 0/50 leaked |
+| Cross-contamination B→A | 0/50 leaked |
+| Training time per persona | ~35 min |
+
+**Config:** rank=8, alpha=16, 30 epochs, skip_distill=True, non-overlapping
+key namespaces (graph1..50 vs graph1001..1050).
+
+### Key findings
+
+1. **Perfect isolation.** Both adapters achieve 100% recall. Training persona B
+   does not degrade persona A. Cross-contamination is zero in both directions.
+2. **Architecture validated.** Multiple independent LoRA adapters on a single
+   base model work as designed. The mechanism is model-agnostic — confirmed
+   on both Gemma 2 9B and Mistral 7B with identical results.
+
+---
+
+## Part 2 — Continual Learning & Retention
 
 ---
 
@@ -463,18 +969,6 @@ Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
 
 **Script:** `archive/experiments/test2_contradictions.py` (archived 2026-05-28; superseded by Test 13)
 **Status:** COMPLETE — both models (2026-03-20)
-
-### Methodology updates (2026-03-19)
-
-1. **Predicate-based evaluation matching** replaces question-text similarity.
-   Each keyed pair carries `source_predicate` from QA generation, mapped
-   deterministically to contradiction chains. No threshold-sensitive embedding
-   matching for chain assignment.
-2. **`is_current` threshold 0.75** (lowered from 0.85) for answer quality scoring.
-3. **QA generator prompt fixed** for verbose narrative objects — focus on
-   current state, not transitions.
-4. **`gradient_checkpointing_disable` moved** to top of session loop (was after
-   merge, causing garbage output for model strategy on Gemma).
 
 **Objective:** Validate that the system detects and resolves contradictions when
 facts change over time (e.g. "Alex works at AutoMate" → "Alex works at SpaceX").
@@ -637,143 +1131,6 @@ in early cycles (0.688); they reach 1.000 once the adapter stabilizes.
 
 ---
 
-## Test 3: Reasoning Quality Parity with RAG
-
-**Script:** `experiments/test3_inference.py`
-**Status:** COMPLETE — both models (2026-03-20)
-
-**Objective:** Verify that reasoning over parametrically recalled facts achieves
-comparable quality to RAG with equivalent context. Reasoning is a base model
-capability — the claim is quality parity with better operational properties.
-
-**Design:** ~50 QA pairs distilled from PerLTQA dialogues, trained as indexed
-keys. The LLM generates 14-15 inference questions requiring 2+ facts. Three
-evaluation conditions:
-
-- **PM Recall+Reason:** Adapter active. Enumerate all keys → reconstruct all
-  facts → feed as context → answer.
-- **PM Adapter-Only:** Adapter active. Ask directly, no explicit retrieval.
-  Diagnostic baseline — different system prompt, not directly comparable.
-- **RAG all facts:** Adapter disabled (base model). All facts loaded from
-  store → feed as context → answer. Fair comparison to PM Recall+Reason.
-
-**Key comparison:** PM Recall+Reason vs RAG all facts — both have all facts in
-context, identical prompt format and system prompt. The only difference is the
-source: parametric recall from adapter weights vs loaded from external store.
-
-### Results (2026-03-20)
-
-| Condition | Gemma OK | Gemma sim | Gemma gen/q | Mistral OK | Mistral sim | Mistral gen/q |
-|-----------|----------|-----------|-------------|------------|-------------|---------------|
-| PM Recall+Reason | 13/14 | 0.687 | 2.40s | 9/14 | 0.566 | 1.76s |
-| PM Adapter-Only | 12/14 | 0.633 | 2.98s | 7/14 | 0.446 | 1.12s |
-| RAG all facts | 12/14 | 0.679 | 2.26s | 9/14 | 0.525 | 1.71s |
-
-**One-time reconstruction overhead:** Gemma 162s (11.56s amortized over 14
-questions), Mistral 121s (8.64s amortized). Reconstruction happens once per
-session, not per query.
-
-**Config:** rank=8, alpha=16, 30 epochs, temperature=0.0.
-
-### Key findings
-
-1. **PM matches or exceeds RAG.** PM Recall+Reason vs RAG all facts:
-   Gemma 0.687 vs 0.679 (1.2% gap), Mistral 0.566 vs 0.525 (7.8% gap).
-   PM is at least as good as RAG on both models, slightly better on Mistral.
-   The adapter-tuned model reasoning over recalled facts performs at least as
-   well as the base model reasoning over loaded facts.
-
-2. **Per-query generation is equivalent.** PM 2.40s vs RAG 2.26s (Gemma),
-   PM 1.76s vs RAG 1.71s (Mistral). Once context is built, both approaches
-   have the same generation cost.
-
-3. **PM has a one-time reconstruction overhead.** 162s (Gemma) to enumerate
-   and probe all keys. This amortizes across queries in a session. RAG's
-   equivalent cost (loading facts from store) is negligible at 50 facts but
-   grows with scale.
-
-4. **RAG latency excludes retrieval overhead.** The measured 2.26s is
-   generation only — embedding the query, searching the index, and ranking
-   results are not included. At 50 facts this is milliseconds; at production
-   scale it becomes significant. PM's retrieval mechanism (key enumeration +
-   probing) is a different cost structure — one-time reconstruction amortized
-   across queries, rather than per-query embedding + search.
-
-5. **Adapter-Only is the production PM path for direct queries.** No
-   reconstruction, no context — the model answers from weights. 2.98s (Gemma),
-   1.12s (Mistral). This is how PM serves simple factual questions.
-
-### Scale caveat
-
-At 50 facts (~300 tokens of context), exhaustive recall is cheap. At 1000+
-facts, injecting all facts would be expensive. Selective enumeration by entity,
-topic, or recency would be needed at larger scales.
-
----
-
-## Test 4: Multi-Session Pipeline Robustness
-
-**Script:** `archive/experiments/test4_reinforcement.py` (archived 2026-05-28; QA-shape format retired)
-**Status:** COMPLETE — both models (2026-03-20)
-
-### Methodology update (2026-03-18)
-
-1. **Reframed from "reinforcement" to "pipeline robustness."** The cumulative
-   pool overwrites by fact_id — all facts get one QA pair regardless of mention
-   frequency. The test validates train-delete-retrain cycle reliability, not
-   frequency-dependent consolidation.
-2. **Added `skip_distill=True`** since QA pairs are pre-formed synthetic data.
-   Avoids unnecessary distillation round-trip.
-3. **RAG max_new_tokens unified to 200** (was 150).
-
-**Rerun completed 2026-03-20. Results below supersede previous run.**
-
-**Objective:** Test whether cumulative fact recall remains reliable across 10
-train-delete-retrain cycles as facts accumulate from 3 to 30.
-
-**Design:** 30 facts in three frequency tiers:
-- 10 reinforced (appear in 3-4 of 10 sessions)
-- 10 mentioned twice
-- 10 single mention
-
-Each session adds new facts to a cumulative pool (overwrite-by-fact_id).
-Uses `skip_distill=True` — clean synthetic QA pairs bypass graph extraction.
-Fresh adapter per session trained on all cumulative facts.
-
-### Results (2026-03-20, final run)
-
-| Metric | Gemma 2 9B | Mistral 7B |
-|--------|-----------|------------|
-| Final recall (session 10) | 30/30 (100%) | 30/30 (100%) |
-| Reinforced (3-4 mentions) | 10/10, conf=1.000 | 10/10, conf=1.000 |
-| Mentioned twice | 10/10, conf=1.000 | 10/10, conf=1.000 |
-| Single mention | 10/10, conf=1.000 | 10/10, conf=1.000 |
-| RAG similarity (reinforced) | 1.000 | 1.000 |
-| RAG similarity (mentioned twice) | 0.988 | 0.993 |
-| RAG similarity (single mention) | 1.000 | 1.000 |
-| Time | 173 min | 132 min |
-
-**Config:** rank=8, alpha=16, 30 epochs, lr=1e-4, temperature=0.0,
-repetition_penalty=1.1.
-
-### Key findings
-
-1. **Perfect recall on both models.** 30/30 across all frequency tiers, all
-   10 sessions. The adapter unwrap fix (replacing `delete_adapter` with base
-   model unwrap) eliminated the cross-key contamination failures from the
-   previous run (Gemma was 28/30).
-
-2. **No frequency effect.** All tiers (reinforced, mentioned twice, single
-   mention) achieve identical 100% recall and 1.000 confidence. The cumulative
-   pool overwrites by fact_id — frequency has no effect on training data.
-
-3. **The mechanism is model-agnostic.** Both models produce identical results.
-
-4. **Cumulative training is robust.** 10 train-delete-retrain cycles with
-   facts accumulating from 7 to 30 — no degradation at any point.
-
----
-
 ## Test 4b: Incremental Learning Without Full Replay
 
 **Script:** `experiments/test4b_incremental_no_replay.py`
@@ -821,1250 +1178,7 @@ keys validates recovery.
 5. **Implication for production:** nightly full-replay consolidation is
    required. The multi-adapter session routing architecture (train per-session
    adapters independently, consolidate with full replay overnight) is the
-   correct approach. See ROADMAP_v2.md.
-
----
-
-## Test 5: Natural Recall
-
-**Script:** `archive/experiments/test5_natural_recall.py` (archived 2026-05-28; QA-shape format retired)
-**Status:** COMPLETE — both models (2026-03-21)
-
-### Methodology update (2026-03-18)
-
-1. **Added per-question natural recall.** Each training question asked directly
-   (one at a time, adapter active, no key) — fair comparison with keyed recall.
-2. **Unified scoring metric.** Both keyed and natural recall scored by embedding
-   similarity (`compute_similarity`, 0.75 threshold). SimHash retained as
-   secondary diagnostic for keyed recall.
-3. **Scored against keyed_pairs** (post-distillation), not original `qa_pairs`.
-   Eliminates ground-truth asymmetry.
-4. **Uses PerLTQA data** (50 QA pairs, was 20 synthetic).
-5. **Broad natural probes retained** as supplementary data alongside per-question.
-
-**Rerun completed 2026-03-21. Results below supersede previous run.**
-
-**Objective:** Quantify how much stored knowledge is recoverable through
-natural-language prompts alone (without indexed keys), motivating the key
-mechanism.
-
-**Design:** Train adapter on 50 QA pairs with indexed keys (rank 8, 30 epochs).
-Verify keyed recall (control), then probe with 10 open-ended natural-language
-prompts — broad ("List everything you know about the user") to narrow ("What do
-you know about the user's daily routine?"). Count unique facts surfaced across
-all probes (deduplicated). No RAG comparison — test focuses on the keyed vs.
-natural recall gap.
-
-**Key metrics:** Keyed recall rate, natural recall rate (unique facts / total
-facts), per-prompt fact count.
-
-### Results (2026-03-21, final run)
-
-| Metric | Gemma 2 9B | Mistral 7B |
-|---|---|---|
-| Keyed recall (SimHash) | 49/50 (conf=0.980) | 49/50 (conf=0.980) |
-| Keyed recall (embedding) | 49/50 (sim=0.980) | 49/50 (sim=0.980) |
-| Per-question natural | 50/50 (sim=1.000) | 50/50 (sim=1.000) |
-| Broad natural (unique) | 22/50 | 32/50 |
-
-**Per-question natural recall** asks each training question directly (without
-the key wrapper). 50/50 on both models means the adapter encodes facts well
-enough for direct question-answer recall — the key mechanism adds
-*addressability and verification*, not the ability to recall.
-
-**Broad natural probes** ("Tell me everything you know") surface only 22-32
-of 50 facts. The model selectively activates a subset of stored knowledge.
-Mistral surfaces more (32 vs 22) — more informative in open-ended responses.
-
-**One keyed recall miss (graph23):** SimHash confidence 0.734, below the 0.75
-threshold. The model recalled the correct content but paraphrased it (different
-word order). Embedding similarity was 0.994 — a SimHash strictness issue, not
-a recall failure. Identical on both models.
-
-**Indexed keys close the gap** by providing deterministic, exhaustive, verifiable
-access to all stored facts — addressing the 56-78% of facts that broad probes
-miss.
-
----
-
-## Test 6: Parametric vs RAG Head-to-Head
-
-**Script:** `experiments/test6_footprint.py`
-**Status:** COMPLETE — both models (2026-03-21)
-
-**Objective:** Head-to-head comparison of parametric retrieval (indexed keys)
-vs RAG on the same fact set at multiple scales. Three dimensions: storage
-footprint, inference latency, and recall quality.
-
-**Design (redesigned):**
-- **Data:** PerLTQA eval QA pairs (character "Liang Xin"), 2x input buffer
-  for distillation loss. Distill once at max scale, subset for smaller scales.
-- **Scales:** 10, 25, 50, 100 keys (default).
-- **Storage:** Final adapter weights only (via `selected_adapters`), not
-  training checkpoints. RAG total includes embedding model (~87 MB) for fair
-  comparison. Breakdown separates fixed costs (adapter, embedding model) from
-  per-fact variable costs (registry, index).
-- **Latency:** Three conditions (bare model, parametric, RAG), all with
-  `max_new_tokens=200`, 3 warm-up queries discarded before timing. Query count
-  capped to available keys minus warm-up.
-- **Recall:** Both systems scored by embedding similarity (`compute_similarity`,
-  `all-MiniLM-L6-v2` cosine, 0.75 threshold). SimHash confidence retained as
-  secondary diagnostic for parametric. Both evaluated on identical keyed_pairs.
-- **RAG note:** Indexes pre-extracted QA pairs (upper bound on RAG performance).
-
-**Methodology fixes applied:**
-1. PerLTQA data with 2x buffer (was: 20-fact synthetic, scales capped)
-2. Final adapter only for storage (was: all checkpoints, 94x overestimate)
-3. Same questions for PM and RAG (was: distilled vs original)
-4. Same scoring metric (was: SimHash vs embedding similarity)
-5. Same max_new_tokens (was: 256 vs 150)
-6. Warm-up queries (was: none)
-7. Single distillation, nested subsets (was: per-scale distillation)
-8. `selected_adapters` in save_pretrained (was: saving all accumulated adapters)
-
-### Results (2026-03-21, final run)
-
-**Gemma 2 9B:**
-
-| Scale | PM Recall | RAG Recall | PM Size | RAG Size | PM Latency | RAG Latency |
-|-------|-----------|------------|---------|----------|------------|-------------|
-| 10 | 10/10 | 6/10 | 35 MB | 89 MB | 4819ms | 1805ms |
-| 25 | 25/25 | 16/25 | 35 MB | 89 MB | 4341ms | 1515ms |
-| 50 | 49/50 | 36/50 | 35 MB | 89 MB | 4380ms | 1546ms |
-| 100 | 99/100 | 78/100 | 35 MB | 89 MB | 4437ms | 1546ms |
-
-**Mistral 7B:**
-
-| Scale | PM Recall | RAG Recall | PM Size | RAG Size | PM Latency | RAG Latency |
-|-------|-----------|------------|---------|----------|------------|-------------|
-| 10 | 10/10 | 10/10 | 27 MB | 89 MB | 3532ms | 1932ms |
-| 25 | 25/25 | 25/25 | 27 MB | 89 MB | 3160ms | 1271ms |
-| 50 | 49/50 | 50/50 | 27 MB | 89 MB | 2732ms | 1242ms |
-| 100 | 99/100 | 96/100 | 27 MB | 89 MB | 2931ms | 1218ms |
-
-### Key findings
-
-1. **PM storage is constant (O(1)).** 35 MB (Gemma) / 27 MB (Mistral)
-   regardless of fact count. RAG is 89 MB (includes embedding model). PM is
-   smaller at all scales tested; RAG's per-fact variable cost would overtake
-   PM at ~20K facts.
-
-2. **PM recall exceeds RAG on Gemma.** 99/100 vs 78/100 at scale 100. The
-   RAG pipeline (top-3 retrieval + generation) loses recall quality as scale
-   grows. Mistral's RAG is stronger (96/100) due to cleaner generation.
-
-3. **RAG is faster per query.** 1.2-1.9s vs 2.7-4.8s for PM. RAG benefits
-   from disabled adapter (simpler forward pass) and focused context (top-3
-   facts). PM generates from full adapter weights with no context assistance.
-
-4. **PM latency is faster than bare model.** The adapter produces more
-   confident, concise answers than the unassisted base model (4.4s vs 6.7s
-   on Gemma). The adapter adds knowledge, not overhead.
-
-5. **RAG latency excludes retrieval overhead.** The measured times are
-   generation only. Embedding the query and searching the index add
-   milliseconds at 100 facts but grow linearly at production scale.
-
----
-
-## Test 7: Second Persona
-
-**Script:** `experiments/test7_second_persona.py`
-**Status:** COMPLETE — both models (2026-03-20)
-
-**Objective:** Validate that the architecture generalizes beyond a single user
-persona, and that separate adapters maintain isolation on the same base model.
-
-**Design (redesigned):**
-- **Data:** Two PerLTQA characters (selected by eval QA count, excluding
-  "Liang Xin" for independence from Tests 1-5). 50 QA pairs each.
-- **Key namespaces:** Non-overlapping. Persona A: `graph1..graphN`,
-  Persona B: `graph1001..graph1000+N`. Ensures cross-contamination probes
-  test true isolation, not namespace collision.
-- **Training:** `skip_distill=True` — eval QA pairs used directly as indexed
-  keys to isolate persona generalization from distillation quality.
-- **Evaluations:**
-  1. Per-persona recall (should be comparable)
-  2. Re-evaluation of persona A after persona B training (isolation check)
-  3. Cross-contamination: probe persona A keys with persona B adapter
-     (and vice versa) — should fail on untrained keys
-- **Fallback:** Synthetic persona B (20 facts), both personas capped equally.
-
-**Methodology fixes applied:**
-1. Non-overlapping key namespaces (was: both used graph1..N)
-2. skip_distill=True (was: lossy distillation round-trip on eval QA)
-3. Character selection filters by eval QA count (was: dialogue count)
-4. Re-evaluation of persona A after persona B (was: missing)
-5. Excludes "Liang Xin" (was: likely selected as persona A)
-6. Equal persona sizes in fallback mode (was: 50 vs 20)
-
-### Results (2026-03-19, Gemma)
-
-| Metric | Gemma 2 9B |
-|--------|-----------|
-| Persona A (Cai Xiuying) recall | 50/50 (1.000) |
-| Persona B (Xiong Fei) recall | 50/50 (1.000) |
-| Persona A after B training | 50/50 (zero degradation) |
-| Cross-contamination A→B | 0/50 leaked |
-| Cross-contamination B→A | 0/50 leaked |
-| Training time per persona | ~35 min |
-
-**Config:** rank=8, alpha=16, 30 epochs, skip_distill=True, non-overlapping
-key namespaces (graph1..50 vs graph1001..1050).
-
-### Key findings
-
-1. **Perfect isolation.** Both adapters achieve 100% recall. Training persona B
-   does not degrade persona A. Cross-contamination is zero in both directions.
-2. **Architecture validated.** Multiple independent LoRA adapters on a single
-   base model work as designed. The mechanism is model-agnostic — confirmed
-   on both Gemma 2 9B and Mistral 7B with identical results.
-
----
-
-## Test 7b: Multi-Adapter Composition (Exploratory)
-
-**Script:** `experiments/test7b_merged_personas.py`
-**Status:** COMPLETE — both models (2026-03-21) — negative result
-
-**Objective:** Test whether two independently trained LoRA adapters can serve
-both personas simultaneously without adapter switching. Two approaches tested:
-additive composition (both adapters active) and weight merging.
-
-**Design:** Load persona A and persona B adapters from Test 7. Test:
-1. **Additive composition:** `set_adapter(["persona_a", "persona_b"])` — both
-   LoRA deltas applied in each forward pass, outputs summed.
-2. **Weight merge:** `add_weighted_adapter([0.5, 0.5])` — combine weights
-   into a single adapter (negative control, known failure).
-
-### Results (2026-03-21, both models)
-
-| Approach | Gemma A | Gemma B | Mistral A | Mistral B |
-|----------|---------|---------|-----------|-----------|
-| Individual (switching) | 50/50 | 50/50 | 50/50 | 50/50 |
-| Composition (additive) | 0/50 | 1/50 | 0/50 | 1/50 |
-| Merge [0.5, 0.5] | 0/50 | 1/50 | 0/50 | 1/50 |
-
-### Analysis
-
-Both composition and merging fail for indexed key recall. The combined LoRA
-deltas (whether summed in the forward pass or averaged in the weights) destroy
-the structured
-key→QA mapping that each adapter learned independently.
-
-Root cause: indexed key retrieval requires precise token-level generation
-(exact JSON format with specific key-question-answer triples). Even small
-perturbations to the LoRA weight matrices disrupt this precision. This contrasts
-with task-level merging (e.g., translation + summarization) where approximate
-outputs are acceptable.
-
-### Literature context
-
-This is a known limitation. Recent work confirms that linear weight averaging
-causes destructive interference for LoRA adapters on structured tasks:
-
-- **"Unraveling LoRA Interference"** (ACL 2025) shows that aligned LoRA weight
-  vectors interfere when summed and proposes OSRM (orthogonal subspace
-  training) as a mitigation — requires retraining from scratch.
-- **"Understanding LoRA as Knowledge Memory"** (2026) systematically studies
-  LoRA as a factual knowledge store and finds that combining multiple LoRAs
-  for knowledge does not compose well.
-- **"Position: Pause Recycling LoRAs"** (ICML 2025) argues that adaptive
-  merging relies on shallow pattern matching, not genuine cross-task transfer.
-
-The core insight: merging works for tasks with shared "solution templates"
-(reasoning patterns, code structures) where approximate outputs are acceptable.
-It fails for tasks requiring distinct memorized mappings — which is exactly
-what indexed key recall does.
-
-### Chained adapter composition (2026-03-26)
-
-Follow-up experiment: train adapters sequentially with previous adapters frozen
-but active in the forward pass (compose mode). Each adapter learns its residual
-delta against `base + Δ₁ + ... + Δₙ₋₁`. Unlike Test 7b's independent training,
-this makes each adapter complementary by construction.
-
-**PEFT forward pass verified correct** via `verify_peft_forward.py`: adapter
-active via PEFT = 15/15, same adapter merged into NF4 base = 0/15. PEFT merge
-code properly dequantizes → adds in float → re-quantizes. The 0/15 is NF4
-precision loss, not a broken addition.
-
-| Condition | Session 1 | Session 3 |
-|---|---|---|
-| Single adapter (baseline) | 15/15 (100%) | — |
-| Compose r8 (both PEFT active) | 1/15 (6.7%) | 11/11 (100%) |
-| Compose r2,4,8 progressive | 0/15 (0%) | 11/11 (100%) |
-| Merge r8 (s1 merged, s3 PEFT) | 0/15 (0%) | 9/9 (100%) |
-| Merge r8 (both merged) | 0/15 (0%) | 0/9 (0%) |
-
-**Conclusions:**
-- Additive composition causes ~93-100% interference on earlier adapters even
-  with frozen weights. The later adapter's delta acts as noise on all inputs.
-- Lower-rank adapters are more fragile (r2 = 0% vs r8 = 6.7%).
-- NF4 merge always destroys recall. The LoRA delta is too small relative to
-  base weights to survive re-quantization.
-- Adapter switching remains the only viable multi-adapter approach on NF4.
-
-### Alternative composition approaches (from literature)
-
-Other approaches from literature:
-- **TIES-Merging** (Yadav et al. 2023): trim, elect signs, merge — resolves
-  sign conflicts. Available in PEFT (`combination_type="ties"`).
-- **DARE** (Yu et al. 2024): drop and rescale — prunes redundant parameters
-  before merging. Available as `combination_type="dare_ties"`.
-- **LoRI** (COLM 2025): freezes A matrices as random projections, trains
-  sparse B with task-specific masks. Orthogonal by construction.
-- **MoLoRA** (2026): per-token routing across adapters — conceptually ideal
-  for key-based routing but requires a trained router.
-
-### Implications
-
-1. **Both composition and merging fail for indexed key recall.** Additive
-   composition (both adapters active, deltas summed) produces the same
-   near-zero recall as weight merging. Confirmed on both models and by
-   recent literature. Not a hyperparameter issue.
-2. **Adapter switching is the only viable multi-adapter approach.** `set_adapter`
-   (single adapter active) achieves 50/50 on both personas. Switching is fast
-   (metadata flip, no weight loading) and guaranteed to work.
-3. **Future exploration:** TIES-Merging, DARE, orthogonal subspace training
-   (LoRI, OSRM) may preserve structure — but would require retraining with
-   orthogonality constraints, not post-hoc merging.
-
-### Bug fixes discovered during Test 7b
-
-1. **PEFT multi-adapter save/reload:** `get_peft_model` on an existing PeftModel
-   re-wraps it, causing nested tensor names (`base_model.model.base_model.model.model.`).
-   Fix: use `model.add_adapter()` instead for second+ adapters.
-2. **PEFT `base_model_name_or_path`:** second adapter's config gets `None`,
-   breaking reload. Fix: patch after creation from base model config.
-3. **Adapter delete crash:** `delete_adapter` on sole adapter leaves PeftModel
-   with empty config. Fix: unwrap to base model via `model.base_model.model`.
-
----
-
-## Test 8: Large-Scale Incremental (500-Key Target) — CLOSED — scaling target reached; ceiling exploration continues in future work
-
-**Script:** `experiments/test8_large_scale.py`
-**Status:** CLOSED 2026-05-11 — scaling target (550 keys) reached at cycle 56, 100% recall, no ceiling indicator observed in the training signal. Test 8 used the QA-pair encoding with incremental full-replay (56 cycles, 280 sessions across 11 characters, multi-day wall time). The closure answers the immediate research question (does the indexed-key mechanism scale past 100 keys under the legacy QA-pair encoding? — yes) and is not a negative result on Test 8. Test 17 is a separate scaling effort under the production quadruple encoding on a different source graph (LongMemEval); it settled the production-encoding decision and is the canonical reference for the quadruple path. Test 8 remains the reference for the QA-pair path. The capacity ceiling remains unmeasured and is open future work.
-
-**Critical finding (2026-03-25):** Outlines constrained generation never succeeded in any Test 8 cycle — all 25 extraction attempts failed with `max_tokens` kwarg bug. Every successful extraction came from the unconstrained prompt-parse fallback, which itself only succeeded 3/25 times (12%). The 168 keys accumulated from the minority of sessions where fallback extraction worked. Fix: Outlines removed entirely, generate-once parse-once pipeline. **Validated at scale:** cycles 22-23 produced 46 new keys (12+34), QA yield jumped from 1.6 to 6.8/session.
-
-### What it tests
-
-Can indexed key retrieval scale to 500+ keys using the full automated consolidation
-pipeline? This is the paper's primary scaling claim — everything beyond 100 keys is
-new territory. Uses multi-character PerLTQA data processed through the complete
-pipeline: session transcript → graph extraction → graph merge → QA generation →
-indexed key training with full replay.
-
-### Design
-
-- **Model:** Mistral 7B Instruct v0.3, NF4 4-bit, rank 8
-- **Cycle structure:** 5 sessions per cycle, full replay (retrain all keys from scratch each cycle)
-- **Training:** 30 epochs per cycle, batch_size=1, gradient_accumulation=2
-- **QA regeneration:** Full regeneration from cumulative graph each cycle (no cache — verifies pipeline integrity as adapter weights change the extraction landscape)
-- **Data source:** Multi-character PerLTQA (~11 characters queued for 500 keys)
-- **Pause/resume:** `tpause`/`tresume` commands, state.json + cumulative graph persisted at cycle boundaries
-- **Monitoring:** Per-epoch recall probing every 5 epochs via `ScaleRecallCallback`, `tstatus` command
-- **Disk:** ~35 MB/cycle (adapter weights only, no Trainer checkpoints), ~2 GB total
-
-### Results (2026-04-08, cycles 1-56 complete)
-
-| Cycle | Keys | Recall | Loss | QA Yield/Session | Cycle Time | Notes |
-|-------|------|--------|------|------------------|------------|-------|
-| 1 | 21 | 21/21 (100%) | 0.172 | 4.2 | 20 min | |
-| 2 | 31 | 31/31 (100%) | 0.180 | 2.0 | 29 min | |
-| 3 | 38 | 38/38 (100%) | 0.176 | 1.4 | 32 min | |
-| 4 | 61 | 61/61 (100%) | 0.174 | 4.6 | 49 min | |
-| 5 | 61 | 61/61 (100%) | 0.176 | 0.0 | 49 min | Skipped (no new triples) |
-| 6 | 67 | 67/67 (100%) | 0.169 | 1.2 | 53 min | |
-| 7 | 76 | 76/76 (100%) | 0.177 | 1.8 | 60 min | |
-| 8 | 84 | 84/84 (100%) | 0.176 | 1.6 | 70 min | |
-| 9 | 96 | 96/96 (100%) | 0.172 | 3.0 | 77 min | |
-| 10 | 108 | 108/108 (100%) | 0.170 | 2.4 | 85 min | |
-| 11 | 108 | 108/108 (100%) | 0.170 | 0.0 | 85 min | Skipped (no new triples) |
-| 12 | 118 | 118/118 (100%) | 0.166 | 2.0 | 92 min | |
-| 13 | 118 | 118/118 (100%) | 0.176 | 0.2 | 92 min | |
-| 14 | 140 | 140/140 (100%) | 0.171 | 4.4 | 109 min | |
-| 15-19 | 160 | 160/160 (100%) | 0.164 | 0.8 | ~120 min | Old pipeline, diminishing yields |
-| 20 | 160 | 160/160 (100%) | 0.159 | 0.0 | ~120 min | Skipped |
-| 21 | 168 | 168/168 (100%) | 0.164 | 1.6 | ~128 min | Last cycle before extraction fix |
-| 22 | 180 | 180/180 (100%) | 0.165 | 2.4 | ~151 min | **New extraction pipeline** |
-| 23 | 214 | 214/214 (100%) | 0.160 | 6.8 | ~182 min | Best single-cycle yield (34 new) |
-| 24 | 220 | 220/220 (100%) | 0.162 | 1.2 | ~164 min | |
-| 25 | 233 | 233/233 (100%) | 0.166 | 2.6 | ~175 min | |
-| 26 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 27 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 28 | 256 | 256/256 (100%) | 0.158 | 4.6 | ~196 min | New character (Bao Jun), lowest loss yet |
-| 29 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 30 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 31 | 274 | 274/274 (100%) | 0.156 | 3.6 | ~215 min | Lowest loss yet (0.156) |
-| 32 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 33 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 34 | 295 | 295/295 (100%) | 0.0001 | 21 | ~200 min | New character (Cai Xiuying) |
-| 35 | 324 | 324/324 (100%) | 0.0000 | 29 | ~223 min | |
-| 36 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 37 | 334 | 334/334 (100%) | — | 10 | ~231 min | |
-| 38 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 39 | 347 | 347/347 (100%) | 0.154 | 13 | 306 min | New character (Ye Jie) |
-| 40 | 373 | 373/373 (100%) | 0.154 | 26 | 332 min | Best yield since cycle 35 |
-| 41 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 42 | 408 | 408/408 (100%) | 0.154 | 35 | 402 min | New character (He Xiaohong), best single-cycle yield since cycle 23 |
-| 43 | 420 | 420/420 (100%) | 0.158 | 12 | 413 min | 9th character processing |
-| 44 | 431 | 431/431 (100%) | 0.156 | 11 | — | |
-| 45 | 441 | 441/441 (100%) | 0.150 | 10 | — | |
-| 46 | 461 | 461/461 (100%) | 0.153 | 20 | — | |
-| 47 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 48 | 489 | 489/489 (100%) | 0.153 | 28 | — | 10th character (Ruan Wenting) |
-| 49 | 510 | 510/510 (100%) | 0.152 | 21 | — | **500-key milestone passed** |
-| 50 | 528 | 528/528 (100%) | 0.148 | 18 | — | Lowest loss yet (0.148) |
-| 51 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 52 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 53 | 536 | 536/536 (100%) | — | 8 | — | 11th character (Zou Min) |
-| 54 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 55 | — | — | — | 0.0 | — | Skipped (no new triples) |
-| 56 | 550 | 550/550 (100%) | 0.156 | 14 | — | Final cycle (Zou Min, 14 new keys); 550-key target reached |
-
-**500-key milestone passed at cycle 49. 100% keyed recall at every scale point
-from 21 to 550 keys.** Eleven characters processed (Deng Yu, Liang Xin, Xia Yu,
-Zhao Li, shili, Bao Jun, Cai Xiuying, Ye Jie, He Xiaohong, Ruan Wenting, Zou Min).
-Adapter size: 27 MB (fixed, independent of key count). Graph: 623 nodes, 550
-edges. Loss stable at 0.148-0.156, no upward trend through 5× the original
-100-key validated scale.
-
-### Extraction pipeline improvement (cycles 22-23)
-
-Cycles 1-21 used the old extraction pipeline (Outlines fallback, ~12% success rate).
-Cycles 22-23 used the new generate-once parse-once pipeline:
-
-| Metric | Old pipeline (cycles 1-21) | New pipeline (cycles 22-23) |
-|--------|---------------------------|----------------------------|
-| QA yield/session | 1.6 avg | 2.4-6.8 |
-| New keys/cycle | 0-8 | 12-34 |
-| Extraction success | ~12% | ~40-60% |
-| Extraction time/session | ~70s (two generations) | ~35s (one generation) |
-
-The yield increase accelerated progress toward 500 keys. At the new rate (~20-30 keys/cycle), ~10-12 more cycles were needed vs ~42 at the old rate.
-
-### Key observations
-
-1. **Loss was flat at ~0.15-0.16** across all scales (21-550 keys). Brief near-zero dip at 295-324 keys normalized back to 0.150-0.152 at 441-510 keys. No upward trend was observed at 5× the original 100-key scale — the adapter had capacity headroom.
-
-2. **Epoch convergence was stable but borderline.** Most cycles (30/34) reached 100% at epoch 25. Four cycles needed the full 30 epochs (cycles 31, 34, 37, 45) — these were not correlated with scale but represented ~12% of training cycles hitting the budget ceiling with zero margin. Mid-training recall (E15) fluctuated between 8–74% with no monotonic trend. 30 epochs was sufficient but not conservative — any cycle that needed 31+ would have failed the budget. See "Key ID interleaving" below for the root cause.
-
-3. **QA yield varied 0-6.8 per session.** Conversations were not uniformly information-dense. Yield was highest at character transitions (fresh entity graph) and lowest when a character's sessions were nearly exhausted (dedup filters most triples). The extraction pipeline fix (cycle 22+) significantly improved yield.
-
-4. **Cycle time scaled linearly** — ~0.89 min/key at the observed scales. At 489 keys, cycle time was ~7.3 hours (projected from linear trend). Projected: ~7.4 hours/cycle at 500 keys. Training dominated (~91% of cycle time).
-
-5. **Zero-yield cycles (5, 11, 13, 20, 26, 27, 29, 30, 32, 33, 36, 38, 41, 47)** skipped training entirely. Dedup on triple identity `(subject, predicate, object)` correctly detects no new information. Skipped cycles are recorded in state.json. Ruan Wenting (10th character) started cycle 48 with 28 new keys.
-
-### Key ID interleaving and epoch convergence
-
-**Finding:** The 4 cycles that needed 30 epochs (31, 34, 37, 45) all have a disproportionate number of new keys assigned to low key IDs — IDs that interleave with keys learned in much earlier cycles. 59% of new keys in borderline cycles had IDs below the 50th percentile of total keys, vs only 7% in clean (E25) cycles.
-
-**Mechanism:** The QA generator assigns key IDs sequentially per-entity, not globally. When a new character's entity (e.g. "Li Ming" in He Xiaohong's sessions) shares a name with an entity from an earlier character, the QA generator fills gaps in the existing ID range. This places new keys in ID-space neighborhoods where the adapter weights are already tightly optimized from 40+ cycles of full-replay training.
-
-**Example (cycle 45, 441 keys):** New keys graph58–60 were inserted between graph57 (cycle 43, "User curious about Fish Fillet") and graph61 (cycle 3, "Li Ming has a friend named Xiaoyu"). New keys graph95–101 were inserted between graph93–94 (cycle 31, Li Ming/Law Department) and graph102–103 (cycle 3, Cheng Ping/Media Company, Everything Is Good/Tsinghua). The adapter must carve out new distinctions in regions where weights have been reinforced for dozens of cycles.
-
-**Contrast (cycle 42, 408 keys, converged at E25):** 35 new keys were mostly assigned graph353–408 — a fresh, unoccupied range with no existing weight patterns to work around.
-
-**Implication:** Epoch budget pressure was driven by key ID distribution, not key count. A mitigation would be to assign globally sequential IDs rather than per-entity IDs, ensuring new keys always land in fresh ID-space. However, this is an observation from the closed run — the 30-epoch budget did not fail within Test 8's 56 cycles.
-
-### Cohort tracking
-
-Per-key `first_seen_cycle` and `source_character` metadata enables post-hoc analysis of:
-- Catastrophic forgetting (do early keys degrade as new ones are added?)
-- Per-character recall (do some characters' facts train better than others?)
-- Cross-character entity collision (does graph merging across characters cause issues?)
-
-Data was captured; analysis was deferred past closure and is open future work.
-
-### Weight Diff Analysis (2026-03-26)
-
-**Question:** To what extent does adding a single key perturb the adapter weight
-landscape under full-replay training?
-
-**Method:** Two fresh rank-8 adapters trained with identical hyperparameters (30
-epochs, seed 42) on the same base model — one on 108 keys (cycle 11 data), one
-on 109 keys (108 + 1 synthetic). Per-parameter L2 delta, sparsity, and
-row-level norms computed across all LoRA matrices.
-
-**Results:**
-- Overall relative weight change: **141%** (the delta is larger than the original weights)
-- Sparsity: **3.3%** near-zero — 97% of all parameters change significantly
-- Uniform across all 32 layers and all 4 target modules (q/k/v/o)
-- Both adapters achieve 100% recall
-
-**Observations:**
-1. Full replay causes near-total weight reorganization even for a single key
-   addition. The encoding is distributed — facts do not occupy stable subspaces.
-2. This confirms that full replay is a structural requirement for unconstrained
-   LoRA: any new key shifts the entire weight landscape, making incremental
-   addition without replay impossible.
-3. Consistent with the Test 7b merging failure — independently trained adapters
-   converge to incompatible weight configurations.
-4. Constrained approaches (O-LoRA, OSRM) enforce orthogonal subspaces by
-   construction and are not addressed by this experiment.
-
-**Script:** `experiments/weight_diff_analysis.py`
-**Raw data:** `outputs/weight_diff_analysis/results.json`, `row_level_diffs.json`
-
-### Probing Experiments (2026-03-24)
-
-Interactive probing of the 140-key adapter revealed four findings about the inference architecture:
-
-#### Finding 1: Keyed recall is the only reliable interface
-
-Keyed recall achieves 140/140 (100%). Without the key prefix, the adapter
-exhibits emergent direct-recall behavior for some questions but it is
-inconsistent and degrades with phrasing distance from training data. Novel
-natural language questions that were not in the training set produce
-hallucinations. The adapter encodes key→QA associations, not general semantic
-knowledge.
-
-**Takeaway:** Keyed retrieval is the only reliable interface for production use.
-The enumerate→reconstruct→reason pipeline is the correct inference architecture.
-Security implications of the emergent recall behavior are analyzed in
-`security_analysis.md` (internal).
-
-#### Finding 2: Adapter OFF for reasoning produces richer output
-
-Compared identical reasoning questions over 50 recalled facts with adapter active vs disabled:
-
-| Condition | Answer quality |
-|-----------|---------------|
-| Adapter ON | Terse, correct but minimal (biased toward key→value format) |
-| Adapter OFF (base model) | Rich, detailed, cites evidence, synthesizes across facts |
-
-The adapter's training objective (produce JSON for keyed recall) biases all output toward terse structured responses, degrading reasoning quality.
-
-**Optimal inference architecture:** Adapter ON for keyed retrieval → Adapter OFF for reasoning over recalled context. Memory and intelligence are separate roles that should not be mixed.
-
-#### Finding 3: Enumerate → Reconstruct → Reason pipeline works end-to-end
-
-Full pipeline test: recall all 140 keys (adapter on), assemble as context, reason (adapter off).
-
-| Question | Answer |
-|----------|--------|
-| "Which characters are connected to the Chinese Women's Volleyball Team?" | "Xiaoyu and Wang Chao" (correct, with evidence) |
-| "What do Wang Chao and Xiaoyu have in common?" | Lists movie, volleyball, date, celebration, mutual friend |
-| "Which characters seem to be in a romantic relationship?" | "Wang Chao and Xiaoyu" — cites date as evidence |
-
-All answers factually correct and grounded in recalled facts. The base model reasons effectively over parametric memory output when facts are provided as explicit context.
-
-#### Finding 4: Memory/intelligence separation enables portable knowledge
-
-The adapter stores facts. The base model reasons over them. These are independently swappable:
-- A small fast model (e.g. Qwen 2.5 3B) could handle retrieval
-- A larger model (70B, or cloud API) could handle reasoning
-- The adapter (27 MB) is the portable knowledge artifact
-
-This is a novel framing: LoRA adapters as structured storage with explicit retrieval, not as fine-tuning for task improvement.
-
-### Security implications
-
-| State | Parametric Memory | RAG |
-|-------|-------------------|-----|
-| At rest | Facts in LoRA weights — not human-readable, requires model + retrieval prompt | Facts in plain text (vector DB, documents) |
-| During inference | Recalled facts in RAM as text context | Retrieved documents in RAM as text context |
-| After inference | Ephemeral — discarded with context | Same |
-
-Parametric memory reduces the at-rest attack surface. Runtime exposure during reasoning is identical to RAG and inherent to any agent that processes private data. A tool-boundary architecture (PM server as a function call) limits exposure to query results, not the full knowledge base.
-
-### Scaling status
-
-500-key target reached at cycle 49 (2026-04-02). Run closed at cycle 56 with 550 keys:
-- **550 keys at 100% recall** (cycle 56, 280 sessions, 11 characters, 623 graph nodes)
-- Final training loss: 0.156, QA yield: 2.8/session
-- Test 9 confirmed at 550 keys: keyed 100%, direct 99.6%, open-ended 32.2% — all metrics stable
-- Zero degradation observed from 21 to 550 keys — no ceiling indicator in the training signal at closure
-- Additional characters remained in PerLTQA data; further scaling is open future work
-
-Capacity ceiling beyond 550 keys remains unmeasured and is planned for follow-up work.
-
----
-
-## Test 9: Natural Recall Emergence
-
-**Script:** `experiments/test9_natural_recall.py`
-**Status:** COMPLETE — Mistral 7B, 41 cycles evaluated (21→550 keys). Latest run 2026-04-08.
-
-### Objective
-
-Track how natural recall (without keyed retrieval prompts) emerges as
-adapter knowledge density grows. Uses Test 8's cycle checkpoints to
-measure recall across scale.
-
-### Design
-
-Three probe passes per Test 8 cycle checkpoint:
-
-| Pass | Probe style | Difficulty |
-|------|------------|------------|
-| 1. Keyed retrieval | "Recall the QA pair stored under key 'graphN'." | Baseline (structured) |
-| 2. Direct question | Natural question from keyed_pairs (no key prefix) | Medium |
-| 3. Open-ended | "What do you know about {entity}?" — one per unique entity | Hardest |
-
-- **Keyed retrieval** uses `probe_key()` — the standard pipeline (SimHash verified)
-- **Direct questions** use the training questions asked naturally, scored by token overlap against expected answer (threshold 0.4)
-- **Open-ended** asks one question per unique entity, scored against all known facts for that entity. Reports both fact-level recall and entity hit rate.
-
-One model load, adapter swapped per cycle. Incremental per-cycle results saved.
-
-### Resumability
-
-`--resume` skips completed cycles and merges results. Re-runnable after
-Test 8 advances — picks up new cycle checkpoints automatically.
-
-### Results — Mistral 7B (41 cycles, 550 keys, 107 entities)
-
-| Cycle | Keys | Entities | Keyed | Direct | Overlap | Open Facts | Entity Hit | Time |
-|------:|-----:|---------:|------:|-------:|--------:|-----------:|-----------:|-----:|
-| 1 | 21 | 8 | 100% | 95.2% | 0.954 | 33.3% | 37.5% | 1.7m |
-| 2 | 31 | 9 | 100% | 100% | 0.969 | 29.0% | 44.4% | 2.3m |
-| 3 | 38 | 12 | 100% | 100% | 0.958 | 28.9% | 50.0% | 2.6m |
-| 4 | 61 | 17 | 100% | 98.4% | 0.972 | 32.8% | 52.9% | 4.0m |
-| 5 | 61 | 17 | 100% | 100% | 0.975 | 29.5% | 58.8% | 4.1m |
-| 6 | 67 | 20 | 100% | 97.0% | 0.971 | 32.8% | 50.0% | 4.4m |
-| 7 | 76 | 22 | 100% | 100% | 0.980 | 26.3% | 50.0% | 5.0m |
-| 8 | 84 | 25 | 100% | 98.8% | 0.979 | 25.0% | 44.0% | 5.4m |
-| 9 | 96 | 26 | 100% | 97.9% | 0.970 | 34.4% | 61.5% | 6.0m |
-| 10 | 108 | 28 | 100% | 100% | 0.994 | 36.1% | 71.4% | 6.7m |
-| 11 | 108 | 28 | 100% | 100% | 0.994 | 36.1% | 71.4% | 7.4m |
-| 12 | 118 | 28 | 100% | 99.2% | 0.983 | 30.5% | 60.7% | 7.9m |
-| 13 | 118 | 28 | 100% | 99.2% | 0.980 | 13.6% | 35.7% | 7.6m |
-| 14 | 140 | 30 | 100% | 100% | 0.989 | 32.1% | 53.3% | 8.8m |
-| 15 | 140 | 30 | 100% | 100% | 0.988 | 32.9% | 56.7% | 8.6m |
-| 16 | 140 | 30 | 100% | 100% | 0.993 | 36.4% | 66.7% | 8.8m |
-| 17 | 150 | 32 | 100% | 99.3% | 0.981 | 32.7% | 59.4% | 9.7m |
-| 18 | 160 | 39 | 100% | 99.4% | 0.984 | 35.6% | 53.8% | 10.1m |
-| 19 | 160 | 39 | 100% | 99.4% | 0.989 | 35.6% | 59.0% | 10.3m |
-| 21 | 168 | 39 | 100% | 100% | 0.997 | 30.9% | 48.7% | 10.8m |
-| 22 | 180 | 43 | 100% | 100% | 0.993 | 33.9% | 51.2% | 12.1m |
-| 23 | 214 | 50 | 100% | 100% | 0.989 | 33.2% | 54.0% | 13.5m |
-| 24 | 220 | 51 | 100% | 99.6% | 0.994 | 32.7% | 49.0% | 14.1m |
-| 25 | 233 | 53 | 100% | 100% | 0.998 | 37.3% | 54.7% | 15.0m |
-| 28 | 256 | 56 | 100% | 100% | 0.996 | 28.9% | 39.3% | 16.2m |
-| 31 | 274 | 56 | 100% | 100% | 0.993 | 33.9% | 53.6% | 16.4m |
-| 34 | 295 | 61 | 100% | 99.7% | 0.996 | 31.5% | 49.2% | 17.6m |
-| 35 | 324 | 64 | 100% | 100% | 0.997 | 33.6% | 51.6% | 19.8m |
-| 37 | 334 | 65 | 100% | 100% | 0.997 | 33.2% | 49.2% | 24.4m |
-| 39 | 347 | 67 | 100% | 99.7% | 0.992 | 35.7% | 50.7% | 21.7m |
-| 40 | 373 | 73 | 100% | 99.7% | 0.995 | 37.3% | 52.0% | 23.2m |
-| 42 | 408 | 77 | 100% | 100% | 0.996 | 33.8% | 49.4% | 25.1m |
-| 43 | 420 | 79 | 100% | 100% | 0.997 | 35.2% | 51.9% | 26.0m |
-| 44 | 431 | 85 | 100% | 100% | 0.998 | 35.0% | 50.6% | 26.4m |
-| 45 | 441 | 87 | 100% | 100% | 0.999 | 37.2% | 51.7% | 26.4m |
-| 46 | 461 | 88 | 100% | 100% | 0.999 | 35.4% | 51.1% | 27.7m |
-| 48 | 489 | 96 | 100% | 100% | 0.997 | 35.0% | 51.0% | 29.3m |
-| 49 | 510 | 101 | 100% | 100% | 0.998 | 33.5% | 49.5% | 31.4m |
-| 50 | 528 | 105 | 100% | 99.8% | 0.998 | 33.0% | 47.6% | 32.2m |
-| 53 | 536 | 106 | 100% | 100% | 0.998 | 33.0% | 47.2% | 30.9m |
-| 56 | 550 | 107 | 100% | 99.6% | 0.995 | 32.2% | 47.7% | 33.7m |
-
-### Summary
-
-| Metric | Final (550 keys) | Range across 41 cycles |
-|--------|------------------|---------------------|
-| Keyed retrieval | **100%** | 100% every cycle |
-| Direct questions | **99.6%** | 95.2% – 100% |
-| Direct overlap | **0.995** | 0.954 – 0.998 |
-| Open-ended facts | **32.2%** | 13.6% – 37.3% |
-| Open-ended entity hit | **47.7%** | 35.7% – 71.4% |
-
-### Analysis
-
-**Keyed retrieval is perfect at all scales.** 100% across 41 cycles from
-21 to 550 keys. The indexed key mechanism shows no degradation with scale.
-
-**Direct questions (natural language, no key cue) achieve 95–100%.** The
-model reliably retrieves parametrically stored facts when asked the training
-question in natural form. Token overlap with expected answers averages 0.99+.
-This confirms that parametric recall is not limited to the keyed retrieval
-prompt — natural language works. The occasional misses (1–5% at small scales,
-<1% at larger scales) show no trend with key count.
-
-**Open-ended recall plateaus around 1/3 of facts.** The "What do you know
-about X?" probe style does not show an upward trend with scale. Fact recall
-fluctuates between 25–37% from 21 keys to 550 keys. Entity hit rate is
-similarly flat around 48% (half the entities produce at least one correct
-fact).
-
-**Cycle 13 outlier (13.6%) is a scoring artifact, not a recall regression.**
-Compared to adjacent cycles (12: 30.5%, 14: 32.1%), cycle 13's adapter
-produces terser refusal responses ("I don't have specific knowledge about X")
-instead of verbose ones that leak training-format language ("Information
-about X is not available in this knowledge graph triple..."). The verbose
-format incidentally overlaps more content words with expected answers,
-inflating the overlap score. Keyed (100%) and direct (99.2%) recall are
-identical across cycles 12 and 13, confirming the knowledge is intact.
-
-**Interpretation:** The adapter encodes facts with high fidelity (100% keyed,
-99%+ direct), but maximally vague open-ended questions do not reliably trigger
-full recall. The model needs some specificity in the query to activate the
-right weight patterns. The enumerate→reconstruct→reason pipeline remains the
-right interface for complete recall. Open-ended recall is a bonus, not the
-primary retrieval mechanism.
-
-### Runtime
-
-- 39 cycles, ~9h total on RTX 5070 (8GB, QLoRA 4-bit)
-- Per-cycle time scales linearly: ~1.7m at 21 keys → ~32m at 528 keys
-- Dominated by keyed retrieval pass at larger scales
-
----
-
-## Test 10: Generalization Boundaries of Parametric Memory
-
-**Script:** `experiments/test10_grokking.py`
-**Status:** RUNNING — 35 cycles complete (E1050). Target E3,000.
-
-### Objective
-
-Characterize which types of generalization LoRA adapters can and cannot
-support under extended training. Three axes:
-
-1. **Associative generalization** — does the adapter transfer learned facts
-   to novel prompt formats (rephrased, direct, open-ended)?
-2. **Compositional generalization** — can the adapter compose multi-hop
-   chains from individually learned facts (3-hop questions)?
-3. **Grokking** — does extended training beyond memorization convergence
-   produce delayed emergence of compositional reasoning?
-
-### Background
-
-Grokking (Power et al., 2022) is delayed generalization: models first memorize
-training data, then much later suddenly generalize to held-out data. Key
-conditions: weight decay (drives transition), training far beyond convergence
-(3-10x), and sufficient relational structure in the data. "Grokking in the Wild"
-(2025) demonstrated this on multi-hop factual QA with a critical threshold of
-~3.6 inferred-to-atomic fact ratio. No published work has studied grokking in
-LoRA adapters.
-
-LoRA's low-rank constraint may accelerate grokking onset: it restricts the
-memorization solution space, making generalizing circuits relatively more
-accessible (analogous to implicit regularization).
-
-### Design
-
-**Data selection from cycle 50 graph.** The test uses the cycle 50 cumulative
-graph from Test 8 as the source of relational structure. "Unknown" entities
-are excluded before path enumeration.
-
-1. Enumerate all 3-hop paths: A →[r1]→ B →[r2]→ C →[r3]→ D
-2. Filter to triples participating in ≥3 three-hop paths
-3. Re-filter to paths where all 3 triples survived
-
-This yields **129 training triples, 360 three-hop evaluation questions,
-ratio ~2.79** (after "Unknown" entity filtering).
-
-**Training.** Cycle-based: train 30 epochs per cycle, probe all metrics,
-save adapter checkpoint, cooldown, repeat indefinitely. Each cycle creates
-a fresh Trainer (fresh optimizer) with warm adapter weights from the previous
-cycle. No epoch target — runs until paused.
-
-Key training parameters:
-- **Constant LR** (`lr_scheduler_type="constant"`) — grokking requires
-  sustained gradient magnitude well past memorization convergence.
-- **warmup_steps=100** (~1.5 epochs) — fixed step count, not ratio-based.
-- **weight_decay=0.1** — literature uses 0.1–1.0 for grokking; stronger
-  regularization accelerates onset.
-- **GPU guard** with automatic server release (`acquire_gpu(interactive=False)`).
-- **GPU cooldown** between cycles (wait for ≤45°C).
-
-**Evaluation probes (7 probes at each cycle):**
-
-| Probe | What it measures | Scoring |
-|-------|-----------------|---------|
-| 1. Keyed retrieval | Baseline recall (should be 100%) | SimHash confidence |
-| 2. Direct questions | Single-hop natural recall | Exact entity match |
-| 3. Rephrased questions | Surface-form generalization | Exact entity match |
-| 4. 3-hop questions | Compositional generalization (grokking target) | Exact entity match on D |
-| 5. 2-hop questions | Intermediate compositional (secondary) | Exact entity match on C |
-| 6. Open-ended | Entity-level recall | Token overlap (threshold 0.4) |
-| 7. **Relation shortcut** | **Shortcut baseline for 3-hop** | **Exact entity match** |
-
-**Relation shortcut control (probe 7).** For each unique final relation in
-3-hop questions, asks "What entity does someone {relation}?" — no chain, no
-starting entity. If shortcut accuracy ≥ 3-hop accuracy, all 3-hop success is
-explainable by single-hop relation→entity memorization, not composition.
-Grokking is evidenced when 3-hop exceeds shortcut.
-
-**Controls:**
-- Base model (adapter OFF): run once, measures pretraining knowledge baseline.
-- Shuffled labels: cycle-based (same structure as main), randomized key→answer
-  pairings. Trajectory must stay flat for valid comparison.
-
-### Parameters
-
-```
---model mistral|gemma          Model to use (default: mistral)
---base-cycle N                 Test 8 cycle to use as graph source (default: 50)
---weight-decay F               Weight decay (default: 0.1)
---learning-rate F              Learning rate (default: 1e-4, constant)
---epochs-per-cycle N           Epochs per training cycle (default: 30)
---resume                       Resume from last completed checkpoint
---control-only                 Run control conditions only
-```
-
-### Resumability
-
-Cycle-based with full checkpoint persistence:
-- Adapter weights saved per cycle (`epoch_NNN/adapter/`)
-- All 7 probe results saved per cycle (`epoch_NNN/probe_results.json`)
-- Training loss, keyed_pairs.json saved per cycle
-- `state.json` + `results.json` updated atomically after each cycle
-- `progress.json` updated at each epoch for live `tstatus` display
-- `--resume` loads last adapter checkpoint, continues indefinitely
-- No epoch target needed — extend by simply resuming
-
-### Results (constant LR, weight_decay=0.1)
-
-Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
-89 unique final relations.
-
-| Epoch | Keyed | Direct | Rephrased | 3-hop | Shortcut | 2-hop | Open | Loss |
-|-------|-------|--------|-----------|-------|----------|-------|------|------|
-| base | 0.0% | 23.3% | 23.3% | 1.1% | 2.5% | 0.5% | 41.1% | — |
-| E30 | 94.6% | 91.5% | 60.5% | 6.7% | 14.7% | 12.8% | 41.1% | 0.113 |
-| E60 | 99.2% | 93.0% | 72.9% | 11.7% | 23.9% | 16.3% | 45.7% | 0.014 |
-| E90 | 100% | 93.0% | 69.8% | 10.3% | 20.3% | 14.8% | 45.0% | 0.010 |
-| E120 | 99% | 93.0% | 74.4% | 11.4% | 28.1% | 12.3% | 45.0% | 0.012 |
-| E150 | 100% | 93.0% | 72.9% | 10.0% | 36.9% | 16.3% | 50.0% | 0.008 |
-| E180 | 97% | 91.5% | 71.3% | 5.3% | 32.8% | 8.4% | 46.5% | 0.009 |
-| E210 | 100% | 93.0% | 74.4% | 8.3% | 32.8% | 10.8% | 41.9% | 0.009 |
-| E240 | 93% | 91.5% | 75.2% | 16.9% | 41.1% | 15.8% | 46.5% | 0.008 |
-| E270 | 100% | 93.0% | 71.3% | 13.6% | 39.7% | 16.3% | 46.5% | 0.004 |
-| E300 | 100% | 93.0% | 77.5% | 13.6% | 36.1% | 14.3% | 42.6% | 0.005 |
-| E330 | 100% | 93.0% | 72.9% | 5.6% | 35.6% | 4.9% | 47.3% | 0.006 |
-| E360 | 99% | 93.0% | 74.4% | 6.9% | 35.0% | 5.9% | 45.7% | 0.008 |
-| E390 | 100% | 93.0% | 72.9% | 16.1% | 29.4% | 20.7% | 45.0% | 0.006 |
-| E420 | 100% | 93.0% | 74.4% | 9.7% | 33.9% | 9.4% | 45.7% | 0.004 |
-| E450 | 100% | 93.0% | 76.0% | 8.6% | 39.2% | 6.9% | 48.8% | 0.005 |
-| E480 | 100% | 93.0% | 71.3% | 6.7% | 41.1% | 7.9% | 31.8% | 0.004 |
-| E510 | 100% | 93.0% | 74.4% | 9.2% | 35.6% | 10.8% | 45.0% | 0.007 |
-| E540 | 97% | 91.0% | 69.8% | 8.1% | 36.7% | 3.5% | 43.4% | 0.009 |
-| E570 | 100% | 93.0% | 75.2% | 11.1% | 46.1% | 13.3% | 41.1% | 0.005 |
-| E600 | 100% | 93.0% | 74.4% | 17.8% | 41.9% | 16.8% | 44.2% | 0.003 |
-| E630 | 95% | 93.0% | 69.8% | 13.6% | 31.1% | 16.3% | 43.4% | 0.008 |
-| E660 | 99% | 93.0% | 69.8% | 8.1% | 45.6% | 8.9% | 47.3% | 0.006 |
-| E690 | 100% | 93.0% | 72.1% | 10.8% | 41.1% | 10.3% | 45.0% | 0.004 |
-| E720 | 97% | 92.2% | 72.9% | 10.8% | 48.6% | 12.3% | 41.1% | 0.009 |
-| E750 | 100% | 93.0% | 73.6% | 6.1% | 43.3% | 11.3% | 45.7% | 0.003 |
-| E780 | 100% | 93.0% | 72.9% | 14.7% | 49.2% | 11.8% | 49.6% | 0.004 |
-| E810 | 100% | 93.0% | 70.5% | 7.5% | 48.6% | 4.9% | 48.1% | 0.002 |
-| E840 | 100% | 93.0% | 77.5% | 7.2% | 45.0% | 10.8% | 42.6% | 0.002 |
-| E870 | 100% | 93.0% | 72.1% | 10.6% | 51.4% | 10.8% | 44.2% | 0.003 |
-| E900 | 100% | 93.0% | 67.4% | 15.0% | 45.3% | 13.8% | 45.7% | 0.002 |
-| E930 | 100% | 93.0% | 68.2% | 11.1% | 44.7% | 11.3% | 43.4% | 0.003 |
-| E960 | 100% | 93.0% | 72.9% | 10.6% | 45.6% | 12.3% | 44.2% | 0.004 |
-| E990 | 99% | 93.0% | 76.0% | 8.9% | 39.7% | 13.8% | 42.6% | 0.008 |
-| E1020 | 100% | 93.0% | 74.4% | 8.6% | 42.2% | 11.3% | 45.0% | 0.002 |
-| E1050 | 100% | 93.0% | 67.4% | 8.9% | 39.4% | 11.8% | 46.5% | 0.003 |
-| E1080 | 100% | 93.0% | 69.0% | 6.7% | 46.9% | 7.4% | 44.2% | 0.003 |
-| E1110 | 100% | 93.0% | 64.3% | 3.3% | 42.8% | 6.9% | 46.5% | 0.002 |
-| E1140 | 100% | 93.0% | 69.0% | 10.6% | 43.3% | 6.9% | 38.8% | 0.004 |
-| E1170 | 100% | 93.0% | 73.6% | 9.7% | 34.4% | 8.4% | 45.0% | 0.005 |
-| E1200 | 100% | 93.0% | 70.5% | 7.8% | 36.7% | 4.9% | 48.1% | 0.003 |
-| E1230 | 100% | 93.0% | 74.4% | 8.9% | 41.1% | 10.8% | 36.4% | 0.004 |
-| E1260 | 100% | 93.0% | 72.1% | 10.3% | 48.3% | 8.4% | 43.4% | 0.004 |
-| E1290 | 100% | 93.0% | 76.7% | 12.5% | 44.4% | 10.3% | 43.4% | 0.005 |
-| E1320 | 100% | 93.0% | 71.3% | 11.1% | 47.8% |  5.4% | 46.5% | 0.005 |
-| E1350 | 100% | 93.0% | 69.0% |  9.4% | 40.6% |  5.4% | 44.2% | 0.005 |
-| E1380 | 100% | 93.0% | 68.2% |  9.4% | 35.8% |  7.9% | 45.0% | 0.002 |
-| E1410 | 100% | 93.0% | 69.8% |  6.9% | 41.9% | 11.3% | 46.5% | 0.006 |
-| E1440 | 100% | 93.0% | 73.6% |  9.2% | 51.9% |  6.9% | 41.9% | 0.002 |
-| E1470 | 100% | 93.0% | 67.4% |  5.3% | 41.4% |  6.4% | 42.6% | 0.007 |
-| E1500 | 100% | 93.0% | 73.6% |  6.9% | 45.6% |  4.9% | 40.3% | 0.003 |
-| E1530 | 100% | 93.0% | 73.6% |  8.3% | 49.2% |  8.9% | 28.7% | 0.005 |
-| E1560 | 100% | 93.0% | 76.0% |  8.1% | 46.4% | 10.8% | 38.8% | 0.006 |
-| E1590 | 100% | 93.0% | 76.0% |  7.2% | 49.7% |  8.9% | 43.4% | 0.005 |
-| E1620 | 100% | 93.0% | 72.9% | 10.3% | 47.8% |  9.9% | 47.3% | 0.006 |
-| E1650 |  99% | 93.0% | 74.4% | 10.0% | 33.9% |  6.9% | 47.3% | 0.006 |
-| E1680 | 100% | 93.0% | 69.0% |  7.5% | 43.3% |  8.9% | 48.1% | 0.002 |
-| E1710 | 100% | 93.0% | 73.6% | 13.1% | 45.0% |  6.4% | 47.3% | 0.002 |
-
-3-hop breakdown (hub/non-hub/full-chain):
-
-| Epoch | 3-hop | Hub (of 35) | Non-hub (of 325) | Full-chain |
-|-------|-------|-------------|------------------|------------|
-| E30 | 24/360 | 4/35 (11%) | 20/325 (6%) | 0 |
-| E60 | 42/360 | 9/35 (26%) | 33/325 (10%) | 0 |
-| E90 | 37/360 | — | — | 0 |
-| E690 | 39/360 | 8/35 (23%) | 31/325 (10%) | 0 |
-| E720 | 39/360 | 9/35 (26%) | 30/325 (9%) | 0 |
-| E750 | 22/360 | 5/35 (14%) | 17/325 (5%) | 0 |
-| E780 | 53/360 | 11/35 (31%) | 42/325 (13%) | 0 |
-| E810 | 27/360 | 7/35 (20%) | 20/325 (6%) | 0 |
-| E840 | 26/360 | 4/35 (11%) | 22/325 (7%) | 0 |
-| E870 | 38/360 | 4/35 (11%) | 34/325 (10%) | 0 |
-| E900 | 54/360 | 8/35 (23%) | 46/325 (14%) | 0 |
-| E930 | 40/360 | 9/35 (26%) | 31/325 (10%) | 0 |
-| E960 | 38/360 | 9/35 (26%) | 29/325 (9%) | 0 |
-| E990 | 32/360 | 9/35 (26%) | 23/325 (7%) | 0 |
-| E1020 | 31/360 | 7/35 (20%) | 24/325 (7%) | 0 |
-| E1050 | 32/360 | 6/35 (17%) | 26/325 (8%) | 0 |
-| E1080 | 24/360 | 5/35 (14%) | 19/325 (5%) | 0 |
-| E1110 | 12/360 | 2/35 (5%) | 10/325 (3%) | 0 |
-| E1140 | 38/360 | 2/35 (5%) | 36/325 (11%) | 0 |
-| E1170 | 35/360 | 6/35 (17%) | 29/325 (8%) | 0 |
-| E1200 | 28/360 | 9/35 (25%) | 19/325 (5%) | 0 |
-| E1230 | 32/360 | 8/35 (22%) | 24/325 (7%) | 0 |
-| E1260 | 37/360 | 4/35 (11%) | 33/325 (10%) | 0 |
-| E1290 | 45/360 | 11/35 (31%) | 34/325 (10%) | 0 |
-| E1320 | 40/360 |  3/35 (9%)  | 37/325 (11%) | 0 |
-| E1350 | 34/360 |  1/35 (3%)  | 33/325 (10%) | 0 |
-| E1380 | 34/360 |  5/35 (14%) | 29/325 (9%)  | 0 |
-| E1410 | 25/360 |  5/35 (14%) | 20/325 (6%)  | 0 |
-| E1440 | 33/360 |  8/35 (23%) | 25/325 (8%)  | 0 |
-| E1470 | 19/360 |  2/35 (6%)  | 17/325 (5%)  | 0 |
-| E1500 | 25/360 |  5/35 (14%) | 20/325 (6%)  | 0 |
-| E1530 | 30/360 |  7/35 (20%) | 23/325 (7%)  | 0 |
-| E1560 | 29/360 |  4/35 (11%) | 25/325 (8%)  | 0 |
-| E1590 | 26/360 |  6/35 (17%) | 20/325 (6%)  | 0 |
-| E1620 | 37/360 |  7/35 (20%) | 30/325 (9%)  | 0 |
-| E1650 | 36/360 |  4/35 (11%) | 32/325 (10%) | 0 |
-| E1680 | 27/360 |  6/35 (17%) | 21/325 (6%)  | 0 |
-| E1710 | 47/360 | 10/35 (29%) | 37/325 (11%) | 0 |
-
-### Key findings (E1710, 57 cycles) — 2026-04-25
-
-Resume E1590→E1710 (4 additional cycles, ~120 epochs overnight) extends the
-pattern without change: no grokking signal. Rephrased oscillates in the
-69-74% band (E1620-E1710: 72.9, 74.4, 69.0, 73.6%), within the long-run
-plateau. 3-hop entity match swings 7.5-13.1% (E1620-E1710: 10.3, 10.0, 7.5,
-13.1%); the E1710 13.1% is the highest in the last 12 cycles but produces
-0/360 full chains, so it remains entity-name lookup landing on the answer
-hub by surface association, not chain reasoning. Shortcut continues to
-oscillate 34-48% and stays strictly above 3-hop at every checkpoint
-(E1620-E1710 ratio sc/3h: 4.6×, 3.4×, 5.8×, 3.4×). Full-chain count remains
-0 across all 57 cycles (cumulative 0/20,520). Keyed stable at 100% with one
-mild blip at c55/E1650 (127/129, 98.5%) that recovered next cycle; direct
-locked at 93.0%. Loss is at floor (~0.002-0.006). The compositional
-crossover has not occurred at 57× convergence.
-
-### Prior findings (E1590, 53 cycles) — superseded by E1710
-
-Resume E1410→E1590 (6 additional cycles, ~180 epochs overnight) reinforces
-the pattern: no grokking signal. Rephrased recovered into the 67-76% band
-(E1590: 76.0%), matching the long-run plateau. 3-hop stays in the 5-9% band
-with no upward trend (E1440-E1590: 9.2, 5.3, 6.9, 8.3, 8.1, 7.2%). Shortcut
-continues to oscillate 41-52% and remains strictly above 3-hop at every
-checkpoint. Full-chain count remains 0 across all 53 cycles. Keyed/direct
-fully stable at 100%/93%.
-
-### Prior findings (E1410, 47 cycles) — superseded by E1590
-
-Resume E1290→E1410 (4 additional cycles) reinforces the pattern: no grokking
-signal. Rephrased dropped slightly from 76.7% → 69.8%, 3-hop ended at its
-lowest recorded value (6.9%), full-chain count remains 0 across all 47 cycles.
-Keyed/direct fully stable at 100%/93%. Shortcut oscillates 36-48%. The earlier
-finding stands: shortcut consistently exceeds 3-hop, no compositional
-crossover emerging.
-
-### Prior findings (E1290, 43 cycles) — superseded by E1410
-
-**1. Shortcut > 3-hop at all checkpoints — no compositional crossover.**
-The relation shortcut control consistently exceeds 3-hop accuracy across all
-43 cycles. Gap ranges from 13pp (E390: 29.4% vs 16.1%) to 41pp (E870: 51.4%
-vs 10.6%). Shortcut oscillates in the 34-48% band (E1290: 44.4%), 3-hop stays
-3-17% (E1290: 12.5%). All multi-hop accuracy remains explainable by single-hop
-relation→entity shortcuts. No compositional generalization observed.
-
-**2. 3-hop oscillates without upward trend.** 3-hop accuracy fluctuates
-between 3-18% with periodic spikes (16.9% at E240, 16.1% at E390, 17.8% at
-E600, 14.7% at E780) that always revert to the 6-10% baseline within 1-2
-cycles. The E900-E1290 extension continues the pattern without any emerging
-trend: 15.0%, 11.1%, 10.6%, 8.9%, 8.6%, 8.9%, 6.7%, 3.3%, 10.6%, 9.7%, 7.8%,
-8.9%, 10.3%, 12.5%. No grokking signal at 43x convergence (E1290), still
-within lower end of grokking literature thresholds (100-10,000x).
-
-**3. Associative generalization is real and stable — but has plateaued.**
-The adapter transfers learned knowledge to novel prompt formats never seen
-in training:
-- Rephrased questions: plateau at ~73% (range 64-78%, first-10-cycles avg
-  73.6%, last-10-cycles avg 71.2% — no upward trend across 40 cycles)
-- Direct questions: locked at 93% across all 43 checkpoints
-- Open-ended: variable 32-50%, no clear trend
-This is the mechanism that makes parametric memory useful for personal
-assistants — users ask naturally, not in keyed retrieval format. Note: the
-current rephrased probe uses passive voice transformations only; Test 10b
-evaluated genuinely diverse question forms (see below).
-
-**4. Keyed recall remains robust.** 100% at most checkpoints (43/43 cycles
-include 100% keyed recall at E1080-E1290). Earlier dips (93% at E240, 95%
-at E630, 97% at E180/E540/E720/E720) anti-correlated with 3-hop spikes,
-suggesting weight reorganization between memorization and generalization
-modes. No dips in the E1080-E1290 extension.
-
-**5. Full-chain reasoning: 0 across all 43 checkpoints.** The model never
-names intermediate entities in multi-hop answers. When it gets the terminal
-entity correct, it does so via shortcut, not by tracing the chain.
-
-**6. Loss at floor.** Loss converged by E30 (0.113), reached near-zero by
-E60 (0.014). E90-E720 fluctuated 0.003-0.009. E750-E1290 stabilized at
-0.002-0.005 with occasional spikes. No further decline — the model is at
-the loss floor.
-
-### Grokking detection criterion
-
-3-hop accuracy must exceed shortcut accuracy. Until this crossover occurs,
-all multi-hop success is attributable to shortcuts. The test runs indefinitely
-in 30-epoch cycles; the crossover (if it occurs) will be visible in the trend.
-
-### Methodological concerns
-
-**1. Shortcut control bias.** The shortcut probe asks a single relation
-without specifying a starting entity — the model only needs to retrieve
-*any* entity satisfying that relation from the 129 trained facts. The 3-hop
-question requires a specific chain anchored at a specific entity. The
-shortcut has a systematically larger solution space per question. To validate
-the control, compute expected shortcut accuracy under random selection from
-trained facts. If the shortcut baseline is high by construction, the
-crossover criterion is too conservative.
-
-**2. Inferred-to-atomic ratio below threshold.** Our ratio is 2.79
-(360 compositional questions / 129 training facts), 22% below the 3.6
-critical threshold reported in "Grokking in the Wild" (2025). Below this
-threshold, the gradient signal from compositional examples may be
-insufficient to overcome the memorization attractor. This is the most
-actionable variable — either increase compositional questions or reduce
-training facts to push above 3.6.
-
-**3. LoRA rank capacity.** Rank 8 restricts adapter modifications to an
-8-dimensional bottleneck per weight matrix. Compositional reasoning circuits
-in transformers involve coordinated attention patterns across multiple
-layers. If the compositional circuit requires rank > 8 modifications at any
-layer, grokking is impossible regardless of training duration. A rank-16 or
-rank-32 comparison on a subset of epochs would test this.
-
-**4. 3-hop oscillation vs. noise.** The 5-17% oscillation on 360 questions
-means absolute counts swing between ~19 and ~61 correct answers. To
-distinguish partial learning from noise: check whether the *same* questions
-succeed across probes (consistent subset = learning) or whether the success
-set is random each time (churn = noise).
-
-**5. Open-ended stable, not degrading.** Open-ended recall varies 32-50%
-with no sustained trend. The E480 dip (32%) was an outlier — subsequent
-checkpoints recovered to 41-50%. No evidence of catastrophic forgetting
-from extended overtraining through E870.
-
-**6. Weight norm tracking.** Grokking in the literature is associated with
-weight norm decrease after initial increase. Tracking per-layer LoRA weight
-norms over training would provide a direct signal of whether the
-regularization dynamics that drive grokking are engaging.
-
-### Next steps
-
-1. Continue running — at 57× convergence (E1710), still below the 100×
-   threshold from the grokking literature (100-10,000×). Target E3,000 (100×)
-   before concluding. Shortcut oscillation and 3-hop stagnation suggest
-   grokking may not occur at rank 8, but the lower bound of the literature
-   threshold has not yet been reached.
-2. ~~**Test 10b**: evaluate diverse question forms~~ — COMPLETE (see below).
-3. Same-question overlap analysis: check if the same 3-hop questions succeed
-   across probes to distinguish partial learning from noise.
-4. Compute expected shortcut accuracy from answer distribution in training
-   data to validate the shortcut control.
-5. Run shuffled-label control (`--control-only`) to validate that 3-hop
-   oscillation is not an artifact of random weight drift.
-6. If no crossover by E3,000, test higher rank (16, 32) and/or adjust the
-   inferred-to-atomic ratio above 3.6.
-7. Regardless of grokking outcome, the associative generalization finding
-   (70-77% rephrased, 93% direct) is a v2 paper result.
-
----
-
-## Test 10b: Diverse Rephrasing Probe
-
-**Script:** `experiments/test10b_diverse_rephrase.py`
-**Status:** COMPLETE — 24 checkpoints evaluated (E30–E720).
-
-### Objective
-
-Evaluate whether facts trained via keyed indexing are accessible through
-genuinely diverse question forms — not just the passive voice transformations
-used in Test 10's standard rephrasing probe.
-
-### Design
-
-Five rephrasing styles generated automatically by the base model (adapter OFF)
-from one-shot prompted templates. 645 questions total (5 styles × 129 keys).
-Dual scoring: entity match (strict, substring) + LLM-as-judge (semantic).
-Evaluated against all 22 existing Test 10 adapter checkpoints.
-
-| Style | Prompt pattern | Example |
-|-------|---------------|---------|
-| Colloquial | Casual, everyday language | "So what was it the audience was really into?" |
-| Indirect | "I was wondering...", "Could you tell me..." | "I was wondering, could you tell me what Chen Ming appreciates?" |
-| Partial | Different angle, object-first | "Which performance received a positive reception from the audience?" |
-| Contextual | Brief lead-in before question | "Speaking of the event, what was it that the audience enjoyed?" |
-| Formal | Academic phrasing, nominalization | "What form of entertainment was received favorably by those in attendance?" |
-
-### Results
-
-Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 645 diverse questions.
-
-| Epoch | Entity% | Judge% | Colloq | Indirect | Partial | Context | Formal |
-|-------|---------|--------|--------|----------|---------|---------|--------|
-| E30 | 53.0% | 61.1% | 36.4% | 86.1% | 41.1% | 58.1% | 43.4% |
-| E60 | 61.2% | 68.4% | 41.9% | 89.9% | 55.0% | 66.7% | 52.7% |
-| E90 | 61.1% | 69.2% | 41.9% | 90.7% | 51.2% | 68.2% | 53.5% |
-| E120 | 66.4% | 72.7% | 50.4% | 90.7% | 59.7% | 71.3% | 59.7% |
-| E150 | 63.4% | 70.9% | 44.2% | 90.7% | 58.9% | 69.8% | 53.5% |
-| E180 | 61.6% | 67.8% | 45.0% | 88.4% | 52.7% | 66.7% | 55.0% |
-| E210 | 66.8% | 71.9% | 46.5% | 89.9% | 63.6% | 72.1% | 62.0% |
-| E240 | 63.7% | 69.0% | 48.8% | 86.8% | 60.5% | 65.9% | 56.6% |
-| E270 | 62.2% | 69.9% | 41.9% | 91.5% | 55.0% | 62.0% | 60.5% |
-| E300 | 62.5% | 68.8% | 45.0% | 90.7% | 55.8% | 65.1% | 55.8% |
-| E330 | 65.3% | 71.9% | 45.0% | 90.7% | 59.7% | 69.0% | 62.0% |
-| E360 | 63.9% | 69.2% | 44.2% | 89.9% | 60.5% | 65.9% | 58.9% |
-| E390 | 64.8% | 70.4% | 41.9% | 91.5% | 59.7% | 71.3% | 59.7% |
-| E420 | 62.9% | 69.2% | 41.9% | 89.9% | 58.9% | 68.2% | 55.8% |
-| E450 | 62.8% | 69.0% | 43.4% | 89.9% | 56.6% | 65.9% | 58.1% |
-| E480 | 62.3% | 68.4% | 40.3% | 89.9% | 55.8% | 69.0% | 56.6% |
-| E510 | 67.6% | 71.3% | 49.6% | 88.4% | 65.9% | 72.1% | 62.0% |
-| E540 | 61.9% | 65.3% | 45.0% | 86.1% | 55.8% | 67.4% | 55.0% |
-| E570 | 66.0% | 71.3% | 48.8% | 89.9% | 60.5% | 67.4% | 63.6% |
-| E600 | 62.9% | 67.6% | 45.0% | 89.1% | 58.1% | 70.5% | 51.9% |
-| E630 | 62.0% | 66.4% | 50.4% | 89.9% | 53.5% | 62.8% | 53.5% |
-| E660 | 62.0% | 65.0% | 45.7% | 91.5% | 55.0% | 65.9% | 51.9% |
-| E690 | 62.8% | 67.9% | 46.5% | 89.1% | 57.4% | 69.8% | 51.2% |
-| E720 | 61.2% | 66.2% | 43.4% | 86.8% | 55.0% | 66.7% | 54.3% |
-
-### Aggregated per-style summary
-
-| Style | Mean | Range | Character |
-|-------|------|-------|-----------|
-| **Indirect** | **89.7%** | 86–92% | Natural conversational queries |
-| Contextual | 67.3% | 58–72% | Topical lead-in |
-| Partial | 56.5% | 41–66% | Different angle |
-| Formal | 56.0% | 44–64% | Academic phrasing |
-| Colloquial | 44.7% | 36–50% | Casual/slang |
-| Overall entity | 63.0% | 53–68% | All styles combined |
-| Overall judge | 68.9% | 61–73% | Semantic correctness |
-
-### Key findings
-
-**1. Indirect recall at 90% is the headline result.** "I was wondering,
-could you tell me..." and "Do you happen to know..." are natural
-conversational query styles. The adapter answers these at 90%+ accuracy
-purely from parametric memory, with no retrieval system. This is the
-style most likely used in real assistant interactions.
-
-**2. Keyed indexing is training scaffolding, not an inference requirement.**
-Facts trained via "Recall the QA pair stored under key 'graphN'" format
-are accessible through natural language at 90%+ (indirect), 93% (direct),
-and 70-77% (passive rephrasing). The key format forces precise encoding;
-the knowledge generalizes beyond it.
-
-**3. No training duration effect.** Results are stable from E60 onwards.
-The generalization is established early and preserved through extended
-training. Extended training does not improve or degrade diverse recall.
-
-**4. Style hierarchy is stable across all checkpoints:**
-indirect >> contextual > partial ≈ formal >> colloquial. This ranking
-never changes, suggesting each style tests a distinct generalization axis.
-
-**5. Judge adds ~6pp over entity match consistently.** The model conveys
-the correct fact in ~6% of cases where it doesn't use the exact entity
-string. Both metrics are valuable: entity match for comparability with
-Test 10, judge for real-world accuracy assessment.
-
-**6. Colloquial is the hardest style (45%).** Casual language
-("So what's Chen Ming into?") differs most from the training format.
-This is expected — the adapter was trained on formal QA pairs, not slang.
-
----
-
-## Test 11: Extraction Pipeline Configuration
-
-**Script:** `experiments/test11_adapter_extraction.py`
-**Status:** COMPLETE — two findings that improve the extraction pipeline.
-
-### Design
-
-A/B comparison of graph extraction with LoRA adapter ON vs OFF.
-Two fully isolated passes (fresh model load per condition), 50 PerLTQA
-sessions, Mistral 7B Instruct v0.3. Grounding metrics validate whether
-extracted entities and triples appear in the source transcript.
-
-### Finding 1: max_tokens=1024 was silently truncating extraction
-
-The default `max_tokens=1024` in `extract_graph` caused 76% of base-model
-extractions to fail — the model produced well-structured JSON but hit the
-token limit before closing braces. Raising to 2048 fixes this:
-
-| max_tokens | Base model success | Adapter ON success |
-|------------|-------------------|--------------------|
-| 1024       | 24%               | 68%                |
-| 2048       | 94%               | 94%                |
-
-The apparent "adapter helps extraction" result at 1024 was an artifact —
-the adapter's QA training happened to produce more compact JSON, not
-better extraction. At 2048, both conditions succeed equally.
-
-This affected the entire pipeline: Test 8 (528 keys from 195 sessions),
-production consolidation, and all prior extraction. Sessions that needed
->1024 tokens were silently discarded. The "~60% fact capture rate" noted
-in earlier tests was partly a token budget problem. Default raised to 2048.
-
-### Finding 2: Adapter ON harms extraction quality
-
-With the token budget equalized, the clean base model extracts better:
-
-| Metric | Adapter OFF | Adapter ON |
-|--------|-------------|------------|
-| Success rate | 94% | 94% |
-| Mean triples/session | **15.2** | 12.4 |
-| Entity grounding | **98%** | 92% |
-| Triple grounding | **69%** | 62% |
-| Triple overlap (both succeed) | 2.0% | — |
-
-The adapter reduces extraction yield (fewer triples), lowers entity
-grounding (6% more entities not found in the transcript — adapter prior
-leakage), and fundamentally changes what is extracted (2% triple overlap).
-
-**Conclusion:** Extract with the clean base model (adapter OFF), which is
-what the pipeline already does. The adapter should remain disabled during
-extraction. This is now validated empirically, not just assumed.
-
-### Incidental finding: PEFT disable_adapter() is not transparent
-
-During debugging, we discovered that PEFT 0.18.1's `disable_adapter()`
-context manager produces different generation output than the unwrapped
-base model, due to `prepare_inputs_for_generation` patching and dtype
-casting path differences in the PeftModel wrapper. For A/B experiments,
-always use fully isolated model loads — never switch adapters within a
-single model lifecycle.
-
----
-
-## Test 12: Contradiction-Learning Probe (merged into Test 13)
-
-**Status:** RESOLVED — merged into Test 13 (2026-04-22).
-
-The originally-scoped Test 12 was a 1–3 day Mistral 7B A/B/C probe of the
-"key + Q stay, only A is replaced" hypothesis: identifier circuit already
-encoded, only the answer-producing path needs to shift, so retraining
-should converge in fewer epochs than fresh keys. Test 13 implemented the
-same A/B/C design at N=200 with an added C2 fill phase, and answered the
-contradiction-learning question directly:
-
-- **Phase B (answer-swap)** = the contradiction case. stable_perfect at
-  e18 vs Phase A's full convergence — warm-start is real on swapped keys.
-  Retention on the 160 unchanged keys collapsed to 5.6% — warm-start is
-  not a safe in-place rewrite.
-- **Phase C2 (scaffold-then-fill)** = the placeholder variant. e11 fill,
-  zero placeholder leakage, 37.5% retention.
-
-Full results in §"Test 13: Placeholder Generalization (Journal-Scaffold)"
-below; retention curve and latent-recovery follow-up in §"Test 13b". No
-separate Test 12 script was run — the question is answered.
-
-`experiments/test12_session_cohort_smoke.py` is unrelated: a multi-adapter
-session-cohort decision gate (ran 2026-04-18). Same number, different
-scope.
+   correct approach.
 
 ---
 
@@ -2088,6 +1202,8 @@ triple-content diversity, not by a universal ceiling. Test 13 isolates
 *training cost amortization*: if placeholder scaffolds work, per-session
 adapter training becomes cheap enough to run during silent hours, and
 pre-trained scaffolds become shippable.
+
+*Note: Phase B (answer-swap) also answers the contradiction-learning question originally scoped as Test 12 — the same (key, Q) structure with a different answer confirms the warm-start hypothesis, but at the cost of ~94% retention on unchanged keys.*
 
 ### Design
 
@@ -2158,8 +1274,8 @@ scan at qa_pool load logs the colliding pairs (`graph23/graph26`,
 This is **not grokking**. No delayed generalization on held-out
 reasoning was tested. The observable is *epochs-to-recall uplift on
 content replacement when (key, Q) structure is pre-formed*, plus
-partial protection of unchanged slots. The A↔B phase transition noted
-in the 2026-04-21 handover, now paired with C1↔C2 matching evidence,
+partial protection of unchanged slots. The A↔B phase transition,
+now paired with C1↔C2 matching evidence,
 is consistent with structural-slot pre-formation, not emergent
 generalization.
 
@@ -2311,46 +1427,33 @@ is ≈98% recoverable at ~3% of the full-fill compute cost.
   (`_run_recall_sanity_probe` already produces one).
 
 **What this unlocks (gated on multi-round validation):**
-- **Touch-up-as-self-healing extension** of `_run_recall_sanity_probe`.
-  Instead of rolling back on failure, replay the specific failing keys
-  for 2 epochs at LR=1e-5 and re-probe. Rollback only if re-probe still
-  fails. Preserves the carry-forward adapter instead of discarding work.
-- **Operational pattern: carry-forward adapter with nightly touch-up.**
-  Each consolidation's retention drift is a transient decoding offset,
-  fixable overnight at negligible compute cost.
+- **Touch-up-as-self-healing:** replay failing keys for 2 epochs at
+  LR=1e-5, re-probe, roll back only if still failing. Preserves the
+  carry-forward adapter instead of discarding work.
+- **Carry-forward adapter with nightly touch-up.** Retention drift is a
+  transient decoding offset, fixable at negligible compute cost.
 
 #### Weight-space analysis (corroborating evidence)
 
-Per-epoch metrics computed during the 13b prod run on the fill-LoRA
-delta (`weight_space_metrics.json`, `weight_space_curve.png`):
+Per-epoch metrics from `weight_space_metrics.json` / `weight_space_curve.png`:
 
-- **`||ΔW||_F` saturates early.** 0.44 (e1) → 3.26 (e8) → 3.43 (e14) →
-  3.43 (e30). The adapter stops moving in norm by e8, 6 epochs before
-  fill converges.
-- **Effective rank is stable.** 6.28 (e1) → 6.33 (e30), on an 8-dim
-  LoRA. No subspace collapse; the scaffold does not compress capacity.
-- **Trajectory coherence flips sharply around e17.** Cosine similarity
-  between consecutive Δ-step vectors: near-zero through e13
-  (values: 0.33, 0.17, 0.07, 0.03, 0.07, −0.00, 0.01, −0.00, 0.17,
-  0.02, −0.04 — gradient-descent thrash), transitioning at e16 (0.40),
-  e17 (0.79), e18 (0.89), then locked at +0.87 to +0.94 through e30.
+- **`||ΔW||_F` saturates at e8**: 0.44 → 3.26 (e8) → 3.43 (e14) → 3.43 (e30),
+  6 epochs before fill converges.
+- **Effective rank stable**: 6.28 (e1) → 6.33 (e30); no subspace collapse.
+- **Trajectory coherence locks ~e17**: near-zero cosine similarity through
+  e13, transitioning at e16 (0.40) → e17 (0.79) → locked +0.87–+0.94 through e30.
   Fill `stable_perfect` was e14; coherence lock lags by ~3 epochs.
 
-Consistent with the recovery-probe reading: training past e8 is not
-adding weight-space mass, it is reorienting gradient steps into a
-coherent-direction regime that settles the decoding surface. The
-retention plateau at 0.394 sits in the epochs where ‖ΔW‖ is flat and
-coherence has locked in — further training would cost GPU without
-moving the adapter.
+Training past e8 adds no weight-space mass — it reorients gradients into
+a coherent regime that settles the decoding surface. The retention plateau
+at 0.394 sits where ‖ΔW‖ is flat and coherence has locked in.
 
-**Still-deferred:** placeholder-variant ablation (`TBD-k` vs
-in-distribution decoy vs OOD prose vs nonsense) stays on the paper_notes
-follow-up list. Triple-level dedup ablation (fix `graph23↔graph26` etc)
-also stays deferred.
+**Still-deferred:** placeholder-variant ablation and triple-level dedup
+ablation (`graph23↔graph26`) stay on the paper_notes follow-up list.
 
 ---
 
-## Test 14: Content-Free Scaffold + Multi-Round Early-Stop at Scale
+## Test 14: Content-Free Scaffold with Multi-Round Early-Stop at Scale
 
 **Script:** `experiments/test14.py`
 **Status (2026-05-06):** V1/V2/V3 × 3 seeds (42, 7, 1337) complete at the
@@ -2528,39 +1631,7 @@ not need to engage — V3's fill was strictly faster.
 
 ### Conclusions from 14a-pre (n=1)
 
-**The "key alone routes" hypothesis is consistent with V3 winning at
-n=1**, but the V3<V2<V1 stable_perfect ordering (20 / 22 / 24) sits
-within plausible single-seed variance and the multi-seed replication
-(below) is required before treating it as a result. V3's Phase B
-placeholder content is uniform across every slot (`"question":
-"pending"`, `"answer": "pending"` — zero per-slot information), and
-V3 nonetheless pre-forms (key → slot) bindings well enough for Phase
-C fill to converge by `stable_perfect` e20 — beating V1/V2 by 2-4
-epochs at this seed. Whether per-slot uniqueness in V1/V2's
-placeholders is *causally* slower or just unlucky at seed=42 is the
-multi-seed batch's first question.
-
-**Production direction (provisional).** V3 is the deployable scaffold
-candidate at n=1: a single 500-key adapter trained on uniform `"pending"`
-placeholders, content-uniform across all slots, with no dataset-specific
-text baked in. The same scaffold would serve any downstream fill of
-real Q+A. Whether V3 stays the winner after multi-seed replication and
-the V6 family probe is the open question.
-
-**Caveats.** All three content-free variants converge their fill phase
-slower than Test 13's real-Q scaffold did at N=200 (C2 fired at
-stable_perfect = 11). V3's e20 fill at N=100 is ~2× slower. The
-content-free scaffold pre-forms bindings, but less efficiently than a
-real-Q scaffold does at this seed — content-free production reuse
-trades off fill speed for deployment simplicity. Whether the gap holds
-at N=500 is what 14a tests next; whether the gap can be narrowed by a
-better uniform placeholder is what V5 (long uniform natural template)
-probes.
-
-**Per-field Q/A split** at fill convergence was clean across all three
-variants — `both/total = 1.00`, `q_only/total = 0.00`, no discriminator
-collapse. Placeholder leakage at fill was zero for all three (no `TBD-*-N`
-or `pending` tokens emitted after Phase C).
+V3 won on every metric at n=1, but the V3<V2<V1 stable_perfect ordering (20 / 22 / 24) sits within plausible single-seed variance (±3-5 epochs at rank 8). Multi-seed replication was required before treating the shared-channel framing as a result — and the multi-seed batch (below) found V3 was not the winner.
 
 ### Implementation notes (post-run)
 
@@ -2581,155 +1652,7 @@ or `pending` tokens emitted after Phase C).
   `outputs/test14_pre/mistral/20260426_012907/<variant>/<phase>_done.json`
   and `epoch_log.json` for replay or finer-grained analysis.
 
-### Original extension plan: 14a-pre extended (V3_extended / V4 / V5)
-
-> **Historical (executed 2026-04-27 → 2026-04-29).** V3_extended and V4
-> are complete; V5 was started 2026-04-29 then stopped to fold into the
-> multi-seed batch (see "Multi-seed replication + V6 family" below).
-> The original "stop_epoch ≤ 14" decision rule was *not* met by any
-> variant; V3 remains the n=1 winner. The multi-seed batch supersedes
-> this single-seed extension as the gate for 14a launch.
-
-Before committing to 14a's ~45 h scale-up of V3, three additional
-variants are run on the same N=100 budget to test whether the ~9-epoch gap
-to Test 13's real-Q baseline (V3 fired at e20; real-Q C2 at e11) can be
-closed. The extension reuses `outputs/test14_pre/mistral/20260426_012907/`
-(no new run dir) and `V3/A/adapter` as the Phase A baseline (variant-
-independent; Phase A walls were within ±0.1 h across V1/V2/V3, so reusing
-saves ~8 h of redundant compute).
-
-| Cell | Phase B target / approach | Hypothesis under test |
-|---|---|---|
-| **V3_extended** | Resume `V3/B/adapter`, train +30 more scaffold epochs (effective e10 → e40), then fill 20 | Was V3's Phase B at e10 (the floor) too shallow? Deeper scaffold pre-training may pre-form (key → slot) bindings strongly enough that fill converges faster than V3's e20. EarlyStop on this Phase B is hard-disabled — the deepening goal would otherwise be silently defeated by stop firing at e10 again. |
-| **V4** — empty Q/A | `{"key":"graphN", "question":"", "answer":""}` (fresh, 30 ep) | The minimum-content scaffold: Q/A fields preserved (so the JSON framing and downstream consumers are unchanged) but no per-slot information. Tests whether the Q/A *content* in V1/V2/V3 was load-bearing or just structural padding. If V4 fills as fast as V3, content adds nothing routing-wise. |
-| **V5** — random-byte placeholder | `{"key":"graphN", "question":"<sha256(V5-Q-N)[:16]>", "answer":"<sha256(V5-A-N)[:16]>"}` per-slot deterministic (fresh, 30 ep) | Maximal per-slot uniqueness — opposite end of the V3 uniform-sentinel axis. Tests whether high-entropy per-slot content routes better than no per-slot content. |
-
-**Decision rule for the extended run:** the new winner replaces V3 only if
-a new variant fires Phase C at `stop_epoch ≤ 14` (halves the V3-to-real-Q
-gap from 9 epochs to ~3). Otherwise V3 stays as winner and 14a launches
-unchanged. Marginal speedups (V3 → e16 or e18) are not worth re-running
-14a-pre with a new winner — sticking with V3 buys consistency.
-
-**Wall estimate:** ~7.5-8 h. Single overnight. Per-cell ~2.5 h
-(Phase B 0.65-0.85 h + Phase C 1.6-2 h, no Phase A). V3_extended's full
-30 deepening epochs add ~2 h on top of V3's existing Phase B wall.
-
-**Implementation deviations now resolved (caught at code review,
-fixed before launch):**
-- V4 was originally implemented as `{"key": "graphN"}` only (no Q/A
-  fields). This crashed downstream consumers (`build_registry`,
-  `format_indexed_training`, `validate_recall`, `_write_phase_done`)
-  immediately at Phase B start. Fixed: V4 now emits empty Q/A strings
-  preserving the JSON framing while staying content-free.
-- V3_extended Phase B was being silently truncated to 10 epochs because
-  the EarlyStopPolicy fired at the floor on V3's already-converged
-  adapter. Fixed: early-stop is now hard-disabled for V3_extended
-  Phase B (the only sensible behavior — there is no use case for
-  EarlyStop on a deepening run).
-
-### Results — extended cells (single seed, n=1)
-
-Run dir: `outputs/test14_pre/mistral/20260426_012907/`.
-
-**V3_extended — REJECTED.** Resumed `V3/B/adapter` for +30 scaffold epochs
-(effective e10 → e40), then filled 20 keys.
-
-| Phase | Wall | First perfect | Stable perfect | Stop epoch | Notes |
-|---|---:|---:|---:|---:|---|
-| B (deepen) | 1.92 h | e1 (probe) | e3 (probe) | n/a (ES disabled) | 100 / 100 at every probe; train loss 2.1e-08 |
-| C (fill 20) | 1.99 h | **e23** | e25 | **e25** | both/total = 1.00, q_only = 0, leakage 0 |
-
-vs V3 plain (B at e10 floor, C stop at **e20**): V3_extended fills **5
-epochs slower**. Deepening Phase B sharpened the model's commitment to
-`"pending"`, which the fill phase then had to overwrite — costing more
-epochs, not fewer.
-
-**V4 — DOES NOT CLEAR THE BAR (n=1).** Empty Q/A scaffold
-(`{"key":"graphN", "question":"", "answer":""}`), 30-epoch budget,
-fresh Phase B. Resumed across two sessions on 2026-04-27 (CUDA crash) and
-2026-04-29 (pause-bug fix to `_done.json` writer + age-decryption fix to
-PEFT load path).
-
-| Phase | Wall | First perfect | Stable perfect | Stop epoch | Notes |
-|---|---:|---:|---:|---:|---|
-| B (scaffold) | 0.66 h | e1 | e3 | e10 (floor) | 100 / 100; train loss 0.020 |
-| C (fill 20) | 2.22 h | **e29** | **None** | None (ES never fired) | final 20/20 at e29-30; leakage 0 |
-
-V4 reaches 100% fill recall but only at e29 of 30 — `stable_perfect`
-never fires (would need 3 consecutive perfect epochs, only 2 available
-in budget). The fill curve is non-monotone: 0.40 (e21) → 0.20 (e23) →
-0.65 (e25) → 0.90 (e26) → 1.00 (e29). Decision-rule bar (`stop_epoch
-≤ 14`) is missed by ≥15 epochs.
-
-**Per-key diagnostic (V4 vs V3):**
-
-The `first_perfect_log.json` per-key trajectories diverge sharply between
-V3 and V4 even though both reach the same final 20/20:
-
-| Variant | per-key first_perfect (sorted) | min | max | median | std |
-|---|---|---:|---:|---:|---:|
-| V1 | 3,5,6,8,13,14×6,15,15,16,16,17,17,17,18,18 | 3 | 18 | 14 | 4.3 |
-| V2 | 2,4,5,6,8,9,9,10,10,11,11,12,13,14,14,14,15,15,15,17 | 2 | 17 | **11** | 4.0 |
-| **V3** | 3,5,6,8,10,11,12,13×4,14×6,15×3 | 3 | **15** | 13 | **3.5** |
-| V3_extended | 3,4,7,12,13,14,14,16,17,18,19,19,19,19,19,19,19,19,22,23 | 3 | 23 | 18.5 | 5.4 |
-| **V4** | 3,4,5,9,11,17,18,18,22,22,24,24,25,25,26,26,26,26,28,29 | 3 | **29** | **23** | **8.2** |
-
-**Headline observations from per-key data:**
-
-1. **V4's per-key spread is dramatically wider than V3's** (range 26 vs
-   12, std 8.2 vs 3.5). This is the clearest signal in the data and is
-   robust at n=1.
-2. **V3 wins `stable_perfect` not by faster average convergence but by
-   tighter spread.** V2 has the lowest *median* first_perfect (e11) but
-   the slower-converging tail keeps stable_perfect at e22 vs V3's e20.
-   V3's slowest key (e15) converges ahead of V2's slowest (e17) and
-   V1's slowest (e18). The 3-window stable arrives sooner because all
-   keys are "ready" within a tighter epoch band.
-3. **V3 vs V1/V2 std differences are small** (3.5 / 4.0 / 4.3). The
-   ordering V3 < V2 < V1 on stable_perfect (20 / 22 / 24) sits within
-   plausible single-seed noise envelope and **needs multi-seed
-   replication to confirm**.
-4. **V4 reaches real Q+A content, not empty strings.** All 20 fill keys
-   ultimately recall correct content (e.g. graph81: "Liang Xin is
-   female."). An earlier diagnostic suggesting an "empty-string
-   attractor" failure mode was a bug in the trace-reading script
-   (wrong field name) — refuted on re-inspection.
-
-### Mechanism — candidate hypothesis (n=1; not validated)
-
-The V3 vs V1 vs V4 results are consistent with a **shared-update-channel
-hypothesis**, but the evidence is single-seed and the V3<V2<V1 fine
-ordering is within noise:
-
-- **Uniform scaffolds may enable cross-slot transfer in Phase C.** Phase
-  B with uniform `"pending"` content encodes a near-identical (key →
-  pending) mapping across all 100 slots. Phase C gradients update the
-  shared structure; the model learns "for slots like these, content can
-  be anything" almost simultaneously across the fill set, which could
-  explain V3's tight per-key cluster at e13–e15.
-- **Per-slot unique scaffolds (V1, V2) split this channel.** Each slot
-  has its own placeholder, so updates don't share — closer to per-slot
-  independent learning. V1's per-slot uniqueness on both Q and A pulls
-  the slowest keys to e18; V2's structural Q + per-slot unique A is in
-  between (max e17). This is the *direction* the hypothesis predicts;
-  the *magnitude* is small and could be noise.
-- **Empty placeholders (V4) invest minimal Phase B weight at all.**
-  Predicting `""` is trivially low-loss; the adapter develops only weak
-  slot-specific commitment in Phase B. Phase C then learns each slot's
-  binding essentially from scratch, with per-key time correlated to
-  answer difficulty. Wide spread (e3 to e29) is the signature.
-- **V3_extended (deeper Phase B) is slower** — deepening sharpens the
-  model's commitment to `"pending"`, increasing per-token overwrite
-  cost in Phase C. Negative directional evidence on the "deepen
-  scaffold" axis.
-
-**This hypothesis is not yet validated.** The V3<V2<V1 ordering at n=1
-sits within plausible single-seed variance (±3-5 epochs at rank 8 / 30
-epochs). Multi-seed replication is required before treating the shared-
-channel framing as a result rather than a design hint. The V4 wide-
-spread signature is robust at n=1 but the underlying mechanism (no
-scaffold weight invested) needs corroboration via the next-step
-multi-seed batch.
+Deepening Phase B (V3_extended) was negative-directional (fill converged 5 epochs slower at e25 vs V3's e20).
 
 ### Multi-seed result (2026-05-06)
 
@@ -3092,69 +2015,6 @@ none measured the production format.
 3. How sensitive is recovery to **repair epochs-per-episode** (1 / 3)?
 4. Spot-check: does `weight_decay=0.1 vs 0.01` in the repair loop move any metric?
 
-### Redesign (2026-05-13)
-
-The first design used `depths = [30, 50]` (total pretrain epochs) and called
-`decay_steps_for(n_keys, num_epochs) = n_keys * num_epochs // 2` to set
-`lr_decay_steps` per arm. That helper had been validated by Test 14's
-apples-to-apples diagnostic (2026-05-04, see `scripts/dev/test14_reproduce.md`)
-for **fixed-budget** phases. The Test 16 D=30 arm was the first config where
-the same formula was applied to a budget where `num_epochs / 2 < first_perfect_epoch`:
-
-| Test | Schedule | `lr_decay_steps` | LR → 0 at | First-perfect | Margin |
-|---|---|---|---|---|---|
-| Test 13 fill (40k × 50e) | linear, halved | 1000 | epoch 25 | epoch 13 | +12 ep |
-| Test 14 V3/A (100k × 50e) | linear, halved | 2500 | epoch 25 | epoch 21 | +4 ep |
-| Test 15 A (100k × 50e) | linear, halved | 2500 | epoch 25 | epoch 22 | +3 ep |
-| Test 16 base_50 (50k × 50e) | linear, halved | 1250 | epoch 25 | epoch 20 | +5 ep |
-| **Test 16 base_30 (50k × 30e)** | **linear, halved** | **750** | **epoch 15** | **never** | **negative** |
-
-Empirically: seed 42 base_30 (`outputs/test16_repair_sweep/mistral/20260512_001618`)
-plateaued at 42/50 recall from epoch 16 onward, while base_50 reached 50/50 at
-epoch 20 on the same QA pairs. The LR had decayed to zero by step 750 (epoch 15)
-for the D=30 arm; from there no learning could happen. The "depth knob"
-therefore conflated three things:
-
-1. Total epochs trained.
-2. LR-schedule shape (`lr_decay_steps` scaled with `num_epochs`).
-3. End encoding state (D=30 below floor, D=50 at floor).
-
-That violates CLAUDE.md's "Extended-training config" rule — *linear LR
-scheduler with fixed `lr_decay_steps` (decoupled from `num_train_epochs`)*.
-
-**Fix.** Two coordinated changes in `experiments/test16_repair_sweep.py`:
-
-- `decay_steps_for(n_keys, reference_epochs=REFERENCE_EPOCHS)` — the LR
-  decay window is pinned to a shared reference (60 epochs), independent of
-  the per-arm `num_epochs`. Every base arm sees identical LR-vs-step
-  trajectory up to wherever it stops.
-- The depth knob becomes `depths_past_floor` — epochs trained *past
-  first_perfect_epoch*. A new `FloorRelativeStopCallback` halts each base
-  training at `first_perfect_epoch + D`. The base phase trains up to
-  `MAX_BASE_EPOCHS = REFERENCE_EPOCHS` and **refuses to corrupt** if
-  `first_perfect_epoch is None` at end of base — silent acceptance of a
-  sub-perfect base was the bug.
-
-This removes the conflation: with a shared schedule and a floor-anchored
-stop, the only variable across base arms is "how many additional epochs of
-refinement past just-perfect."
-
-### Motivation (unchanged from prior version)
-
-Test 15 (n=5 seeds, N=100, K=20) killed the scaffold-as-retention-lever
-hypothesis (`verdict: DOES NOT HOLD` — see "Test 15: Results"): the
-no-scaffold (B) and scaffold-fill (C2) paths converge after repair
-(`ratio_repaired ≈ 1.04`). What survived is the repair loop itself — a
-cheap ≤5-episode, 1-epoch-at-LR=1e-5-per-episode, re-probe-between-episodes
-loop that recovers ~91.5% (B) / ~95% (C2) of unchanged keys from a
-post-overwrite retention floor of ~4.5%, with `alignment_delta` ~0.8–0.9
-across all seeds (post-overwrite forgetting is decoding-misalignment, not
-weight-erasure). So the lever worth a sensitivity study is the **repair
-primitive**, not the scaffold. Test 16 characterises it across three
-encoding-depth-past-floor values and a 6-cell `repair_lr` ×
-`repair_epochs_per_episode` grid, with one weight-decay spot-check — B-path
-only (Test 15 showed the repair loop is path-agnostic).
-
 ### N≈50 / K≈12 rationale
 
 Shrinking from Test 15's N=100 / K=20 to N=50 / K=12 (24% swap fraction vs
@@ -3174,40 +2034,6 @@ at N=50 is empirically around epoch 20 (seed-42 base_50 from the deleted
 `D` in path names (`base_{D}/`, `corrupted_{D}/`, `repair_{D}_...`) is the
 `depth_past_floor` value (0, 10, or 30 by default), not total epochs.
 
-### Encoding format (2026-05-16 refactor)
-
-Each entry is a **`(key, subject, predicate, object)` quadruple**, matching
-the production indexed-key memory introduced in commit
-`a8b329d feat(memory): quadruple indexed-key encoding behind
-consolidation.indexed_format`. Training uses
-`paramem.training.entry_memory.format_entry_training` — **one example per
-entry**, JSON envelope `{"key", "subject", "predicate", "object"}`. The
-recall template is `"Recall the fact stored under key '{key}'."`. Probes
-use `paramem.training.recall_eval.evaluate_indexed_recall`, which matches
-all three structural fields for `exact_match`.
-
-The triple pool is loaded from
-`outputs/lme_graph/graph_snapshot.json` via
-`experiments.quadruple_adapter.load_unique_triples` (563 deduplicated
-triples; test 16 takes the first `n_keys + swap_keys = 62`). Same
-deterministic source the quadruple_adapter experiment uses.
-
-Prior Test 15-aligned QA-format (`{key, question, answer}` with two
-training examples per pair) was the original Test 16 design. The
-triple-format refactor halves training-step count per epoch (one example
-per fact instead of two) and shortens probe generation
-(`max_new_tokens=128` vs 200 — structured output terminates earlier).
-
-Observed wall-time on this hardware (seed 42, triple vs QA on the same
-schedule): base phase ≈ 178 s/epoch (was ~185) — ~4 % faster; corruption
-phase ≈ 130 s/epoch (was ~167) — ~22 % faster. Per-seed net ≈ 10-15 %
-faster, dominated by corruption savings. Probing remains the bottleneck
-because EOS terminates responses well before the
-`max_new_tokens` budget in both formats.
-
-Not directly comparable to Test 15 numbers, but informs the production
-memory format that's shipping.
-
 ### Repair grid
 
 | Cell | `repair_lr` | `repair_epochs_per_episode` | `repair_weight_decay` | Note |
@@ -3223,50 +2049,19 @@ memory format that's shipping.
 Every `depth_past_floor` arm runs cells 1–6. Cell 7 runs for the
 `spotcheck_depth` arm only (default 0 — at-floor).
 
-### New Test-16 metrics
+### Metrics
 
-After each repair cell, two overwrite-integrity probes run via `_safe_probe`
-(triple-aware probe; `exact_match` requires `subject`/`predicate`/`object`
-all to match):
+Two overwrite-integrity probes run after each repair cell (`_safe_probe`,
+`exact_match` requires all three triple fields):
 
-- **`overwrite_recall_after_repair`** — probe `overwrite_swap_keyed` (the
-  *new* triple installed by corruption); < 0.95 ⇒ repair leaked into the
-  swap set.
-- **`original_answer_resurfaced_rate`** — probe `overwritten_keyed` (the
-  *original* triple, kept aside before corruption swapped it out); > 0.0
-  ⇒ active reversion (the original triple is coming back, not just
-  degradation of the swapped triple).
+- **`overwrite_recall_after_repair`** (`over_ar`) — probes the *new* swap triple; < 0.95 ⇒ repair leaked into the swap.
+- **`original_answer_resurfaced_rate`** (`orig_rsr`) — probes the *original* triple; > 0.0 ⇒ active reversion.
 
-Per-arm metadata stamped into `base_{D}_done.json`:
-`encoding_floor_epoch` (= first_perfect_epoch), `depth_past_floor` (= D
-by construction), `total_epochs_trained` (= floor + D), `lr_decay_steps`,
-`reference_epochs`, `max_base_epochs`.
+Per-arm metadata in `base_{D}_done.json`: `encoding_floor_epoch`,
+`depth_past_floor`, `total_epochs_trained`, `lr_decay_steps`.
 
-### Output layout
-
-```
-outputs/test16_repair_sweep/mistral/<ts>/
-  run_config.json               # frozen at first launch
-  test16_aggregate.json         # recomputed after each (seed, D)
-  paused.json                   # boundary-pause marker
-  seed42/
-    base_0/                     # depth_past_floor=0 — stop at first_perfect
-    base_10/                    # depth_past_floor=10
-    base_30/                    # depth_past_floor=30
-    corrupted_0/  corrupted_10/  corrupted_30/
-    repair_0_lr1e-05_ep1/ ... repair_0_lr5e-05_ep3/   (6 cells)
-    repair_0_lr1e-05_ep1_wd0.1/                       (spotcheck — at D=0)
-    repair_10_lr*/ ... (6 cells)
-    repair_30_lr*/ ... (6 cells)
-  seed7/ ... seed1337/ ... seed1/ ... seed11/ ...
-```
-
-Smoke run writes to `outputs/test16_repair_sweep/mistral/_smoke/<ts>/`;
-`tresume 16` always excludes `_smoke/` when finding the latest run dir.
-
-### Cell count
-
-`5 seeds × (3 depths × 6 repair-grid cells + 1 spotcheck cell per seed) = 95 cells`.
+**Cell count:** `5 seeds × (3 depths × 6 repair-grid cells + 1 spotcheck) = 95 cells`.
+Output tree: `outputs/test16_repair_sweep/mistral/<ts>/seed{N}/base_{D}/`, `corrupted_{D}/`, `repair_{D}_*/`.
 
 ### Results (n=5, 2026-05-19)
 
@@ -3378,11 +2173,645 @@ The current run characterizes the repair primitive at one model (Mistral 7B nf4)
 
 6. **Latent-recovery time-scale**: how fast does `first_perfect_epoch` drift after consecutive overwrite + repair cycles?  Multiple consolidation cycles compound effects; the single overwrite + single repair characterised here is the unit step, not the long-run behaviour.
 
-### Design retrospective (kept for follow-up architecture)
 
-- `MAX_BASE_EPOCHS = 60` was sufficient — no run hit the refuse-to-corrupt guard.
-- `corrupted_D` uses its own `decay_steps_for(K, overwrite_epochs)` with `overwrite_epochs=20` as the reference, intentionally apples-to-apples within the corruption phase.  Different scale from base (K=12 vs N=50) so doesn't share base's reference.
-- Floor-relative stop via `EarlyStopPolicy.extra_epochs_past_first_perfect=D` (added 2026-05-13 in `paramem/training/early_stop.py`) is the production-path mechanism.  The stable-perfect path stays disabled in Test 16 via `signal_from_epoch=10**9`.
+---
+
+## Part 3 — Generalization Boundaries
+
+---
+
+## Test 10: Generalization Boundaries of Parametric Memory
+
+**Script:** `experiments/test10_grokking.py`
+**Status:** RUNNING — 35 cycles complete (E1050). Target E3,000.
+
+### Objective
+
+Characterize which types of generalization LoRA adapters can and cannot
+support under extended training. Three axes:
+
+1. **Associative generalization** — does the adapter transfer learned facts
+   to novel prompt formats (rephrased, direct, open-ended)?
+2. **Compositional generalization** — can the adapter compose multi-hop
+   chains from individually learned facts (3-hop questions)?
+3. **Grokking** — does extended training beyond memorization convergence
+   produce delayed emergence of compositional reasoning?
+
+### Background
+
+Grokking (Power et al., 2022) is delayed generalization: models first memorize
+training data, then much later suddenly generalize to held-out data. Key
+conditions: weight decay (drives transition), training far beyond convergence
+(3-10x), and sufficient relational structure in the data. "Grokking in the Wild"
+(2025) demonstrated this on multi-hop factual QA with a critical threshold of
+~3.6 inferred-to-atomic fact ratio. No published work has studied grokking in
+LoRA adapters.
+
+LoRA's low-rank constraint may accelerate grokking onset: it restricts the
+memorization solution space, making generalizing circuits relatively more
+accessible (analogous to implicit regularization).
+
+### Design
+
+**Data selection from cycle 50 graph.** The test uses the cycle 50 cumulative
+graph from Test 8 as the source of relational structure. "Unknown" entities
+are excluded before path enumeration.
+
+1. Enumerate all 3-hop paths: A →[r1]→ B →[r2]→ C →[r3]→ D
+2. Filter to triples participating in ≥3 three-hop paths
+3. Re-filter to paths where all 3 triples survived
+
+This yields **129 training triples, 360 three-hop evaluation questions,
+ratio ~2.79** (after "Unknown" entity filtering).
+
+**Training.** Cycle-based: train 30 epochs per cycle, probe all metrics,
+save adapter checkpoint, cooldown, repeat indefinitely. Each cycle creates
+a fresh Trainer (fresh optimizer) with warm adapter weights from the previous
+cycle. No epoch target — runs until paused.
+
+Key training parameters:
+- **Constant LR** (`lr_scheduler_type="constant"`) — grokking requires
+  sustained gradient magnitude well past memorization convergence.
+- **warmup_steps=100** (~1.5 epochs) — fixed step count, not ratio-based.
+- **weight_decay=0.1** — literature uses 0.1–1.0 for grokking; stronger
+  regularization accelerates onset.
+- **GPU guard** with automatic server release (`acquire_gpu(interactive=False)`).
+- **GPU cooldown** between cycles (wait for ≤45°C).
+
+**Evaluation probes (7 probes at each cycle):**
+
+| Probe | What it measures | Scoring |
+|-------|-----------------|---------|
+| 1. Keyed retrieval | Baseline recall (should be 100%) | SimHash confidence |
+| 2. Direct questions | Single-hop natural recall | Exact entity match |
+| 3. Rephrased questions | Surface-form generalization | Exact entity match |
+| 4. 3-hop questions | Compositional generalization (grokking target) | Exact entity match on D |
+| 5. 2-hop questions | Intermediate compositional (secondary) | Exact entity match on C |
+| 6. Open-ended | Entity-level recall | Token overlap (threshold 0.4) |
+| 7. **Relation shortcut** | **Shortcut baseline for 3-hop** | **Exact entity match** |
+
+**Relation shortcut control (probe 7).** For each unique final relation in
+3-hop questions, asks "What entity does someone {relation}?" — no chain, no
+starting entity. If shortcut accuracy ≥ 3-hop accuracy, all 3-hop success is
+explainable by single-hop relation→entity memorization, not composition.
+Grokking is evidenced when 3-hop exceeds shortcut.
+
+**Controls:**
+- Base model (adapter OFF): run once, measures pretraining knowledge baseline.
+- Shuffled labels: cycle-based (same structure as main), randomized key→answer
+  pairings. Trajectory must stay flat for valid comparison.
+
+### Parameters
+
+```
+--model mistral|gemma          Model to use (default: mistral)
+--base-cycle N                 Test 8 cycle to use as graph source (default: 50)
+--weight-decay F               Weight decay (default: 0.1)
+--learning-rate F              Learning rate (default: 1e-4, constant)
+--epochs-per-cycle N           Epochs per training cycle (default: 30)
+--resume                       Resume from last completed checkpoint
+--control-only                 Run control conditions only
+```
+
+### Resumability
+
+Cycle-based with full checkpoint persistence:
+- Adapter weights saved per cycle (`epoch_NNN/adapter/`)
+- All 7 probe results saved per cycle (`epoch_NNN/probe_results.json`)
+- Training loss, keyed_pairs.json saved per cycle
+- `state.json` + `results.json` updated atomically after each cycle
+- `progress.json` updated at each epoch for live `tstatus` display
+- `--resume` loads last adapter checkpoint, continues indefinitely
+- No epoch target needed — extend by simply resuming
+
+### Results (constant LR, weight_decay=0.1)
+
+Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 360 3-hop questions,
+89 unique final relations.
+
+| Epoch | Keyed | Direct | Rephrased | 3-hop | Shortcut | 2-hop | Open | Loss |
+|-------|-------|--------|-----------|-------|----------|-------|------|------|
+| base | 0.0% | 23.3% | 23.3% | 1.1% | 2.5% | 0.5% | 41.1% | — |
+| E30 | 94.6% | 91.5% | 60.5% | 6.7% | 14.7% | 12.8% | 41.1% | 0.113 |
+| E60 | 99.2% | 93.0% | 72.9% | 11.7% | 23.9% | 16.3% | 45.7% | 0.014 |
+| E90 | 100% | 93.0% | 69.8% | 10.3% | 20.3% | 14.8% | 45.0% | 0.010 |
+| E120 | 99% | 93.0% | 74.4% | 11.4% | 28.1% | 12.3% | 45.0% | 0.012 |
+| E150 | 100% | 93.0% | 72.9% | 10.0% | 36.9% | 16.3% | 50.0% | 0.008 |
+| E180 | 97% | 91.5% | 71.3% | 5.3% | 32.8% | 8.4% | 46.5% | 0.009 |
+| E210 | 100% | 93.0% | 74.4% | 8.3% | 32.8% | 10.8% | 41.9% | 0.009 |
+| E240 | 93% | 91.5% | 75.2% | 16.9% | 41.1% | 15.8% | 46.5% | 0.008 |
+| E270 | 100% | 93.0% | 71.3% | 13.6% | 39.7% | 16.3% | 46.5% | 0.004 |
+| E300 | 100% | 93.0% | 77.5% | 13.6% | 36.1% | 14.3% | 42.6% | 0.005 |
+| E330 | 100% | 93.0% | 72.9% | 5.6% | 35.6% | 4.9% | 47.3% | 0.006 |
+| E360 | 99% | 93.0% | 74.4% | 6.9% | 35.0% | 5.9% | 45.7% | 0.008 |
+| E390 | 100% | 93.0% | 72.9% | 16.1% | 29.4% | 20.7% | 45.0% | 0.006 |
+| E420 | 100% | 93.0% | 74.4% | 9.7% | 33.9% | 9.4% | 45.7% | 0.004 |
+| E450 | 100% | 93.0% | 76.0% | 8.6% | 39.2% | 6.9% | 48.8% | 0.005 |
+| E480 | 100% | 93.0% | 71.3% | 6.7% | 41.1% | 7.9% | 31.8% | 0.004 |
+| E510 | 100% | 93.0% | 74.4% | 9.2% | 35.6% | 10.8% | 45.0% | 0.007 |
+| E540 | 97% | 91.0% | 69.8% | 8.1% | 36.7% | 3.5% | 43.4% | 0.009 |
+| E570 | 100% | 93.0% | 75.2% | 11.1% | 46.1% | 13.3% | 41.1% | 0.005 |
+| E600 | 100% | 93.0% | 74.4% | 17.8% | 41.9% | 16.8% | 44.2% | 0.003 |
+| E630 | 95% | 93.0% | 69.8% | 13.6% | 31.1% | 16.3% | 43.4% | 0.008 |
+| E660 | 99% | 93.0% | 69.8% | 8.1% | 45.6% | 8.9% | 47.3% | 0.006 |
+| E690 | 100% | 93.0% | 72.1% | 10.8% | 41.1% | 10.3% | 45.0% | 0.004 |
+| E720 | 97% | 92.2% | 72.9% | 10.8% | 48.6% | 12.3% | 41.1% | 0.009 |
+| E750 | 100% | 93.0% | 73.6% | 6.1% | 43.3% | 11.3% | 45.7% | 0.003 |
+| E780 | 100% | 93.0% | 72.9% | 14.7% | 49.2% | 11.8% | 49.6% | 0.004 |
+| E810 | 100% | 93.0% | 70.5% | 7.5% | 48.6% | 4.9% | 48.1% | 0.002 |
+| E840 | 100% | 93.0% | 77.5% | 7.2% | 45.0% | 10.8% | 42.6% | 0.002 |
+| E870 | 100% | 93.0% | 72.1% | 10.6% | 51.4% | 10.8% | 44.2% | 0.003 |
+| E900 | 100% | 93.0% | 67.4% | 15.0% | 45.3% | 13.8% | 45.7% | 0.002 |
+| E930 | 100% | 93.0% | 68.2% | 11.1% | 44.7% | 11.3% | 43.4% | 0.003 |
+| E960 | 100% | 93.0% | 72.9% | 10.6% | 45.6% | 12.3% | 44.2% | 0.004 |
+| E990 | 99% | 93.0% | 76.0% | 8.9% | 39.7% | 13.8% | 42.6% | 0.008 |
+| E1020 | 100% | 93.0% | 74.4% | 8.6% | 42.2% | 11.3% | 45.0% | 0.002 |
+| E1050 | 100% | 93.0% | 67.4% | 8.9% | 39.4% | 11.8% | 46.5% | 0.003 |
+| E1080 | 100% | 93.0% | 69.0% | 6.7% | 46.9% | 7.4% | 44.2% | 0.003 |
+| E1110 | 100% | 93.0% | 64.3% | 3.3% | 42.8% | 6.9% | 46.5% | 0.002 |
+| E1140 | 100% | 93.0% | 69.0% | 10.6% | 43.3% | 6.9% | 38.8% | 0.004 |
+| E1170 | 100% | 93.0% | 73.6% | 9.7% | 34.4% | 8.4% | 45.0% | 0.005 |
+| E1200 | 100% | 93.0% | 70.5% | 7.8% | 36.7% | 4.9% | 48.1% | 0.003 |
+| E1230 | 100% | 93.0% | 74.4% | 8.9% | 41.1% | 10.8% | 36.4% | 0.004 |
+| E1260 | 100% | 93.0% | 72.1% | 10.3% | 48.3% | 8.4% | 43.4% | 0.004 |
+| E1290 | 100% | 93.0% | 76.7% | 12.5% | 44.4% | 10.3% | 43.4% | 0.005 |
+| E1320 | 100% | 93.0% | 71.3% | 11.1% | 47.8% |  5.4% | 46.5% | 0.005 |
+| E1350 | 100% | 93.0% | 69.0% |  9.4% | 40.6% |  5.4% | 44.2% | 0.005 |
+| E1380 | 100% | 93.0% | 68.2% |  9.4% | 35.8% |  7.9% | 45.0% | 0.002 |
+| E1410 | 100% | 93.0% | 69.8% |  6.9% | 41.9% | 11.3% | 46.5% | 0.006 |
+| E1440 | 100% | 93.0% | 73.6% |  9.2% | 51.9% |  6.9% | 41.9% | 0.002 |
+| E1470 | 100% | 93.0% | 67.4% |  5.3% | 41.4% |  6.4% | 42.6% | 0.007 |
+| E1500 | 100% | 93.0% | 73.6% |  6.9% | 45.6% |  4.9% | 40.3% | 0.003 |
+| E1530 | 100% | 93.0% | 73.6% |  8.3% | 49.2% |  8.9% | 28.7% | 0.005 |
+| E1560 | 100% | 93.0% | 76.0% |  8.1% | 46.4% | 10.8% | 38.8% | 0.006 |
+| E1590 | 100% | 93.0% | 76.0% |  7.2% | 49.7% |  8.9% | 43.4% | 0.005 |
+| E1620 | 100% | 93.0% | 72.9% | 10.3% | 47.8% |  9.9% | 47.3% | 0.006 |
+| E1650 |  99% | 93.0% | 74.4% | 10.0% | 33.9% |  6.9% | 47.3% | 0.006 |
+| E1680 | 100% | 93.0% | 69.0% |  7.5% | 43.3% |  8.9% | 48.1% | 0.002 |
+| E1710 | 100% | 93.0% | 73.6% | 13.1% | 45.0% |  6.4% | 47.3% | 0.002 |
+
+3-hop breakdown (hub/non-hub/full-chain):
+
+| Epoch | 3-hop | Hub (of 35) | Non-hub (of 325) | Full-chain |
+|-------|-------|-------------|------------------|------------|
+| E30 | 24/360 | 4/35 (11%) | 20/325 (6%) | 0 |
+| E60 | 42/360 | 9/35 (26%) | 33/325 (10%) | 0 |
+| E90 | 37/360 | — | — | 0 |
+| E690 | 39/360 | 8/35 (23%) | 31/325 (10%) | 0 |
+| E720 | 39/360 | 9/35 (26%) | 30/325 (9%) | 0 |
+| E750 | 22/360 | 5/35 (14%) | 17/325 (5%) | 0 |
+| E780 | 53/360 | 11/35 (31%) | 42/325 (13%) | 0 |
+| E810 | 27/360 | 7/35 (20%) | 20/325 (6%) | 0 |
+| E840 | 26/360 | 4/35 (11%) | 22/325 (7%) | 0 |
+| E870 | 38/360 | 4/35 (11%) | 34/325 (10%) | 0 |
+| E900 | 54/360 | 8/35 (23%) | 46/325 (14%) | 0 |
+| E930 | 40/360 | 9/35 (26%) | 31/325 (10%) | 0 |
+| E960 | 38/360 | 9/35 (26%) | 29/325 (9%) | 0 |
+| E990 | 32/360 | 9/35 (26%) | 23/325 (7%) | 0 |
+| E1020 | 31/360 | 7/35 (20%) | 24/325 (7%) | 0 |
+| E1050 | 32/360 | 6/35 (17%) | 26/325 (8%) | 0 |
+| E1080 | 24/360 | 5/35 (14%) | 19/325 (5%) | 0 |
+| E1110 | 12/360 | 2/35 (5%) | 10/325 (3%) | 0 |
+| E1140 | 38/360 | 2/35 (5%) | 36/325 (11%) | 0 |
+| E1170 | 35/360 | 6/35 (17%) | 29/325 (8%) | 0 |
+| E1200 | 28/360 | 9/35 (25%) | 19/325 (5%) | 0 |
+| E1230 | 32/360 | 8/35 (22%) | 24/325 (7%) | 0 |
+| E1260 | 37/360 | 4/35 (11%) | 33/325 (10%) | 0 |
+| E1290 | 45/360 | 11/35 (31%) | 34/325 (10%) | 0 |
+| E1320 | 40/360 |  3/35 (9%)  | 37/325 (11%) | 0 |
+| E1350 | 34/360 |  1/35 (3%)  | 33/325 (10%) | 0 |
+| E1380 | 34/360 |  5/35 (14%) | 29/325 (9%)  | 0 |
+| E1410 | 25/360 |  5/35 (14%) | 20/325 (6%)  | 0 |
+| E1440 | 33/360 |  8/35 (23%) | 25/325 (8%)  | 0 |
+| E1470 | 19/360 |  2/35 (6%)  | 17/325 (5%)  | 0 |
+| E1500 | 25/360 |  5/35 (14%) | 20/325 (6%)  | 0 |
+| E1530 | 30/360 |  7/35 (20%) | 23/325 (7%)  | 0 |
+| E1560 | 29/360 |  4/35 (11%) | 25/325 (8%)  | 0 |
+| E1590 | 26/360 |  6/35 (17%) | 20/325 (6%)  | 0 |
+| E1620 | 37/360 |  7/35 (20%) | 30/325 (9%)  | 0 |
+| E1650 | 36/360 |  4/35 (11%) | 32/325 (10%) | 0 |
+| E1680 | 27/360 |  6/35 (17%) | 21/325 (6%)  | 0 |
+| E1710 | 47/360 | 10/35 (29%) | 37/325 (11%) | 0 |
+
+### Key findings (E1710, 57 cycles) — 2026-04-25
+
+Resume E1590→E1710 (4 additional cycles, ~120 epochs overnight) extends the
+pattern without change: no grokking signal. Rephrased oscillates in the
+69-74% band (E1620-E1710: 72.9, 74.4, 69.0, 73.6%), within the long-run
+plateau. 3-hop entity match swings 7.5-13.1% (E1620-E1710: 10.3, 10.0, 7.5,
+13.1%); the E1710 13.1% is the highest in the last 12 cycles but produces
+0/360 full chains, so it remains entity-name lookup landing on the answer
+hub by surface association, not chain reasoning. Shortcut continues to
+oscillate 34-48% and stays strictly above 3-hop at every checkpoint
+(E1620-E1710 ratio sc/3h: 4.6×, 3.4×, 5.8×, 3.4×). Full-chain count remains
+0 across all 57 cycles (cumulative 0/20,520). Keyed stable at 100% with one
+mild blip at c55/E1650 (127/129, 98.5%) that recovered next cycle; direct
+locked at 93.0%. Loss is at floor (~0.002-0.006). The compositional
+crossover has not occurred at 57× convergence.
+
+
+**Extended observation (from E1290 analysis, 43 cycles):** 3-hop accuracy oscillated
+between 3–18% across all checkpoints with no upward trend, while shortcut accuracy
+remained strictly above 3-hop at every checkpoint (gap 13–41pp). The inferred-to-atomic
+ratio of 2.79 (360 compositional questions / 129 training facts) sits 22% below the 3.6
+critical threshold reported in "Grokking in the Wild" (2025) — below this threshold the
+gradient signal from compositional examples may be insufficient to overcome the memorization
+attractor. No compositional crossover has occurred at 57× convergence (E1710).
+
+### Grokking detection criterion
+
+3-hop accuracy must exceed shortcut accuracy. Until this crossover occurs,
+all multi-hop success is attributable to shortcuts. The test runs indefinitely
+in 30-epoch cycles; the crossover (if it occurs) will be visible in the trend.
+
+### Methodological concerns
+
+**1. Shortcut control bias.** The shortcut probe asks a single relation
+without specifying a starting entity — the model only needs to retrieve
+*any* entity satisfying that relation from the 129 trained facts. The 3-hop
+question requires a specific chain anchored at a specific entity. The
+shortcut has a systematically larger solution space per question. To validate
+the control, compute expected shortcut accuracy under random selection from
+trained facts. If the shortcut baseline is high by construction, the
+crossover criterion is too conservative.
+
+**2. Inferred-to-atomic ratio below threshold.** Our ratio is 2.79
+(360 compositional questions / 129 training facts), 22% below the 3.6
+critical threshold reported in "Grokking in the Wild" (2025). Below this
+threshold, the gradient signal from compositional examples may be
+insufficient to overcome the memorization attractor. This is the most
+actionable variable — either increase compositional questions or reduce
+training facts to push above 3.6.
+
+**3. LoRA rank capacity.** Rank 8 restricts adapter modifications to an
+8-dimensional bottleneck per weight matrix. Compositional reasoning circuits
+in transformers involve coordinated attention patterns across multiple
+layers. If the compositional circuit requires rank > 8 modifications at any
+layer, grokking is impossible regardless of training duration. A rank-16 or
+rank-32 comparison on a subset of epochs would test this.
+
+**4. 3-hop oscillation vs. noise.** The 5-17% oscillation on 360 questions
+means absolute counts swing between ~19 and ~61 correct answers. To
+distinguish partial learning from noise: check whether the *same* questions
+succeed across probes (consistent subset = learning) or whether the success
+set is random each time (churn = noise).
+
+**5. Open-ended stable, not degrading.** Open-ended recall varies 32-50%
+with no sustained trend. The E480 dip (32%) was an outlier — subsequent
+checkpoints recovered to 41-50%. No evidence of catastrophic forgetting
+from extended overtraining through E870.
+
+**6. Weight norm tracking.** Grokking in the literature is associated with
+weight norm decrease after initial increase. Tracking per-layer LoRA weight
+norms over training would provide a direct signal of whether the
+regularization dynamics that drive grokking are engaging.
+
+### Next steps
+
+1. Continue running — at 57× convergence (E1710), still below the 100×
+   threshold from the grokking literature (100-10,000×). Target E3,000 (100×)
+   before concluding. Shortcut oscillation and 3-hop stagnation suggest
+   grokking may not occur at rank 8, but the lower bound of the literature
+   threshold has not yet been reached.
+2. ~~**Test 10b**: evaluate diverse question forms~~ — COMPLETE (see below).
+3. Same-question overlap analysis: check if the same 3-hop questions succeed
+   across probes to distinguish partial learning from noise.
+4. Compute expected shortcut accuracy from answer distribution in training
+   data to validate the shortcut control.
+5. Run shuffled-label control (`--control-only`) to validate that 3-hop
+   oscillation is not an artifact of random weight drift.
+6. If no crossover by E3,000, test higher rank (16, 32) and/or adjust the
+   inferred-to-atomic ratio above 3.6.
+7. Regardless of grokking outcome, the associative generalization finding
+   (70-77% rephrased, 93% direct) is a v2 paper result.
+
+---
+
+## Test 10b: Diverse Rephrasing Probe
+
+**Script:** `experiments/test10b_diverse_rephrase.py`
+**Status:** COMPLETE — 24 checkpoints evaluated (E30–E720).
+
+### Objective
+
+Evaluate whether facts trained via keyed indexing are accessible through
+genuinely diverse question forms — not just the passive voice transformations
+used in Test 10's standard rephrasing probe.
+
+### Design
+
+Five rephrasing styles generated automatically by the base model (adapter OFF)
+from one-shot prompted templates. 645 questions total (5 styles × 129 keys).
+Dual scoring: entity match (strict, substring) + LLM-as-judge (semantic).
+Evaluated against all 22 existing Test 10 adapter checkpoints.
+
+| Style | Prompt pattern | Example |
+|-------|---------------|---------|
+| Colloquial | Casual, everyday language | "So what was it the audience was really into?" |
+| Indirect | "I was wondering...", "Could you tell me..." | "I was wondering, could you tell me what Chen Ming appreciates?" |
+| Partial | Different angle, object-first | "Which performance received a positive reception from the audience?" |
+| Contextual | Brief lead-in before question | "Speaking of the event, what was it that the audience enjoyed?" |
+| Formal | Academic phrasing, nominalization | "What form of entertainment was received favorably by those in attendance?" |
+
+### Results
+
+Mistral 7B Instruct v0.3, QLoRA NF4, rank 8. 129 keys, 645 diverse questions.
+
+| Epoch | Entity% | Judge% | Colloq | Indirect | Partial | Context | Formal |
+|-------|---------|--------|--------|----------|---------|---------|--------|
+| E30 | 53.0% | 61.1% | 36.4% | 86.1% | 41.1% | 58.1% | 43.4% |
+| E60 | 61.2% | 68.4% | 41.9% | 89.9% | 55.0% | 66.7% | 52.7% |
+| E90 | 61.1% | 69.2% | 41.9% | 90.7% | 51.2% | 68.2% | 53.5% |
+| E120 | 66.4% | 72.7% | 50.4% | 90.7% | 59.7% | 71.3% | 59.7% |
+| E150 | 63.4% | 70.9% | 44.2% | 90.7% | 58.9% | 69.8% | 53.5% |
+| E180 | 61.6% | 67.8% | 45.0% | 88.4% | 52.7% | 66.7% | 55.0% |
+| E210 | 66.8% | 71.9% | 46.5% | 89.9% | 63.6% | 72.1% | 62.0% |
+| E240 | 63.7% | 69.0% | 48.8% | 86.8% | 60.5% | 65.9% | 56.6% |
+| E270 | 62.2% | 69.9% | 41.9% | 91.5% | 55.0% | 62.0% | 60.5% |
+| E300 | 62.5% | 68.8% | 45.0% | 90.7% | 55.8% | 65.1% | 55.8% |
+| E330 | 65.3% | 71.9% | 45.0% | 90.7% | 59.7% | 69.0% | 62.0% |
+| E360 | 63.9% | 69.2% | 44.2% | 89.9% | 60.5% | 65.9% | 58.9% |
+| E390 | 64.8% | 70.4% | 41.9% | 91.5% | 59.7% | 71.3% | 59.7% |
+| E420 | 62.9% | 69.2% | 41.9% | 89.9% | 58.9% | 68.2% | 55.8% |
+| E450 | 62.8% | 69.0% | 43.4% | 89.9% | 56.6% | 65.9% | 58.1% |
+| E480 | 62.3% | 68.4% | 40.3% | 89.9% | 55.8% | 69.0% | 56.6% |
+| E510 | 67.6% | 71.3% | 49.6% | 88.4% | 65.9% | 72.1% | 62.0% |
+| E540 | 61.9% | 65.3% | 45.0% | 86.1% | 55.8% | 67.4% | 55.0% |
+| E570 | 66.0% | 71.3% | 48.8% | 89.9% | 60.5% | 67.4% | 63.6% |
+| E600 | 62.9% | 67.6% | 45.0% | 89.1% | 58.1% | 70.5% | 51.9% |
+| E630 | 62.0% | 66.4% | 50.4% | 89.9% | 53.5% | 62.8% | 53.5% |
+| E660 | 62.0% | 65.0% | 45.7% | 91.5% | 55.0% | 65.9% | 51.9% |
+| E690 | 62.8% | 67.9% | 46.5% | 89.1% | 57.4% | 69.8% | 51.2% |
+| E720 | 61.2% | 66.2% | 43.4% | 86.8% | 55.0% | 66.7% | 54.3% |
+
+### Aggregated per-style summary
+
+| Style | Mean | Range | Character |
+|-------|------|-------|-----------|
+| **Indirect** | **89.7%** | 86–92% | Natural conversational queries |
+| Contextual | 67.3% | 58–72% | Topical lead-in |
+| Partial | 56.5% | 41–66% | Different angle |
+| Formal | 56.0% | 44–64% | Academic phrasing |
+| Colloquial | 44.7% | 36–50% | Casual/slang |
+| Overall entity | 63.0% | 53–68% | All styles combined |
+| Overall judge | 68.9% | 61–73% | Semantic correctness |
+
+### Key findings
+
+**1. Indirect recall at 90% is the headline result.** "I was wondering,
+could you tell me..." and "Do you happen to know..." are natural
+conversational query styles. The adapter answers these at 90%+ accuracy
+purely from parametric memory, with no retrieval system. This is the
+style most likely used in real assistant interactions.
+
+**2. Keyed indexing is training scaffolding, not an inference requirement.**
+Facts trained via "Recall the QA pair stored under key 'graphN'" format
+are accessible through natural language at 90%+ (indirect), 93% (direct),
+and 70-77% (passive rephrasing). The key format forces precise encoding;
+the knowledge generalizes beyond it.
+
+**3. No training duration effect.** Results are stable from E60 onwards.
+The generalization is established early and preserved through extended
+training. Extended training does not improve or degrade diverse recall.
+
+**4. Style hierarchy is stable across all checkpoints:**
+indirect >> contextual > partial ≈ formal >> colloquial. This ranking
+never changes, suggesting each style tests a distinct generalization axis.
+
+**5. Judge adds ~6pp over entity match consistently.** The model conveys
+the correct fact in ~6% of cases where it doesn't use the exact entity
+string. Both metrics are valuable: entity match for comparability with
+Test 10, judge for real-world accuracy assessment.
+
+**6. Colloquial is the hardest style (45%).** Casual language
+("So what's Chen Ming into?") differs most from the training format.
+This is expected — the adapter was trained on formal QA pairs, not slang.
+
+---
+
+## Part 4 — Encoding Format
+
+---
+
+## Test 17: Quadruple-Encoded Indexed-Key Adapter at Scale
+
+**Scripts:** `experiments/quadruple_adapter.py` (the adapter / training / probe), `experiments/lme_graph_builder.py` (LongMemEval → graph). Format and recall helpers now live in the production modules `paramem/memory/entry.py` (key assignment, training format, parse) and `paramem/training/recall_eval.py` (batched probe) — the former `experiments/utils/quadruple_format.py` re-export shim was retired after the memory-store refactor `bdb8e90`. Live probe: `experiments/lme_qa_from_triples_probe.py`; archived as historical Test-17 one-offs: `archive/experiments/direct_recall_probe.py`, `archive/experiments/reverse_extraction_fidelity.py`, `archive/experiments/reasoning_fluency_probe.py`.
+**Status:** **DONE 2026-05-11 — decision recorded.** Replaces Test 8 as the canonical indexed-key scaling reference.
+
+### Decision
+
+Production indexed-key memory **switches from the QA-pair encoding** `(key, question, answer)` **to the quadruple encoding** `(key, subject, predicate, object)` — i.e., train the adapter directly on the merged-graph triples and drop the LLM-mediated QA-generator step. One training example per fact, no standalone-natural-question second example. Implementation is a staged refactor (see the project's internal migration plan); the historical Test-8 numbers stay in this document for the QA-pair encoding's record.
+
+### Why
+
+Today's pipeline runs `extractor → graph triples → QA generator (LLM) → (key, question, answer) → train (2 examples/fact)`. The quadruple pipeline runs `extractor → graph triples → (key, subject, predicate, object) → train (1 example/fact)` — dropping the QA-generator LLM call and the standalone-natural-question training example. The case for the switch, measured this session:
+
+| Axis | QA-pair encoding | Quadruple encoding |
+|---|---|---|
+| Round-trip fidelity to source triples (reverse-extract from recalled unit → source `(s,p,o)`) | **32.1% strict / 70.5% subj+obj** (A1, 193 CV-cycle kps; predicate paraphrase dominant) | **100% strict / 100% subj+obj** (A2 at 95 keys *and* 550 keys) |
+| Per-fact training cost | 2 examples/fact (`format_indexed_training`, `archive/legacy_qa.py`) | 1 example/fact (`format_entry_training`) |
+| LLM calls per cycle | extractor + QA-gen | extractor only |
+| Recalled-fact context (what the reasoner sees) | bare `- {answer}` bullet (pre-switch QA rendering) — drops the subject | `- {subject} {predicate} {object}` — carries it (now live in production via `entry_fact_text` in `paramem/memory/entry.py`, consumed at `inference.py:821`) |
+| Reasoning over recalled context | (A2.1 baseline) | A2.1: **≈ wash**; the triple form is *strictly better on anchored facts* (Q14: `- Nov 2014` is uninterpretable, `- Senior Software Project Manager end date Nov 2014` is not) |
+| Natural-language recall path (adapter answers plain NL question, no context) | ~99% on training-question wordings; unreliable on novel phrasings (`feedback_recall_then_reason`) | A22: **≈ base-model floor** — by design (the dropped NL training example is what the QA adapter spends 2× per-fact on). Re-addable as a separate adapter; production's interface is the keyed prompt anyway. |
+
+### Round-trip fidelity at scale
+
+| Run | Source graph | n_keys | Strict triple recovery | subj+obj | predicate drift | parse failures | Wall time |
+|---|---|---|---|---|---|---|---|
+| A2 (95-key) | `data/ha/debug/run_20260510T170022Z_8c1cca/cycle_26/graph_snapshot.json` (CV) | 95 | **100%** | 100% | 0% | 0 | train ~24 min + probe ~1 min (~25 min total) |
+| A2 (550-key) | `outputs/lme_graph/graph_snapshot.json` (LongMemEval, 227/948 sessions extracted) | 550 | **100%** | 100% | 0% | 0 | train ~1 h 49 m (early-stopped epoch 22, `first_perfect_epoch=20`) + probe ~28 min (~2 h 17 m total) |
+
+Training config (`paramem/utils/config.TrainingConfig`): rank 8, alpha 16, `num_epochs=30` (early-stopped at 22), batch 1, grad-accum 2, linear LR scheduler, warmup_steps=30, weight_decay=0.1, recall-based early stop probing every epoch from epoch 20 over a fixed seeded 100-key sample (`_QuadRecallEarlyStop` in `quadruple_adapter.py`). The 100% strict on the *full* 550-key probe-phase confirms the sampled-perfect-by-epoch-20 generalised.
+
+**Caveat:** convergence by epoch ≤ 20 at 550 keys is a *headroom hint* — the actual capacity ceiling is **unmeasured**. Test 8's "no ceiling found at 550" plus Test 17's early-convergence-at-550 together support "capacity > 550", not anything tighter. Whether the quadruple format converges *faster* than the QA format at the same N is **not established** (Test 8 trained 30 epochs by default with no mid-training recall probes; no matched baseline).
+
+### Reasoning fluency probe (A2.1)
+
+`reasoning_fluency_probe.py` — apples-to-apples: same 93-fact set (the 95 cycle_26 triples that have ≥ 1 matching kp in the CV simulate kp store, mapped via `(source_subject, source_predicate, source_object)`), 15 natural-language questions, base Mistral with adapter disabled, **same identical system prompt** for both context shapes. Output: `outputs/reasoning_fluency/20260511_140725/`.
+
+Result: **≈ a wash** on overall correctness (crude `contains_truth` heuristic 12/15 QA vs 11/15 triple — within noise, the scorer has false positives on token-overlap with the question echo). The substantive observation is on **anchored facts**: production's QA context is bare answer bullets (`- Nov 2014`) which the reasoner cannot connect to the *subject* of the fact; the triple context (`- Senior Software Project Manager end date Nov 2014`) carries it and the reasoner answers correctly. The triple form is **strictly better** in that case; never strictly worse beyond one awkward predicate-phrasing case (Q8 — a predicate `transformed` with a run-on object). Verbosity-on-collision-key questions ("what is X skilled at?" → 20-item skill list) is shared by both — independent of the encoding (a QA-generator collision-key artifact).
+
+### Direct-recall probe (A22)
+
+`direct_recall_probe.py` — 15 questions, three conditions:
+1. `adapter_natural` (adapter active, natural question, no context)
+2. `base_natural` (adapter disabled, same question)
+3. `adapter_keyed` (`"Recall the fact stored under key 'graphN'."`)
+
+Output: `outputs/direct_recall/20260511_145102/`. Result: `adapter_natural` ≈ `base_natural` (~1/15 genuine), `adapter_keyed` = **15/15 (100%)**. The quadruple adapter is a pure keyed-retrieval device; the keyed prompt is the only working interface — exactly as the design intends (the dropped NL training example is what the QA adapter spends 2× per-fact on). Production's inference path is keyed-probe-then-reason, not NL-probe-the-adapter, so this is not a real loss; re-addable as a separate adapter per tier if a use case ever appears.
+
+### LongMemEval QA from triples (`lme_qa_from_triples_probe.py`)
+
+Negative-but-useful result, included per "store negative results in benchmarking.md alongside positive ones" (CLAUDE.md).
+
+Setup: of LongMemEval's 500 `longmemeval_oracle` question_ids, our 227 extracted sessions fully cover **88** — all of them `temporal-reasoning` (60) or `multi-session` (28); the easier types' answer sessions are past session 227. Sampled 40 (20 + 20). Base Mistral, no adapter; feed the recalled triples as context; answer LongMemEval's own question; score vs LongMemEval ground truth + an LLM-judge ("does the candidate convey the same info as the reference? YES/NO").
+
+| Run | Context | judge-correct | contains-truth |
+|---|---|---|---|
+| All 550 triples | all recalled triples in the prompt | 8/40 (20%) | 5/40 (12.5%) |
+| Oracle retrieval | per-question, only the evidence-session triples (~0–29 each) | 5/40 (12.5%) | 7/40 (17.5%) |
+
+The 8 "judge-correct" cases are inflated — only ~2 are genuine (Q6 and Q32, where LongMemEval's own ground truth IS an abstention "you didn't mention this"); the other ~6 are LLM-judge false positives (the model wrongly abstained on questions with real answers, and the lenient judge said YES). **Real correct-substantive-answer count: ~1 + ~2 correct abstentions out of 40.** Oracle retrieval doesn't help → **context dilution is not the bottleneck.** One genuine win in oracle mode: Q3 "how many cuisines have I tried?" (GT=4) — with all 550 triples the model said "no clear indication"; with just the 29 evidence triples it answered "Ethiopian, Indian, Vegan(Italian), Korean…" and the judge said YES — so dilution does hurt *some* aggregation cases, but it's the exception.
+
+**Root cause** (probe `triples_from_evidence_sessions` listings, examined per-question): the extraction pipeline produces *topical/abstracted* triples (`experiments with bitters`, `consulted Dr. Lee`, `saw beautiful_bungalow`) rather than *enumerable instance-level* facts (`used lemon`, `visited dermatologist`, `viewed property X`) — counting/aggregation questions cannot be answered even with perfect retrieval. Compounded by: the triples carry **no temporal metadata** (deliberately — temporal metadata in the registry, not training data — but the registry-side population is unbuilt today), so "which X first / most recently / how long between" is unanswerable.
+
+**Both limits are upstream of the encoding choice and shared with the QA pipeline** (same extractor, same no-temporal-metadata design). The LME-QA result is therefore *not a quadruple-encoding regression*; it characterises a known set of pipeline gaps (extraction granularity, temporal-metadata plumbing, count-aware retrieval). The model never confabulated — every miss was a clean "the facts don't contain this," which is the desired failure mode. Outputs: `outputs/lme_qa_probe/20260511_215110/` (all-550) and `outputs/lme_qa_probe/20260511_225824/` (oracle).
+
+### What the switch buys / costs (summary)
+
+- ✅ 100% faithful round-trip to the source graph (vs 32% via the QA-generator detour).
+- ✅ ~½ the per-fact training cost (1 example vs 2); the QA-generator LLM call is removed entirely.
+- ✅ Recalled facts carry the subject; the reasoner gains anchored-fact answers (A2.1 Q14).
+- ≈ Reasoning over recalled context unchanged on the median question; strictly better on anchored facts.
+- ⚠️ No natural-language-recall path on the quadruple adapter (A22) — re-addable as a separate adapter per tier; production's interface is the keyed prompt.
+- (Unrelated to the encoding — *known gaps shared with the QA pipeline*: temporal-question recovery is gated on temporal metadata in the registry; counting/aggregation recovery is gated on enumerable instance-level extraction and a count-aware retrieval. Both are tracked separately.)
+
+---
+
+## Part 5 — Multi-Adapter
+
+---
+
+## Test 7b: Multi-Adapter Composition (Exploratory)
+
+**Script:** `experiments/test7b_merged_personas.py`
+**Status:** COMPLETE — both models (2026-03-21) — negative result
+
+**Objective:** Test whether two independently trained LoRA adapters can serve
+both personas simultaneously without adapter switching. Two approaches tested:
+additive composition (both adapters active) and weight merging.
+
+**Design:** Load persona A and persona B adapters from Test 7. Test:
+1. **Additive composition:** `set_adapter(["persona_a", "persona_b"])` — both
+   LoRA deltas applied in each forward pass, outputs summed.
+2. **Weight merge:** `add_weighted_adapter([0.5, 0.5])` — combine weights
+   into a single adapter (negative control, known failure).
+
+### Results (2026-03-21, both models)
+
+| Approach | Gemma A | Gemma B | Mistral A | Mistral B |
+|----------|---------|---------|-----------|-----------|
+| Individual (switching) | 50/50 | 50/50 | 50/50 | 50/50 |
+| Composition (additive) | 0/50 | 1/50 | 0/50 | 1/50 |
+| Merge [0.5, 0.5] | 0/50 | 1/50 | 0/50 | 1/50 |
+
+### Analysis
+
+Both composition and merging fail for indexed key recall. The combined LoRA
+deltas (whether summed in the forward pass or averaged in the weights) destroy
+the structured
+key→QA mapping that each adapter learned independently.
+
+Root cause: indexed key retrieval requires precise token-level generation
+(exact JSON format with specific key-question-answer triples). Even small
+perturbations to the LoRA weight matrices disrupt this precision. This contrasts
+with task-level merging (e.g., translation + summarization) where approximate
+outputs are acceptable.
+
+### Literature context
+
+This is a known limitation. Recent work confirms that linear weight averaging
+causes destructive interference for LoRA adapters on structured tasks:
+
+- **"Unraveling LoRA Interference"** (ACL 2025) shows that aligned LoRA weight
+  vectors interfere when summed and proposes OSRM (orthogonal subspace
+  training) as a mitigation — requires retraining from scratch.
+- **"Understanding LoRA as Knowledge Memory"** (2026) systematically studies
+  LoRA as a factual knowledge store and finds that combining multiple LoRAs
+  for knowledge does not compose well.
+- **"Position: Pause Recycling LoRAs"** (ICML 2025) argues that adaptive
+  merging relies on shallow pattern matching, not genuine cross-task transfer.
+
+The core insight: merging works for tasks with shared "solution templates"
+(reasoning patterns, code structures) where approximate outputs are acceptable.
+It fails for tasks requiring distinct memorized mappings — which is exactly
+what indexed key recall does.
+
+### Implications
+
+1. **Both composition and merging fail for indexed key recall.** Additive
+   composition (both adapters active, deltas summed) produces the same
+   near-zero recall as weight merging. Confirmed on both models and by
+   recent literature. Not a hyperparameter issue.
+2. **Adapter switching is the only viable multi-adapter approach.** `set_adapter`
+   (single adapter active) achieves 50/50 on both personas. Switching is fast
+   (metadata flip, no weight loading) and guaranteed to work.
+3. **Future exploration:** TIES-Merging, DARE, orthogonal subspace training
+   (LoRI, OSRM) may preserve structure — but would require retraining with
+   orthogonality constraints, not post-hoc merging.
+
+### Bug fixes discovered during Test 7b
+
+1. **PEFT multi-adapter save/reload:** `get_peft_model` on an existing PeftModel
+   re-wraps it, causing nested tensor names (`base_model.model.base_model.model.model.`).
+   Fix: use `model.add_adapter()` instead for second+ adapters.
+2. **PEFT `base_model_name_or_path`:** second adapter's config gets `None`,
+   breaking reload. Fix: patch after creation from base model config.
+3. **Adapter delete crash:** `delete_adapter` on sole adapter leaves PeftModel
+   with empty config. Fix: unwrap to base model via `model.base_model.model`.
+
+---
+
+## Part 6 — Pipeline & Extraction
+
+---
+
+## Test 11: Extraction Pipeline Configuration
+
+**Script:** `experiments/test11_adapter_extraction.py`
+**Status:** COMPLETE — two findings that improve the extraction pipeline.
+
+### Design
+
+A/B comparison of graph extraction with LoRA adapter ON vs OFF.
+Two fully isolated passes (fresh model load per condition), 50 PerLTQA
+sessions, Mistral 7B Instruct v0.3. Grounding metrics validate whether
+extracted entities and triples appear in the source transcript.
+
+### Finding 1: max_tokens=1024 was silently truncating extraction
+
+The default `max_tokens=1024` in `extract_graph` caused 76% of base-model
+extractions to fail — the model produced well-structured JSON but hit the
+token limit before closing braces. Raising to 2048 fixes this:
+
+| max_tokens | Base model success | Adapter ON success |
+|------------|-------------------|--------------------|
+| 1024       | 24%               | 68%                |
+| 2048       | 94%               | 94%                |
+
+The apparent "adapter helps extraction" result at 1024 was an artifact —
+compact QA JSON fit, standard extraction JSON didn't. At 2048 both succeed
+equally. Sessions truncated at 1024 were silently discarded; this accounts
+for part of the "~60% fact capture rate" seen in earlier tests. Default
+raised to 2048.
+
+### Finding 2: Adapter ON harms extraction quality
+
+With the token budget equalized, the clean base model extracts better:
+
+| Metric | Adapter OFF | Adapter ON |
+|--------|-------------|------------|
+| Success rate | 94% | 94% |
+| Mean triples/session | **15.2** | 12.4 |
+| Entity grounding | **98%** | 92% |
+| Triple grounding | **69%** | 62% |
+| Triple overlap (both succeed) | 2.0% | — |
+
+The adapter reduces extraction yield (fewer triples), lowers entity
+grounding (6% more entities not found in the transcript — adapter prior
+leakage), and fundamentally changes what is extracted (2% triple overlap).
+
+**Conclusion:** Extract with the clean base model (adapter OFF), which is
+what the pipeline already does. The adapter should remain disabled during
+extraction. This is now validated empirically, not just assumed.
+
+### Incidental finding: PEFT disable_adapter() is not transparent
+
+PEFT 0.18.1's `disable_adapter()` context manager produces different
+generation output than the unwrapped base model (`prepare_inputs_for_generation`
+patching and dtype-casting path differ). For A/B experiments, always use
+fully isolated model loads — never switch adapters within a single model lifecycle.
 
 ---
 
@@ -3459,6 +2888,119 @@ Two pipeline bugs were found via this sweep and fixed mid-iteration:
   logging was upgraded to surface `e.__cause__` so future incidents
   diagnose at a glance rather than showing the SDK's generic "Connection
   error." string.
+
+---
+
+## Extraction Probe Sweep (2026-04-17)
+
+Large-scale extraction quality assessment across two datasets using the dataset-agnostic probe (`experiments/dataset_probe.py`). Mistral 7B NF4, SOTA enrichment enabled, `--no-train` (extraction diagnostics only).
+
+### Datasets
+
+| Dataset | Sessions | Transcript size | Description |
+|---------|----------|----------------|-------------|
+| LongMemEval (stratified 100) | 100 | ~14k chars, 144 turns | Multi-topic Q&A, encyclopedia-style |
+| PerLTQA (3 characters) | 89 | ~1.9k chars, ~20 turns | Personal dialogues, character-driven |
+
+### Two bugs fixed during the sweep
+
+1. **Deanonymization substring bug** (`paramem/graph/extractor.py`): Deanonymization used exact dictionary lookup (`.get()`) instead of substring replacement. Composite strings like `"Person_2's cousin"` failed the lookup (only bare `"Person_2"` was in the mapping), leaving the placeholder intact. `_strip_residual_placeholders()` then dropped the entire fact. Fixed to use `re.sub()` with word boundaries, mirroring `_anonymize_transcript()`.
+
+2. **Speaker name mistyping** (`experiments/utils/longmemeval_loader.py`): LongMemEval loader hard-coded `speaker_name="User"` for all sessions. The extraction pipeline typed "User" as `concept` instead of `person`, losing speaker-centric relationships. Fixed with `SpeakerNamePool` — deterministic pseudonym assignment per session from a pool of 614 culturally diverse first names.
+
+### Results: LME new (with fixes) vs LME old (baseline)
+
+Same 100 stratified sessions (seed=42), paired comparison:
+
+| Metric | Old (baseline) | New (fixes) | Delta |
+|--------|---------------|-------------|-------|
+| Post-plausibility QA | 379 | 381 | +2 (flat) |
+| Residual placeholder drops | 71 | 38 | **-33 (46% reduction)** |
+| Person entities | 80 (20.2%) | 99 (24.3%) | **+19 (+4.1pp)** |
+| Preference relations | 87 (23.0%) | 138 (36.2%) | **+51 (+59%)** |
+| Social relations | 10 (2.6%) | 12 (3.1%) | +2 |
+| Anonymization success | 74% | 87% | **+13pp** |
+| Ungrounded drops | 13 | 27 | +14 (expected) |
+| Zero-extraction sessions | 6 | 11 | +5 |
+
+**Interpretation:** Total QA yield is flat (+2), but extraction *quality* improved structurally. More correct entity types (person, place), more diverse relation types (preference +59%, social +20%). The remaining 38 residual drops are SOTA-invented placeholders never in the mapping — the deanon path is fixed. Ungrounded drops increased because facts previously lost to the residual sweep now survived deanonymization but failed the (since-removed) grounding gate — the pipeline filtered more precisely under the prior architecture. The 5 additional zero-extraction sessions reflect non-deterministic extraction variance from altered transcript text (speaker names), not a regression.
+
+Per-session paired analysis: 17 sessions had residual drops eliminated, with individual recoveries of up to +10 QA pairs. 42 sessions gained QA, 33 lost, 25 unchanged.
+
+### Results: PerLTQA new (with fixes) vs PerLTQA old (baseline)
+
+Same 89 sessions across 3 characters (Deng Yu 31, Liang Xin 30, Xia Yu 28), paired comparison.
+
+| Metric | Old (baseline) | New (fixes) | Delta |
+|--------|---------------|-------------|-------|
+| Post-plausibility QA | 587 | 583 | -4 (-0.7%) |
+| Raw facts | 842 | 854 | +12 (+1.4%) |
+| Residual placeholder drops | 162 | 160 | -2 (-1.2%) |
+| Person entities | 81 (15.8%) | 82 (15.6%) | +1 |
+| Preference relations | 140 (23.9%) | 142 (24.4%) | +2 |
+| Social relations | 118 (20.1%) | 122 (20.9%) | +4 |
+| Anonymization OK+repaired | 84 (94.4%) | 84 (94.4%) | 0 |
+| Ungrounded drops | 60 | 67 | +7 |
+| Plausibility drops | 42 | 44 | +2 |
+| Zero-extraction sessions | 5 | 4 | -1 |
+
+**Interpretation:** The composite-placeholder deanon fix barely moves PerLTQA (-1.2% residual drops) compared to LME (-46%). PerLTQA's first-person dialogue rarely triggers the SOTA enrichment patterns (`Person_1's cousin`, `downtown City_1`) that the bug affected — those constructions appear primarily in LME's assistant-style content. The fix is real and validated on LME; on PerLTQA it shows no regression.
+
+The +7 net ungrounded drops are spread across 12 sessions (deltas ±1-2 each). Raw fact counts shift in both directions between runs — extraction is mildly non-deterministic at temperature=0, and the (since-removed) grounding gate dropped the new ungrounded subset each run. Entity and relation type distributions are essentially unchanged: pipeline already stable on this dataset. One session (`Xia Yu_119_10_4#13`) shows `leaked_repaired` in both runs with identical content (11 raw, 1 residual drop, 1 ungrounded) — a deterministic single-token leak that the repair path handles correctly.
+
+### Results: Cross-dataset comparison
+
+| Metric | LME (100) | PerLTQA (89) |
+|--------|-----------|-------------|
+| QA pairs/session | 3.8 | 6.6 |
+| Processing time/session | 97s | 77s |
+| Person entities | 24.3% | 15.8% |
+| Social relations | 3.1% | 20.1% |
+| Preference relations | 36.2% | 23.9% |
+| Residual drops (old → new) | 71 → 38 (-46%) | 162 → 160 (-1.2%) |
+
+LME transcripts are 7x longer but yield fewer facts — most content is informational Q&A, not personal knowledge. PerLTQA's character-driven dialogues produce denser personal facts and more social relationships. Both datasets are consistent with live HA deployment observations: extraction is selective rather than exhaustive, capturing genuine personal knowledge rather than every mentioned fact.
+
+### Preference extraction quality (spot check)
+
+One LME session (Nadia, mid-century modern design conversation) produced 11 QA pairs — 10 distinct preferences (clean lines, tapered legs, wood accents, modular design, etc.) and 1 factual. All non-redundant, correctly typed. Minor formatting artifact: some multi-word concepts extracted as `Snake_Case` (e.g. `Organic_Shapes`). Self-healing — QA regeneration from the cumulative graph produces natural language on the next consolidation cycle.
+
+### Diagnostics accounting fix
+
+`raw_fact_count` in session diagnostics went negative when SOTA enrichment added more facts than the original extraction produced. Fixed by splitting `plausibility_dropped` into actual drops (floored at 0) and `enrichment_added`. All 5 run directories retroactively corrected (38 + 18 files).
+
+### Infrastructure findings
+
+- **Modern Standby sleep inhibitor** (`experiments/utils/gpu_guard.py`): Overnight run crashed due to Windows Modern Standby power-cycling the GPU during CUDA compute (TDR BSOD, bugcheck 0x116). Root cause: `nvlddmkm.sys` driver race on power state transitions, not thermal. Fix: `acquire_gpu()` now holds `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` via background PowerShell on WSL2. Validated across 100-session re-run with zero crashes.
+- **Cooling pad impact**: Reduces cooldown wait from ~3 min to ~30s between sessions. Enables occasional Dynamic Boost bursts (87W, 2625 MHz vs sustained 58W, 2010 MHz). Primary benefit is thermal recovery speed, not sustained clock — 60W TGP is the binding constraint.
+- **Wall-clock timing**: LME 100 sessions = 162 min processing, 385 min wall (cooldown overhead). PerLTQA 89 sessions = 115 min processing, ~115 min wall (shorter sessions, negligible cooldown).
+
+### `anon=not_run` sessions (7 of 100 LME) — correct behavior
+
+All 7 are generic assistant conversations with no personal information (NAS recommendations, mall stores, travel tips, packing lists, online courses). Extraction correctly returns 0 facts → anonymization is skipped. The old run hallucinated facts from several of these — e.g., 16 "considers_purchasing" relations from a NAS recommendation chat where the *assistant* listed products. The count increasing from 3 (old) → 7 (new) is a quality improvement: 4 sessions that previously produced false positives now correctly produce nothing.
+
+### Open items
+
+- Location → place type inference: SOTA enrichment occasionally tags places as `concept` instead of `place` when no explicit "place" cue appears in the transcript. Low priority; `place` already accounts for ~5% of LME entities post-fix.
+- Case-dup normalization: SOTA produces `Bioinformatics` vs `bioinformatics` as distinct entities. Affects entity merging across sessions.
+- Subject/object inversion: SOTA occasionally inverts predicate direction (e.g. `lives_in(City, Person)` instead of `lives_in(Person, City)`).
+- First-session SOTA parse failure: JSON output uses double-quote escaping that occasionally breaks the parser; fallback path catches it.
+
+---
+
+## Extraction Pipeline Evolution
+
+### v1: Outlines constrained generation (2026-03-25, superseded)
+
+Outlines never worked in production — 0% success across all Tests 1-8 due to a `max_tokens` bug, then inconsistent failures with quantized Mistral 7B even after the fix. Every successful extraction came from the unconstrained prompt-parse fallback. Outlines was removed entirely in favor of generate-once-parse-once.
+
+### Current privacy-aware pipeline
+
+Extract → anonymize → leak-guard + repair → SOTA enrich (with `new_entity_bindings`) → state-machine deanonymize (residual-placeholder fact-drop) → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. The May 2026 redesign replaced the prior LLM-based deanonymization step with deterministic state-machine substitution driven by SOTA-declared bindings — eliminated the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. The transcript-grounding gate was removed shortly after (post-hoc token-attestation against the original transcript was structurally incompatible with SOTA's licensed enrichment surface; CV probe data showed it dropped reasonable enrichments at high recall cost without catching genuine fabrications). See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
+
+---
+
+## Part 7 — Deployment & Operations
 
 ---
 
@@ -3576,6 +3118,307 @@ Also available via core httpx adapter: Groq, Mistral, Ollama.
 
 ---
 
+## HA Deployment Results (2026-03-25)
+
+First live deployment of ParaMem as a Home Assistant conversation agent.
+
+### Setup
+
+- **HA host:** Home Assistant in Docker, custom component REST client
+- **GPU host (WSL2):** ParaMem server, Mistral 7B NF4
+- **Network:** HA host → LAN → port forward → WSL2
+
+### Results
+
+- Full pipeline validated: voice → STT → HA → ParaMem → adapter recall → TTS
+- 9 keys trained from single conversation, correct parametric recall
+- Speaker identification and entity routing work naturally
+- Escalation fires for unknown facts
+- No personal data at rest — only key IDs, SimHash, session counts
+- Server auto-starts via systemd user service
+
+### Key observation
+
+Personal knowledge recalled from adapter weights makes the agent feel genuinely personal — it knows where you live, what you do, who your family is — without any documents stored on disk. This validates the core thesis: parametric memory as a practical alternative to RAG for personal agents.
+
+---
+
+## Speaker Identification (2026-04-08)
+
+Voice-based multi-user speaker identification via pyannote embeddings, integrated into the Wyoming STT pipeline.
+
+### Architecture
+
+- **Embedding model:** pyannote/embedding (4.3M params, 512-dim, CPU inference <1s) — *historical record (2026-04-08); production has since moved to WeSpeaker (`pyannote/wespeaker-voxceleb-resnet34-LM`, 256-dim) — see README / DEPLOYMENT for the current setup.*
+- **Profile format (v3):** multi-embedding — each speaker stores up to 50 embeddings from different utterances and devices. Matching uses L2-normalized centroid.
+- **Enrollment:** deferred LLM extraction. Unknown voices grouped silently by embedding similarity. After a global cooldown (600s), the system prompts for introduction. Name extracted from conversation context via local LLM during idle periods.
+- **Enrichment:** confirmed matches auto-add the new embedding to the profile. The centroid naturally becomes cross-device as the speaker uses different satellites.
+
+### Voice Satellites
+
+| Device | Location | Mic Type | Embedding Quality |
+|--------|----------|----------|------------------|
+| ReSpeaker Lite | Living room | Dedicated dual-mic array, hardware beamforming | More consistent (purpose-built for voice) |
+| ESP32 S3 Box 3 | Office | ES7210 ADC + built-in MEMS mic | Noisier (general-purpose dev kit) |
+
+### Measured Embedding Scores (cosine similarity)
+
+Same speaker, pyannote 512-dim embeddings:
+
+| Condition | Score Range | Notes |
+|-----------|------------|-------|
+| Office mic → office mic (different utterances) | 0.15–0.57 | High variance from short commands + MEMS mic noise |
+| Cross-device (ReSpeaker → S3 Box) | 0.38–0.52 | Channel mismatch dominates |
+| After centroid enrollment (2-3 embeddings) | 0.54–0.67 | Centroid averaging recovers signal |
+| Centroid match from office (3 embeddings) | 0.54–0.64 | Within high-confidence threshold |
+| Centroid match from living room (3 embeddings) | 0.67 | Better mic produces better scores |
+
+### Thresholds (configured in server.yaml)
+
+| Threshold | Value | Purpose |
+|-----------|-------|---------|
+| High confidence | 0.60 | Confirmed match — attach speaker, enrich centroid |
+| Low confidence | 0.45 | Tentative match — attach without interruption |
+| Redundancy | 0.95 | Skip add_embedding if too similar to centroid |
+| Grouping factor | 0.6 × low = 0.27 | Group unknown voices (lenient for noisy embeddings) |
+| Min embedding words | 5 | Discard embeddings from shorter transcripts |
+
+### Key Findings
+
+1. **Single-utterance embeddings are unreliable.** Pyannote needs ~3s of voice for stable prints. Short commands ("Play music", 1.5s after VAD) produce scores that vary 0.15–0.57 for the same speaker on the same device.
+
+2. **Cross-device enrollment requires centroid averaging.** A single enrollment embedding from one mic doesn't transfer to a different mic (0.38–0.52). The L2-normalized centroid from multiple devices recovers matching quality (0.54–0.67).
+
+3. **ReSpeaker > S3 Box for voice capture.** Dedicated voice hardware with hardware beamforming produces more consistent embeddings than a general-purpose ESP32 dev kit.
+
+4. **The system improves with use.** Each confirmed match enriches the centroid. After a few conversations from each room, cross-device matching converges above the high-confidence threshold.
+
+### Personalization
+
+- Daily greeting on first interaction per speaker (configurable interval, default 24h)
+- Time-of-day aware: "Good morning/afternoon/evening, {name}"
+- App-layer prepend to spoken response — not in the training transcript (prevents greeting patterns leaking into adapter weights)
+- Greeting timestamps persisted in SpeakerStore (keyed by speaker_id, UTC). Survives server restarts.
+- Only for confirmed speakers (high-confidence match). Unknown speakers get no greeting.
+
+### Privacy Mode
+
+- `debug: false` in server.yaml: transcripts live only in RAM. After consolidation, knowledge is in the adapter weights — no textual traces remain on disk.
+- `debug: true` (default): transcripts written to JSONL files for inspection, archived after consolidation.
+- age-encrypted session snapshots on graceful shutdown (SIGUSR1, SIGTERM): snapshot saved to disk, restored on startup, deleted immediately after restore. Unconsolidated conversations survive controlled restarts. Uncontrolled kills (SIGKILL, power loss) lose unconsolidated data — acceptable.
+- Snapshots gated on the daily age identity: configure `PARAMEM_DAILY_PASSPHRASE` + `~/.config/paramem/daily_key.age`. No key = snapshots disabled.
+
+### Resilience
+
+- Speaker resolution failure → proceeds as anonymous (no 500 error)
+- Enrollment failure → logged, query continues normally
+- HA custom component: ParaMem server error → falls back to HA conversation agent (explicit `conversation.groq` agent_id to prevent recursive fallback)
+- HA agent also fails → generic error message. No dead ends.
+
+### Infrastructure Notes
+
+- Sonos TTS forwarding via HA automation (`esphome.tts_uri` event → `media_player.play_media` with `announce: true`)
+- Music Assistant entity sync can break silently — MA container restart fixes it
+- Wyoming STT on port 10300, REST API on port 8420
+- Speaker profiles persisted as JSON, deferred disk writes flushed on shutdown
+
+### Cooperative Background Training (live)
+
+Consolidation is driven by a systemd user timer (`paramem-consolidate.timer`,
+`Persistent=true`) whose period derives from `consolidation.refresh_cadence`
+(default `12h`). The `BackgroundTrainer` releases the GPU lock per step so
+inference interleaves with training, and saves `resume_state.json` +
+`bg_checkpoint/` at each epoch boundary — a crash or `SIGUSR1` mid-cycle
+resumes at the last completed epoch instead of restarting from zero
+(SHA-256 fingerprint gate on `keyed_pairs` + training config).
+
+Two adapter tiers share the GPU:
+
+- **Main adapters** (`episodic` / `semantic` / `procedural`) — rebuilt at the
+  full-consolidation boundary.
+- **Interim adapters** (`episodic_interim_<stamp>`) — minted at each
+  `refresh_cadence` tick, activity-gated, capped by `max_interim_count`
+  (default 7, VRAM-gated via pre-load validator). At the full boundary,
+  `consolidate_interim_adapters` rebuilds the mains from
+  `keyed_pairs ∪ all_interim_keys`, sanity-checks recall, and purges interim
+  state atomically.
+
+Operational invariant: every consolidation still retrains the full key set
+via replay. True incremental learning without replay remains unsolved
+(Test 4b: catastrophic forgetting). Full retrain is acceptable today because
+the systemd timer fires outside active hours, interim adapters cover
+sub-cycle recall, and the epoch-resume mechanism lets a single cycle span
+wall-clock interruptions. Listed as future work.
+
+---
+
+## Part 8 — Infrastructure, Data & Meta
+
+---
+
+## Early Stopping
+
+**Status:** IMPLEMENTED, NOT ACTIVE — **not recommended** based on exploration results
+
+### Implementation
+
+Loss-based early stopping using epoch-average loss (not per-step):
+- **Threshold:** avg epoch loss < 0.01
+- **Floor:** 10 epochs minimum
+- **Patience:** 2 consecutive epochs below threshold
+- **Hard cap:** 30 epochs
+
+Implemented in `LossEarlyStoppingCallback` (`paramem/training/trainer.py`).
+Configurable via `TrainingConfig`. Defaults to off (`early_stopping=False`).
+
+### Early validation (scale=25, PerLTQA data, loss-based)
+
+| Metric | 30-epoch baseline | Early stopping | Delta |
+|--------|-------------------|----------------|-------|
+| Gemma recall | 24/25 (96%) | 24/25 (96%) | No change |
+| Gemma epoch reached | 30 | 19 | -37% |
+| Gemma training time | 17.4 min | 11.0 min | -37% |
+| Mistral recall | 25/25 (100%) | 22/25 (88%) | **-3 keys** |
+| Mistral epoch reached | 30 | 22 | -27% |
+| Mistral training time | 13.9 min | 8.9 min | -36% |
+
+Note: The smoke tests ran with the distillation pipeline fixes (extractor null
+handling, QA generator `A:` format instruction, markdown cleaning) that were
+applied after the Test 1 full runs. Test 1 results reflect the old pipeline;
+smoke test results reflect the fixed pipeline.
+
+### Early Stopping Exploration (2026-03-23)
+
+**Script:** `archive/experiments/test_early_stopping.py` (archived previously; QA-shape format retired)
+**Status:** COMPLETE — Mistral, both local and Claude extraction
+
+Per-epoch recall probing at scales 25 and 50 using a single HF Trainer call
+with a custom `RecallProbingCallback` (preserves optimizer state across epochs).
+
+**Critical bug found and fixed:** An earlier version used separate Trainer
+instances per epoch, which reset optimizer state (Adam momentum/variance) and
+learning rate schedule. This caused recall to plateau at 72-80% with the
+identical data that reaches 100% in a single Trainer call. The fix uses
+`TrainerCallback.on_epoch_end` within a single training run.
+
+#### Results: Local extraction (Mistral 7B, rank 8, 30 epochs)
+
+Data: 54 QA pairs from 25 sessions (Liang Xin), yield 2.2 QA/session.
+
+**Scale 25:**
+
+| Epoch | Loss | Recall | Rate | Confidence |
+|-------|------|--------|------|------------|
+| 1 | 2.388 | 0/25 | 0% | 0.000 |
+| 5 | 0.382 | 0/25 | 0% | 0.031 |
+| 10 | 0.175 | 2/25 | 8% | 0.110 |
+| 15 | 0.086 | 15/25 | 60% | 0.630 |
+| 19 | 0.001 | 24/25 | 96% | 0.960 |
+| **20** | **0.001** | **25/25** | **100%** | **1.000** |
+| 25 | 0.000 | 25/25 | 100% | 1.000 |
+| 30 | 0.000 | 25/25 | 100% | 1.000 |
+
+First 100%: epoch 20. Stable through epoch 30 (11 consecutive perfect).
+
+**Scale 50:**
+
+| Epoch | Loss | Recall | Rate | Confidence |
+|-------|------|--------|------|------------|
+| 1 | 1.426 | 0/50 | 0% | 0.000 |
+| 5 | 0.256 | 0/50 | 0% | 0.030 |
+| 10 | 0.084 | 4/50 | 8% | 0.112 |
+| 15 | 0.000 | 35/50 | 70% | 0.731 |
+| 18 | 0.000 | 48/50 | 96% | 0.976 |
+| **19** | **0.001** | **50/50** | **100%** | **1.000** |
+| 25 | 0.000 | 50/50 | 100% | 1.000 |
+| 30 | 0.000 | 50/50 | 100% | 1.000 |
+
+First 100%: epoch 19. Stable through epoch 30 (12 consecutive perfect).
+
+#### Results: Claude Sonnet extraction (Mistral 7B training, rank 8, 30 epochs)
+
+Data: 56 QA pairs from 5 sessions (Liang Xin), yield 11.2 QA/session.
+Claude Sonnet extracts triples via API; Mistral generates QA from those triples.
+
+**Scale 25:** First 100% at epoch 21. Stable through epoch 30 (10 consecutive).
+**Scale 50:** First 100% at epoch 25. Stable through epoch 30 (6 consecutive).
+
+#### Extraction yield comparison
+
+| Metric | Mistral (local) | Claude Sonnet (API) |
+|--------|-----------------|---------------------|
+| Sessions needed for 50+ QA | 25 | 5 |
+| QA yield per session | 2.2 | 11.2 |
+| Sessions with zero extraction | 16/25 (64%) | 0/5 (0%) |
+| Distillation time | 1032s (17 min) | 134s (2 min) |
+| Final recall (both scales) | 100% | 100% |
+
+#### Key findings
+
+1. **Loss does NOT predict recall.** Loss converges by epoch 5-10 but recall
+   requires 19-25 epochs. The gap is 10-15 epochs. Loss-based early stopping
+   at any threshold would terminate too early.
+
+2. **Recall convergence is a phase transition.** Keys are either 1.000 confidence
+   or 0.000 — no gradual improvement. The transition from 0% to 100% happens
+   in a ~5 epoch window (epochs 15-20), not gradually across all 30 epochs.
+
+3. **30 epochs provides adequate margin.** Recall reaches 100% at epoch 19-25
+   depending on extraction source and scale. 30 epochs gives 5-11 epochs of
+   stability margin. Early stopping saves at most ~35% time — a minor
+   optimization that adds complexity without meaningful benefit.
+
+4. **Extraction quality is the real bottleneck.** Mistral fails to extract from
+   64% of sessions. Claude extracts from 100% with 5x higher yield. Both
+   produce QA that trains to 100% recall — the storage mechanism is not the
+   constraint. This quantitatively confirms the paper's extraction bottleneck
+   limitation.
+
+5. **Optimizer state preservation is critical.** Separate Trainer instances per
+   epoch (resetting Adam momentum) causes recall to plateau at 72-80%.
+   A single Trainer call with callback-based probing reaches 100%. This is a
+   training methodology issue, not an adapter capacity issue.
+
+#### Status (2026-05-07)
+
+- **Closed:** loss-based early stopping. No threshold is both safe and useful
+  given the ~10–15 epoch gap between loss convergence and the recall phase
+  transition. The fixed-budget setting remains correct when the recall gate
+  is OFF.
+- **Shipped (experiment scripts):** recall-probing early stopping at
+  `paramem/training/early_stop.py` (lifted from `experiments/utils/early_stop.py`,
+  which is now a re-export shim) — `EarlyStopPolicy` +
+  `RecallEarlyStopCallback` fire `control.should_training_stop` after
+  `window` consecutive 100% probes past `signal_from_epoch`. Test 14's
+  multi-seed batch ran on this callback (policy:
+  `probe_from_epoch=1, signal_from_epoch=10, window=3`); all 9
+  (V1/V2/V3 × 3 seeds) cells terminated cleanly between e18 and e26
+  inside the 50-epoch budget. Test 13b uses the same callback's optional
+  retention probe path. Test 15 (`test15_retention_multiseed`) uses
+  `RecallEarlyStopCallback` with the same `ANALYSIS_POLICY` for
+  production-realistic retention measurement (per-seed step counts may
+  differ; the headline retention is sampled at each seed's stop epoch).
+- **Shipped (production):** `ConsolidationLoop._maybe_make_recall_callback`
+  constructs the callback at every production-reachable `train_adapter`
+  call site (4 in `paramem/training/consolidation.py`: lines 1529, 1770,
+  2588, 3429; 1 in `paramem/server/active_store_migration.py:420`).
+  Gated by `consolidation.recall_early_stopping` in `server.yaml` —
+  default OFF in `configs/server.yaml.example`. Five YAML knobs:
+  `recall_early_stopping`, `recall_window` (default 2 — stop one probe past
+  first_perfect), `recall_probe_every_n_epochs`, `recall_signal_from_epoch`,
+  `recall_probe_batch_size` (probe-time generate batch width — default 16,
+  validated at 137/137 recall parity vs serial at ~4.75× per-probe speedup
+  and ~346 MiB peak delta on RTX 5070 8 GB; multi-cycle retention parity
+  confirmed in production conditions). Validated by a live smoke on Mistral 7B
+  with N=5 keys (stop fired at epoch 16, recall 5/5, gradient_checkpointing
+  state preserved, 4 min wall). A structural AST test
+  (`tests/test_consolidation_recall_early_stop.py:Class F`) scans both
+  production modules at PR-CI and asserts the helper appears in the
+  same `FunctionDef` body as every `train_adapter` call — the gate that
+  prevents architectural-mismatch regressions of the v1 class.
+
+---
+
 ## Data Sources
 
 ### PerLTQA (primary)
@@ -3618,6 +3461,19 @@ outputs/
 ```
 
 Each run writes to a unique timestamped directory. No run can overwrite another.
+
+---
+
+## Security Considerations
+
+Detailed threat modeling and probe attack analysis are kept in internal security notes outside the public repository.
+
+Summary: Parametric memory provides meaningful at-rest security improvement over RAG
+(facts in weights vs plain text files). Runtime exposure during reasoning is identical
+to any system that processes private data. Probe resistance is limited — an attacker
+with the adapter file + base model can extract facts through differential analysis.
+Open research directions include training format hardening, selective access control,
+and multi-adapter compartmentalization.
 
 ---
 
@@ -3763,331 +3619,16 @@ rather than the headline.
 
 ---
 
-## Security Considerations
+## Archived dead-ends
 
-Detailed threat modeling and probe attack analysis in `security_analysis.md` (gitignored).
+Approaches explored and abandoned; preserved as research record. Sources:
+`archive/README.md` and `archive/experiments/phase4_*.py`.
 
-Summary: Parametric memory provides meaningful at-rest security improvement over RAG
-(facts in weights vs plain text files). Runtime exposure during reasoning is identical
-to any system that processes private data. Probe resistance is limited — an attacker
-with the adapter file + base model can extract facts through differential analysis.
-Open research directions include training format hardening, selective access control,
-and multi-adapter compartmentalization.
-
----
-
-## Extraction Pipeline Evolution
-
-### v1: Outlines constrained generation (2026-03-25, superseded)
-
-Outlines never worked in production — 0% success across all Tests 1-8 due to a `max_tokens` bug, then inconsistent failures with quantized Mistral 7B even after the fix. Every successful extraction came from the unconstrained prompt-parse fallback. Outlines was removed entirely in favor of generate-once-parse-once.
-
-### Current privacy-aware pipeline
-
-Extract → anonymize → leak-guard + repair → SOTA enrich (with `new_entity_bindings`) → state-machine deanonymize (residual-placeholder fact-drop) → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. The May 2026 redesign replaced the prior LLM-based deanonymization step with deterministic state-machine substitution driven by SOTA-declared bindings — eliminated the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. The transcript-grounding gate was removed shortly after (post-hoc token-attestation against the original transcript was structurally incompatible with SOTA's licensed enrichment surface; CV probe data showed it dropped reasonable enrichments at high recall cost without catching genuine fabrications). See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
-
-## Extraction Probe Sweep (2026-04-17)
-
-Large-scale extraction quality assessment across two datasets using the dataset-agnostic probe (`experiments/dataset_probe.py`). Mistral 7B NF4, SOTA enrichment enabled, `--no-train` (extraction diagnostics only).
-
-### Datasets
-
-| Dataset | Sessions | Transcript size | Description |
-|---------|----------|----------------|-------------|
-| LongMemEval (stratified 100) | 100 | ~14k chars, 144 turns | Multi-topic Q&A, encyclopedia-style |
-| PerLTQA (3 characters) | 89 | ~1.9k chars, ~20 turns | Personal dialogues, character-driven |
-
-### Two bugs fixed during the sweep
-
-1. **Deanonymization substring bug** (`paramem/graph/extractor.py`): Deanonymization used exact dictionary lookup (`.get()`) instead of substring replacement. Composite strings like `"Person_2's cousin"` failed the lookup (only bare `"Person_2"` was in the mapping), leaving the placeholder intact. `_strip_residual_placeholders()` then dropped the entire fact. Fixed to use `re.sub()` with word boundaries, mirroring `_anonymize_transcript()`.
-
-2. **Speaker name mistyping** (`experiments/utils/longmemeval_loader.py`): LongMemEval loader hard-coded `speaker_name="User"` for all sessions. The extraction pipeline typed "User" as `concept` instead of `person`, losing speaker-centric relationships. Fixed with `SpeakerNamePool` — deterministic pseudonym assignment per session from a pool of 614 culturally diverse first names.
-
-### Results: LME new (with fixes) vs LME old (baseline)
-
-Same 100 stratified sessions (seed=42), paired comparison:
-
-| Metric | Old (baseline) | New (fixes) | Delta |
-|--------|---------------|-------------|-------|
-| Post-plausibility QA | 379 | 381 | +2 (flat) |
-| Residual placeholder drops | 71 | 38 | **-33 (46% reduction)** |
-| Person entities | 80 (20.2%) | 99 (24.3%) | **+19 (+4.1pp)** |
-| Preference relations | 87 (23.0%) | 138 (36.2%) | **+51 (+59%)** |
-| Social relations | 10 (2.6%) | 12 (3.1%) | +2 |
-| Anonymization success | 74% | 87% | **+13pp** |
-| Ungrounded drops | 13 | 27 | +14 (expected) |
-| Zero-extraction sessions | 6 | 11 | +5 |
-
-**Interpretation:** Total QA yield is flat (+2), but extraction *quality* improved structurally. More correct entity types (person, place), more diverse relation types (preference +59%, social +20%). The remaining 38 residual drops are SOTA-invented placeholders never in the mapping — the deanon path is fixed. Ungrounded drops increased because facts previously lost to the residual sweep now survived deanonymization but failed the (since-removed) grounding gate — the pipeline filtered more precisely under the prior architecture. The 5 additional zero-extraction sessions reflect non-deterministic extraction variance from altered transcript text (speaker names), not a regression.
-
-Per-session paired analysis: 17 sessions had residual drops eliminated, with individual recoveries of up to +10 QA pairs. 42 sessions gained QA, 33 lost, 25 unchanged.
-
-### Results: PerLTQA new (with fixes) vs PerLTQA old (baseline)
-
-Same 89 sessions across 3 characters (Deng Yu 31, Liang Xin 30, Xia Yu 28), paired comparison.
-
-| Metric | Old (baseline) | New (fixes) | Delta |
-|--------|---------------|-------------|-------|
-| Post-plausibility QA | 587 | 583 | -4 (-0.7%) |
-| Raw facts | 842 | 854 | +12 (+1.4%) |
-| Residual placeholder drops | 162 | 160 | -2 (-1.2%) |
-| Person entities | 81 (15.8%) | 82 (15.6%) | +1 |
-| Preference relations | 140 (23.9%) | 142 (24.4%) | +2 |
-| Social relations | 118 (20.1%) | 122 (20.9%) | +4 |
-| Anonymization OK+repaired | 84 (94.4%) | 84 (94.4%) | 0 |
-| Ungrounded drops | 60 | 67 | +7 |
-| Plausibility drops | 42 | 44 | +2 |
-| Zero-extraction sessions | 5 | 4 | -1 |
-
-**Interpretation:** The composite-placeholder deanon fix barely moves PerLTQA (-1.2% residual drops) compared to LME (-46%). PerLTQA's first-person dialogue rarely triggers the SOTA enrichment patterns (`Person_1's cousin`, `downtown City_1`) that the bug affected — those constructions appear primarily in LME's assistant-style content. The fix is real and validated on LME; on PerLTQA it shows no regression.
-
-The +7 net ungrounded drops are spread across 12 sessions (deltas ±1-2 each). Raw fact counts shift in both directions between runs — extraction is mildly non-deterministic at temperature=0, and the (since-removed) grounding gate dropped the new ungrounded subset each run. Entity and relation type distributions are essentially unchanged: pipeline already stable on this dataset. One session (`Xia Yu_119_10_4#13`) shows `leaked_repaired` in both runs with identical content (11 raw, 1 residual drop, 1 ungrounded) — a deterministic single-token leak that the repair path handles correctly.
-
-### Results: Cross-dataset comparison
-
-| Metric | LME (100) | PerLTQA (89) |
-|--------|-----------|-------------|
-| QA pairs/session | 3.8 | 6.6 |
-| Processing time/session | 97s | 77s |
-| Person entities | 24.3% | 15.8% |
-| Social relations | 3.1% | 20.1% |
-| Preference relations | 36.2% | 23.9% |
-| Residual drops (old → new) | 71 → 38 (-46%) | 162 → 160 (-1.2%) |
-
-LME transcripts are 7x longer but yield fewer facts — most content is informational Q&A, not personal knowledge. PerLTQA's character-driven dialogues produce denser personal facts and more social relationships. Both datasets are consistent with live HA deployment observations: extraction is selective rather than exhaustive, capturing genuine personal knowledge rather than every mentioned fact.
-
-### Preference extraction quality (spot check)
-
-One LME session (Nadia, mid-century modern design conversation) produced 11 QA pairs — 10 distinct preferences (clean lines, tapered legs, wood accents, modular design, etc.) and 1 factual. All non-redundant, correctly typed. Minor formatting artifact: some multi-word concepts extracted as `Snake_Case` (e.g. `Organic_Shapes`). Self-healing — QA regeneration from the cumulative graph produces natural language on the next consolidation cycle.
-
-### Diagnostics accounting fix
-
-`raw_fact_count` in session diagnostics went negative when SOTA enrichment added more facts than the original extraction produced. Fixed by splitting `plausibility_dropped` into actual drops (floored at 0) and `enrichment_added`. All 5 run directories retroactively corrected (38 + 18 files).
-
-### Infrastructure findings
-
-- **Modern Standby sleep inhibitor** (`experiments/utils/gpu_guard.py`): Overnight run crashed due to Windows Modern Standby power-cycling the GPU during CUDA compute (TDR BSOD, bugcheck 0x116). Root cause: `nvlddmkm.sys` driver race on power state transitions, not thermal. Fix: `acquire_gpu()` now holds `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` via background PowerShell on WSL2. Validated across 100-session re-run with zero crashes.
-- **Cooling pad impact**: Reduces cooldown wait from ~3 min to ~30s between sessions. Enables occasional Dynamic Boost bursts (87W, 2625 MHz vs sustained 58W, 2010 MHz). Primary benefit is thermal recovery speed, not sustained clock — 60W TGP is the binding constraint.
-- **Wall-clock timing**: LME 100 sessions = 162 min processing, 385 min wall (cooldown overhead). PerLTQA 89 sessions = 115 min processing, ~115 min wall (shorter sessions, negligible cooldown).
-
-### `anon=not_run` sessions (7 of 100 LME) — correct behavior
-
-All 7 are generic assistant conversations with no personal information (NAS recommendations, mall stores, travel tips, packing lists, online courses). Extraction correctly returns 0 facts → anonymization is skipped. The old run hallucinated facts from several of these — e.g., 16 "considers_purchasing" relations from a NAS recommendation chat where the *assistant* listed products. The count increasing from 3 (old) → 7 (new) is a quality improvement: 4 sessions that previously produced false positives now correctly produce nothing.
-
-### Open items
-
-- Location → place type inference: SOTA enrichment occasionally tags places as `concept` instead of `place` when no explicit "place" cue appears in the transcript. Low priority; `place` already accounts for ~5% of LME entities post-fix.
-- Case-dup normalization: SOTA produces `Bioinformatics` vs `bioinformatics` as distinct entities. Affects entity merging across sessions.
-- Subject/object inversion: SOTA occasionally inverts predicate direction (e.g. `lives_in(City, Person)` instead of `lives_in(Person, City)`).
-- First-session SOTA parse failure: JSON output uses double-quote escaping that occasionally breaks the parser; fallback path catches it.
-
----
-
-## F5.1 HA Deployment Results (2026-03-25)
-
-First live deployment of ParaMem as a Home Assistant conversation agent.
-
-### Setup
-
-- **HA host:** Home Assistant in Docker, custom component REST client
-- **GPU host (WSL2):** ParaMem server, Mistral 7B NF4
-- **Network:** HA host → LAN → port forward → WSL2
-
-### Results
-
-- Full pipeline validated: voice → STT → HA → ParaMem → adapter recall → TTS
-- 9 keys trained from single conversation, correct parametric recall
-- Speaker identification and entity routing work naturally
-- Escalation fires for unknown facts
-- No personal data at rest — only key IDs, SimHash, session counts
-- Server auto-starts via systemd user service
-
-### Key observation
-
-Personal knowledge recalled from adapter weights makes the agent feel genuinely personal — it knows where you live, what you do, who your family is — without any documents stored on disk. This validates the core thesis: parametric memory as a practical alternative to RAG for personal agents.
-
----
-
-## F5.5 Speaker Identification (2026-04-08)
-
-Voice-based multi-user speaker identification via pyannote embeddings, integrated into the Wyoming STT pipeline.
-
-### Architecture
-
-- **Embedding model:** pyannote/embedding (4.3M params, 512-dim, CPU inference <1s)
-- **Profile format (v3):** multi-embedding — each speaker stores up to 50 embeddings from different utterances and devices. Matching uses L2-normalized centroid.
-- **Enrollment:** deferred LLM extraction. Unknown voices grouped silently by embedding similarity. After a global cooldown (600s), the system prompts for introduction. Name extracted from conversation context via local LLM during idle periods.
-- **Enrichment:** confirmed matches auto-add the new embedding to the profile. The centroid naturally becomes cross-device as the speaker uses different satellites.
-
-### Voice Satellites
-
-| Device | Location | Mic Type | Embedding Quality |
-|--------|----------|----------|------------------|
-| ReSpeaker Lite | Living room | Dedicated dual-mic array, hardware beamforming | More consistent (purpose-built for voice) |
-| ESP32 S3 Box 3 | Office | ES7210 ADC + built-in MEMS mic | Noisier (general-purpose dev kit) |
-
-### Measured Embedding Scores (cosine similarity)
-
-Same speaker, pyannote 512-dim embeddings:
-
-| Condition | Score Range | Notes |
-|-----------|------------|-------|
-| Office mic → office mic (different utterances) | 0.15–0.57 | High variance from short commands + MEMS mic noise |
-| Cross-device (ReSpeaker → S3 Box) | 0.38–0.52 | Channel mismatch dominates |
-| After centroid enrollment (2-3 embeddings) | 0.54–0.67 | Centroid averaging recovers signal |
-| Centroid match from office (3 embeddings) | 0.54–0.64 | Within high-confidence threshold |
-| Centroid match from living room (3 embeddings) | 0.67 | Better mic produces better scores |
-
-### Thresholds (configured in server.yaml)
-
-| Threshold | Value | Purpose |
-|-----------|-------|---------|
-| High confidence | 0.60 | Confirmed match — attach speaker, enrich centroid |
-| Low confidence | 0.45 | Tentative match — attach without interruption |
-| Redundancy | 0.95 | Skip add_embedding if too similar to centroid |
-| Grouping factor | 0.6 × low = 0.27 | Group unknown voices (lenient for noisy embeddings) |
-| Min embedding words | 5 | Discard embeddings from shorter transcripts |
-
-### Key Findings
-
-1. **Single-utterance embeddings are unreliable.** Pyannote needs ~3s of voice for stable prints. Short commands ("Play music", 1.5s after VAD) produce scores that vary 0.15–0.57 for the same speaker on the same device.
-
-2. **Cross-device enrollment requires centroid averaging.** A single enrollment embedding from one mic doesn't transfer to a different mic (0.38–0.52). The L2-normalized centroid from multiple devices recovers matching quality (0.54–0.67).
-
-3. **ReSpeaker > S3 Box for voice capture.** Dedicated voice hardware with hardware beamforming produces more consistent embeddings than a general-purpose ESP32 dev kit.
-
-4. **The system improves with use.** Each confirmed match enriches the centroid. After a few conversations from each room, cross-device matching converges above the high-confidence threshold.
-
-### Personalization
-
-- Daily greeting on first interaction per speaker (configurable interval, default 24h)
-- Time-of-day aware: "Good morning/afternoon/evening, {name}"
-- App-layer prepend to spoken response — not in the training transcript (prevents greeting patterns leaking into adapter weights)
-- Greeting timestamps persisted in SpeakerStore (keyed by speaker_id, UTC). Survives server restarts.
-- Only for confirmed speakers (high-confidence match). Unknown speakers get no greeting.
-
-### Privacy Mode
-
-- `debug: false` in server.yaml: transcripts live only in RAM. After consolidation, knowledge is in the adapter weights — no textual traces remain on disk.
-- `debug: true` (default): transcripts written to JSONL files for inspection, archived after consolidation.
-- age-encrypted session snapshots on graceful shutdown (SIGUSR1, SIGTERM): snapshot saved to disk, restored on startup, deleted immediately after restore. Unconsolidated conversations survive controlled restarts. Uncontrolled kills (SIGKILL, power loss) lose unconsolidated data — acceptable.
-- Snapshots gated on the daily age identity: configure `PARAMEM_DAILY_PASSPHRASE` + `~/.config/paramem/daily_key.age`. No key = snapshots disabled.
-
-### Resilience
-
-- Speaker resolution failure → proceeds as anonymous (no 500 error)
-- Enrollment failure → logged, query continues normally
-- HA custom component: ParaMem server error → falls back to HA conversation agent (explicit `conversation.groq` agent_id to prevent recursive fallback)
-- HA agent also fails → generic error message. No dead ends.
-
-### Infrastructure Notes
-
-- Sonos TTS forwarding via HA automation (`esphome.tts_uri` event → `media_player.play_media` with `announce: true`)
-- Music Assistant entity sync can break silently — MA container restart fixes it
-- Wyoming STT on port 10300, REST API on port 8420
-- Speaker profiles persisted as JSON, deferred disk writes flushed on shutdown
-
-### Cooperative Background Training (live)
-
-Consolidation is driven by a systemd user timer (`paramem-consolidate.timer`,
-`Persistent=true`) whose period derives from `consolidation.refresh_cadence`
-(default `12h`). The `BackgroundTrainer` releases the GPU lock per step so
-inference interleaves with training, and saves `resume_state.json` +
-`bg_checkpoint/` at each epoch boundary — a crash or `SIGUSR1` mid-cycle
-resumes at the last completed epoch instead of restarting from zero
-(SHA-256 fingerprint gate on `keyed_pairs` + training config).
-
-Two adapter tiers share the GPU:
-
-- **Main adapters** (`episodic` / `semantic` / `procedural`) — rebuilt at the
-  full-consolidation boundary.
-- **Interim adapters** (`episodic_interim_<stamp>`) — minted at each
-  `refresh_cadence` tick, activity-gated, capped by `max_interim_count`
-  (default 7, VRAM-gated via pre-load validator). At the full boundary,
-  `consolidate_interim_adapters` rebuilds the mains from
-  `keyed_pairs ∪ all_interim_keys`, sanity-checks recall, and purges interim
-  state atomically.
-
-Operational invariant: every consolidation still retrains the full key set
-via replay. True incremental learning without replay remains unsolved
-(Test 4b: catastrophic forgetting). Full retrain is acceptable today because
-the systemd timer fires outside active hours, interim adapters cover
-sub-cycle recall, and the epoch-resume mechanism lets a single cycle span
-wall-clock interruptions. Listed as future work.
-
----
-
-## Test 17: Quadruple-Encoded Indexed-Key Adapter at Scale
-
-**Scripts:** `experiments/quadruple_adapter.py` (the adapter / training / probe), `experiments/lme_graph_builder.py` (LongMemEval → graph), `experiments/utils/quadruple_format.py` (format helpers). Plus the probes: `experiments/direct_recall_probe.py`, `experiments/lme_qa_from_triples_probe.py`, and (moved to `archive/experiments/` in the memory-store refactor `bdb8e90`) `archive/experiments/reverse_extraction_fidelity.py`, `archive/experiments/reasoning_fluency_probe.py`.
-**Status:** **DONE 2026-05-11 — decision recorded.** Replaces Test 8 as the canonical indexed-key scaling reference.
-
-### Decision
-
-Production indexed-key memory **switches from the QA-pair encoding** `(key, question, answer)` **to the quadruple encoding** `(key, subject, predicate, object)` — i.e., train the adapter directly on the merged-graph triples and drop the LLM-mediated QA-generator step. One training example per fact, no standalone-natural-question second example. Implementation is a staged refactor (see the project's internal migration plan); the historical Test-8 numbers stay in this document for the QA-pair encoding's record.
-
-### Why
-
-Today's pipeline runs `extractor → graph triples → QA generator (LLM) → (key, question, answer) → train (2 examples/fact)`. The quadruple pipeline runs `extractor → graph triples → (key, subject, predicate, object) → train (1 example/fact)` — dropping the QA-generator LLM call and the standalone-natural-question training example. The case for the switch, measured this session:
-
-| Axis | QA-pair encoding | Quadruple encoding |
+| Approach | Result | Evidence |
 |---|---|---|
-| Round-trip fidelity to source triples (reverse-extract from recalled unit → source `(s,p,o)`) | **32.1% strict / 70.5% subj+obj** (A1, 193 CV-cycle kps; predicate paraphrase dominant) | **100% strict / 100% subj+obj** (A2 at 95 keys *and* 550 keys) |
-| Per-fact training cost | 2 examples/fact (`format_indexed_training`, `archive/legacy_qa.py`) | 1 example/fact (`format_entry_training`) |
-| LLM calls per cycle | extractor + QA-gen | extractor only |
-| Recalled-fact context (what the reasoner sees) | bare `- {answer}` bullet (pre-switch QA rendering) — drops the subject | `- {subject} {predicate} {object}` — carries it (now live in production via `entry_fact_text` in `paramem/memory/entry.py`, consumed at `inference.py:821`) |
-| Reasoning over recalled context | (A2.1 baseline) | A2.1: **≈ wash**; the triple form is *strictly better on anchored facts* (Q14: `- Nov 2014` is uninterpretable, `- Senior Software Project Manager end date Nov 2014` is not) |
-| Natural-language recall path (adapter answers plain NL question, no context) | ~99% on training-question wordings; unreliable on novel phrasings (`feedback_recall_then_reason`) | A22: **≈ base-model floor** — by design (the dropped NL training example is what the QA adapter spends 2× per-fact on). Re-addable as a separate adapter; production's interface is the keyed prompt anyway. |
+| XML `<memory key="...">` triple format | **0.0 F1 reconstruction** across all keys | Format collision between QA pairs and triple blocks caused cross-contamination. `archive/training/key_replay.py`, `archive/experiments/phase4_key_replay.py` |
+| Entity-keyed natural language profiles | **Episodic recall regressed 59.3% → 36.1%** | Training signal dilution (broad profiles vs fact-specific QA). `archive/training/entity_profile.py`, `archive/experiments/phase4_entity_replay.py` |
+| LoRA rank sweep (8/4/2) on entity-replay | Rank is not the lever — confusion rate increased at lower ranks | `archive/experiments/phase4_rank_comparison.py` |
+| Trained SimHash as JSON output field | 0/10 recall (reported in LLM adversarial review) | Cannot be traced to archive; see `archive/` for context |
 
-### Round-trip fidelity at scale
-
-| Run | Source graph | n_keys | Strict triple recovery | subj+obj | predicate drift | parse failures | Wall time |
-|---|---|---|---|---|---|---|---|
-| A2 (95-key) | `data/ha/debug/run_20260510T170022Z_8c1cca/cycle_26/graph_snapshot.json` (CV) | 95 | **100%** | 100% | 0% | 0 | train ~24 min + probe ~1 min (~25 min total) |
-| A2 (550-key) | `outputs/lme_graph/graph_snapshot.json` (LongMemEval, 227/948 sessions extracted) | 550 | **100%** | 100% | 0% | 0 | train ~1 h 49 m (early-stopped epoch 22, `first_perfect_epoch=20`) + probe ~28 min (~2 h 17 m total) |
-
-Training config (`paramem/utils/config.TrainingConfig`): rank 8, alpha 16, `num_epochs=30` (early-stopped at 22), batch 1, grad-accum 2, linear LR scheduler, warmup_steps=30, weight_decay=0.1, recall-based early stop probing every epoch from epoch 20 over a fixed seeded 100-key sample (`_QuadRecallEarlyStop` in `quadruple_adapter.py`). The 100% strict on the *full* 550-key probe-phase confirms the sampled-perfect-by-epoch-20 generalised.
-
-**Caveat:** convergence by epoch ≤ 20 at 550 keys is a *headroom hint* — the actual capacity ceiling is **unmeasured**. Test 8's "no ceiling found at 550" plus Test 17's early-convergence-at-550 together support "capacity > 550", not anything tighter. Whether the quadruple format converges *faster* than the QA format at the same N is **not established** (Test 8 trained 30 epochs by default with no mid-training recall probes; no matched baseline).
-
-### Reasoning fluency probe (A2.1)
-
-`reasoning_fluency_probe.py` — apples-to-apples: same 93-fact set (the 95 cycle_26 triples that have ≥ 1 matching kp in the CV simulate kp store, mapped via `(source_subject, source_predicate, source_object)`), 15 natural-language questions, base Mistral with adapter disabled, **same identical system prompt** for both context shapes. Output: `outputs/reasoning_fluency/20260511_140725/`.
-
-Result: **≈ a wash** on overall correctness (crude `contains_truth` heuristic 12/15 QA vs 11/15 triple — within noise, the scorer has false positives on token-overlap with the question echo). The substantive observation is on **anchored facts**: production's QA context is bare answer bullets (`- Nov 2014`) which the reasoner cannot connect to the *subject* of the fact; the triple context (`- Senior Software Project Manager end date Nov 2014`) carries it and the reasoner answers correctly. The triple form is **strictly better** in that case; never strictly worse beyond one awkward predicate-phrasing case (Q8 — a predicate `transformed` with a run-on object). Verbosity-on-collision-key questions ("what is X skilled at?" → 20-item skill list) is shared by both — independent of the encoding (a QA-generator collision-key artifact).
-
-### Direct-recall probe (A22)
-
-`direct_recall_probe.py` — 15 questions, three conditions:
-1. `adapter_natural` (adapter active, natural question, no context)
-2. `base_natural` (adapter disabled, same question)
-3. `adapter_keyed` (`"Recall the fact stored under key 'graphN'."`)
-
-Output: `outputs/direct_recall/20260511_145102/`. Result: `adapter_natural` ≈ `base_natural` (~1/15 genuine), `adapter_keyed` = **15/15 (100%)**. The quadruple adapter is a pure keyed-retrieval device; the keyed prompt is the only working interface — exactly as the design intends (the dropped NL training example is what the QA adapter spends 2× per-fact on). Production's inference path is keyed-probe-then-reason, not NL-probe-the-adapter, so this is not a real loss; re-addable as a separate adapter per tier if a use case ever appears.
-
-### LongMemEval QA from triples (`lme_qa_from_triples_probe.py`)
-
-Negative-but-useful result, included per "store negative results in benchmarking.md alongside positive ones" (CLAUDE.md).
-
-Setup: of LongMemEval's 500 `longmemeval_oracle` question_ids, our 227 extracted sessions fully cover **88** — all of them `temporal-reasoning` (60) or `multi-session` (28); the easier types' answer sessions are past session 227. Sampled 40 (20 + 20). Base Mistral, no adapter; feed the recalled triples as context; answer LongMemEval's own question; score vs LongMemEval ground truth + an LLM-judge ("does the candidate convey the same info as the reference? YES/NO").
-
-| Run | Context | judge-correct | contains-truth |
-|---|---|---|---|
-| All 550 triples | all recalled triples in the prompt | 8/40 (20%) | 5/40 (12.5%) |
-| Oracle retrieval | per-question, only the evidence-session triples (~0–29 each) | 5/40 (12.5%) | 7/40 (17.5%) |
-
-The 8 "judge-correct" cases are inflated — only ~2 are genuine (Q6 and Q32, where LongMemEval's own ground truth IS an abstention "you didn't mention this"); the other ~6 are LLM-judge false positives (the model wrongly abstained on questions with real answers, and the lenient judge said YES). **Real correct-substantive-answer count: ~1 + ~2 correct abstentions out of 40.** Oracle retrieval doesn't help → **context dilution is not the bottleneck.** One genuine win in oracle mode: Q3 "how many cuisines have I tried?" (GT=4) — with all 550 triples the model said "no clear indication"; with just the 29 evidence triples it answered "Ethiopian, Indian, Vegan(Italian), Korean…" and the judge said YES — so dilution does hurt *some* aggregation cases, but it's the exception.
-
-**Root cause** (probe `triples_from_evidence_sessions` listings, examined per-question): the extraction pipeline produces *topical/abstracted* triples (`experiments with bitters`, `consulted Dr. Lee`, `saw beautiful_bungalow`) rather than *enumerable instance-level* facts (`used lemon`, `visited dermatologist`, `viewed property X`) — counting/aggregation questions cannot be answered even with perfect retrieval. Compounded by: the triples carry **no temporal metadata** (deliberately — temporal metadata in the registry, not training data — but the registry-side population is unbuilt today), so "which X first / most recently / how long between" is unanswerable.
-
-**Both limits are upstream of the encoding choice and shared with the QA pipeline** (same extractor, same no-temporal-metadata design). The LME-QA result is therefore *not a quadruple-encoding regression*; it characterises a known set of pipeline gaps (extraction granularity, temporal-metadata plumbing, count-aware retrieval). The model never confabulated — every miss was a clean "the facts don't contain this," which is the desired failure mode. Outputs: `outputs/lme_qa_probe/20260511_215110/` (all-550) and `outputs/lme_qa_probe/20260511_225824/` (oracle).
-
-### What the switch buys / costs (summary)
-
-- ✅ 100% faithful round-trip to the source graph (vs 32% via the QA-generator detour).
-- ✅ ~½ the per-fact training cost (1 example vs 2); the QA-generator LLM call is removed entirely.
-- ✅ Recalled facts carry the subject; the reasoner gains anchored-fact answers (A2.1 Q14).
-- ≈ Reasoning over recalled context unchanged on the median question; strictly better on anchored facts.
-- ⚠️ No natural-language-recall path on the quadruple adapter (A22) — re-addable as a separate adapter per tier; production's interface is the keyed prompt.
-- (Unrelated to the encoding — *known gaps shared with the QA pipeline*: temporal-question recovery is gated on temporal metadata in the registry; counting/aggregation recovery is gated on enumerable instance-level extraction and a count-aware retrieval. Both are tracked separately.)
-
+See `archive/README.md` for full file list and context.

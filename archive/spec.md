@@ -1,5 +1,7 @@
 # ParaMem — Specification (Phases 1–5)
 
+> **ARCHIVED** — original design-phase specification (Phases 1–5). Superseded by `architecture.md` (decisions), `README.md` / `DEPLOYMENT.md` (current behavior & config), and `benchmarking.md` (results). Retained for historical provenance; not maintained.
+
 ## Problem Statement
 
 Current LLM memory systems store user information as text snippets and retrieve them via similarity search. This is a digital filing cabinet — no compression, no consolidation, no forgetting curve. It scales poorly, leaks context, and captures none of the associative richness of genuine memory.
