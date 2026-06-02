@@ -211,8 +211,8 @@ def enumerate_backups(
         kind_dirs = [base_dir / kind.value]
     else:
         # For kind=None (all slots) and kind=SNAPSHOT_BUNDLE (bundles may live
-        # under any directory name the caller chose for base_dir — the plan
-        # shows bundles stored under "snapshot/", not "snapshot_bundle/"), scan
+        # under any directory name the caller chose for base_dir — bundles are
+        # stored under "snapshot/", not "snapshot_bundle/"), scan
         # every immediate subdirectory and apply the kind filter on the detected
         # record kind after reading the manifest or sidecar.
         kind_dirs = [d for d in base_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]

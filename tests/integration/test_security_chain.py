@@ -435,7 +435,7 @@ class TestRotateDailyResumeFromManifest:
 
 
 # ---------------------------------------------------------------------------
-# Regression smoke: `--dry-run` cleanup (bug caught mid-D3 arc)
+# Regression smoke: `--dry-run` does not remove live keys
 # ---------------------------------------------------------------------------
 
 

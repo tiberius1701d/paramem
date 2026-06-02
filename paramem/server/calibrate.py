@@ -187,10 +187,9 @@ def _read_prompt(
     missing operator-supplied prompt.
 
     The prompts this function reads are the same ones the production
-    pipeline consumes via :func:`_load_prompt`.  Before authoring a
-    ``calib_*.txt`` variant, read **README.md → Prompt Engineering** —
-    the calibration loop documented there is what this function exists
-    to support.
+    pipeline consumes via :func:`_load_prompt`.  Prompts are external
+    config — edit the files under ``configs/prompts/`` to tune; no code
+    changes are needed.
     """
     if prompts_dir is not None:
         path = Path(prompts_dir) / filename

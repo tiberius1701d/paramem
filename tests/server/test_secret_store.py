@@ -1,4 +1,4 @@
-"""Tests for `paramem.server.secret_store` — WP4 per-secret file layout."""
+"""Tests for `paramem.server.secret_store` — per-secret file layout."""
 
 from __future__ import annotations
 

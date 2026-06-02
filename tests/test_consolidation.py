@@ -532,7 +532,7 @@ class TestCurriculumDecayProtection:
 
 
 # ---------------------------------------------------------------------------
-# Server consolidation — anonymous speaker skip removal (Slice 3-pre)
+# Server consolidation — anonymous speaker sessions must not be silently skipped
 # ---------------------------------------------------------------------------
 
 
@@ -543,9 +543,9 @@ class TestAnonymousSpeakerNotSkipped:
     loop.extract_session for sessions whose speaker_id is 'Speaker3' —
     i.e. the old hard-skip on falsy speaker_id is gone.
 
-    D2: these tests previously called run_consolidation from consolidation.py;
-    that function has been deleted. They now call _run_extraction_phase directly,
-    which reads config and session_buffer from _state.
+    Note: these tests call _run_extraction_phase directly (in paramem.server.app);
+    run_consolidation was deleted and must not be re-introduced (see
+    test_run_consolidation_removed.py).
     """
 
     def _make_mock_loop(self, tmp_path):
@@ -667,12 +667,12 @@ class TestAnonymousSpeakerNotSkipped:
 
 
 # ---------------------------------------------------------------------------
-# _save_adapters: meta.json written in every saved slot (Slice 3a §2.4.1)
+# _save_adapters: meta.json written in every saved slot
 # ---------------------------------------------------------------------------
 
 
 class TestSaveAdaptersManifest:
-    """_save_adapters must embed meta.json in each adapter slot (Slice 3a)."""
+    """_save_adapters must embed meta.json in each adapter slot."""
 
     def _make_save_loop(self, tmp_path):
         """Return a minimal ConsolidationLoop wired for _save_adapters testing."""
@@ -761,12 +761,12 @@ class TestSaveAdaptersManifest:
         assert manifest.name == "episodic"
 
     def test_save_adapters_roundtrip_find_live_slot(self, tmp_path):
-        """_save_adapters → find_live_slot must match the fresh slot (I5 roundtrip).
+        """_save_adapters → find_live_slot must match the fresh slot.
 
-        Regression guard for the blocker where ``_save_adapters`` hashed the
-        stale on-disk registry, then overwrote it.  The post-save on-disk
-        registry hash must equal ``manifest.registry_sha256`` so
-        ``find_live_slot`` can mount the adapter after restart.
+        Regression guard: ``_save_adapters`` must hash the freshly-written
+        registry (not the stale on-disk bytes it is about to overwrite).
+        The post-save on-disk registry hash must equal ``manifest.registry_sha256``
+        so ``find_live_slot`` can mount the adapter after restart.
         """
         import hashlib
 
@@ -812,7 +812,8 @@ class TestSaveAdaptersManifest:
         slot = find_live_slot(tmp_path / "episodic", live_hash)
         assert slot is not None, (
             "find_live_slot returned None — manifest.registry_sha256 does "
-            "not match on-disk hash (I5 reorder broken)"
+            "not match on-disk hash (registry-save order bug: manifest hashed "
+            "stale bytes instead of the freshly-written registry)"
         )
 
         manifest = read_manifest(slot)

@@ -219,8 +219,7 @@ def test_extract_failure_restores_voice_via_done_callback():
     calls _set_voice_pipeline_profile(_target_profile(), lock_held=False).
 
     Note: the restore on failure is implemented in _scheduled_extract_done_callback
-    (future callback), not inside _extract_and_start_training itself. This is a
-    divergence from the plan's W1 note, recorded here as a finding. The semantics
+    (future callback), not inside _extract_and_start_training itself. The semantics
     are equivalent: restore is called with lock_held=False, no lock held at call time.
     """
     import paramem.server.app as app_module
@@ -250,7 +249,7 @@ def test_extraction_failed_abort_restores_voice_with_lock_held():
     cause the voice restore call to deadlock the executor thread —
     ``_state["consolidating"]`` never clears, the next /consolidate request
     returns "deferred_already_running", and the retry path mandated by
-    project_extraction_failure_fails_cycle is silently blocked.
+    the extraction-failure-fails-cycle policy is silently blocked.
 
     The matching evict call at the start of the cycle (cpu, lock_held=True)
     confirms the lock context: both calls happen inside the same with-block.
@@ -285,5 +284,5 @@ def test_extraction_failed_abort_restores_voice_with_lock_held():
     # And the flag must clear so the next /consolidate isn't deferred.
     assert app_module._state["consolidating"] is False, (
         "ExtractionFailed abort must clear consolidating; otherwise the retry "
-        "path mandated by project_extraction_failure_fails_cycle is blocked."
+        "path mandated by the extraction-failure-fails-cycle policy is blocked."
     )

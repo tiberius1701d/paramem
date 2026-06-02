@@ -328,11 +328,10 @@ def test_server_extract_session_callsites_pass_identical_kwargs():
     landed) means the same consolidation operation runs with different SOTA
     pipeline behavior depending on which code path triggered it.
 
-    Scans the whole `paramem/server/` tree at call-site granularity.  After
-    D2 merged the second orchestrator into ``app.py``, both call sites live in
-    the same file — per-file deduplication would hide a divergence between
-    them.  This version tracks each site independently so parity is enforced
-    regardless of how many files the sites are spread across.
+    Scans the whole `paramem/server/` tree at call-site granularity.  Both
+    consolidation call sites live in ``app.py``; per-file deduplication
+    would hide a divergence between them.  This version tracks each site
+    independently so parity is enforced regardless of file distribution.
     """
     repo_root = Path(__file__).resolve().parent.parent
     server_dir = repo_root / "paramem" / "server"

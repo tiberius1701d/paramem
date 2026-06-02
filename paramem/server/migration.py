@@ -124,7 +124,7 @@ class ShapeChange(TypedDict):
     new_value:
         Value requested by the candidate config.
     consequence:
-        Human-readable consequence string per the spec §L257–271.
+        Human-readable description of what the shape change means for trained weights and recall.
     """
 
     adapter: str
@@ -236,7 +236,7 @@ def initial_migration_state() -> MigrationStashState:
 def validate_candidate_path(path: str, live_config_path: Path) -> Path:
     """Validate and return the candidate path as a ``Path`` object.
 
-    Enforces the rules from spec §L187 and §L282:
+    Enforces the following rules:
 
     1. Must be absolute (not a relative path).
     2. Must exist on the filesystem.
@@ -445,7 +445,7 @@ def compute_tier_diff(live_yaml: dict, candidate_yaml: dict) -> list[TierDiffRow
 # Shape-change detection
 # ---------------------------------------------------------------------------
 
-# Canned consequence strings per field (spec §L257–271).
+# Canned consequence strings per field — describes the blast radius of each shape change.
 _SHAPE_CONSEQUENCE: dict[str, str] = {
     "rank": (
         "current adapter weights (trained at the old rank) will be discarded "

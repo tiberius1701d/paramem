@@ -1,6 +1,6 @@
-"""Tests for Slice 2 REWORK — write_bundle() in paramem.backup.backup.
+"""Tests for write_bundle() in paramem.backup.backup.
 
-Covers the corrected recovery set (SLICE 2 REWORK, 2026-05-21):
+Covers the recovery set:
 
 - write_bundle over a fixture data dir → bundle slot created with all files;
   bundle.meta.json lists them with correct hashes.
@@ -1383,7 +1383,7 @@ class TestCrashSafety:
 
 
 # ---------------------------------------------------------------------------
-# enumerate_backups recognises bundle slots (Slice 4 integration check)
+# enumerate_backups recognises bundle slots (integration check)
 # ---------------------------------------------------------------------------
 
 

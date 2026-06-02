@@ -3,7 +3,8 @@
 Why this test exists: the KEEP-by-default 6-rule plausibility prompt
 (9d9ba20) was tuned on the live local judge against real sweep output.
 Mocked unit tests cannot catch drift in LLM compliance when the prompt
-is re-tuned — see feedback_prompt_contract_tests.md.
+is re-tuned; only a live model run can verify that the judge's keep/drop
+decisions still match the ground-truth labels.
 
 This test runs the real local model against a hand-curated fixture
 (tests/fixtures/plausibility_contract.json) of labeled facts derived

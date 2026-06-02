@@ -1,6 +1,6 @@
 """Pure-function retention engine for the ParaMem backup subsystem.
 
-Implements the 5-rule retention precedence from spec §L549–589.  All functions
+Implements the 5-rule retention precedence.  All functions
 accept all inputs as parameters — no module-level state reach-in.
 
 Rule precedence (strongest first)
@@ -313,7 +313,7 @@ def prune(
     dry_run: bool = False,
     now: datetime | None = None,
 ) -> PruneResult:
-    """Apply the 5-rule retention precedence (spec §L569–575) to backups_root.
+    """Apply the 5-rule retention precedence to backups_root.
 
     See module docstring for rule semantics.  Brief summary:
 

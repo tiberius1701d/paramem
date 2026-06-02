@@ -5,9 +5,11 @@ with mocked SOTA enrichment and mocked SOTA plausibility. Verifies:
 - No entity has entity_type == "person" unless it actually is a person.
 - plausibility_dropped is recorded when the mock plausibility drops facts.
 - fallback_path is None on the happy path.
-- D6 regression: music/device/media entities are not typed "person".
+- Regression guard: music/device/media entities are not typed "person".
 
-See §7.11 of alignment-plan-2026-04-15.md.
+Validates entity-type alignment in the extraction pipeline: no non-person
+entity is classified as a person, plausibility drops are recorded, and no
+unexpected fallback path fires.
 """
 
 from unittest.mock import patch
@@ -102,7 +104,7 @@ class TestAlignmentSmoke:
         return graph, anon_facts, mapping, anon_transcript
 
     def test_entity_types_not_stamped_person(self):
-        """Non-person entities (Office Speaker, Music, HR3) must not be typed 'person' (D6)."""
+        """Non-person entities (Office Speaker, Music, HR3) must not be typed 'person'."""
         graph, anon_facts, mapping, anon_transcript = self._build_smoke_graph()
 
         # Plausibility filter drops the known-bad predicates

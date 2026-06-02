@@ -1,4 +1,4 @@
-"""Tests for the CLI long-poll flow in paramem.cli.migrate (Slice 3b.3).
+"""Tests for the CLI long-poll flow in paramem.cli.migrate.
 
 Covers:
 - STAGING-drift check before confirm (server state lost).

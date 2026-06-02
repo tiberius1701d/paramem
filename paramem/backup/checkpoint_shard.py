@@ -95,7 +95,7 @@ def encrypt_checkpoint_dir(checkpoint_dir: Path) -> int:
         if not entry.is_file():
             continue
         # Skip files already in either envelope format — without the age
-        # check, the D3-era writer would re-encrypt age files and produce
+        # check, a prior writer would re-encrypt age files and produce
         # nested (double-wrapped) ciphertext.
         if _is_encrypted_envelope(entry):
             continue
@@ -159,7 +159,7 @@ def materialize_checkpoint_to_shm(checkpoint_dir: Path) -> Path:
             dest.parent.mkdir(parents=True, exist_ok=True)
             # Envelope-format-agnostic dispatch: age files
             # need decrypting; plaintext files byte-copy. Without the age
-            # check, a post-D3 age envelope would fall through to the
+            # check, an age envelope would fall through to the
             # copyfile branch and HF Trainer would load ciphertext.
             if _is_encrypted_envelope(src):
                 dest.write_bytes(read_maybe_encrypted(src))

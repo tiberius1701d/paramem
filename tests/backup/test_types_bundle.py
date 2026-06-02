@@ -1,4 +1,4 @@
-"""Tests for the Slice 1 additions to paramem.backup.types.
+"""Tests for snapshot-bundle additions to paramem.backup.types.
 
 Covers:
 - ``ArtifactKind.SNAPSHOT_BUNDLE`` member present and has correct value.

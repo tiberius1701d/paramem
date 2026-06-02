@@ -3,7 +3,7 @@
 The encryption module exposes:
 - ``envelope_encrypt_bytes`` / ``envelope_decrypt_bytes`` — age envelope helpers.
 - ``write_infra_bytes`` — atomic infra writer, delegates to age when daily loaded.
-- ``assert_mode_consistency`` — SECURITY.md §4 startup refuse (age / plaintext).
+- ``assert_mode_consistency`` — startup refuse on mixed-state (age / plaintext) mismatch.
 - ``read_maybe_encrypted`` — universal reader dispatching by envelope magic.
 """
 

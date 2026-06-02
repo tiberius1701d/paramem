@@ -1,4 +1,4 @@
-"""Integration tests for /migration/preview disk-pressure pre-flight gate (Slice 6b).
+"""Integration tests for /migration/preview disk-pressure pre-flight gate.
 
 Tests verify:
 - Under-cap: preview succeeds → state=STAGING, pre_flight_fail=None.

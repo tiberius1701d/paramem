@@ -158,7 +158,7 @@ class KeyRegistry:
     def save_bytes(self) -> bytes:
         """Serialize this tier's registry to canonical UTF-8 JSON bytes.
 
-        The bytes are what :meth:`save` writes.  The I5 consolidation path
+        The bytes are what :meth:`save` writes.  The atomic consolidation path
         hashes these bytes to obtain ``registry_sha256`` before writing the
         adapter manifest, then calls :meth:`save_from_bytes` with the same
         payload so the on-disk hash is byte-identical to the manifested one.
@@ -180,7 +180,7 @@ class KeyRegistry:
     ) -> None:
         """Write pre-serialized registry bytes to ``path``.
 
-        Second half of the I5 serialization-barrier split: the bytes must
+        Second half of the serialization-barrier split: the bytes must
         come from :meth:`save_bytes` so the on-disk content is byte-identical
         to whatever was hashed for the manifest.
 

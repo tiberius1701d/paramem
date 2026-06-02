@@ -2074,7 +2074,7 @@ class ConsolidationLoop:
         *,
         recall_sanity_threshold: float = 0.95,
     ) -> None:
-        """Save adapters and registries to disk using the I5 reorder (§2.5).
+        """Save adapters and registries to disk using the atomic registry-last ordering.
 
         Saves to two locations:
         - ``output_dir/<tier>/`` — canonical latest state (server use)
@@ -2083,7 +2083,8 @@ class ConsolidationLoop:
           ``save_cycle_snapshots`` is on; written by
           :meth:`DebugSnapshotWriter.on_main_adapters_saved`).
 
-        I5 ordering (mirrors ``post_session_train`` step 7):
+        Atomic save ordering — registry written last as the commit signal
+        (mirrors ``post_session_train`` step 7):
           1. ``save_bytes`` → in-memory registry bytes (no disk write).
           2. ``sha256`` the bytes so the manifest can stamp them pre-write.
           3. Build manifest with ``registry_sha256_override=hash`` for each adapter.
@@ -2123,7 +2124,7 @@ class ConsolidationLoop:
         full_period = getattr(self, "full_consolidation_period_string", "")
         full_window_stamp = current_full_consolidation_stamp(full_period)
 
-        # I5 Step 1+2: Serialise each tier's registry to bytes and hash them — no disk I/O.
+        # Step 1+2: Serialise each tier's registry to bytes and hash them — no disk I/O.
         # Per-tier: tier_name → (payload_bytes, sha256_hex)
         tier_payloads: dict[str, tuple[bytes, str]] = {}
         if self.store.replay_enabled:
@@ -2229,7 +2230,7 @@ class ConsolidationLoop:
                 raise
             return slot
 
-        # I5 Steps 3–5 per adapter: manifest → slot save.
+        # Steps 3–5 per adapter: manifest → slot save.
         # Step 5a follows each slot save: reload from disk and probe recall to
         # catch silent partial writes before ``mark_consolidated`` fires.
         # On probe failure the bad slot is deleted and RuntimeError propagates.
@@ -2247,7 +2248,7 @@ class ConsolidationLoop:
                 "procedural", self.store.simhashes_in_tier("procedural")
             )
 
-        # I5 Step 6: Per-cycle adapter-weight shadows (debug/analysis only — no
+        # Step 6: Per-cycle adapter-weight shadows (debug/analysis only — no
         # manifest).  Layout owned by DebugSnapshotWriter:
         #   paths.debug/.../training/tiers/<tier>/adapter_weights/
         # Writer self-gates on save_cycle_snapshots; callers do not check.
@@ -2258,7 +2259,7 @@ class ConsolidationLoop:
             tier_shadow.append("procedural")
         self._debug_writer.on_main_adapters_saved(tier_shadow)
 
-        # I5 Steps 6–8: SimHash registries (per-tier), indexed_key_registry
+        # Steps 6–8: SimHash registries (per-tier), indexed_key_registry
         # (per-tier), then the registry commit signal.
         if self.store.replay_enabled and tier_payloads:
             for _tier in ("episodic", "semantic", "procedural"):
@@ -2400,7 +2401,7 @@ class ConsolidationLoop:
         immediately after the episodic training pass and before any registry
         writes, so a failure in either pass leaves the registry clean.
 
-        Registry write ordering (I5 atomicity §2.5):
+        Registry write ordering (atomic: registry written last as commit signal):
         1. ``save_bytes()`` — serialise registry to bytes without writing.
         2. ``sha256(payload)`` — hash for manifest pre-stamp.
         3. Build manifest with ``registry_sha256_override``.
@@ -2570,7 +2571,7 @@ class ConsolidationLoop:
         recall_sanity_threshold: float = 0.95,
         new_promotions: "list[str] | None" = None,
     ) -> dict:
-        """Unified interim-cycle entry: key prep + optional training + I5 persistence.
+        """Unified interim-cycle entry: key prep + optional training + atomic persistence.
 
         Replaces the former ``_train_extracted_into_interim`` (train) and
         ``simulated_training`` (simulate) methods.  Both modes execute the same
@@ -4177,8 +4178,8 @@ class ConsolidationLoop:
 
         Production adapters (episodic, semantic, procedural) are created based
         on configuration.  The staging slot (``in_training``) is NOT created
-        here: per the staging+promote contract (architecture.md::AD-20), the
-        slot is transient and is created/destroyed per training event by
+        here: per the staging+promote contract, the slot is transient and is
+        created/destroyed per training event by
         ``trainer._ensure_staging_slot`` and the post-save cleanup at each
         save site.  Pre-creating it at startup would violate the
         "transient — exists only while a training event is in flight"

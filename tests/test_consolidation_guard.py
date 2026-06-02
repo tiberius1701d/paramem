@@ -1,4 +1,4 @@
-"""Tests for ConsolidationLoop.guard_trial_state and TrialActiveError (Slice 3b.2).
+"""Tests for ConsolidationLoop.guard_trial_state and TrialActiveError.
 
 No GPU — all tests use mocked ConsolidationLoop instances.
 """

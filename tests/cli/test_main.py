@@ -41,9 +41,9 @@ class TestMigrate404PrintsVersionAlignmentMessage:
     def test_migrate_404_prints_version_alignment_message_and_returns_1(self, monkeypatch, capsys):
         """ServerUnavailable from post_json → rc=1, evergreen version-alignment message.
 
-        The 404 message no longer includes slice labels — it mentions
+        The 404 message no longer includes internal labels — it mentions
         /migration/preview and instructs the operator to check version
-        alignment (spec §L404: evergreen 404 fallback).
+        alignment (evergreen fallback: the message stays valid across releases).
         """
 
         def _raise(*_args, **_kwargs):

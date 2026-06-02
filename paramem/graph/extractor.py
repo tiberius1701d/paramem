@@ -488,12 +488,11 @@ def _load_prompt(filename: str, default: str, prompts_dir: Path | None = None) -
     anonymization.txt, sota_enrichment.txt, sota_plausibility.txt, …).
 
     Before editing any file under ``configs/prompts/`` — or adding a new
-    template slot here — read **README.md → Prompt Engineering**.  That
-    section documents the empirical rules that govern these files
-    (few-shot examples carry the schema; verbatim taxonomy slots like
+    template slot here — note the empirical rules that govern these files:
+    few-shot examples carry the schema; verbatim taxonomy slots like
     ``{entity_types}`` are anti-patterns; long prose rules dilute the
-    example signal).  The principles were learned the hard way and
-    contradict natural intuition about LLM prompting.
+    example signal.  Edit the prompt files directly to tune; no code
+    changes are needed.
     """
     search_dirs = []
     if prompts_dir:
@@ -515,8 +514,9 @@ def load_extraction_prompts(
 ) -> tuple[str, str]:
     """Load extraction prompts from a directory, with hardcoded fallbacks.
 
-    Before editing the prompts this function loads, read **README.md →
-    Prompt Engineering** for the empirical principles that govern them.
+    The prompts this function loads are external config — edit the files
+    under ``configs/prompts/`` to tune extraction behaviour; no code
+    changes are needed.
 
     Args:
         prompts_dir: Directory containing the prompt files.  Falls back to
@@ -567,8 +567,9 @@ def load_procedural_prompt(
 ) -> tuple[str, str]:
     """Load procedural extraction prompts.
 
-    Before editing the prompts this function loads, read **README.md →
-    Prompt Engineering** for the empirical principles that govern them.
+    The prompts this function loads are external config — edit the files
+    under ``configs/prompts/`` to tune extraction behaviour; no code
+    changes are needed.
 
     Args:
         prompts_dir: Directory containing the prompt files.  Falls back to
@@ -2350,7 +2351,7 @@ def _sota_pipeline(
                 # cumulative graph — the same triples re-extracted in the
                 # next cycle would dedup, so the missing second-order
                 # relations were lost permanently.  Per
-                # project_extraction_failure_fails_cycle: raise, propagate
+                # Extraction failure must fail the whole cycle: raise and propagate
                 # past :meth:`ConsolidationLoop.extract_session` (which has
                 # not yet merged this session's graph), and let the
                 # per-session loop in app.py treat this session like a
@@ -3721,9 +3722,9 @@ def load_anonymization_prompt() -> str:
     this helper so a `configs/prompts/anonymization.txt` override applies to
     both — no silent divergence.
 
-    Before editing ``configs/prompts/anonymization.txt``, read
-    **README.md → Prompt Engineering** for the empirical principles that
-    govern these files.
+    The prompt this function loads is external config — edit
+    ``configs/prompts/anonymization.txt`` to tune; no code changes are
+    needed.
     """
     return _load_prompt("anonymization.txt", _DEFAULT_ANONYMIZATION_PROMPT)
 
@@ -4186,9 +4187,9 @@ def _filter_with_sota(
     * ``bindings_count``: number of SOTA-introduced placeholders for
       which the response carried an explicit binding.
 
-    Before editing ``configs/prompts/sota_enrichment.txt``, read
-    **README.md → Prompt Engineering** for the empirical principles that
-    govern these files.
+    The prompt this function loads is external config — edit
+    ``configs/prompts/sota_enrichment.txt`` to tune; no code changes are
+    needed.
     """
     enrichment_prompt = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
     prompt = enrichment_prompt.format(
@@ -4291,9 +4292,9 @@ def _graph_enrich_with_sota(
         ``new_relations`` is a list of relation dicts; ``same_as_pairs`` is a
         list of ``[canonical, variant]`` pairs.
 
-    Before editing ``configs/prompts/sota_graph_enrichment.txt``, read
-    **README.md → Prompt Engineering** for the empirical principles that
-    govern these files.
+    The prompt this function loads is external config — edit
+    ``configs/prompts/sota_graph_enrichment.txt`` to tune; no code changes
+    are needed.
     """
     enrichment_prompt = _load_prompt("sota_graph_enrichment.txt", _DEFAULT_GRAPH_ENRICHMENT_PROMPT)
     try:
@@ -4713,9 +4714,8 @@ def _plausibility_filter_with_sota(
     Returns `(facts, raw_response)`. Raw response is preserved so callers
     can inspect the judge's verdict when questioning drop decisions.
 
-    Before editing ``configs/prompts/sota_plausibility.txt``, read
-    **README.md → Prompt Engineering** for the empirical principles that
-    govern these files.
+    The prompt is external config — edit ``configs/prompts/sota_plausibility.txt``
+    to tune; no code changes are needed.
     """
     plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
     prompt = plaus_prompt.format(
@@ -4756,9 +4756,8 @@ def _local_plausibility_filter(
     re-running the call; an empty string indicates no raw response was
     obtained.
 
-    Before editing ``configs/prompts/sota_plausibility.txt``, read
-    **README.md → Prompt Engineering** for the empirical principles that
-    govern these files.
+    The prompt is external config — edit ``configs/prompts/sota_plausibility.txt``
+    to tune; no code changes are needed.
     """
     _vram_snapshot(f"plaus_filter_entry n_facts={len(facts)}")
     plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)

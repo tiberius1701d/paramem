@@ -294,8 +294,8 @@ class TestReleaseServerGpuRaisesOnMissingConfig:
     """release_server_gpu() raises GPUConfigMissing (not returns False) when
     no config registers paramem-server.
 
-    Closes D4-sub at the paramem level: a misconfigured workstation must
-    surface loudly, not masquerade as a release timeout.
+    A misconfigured workstation (no paramem-server entry in GPU_GUARD_CONFIG)
+    must raise loudly, not masquerade as a release timeout.
     """
 
     def test_release_server_gpu_raises_on_missing_config(self, tmp_path: Path) -> None:
@@ -339,8 +339,8 @@ class TestWaitForIdleOwnsLoop:
     to return False four times then True, and verifies that ``time.sleep`` was
     called four times with argument ``2``.
 
-    This closes D5-sub-A at the paramem level: the idle loop is owned by
-    ConfigConsumer, not delegated to any outer caller.
+    The idle-poll loop is owned by ConfigConsumer itself — it must not be
+    delegated to an outer caller.
     """
 
     def test_wait_for_idle_owns_loop_paramem_side(self, tmp_path: Path) -> None:

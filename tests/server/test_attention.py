@@ -1,4 +1,4 @@
-"""Unit tests for paramem.server.attention (Slice 5a).
+"""Unit tests for paramem.server.attention.
 
 Tests cover every populator's emit/no-emit branches, collection ordering,
 stub behaviour, and the AttentionItem dataclass contract.
@@ -709,7 +709,7 @@ def test_adapter_no_matching_slot_secondary_emits_info():
 def test_stub_populators_return_empty():
     """Stub populators return [] when config=None (forward-compat guardrail)."""
     state = _live_state()
-    # _collect_backup_items and _collect_pre_flight_items now take (state, config) after Slice 6b.
+    # _collect_backup_items and _collect_pre_flight_items take (state, config).
     # Passing config=None exercises the early-return guard.
     assert _collect_backup_items(state, None) == []
     assert _collect_key_rotation_items(state) == []

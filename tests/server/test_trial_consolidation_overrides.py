@@ -1,4 +1,4 @@
-"""Tests for trial consolidation overrides (Slice 3b.2, §10.4).
+"""Tests for trial consolidation overrides.
 
 Verifies that the trial consolidation loop is configured with:
 - mode="train" regardless of the candidate config's consolidation.mode
@@ -139,7 +139,7 @@ class TestRunTrialConsolidation:
     All imports inside _run_trial_consolidation are local, so we patch via
     the module where they are defined (paramem.server.consolidation, etc.).
 
-    Slice 4 note: _run_trial_consolidation now calls evaluate_gates internally.
+    _run_trial_consolidation calls evaluate_gates internally.
     Tests that only verify outer state transitions (exception handling, gate
     status) patch evaluate_gates at the module boundary to keep them fast and
     isolated from gate internals.
@@ -148,9 +148,9 @@ class TestRunTrialConsolidation:
     def test_trial_exception_sets_trial_exception_gate(self, tmp_path, monkeypatch):
         """When _run_trial_consolidation outer try-block raises, gates become trial_exception.
 
-        Slice 4: the outer exception path (e.g. load_server_config failing) is
-        preserved — sets {"status": "trial_exception", ...}.  Gate-level exceptions
-        are handled inside evaluate_gates and produce "fail", not "trial_exception".
+        The outer exception path (e.g. load_server_config failing) sets
+        {"status": "trial_exception", ...}.  Gate-level exceptions are handled
+        inside evaluate_gates and produce "fail", not "trial_exception".
         """
         state = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", state)
@@ -172,7 +172,7 @@ class TestRunTrialConsolidation:
     def test_trial_completion_sets_no_new_sessions_gate(self, tmp_path, monkeypatch):
         """Successful trial with empty queue → gates.status == no_new_sessions.
 
-        Slice 4: session_buffer is None → session_buffer_empty=True → all gates
+        session_buffer is None → session_buffer_empty=True → all gates
         return skipped → rollup is no_new_sessions.  evaluate_gates is patched to
         return controlled GateResult objects so this test stays GPU-free.
         """
@@ -229,7 +229,7 @@ class TestTrialDoesNotMarkConsolidated:
         the real session_buffer.mark_consolidated must not be called so that
         pending sessions stay in the buffer after the trial cycle (spec L364).
 
-        Slice 4: session_buffer.pending_count is set to 2 so _run_extraction_phase
+        session_buffer.pending_count is set to 2 so _run_extraction_phase
         is called (buffer-empty path skips it).  evaluate_gates is patched to
         avoid GPU interactions.
         """
@@ -276,7 +276,8 @@ class TestTrialDoesNotMarkConsolidated:
                                 return_value=skipped_gates,
                             ):
                                 await app_module._run_trial_consolidation()
-                            # Verify mark_callback=lambda _: None was passed (D2 interface).
+                            # Verify mark_callback=lambda _: None was passed.
+                            # The trial path must not mark sessions consolidated.
                             call_kwargs = mock_run.call_args.kwargs
                             callback = call_kwargs.get("mark_callback")
                             assert callback is not None, "trial path must pass mark_callback"
@@ -294,7 +295,7 @@ class TestTrialDoesNotMarkConsolidated:
         The trial cycle must leave the session buffer untouched so
         /migration/rollback (3b.3) finds the original pending queue intact.
 
-        Slice 4: session_buffer.pending_count is set to 2 so _run_extraction_phase
+        session_buffer.pending_count is set to 2 so _run_extraction_phase
         is called.  evaluate_gates is patched to avoid GPU interactions.
         """
         from unittest.mock import MagicMock, patch
@@ -355,7 +356,7 @@ class TestTrialDoesNotMarkConsolidated:
         active-store migration), so only non-mode changes reach the trial, where
         the live mode is unchanged and the trial must faithfully reflect it.
         Here the candidate is simulate, so the trial must run in simulate mode.
-        Slice 4: session_buffer is provided with pending_count > 0 so that
+        session_buffer is provided with pending_count > 0 so that
         _run_extraction_phase is actually called (buffer-empty path skips it).
         evaluate_gates is patched to avoid GPU interactions.
         """
@@ -500,12 +501,12 @@ class TestUpdateTrialGates:
 
 
 # ---------------------------------------------------------------------------
-# Slice 4 extension tests (spec §Tests — 4 extensions)
+# Gate extension tests — additional gate-override scenarios
 # ---------------------------------------------------------------------------
 
 
 class TestSlice4GateExtensions:
-    """Slice 4 extension tests for _run_trial_consolidation gate integration."""
+    """Gate integration tests for _run_trial_consolidation: payload shape and backward-compat."""
 
     def test_trial_gates_no_new_sessions_has_details_list(self, tmp_path, monkeypatch):
         """status==no_new_sessions AND gates['details'] has exactly 4 entries.
@@ -547,7 +548,7 @@ class TestSlice4GateExtensions:
 
         The outer exception path (e.g. config load failure) sets a minimal gate
         dict with only 'status', 'exception', and 'completed_at' — no 'details'
-        list, preserving backward-compat with Slice 3b.3 consumers.
+        list (backward-compat: trial_exception gates dict is minimal).
         """
         state = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", state)

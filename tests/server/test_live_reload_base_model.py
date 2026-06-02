@@ -18,20 +18,20 @@ load, the VRAM check, and ``_build_config_derived_state`` are mocked — the
 contract under test is the control flow and the resulting ``_state``
 mode/reason, not real CUDA.
 
-After the WP1 refactor, ``_live_reload_base_model`` calls
-``_build_config_derived_state`` after a successful model load (to rebuild
-router, exemplar banks, etc.).  Existing tests mock
-``_build_config_derived_state`` so they exercise the same control-flow
-contract as before without triggering real STT/HA/SOTA construction.
+``_live_reload_base_model`` calls ``_build_config_derived_state`` after a
+successful model load (to rebuild router, exemplar banks, etc.).  Existing
+tests mock ``_build_config_derived_state`` so they exercise the same
+control-flow contract without triggering real STT/HA/SOTA construction.
 
-New tests added for WP1:
+Additional tests cover the config-refresh path:
 - ``refresh_config_from_disk=True`` calls ``load_server_config`` BEFORE
   ``_release_base_model_in_process``.
 - Mode is not set to ``local`` until AFTER ``_build_config_derived_state``.
 - A rebuild failure leaves mode=cloud-only with reason ``apply_failed``.
   A partial preload (boot_degraded) now stays local — recall self-heals.
 - ``_build_config_derived_state`` is NOT passed ``check_post_load_budget``
-  (the build-once VRAM gate stays lifespan-only — B-1).
+  (the build-once VRAM gate must stay lifespan-only; in-process reload must
+  not re-run the post-load budget check on every reclaim).
 - ``_preload_memory_store`` source selection is driven by
   ``config.consolidation.mode``, not ``_state["mode"]``.
 - ``boot_degraded`` is cleared on full hydration and on ``preload_cache=False``;
@@ -172,8 +172,8 @@ def test_preflight_skipped_when_no_boot_assessment():
     budget check, defer to the live load gate. torch.cuda.mem_get_info is not
     consulted (no assessment to compare against).
 
-    After the WP1 refactor: _build_config_derived_state is called once (to
-    rebuild the router + classifier) on the plain-reclaim path.
+    _build_config_derived_state is called once (to rebuild the router +
+    classifier) on the plain-reclaim path.
     """
     from paramem.server import app as app_module
 
@@ -196,7 +196,7 @@ def test_preflight_skipped_when_no_boot_assessment():
         # With topology_assessment=None, mem_get_info must NOT be called.
         mock_mem_get_info.assert_not_called()
         mock_load.assert_called_once()
-        # WP1: plain-reclaim path calls _build_config_derived_state once
+        # plain-reclaim path calls _build_config_derived_state once
         # (rebuild_session_buffer=False, cloud_only=False).
         mock_build.assert_called_once()
         assert app_module._state["mode"] == "local"
@@ -206,8 +206,7 @@ def test_preflight_skipped_when_no_boot_assessment():
 def test_successful_reload_sets_local():
     """Gate reports room and the load succeeds → mode local.
 
-    After the WP1 refactor: _build_config_derived_state is called once on
-    the plain-reclaim path.
+    _build_config_derived_state is called once on the plain-reclaim path.
     """
     from paramem.server import app as app_module
 
@@ -232,7 +231,7 @@ def test_successful_reload_sets_local():
         app_module._live_reload_base_model()
 
         mock_load.assert_called_once()
-        # WP1: _build_config_derived_state called once on plain-reclaim path.
+        # _build_config_derived_state called once on plain-reclaim path.
         mock_build.assert_called_once()
         assert app_module._state["mode"] == "local"
         assert app_module._state["cloud_only_reason"] is None
@@ -280,13 +279,13 @@ def test_load_failure_releases_and_stays_cloud_only():
 
 
 # ---------------------------------------------------------------------------
-# WP1 new tests: config-refresh ordering + full rebuild on True vs model-only
+# Config-refresh ordering + full rebuild on True vs model-only
 # ---------------------------------------------------------------------------
 
 
 def test_refresh_config_from_disk_loads_config_before_release():
     """When refresh_config_from_disk=True: load_server_config is called BEFORE
-    _release_base_model_in_process (correction S-4 ordering / D2).
+    _release_base_model_in_process.
 
     The config is committed to _state before the release so that a crash
     mid-reload leaves _state["config"] pointing at the new config B
@@ -330,7 +329,7 @@ def test_refresh_config_from_disk_loads_config_before_release():
 
 def test_refresh_config_mode_not_local_until_after_build():
     """When refresh_config_from_disk=True: mode is NOT set to 'local' until
-    AFTER _build_config_derived_state succeeds (D2 / §3.12 step 9).
+    AFTER _build_config_derived_state succeeds.
 
     If the build is not called (or raises), mode stays cloud-only.
     """
@@ -373,7 +372,8 @@ def test_refresh_config_mode_not_local_until_after_build():
 def test_refresh_config_rebuild_failure_stays_cloud_only():
     """When refresh_config_from_disk=True: a rebuild failure in
     _build_config_derived_state leaves mode=cloud-only with reason
-    'apply_failed' (§3.15 partial-rebuild recovery).
+    'apply_failed' (partial-rebuild recovery — the server must not silently
+    enter local mode with a broken derived state).
     """
     from paramem.server import app as app_module
 
@@ -526,7 +526,7 @@ def test_post_load_gate_not_called_from_reload():
 
 
 # ---------------------------------------------------------------------------
-# WP1 new tests: _preload_memory_store source selection + boot_degraded lifecycle
+# _preload_memory_store source selection + boot_degraded lifecycle
 # ---------------------------------------------------------------------------
 
 
@@ -541,8 +541,7 @@ def _fake_memory_store():
 def test_preload_source_selection_simulate_mode():
     """preload_cache=True + consolidation.mode='simulate' → DiskMemorySource selected.
 
-    Source selection must use config.consolidation.mode, NOT _state["mode"]
-    (correction #4 / D6).
+    Source selection must use config.consolidation.mode, NOT _state["mode"].
     """
     from paramem.server import app as app_module
 

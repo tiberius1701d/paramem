@@ -5,7 +5,7 @@ returns the server to LIVE state.  Valid only when a candidate is staged;
 returns 409 ``not_staging`` otherwise.
 
 This module is intentionally minimal — the cancel logic is entirely
-server-side.  The CLI is a thin stateless HTTP client (spec §L187).
+server-side.  The CLI is a thin stateless HTTP client.
 """
 
 from __future__ import annotations

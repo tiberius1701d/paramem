@@ -1,4 +1,4 @@
-"""Unit tests for _collect_backup_items populator (Slice 6b).
+"""Unit tests for _collect_backup_items populator.
 
 Tests cover:
 - Empty state file / no state → []

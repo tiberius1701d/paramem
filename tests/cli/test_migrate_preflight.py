@@ -1,7 +1,7 @@
-"""Tests for migrate CLI pre-flight short-circuit (Slice 6b).
+"""Tests for migrate CLI pre-flight short-circuit.
 
 Tests cover:
-9  — pre_flight_fail="disk_pressure" → spec message + paramem backup-prune + rc=1
+9  — pre_flight_fail="disk_pressure" → disk-pressure message + paramem backup-prune + rc=1
 10 — pre_flight_fail="something_new" → generic message + rc=1
 11 — pre_flight_fail=None → reaches proceed prompt (operator N → cancel + rc=1)
 """

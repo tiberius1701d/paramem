@@ -8,7 +8,7 @@ populators in display order and concatenates results.
 The module is intentionally isolated so tests can call populators directly
 without spinning a FastAPI server or loading a model.
 
-Display order (spec §L504–513):
+Display order (most actionable first):
 
     Migration → Consolidation → Sweeper → Backup* → Config drift →
     Boot degraded → Key rotation* → Encryption* → Adapter fingerprint → Pre-flight*

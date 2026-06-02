@@ -185,7 +185,8 @@ def _has_adapter_registry(adapter_dir: Path, tier: str) -> bool:
     """Return True when a per-tier indexed_key_registry.json exists for *tier*.
 
     The canonical layout is ``<adapter_dir>/<tier>/indexed_key_registry.json``.
-    This is the commit signal written last by ``_save_adapters`` (I5 ordering).
+    This is the commit signal written last by ``_save_adapters``: its presence
+    on disk means all preceding adapter files are complete.
     """
     return (Path(adapter_dir) / tier / "indexed_key_registry.json").exists()
 
@@ -647,8 +648,8 @@ def _migrate_tier_simulate_to_train(
     # hash unavailable); we save without manifest in that case so the weights
     # are durable even when the manifest sidecar isn't.
     # Bind the slot to the tier registry exactly as consolidation._save_adapters
-    # does (I5): hash the registry bytes and pass them as
-    # registry_sha256_override.  Without this the slot's meta.registry_sha256 is
+    # does (hash registry bytes before writing and pass as registry_sha256_override).
+    # Without this the slot's meta.registry_sha256 is
     # empty, find_live_slot can never match it on the next boot/reload, and the
     # adapter silently fails to mount (recall then returns 0 keys → boot_degraded).
     _tier_reg = loop.store.registry(name)
@@ -700,8 +701,8 @@ def _migrate_tier_simulate_to_train(
 
     # Step 7c2: flush the exact registry bytes that were hashed into the manifest
     # so find_live_slot matches meta.registry_sha256 against the tier registry on
-    # the next boot/reload (mirrors consolidation._save_adapters I5 step 8 — the
-    # registry is the commit signal, written last).
+    # the next boot/reload (mirrors consolidation._save_adapters — registry written
+    # last as the commit signal, so its presence on disk means all preceding files are complete).
     if _tier_reg is not None and _reg_payload is not None:
         slot_root.mkdir(parents=True, exist_ok=True)
         _tier_reg.save_from_bytes(

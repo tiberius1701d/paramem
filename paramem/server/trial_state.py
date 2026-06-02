@@ -63,8 +63,8 @@ class TrialMarker:
     directly when the server is offline.
 
     Paths stored in ``backup_paths``, ``trial_adapter_dir``, and
-    ``trial_graph_dir`` are absolute (Correction 5) so the marker is
-    portable across working-directory changes (e.g. systemd units).
+    ``trial_graph_dir`` are absolute so the marker is portable across
+    working-directory changes (e.g. systemd units).
 
     Attributes
     ----------

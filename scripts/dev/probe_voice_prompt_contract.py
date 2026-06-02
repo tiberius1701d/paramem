@@ -5,7 +5,7 @@ trained adapter to verify three contracts end-to-end:
 
   1. In-domain recall — the model surfaces facts present in the
      layered_context assembled from recalled keys.
-  2. Anti-confabulation (Slice 2) — off-domain personal queries
+  2. Anti-confabulation — off-domain personal queries
      (location, job, birthday, spouse) return polite abstentions
      instead of invented facts.
   3. Escalation sentinel — real-time queries (time, weather) and
@@ -44,11 +44,11 @@ from experiments.utils.test_harness import (  # noqa: E402
     setup_logging,
 )
 from paramem.evaluation.recall import generate_answer  # noqa: E402
+from paramem.memory.probe import probe_keys_grouped_by_adapter  # noqa: E402
 from paramem.models.loader import load_adapter, load_base_model  # noqa: E402
 from paramem.server.config import load_server_config  # noqa: E402
 from paramem.server.escalation import detect_escalation  # noqa: E402
 from paramem.server.inference import _personalize_prompt  # noqa: E402
-from paramem.memory.probe import probe_keys_grouped_by_adapter  # noqa: E402
 
 CYCLE_DIR = (
     PROJECT_ROOT / "outputs" / "test8_large_scale" / "mistral" / "20260323_161747" / "cycle_001"
@@ -97,7 +97,7 @@ def main() -> int:
     subject_keys = [kp["key"] for kp in keyed_pairs if kp["source_subject"] == SUBJECT]
     print(f"Subject '{SUBJECT}': {len(subject_keys)} trained keys: {subject_keys}")
 
-    # Load server config (for voice prompt — the Slice-2 version)
+    # Load server config to get the voice prompt template.
     server_config = load_server_config()
     voice_prompt_raw = server_config.voice.load_prompt()
     system_prompt = _personalize_prompt(voice_prompt_raw, SUBJECT, None, server_config)

@@ -1,4 +1,4 @@
-"""Unit tests for build_comparison_report (Slice 5a).
+"""Unit tests for build_comparison_report.
 
 Tests cover all 5 rows (3 real + 2 deferred), missing-input fallbacks,
 schema-version stability, and the no-state-reach-in purity guardrail.

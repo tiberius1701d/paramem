@@ -19,23 +19,22 @@ default; production has its own pause flow + does not need per-key logs).
 ``progress_path`` already accepts ``None``.  All three are guarded at every
 ``.exists()`` / write site.
 
-Stop-trigger semantics (lock-in §13.3 of plan-test14.md)
----------------------------------------------------------
+Stop-trigger semantics
+-----------------------
 The callback fires when ``fill["exact_count"] == fill["total"]`` (aggregate
 100% recall) for ``window`` consecutive probes AND ``epoch >=
 signal_from_epoch``.  Per-key streak tracking is NOT used; 100% aggregate
 at a probe epoch means every key passed at that probe, which is equivalent
 in effect but does not require per-key state.
 
-``gradient_checkpointing`` re-enable (§14.3 of plan-test14.md)
----------------------------------------------------------------
+``gradient_checkpointing`` re-enable
+--------------------------------------
 ``evaluate_indexed_recall`` (test_harness.py:403) calls
 ``model.gradient_checkpointing_disable()`` internally.  The in-loop
 callback re-enables it inline after both probes complete and before
-returning from ``on_epoch_end``.  This is the "callback is exempt from the
-standalone helper rule" mentioned in §14.3 — HF Trainer manages
-checkpointing state across ``on_epoch_end`` boundaries, so the next epoch's
-training step sees the re-enabled state.
+returning from ``on_epoch_end``.  HF Trainer manages checkpointing state
+across ``on_epoch_end`` boundaries, so the next epoch's training step sees
+the re-enabled state.
 """
 
 from __future__ import annotations
@@ -54,7 +53,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Default policy used throughout Test 14 (plan §6, §8).
+# Default policy for recall-based early stopping.
 # probe_from_epoch=1: start probing at the first epoch boundary.
 # signal_from_epoch=10: only fire the stop signal after epoch 10.
 # window=3: require 3 consecutive probes with aggregate 100% recall.
@@ -120,7 +119,7 @@ class EarlyStopPolicy:
             )
 
 
-# Singleton policy for Test 14 phases (plan §6 ANALYSIS_POLICY).
+# Singleton instance of the default early-stop policy (used by production training paths).
 ANALYSIS_POLICY = EarlyStopPolicy(**ANALYSIS_POLICY_KWARGS)
 
 
@@ -229,7 +228,7 @@ class RecallEarlyStopCallback(TrainerCallback):
         self._retention_registry = retention_registry
         self._eval_fn = eval_fn
 
-        # Internal state (§6 pseudocode variable names).
+        # Internal state tracking variables.
         self._last_epoch: int = -1
         self._consecutive_perfect: int = 0
         self._first_perfect_log: dict[str, dict] = {}
@@ -340,12 +339,12 @@ class RecallEarlyStopCallback(TrainerCallback):
     def on_epoch_end(self, args, state, control, **kwargs) -> None:  # noqa: ARG002
         """Probe fill (and optionally retention), update logs, check stop.
 
-        Implements the pseudocode from plan §6 exactly:
+        Implements the recall-based early-stop analysis policy:
         - _last_epoch guard prevents double-fire for the same epoch.
         - Only probes on ``probe_every_n_epochs`` cadence.
         - Aggregate-recall stop trigger: ``_consecutive_perfect >= window``.
         - ``gradient_checkpointing_enable()`` called after probes and before
-          returning (callback-exempt re-enable per §14.3).
+          returning (the recall callback is exempt from the per-probe disable).
         - Pause file checked AFTER probe completes and epoch_log is persisted.
         """
         # Lazy import for diagnostics helpers (GPU-free; no startup penalty).
@@ -410,10 +409,10 @@ class RecallEarlyStopCallback(TrainerCallback):
                 adapter_name=self._adapter_name,
             )
 
-        # Re-enable gradient checkpointing after ALL probes (§14.3 callback
-        # exemption) — but only if the training run had it enabled to begin
-        # with.  evaluate_indexed_recall disables it unconditionally; we
-        # restore the pre-probe state from ``args.gradient_checkpointing``
+        # Re-enable gradient checkpointing after ALL probes (the recall callback
+        # is exempt from the per-probe disable) — but only if the training run
+        # had it enabled to begin with.  evaluate_indexed_recall disables it
+        # unconditionally; we restore the pre-probe state from ``args.gradient_checkpointing``
         # (TrainingArguments forwards the TrainingConfig setting verbatim,
         # see paramem/training/trainer.py:203 and paramem/server/background_trainer.py:1007).
         # If the trainer was constructed with checkpointing OFF, leaving it
@@ -519,7 +518,8 @@ class RecallEarlyStopCallback(TrainerCallback):
             self._state.stable_perfect_epoch = epoch
             logger.info("  stable_perfect_epoch = %d", epoch)
 
-        # --- Aggregate-recall early-stop trigger (lock-in §13.3) ---
+        # --- Aggregate-recall early-stop trigger ---
+        # Fires when ``_consecutive_perfect >= window`` and epoch >= signal_from_epoch.
         if (
             not self._signaled_stop
             and epoch >= policy.signal_from_epoch

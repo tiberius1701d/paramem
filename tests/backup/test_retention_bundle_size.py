@@ -1,13 +1,13 @@
-"""Tests for Slice 1.5 — recursive slot sizing in paramem.backup.retention.
+"""Tests for recursive slot sizing in paramem.backup.retention.
 
 Verifies that ``_slot_size_bytes`` (and therefore ``compute_disk_usage``)
 correctly sizes slots whose payload files live in subdirectories, as is the
 case for ``snapshot_bundle`` slots that store adapter weights under
 ``adapters/<tier>/adapter_model.safetensors``.
 
-Before the Slice 1.5 fix, ``_slot_size_bytes`` only iterated top-level files
-(``iterdir()``) and returned ~0 for bundle slots, silently bypassing the disk
-cap and retention rules.
+``_slot_size_bytes`` used to iterate only top-level files (``iterdir()``)
+and returned ~0 for bundle slots, silently bypassing the disk cap and
+retention rules.
 """
 
 from __future__ import annotations

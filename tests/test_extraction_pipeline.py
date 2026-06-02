@@ -1172,7 +1172,7 @@ class TestSOTANoiseFilter:
         assert anon_transcript == ""
 
     def test_pipeline_anonymize_failure_falls_back_to_raw_plausibility(self):
-        """If anonymization fails, the pipeline falls back to raw (local) plausibility (D8).
+        """If anonymization fails, the pipeline falls back to raw (local) plausibility.
 
         The old behavior was to return the original graph unchanged.
         The new behavior runs _fallback_plausibility_on_raw so that tautologies,
@@ -1214,13 +1214,13 @@ class TestSOTANoiseFilter:
     def test_pipeline_enrichment_failure_raises_extraction_failed(self):
         """Enrichment failure must FAIL the cycle, not silently fall back.
 
-        Previously this test asserted the silent-fallback behavior the
-        2026-05-13 handover identified as a load-bearing bug: a SOTA
-        529 baked a degraded (un-enriched) snapshot into the cumulative
-        graph; the next cycle deduped the same triples so the missing
-        second-order relations were lost permanently.  The pipeline
-        now raises ``ExtractionFailed`` so the per-session loop in
-        ``app.py`` leaves the session pending for retry.
+        Previously this test asserted the silent-fallback behavior, which
+        was a load-bearing bug: a SOTA 5xx baked a degraded (un-enriched)
+        snapshot into the cumulative graph; the next cycle deduped the
+        same triples so the missing second-order relations were lost
+        permanently.  The pipeline now raises ``ExtractionFailed`` so
+        the per-session loop in ``app.py`` leaves the session pending
+        for retry.
         """
         from paramem.graph.extractor import ExtractionFailed, _sota_pipeline
 
@@ -2188,12 +2188,14 @@ class TestDebugArtifacts:
 
 
 # ---------------------------------------------------------------------------
-# PR1 Alignment Tests — D1, D3, D4, D6, D7, D8, D9, D10, D13, D17, D18
+# Extraction pipeline alignment tests
 # ---------------------------------------------------------------------------
 
 
 class TestPlausibilityAnon:
-    """§7 test 1: _sota_pipeline with plausibility_stage="anon" (D3)."""
+    """_sota_pipeline with plausibility_stage="anon": plausibility runs on
+    anonymized facts before de-anonymization.
+    """
 
     def test_anon_stage_plausibility_filters_subset(self):
         """When plausibility_stage="anon" and a SOTA validator is configured, it runs
@@ -2253,7 +2255,9 @@ class TestPlausibilityAnon:
 
 
 class TestPlausibilityDeanon:
-    """§7 test 2: _sota_pipeline with plausibility_stage="deanon" (D3)."""
+    """_sota_pipeline with plausibility_stage="deanon": plausibility runs on
+    de-anonymized facts using the original transcript.
+    """
 
     def test_deanon_stage_plausibility_drops_tautology(self):
         """Deanon-stage local plausibility receives real names and drops tautologies."""
@@ -2315,7 +2319,7 @@ class TestPlausibilityDeanon:
         assert result.relations[0].predicate == "lives_in"
 
         # Verify the plausibility call received the ORIGINAL real-name transcript,
-        # NOT the anonymized transcript (privacy-critical per D1/D3 plan).
+        # NOT the anonymized transcript (deanon stage must pass real names to plausibility).
         assert len(local_plaus_calls) == 1
         _, transcript_arg = local_plaus_calls[0]
         assert transcript_arg == "Alex lives in Millfield.", (
@@ -2325,7 +2329,8 @@ class TestPlausibilityDeanon:
 
 
 class TestResidualLeakDropsReferencingTriples:
-    """§7 test 3: D1 — residual-leak fact-level filter.
+    """Residual-leak fact-level filter: triples referencing a PII name that
+    survived anonymization are dropped.
 
     The fact-level residual filter exists for the case where
     ``verify_anonymization_completeness`` flags a leak that the
@@ -2428,7 +2433,9 @@ class TestResidualLeakDropsReferencingTriples:
 
 
 class TestAnonFailureFallback:
-    """§7 test 4: D8 — anon failure runs raw plausibility instead of returning original."""
+    """When anonymization fails, _sota_pipeline runs raw (local) plausibility
+    instead of returning the original facts.
+    """
 
     def test_anon_failure_triggers_fallback(self):
         """_sota_pipeline calls _fallback_plausibility_on_raw when anonymization fails."""
@@ -2478,7 +2485,8 @@ class TestSotaEnrichmentFailureRaises:
     into the cumulative graph after an Anthropic 529 — by the time the
     next cycle re-extracted, the in-memory merger had already absorbed
     the un-enriched triples, so the missing second-order relations were
-    permanently lost.  See ``project_extraction_failure_fails_cycle``.
+    permanently lost.  The extraction-failure-fails-cycle policy requires
+    the whole cycle to abort so sessions stay pending for a clean retry.
     """
 
     def test_sota_enrich_failure_raises_extraction_failed(self):
@@ -2594,7 +2602,9 @@ class TestAllDroppedSafetyNet:
 
 
 class TestEntityTypePreservation:
-    """§7 test 6: D6 — entity types preserved, no "person" stampdown (regression)."""
+    """Entity types set by _normalize_extraction must survive the SOTA pipeline
+    unchanged; no "person" stampdown on non-person entities.
+    """
 
     def test_preserved_entity_types_pass_through(self):
         """Entities pre-typed by _normalize_extraction keep their original types
@@ -2682,10 +2692,10 @@ class TestEntityTypePreservation:
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
-        # Germany already existed in the graph as "place"; D6 preserves existing entity types.
-        # The Country_ → "location" mapping applies only to SOTA-*introduced* entities
-        # (names absent from the original graph). "place" and "location" both express
-        # geographic entities — accept both values.
+        # Germany already existed in the graph as "place"; the entity-type-preservation
+        # rule keeps the original type. The Country_ → "location" mapping applies only
+        # to SOTA-introduced entities (names absent from the original graph).
+        # "place" and "location" both express geographic entities — accept both values.
         assert entity_map.get("Germany") in ("place", "location"), (
             f"Germany (Country_1) must be typed 'place' or 'location', "
             f"not {entity_map.get('Germany')!r}"
@@ -2694,11 +2704,12 @@ class TestEntityTypePreservation:
     def test_sota_introduced_entity_no_placeholder_typed_concept(self):
         """SOTA-introduced entity with no placeholder (bare name) gets type 'concept', not 'person'.
 
-        D6 regression guard: entity with no reverse_mapping entry defaults to 'concept'.
+        Regression guard: entity with no reverse_mapping entry must default to
+        'concept', never 'person'.
         China is NOT present in the original graph — only Alex is. SOTA enrichment
         introduces China as a bare name (no anonymizer placeholder), so no
-        reverse_mapping entry exists. D6 ensures the fallback type is 'concept',
-        never 'person'.
+        reverse_mapping entry exists. The entity-type-preservation rule ensures the
+        fallback type is 'concept', never 'person'.
         """
         from paramem.graph.extractor import _sota_pipeline
 
@@ -2737,7 +2748,7 @@ class TestEntityTypePreservation:
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
-        # China has no reverse_mapping entry → D6 safe fallback is "concept", not "person"
+        # China has no reverse_mapping entry → safe fallback type is "concept", not "person"
         china_type = entity_map.get("China")
         assert china_type == "concept", (
             f"SOTA-introduced bare entity must be typed 'concept', not {china_type!r}"
@@ -2745,7 +2756,9 @@ class TestEntityTypePreservation:
 
 
 class TestFallbackPlausibilityOnRawHelper:
-    """§7 test 7: D10 — direct test of _fallback_plausibility_on_raw helper."""
+    """Direct tests of the _fallback_plausibility_on_raw helper: drops
+    residual placeholders and anon-failed facts.
+    """
 
     def test_helper_removes_residual_placeholders(self):
         """Helper drops facts containing residual placeholder tokens."""
@@ -2798,7 +2811,10 @@ class TestFallbackPlausibilityOnRawHelper:
 
 
 class TestExtractGraphNewKwargs:
-    """§7 test 8: D4/D18 — new kwargs reach _sota_pipeline."""
+    """extract_graph forwards privacy/plausibility kwargs (ner_check,
+    plausibility_judge, plausibility_stage, verify_anonymization) to
+    _sota_pipeline.
+    """
 
     def test_extract_graph_plumbs_ner_and_plausibility_kwargs(self):
         """extract_graph forwards ner_check, ner_model, plausibility_judge,
@@ -2885,7 +2901,10 @@ class TestExtractGraphNewKwargs:
         assert captured.get("verify_anonymization") is False
 
     def test_extract_graph_default_temperature_zero(self):
-        """D14: extract_graph default temperature is 0.0 (was 0.3)."""
+        """extract_graph default temperature must be 0.0.
+
+        Structured output (JSON, QA) requires deterministic generation.
+        """
         import inspect
 
         from paramem.graph.extractor import extract_graph
@@ -2908,7 +2927,11 @@ class TestExtractGraphNewKwargs:
         assert sig.parameters["max_tokens"].default == _DEFAULT_FILTER_MAX_TOKENS
 
     def test_verify_anonymization_false_skips_guard(self):
-        """D18: verify_anonymization=False skips the forward-path privacy guard."""
+        """verify_anonymization=False skips the forward-path privacy guard.
+
+        The completeness verifier (verify_anonymization_completeness) must not
+        be called when the caller opts out of the guard.
+        """
         from paramem.graph.extractor import _sota_pipeline
 
         graph = _make_graph(
@@ -2964,7 +2987,7 @@ class TestExtractGraphNewKwargs:
 
 
 class TestDiagnosticsKeys:
-    """§7 test 9: D13 — diagnostic keys populated after full pipeline run."""
+    """Diagnostics dict is populated with expected keys after a full pipeline run."""
 
     def test_diagnostics_contains_plausibility_keys(self):
         """After a deanon-stage plausibility run, diagnostics contains the expected keys."""
@@ -3052,7 +3075,9 @@ class TestDiagnosticsKeys:
 
 
 class TestConsolidationScheduleConfigPrivacyGuard:
-    """§7/§6 — privacy guard in ConsolidationScheduleConfig.__post_init__."""
+    """ConsolidationScheduleConfig rejects the combination of a cloud judge
+    with deanon-stage plausibility (privacy violation).
+    """
 
     def test_cloud_judge_plus_deanon_stage_raises(self):
         """cloud provider + deanon stage must raise ValueError at construction."""
@@ -3108,7 +3133,7 @@ class TestConsolidationScheduleConfigPrivacyGuard:
     def test_minimal_yaml_loads_with_defaults(self, tmp_path):
         """Back-compat: minimal yaml without new keys loads with all new defaults.
 
-        Pre-flight check #2 from alignment-plan-2026-04-15.md §12.
+        Pre-flight check #2: minimal yaml without new keys must load with all new defaults.
         """
         from paramem.server.config import load_server_config
 

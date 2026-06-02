@@ -21,8 +21,7 @@ from typing import Any
 
 COMPARISON_REPORT_OPERATOR_LINE = (
     "These are the raw numbers before vs. after. "
-    "Config/prompt changes may legitimately alter extraction behavior. "
-    "See docs/config_impact.md for the expected impact of the fields you changed."
+    "Config/prompt changes may legitimately alter extraction behavior."
 )
 
 COMPARISON_REPORT_SCHEMA_VERSION: int = 1
@@ -36,8 +35,8 @@ COMPARISON_REPORT_SCHEMA_VERSION: int = 1
 def _row_triples_extracted(gates: dict) -> dict[str, Any]:
     """Return the deferred 'Triples extracted' row.
 
-    Defers this row because the spec (L395) requires
-    ``_state["last_consolidation_summary"]`` which is not yet persisted.
+    Defers this row because ``_state["last_consolidation_summary"]`` is not yet
+    persisted at the time this function runs.
     Renders ``pending: True`` with an explicit reason so the row is
     never silently empty.
 

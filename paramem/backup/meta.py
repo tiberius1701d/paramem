@@ -111,7 +111,7 @@ def write_meta(slot_dir: Path, meta: ArtifactMeta) -> Path:
         "pre_trial_hash": meta.pre_trial_hash,
     }
 
-    # Plaintext-by-design (SECURITY.md §4 carve-out): backup sidecars are
+    # Plaintext-by-design carve-out: backup sidecars are
     # control-plane metadata only (timestamp, content_sha256 of the already-
     # encrypted payload, size, tier, label).  Encrypting them would turn
     # every wrong-key restore into a silent "backup not found" instead of a
@@ -158,7 +158,7 @@ def read_meta(slot_dir: Path) -> ArtifactMeta:
     if not meta_file.exists():
         raise FileNotFoundError(f"No .meta.json sidecar found in {slot_dir}")
 
-    # Sidecars are plaintext-by-design (SECURITY.md §4 carve-out), but the
+    # Sidecars are plaintext-by-design (carve-out), but the
     # universal reader handles any legacy ciphertext transparently; RuntimeError
     # from the reader surfaces as a clear corrupt-sidecar error for the caller.
     try:

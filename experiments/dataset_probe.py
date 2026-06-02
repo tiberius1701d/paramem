@@ -13,9 +13,6 @@ Usage:
     python experiments/dataset_probe.py --dataset longmemeval \
         --sample-strategy stratified --sample-size 100
 
-Sections of this file follow the plan at:
-  .agent/plan-dataset-probe-2026-04-16.md
-
 Hard rules carried forward:
   - Tests 1-11 are not modified. This file is a new consumer.
   - ConsolidationLoop is used exactly as in archive/experiments/phase3_consolidation.py.

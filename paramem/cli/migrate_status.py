@@ -1,14 +1,13 @@
 """Handler for ``paramem migrate-status``.
 
 Queries ``GET /migration/status``.  On ``ServerUnreachable``, falls back to
-reading ``state/trial.json`` directly from disk (spec §L228).  When the file
-does not exist, the fallback prints "server offline; no trial marker on disk"
-and exits 0 (not 2 — the absence of a trial marker is not an error state,
-per plan §L228).
+reading ``state/trial.json`` directly from disk.  When the file does not
+exist, the fallback prints "server offline; no trial marker on disk" and
+exits 0 (absence of a trial marker is not an error state).
 
 TRIAL state (``state/trial.json``) is plaintext and always readable without
 decryption — trial markers intentionally stay plaintext across key rotation
-(plan §Encryption rule table).
+so the fallback path works with no loaded key.
 """
 
 from __future__ import annotations
@@ -24,10 +23,9 @@ from paramem.cli import http_client
 def _trial_json_path(server_url: str) -> Path:
     """Return the conventional path to ``state/trial.json`` on the local host.
 
-    Per spec §L516–545 and Correction 4, the marker lives at
-    ``data/ha/state/trial.json`` (inside the ``data/ha/`` tree, NOT at a
-    bare ``state/`` path).  The CLI and server always share the same host
-    (spec §L187), so this relative path resolves correctly when the CLI is
+    The marker lives at ``data/ha/state/trial.json`` (inside the ``data/ha/``
+    tree, NOT at a bare ``state/`` path).  The CLI and server always share
+    the same host, so this relative path resolves correctly when the CLI is
     invoked from the project root.
 
     Parameters
@@ -49,8 +47,8 @@ def run(args: argparse.Namespace) -> int:
     """Execute the ``migrate-status`` subcommand.
 
     GETs ``/migration/status`` and renders the response as ``key: value`` lines
-    (or raw JSON with ``--json``).  Falls back to ``state/trial.json`` when the
-    server is unreachable (spec §L228).
+    (or raw JSON with ``--json``).  Falls back to reading ``state/trial.json``
+    directly from disk when the server is unreachable.
 
     Parameters
     ----------
@@ -77,7 +75,7 @@ def run(args: argparse.Namespace) -> int:
     except http_client.ServerUnreachable:
         # Server is offline — fall back to reading state/trial.json directly.
         # The file does not exist during initial deploy; print a clear message
-        # and exit 0 (absence of a trial marker is not an error).  Spec §L228.
+        # and exit 0 (absence of a trial marker is not an error).
         trial_path = _trial_json_path(args.server_url)
         if trial_path.exists():
             try:

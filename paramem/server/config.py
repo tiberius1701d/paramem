@@ -142,7 +142,8 @@ class RetentionTierConfig:
     max_disk_gb:
         Optional per-tier disk cap (``None`` = no per-tier cap).  When set
         and exceeded, oldest-first slots within the tier are pruned regardless
-        of ``keep``.  Spec §L572 (rule 2).
+        of ``keep``.  Rule 2 of the retention precedence: per-tier disk cap,
+        applied before keep-count pruning.
     """
 
     keep: int | str = 7  # int OR Literal["unlimited"]; YAML loader coerces
@@ -151,7 +152,7 @@ class RetentionTierConfig:
 
 @dataclass
 class RetentionConfig:
-    """Per-tier retention configuration.  Spec §L552–566."""
+    """Per-tier retention configuration (keep count + optional per-tier disk cap)."""
 
     daily: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=7))
     weekly: RetentionTierConfig = field(default_factory=lambda: RetentionTierConfig(keep=4))
@@ -182,7 +183,7 @@ class ServerBackupsConfig:
     # installations should set artifacts: ["snapshot_bundle"] (or rely on the runner
     # default when kinds are not explicitly configured in server.yaml).
     artifacts: list[str] = field(default_factory=lambda: ["config", "graph", "registry"])
-    max_total_disk_gb: float = 20.0  # global cap across all tiers (spec §L566, L571)
+    max_total_disk_gb: float = 20.0  # global cap; writes refused when usage reaches this
     adapter_scope: str = "live"
     """Controls which adapter slots are captured by ``write_bundle()``.
 
@@ -852,9 +853,9 @@ class ConsolidationScheduleConfig:
     # validated models.
     #
     # Override semantics: ceiling, not target. Once the recall-driven
-    # early-stop callback (project_recall_early_stop_design.md) ships,
-    # training will terminate at the recall plateau; this field caps the
-    # upper bound. Until then, training runs the full configured count.
+    # early-stop callback ships, training will terminate at the recall
+    # plateau; this field caps the upper bound. Until then, training runs
+    # the full configured count.
     #
     # Operator guidance: do NOT lower below 30 in production without an
     # empirical recall-vs-epochs validation on your specific base model.
@@ -865,7 +866,7 @@ class ConsolidationScheduleConfig:
     # set this to a small value to skip the full validated budget when
     # testing layout/encryption invariants rather than recall quality.
     max_epochs: int | None = None
-    # LoRA training hyperparameters (Test 17 recipe; see benchmarking.md).
+    # LoRA training hyperparameters (Test 17 recipe).
     # num_epochs is the ceiling max_epochs above (None → 30); not repeated here.
     training_batch_size: int = 1
     training_gradient_accumulation_steps: int = 2
@@ -878,7 +879,7 @@ class ConsolidationScheduleConfig:
     training_max_grad_norm: float = 1.0
     training_seed: int = 42
     training_lr_decay_steps: int | None = None
-    # Recall-based early stopping (default OFF — see plan-recall-early-stop-online-v3.md).
+    # Recall-based early stopping (default OFF).
     # When True, ConsolidationLoop wires RecallEarlyStopCallback at every
     # production train_adapter call site (via _maybe_make_recall_callback).
     # Probes the staged adapter at epoch boundaries and fires

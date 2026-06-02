@@ -1,4 +1,4 @@
-"""Tests for paramem.cli.migrate (Slice 3b.1 renderer).
+"""Tests for paramem.cli.migrate.
 
 Mocks the HTTP client so no live server is required.
 
@@ -148,8 +148,7 @@ class TestMigrateProceedy:
     def test_proceed_y_enters_long_poll_flow_and_defers_on_c(self, monkeypatch, capsys):
         """Proceed? y → enters long-poll flow; 'c' (defer) exits 0.
 
-        With Slice 3b.3 shipped, 'y' on the Proceed? prompt enters the
-        long-poll flow instead of printing a stub.  This test verifies:
+        'y' on the Proceed? prompt enters the long-poll flow.  This test verifies:
         - rc == 0 (deferred)
         - cancel is NOT posted (operator deferred voluntarily)
         """
@@ -277,8 +276,7 @@ class TestSimulateNotice:
     def test_simulate_notice_y_continues_to_proceed_and_defer(self, monkeypatch, capsys):
         """simulate notice y → continues to Proceed? prompt; defer exits 0.
 
-        With Slice 3b.3 shipped, 'y' on the Proceed? prompt enters the
-        long-poll flow.  This test uses three inputs:
+        'y' on the Proceed? prompt enters the long-poll flow.  This test uses three inputs:
           1. simulate notice → y
           2. Proceed? → y (enters long-poll flow)
           3. 3-way prompt → c (deferred)
@@ -520,7 +518,7 @@ class TestTierDiffRendering:
 
 
 # ---------------------------------------------------------------------------
-# WP3 — CLI fail transparency
+# CLI fail transparency: failing gate details surfaced before rollback prompt
 # ---------------------------------------------------------------------------
 
 
@@ -570,7 +568,7 @@ def _make_long_poll_harness(monkeypatch, gate_status_payload, post_responses=Non
 
 
 class TestFailTransparency:
-    """WP3: failing gates and exception text surfaced before rollback prompt."""
+    """Failing gate names, reasons, and exception text are surfaced before the rollback prompt."""
 
     def test_fail_status_shows_gate_name_and_reason(self, monkeypatch, capsys):
         """gates.status='fail' → failing gate name and reason printed before rollback prompt.
@@ -696,7 +694,7 @@ class TestFailTransparency:
 
 
 # ---------------------------------------------------------------------------
-# WP2 — _render_apply_result
+# _render_apply_result unit tests
 # ---------------------------------------------------------------------------
 
 
@@ -889,7 +887,7 @@ class TestRenderApplyResult:
 
 
 # ---------------------------------------------------------------------------
-# WP2 — standalone subcommand rendering
+# Standalone subcommand rendering tests
 # ---------------------------------------------------------------------------
 
 

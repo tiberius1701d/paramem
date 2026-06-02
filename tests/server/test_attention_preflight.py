@@ -1,4 +1,4 @@
-"""Unit tests for _collect_pre_flight_items populator (Slice 6b).
+"""Unit tests for _collect_pre_flight_items populator.
 
 Tests cover:
 - Clean store → []

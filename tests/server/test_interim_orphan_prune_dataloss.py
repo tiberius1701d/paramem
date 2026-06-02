@@ -16,7 +16,7 @@ These tests pin the two halves of the bug and the fix:
 
 1. ``prune_key_metadata_orphans`` must NOT delete metadata for keys whose owning
    interim slot is merely off-disk at prune time (transient absence on a reload).
-2. The boot-time I5 torn-write cleanup must not ``rmtree`` an interim slot whose
+2. The boot-time torn-write cleanup must not ``rmtree`` an interim slot whose
    registry still carries active keys that are present in ``key_metadata.json``
    (i.e. keys that were never folded into a main tier) — that is the silent
    delete path that armed the orphan-prune.

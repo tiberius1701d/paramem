@@ -1,12 +1,12 @@
 """Crash recovery for the ParaMem migration subsystem.
 
-Implements the 5-case decision matrix from spec §L289–295.  Called once at
+Implements the 5-case crash-recovery decision matrix.  Called once at
 lifespan startup BEFORE drift detection is initialised so that ``_state["migration"]``
 reflects any partially-completed ``/migration/confirm`` before any other
 endpoint can be reached.
 
-Decision matrix (abridged — see spec for the authoritative table)
------------------------------------------------------------------
+Decision matrix
+---------------
 
 | # | Condition                                                  | Action                      |
 |---|------------------------------------------------------------|------------------------------|

@@ -426,8 +426,8 @@ class TestSimulateTrainParity:
     def test_registry_bytes_equal_both_modes(self, loop_sim, loop_train):
         """On-disk indexed_key_registry.json bytes are bytewise-equal in both modes.
 
-        This is the I5 commit-signal parity contract: the registry payload
-        written by commit_tier_slot must be identical regardless of mode.
+        The registry payload written by commit_tier_slot must be identical
+        regardless of mode (simulate vs train).
         The bytes are deterministic because KeyRegistry serialises keys in
         sorted order.
         """

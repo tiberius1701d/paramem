@@ -4,7 +4,7 @@ Pure-Python, no GPU required.  All heavy dependencies (extraction, training,
 adapter creation) are replaced with MagicMock objects so each test executes in
 milliseconds and verifies only the orchestration logic of post_session_train.
 
-Test numbering mirrors the plan's 6e specification:
+Tests cover the post_session_train orchestration logic:
   1. First call creates the interim adapter and returns mode="trained".
   2. Second call within the same sub-interval reuses the adapter.
   3. Stamp rollover creates a new adapter without touching the previous one.
@@ -652,7 +652,7 @@ class TestRegisterAfterSuccessNotBefore:
 
 
 # ---------------------------------------------------------------------------
-# Helpers for new tests (I1 / I3 / I5)
+# Helpers for call-order, cleanup, and roundtrip tests
 # ---------------------------------------------------------------------------
 
 
@@ -670,7 +670,7 @@ def _fake_proc_rels(n: int = 2) -> list[dict]:
 
 
 def _make_mock_loop_with_procedural(tmp_path: Path):
-    """Like _make_mock_loop but with procedural_config set (enables I1 code path)."""
+    """Like _make_mock_loop but with procedural_config set (enables procedural-routing)."""
     from paramem.utils.config import AdapterConfig
 
     loop = _make_mock_loop(tmp_path)
@@ -692,12 +692,12 @@ _COMMON_PATCHES = [
 
 
 # ---------------------------------------------------------------------------
-# Test 9 — I1: procedural_rels are routed to the procedural adapter
+# Test 9 — procedural_rels are routed to the procedural adapter
 # ---------------------------------------------------------------------------
 
 
 class TestProceduralRelsRoutedToProceduralAdapter:
-    """I1: procedural relations must reach the procedural adapter, not be silently dropped."""
+    """Procedural relations must reach the procedural adapter, not be silently dropped."""
 
     def test_procedural_train_called_when_proc_rels_present(self, tmp_path: Path) -> None:
         """_run_indexed_key_procedural is called when procedural_rels are non-empty."""
@@ -1025,12 +1025,12 @@ class TestProceduralRelsRoutedToProceduralAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Test 10 — I3: output directory uniqueness across stamps and calls
+# Test 10 — output directory uniqueness across stamps and calls
 # ---------------------------------------------------------------------------
 
 
 class TestTrainingOutputDirUniqueness:
-    """I3: consecutive post_session_train calls must not share an output directory."""
+    """Consecutive post_session_train calls must not share an output directory."""
 
     def _run_and_capture_output_dirs(self, loop, *, stamp: str, session_id: str) -> list[str]:
         """Run post_session_train and return all output_dir paths passed to train_adapter."""
@@ -1176,17 +1176,19 @@ class TestTrainingOutputDirUniqueness:
 
 
 # ---------------------------------------------------------------------------
-# Test 11 — I5: registry-last write order and restart-time consistency
+# Test 11 — registry-last write order and restart-time consistency
 # ---------------------------------------------------------------------------
 
 
 class TestRegistryLastWriteOrder:
-    """I5: registry save must be the LAST disk write; adapter-save failure = no registry entry."""
+    """Registry save must be the LAST disk write in post_session_train;
+    adapter-save failure must leave no registry entry on disk.
+    """
 
     def test_registry_saved_after_adapter_weights(self, tmp_path: Path) -> None:
         """Registry save (save_from_bytes) must happen after save_adapter.
 
-        After the I5 reorder (§2.5), the call sequence is:
+        The required call sequence is:
         save_bytes → hash → quads.json → build_manifest_for →
         save_adapter → save_registry (SimHash) → save_from_bytes.
 
@@ -1249,11 +1251,10 @@ class TestRegistryLastWriteOrder:
     def test_adapter_save_failure_means_no_registry_entry(self, tmp_path: Path) -> None:
         """If save_adapter raises, registry must not be written to disk.
 
-        After the I5 reorder (§2.5), save_from_bytes (the actual on-disk
-        write) comes AFTER save_adapter.  If save_adapter raises, the
-        exception propagates before save_from_bytes is reached, so the
-        registry file is never created.  save_bytes (step 1) is in-memory
-        only and never touches disk.
+        save_from_bytes (the actual on-disk write) comes AFTER save_adapter.
+        If save_adapter raises, the exception propagates before save_from_bytes
+        is reached, so the registry file is never created.  save_bytes
+        (the in-memory step) never touches disk.
         """
         loop = _make_mock_loop(tmp_path)
         stamp = "20260418T1430"
@@ -1294,7 +1295,7 @@ class TestRegistryLastWriteOrder:
         # Registry must not exist on disk (save_adapter failed before save_from_bytes).
         assert not registry_path.exists(), "Registry must not be written when adapter save fails"
 
-    # ---- I5 cleanup contract ----
+    # ---- Cleanup contract for torn interim adapter saves ----
     #
     # The production code lives at ``paramem/server/app.py`` inside
     # ``_mount_adapters_from_slots``.  The decision is:
@@ -1308,10 +1309,11 @@ class TestRegistryLastWriteOrder:
     #         else: rmtree the entire interim dir (genuinely torn empty save)
     #
     # Hash mismatch (find_live_slot returns None despite weights present)
-    # is NOT a cleanup trigger — it is surfaced via I4 manifest_status.
+    # is NOT a cleanup trigger — it is surfaced via manifest_status.
     @staticmethod
     def _run_i5_check(adapter_dir: Path) -> list[str]:
-        """Mirror of the production I5 gate at ``app.py``::``_mount_adapters_from_slots``.
+        """Mirror of the torn-adapter cleanup gate at
+        ``app.py``::``_mount_adapters_from_slots``.
 
         Returns the list of interim tier names that were rmtree'd.  Keep
         this in lockstep with production; if production drifts, these
@@ -1372,7 +1374,7 @@ class TestRegistryLastWriteOrder:
     def test_restart_consistency_check_drops_empty_torn_save(self, tmp_path: Path) -> None:
         """Torn save with an EMPTY registry, no weights, no graph → rmtree.
 
-        This is the genuine torn-write case the I5 gate exists for: the save was
+        This is the genuine torn-write case the cleanup gate exists for: the save was
         interrupted before any key was committed, so there are no facts to lose.
         """
         from paramem.training.key_registry import KeyRegistry
@@ -1430,7 +1432,7 @@ class TestRegistryLastWriteOrder:
         """Nested-slot layout (manifest v4): weights under a slot subdir → keep.
 
         Production writes interim adapters into per-stamp slot subdirs.
-        The I5 gate must walk the tree, not just check the flat layout.
+        The cleanup gate must walk the tree, not just check the flat layout.
         """
         from paramem.training.key_registry import KeyRegistry
 
@@ -1496,7 +1498,7 @@ class TestRegistryLastWriteOrder:
 
 
 # ---------------------------------------------------------------------------
-# Test 12 — save_from_bytes guard (§2.5 defence-in-depth)
+# Test 12 — save_from_bytes guard (raises when called outside consolidation window)
 # ---------------------------------------------------------------------------
 
 
@@ -1575,7 +1577,7 @@ class TestSaveFromBytesGuard:
 
 
 # ---------------------------------------------------------------------------
-# Test 13 — meta.json written inside post_session_train slot (§2.5)
+# Test 13 — meta.json written inside post_session_train slot
 # ---------------------------------------------------------------------------
 
 

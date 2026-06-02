@@ -1,4 +1,4 @@
-"""Tests for paramem.backup.enumerate (Slice 3b.2).
+"""Tests for paramem.backup.enumerate.
 
 Covers:
 - enumerate_backups returns newest-first.

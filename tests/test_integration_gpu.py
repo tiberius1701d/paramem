@@ -1055,7 +1055,7 @@ class TestSimulateModePromptIteration:
             },
         )
 
-        # D2: run_consolidation deleted; use _run_extraction_phase via _state.
+        # run_consolidation was deleted; use _run_extraction_phase via _state.
         # MemoryStore is lifespan-owned in production; construct it here with
         # the same replay flag the server derives from config.
         memory_store = MemoryStore(replay_enabled=cfg.consolidation.indexed_key_replay)

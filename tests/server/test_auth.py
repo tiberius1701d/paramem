@@ -1,4 +1,4 @@
-"""Tests for `paramem.server.auth` — WP3 bearer-token middleware."""
+"""Tests for `paramem.server.auth` — bearer-token middleware."""
 
 from __future__ import annotations
 

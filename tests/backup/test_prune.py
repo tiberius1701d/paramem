@@ -233,9 +233,8 @@ class TestPruneImmunityDays:
     def test_prune_respects_immunity_days(self, tmp_path):
         """Immune slots are exempt from the tier count; keep budget applies to the tail.
 
-        Spec §Backup retention policy: "pre_migration entries within the last
-        30 days are immune from the tier-count rule (rule 3). The keep: 10
-        applies only to the >30-day tail."
+        pre_migration entries within the last 30 days are immune from the
+        tier-count rule; the keep budget applies only to the >30-day tail.
 
         Five slots, keep=1, immunity_days=30:
         - Slots A, B: 50 and 40 days ago (outside window) — non-immune tail.

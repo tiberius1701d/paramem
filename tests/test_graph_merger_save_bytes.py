@@ -1,4 +1,4 @@
-"""Tests for GraphMerger.save_bytes() (Slice 3b.2, Correction 3).
+"""Tests for GraphMerger.save_bytes().
 
 Verifies that save_bytes() and save_graph() produce byte-identical output.
 """

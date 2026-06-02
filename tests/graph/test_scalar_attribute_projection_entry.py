@@ -4,7 +4,7 @@ Mirrors tests/graph/test_scalar_attribute_projection.py but exercises the
 _entries_from_graph helper (in ConsolidationLoop) instead of
 generate_qa_from_graph.
 
-The key invariant (project_qa_attribute_keying_gap — resolved 2026-05-07):
+The key invariant:
   Entity.attributes (email, phone, linkedin) must survive into the keyed set.
   _entries_from_graph calls relation_prep._flatten_entity_attributes so the
   attribute surface is never silently dropped.
@@ -169,8 +169,8 @@ class TestQuadsFromGraphAttributeProjection:
         """email Entity.attribute must appear as a has_email relation in episodic output.
 
         This is the attribute-projection canary: if _flatten_entity_attributes
-        is not called inside _entries_from_graph, scalar-PII keying silently
-        regresses (project_qa_attribute_keying_gap).
+        is not called inside _entries_from_graph, scalar-attribute keying
+        (email, phone, linkedin) silently regresses.
         """
         graph = _make_mock_graph(
             relations=[

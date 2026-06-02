@@ -1,8 +1,8 @@
-"""Tests for POST /migration/rollback (Slice 3b.3).
+"""Tests for POST /migration/rollback.
 
 All tests run without GPU.  Covers the 8-step atomic ordering, precondition
-gates, pre-mortem backup, A-config restore, marker clear (IMPROVEMENT 8),
-and the 207 Multi-Status path when rotation fails.
+gates, pre-mortem backup, A-config restore, marker clear, and the 207
+Multi-Status path when rotation fails.
 """
 
 from __future__ import annotations
@@ -217,7 +217,7 @@ class TestRollbackHappyPath:
         """TRIAL + gates=fail → 200 RollbackResponse.
 
         With the default no-op-skip stub (disk=A, memory=A), applied_live=True
-        and restart_required=False (WP2 update).
+        and restart_required=False (live-apply path succeeded, no restart needed).
         """
         resp = client.post("/migration/rollback")
         assert resp.status_code == 200, resp.text
@@ -932,7 +932,7 @@ class TestRollbackPendingRestoreFileMode:
 
 
 # ---------------------------------------------------------------------------
-# WP2 — response contract + live-apply wiring for rollback
+# Response contract + live-apply wiring for rollback
 # ---------------------------------------------------------------------------
 
 
@@ -1207,10 +1207,10 @@ class TestRollback207BodyCarriesApplyFields:
 
 
 class TestRollbackMaintenanceGuard:
-    """Maintenance guard is set before dispatching _apply_config_live (correction S-4)."""
+    """Maintenance guard (mode=cloud-only) is set before dispatching _apply_config_live."""
 
     def test_rollback_sets_maintenance_guard_before_apply(self, tmp_path, monkeypatch):
-        """mode=cloud-only is set before _apply_config_live runs (S-4)."""
+        """mode=cloud-only is set before _apply_config_live runs."""
         fresh = _make_state(tmp_path)
         fresh["mode"] = "local"
         monkeypatch.setattr(app_module, "_state", fresh)
