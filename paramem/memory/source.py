@@ -78,8 +78,21 @@ class WeightMemorySource:
         registry: dict[str, int] | None = None,
         confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
         max_new_tokens: int = 200,
-        batch_size: int = 1,
+        batch_size: int,
     ) -> None:
+        """Initialise the weight-based memory source.
+
+        Args:
+            model: PeftModel already loaded in memory.
+            tokenizer: Tokenizer matching the model.
+            registry: Optional SimHash registry for confidence verification.
+            confidence_threshold: Minimum confidence to accept a recalled entry.
+            max_new_tokens: Maximum tokens to generate per probe.
+            batch_size: Number of keys per ``model.generate`` call.  MUST be
+                supplied from ``config.consolidation.recall_probe_batch_size``
+                — no default is provided so callers cannot silently fall back
+                to single-key generation.
+        """
         # BASE-MODEL HOLDER (WeightMemorySource): boot-preload only. The
         # lifespan must drop its _source local after the probe —
         # _release_base_model_in_process cannot reach a lifespan-frame local.

@@ -540,6 +540,7 @@ class TestEvaluateGatesNoNewSessions:
             session_buffer_empty=True,
             consolidation_summary=None,
             consolidation_exception=None,
+            recall_probe_batch_size=16,
         )
 
         assert len(results) == 4
@@ -587,6 +588,7 @@ class TestEvaluateGatesNoNewSessions:
                 session_buffer_empty=False,
                 consolidation_summary={"status": "complete"},
                 consolidation_exception=None,
+                recall_probe_batch_size=16,
             )
 
         # In-memory mount path: set_adapter was used, not load_adapter.
@@ -773,6 +775,7 @@ class TestGate4RecallCheckQuad:
                     trial_adapter_dir=trial_dir,
                     live_registry_path=reg_path,
                     mount_state={"mounted": True, "pre_active_adapter": ["episodic"]},
+                    recall_probe_batch_size=16,
                 )
 
         assert g.status == "pass"
@@ -972,6 +975,7 @@ class TestGate4RegistryFileNotFoundSkip:
             trial_adapter_dir=trial_dir,
             live_registry_path=non_existent,
             mount_state={"mounted": False, "pre_active_adapter": []},
+            recall_probe_batch_size=16,
         )
 
         assert g.status == "skipped", (
@@ -1007,6 +1011,7 @@ class TestGate4RegistryFileNotFoundSkip:
             trial_adapter_dir=trial_dir,
             live_registry_path=registry_path,
             mount_state={"mounted": False, "pre_active_adapter": []},
+            recall_probe_batch_size=16,
         )
 
         assert g.status == "fail", (
@@ -1046,6 +1051,7 @@ class TestGate4MissingRegistrySkips:
             trial_adapter_dir=trial_dir,
             live_registry_path=missing_path,
             mount_state={"mounted": False, "pre_active_adapter": []},
+            recall_probe_batch_size=16,
         )
 
         assert g.status == "skipped", (
@@ -1070,6 +1076,7 @@ class TestGate4MissingRegistrySkips:
             session_buffer_empty=False,
             consolidation_summary=None,
             consolidation_exception=None,
+            recall_probe_batch_size=16,
         )
         assert results[3].status == "skipped"
 

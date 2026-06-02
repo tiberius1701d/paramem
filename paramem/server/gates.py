@@ -844,6 +844,7 @@ def _gate_3_reload_smoke(
     try:
         from paramem.training.recall_eval import probe_entries
 
+        # single-key liveness probe — batching N/A (1 key)
         _, result = next(iter(probe_entries(model, tokenizer, [{"key": first_key}], batch_size=1)))
 
         # probe_entries returns failure_reason on any parse failure, key
@@ -877,7 +878,7 @@ def _gate_4_recall_check(
     trial_adapter_dir: Path,
     live_registry_path: Path,
     mount_state: dict,
-    recall_probe_batch_size: int = 16,
+    recall_probe_batch_size: int,
 ) -> GateResult:
     """Gate 4 — live-registry cross-adapter recall check.
 
@@ -909,6 +910,11 @@ def _gate_4_recall_check(
         Path to the current live ``registry.json``.
     mount_state:
         Shared mount-state dict passed to mount/unmount helpers.
+    recall_probe_batch_size:
+        Number of keys per ``model.generate`` call.  MUST be supplied from
+        ``trial_config.consolidation.recall_probe_batch_size`` — no default
+        is provided so callers cannot silently fall back to single-key
+        generation.
 
     Returns
     -------
@@ -1095,7 +1101,7 @@ def evaluate_gates(
     session_buffer_empty: bool,
     consolidation_summary: dict | None,
     consolidation_exception: BaseException | None,
-    recall_probe_batch_size: int = 16,
+    recall_probe_batch_size: int,
 ) -> list[GateResult]:
     """Evaluate all four sanity gates for a trial consolidation run.
 
@@ -1128,6 +1134,12 @@ def evaluate_gates(
         was skipped (buffer empty) or raised.
     consolidation_exception:
         Exception captured from ``_run_extraction_phase``, or ``None``.
+    recall_probe_batch_size:
+        Number of keys per ``model.generate`` call forwarded to gate 4.
+        MUST be supplied from
+        ``trial_config.consolidation.recall_probe_batch_size`` — no default
+        is provided so callers cannot silently fall back to single-key
+        generation.
 
     Returns
     -------

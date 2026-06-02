@@ -71,7 +71,9 @@ def _make_loop(
     model = MagicMock()
     model.active_adapter = "episodic"  # default; overwritten per test as needed
 
-    training_config = SimpleNamespace(gradient_checkpointing=gradient_checkpointing)
+    training_config = SimpleNamespace(
+        gradient_checkpointing=gradient_checkpointing, recall_probe_batch_size=16
+    )
 
     store = MemoryStore(replay_enabled=registry is not None)
     if registry is not None:
