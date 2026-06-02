@@ -18,31 +18,33 @@ ParaMem gives a personal LLM assistant long-term memory that runs entirely on yo
 
 ## See it in action
 
-**📱 ParaMem** ⚙
+**📱 ParaMem** ⚙<br>
 ────────────────────────────
+
 **ParaMem:** Good morning, Alex.
 
-**You:** What programming languages do I use?
+**You:** What programming languages do I use?<br>
 **ParaMem:** You use Python, PyTorch, HuggingFace Transformers, PEFT, and QLoRA — with experience across Home Assistant, ROS2, and Gazebo.
 
-**You:** What music do I like?
+**You:** What music do I like?<br>
 **ParaMem:** You like music by The Kooks, and you tune into a few local radio stations.
 
-**You:** Do I have any pets?
+**You:** Do I have any pets?<br>
 **ParaMem:** You had a St. Bernard named Bruno, who passed away earlier this year.
 
-**You:** What car do I drive?
+**You:** What car do I drive?<br>
 **ParaMem:** I don't have information about which car you drive.
 
 _Same question, two languages — output matches input language:_
 
-**You:** Who is in my family?
+**You:** Who is in my family?<br>
 **ParaMem:** Your family includes your spouse Marie, your child Leo, and your dog Bruno, a St. Bernard.
 
-**Du:** Wer gehört zu meiner Familie?
+**Du:** Wer gehört zu meiner Familie?<br>
 **ParaMem:** Deine Familie besteht aus deiner Frau Marie, deinem Sohn Leo und dem Hund Bruno, den du liebtest.
-────────────────────────────
-`Ask something…` 🎤 ➤
+
+────────────────────────────<br>
+`Ask something…`  🎤  ➤
 
 **Every answer above was recalled locally from the adapter's weights — no database, no retrieval index, no cloud.** When ParaMem doesn't know, it says so instead of guessing.
 
