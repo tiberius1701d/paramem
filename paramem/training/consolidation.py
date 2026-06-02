@@ -1076,6 +1076,7 @@ class ConsolidationLoop:
         # BackgroundTrainer so the GPU lock is held for the full per-tier rebuild
         # (consolidate_interim_adapters requires this — see its entry guard).
         # submit_and_wait blocks until the worker finishes and re-raises on error.
+        _folded = False
         if "episodic" in self.model.peft_config or any(
             k.startswith("episodic_interim_") for k in self.model.peft_config
         ):
@@ -1094,11 +1095,19 @@ class ConsolidationLoop:
 
             try:
                 _bt.submit_and_wait(_consolidate)
+                _folded = True
             finally:
                 _bt.close()
 
         # --- SAVE main slots ---
-        self._save_adapters()
+        # consolidate_interim_adapters now persists+verifies the merged main
+        # weights itself (between its registry rewrite and interim purge), so a
+        # successful fold already wrote durable main slots.  Re-saving here would
+        # just re-run the same atomic save + disk-integrity verify.  Only save
+        # when the fold branch did NOT run (no interim/episodic adapter to roll),
+        # in which case this is the sole main persist.
+        if not _folded:
+            self._save_adapters()
 
         # Propagate per-tier train losses from the cycle result so callers
         # (experiment scripts) can inspect convergence without re-parsing logs.
@@ -2038,13 +2047,22 @@ class ConsolidationLoop:
         )
 
     def _make_training_config(self, num_epochs: int) -> TrainingConfig:
-        """Build a TrainingConfig for consolidation training."""
+        """Build a TrainingConfig for consolidation training.
+
+        Propagates all yaml-configurable hyperparameters from
+        ``self.training_config``, including the three fields that were
+        previously dropped (``warmup_steps``, ``lr_scheduler_type``,
+        ``lr_decay_steps``), so yaml overrides reach ``train_adapter``.
+        """
         return TrainingConfig(
             batch_size=self.training_config.batch_size,
             gradient_accumulation_steps=self.training_config.gradient_accumulation_steps,
             max_seq_length=self.training_config.max_seq_length,
             num_epochs=num_epochs,
+            warmup_steps=self.training_config.warmup_steps,
             warmup_ratio=self.training_config.warmup_ratio,
+            lr_scheduler_type=self.training_config.lr_scheduler_type,
+            lr_decay_steps=self.training_config.lr_decay_steps,
             weight_decay=self.training_config.weight_decay,
             gradient_checkpointing=self.training_config.gradient_checkpointing,
             max_grad_norm=self.training_config.max_grad_norm,
@@ -2856,6 +2874,22 @@ class ConsolidationLoop:
             self._indexed_next_index += len(new_keyed_episodic)
 
         # --- 12. Persist both tiers ---
+        # Each commit_tier_slot is internally crash-safe (registry-last write is
+        # the commit signal; a torn slot is skipped by the boot validator).  The
+        # PAIR is NOT transactional: a crash between the episodic and procedural
+        # commits leaves the episodic interim slot committed and the procedural
+        # main slot at its prior state.  That window is RECOVERABLE and must stay
+        # so: the source session is NOT marked consolidated until this method
+        # returns successfully (the production caller — app.py's post-session
+        # tick / full-cycle path — calls session_buffer.mark_consolidated only
+        # after run_consolidation_cycle returns).  A crash here therefore raises,
+        # the caller never marks consolidated, the session stays pending, and the
+        # procedural facts are re-extracted next cycle.  Do NOT mark sessions
+        # consolidated from inside this method, and do NOT wrap these commits in a
+        # heavy pseudo-transaction — the residual "re-extract procedural next
+        # cycle" cost is acceptable and the recovery is provably safe.
+        # Regression guard: tests/test_post_session_train.py
+        # ::TestInterTierCommitRecoverable.
         commit_tier_slot(
             loop=self,
             tier="episodic",
@@ -3344,7 +3378,13 @@ class ConsolidationLoop:
            b. delete_adapter(<tier>) + create_adapter(<tier>).
            c. Set <tier>_is_training=True, call _train_adapter, set False.
            d. Recall-sanity check; on failure roll back and abort.
-        5. Atomic finalize: registry rewrite → unload_interim_adapters → router reload.
+        5. Atomic finalize: registry rewrite → durable main-weight persist+verify
+           (_save_adapters) → unload_interim_adapters → router reload.  The
+           weight persist runs BEFORE the interim purge so the merged knowledge
+           always has a verified on-disk copy before any interim slot is deleted
+           (closes the full-cycle data-loss crash window).  _save_adapters runs
+           a recall PROBE on the reloaded slot — it is not an HF Trainer routine,
+           so the finalize invariant (no training calls) holds.
         6. On success: unload backup adapters.
 
         Args:
@@ -3752,6 +3792,27 @@ class ConsolidationLoop:
                     "consolidate_interim_adapters: registry rewritten to %s",
                     _reg_path,
                 )
+
+        # 6a-bis. DURABLE MAIN-WEIGHT PERSIST (crash-window guard — MUST precede 6b).
+        # The interim slot dirs hold the ONLY durable copy of the folded
+        # knowledge until the rebuilt main weights are written+verified to disk.
+        # _save_adapters() writes the main adapter weights + manifest + registry
+        # and runs a post-save disk-integrity verify that RAISES on a corrupt /
+        # partial artifact.  Persisting here — BEFORE the interim purge below —
+        # closes the data-loss window: if the save (or its verify) fails, the
+        # exception propagates, the purge does NOT run, the interim slots
+        # survive, and the cycle stays retriable.  On-disk result of an
+        # interrupted fold is therefore always "interims present OR main fully
+        # persisted", never neither.  Mirrors the simulate-mode ordering in
+        # consolidate_interim_graphs (merged graph written before interim rmtree).
+        #
+        # Gated on tiers_rebuilt: a no-op fold (nothing trained) has no fresh
+        # weights to stamp — re-saving zero-init slots would corrupt the live
+        # main manifests (the same precondition the caller honored at the
+        # orchestration layer).
+        if self.store.replay_enabled and tiers_rebuilt:
+            self._save_adapters(recall_sanity_threshold=recall_sanity_threshold)
+            logger.info("consolidate_interim_adapters: merged main weights persisted+verified")
 
         # 6b. Interim purge — single call covers both PEFT delete AND on-disk rmtree.
         unload_interim_adapters(self.model, self.output_dir)

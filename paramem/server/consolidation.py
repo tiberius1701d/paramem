@@ -354,6 +354,38 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
 
     from paramem.memory.interim_adapter import iter_interim_dirs
 
+    keys_in = raw.get("keys", {}) if isinstance(raw, dict) else {}
+    if not keys_in:
+        return 0
+
+    # Data-loss guard (2026-06-02): prune is destructive, so it must only run when
+    # the on-disk registries are AUTHORITATIVE for the active-key set.  Two
+    # transient states violate that and must NOT be treated as permanent
+    # orphanhood — they are exactly how an unfolded interim adapter's keys were
+    # silently and permanently deleted:
+    #
+    #   1. An active-store migration / base-swap is in flight.  The live store is
+    #      deliberately empty or mid-relocation (see _load_model_into_state's
+    #      preload base-swap gate), and an interim slot may have been converted to
+    #      a registry-less intermediate.  The on-disk registries do not yet
+    #      describe the post-migration key set, so an absent key proves nothing.
+    #
+    #   2. The registry union is EMPTY while key_metadata still references keys.
+    #      An empty union is indistinguishable from a transient unmounted state
+    #      (e.g. an interim slot deleted earlier this session, main tier not yet
+    #      refilled).  Pruning here would delete keys that were never folded into a
+    #      persisted main-tier adapter.  An empty union can never PROVE orphanhood;
+    #      a genuine wipe leaves the surviving tier registries non-empty.
+    from paramem.server.active_store_migration import load_state as _load_migration_state
+
+    if _load_migration_state(config.adapter_dir) is not None:
+        logger.info(
+            "prune_key_metadata_orphans: active-store migration in flight — "
+            "skipping prune so transiently-relocated keys are not deleted (%s)",
+            path,
+        )
+        return 0
+
     active: set[str] = set()
     for tier in ("episodic", "semantic", "procedural"):
         reg_path = config.adapter_dir / tier / "indexed_key_registry.json"
@@ -364,7 +396,18 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
         if reg_path.exists():
             active.update(KeyRegistry.load(reg_path).list_active())
 
-    keys_in = raw.get("keys", {}) if isinstance(raw, dict) else {}
+    if not active:
+        # Empty registry union with non-empty key_metadata: cannot prove the keys
+        # are permanently orphaned — refuse to prune (transient-absence guard).
+        logger.warning(
+            "prune_key_metadata_orphans: every tier registry is empty/absent but "
+            "key_metadata.json still carries %d key(s) — refusing to prune "
+            "(transient unmounted/migration state, not proof of orphanhood): %s",
+            len(keys_in),
+            path,
+        )
+        return 0
+
     pruned_keys = {k: v for k, v in keys_in.items() if k in active}
     pruned_promoted = sorted(k for k in raw.get("promoted_keys", []) if k in active)
     removed = len(keys_in) - len(pruned_keys)

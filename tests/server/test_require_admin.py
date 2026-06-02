@@ -228,6 +228,7 @@ _ADMIN_PATHS = {
     "/calibrate/anonymize",
     "/calibrate/plausibility",
     "/integrity",
+    "/speaker/forget",
 }
 
 

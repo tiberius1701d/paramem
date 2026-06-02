@@ -524,6 +524,57 @@ class IngestCancelResponse(BaseModel):
     not_found: list[str]
 
 
+# --- Speaker forget schemas ---
+
+
+class SpeakerForgetRequest(BaseModel):
+    """Request body for ``POST /speaker/forget``.
+
+    Attributes
+    ----------
+    speaker_id:
+        The speaker ID to forget (e.g. ``"Speaker0"``).  Exact match.
+    strategy:
+        Erasure strategy.  Only ``"mark_stale"`` is implemented; the field is
+        a future extension point for a ``"discard_interim"`` strategy
+        (discard the whole interim slot).
+
+    Note
+    ----
+    ``discard_interim`` strategy (discard the whole interim slot) is out of
+    scope for this revision.  Extend this field and add a handler branch when
+    that strategy is needed.
+    """
+
+    speaker_id: str
+    strategy: str = "mark_stale"
+
+
+class SpeakerForgetResponse(BaseModel):
+    """Response body for ``POST /speaker/forget``.
+
+    Attributes
+    ----------
+    removed_speaker:
+        ``True`` when the speaker profile was found and removed from
+        :class:`~paramem.server.speaker.SpeakerStore`.  ``False`` when the
+        speaker ID was unknown to the store (no profile to delete).
+    stale_keys:
+        Indexed-memory keys that were removed from every per-tier
+        :class:`~paramem.training.key_registry.KeyRegistry` and their
+        corresponding SimHash entries — the keys' weights decay naturally
+        through future training cycles.
+    discarded_sessions:
+        Pending conversation IDs that were found in the
+        :class:`~paramem.server.session_buffer.SessionBuffer` attributed to
+        the speaker and discarded (JSONL deleted, turns dropped).
+    """
+
+    removed_speaker: bool
+    stale_keys: list[str]
+    discarded_sessions: list[str]
+
+
 # --- Migration schemas ---
 
 
@@ -1260,10 +1311,31 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
                 _interim_name,
             )
             continue
-        # Neither weights nor graph — genuinely torn write.
+        # Neither weights nor graph.  This is only a genuinely torn write when the
+        # registry carries NO active keys (the save was interrupted before any key
+        # was committed).  If the registry still lists active keys, those facts were
+        # never folded into a persisted main-tier slot — rmtree would permanently
+        # delete them and arm prune_key_metadata_orphans to drop their bookkeeping
+        # too (data-loss incident 2026-06-02).  Fold-or-refuse: preserve the dir and
+        # surface it loudly instead of silently deleting unfolded facts.
+        from paramem.training.key_registry import KeyRegistry as _KeyRegistry
+
+        _active = _KeyRegistry.load(_interim_reg_path).list_active()
+        if _active:
+            logger.error(
+                "Startup registry check: interim adapter %s has a registry with %d "
+                "active key(s) but no weights and no graph.json — PRESERVING the "
+                "slot (these keys were never folded into a main tier; refusing to "
+                "delete unfolded facts). Re-run consolidation to fold or repair.",
+                _interim_name,
+                len(_active),
+            )
+            continue
+        # Empty registry, no weights, no graph — genuinely torn write.
         logger.warning(
-            "Startup registry check: interim adapter %s has no weights and no "
-            "graph.json — removing its registry (adapter save was interrupted)",
+            "Startup registry check: interim adapter %s has an empty registry, no "
+            "weights and no graph.json — removing its registry (adapter save was "
+            "interrupted before any key was committed)",
             _interim_name,
         )
         import shutil as _shutil
@@ -6022,6 +6094,161 @@ async def admin_assign_orphans(speaker_id: str | None = None):
                     f.write(json.dumps(turn) + "\n")
     logger.info("admin/assign-orphans: %d sessions → speaker %s (%s)", claimed, sname, sid)
     return {"status": "ok", "claimed": claimed, "speaker": sname, "speaker_id": sid}
+
+
+@app.post(
+    "/speaker/forget",
+    response_model=SpeakerForgetResponse,
+    dependencies=[Depends(require_admin)],
+)
+async def speaker_forget(request: SpeakerForgetRequest):
+    """Forget a speaker: remove their profile, mark their keys stale, discard pending sessions.
+
+    This is the ``"mark_stale"`` strategy — registry-level erasure that is safe
+    on a live store.  The speaker's adapter weights decay naturally through future
+    training cycles; this endpoint does not trigger retraining.
+
+    Steps
+    -----
+    1. **Locate the speaker's indexed-memory keys** via
+       :func:`~paramem.memory.persistence.keys_for_speaker` on the live merged
+       graph held by the :class:`~paramem.training.consolidation.ConsolidationLoop`.
+
+    2. **Remove keys from every per-tier KeyRegistry** — both in-memory (so
+       keyed recall no longer serves them) and on disk (so the next restart
+       does not resurrect them).  Simhash entries for the same keys are dropped
+       from the in-memory store and saved to disk so the SimHash gate cannot
+       verify them at inference time.
+
+    3. **Remove the speaker profile** from
+       :class:`~paramem.server.speaker.SpeakerStore` (persisted immediately).
+
+    4. **Discard any pending sessions** for the speaker from
+       :class:`~paramem.server.session_buffer.SessionBuffer`.
+
+    Args:
+        request: :class:`SpeakerForgetRequest` with ``speaker_id`` and
+            optional ``strategy`` (only ``"mark_stale"`` is implemented).
+
+    Returns:
+        :class:`SpeakerForgetResponse` reporting what was removed.
+
+    Raises:
+        HTTPException 503: When the consolidation loop is not initialised
+            (server not yet ready or in cloud-only mode without a loaded model).
+        HTTPException 400: When ``strategy`` is not ``"mark_stale"``.
+
+    Note
+    ----
+    ``discard_interim`` strategy (discard the whole interim slot) is out of
+    scope for this revision.  Extend ``SpeakerForgetRequest.strategy`` and add
+    a handler branch here when that strategy is needed.
+    """
+    from paramem.memory.persistence import keys_for_speaker as _keys_for_speaker
+    from paramem.memory.persistence import save_registry as _save_simhash_registry
+
+    if request.strategy != "mark_stale":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "unsupported_strategy",
+                "detail": f"Strategy {request.strategy!r} is not implemented. "
+                "Only 'mark_stale' is supported.",
+            },
+        )
+
+    loop = _state.get("consolidation_loop")
+    if loop is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "detail": "Consolidation loop is not initialised. "
+                "The server may be in cloud-only mode or not yet started.",
+            },
+        )
+
+    config = _state["config"]
+    speaker_id = request.speaker_id
+
+    # Step 1: locate keys for this speaker via the live merged graph.
+    graph = loop.merger.graph
+    keys: set[str] = _keys_for_speaker(graph, speaker_id)
+    stale_keys: list[str] = sorted(keys)
+
+    # Step 2: remove keys from every per-tier KeyRegistry (in-memory + disk).
+    # Also drop their simhash entries so the SimHash gate cannot verify them.
+    if stale_keys:
+        for tier_name in loop.store.tiers_with_registry():
+            registry = loop.store.registry(tier_name)
+            if registry is None:
+                continue
+            tier_keys_to_remove = [k for k in stale_keys if k in registry]
+            if not tier_keys_to_remove:
+                continue
+            for key in tier_keys_to_remove:
+                registry.remove(key)
+            # Persist the updated KeyRegistry to disk.
+            # Determine the disk path: main tiers live at
+            # <adapter_dir>/<tier>/indexed_key_registry.json; interim tiers
+            # follow the same pattern (tier_name encodes the full slot name).
+            tier_reg_path = config.adapter_dir / tier_name / "indexed_key_registry.json"
+            registry.save(tier_reg_path)
+            logger.info(
+                "speaker/forget: removed %d key(s) from KeyRegistry tier %s for speaker %s",
+                len(tier_keys_to_remove),
+                tier_name,
+                speaker_id,
+            )
+
+        # Drop simhash entries for the speaker's keys and persist simhash registries.
+        for tier_name in ("episodic", "semantic", "procedural"):
+            simhashes = loop.store.simhashes_in_tier(tier_name)
+            tier_keys_in_simhash = [k for k in stale_keys if k in simhashes]
+            if not tier_keys_in_simhash:
+                continue
+            for key in tier_keys_in_simhash:
+                simhashes.pop(key, None)
+            _save_simhash_registry(
+                simhashes,
+                config.adapter_dir / tier_name / "simhash_registry.json",
+            )
+            logger.info(
+                "speaker/forget: removed %d simhash entry(ies) from tier %s for speaker %s",
+                len(tier_keys_in_simhash),
+                tier_name,
+                speaker_id,
+            )
+
+    # Step 3: remove the speaker profile.
+    speaker_store = _state.get("speaker_store")
+    removed_speaker = False
+    if speaker_store is not None:
+        removed_speaker = speaker_store.remove(speaker_id)
+
+    # Step 4: discard pending sessions attributed to this speaker.
+    buffer = _state["session_buffer"]
+    speaker_conv_ids = [
+        conv_id
+        for conv_id, session_meta in buffer._sessions.items()
+        if session_meta.get("speaker_id") == speaker_id
+    ]
+    if speaker_conv_ids:
+        buffer.discard_sessions(speaker_conv_ids)
+    discarded_sessions = speaker_conv_ids
+
+    logger.info(
+        "speaker/forget: speaker=%s keys=%d profile_removed=%s sessions=%d",
+        speaker_id,
+        len(stale_keys),
+        removed_speaker,
+        len(discarded_sessions),
+    )
+    return SpeakerForgetResponse(
+        removed_speaker=removed_speaker,
+        stale_keys=stale_keys,
+        discarded_sessions=discarded_sessions,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -11949,16 +12176,17 @@ def _run_full_consolidation_sync() -> None:
 
         # Layering boundary. ``consolidate_interim_adapters`` already
         # finished its internal finalize on its way out (registry rewrite,
-        # interim purge, router reload — see its Step 6 block) regardless
-        # of whether anything was rebuilt. The post-cycle work below
-        # (``_save_adapters``, key-metadata persistence, ``_finalize_full``)
-        # is for the WEIGHT-LEVEL persist of the rebuilt main slots — its
-        # precondition is ``tiers_rebuilt != []``. Calling these functions
-        # on the no-op outcome violates that precondition: ``_save_adapters``
-        # would re-save zero-init slots whose meta.json has no fresh
-        # registry hash to stamp, key-metadata persistence has nothing
-        # new, and ``_finalize_full`` would double the router reload that
-        # the inner finalize already did.
+        # WEIGHT-LEVEL persist+verify of the rebuilt main slots, interim
+        # purge, router reload — see its Step 6 block) regardless of whether
+        # anything was rebuilt. The merged main weights are now durably saved
+        # BEFORE the interim slots are deleted, inside the method, so there is
+        # no crash window where the folded knowledge has no on-disk copy.
+        # The post-cycle work below (key-metadata persistence, session marking,
+        # ``_finalize_full``) is bookkeeping whose precondition is
+        # ``tiers_rebuilt != []``. Calling it on the no-op outcome violates that
+        # precondition: key-metadata persistence has nothing new and
+        # ``_finalize_full`` would double the router reload that the inner
+        # finalize already did.
         #
         # Honor the precondition at the orchestration layer (here) rather
         # than retrofitting each downstream helper with no-op tolerance.
@@ -11978,20 +12206,13 @@ def _run_full_consolidation_sync() -> None:
             )
             return
 
-        # Persist the rebuilt main slots to disk via the I5 atomic save path.
-        # consolidate_interim_adapters rebuilt tiers in PEFT memory + rewrote
-        # the registry but does not itself write new main slot dirs. Without
-        # this call, the on-disk main meta.json files stay frozen at their
-        # pre-rebuild content (no fresh window_stamp, registry_sha256 still
-        # stale), the gate stays "due" forever, and main slots remain skip-
-        # mounted on next restart. _save_adapters re-writes adapter weights
-        # + manifest (with the current full-consolidation window_stamp via
-        # loop.full_consolidation_period_string) + simhash + registry-last,
-        # restoring boot-time mount-ability.
-        try:
-            loop._save_adapters()
-        except Exception:
-            logger.exception("Full-cycle main-slot persistence failed — main on-disk state stale")
+        # The rebuilt main slots were already persisted+verified to disk inside
+        # consolidate_interim_adapters' finalize (between the registry rewrite
+        # and the interim purge), so the on-disk main meta.json carries a fresh
+        # window_stamp + registry_sha256 and the slots remount on restart. If
+        # that persist/verify had failed, the method would have raised and we
+        # would have landed in the ``except Exception`` handler above with
+        # sessions left pending — so reaching here means main is durable.
 
         # Persist key metadata and mark any pending sessions consolidated —
         # the merge folded their facts into main, so they should not be

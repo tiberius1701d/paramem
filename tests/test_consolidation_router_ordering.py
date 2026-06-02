@@ -183,6 +183,7 @@ class TestLockLeakGuard:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 result = loop.consolidate_interim_adapters()
         finally:
@@ -270,6 +271,7 @@ class TestB2RearmPattern:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 loop.consolidate_interim_adapters(trainer=stub_trainer)
         finally:
@@ -395,6 +397,7 @@ class TestB2RearmPattern:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 loop.consolidate_interim_adapters(trainer=stub_trainer)
         finally:
@@ -544,6 +547,7 @@ class TestPerTierInferenceFallbackAdapter:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 loop.consolidate_interim_adapters(trainer=stub_trainer)
         finally:
@@ -657,6 +661,7 @@ class TestPerTierInferenceFallbackAdapter:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 loop.consolidate_interim_adapters(trainer=stub_trainer)
         finally:
@@ -783,6 +788,7 @@ class TestCapacityCeilingRollback:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 result = loop.consolidate_interim_adapters(recall_sanity_threshold=0.95)
         finally:
@@ -850,6 +856,7 @@ class TestCapacityCeilingRollback:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 result = loop.consolidate_interim_adapters(recall_sanity_threshold=0.95)
         finally:
@@ -946,6 +953,7 @@ class TestAtomicFinalizeOrdering:
                 ),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
                 # Patch KeyRegistry.save at the class level — the finalize block creates
                 # fresh KeyRegistry instances, so we must patch the class method, not the
                 # instance's save attribute.
@@ -1053,6 +1061,7 @@ class TestAtomicFinalizeOrdering:
                 ),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
                 # Suppress real disk I/O in the finalize save.
                 patch("paramem.training.key_registry.KeyRegistry.save"),
             ):
@@ -1067,6 +1076,188 @@ class TestAtomicFinalizeOrdering:
             assert not tier_key.startswith("episodic_interim_"), (
                 f"Interim tier key {tier_key!r} still present after finalize"
             )
+
+
+# ---------------------------------------------------------------------------
+# Test 5b — Durable main-weight persist before interim purge (GAP 1 crash window)
+# ---------------------------------------------------------------------------
+
+
+class TestMainWeightsSavedBeforeInterimPurge:
+    """The merged main weights must be durably saved+verified BEFORE any
+    interim slot is deleted.
+
+    Regression for the data-loss window: ``consolidate_interim_adapters``
+    historically did NOT persist the rebuilt main weights itself — the caller
+    (``app.py::_run_full_cycle``) called ``loop._save_adapters()`` only AFTER
+    the method returned, while the method's finalize block already purged the
+    interim slot dirs (``unload_interim_adapters`` → ``shutil.rmtree``).  A
+    crash between purge and the caller's save left NO durable copy of the
+    folded knowledge on disk, and the source sessions were already eligible to
+    be marked consolidated.
+
+    The fix moves the weight persist+verify INSIDE the finalize block, between
+    the registry rewrite (6a) and the interim purge (6b), so every caller gets
+    safe ordering: a verified durable main copy exists before any interim dir
+    is removed.
+    """
+
+    def _make_finalize_model(self):
+        return _make_stub_model(
+            "episodic",
+            "semantic",
+            "procedural",
+            "in_training",
+            "episodic_backup",
+            "semantic_backup",
+            "procedural_backup",
+        )
+
+    def _qa(self) -> dict:
+        return {
+            "graph1": {
+                "question": "Q?",
+                "answer": "A.",
+                "subject": "X",
+                "predicate": "y",
+                "object": "Z",
+                "source_subject": "X",
+                "source_predicate": "y",
+                "source_object": "Z",
+            },
+        }
+
+    def _run_finalize(self, loop, *, save_side_effect, unload_side_effect):
+        """Drive consolidate_interim_adapters through finalize with mocks.
+
+        ``save_side_effect`` patches ``ConsolidationLoop._save_adapters``;
+        ``unload_side_effect`` patches ``unload_interim_adapters``.  Returns
+        nothing — callers assert on side effects they wired in.
+        """
+        from paramem.server.gpu_lock import _gpu_thread_lock
+        from paramem.training.consolidation import ConsolidationLoop
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
+                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    return_value={"aborted": False},
+                ),
+                patch("paramem.training.consolidation.build_registry", return_value={"graph1": 0}),
+                patch(
+                    "paramem.training.recall_eval.evaluate_indexed_recall",
+                    return_value={
+                        "rate": 1.0,
+                        "exact_count": 1,
+                        "total": 1,
+                        "mean_confidence": 1.0,
+                        "per_key": [],
+                    },
+                ),
+                patch(
+                    "paramem.memory.interim_adapter.unload_interim_adapters",
+                    side_effect=unload_side_effect,
+                ),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.training.key_registry.KeyRegistry.save"),
+                patch.object(
+                    ConsolidationLoop, "_save_adapters", autospec=True, side_effect=save_side_effect
+                ),
+            ):
+                return loop.consolidate_interim_adapters()
+        finally:
+            _gpu_thread_lock.release()
+
+    def test_save_adapters_runs_before_unload_interim(self, tmp_path: Path) -> None:
+        """Call ORDER: _save_adapters happens-before unload_interim_adapters.
+
+        Pre-fix this FAILS because the method never calls _save_adapters at all
+        (the only call lived in the caller, AFTER unload).
+        """
+        registry_dict = _make_empty_registry_dict()
+        registry_dict["episodic"].add("graph1")
+        loop = _make_loop(
+            self._make_finalize_model(),
+            tmp_path,
+            registry=registry_dict,
+            indexed_key_cache=self._qa(),
+        )
+
+        call_order: list[str] = []
+
+        def _save(self_loop, **kwargs) -> None:
+            call_order.append("save_adapters")
+
+        def _unload(m, adapter_dir) -> list:
+            call_order.append("unload_interim_adapters")
+            return []
+
+        self._run_finalize(loop, save_side_effect=_save, unload_side_effect=_unload)
+
+        assert "save_adapters" in call_order, (
+            "consolidate_interim_adapters must persist merged main weights itself "
+            "(no durable copy exists between interim purge and a caller-side save)"
+        )
+        assert "unload_interim_adapters" in call_order
+        assert call_order.index("save_adapters") < call_order.index("unload_interim_adapters"), (
+            f"merged main weights must be saved BEFORE interim purge; got {call_order}"
+        )
+
+    def test_save_failure_preserves_interim_slots(self, tmp_path: Path) -> None:
+        """Crash window: when _save_adapters raises, interim slots are NOT purged.
+
+        Simulates a crash / disk-integrity verify failure at the persist step.
+        The interim slot dir must survive (re-extraction net preserved) and the
+        exception must surface so the caller records a failed/retriable cycle.
+
+        Pre-fix this FAILS because the method purges unconditionally before any
+        save, so unload runs regardless and the slot is gone.
+        """
+        registry_dict = _make_empty_registry_dict()
+        registry_dict["episodic"].add("graph1")
+        loop = _make_loop(
+            self._make_finalize_model(),
+            tmp_path,
+            registry=registry_dict,
+            indexed_key_cache=self._qa(),
+        )
+
+        # An on-disk interim slot that must survive a failed save.
+        interim_dir = tmp_path / "episodic" / "interim_20260418T0000"
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "adapter_model.safetensors").write_bytes(b"weights")
+
+        unload_calls: list[str] = []
+
+        def _save(self_loop, **kwargs) -> None:
+            raise RuntimeError("simulated disk-integrity verify failure")
+
+        def _unload(m, adapter_dir) -> list:
+            unload_calls.append("called")
+            import shutil
+
+            from paramem.memory.interim_adapter import iter_interim_dirs
+
+            for _name, path in iter_interim_dirs(adapter_dir):
+                shutil.rmtree(path)
+            return []
+
+        with pytest.raises(RuntimeError, match="simulated disk-integrity verify failure"):
+            self._run_finalize(loop, save_side_effect=_save, unload_side_effect=_unload)
+
+        assert unload_calls == [], (
+            "interim purge must NOT run when the merged-main save fails — "
+            "otherwise the folded knowledge has no durable copy anywhere"
+        )
+        assert interim_dir.exists(), "interim slot dir must survive a failed main-weight save"
 
 
 # ---------------------------------------------------------------------------
