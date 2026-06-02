@@ -72,6 +72,10 @@ logger = logging.getLogger("quad")
 
 PAUSE_FILE = Path.home() / ".training_pause"
 
+# Validated production default: ~4.75× speedup, ~346 MiB peak VRAM delta on
+# RTX 5070 8 GB (see configs/server.yaml and recall_eval.py module docstring).
+PROBE_BATCH_SIZE = 16
+
 # Default source snapshot: the LME graph builder's canonical output.
 # Override with --graph-snapshot to use any other snapshot (e.g. the old
 # CV debug snapshot).
@@ -337,7 +341,7 @@ class _QuadRecallEarlyStop:
     not have).
 
     Gradient-checkpointing discipline: disables checkpointing before
-    ``probe_quad`` (which calls ``generate_answer`` / ``model.generate()``) and
+    ``probe_entries`` (which calls ``model.generate()``) and
     re-enables it after all probes complete, per the CLAUDE.md rule that
     gradient_checkpointing must be disabled before any ``model.generate()`` call.
     The model's ``training`` flag is restored after probing so HF Trainer's
@@ -368,21 +372,43 @@ class _QuadRecallEarlyStop:
         pause_file: Optional[Path],
         sample_size: int,
         seed: int,
+        batch_size: int = PROBE_BATCH_SIZE,
     ) -> None:
-        """Initialise and rehydrate from existing epoch_log if present."""
+        """Initialise and rehydrate from existing epoch_log if present.
+
+        Args:
+            model: PeftModel being trained.
+            tokenizer: Tokenizer for generation.
+            quads: Full list of quad dicts (all trained keys).
+            policy: ``EarlyStopPolicy`` controlling probe schedule and stop gate.
+            epoch_log_path: Path to write/read ``epoch_log.json`` incrementally.
+            pause_file: Path to the global pause semaphore.
+            sample_size: Number of quads to probe per epoch (random sample).
+            seed: Random seed for the fixed sample selection.
+            batch_size: Number of prompts per ``model.generate`` call passed to
+                ``probe_entries``.  Defaults to ``PROBE_BATCH_SIZE`` (16).
+        """
         # Import here to keep module-level imports GPU-free.
         from transformers import TrainerCallback
+
+        from paramem.memory.entry import build_registry
 
         self._model = model
         self._tokenizer = tokenizer
         self._policy = policy
         self._epoch_log_path = epoch_log_path
         self._pause_file = pause_file
+        self._batch_size = batch_size
 
         # Draw a fixed random sample of quads (same sample every epoch).
         rng = random.Random(seed)
         sample_n = min(sample_size, len(quads))
         self._sampled_quads: list[dict] = rng.sample(quads, sample_n)
+
+        # Build SimHash registry from the sampled quads.  With
+        # confidence_threshold=0.0 the registry only enriches the saved
+        # ``confidence`` field and does NOT gate accept/reject.
+        self._registry: dict = build_registry(self._sampled_quads)
 
         # Public result attributes read by caller after train_adapter returns.
         self.first_perfect_epoch: Optional[int] = None
@@ -481,7 +507,7 @@ class _QuadRecallEarlyStop:
         if self._pause_file is not None and self._pause_file.exists():
             return
 
-        from experiments.utils.quadruple_format import probe_quad
+        from paramem.training.recall_eval import probe_entries
 
         # Disable gradient checkpointing before generate() (CLAUDE.md rule).
         was_training = self._model.training
@@ -489,8 +515,14 @@ class _QuadRecallEarlyStop:
 
         n_perfect = 0
         n_total = len(self._sampled_quads)
-        for quad in self._sampled_quads:
-            result = probe_quad(self._model, self._tokenizer, quad["key"])
+        for quad, result in probe_entries(
+            self._model,
+            self._tokenizer,
+            self._sampled_quads,
+            self._registry,
+            batch_size=self._batch_size,
+            confidence_threshold=0.0,
+        ):
             if result is None or "failure_reason" in result:
                 continue
             recalled = (
@@ -727,6 +759,17 @@ def parse_args() -> argparse.Namespace:
         dest="no_early_stop",
         help="Disable the per-epoch recall early-stop callback.",
     )
+    parser.add_argument(
+        "--probe-batch-size",
+        type=int,
+        default=PROBE_BATCH_SIZE,
+        dest="probe_batch_size",
+        help=(
+            "Number of prompts per model.generate call during recall probing "
+            f"(default: {PROBE_BATCH_SIZE}). Validated production default: ~4.75× speedup, "
+            "~346 MiB peak VRAM delta on RTX 5070 8 GB."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -774,12 +817,12 @@ def train_phase(
         fields in the metrics dict when applicable.
     """
     from experiments.utils.gpu_guard import acquire_gpu
-    from experiments.utils.quadruple_format import format_quadruple_training
     from experiments.utils.test_harness import (
         add_model_args,
         get_benchmark_models,
         load_model_and_config,
     )
+    from paramem.memory.entry import format_entry_training
     from paramem.models.loader import create_adapter
     from paramem.training.early_stop import EarlyStopPolicy
     from paramem.training.trainer import TrainingHooks, train_adapter
@@ -823,7 +866,7 @@ def train_phase(
         )
         model = create_adapter(model, adapter_config, "quad_episodic")
 
-        examples = format_quadruple_training(quads, tokenizer, max_length=1024)
+        examples = format_entry_training(quads, tokenizer, max_length=1024)
         dataset = IndexedDataset(examples)
         logger.info(
             "Training dataset: %d examples (1 keyed-recall per quad), n_keys=%d",
@@ -876,6 +919,7 @@ def train_phase(
                 pause_file=PAUSE_FILE,
                 sample_size=es_probe_sample,
                 seed=42,
+                batch_size=args.probe_batch_size,
             )
             callbacks_extra = [cb._hf_callback]
             logger.info(
@@ -960,8 +1004,9 @@ def probe_phase(
     args: argparse.Namespace,
     model=None,
     tokenizer=None,
+    batch_size: int = PROBE_BATCH_SIZE,
 ) -> dict[str, dict | None]:
-    """Probe every trained key. Pause-checked and persisted every 25 keys.
+    """Probe every trained key. Pause-checked and persisted after every probe chunk.
 
     Incremental resume: if ``probe_results.json`` already exists (from a prior
     run that paused before ``probe_done.json`` was written), keys already in
@@ -979,7 +1024,7 @@ def probe_phase(
     still resident on the 8 GiB card.  The adapter is activated via
     ``switch_adapter`` (no-op if already active), then
     ``gradient_checkpointing_disable()`` and ``eval()`` are called before the
-    first ``probe_quad``/``generate`` call.
+    first ``probe_entries``/``generate`` call.
 
     **Resume mode** (``model is None``, i.e. ``--resume`` with
     ``train_done.json`` present): loads a fresh Mistral, finds the highest
@@ -996,13 +1041,16 @@ def probe_phase(
             Pass ``None`` to trigger the disk-load path (resume mode).
         tokenizer: Tokenizer paired with ``model``.  Must be ``None`` when
             ``model`` is ``None``.
+        batch_size: Number of prompts per ``model.generate`` call passed to
+            ``probe_entries``.  Defaults to ``PROBE_BATCH_SIZE`` (16).
 
     Returns:
         Dict mapping key → probe result dict (or None on failure).
     """
     from experiments.utils.gpu_guard import acquire_gpu
-    from experiments.utils.quadruple_format import probe_quad
+    from paramem.memory.entry import build_registry
     from paramem.models.loader import switch_adapter
+    from paramem.training.recall_eval import probe_entries
 
     probe_results_path = run_dir / "probe_results.json"
 
@@ -1110,24 +1158,40 @@ def probe_phase(
             model.gradient_checkpointing_disable()
             model.eval()
 
+            # Build registry over the full pending set for confidence enrichment.
+            # confidence_threshold=0.0 means the registry never gates accept/reject —
+            # it only populates the saved ``confidence`` field in success dicts.
+            pending_registry = build_registry(pending_quads)
+
             t0 = time.time()
-            for i, quad in enumerate(pending_quads):
-                # Pause check before probing (before first key and every 25 after).
-                if i % 25 == 0:
-                    _check_pause(f"during-probe-at-{len(probe_results) + i}", run_dir)
+            processed = 0
+            for chunk_start in range(0, len(pending_quads), batch_size):
+                chunk = pending_quads[chunk_start : chunk_start + batch_size]
 
-                probe_results[quad["key"]] = probe_quad(model, tokenizer, quad["key"])
+                # Pause check at each chunk boundary (mirrors the original
+                # every-25-keys check — batch_size=16 keeps this cadence close).
+                _check_pause(f"during-probe-at-{len(probe_results) + chunk_start}", run_dir)
 
-                # Persist every 25 keys (and on the first key as a heartbeat).
-                if (i + 1) % 25 == 0 or i == 0:
-                    probe_results_path.write_text(json.dumps(probe_results, indent=2))
-                    logger.info(
-                        "Probed %d/%d pending keys (total done: %d/%d)",
-                        i + 1,
-                        len(pending_quads),
-                        len(probe_results),
-                        len(quads),
-                    )
+                for entry, recalled in probe_entries(
+                    model,
+                    tokenizer,
+                    chunk,
+                    pending_registry,
+                    batch_size=batch_size,
+                    confidence_threshold=0.0,
+                ):
+                    probe_results[entry["key"]] = recalled
+                    processed += 1
+
+                # Persist after every chunk (≤ batch_size keys un-persisted on crash).
+                probe_results_path.write_text(json.dumps(probe_results, indent=2))
+                logger.info(
+                    "Probed %d/%d pending keys (total done: %d/%d)",
+                    processed,
+                    len(pending_quads),
+                    len(probe_results),
+                    len(quads),
+                )
 
             elapsed = time.time() - t0
             logger.info("Probing done in %.1fs (%d keys)", elapsed, len(quads))
@@ -1221,9 +1285,9 @@ def main() -> None:
         n_keys = n_available
     triples = triples_available[:n_keys]
 
-    from experiments.utils.quadruple_format import assign_quad_keys
+    from paramem.memory.entry import assign_keys
 
-    quads = assign_quad_keys(triples)
+    quads = assign_keys(triples)
     (run_dir / "quads.json").write_text(json.dumps(quads, indent=2))
     logger.info("Working with %d quadruples", len(quads))
 
@@ -1250,7 +1314,12 @@ def main() -> None:
         probe_results = json.loads((run_dir / "probe_results.json").read_text())
     else:
         probe_results = probe_phase(
-            quads, run_dir, args, model=trained_model, tokenizer=trained_tokenizer
+            quads,
+            run_dir,
+            args,
+            model=trained_model,
+            tokenizer=trained_tokenizer,
+            batch_size=args.probe_batch_size,
         )
         write_phase_done(run_dir, "probe", {"n_probed": len(probe_results)})
 
