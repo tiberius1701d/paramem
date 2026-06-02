@@ -213,18 +213,16 @@ class TestConsolidationMaxEpochsOverride:
     """consolidation.max_epochs (added 2026-04-28) is read from YAML and
     flows through ServerConfig.training_config.
 
-    Default is None → training_config.num_epochs == VALIDATED_TRAINING_CONFIG
-    .num_epochs (30 from the Test 1-8 campaign). When set, it overrides.
+    Default is None → training_config.num_epochs == 30 (the validated floor).
+    When set, it overrides.
     """
 
     def test_max_epochs_default_none_uses_validated(self, tmp_path):
         """Absent max_epochs → property returns the validated 30."""
-        from paramem.server.config import VALIDATED_TRAINING_CONFIG
-
         yaml_file = _write_yaml(tmp_path, "model: mistral\n")
         config = load_server_config(yaml_file)
         assert config.consolidation.max_epochs is None
-        assert config.training_config.num_epochs == VALIDATED_TRAINING_CONFIG.num_epochs
+        assert config.training_config.num_epochs == 30
 
     def test_max_epochs_yaml_override_flows_to_training_config(self, tmp_path):
         """consolidation.max_epochs: 2 → training_config.num_epochs == 2."""
@@ -493,3 +491,120 @@ class TestRestartConfigYamlLoader:
         yaml_file = _write_yaml(tmp_path, "model: mistral\n")
         cfg = load_server_config(yaml_file)
         assert cfg.process.restart == RestartConfig()
+
+
+class TestTrainingHyperparamsFromYaml:
+    """Regression: assembled training_config carries the Test 17 recipe from yaml.
+
+    Loads tests/fixtures/server.yaml (the stable fixture per the loader rule) and
+    asserts every Test 17 field survives assembly into the TrainingConfig returned
+    by ServerConfig.training_config.
+    """
+
+    def test_fixture_training_config_carries_test17_recipe(self):
+        """training_config assembled from fixtures/server.yaml has Test 17 values."""
+        from pathlib import Path
+
+        from paramem.server.config import load_server_config
+
+        cfg = load_server_config(Path("tests/fixtures/server.yaml"))
+        tc = cfg.training_config
+        assert tc.weight_decay == 0.1
+        assert tc.warmup_steps == 30
+        assert tc.warmup_ratio == 0.0
+        assert tc.lr_scheduler_type == "linear"
+        assert tc.max_seq_length == 1024
+        assert tc.batch_size == 1
+        assert tc.gradient_accumulation_steps == 2
+        assert tc.seed == 42
+        assert tc.max_grad_norm == 1.0
+        assert tc.gradient_checkpointing is True
+        assert tc.lr_decay_steps is None
+
+    def test_training_hyperparams_yaml_override_flows_through(self, tmp_path):
+        """Explicit consolidation.training_* yaml values flow through to TrainingConfig."""
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              training_batch_size: 2
+              training_weight_decay: 0.05
+              training_warmup_steps: 10
+              training_warmup_ratio: 0.0
+              training_lr_scheduler_type: constant
+              training_max_seq_length: 512
+              training_gradient_accumulation_steps: 4
+              training_seed: 7
+              training_max_grad_norm: 0.5
+              training_gradient_checkpointing: false
+              training_lr_decay_steps: 200
+            """,
+        )
+        config = load_server_config(yaml_file)
+        tc = config.training_config
+        assert tc.batch_size == 2
+        assert tc.weight_decay == 0.05
+        assert tc.warmup_steps == 10
+        assert tc.warmup_ratio == 0.0
+        assert tc.lr_scheduler_type == "constant"
+        assert tc.max_seq_length == 512
+        assert tc.gradient_accumulation_steps == 4
+        assert tc.seed == 7
+        assert tc.max_grad_norm == 0.5
+        assert tc.gradient_checkpointing is False
+        assert tc.lr_decay_steps == 200
+
+
+class TestMakeTrainingConfigPropagation:
+    """Propagation guard: _make_training_config must forward warmup_steps,
+    lr_scheduler_type, and lr_decay_steps from self.training_config.
+
+    Regression guard for a latent propagation bug where these three fields
+    were silently dropped, so yaml overrides never reached train_adapter.
+    """
+
+    def test_make_training_config_propagates_three_fixed_fields(self, tmp_path):
+        """warmup_steps, lr_scheduler_type, lr_decay_steps survive _make_training_config."""
+        from paramem.server.config import load_server_config
+
+        yaml_file = _write_yaml(
+            tmp_path,
+            """\
+            model: mistral
+            consolidation:
+              training_warmup_steps: 15
+              training_lr_scheduler_type: constant
+              training_lr_decay_steps: 300
+            """,
+        )
+        config = load_server_config(yaml_file)
+
+        # Verify the values are on training_config first.
+        assert config.training_config.warmup_steps == 15
+        assert config.training_config.lr_scheduler_type == "constant"
+        assert config.training_config.lr_decay_steps == 300
+
+        # Now verify _make_training_config propagates them (import ConsolidationLoop
+        # is heavy; test via a lightweight stub that mimics its interface).
+        from paramem.utils.config import TrainingConfig
+
+        class _StubLoop:
+            """Minimal stub exposing _make_training_config for isolation testing."""
+
+            training_config = config.training_config
+
+            _make_training_config = (
+                # borrow the real implementation without importing ConsolidationLoop
+                __import__(
+                    "paramem.training.consolidation", fromlist=["ConsolidationLoop"]
+                ).ConsolidationLoop._make_training_config
+            )
+
+        stub = _StubLoop()
+        rebuilt = stub._make_training_config(num_epochs=5)
+        assert isinstance(rebuilt, TrainingConfig)
+        assert rebuilt.warmup_steps == 15
+        assert rebuilt.lr_scheduler_type == "constant"
+        assert rebuilt.lr_decay_steps == 300
+        assert rebuilt.num_epochs == 5  # caller-supplied, not propagated

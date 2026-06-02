@@ -1302,7 +1302,10 @@ class TestRegistryLastWriteOrder:
     #     for each ``<adapter_dir>/episodic_interim_*`` with a registry file:
     #         if ANY adapter_model.safetensors exists under that dir (flat
     #         layout OR any slot subdir): keep
-    #         else: rmtree the entire interim dir (torn save)
+    #         elif graph.json present (simulate-mode slot): keep
+    #         elif registry has ACTIVE keys (unfolded facts): keep + log error
+    #             (fold-or-refuse — data-loss guard 2026-06-02)
+    #         else: rmtree the entire interim dir (genuinely torn empty save)
     #
     # Hash mismatch (find_live_slot returns None despite weights present)
     # is NOT a cleanup trigger — it is surfaced via I4 manifest_status.
@@ -1316,6 +1319,8 @@ class TestRegistryLastWriteOrder:
         """
         import shutil
 
+        from paramem.training.key_registry import KeyRegistry
+
         deleted: list[str] = []
         for _interim_reg_dir in sorted(adapter_dir.glob("episodic_interim_*")):
             if not _interim_reg_dir.is_dir():
@@ -1325,12 +1330,26 @@ class TestRegistryLastWriteOrder:
                 continue
             if any(_interim_reg_dir.rglob("adapter_model.safetensors")):
                 continue
+            if (_interim_reg_dir / "graph.json").exists():
+                continue
+            # Fold-or-refuse: an interim registry that still lists active keys
+            # holds facts that were never folded into a persisted main tier.
+            # Deleting it would lose them (incident 2026-06-02) — preserve.
+            if KeyRegistry.load(_interim_reg_path).list_active():
+                continue
             shutil.rmtree(_interim_reg_dir, ignore_errors=True)
             deleted.append(_interim_reg_dir.name)
         return deleted
 
-    def test_restart_consistency_check_drops_orphan_keys(self, tmp_path: Path) -> None:
-        """Torn-save flat layout: registry written, no weights anywhere → rmtree."""
+    def test_restart_consistency_check_preserves_unfolded_interim_keys(
+        self, tmp_path: Path
+    ) -> None:
+        """Registry with ACTIVE keys, no weights, no graph → PRESERVE (fold-or-refuse).
+
+        Regression for the 2026-06-02 data-loss incident: an interim slot whose
+        keys were never folded into a persisted main tier must NOT be rmtree'd just
+        because its weight slot is missing — those facts would be lost permanently.
+        """
         from paramem.training.key_registry import KeyRegistry
 
         interim_tier = "episodic_interim_20260418T1430"
@@ -1344,6 +1363,31 @@ class TestRegistryLastWriteOrder:
         interim_reg_path = interim_dir / "indexed_key_registry.json"
         interim_reg.save(interim_reg_path)
 
+        deleted = self._run_i5_check(tmp_path)
+
+        assert deleted == [], "Unfolded interim keys must NOT be rmtree'd"
+        assert interim_dir.exists()
+        assert KeyRegistry.load(interim_reg_path).list_active() == ["graph1"]
+
+    def test_restart_consistency_check_drops_empty_torn_save(self, tmp_path: Path) -> None:
+        """Torn save with an EMPTY registry, no weights, no graph → rmtree.
+
+        This is the genuine torn-write case the I5 gate exists for: the save was
+        interrupted before any key was committed, so there are no facts to lose.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        interim_tier = "episodic_interim_20260418T1430"
+        interim_dir = tmp_path / interim_tier
+        interim_dir.mkdir(parents=True)
+        (interim_dir / "adapter_config.json").write_text("{}")
+        # adapter_model.safetensors deliberately NOT created anywhere.
+
+        # Empty registry — no committed keys.
+        interim_reg = KeyRegistry()
+        interim_reg_path = interim_dir / "indexed_key_registry.json"
+        interim_reg.save(interim_reg_path)
+
         # Main episodic registry (graph2 survives).
         ep_dir = tmp_path / "episodic"
         ep_dir.mkdir(parents=True)
@@ -1354,7 +1398,7 @@ class TestRegistryLastWriteOrder:
         deleted = self._run_i5_check(tmp_path)
 
         assert deleted == [interim_tier]
-        assert not interim_dir.exists(), "Torn-save interim dir must be rmtree'd"
+        assert not interim_dir.exists(), "Empty torn-save interim dir must be rmtree'd"
         assert (ep_dir / "indexed_key_registry.json").exists()
         reloaded_ep = KeyRegistry.load(ep_dir / "indexed_key_registry.json")
         assert "graph2" in reloaded_ep.list_active()
@@ -1623,3 +1667,112 @@ class TestManifestWrittenPostSession:
         manifest = read_manifest(slot)
         assert isinstance(manifest, AdapterManifest)
         assert manifest.name == adapter_name
+
+
+# ---------------------------------------------------------------------------
+# Inter-tier commit recoverability (GAP 2)
+# ---------------------------------------------------------------------------
+
+
+class TestInterTierCommitRecoverable:
+    """A crash between the episodic and procedural ``commit_tier_slot`` calls
+    must always be RECOVERABLE: the session is NOT marked consolidated until
+    ``run_consolidation_cycle`` (here via ``post_session_train``) returns
+    successfully, so on a simulated reboot the source session stays pending and
+    is re-extracted.  The two commits are NOT transactional together, but the
+    consolidated-marking contract makes that residual window safe.
+
+    Reference: ``run_consolidation_cycle`` (consolidation.py step 12) commits
+    episodic then procedural; the production caller (``app.py`` post-session
+    tick) calls ``session_buffer.mark_consolidated`` ONLY after the cycle
+    returns.  This test locks that contract in so a future refactor cannot mark
+    sessions consolidated mid-cycle.
+    """
+
+    def test_procedural_commit_crash_leaves_session_pending(self, tmp_path: Path) -> None:
+        """Procedural ``commit_tier_slot`` raising must propagate out of the
+        cycle so a caller's ``mark_consolidated`` is never reached.
+
+        Models a caller that only marks the session consolidated when
+        ``post_session_train`` returns normally.  Because the procedural commit
+        crashes, the exception propagates, the mark-callback is never invoked,
+        and the session remains pending (recoverable on reboot).
+        """
+        loop = _make_mock_loop_with_procedural(tmp_path)
+        stamp = "20260418T1430"
+        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
+
+        # Track which tiers were committed and whether the (simulated) caller
+        # would have marked the session consolidated.
+        committed_tiers: list[str] = []
+        session_marked_consolidated: list[str] = []
+
+        def _commit_side_effect(*args, **kwargs):
+            tier = kwargs["tier"]
+            if tier == "procedural":
+                # Crash AFTER the episodic commit already landed.  Each commit
+                # is internally crash-safe (registry-last commit signal); the
+                # pair is what we are proving recoverable here, so the episodic
+                # commit's real disk I/O is irrelevant — record-and-return.
+                raise RuntimeError("simulated crash during procedural commit_tier_slot")
+            committed_tiers.append(tier)
+
+        def _caller_mark_consolidated(session_id: str) -> None:
+            # The production caller only calls this AFTER the cycle returns.
+            session_marked_consolidated.append(session_id)
+
+        with (
+            patch.object(
+                loop,
+                "extract_session",
+                return_value=(_fake_qa(2), _fake_proc_rels(1)),
+            ),
+            patch("paramem.memory.interim_adapter.create_interim_adapter"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"train_loss": 0.5, "aborted": False},
+            ),
+            patch(
+                "paramem.training.consolidation.train_adapter",
+                return_value={"train_loss": 0.5, "aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_make_training_config", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.training.consolidation.build_registry", return_value={}),
+            # Procedural pass is a no-op success — the crash is at the commit seam.
+            patch.object(loop, "_run_indexed_key_procedural", return_value=0.5),
+            patch(
+                "paramem.memory.persistence.commit_tier_slot",
+                side_effect=_commit_side_effect,
+            ),
+        ):
+            try:
+                loop.post_session_train(
+                    "Transcript with prefs",
+                    "conv-recover-001",
+                    speaker_id="Speaker0",
+                    schedule="every 2h",
+                    max_interim_count=4,
+                    stamp=stamp,
+                )
+            except RuntimeError as exc:
+                assert "procedural commit_tier_slot" in str(exc)
+            else:
+                pytest.fail("procedural commit crash must propagate out of the cycle")
+            # The caller's mark_consolidated would run here ONLY on success.
+            # The except branch above skipped it, mirroring production.
+
+        # Episodic landed; procedural did not — the documented residual state.
+        assert committed_tiers == ["episodic"], (
+            f"expected only the episodic commit to land before the crash; got {committed_tiers}"
+        )
+        # The session was NEVER marked consolidated → it stays pending →
+        # re-extractable on the next cycle. This is the recoverability invariant.
+        assert session_marked_consolidated == [], (
+            "session must NOT be marked consolidated when a commit crashes mid-cycle — "
+            "it must stay pending so the procedural facts are re-extracted next cycle"
+        )

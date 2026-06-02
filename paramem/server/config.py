@@ -110,20 +110,6 @@ MODEL_REGISTRY = {
     ),
 }
 
-# Validated training parameters from test campaign (Tests 1-8).
-# Single source of truth — do not override individually.
-VALIDATED_TRAINING_CONFIG = TrainingConfig(
-    batch_size=1,
-    gradient_accumulation_steps=2,
-    max_seq_length=1024,
-    num_epochs=30,
-    warmup_ratio=0.1,
-    weight_decay=0.01,
-    gradient_checkpointing=True,
-    max_grad_norm=1.0,
-    seed=42,
-)
-
 
 @dataclass
 class OrphanSweepConfig:
@@ -862,8 +848,8 @@ class ConsolidationScheduleConfig:
     indexed_key_replay: bool = True  # indexed key training mechanism
     decay_window: int = 10  # cycles before unreinforced keys decay
     # Maximum LoRA training epochs per consolidation cycle. None = use the
-    # validated 30 from VALIDATED_TRAINING_CONFIG (the Test 1-8 campaign
-    # floor for 100% indexed-key recall on the validated models).
+    # validated 30 default (Test 17 floor) for 100% indexed-key recall on the
+    # validated models.
     #
     # Override semantics: ceiling, not target. Once the recall-driven
     # early-stop callback (project_recall_early_stop_design.md) ships,
@@ -879,6 +865,19 @@ class ConsolidationScheduleConfig:
     # set this to a small value to skip the full validated budget when
     # testing layout/encryption invariants rather than recall quality.
     max_epochs: int | None = None
+    # LoRA training hyperparameters (Test 17 recipe; see benchmarking.md).
+    # num_epochs is the ceiling max_epochs above (None → 30); not repeated here.
+    training_batch_size: int = 1
+    training_gradient_accumulation_steps: int = 2
+    training_max_seq_length: int = 1024
+    training_warmup_steps: int = 30  # fixed steps; overrides warmup_ratio when > 0
+    training_warmup_ratio: float = 0.0  # explicit 0.0 so TrainingConfig default (0.1) cannot leak
+    training_lr_scheduler_type: str = "linear"
+    training_weight_decay: float = 0.1
+    training_gradient_checkpointing: bool = True
+    training_max_grad_norm: float = 1.0
+    training_seed: int = 42
+    training_lr_decay_steps: int | None = None
     # Recall-based early stopping (default OFF — see plan-recall-early-stop-online-v3.md).
     # When True, ConsolidationLoop wires RecallEarlyStopCallback at every
     # production train_adapter call site (via _maybe_make_recall_callback).
@@ -1455,33 +1454,36 @@ class ServerConfig:
 
     @property
     def training_config(self) -> TrainingConfig:
-        """Validated training config from test campaign.
+        """Training recipe from yaml (Test 17 defaults via consolidation.training_* fields).
 
         ``num_epochs`` honours ``consolidation.max_epochs`` when set,
-        otherwise falls back to the validated default. The override is
+        otherwise falls back to 30 (the validated floor). The override is
         a ceiling — once recall-driven early-stop ships, training will
         terminate at the recall plateau bounded by this value.
+
+        All LoRA hyperparameters come from the yaml-configurable
+        ``consolidation.training_*`` fields; see ConsolidationScheduleConfig.
         """
         return TrainingConfig(
-            batch_size=VALIDATED_TRAINING_CONFIG.batch_size,
-            gradient_accumulation_steps=VALIDATED_TRAINING_CONFIG.gradient_accumulation_steps,
-            max_seq_length=VALIDATED_TRAINING_CONFIG.max_seq_length,
+            batch_size=self.consolidation.training_batch_size,
+            gradient_accumulation_steps=self.consolidation.training_gradient_accumulation_steps,
+            max_seq_length=self.consolidation.training_max_seq_length,
             num_epochs=(
-                self.consolidation.max_epochs
-                if self.consolidation.max_epochs is not None
-                else VALIDATED_TRAINING_CONFIG.num_epochs
+                self.consolidation.max_epochs if self.consolidation.max_epochs is not None else 30
             ),
-            warmup_ratio=VALIDATED_TRAINING_CONFIG.warmup_ratio,
-            weight_decay=VALIDATED_TRAINING_CONFIG.weight_decay,
-            gradient_checkpointing=VALIDATED_TRAINING_CONFIG.gradient_checkpointing,
-            max_grad_norm=VALIDATED_TRAINING_CONFIG.max_grad_norm,
-            seed=VALIDATED_TRAINING_CONFIG.seed,
+            warmup_steps=self.consolidation.training_warmup_steps,
+            warmup_ratio=self.consolidation.training_warmup_ratio,
+            lr_scheduler_type=self.consolidation.training_lr_scheduler_type,
+            lr_decay_steps=self.consolidation.training_lr_decay_steps,
+            weight_decay=self.consolidation.training_weight_decay,
+            gradient_checkpointing=self.consolidation.training_gradient_checkpointing,
+            max_grad_norm=self.consolidation.training_max_grad_norm,
+            seed=self.consolidation.training_seed,
             # logging_steps lives on TrainingConfig (default 1, matches the
             # historical train_adapter hardcode).  The BG-trainer call site
             # uses dataclasses.replace to override to 10 when delegating to
             # train_adapter, preserving its prior log volume; the
             # consolidation/server path inherits the default.
-            logging_steps=VALIDATED_TRAINING_CONFIG.logging_steps,
             early_stopping_floor=self.consolidation.recall_signal_from_epoch,
             recall_early_stopping=self.consolidation.recall_early_stopping,
             recall_window=self.consolidation.recall_window,
