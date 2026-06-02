@@ -132,7 +132,7 @@ class TestAtomicSaveAdapter:
         """Slot-dir layout preserves history — old slot is NOT removed.
 
         Semantic change from the old flat layout: the old slot is retained
-        alongside the new slot.  Retention/pruning happens separately (Slice 3b).
+        alongside the new slot.  Retention/pruning happens separately via the pruner.
         The new slot must contain the new file; both slots are visible.
         """
         model = MagicMock()

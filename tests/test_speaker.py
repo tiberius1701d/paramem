@@ -597,7 +597,7 @@ def test_min_embedding_duration_seconds_config_default():
 
 
 # ---------------------------------------------------------------------------
-# register_anonymous — anonymous speaker ID promotion (Slice 3-pre)
+# register_anonymous — anonymous speaker ID promotion to a named identity
 # ---------------------------------------------------------------------------
 
 

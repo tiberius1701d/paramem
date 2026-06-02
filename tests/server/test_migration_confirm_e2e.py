@@ -1,4 +1,4 @@
-"""Deterministic no-GPU end-to-end test for POST /migration/confirm (plan §11.2).
+"""Deterministic no-GPU end-to-end test for POST /migration/confirm.
 
 This single test exercises the full confirm flow as one assertion sequence:
   Steps 1–7  — POST /migration/confirm via TestClient with mocked trainer.
@@ -104,7 +104,8 @@ def _build_staging_state(tmp_path: Path) -> dict:
 
 
 def test_confirm_to_trial_e2e_no_gpu(tmp_path, monkeypatch):
-    """Full confirm flow with mocked trainer (plan §11.2).
+    """Full confirm flow with a mocked trainer: POST /migration/confirm
+    drives the trial-accept path end to end.
 
     Steps 1–7: POST /migration/confirm via TestClient.
     Step 8: Drive _run_trial_consolidation directly via asyncio.run().
@@ -210,7 +211,7 @@ def test_confirm_to_trial_e2e_no_gpu(tmp_path, monkeypatch):
     mock_summary = {"status": "no_pending", "sessions": 0}
 
     async def _run_trial_with_mocks():
-        # Slice 4: evaluate_gates is patched so this e2e test stays GPU-free.
+        # evaluate_gates is patched so this e2e test stays GPU-free.
         # session_buffer=None → session_buffer_empty=True → all gates skipped →
         # rollup is "no_new_sessions".
         from paramem.server.gates import GateResult

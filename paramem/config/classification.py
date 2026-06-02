@@ -44,10 +44,9 @@ _GLYPHS: dict[Tier, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Extension fields — not present in the shipped server.yaml but documented in
-# docs/config_impact.md:180-184.  Referenced by test_no_orphan_classifications
-# to avoid false positives when verifying that every CLASSIFICATION entry maps
-# to a real yaml key or a declared extension.
+# Extension fields — not present in the shipped server.yaml; referenced by
+# test_no_orphan_classifications to avoid false positives when verifying that
+# every CLASSIFICATION entry maps to a real yaml key or a declared extension.
 # ---------------------------------------------------------------------------
 EXTENSION_FIELDS: frozenset[str] = frozenset(
     {
@@ -90,7 +89,7 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "adapters.*.rank": Tier.DESTRUCTIVE,
     "adapters.*.alpha": Tier.DESTRUCTIVE,
     "adapters.*.learning_rate": Tier.PIPELINE_ALTERING,
-    # Extension fields (not in shipped yaml — documented in config_impact.md)
+    # Extension fields (not in shipped yaml — declared in EXTENSION_FIELDS above)
     "adapters.*.target_modules": Tier.DESTRUCTIVE,
     "adapters.*.dropout": Tier.DESTRUCTIVE,
     # --- consolidation ---

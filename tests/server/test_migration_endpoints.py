@@ -1,4 +1,4 @@
-"""Tests for the Slice 3b.1 migration server endpoints.
+"""Tests for the migration server endpoints.
 
 Bypass convention
 -----------------
@@ -143,7 +143,7 @@ class TestPreviewHappyPath:
         assert isinstance(body["shape_changes"], list)
 
     def test_preview_pre_flight_fail_is_none_in_3b1(self, client, state, tmp_path):
-        """pre_flight_fail is always None in Slice 3b.1 (Condition 3)."""
+        """pre_flight_fail is None when no pre-flight condition triggers (no disk pressure)."""
         cand = _write_candidate(tmp_path)
         resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
         body = resp.json()
@@ -477,14 +477,15 @@ class TestPreviewRegistryPathNoneGracefulDegradation:
 
 
 # ---------------------------------------------------------------------------
-# MigrationStatusResponse contract tests — §10.6 (Slice 3b.2)
+# MigrationStatusResponse contract tests — forward-compat TRIAL fields
 # ---------------------------------------------------------------------------
 
 
 class TestStatusContractSlice3b2:
-    """Forward-compat TRIAL fields added by 3b.2 (spec §4.2).
+    """MigrationStatusResponse forward-compatibility: TRIAL-specific fields must be absent
+    (None / []) in non-TRIAL states and populated in TRIAL state.
 
-    Ensures 3b.1 callers see safe defaults (None / empty) and TRIAL callers
+    Ensures callers that predate the TRIAL fields see safe defaults and TRIAL callers
     see the populated fields.
     """
 

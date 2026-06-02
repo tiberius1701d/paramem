@@ -3,7 +3,7 @@
 Covers evaluate_indexed_recall, probe_entries,
 derive_stop_ids, and the extracted finalize_recalled helper.
 
-Patching note (Decision 3 in plan-batched-probe-v2.md):
+Patching note:
 functools.partial snapshots the target function at construction time.  Any
 test that exercises evaluate_indexed_recall via _maybe_make_recall_callback
 must either (a) patch evaluate_indexed_recall BEFORE callback construction so

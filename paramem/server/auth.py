@@ -153,9 +153,9 @@ class BearerTokenMiddleware:
         enabled = bool(self._token) or (store is not None)
         if not enabled:
             # Security OFF — the whole server is open by design (no credential
-            # configured; see SECURITY.md).  Stamp admin scope so the
-            # ``require_admin`` gate stays a pure ``scope == "admin"`` check and
-            # OFF-mode requests reach every endpoint as before.
+            # configured).  Stamp admin scope so the ``require_admin`` gate
+            # stays a pure ``scope == "admin"`` check and OFF-mode requests
+            # reach every endpoint as before.
             scope.setdefault("state", {})["scope"] = "admin"
             await self.app(scope, receive, send)
             return

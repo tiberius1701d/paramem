@@ -447,7 +447,7 @@ for adapter_id, h in health_items:
         h.get("keys_at_mark", 0),
         h.get("updated_at", ""),
     ))
-# Slice 5a — Attention block lines: ATTN<TAB>kind<TAB>level<TAB>summary<TAB>action_hint<TAB>age_seconds
+# Attention block lines: ATTN<TAB>kind<TAB>level<TAB>summary<TAB>action_hint<TAB>age_seconds
 for item in (d.get("attention") or {}).get("items", []) or []:
     print("ATTN\t{}\t{}\t{}\t{}\t{}".format(
         item.get("kind", "?"),
@@ -456,7 +456,7 @@ for item in (d.get("attention") or {}).get("items", []) or []:
         (item.get("action_hint") or "").replace("\t", " ").replace("\n", " "),
         item.get("age_seconds") if item.get("age_seconds") is not None else "",
     ))
-# Slice 5a — Migrate footer: MIGRATE<TAB>state<TAB>config_rev<TAB>applied_date
+# Migrate footer: MIGRATE<TAB>state<TAB>config_rev<TAB>applied_date
 _mig = d.get("migration") or {}
 _loaded_hash = (d.get("config_drift") or {}).get("loaded_hash", "")
 _config_rev = _mig.get("config_rev") or (_loaded_hash[:8] if _loaded_hash else "")
@@ -470,7 +470,7 @@ print("MIGRATE\t{}\t{}\t{}\t{}\t{}".format(
     (_mig.get("gates") or {}).get("status") or "",
     _mig.get("base_swap_phase") or "",
 ))
-# Slice 6a — Backup footer: BACKUP|schedule|last_success_at|
+# Backup footer: BACKUP|schedule|last_success_at|
 #   last_failure_at|last_failure_reason|next_scheduled_at|
 #   stale|disk_used_bytes|disk_cap_bytes
 # NOTE: Uses | as separator (not \t) so IFS='|' read preserves empty fields.
@@ -512,7 +512,7 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
 health_lines=$(echo "$parsed" | awk '/^HLT\t/')
 adapter_spec_lines=$(echo "$parsed" | awk '/^ADPT\t/')
-# Slice 5a — attention items and migrate footer.
+# Parse attention items and migrate footer from the status output.
 attention_lines=$(echo "$parsed" | awk '/^ATTN\t/')
 migrate_line=$(echo "$parsed" | awk '/^MIGRATE\t/' | head -1)
 
@@ -670,7 +670,7 @@ if [[ "$hold_active" == "True" ]]; then
 fi
 echo -e "$pid_line"
 
-# Slice 5a — Attention block. Omitted entirely when attention_lines is empty.
+# Attention block. Omitted entirely when attention_lines is empty.
 if [[ -n "$attention_lines" ]]; then
     # Determine banner color: red (✗) if any item is level="failed", else yellow (⚠).
     banner_color="$YELLOW"
@@ -856,7 +856,7 @@ if (( pending_enrollments > 0 )); then
     echo -e "  Enroll:   ${YELLOW}${pending_enrollments} awaiting name extraction${RESET}"
 fi
 
-# Slice 5a — Migrate footer (always rendered when data is present).
+# Migrate footer (always rendered when data is present).
 if [[ -n "$migrate_line" ]]; then
     IFS=$'\t' read -r _mig_marker mig_state mig_rev mig_applied mig_gates mig_phase <<< "$migrate_line"
     # Human label for the in-flight base-swap phase (from /status.migration.base_swap_phase).
@@ -970,7 +970,7 @@ else
     echo -e "  TTS:      ${DIM}not loaded${RESET}"
 fi
 
-# Slice 6a — Backup footer (spec §L457). Always rendered when the line is
+# Backup footer. Always rendered when the line is
 # present; edge cases pick distinct messages.
 # The BACKUP line uses | as separator (not \t) to avoid IFS whitespace
 # collapsing consecutive empty fields (bash collapses consecutive tabs).

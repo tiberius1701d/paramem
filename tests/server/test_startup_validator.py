@@ -1,4 +1,4 @@
-"""Integration tests for _mount_adapters_from_slots (Slice 3a startup validator).
+"""Integration tests for _mount_adapters_from_slots startup validator.
 
 Exercises _mount_adapters_from_slots directly (bypasses full lifespan).
 All assertions operate on state["adapter_manifest_status"] — NOT

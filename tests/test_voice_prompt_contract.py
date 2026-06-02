@@ -6,12 +6,11 @@ naturally as if you simply remember"*, the model confabulated personal
 facts on empty/partial context (observed 2026-04-21: untrained adapter
 + "Where do I live?" → "New York City").
 
-Slice 2 of the no-hallucination fallback removed that primer and added
-a positive anti-confabulation directive. These tests lock both sides
-in: the file on disk AND the inline Python fallback in
-``load_prompt()`` when the prompt file is missing. They are structural
-(string-level) — a full LLM-compliance contract would require a live
-model and is out of scope here.
+The no-hallucination fallback removed that primer and added a positive
+anti-confabulation directive. These tests lock both sides in: the file on disk
+AND the inline Python fallback in ``load_prompt()`` when the prompt file is
+missing. They are structural (string-level) — a full LLM-compliance contract
+would require a live model and is out of scope here.
 """
 
 from pathlib import Path

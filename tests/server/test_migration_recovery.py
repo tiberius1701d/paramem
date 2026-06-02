@@ -1,4 +1,4 @@
-"""Tests for paramem.server.migration_recovery (Slice 3b.2).
+"""Tests for paramem.server.migration_recovery.
 
 Covers all 5 crash-recovery cases plus edge cases (unparseable marker,
 multiple orphan backups, max_age_hours default).

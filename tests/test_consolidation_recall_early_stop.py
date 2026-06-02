@@ -195,7 +195,7 @@ class _Captured:
 # (Class F's mechanism) PLUS we call _maybe_make_recall_callback with the
 # arguments _run_indexed_key_episodic actually passes (as covered by the
 # Class A unit tests).  The end-to-end path is exercised by the live
-# smoke per .agent/plan-recall-early-stop-online-v3.md §3.4.
+# smoke (end-to-end path exercised by the live GPU smoke test).
 # ---------------------------------------------------------------------------
 
 

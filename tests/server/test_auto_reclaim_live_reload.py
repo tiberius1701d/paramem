@@ -1,11 +1,11 @@
-"""Tests for _auto_reclaim_loop D3 rewire: in-process reload + voice gpu switch.
+"""Tests for _auto_reclaim_loop: in-process reload + voice GPU switch when hold clears.
 
 Verifies:
 - Hold-cleared path uses _live_reload_base_model + _set_voice_pipeline_profile("gpu").
 - _restart_service is NOT called on any path.
 - Transient failures populate last_reclaim_error and WARN (not ERROR); loop continues.
 - Retry increments attempt_count.
-- Orphan branch unchanged from before D3.
+- Orphan branch: hold_active=True, owner_alive=False → WARN + exit loop (no restart).
 """
 
 from __future__ import annotations
@@ -358,7 +358,8 @@ def test_auto_reclaim_defers_when_reload_stays_cloud_only():
 def test_auto_reclaim_orphan_path_exits_loop_without_restart():
     """Orphan: hold_active=True, owner_alive=False → emit WARN, exit loop (no restart).
 
-    Regression guard for pre-D3 orphan detection behaviour.
+    Regression guard: orphan detection (hold active, owner dead) must emit
+    WARN and exit the loop without calling _restart_service.
     """
     import paramem.server.app as app_module
 

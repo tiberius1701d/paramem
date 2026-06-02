@@ -452,7 +452,7 @@ class TestRunnerSkipsEmissionWhenKeepIsZero:
 
 
 class TestRunnerBundlePath:
-    """Tests for the snapshot_bundle artifact branch added in Slice 3."""
+    """Tests for the snapshot_bundle artifact branch in BackupRunner."""
 
     def _setup(self, tmp_path: Path):
         """Set up dirs, config, adapter fixture, and live config."""

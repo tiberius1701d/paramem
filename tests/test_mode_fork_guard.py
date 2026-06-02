@@ -47,7 +47,7 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         ("paramem/server/app.py", "_run_extraction_phase"),
         ("paramem/server/app.py", "_extract_and_start_training"),
         ("paramem/server/app.py", "_run_full_cycle"),
-        # WP1: memory store preload source selection (consolidation.mode, not runtime mode)
+        # Memory store preload source selection reads consolidation.mode, not runtime mode.
         # The lifespan's inline preload was extracted here; lifespan no longer forks on mode.
         ("paramem/server/app.py", "_preload_memory_store"),
         # migration tooling — mode-switch detection and graph migration

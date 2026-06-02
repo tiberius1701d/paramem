@@ -1,4 +1,4 @@
-"""Tests for paramem.cli.migrate_accept (Slice 3b.3).
+"""Tests for paramem.cli.migrate_accept.
 
 Covers:
 - Happy path: POST /migration/accept → 200 → prints response + exits 0.
@@ -29,7 +29,7 @@ _ACCEPT_RESPONSE = {
     "restart_required": False,
     "restart_hint": "systemctl --user restart paramem-server",
     "pre_migration_backup_retained": True,
-    # WP2 fields: live apply succeeded on the normal accept path.
+    # Live-apply fields: applied_live=True on the normal accept path.
     "applied_live": True,
     "restart_required_reason": None,
     "auto_restart_scheduled": False,
@@ -75,7 +75,7 @@ class TestMigrateAcceptHappyPath:
         rc = main(["migrate-accept"])
         captured = capsys.readouterr()
         assert rc == 0
-        # WP2: CLI uses _render_apply_result; success path prints human-readable message.
+        # CLI uses _render_apply_result; success path prints a human-readable message.
         assert "accepted" in captured.out.lower() or "applied" in captured.out.lower()
 
     def test_accept_200_json_mode_emits_raw_json(self, monkeypatch, capsys):
@@ -86,7 +86,7 @@ class TestMigrateAcceptHappyPath:
         assert rc == 0
         parsed = json.loads(captured.out)
         assert parsed["state"] == "LIVE"
-        # WP2: live apply succeeded → restart_required=False.
+        # Live apply succeeded → restart_required=False.
         assert parsed["restart_required"] is False
         assert parsed["applied_live"] is True
 
@@ -142,7 +142,7 @@ class TestMigrateAccept409:
         """409 not_trial → friendly message on stdout + exit 0 (idempotent).
 
         No trial active means the operator's intent is already satisfied
-        (spec §L359 idempotent accept).
+        (idempotent accept: calling migrate-accept when no trial is running is not an error).
         """
         monkeypatch.setattr(http_client, "post_json", _raise_409("not_trial"))
         rc = main(["migrate-accept"])
@@ -157,7 +157,7 @@ class TestMigrateAccept409:
     def test_409_gates_failed_exits_1_with_stderr_message(self, monkeypatch, capsys):
         """409 gates_failed → stderr + exit 1.
 
-        Gates failed means only rollback is valid (spec §L354).
+        Gates failed means only rollback is valid (accept requires passing gates).
         """
         monkeypatch.setattr(http_client, "post_json", _raise_409("gates_failed"))
         rc = main(["migrate-accept"])

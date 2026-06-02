@@ -11,7 +11,7 @@
 # logic lives entirely in win-port-forward.ps1 — this script only decides HOW to
 # invoke that worker (mirrors the WU-Lock pattern in training-control.sh).
 #
-# Security scoping (opt-in via env vars — WP5 in plan_security_hardening.md):
+# Security scoping (opt-in via env vars):
 #   PARAMEM_LISTEN_IP  — Windows-side IP to bind the portproxy listener on (e.g. the
 #                         Ethernet interface address). When unset, listens on 0.0.0.0
 #                         (every interface, including Wi-Fi). Strongly recommend setting.
@@ -36,7 +36,6 @@ if [ "$LISTEN_IP" = "0.0.0.0" ] && [ -z "$NAS_IP" ]; then
     echo ""
     echo "WARN: ParaMem ports will be reachable from every LAN interface, unscoped."
     echo "WARN: Set PARAMEM_LISTEN_IP and PARAMEM_NAS_IP to scope exposure."
-    echo "WARN: See docs/plan_security_hardening.md (WP5) for rationale."
     echo ""
 fi
 

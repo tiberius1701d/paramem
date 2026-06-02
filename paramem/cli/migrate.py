@@ -1,9 +1,9 @@
 """Handler for ``paramem migrate <path>``.
 
 Implements the six-step interactive preview + long-poll flow.
-The renderer follows the exact spec wording from plan §4 / §L243–271
-(byte-for-byte compliance is verified by
-``tests/cli/test_migrate.py::test_render_shape_change_block_byte_for_byte_matches_spec``).
+The renderer produces the shape-change and tier-change blocks using exact wording
+verified byte-for-byte by
+``tests/cli/test_migrate.py::test_render_shape_change_block_byte_for_byte_matches_spec``.
 
 Step order
 ----------
@@ -55,7 +55,7 @@ from pathlib import Path
 
 from paramem.cli import http_client
 
-# Long-poll interval for trial gate status (spec §9).
+# Long-poll interval for trial gate status (seconds between GET /migration/status polls).
 LONG_POLL_INTERVAL_SECONDS: float = 2.0
 
 # Terminal gate statuses — polling stops when gates.status is one of these
@@ -162,7 +162,10 @@ def _render_base_change_preview(base_change: dict) -> None:
 
 
 def _render_shape_change_block(shape_changes: list[dict]) -> None:
-    """Print the shape-change warning block (spec §L257–271, byte-for-byte)."""
+    """Print the shape-change warning block.
+
+    Exact wording is verified byte-for-byte by the CLI test suite.
+    """
     if not shape_changes:
         return
     print("  ────────────────────────────────────────")
@@ -575,7 +578,8 @@ def _get_migration_status(server_url: str) -> dict:
 def _do_accept_with_drift_check(server_url: str) -> int:
     """GET /migration/status, verify TRIAL, then POST /migration/accept.
 
-    Implements the spec §L235 drift check before accept.
+    Verifies the server is still in TRIAL state (drift check) before POSTing accept.
+    If state has drifted out of TRIAL, aborts with an error instead of sending the POST.
 
     Parameters
     ----------
@@ -618,8 +622,8 @@ def _do_accept_with_drift_check(server_url: str) -> int:
 def _do_rollback_with_drift_check(server_url: str) -> int:
     """GET /migration/status, verify TRIAL, then POST /migration/rollback.
 
-    Implements the spec §L235 drift check before rollback.  After a successful
-    POST, inspects the response body for ``archive_warning`` — the server
+    Verifies the server is still in TRIAL state (drift check) before POSTing rollback.
+    After a successful POST, inspects the response body for ``archive_warning`` — the server
     returns HTTP 207 for degraded rollback, but ``post_json`` passes it through
     as a plain dict (207 < 400 so no exception is raised).
 
@@ -675,9 +679,9 @@ def _do_rollback_with_drift_check(server_url: str) -> int:
 def _run_long_poll_flow(server_url: str) -> int:
     """Run the full long-poll flow after the operator confirms 'y'.
 
-    Implements spec §9 / CLI steps 1–5:
+    Runs the full long-poll flow after the operator confirms 'y':
 
-    1. STAGING-drift check (spec §L230–235).
+    1. STAGING-drift check: GET /migration/status; abort if not STAGING.
     2. POST /migration/confirm.
     3. Long-poll /migration/status until gates are terminal.
     4. Branch on gates.status.
@@ -698,7 +702,7 @@ def _run_long_poll_flow(server_url: str) -> int:
     int
         0 on accept/deferred, 1 on rollback/fail/drift, 130 on Ctrl+C.
     """
-    # Step 1: STAGING-drift check before confirm (spec §L230–235).
+    # Step 1: STAGING-drift check before confirm — abort if server is no longer in STAGING state.
     try:
         pre_status = _get_migration_status(server_url)
     except (http_client.ServerUnreachable, http_client.ServerHTTPError) as exc:

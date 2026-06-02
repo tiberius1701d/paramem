@@ -448,8 +448,8 @@ def decay_steps_for(n_keys: int, reference_epochs: int = REFERENCE_EPOCHS) -> in
     ``lr_decay_steps`` **decoupled from** ``num_train_epochs``.  The earlier
     Test 13/14/15 convention ``n_keys * num_epochs // 2`` coupled the
     scheduler to per-arm epoch budget and silently produced LR=0 from
-    ``num_epochs / 2`` onward — see benchmarking.md §Test 16 redesign for
-    the diagnostic.  This helper computes a *shared* schedule that is the
+    ``num_epochs / 2`` onward — the redesign diagnosed this coupling.
+    This helper computes a *shared* schedule that is the
     same for every base/corrupted arm regardless of the arm's own epoch
     budget, so all arms see identical LR-vs-step trajectories up to
     whatever step they stop on.
@@ -462,7 +462,6 @@ def decay_steps_for(n_keys: int, reference_epochs: int = REFERENCE_EPOCHS) -> in
     ``reference_epochs / 2`` onward, which silently zeroed the second half
     of every arm's training under the redesigned ``depths_past_floor``
     knob and collapsed D=10 vs D=30 into indistinguishable end states.
-    See benchmarking.md §Test 16 redesign 2026-05-14.
 
     Args:
         n_keys: Number of indexed keys being trained.
@@ -1517,8 +1516,8 @@ def run_cell(
         # fires on first_perfect to make the "depth past floor" definition
         # unambiguous regardless of late-epoch wobble.  Refuse-to-corrupt:
         # hard-fail if encoding never reached perfect within MAX_BASE_EPOCHS.
-        # Silent acceptance of sub-perfect base was the bug Test 16's
-        # redesign forbids — see benchmarking.md §Test 16 redesign.
+        # Silent acceptance of sub-perfect base was the bug the redesign
+        # forbids — hard-fail here rather than corrupt an imperfect base.
         encoding_floor_epoch = probe_a.first_perfect_epoch
         if encoding_floor_epoch is None:
             raise RuntimeError(
@@ -2315,7 +2314,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Depth-past-floor values to sweep (default: 0 10 30).  Each arm "
             "trains base for first_perfect_epoch + D epochs.  Replaces the "
-            "earlier --depths total-epoch knob (see benchmarking.md §Test 16)."
+            "earlier --depths total-epoch knob."
         ),
     )
     parser.add_argument("--n-keys", "--n_keys", type=int, default=DEFAULT_N_KEYS, dest="n_keys")

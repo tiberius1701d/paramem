@@ -1,4 +1,4 @@
-"""Tests for Slice 4 — bundle-aware enumerate_backups.
+"""Tests for bundle-aware enumerate_backups.
 
 Covers:
 - A slot with bundle.meta.json is returned as kind=SNAPSHOT_BUNDLE.

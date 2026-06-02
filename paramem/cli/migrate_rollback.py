@@ -2,10 +2,10 @@
 
 POSTs to ``/migration/rollback``.  Restores config A from backup, archives
 the trial adapter, and returns the server to LIVE state.  Valid from TRIAL at
-any time (no gate-status check — spec §L208).
+any time (no gate-status check required — rollback is always available during TRIAL).
 
 This module mirrors the ``migrate_cancel.py`` shape exactly — thin stateless
-HTTP client, server owns all state (spec §L187).
+HTTP client, server owns all state.
 """
 
 from __future__ import annotations

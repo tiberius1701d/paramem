@@ -1,4 +1,4 @@
-"""Tests for paramem.cli.migrate_status (Slice 3b.1 + 3b.2 path correction).
+"""Tests for paramem.cli.migrate_status.
 
 Covers:
 - Normal MigrationStatusResponse render.
@@ -164,7 +164,10 @@ class TestMigrateStatusOfflineFallback:
         assert json_lines, f"No JSON found in output: {captured.out!r}"
 
     def test_offline_no_trial_json_exit_is_0_not_2(self, monkeypatch, tmp_path):
-        """Offline + no trial.json → exit 0, NOT exit 2 (spec §L228)."""
+        """Offline + no trial.json → exit 0, NOT exit 2.
+
+        Server unreachable with no local trial marker is not an error.
+        """
         monkeypatch.setattr(
             http_client,
             "get_json",
@@ -174,24 +177,21 @@ class TestMigrateStatusOfflineFallback:
             "paramem.cli.migrate_status._trial_json_path", return_value=tmp_path / "none.json"
         ):
             rc = main(["migrate-status"])
-        assert rc == 0, (
-            f"Offline + no trial.json must exit 0 (absence of trial marker is not an "
-            f"error per spec §L228); got {rc}"
-        )
+        assert rc == 0, f"Offline + no trial.json must exit 0 (no error without a marker); got {rc}"
 
 
 # ---------------------------------------------------------------------------
-# Correction 4: path constant is data/ha/state/trial.json (not state/trial.json)
+# _trial_json_path must point to data/ha/state/trial.json (not state/trial.json)
 # ---------------------------------------------------------------------------
 
 
 class TestTrialJsonPathCorrection4:
-    """Verify that _trial_json_path returns data/ha/state/trial.json.
+    """_trial_json_path returns data/ha/state/trial.json.
 
-    Correction 4 (Slice 3b.2): the marker lives at data/ha/state/trial.json
-    inside the data/ha/ tree, NOT at a bare state/trial.json path relative to
-    the project root.  This test asserts the path constant directly so a
-    future regression is caught at the unit level.
+    The marker lives at data/ha/state/trial.json inside the data/ha/ tree,
+    NOT at a bare state/trial.json path relative to the project root.
+    This test asserts the path constant directly so a future regression
+    is caught at the unit level.
     """
 
     def test_migrate_status_offline_reads_data_ha_state_trial_json(self):
@@ -199,7 +199,7 @@ class TestTrialJsonPathCorrection4:
 
         The path must match data/ha/state/trial.json exactly — a cwd-relative
         state/trial.json would fail to locate the marker when the server writes
-        to data/ha/state/ (spec §L516–545, Correction 4).
+        to data/ha/state/.
         """
         path = _trial_json_path("http://localhost:8420")
         expected = Path("data") / "ha" / "state" / "trial.json"
@@ -214,7 +214,7 @@ class TestTrialJsonPathCorrection4:
         """Offline fallback reads a real TrialMarker JSON and renders TRIAL state.
 
         Sets up data/ha/state/trial.json inside tmp_path with a valid
-        TrialMarker dict (Slice 3b.2 schema), redirects _trial_json_path to
+        TrialMarker dict, redirects _trial_json_path to
         that location, and confirms migrate-status prints the marker contents
         including the started_at timestamp.
 

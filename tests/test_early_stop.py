@@ -762,12 +762,11 @@ class TestRecallEarlyStopCallbackStateachine:
     def test_gradient_checkpointing_NOT_reenabled_when_args_says_off(self, tmp_path):
         """When args.gradient_checkpointing=False, the probe must NOT re-enable it.
 
-        Catches the regression class flagged in CLAUDE.md
-        (``feedback_apply_claudemd_to_all_generate.md``): silently turning
-        checkpointing back on after the probe breaks the next epoch's
-        ``model.generate`` KV-cache contract.  Production today defaults to
-        True so this branch is latent, but any debug / VRAM-tuning
-        configuration that flips it False must stay flipped.
+        Catches the regression class where silently turning checkpointing back on
+        after the recall probe breaks the next epoch's ``model.generate`` KV-cache
+        contract (HF disables KV cache when gradient checkpointing is active).
+        Production today defaults to True so this branch is latent, but any debug
+        or VRAM-tuning configuration that flips it False must stay flipped.
         """
         cb, state_out, model = _make_callback(tmp_path, total=2)
         perfect = _make_recall_result(2, 2)

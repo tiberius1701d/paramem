@@ -820,7 +820,7 @@ class TestScopeOnRequestState:
     def test_off_mode_stamps_admin_scope(self):
         """OFF mode (no token, no store) → handler runs, scope stamped 'admin'.
 
-        OFF is the deliberate open posture (SECURITY.md): the middleware stamps
+        OFF is the deliberate open posture: the middleware stamps
         admin scope on pass-through requests so the ``require_admin`` gate stays
         a pure ``scope == 'admin'`` check and every endpoint stays reachable
         without credentials.

@@ -1,4 +1,4 @@
-"""Trial-consolidation sanity gates (spec §Sanity suite L368–412).
+"""Trial-consolidation sanity gates.
 
 Pure-Python module — no GPU-framework imports at top level.  All model /
 tokenizer / registry objects are injected via keyword arguments typed as Any
@@ -7,8 +7,8 @@ transformers.
 
 Gates run inside the server process, reusing the already-loaded base model
 (8 GB VRAM constraint — no second model load).  They are called from
-``_run_trial_consolidation`` in ``app.py`` after the trial
-``_run_extraction_phase`` call returns (D2: ``_run_extraction_phase`` deleted).
+``_run_trial_consolidation`` in ``app.py`` after the trial extraction phase
+completes (``_run_extraction_phase`` was consolidated into ``app.py``).
 
 Public entry point: :func:`evaluate_gates`.
 """

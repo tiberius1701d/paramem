@@ -296,7 +296,8 @@ def unload_interim_adapters(model: PeftModel, adapter_dir: Path) -> list[str]:
       3. Router.reload() — which must not see any episodic_interim_* dirs.
 
     Phase ordering relative to registry rewrite and Router.reload() is the
-    caller's responsibility; see Step 7 of the multi-adapter interim routing plan.
+    caller's responsibility: registry rewrite must complete before this call,
+    and Router.reload() must not be called until after this call returns.
 
     The three main adapters (episodic, semantic, procedural) remain loaded
     throughout — the sole-adapter trap does not apply.

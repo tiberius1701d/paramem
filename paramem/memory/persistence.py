@@ -17,8 +17,8 @@ Public API
 - :func:`keys_for_speaker` — edge keys where ``speaker_id`` matches.
 - :func:`build_tier_graph_from_store` — project a :class:`MemoryStore` tier
   to a fresh ``MultiDiGraph`` for persistence.
-- :func:`commit_tier_slot` — I5 atomic write of one interim tier slot;
-  mode-switches between adapter-weight venue (train) and graph-JSON venue
+- :func:`commit_tier_slot` — atomic write of one interim tier slot (registry written last
+  as commit signal); mode-switches between adapter-weight venue (train) and graph-JSON venue
   (simulate).
 
 Internal edge attribute naming
@@ -452,15 +452,19 @@ def commit_tier_slot(
     all_keyed: "list[dict]",
     output_dir: Path,
 ) -> None:
-    """Atomic I5 write of one interim-tier slot — venue-switches on mode.
+    """Atomic write of one interim-tier slot, venue-switching on mode.
 
-    Executes the full I5 commit sequence for a single tier produced by
+    Registry is written last as the commit signal: its presence on disk means
+    all preceding files (weights, simhash) are complete.
+
+    Executes the full atomic commit sequence for a single tier produced by
     :meth:`paramem.training.consolidation.ConsolidationLoop.run_consolidation_cycle`:
 
     1. ``loop.store.registry(tier).save_bytes()`` — serialise the tier registry
        to canonical UTF-8 JSON bytes (no disk I/O).
     2. ``hashlib.sha256(payload)`` — hash the bytes so the manifest can stamp
-       them before the registry is written to disk (I5 pre-stamp invariant).
+       them before the registry is written to disk (pre-stamp invariant:
+       manifest records the hash before the registry file exists).
     3. Build manifest (train mode only) — calls
        :func:`paramem.adapters.manifest.build_manifest_for` with the
        ``registry_sha256_override`` and ``window_stamp=stamp``.  Simulate mode

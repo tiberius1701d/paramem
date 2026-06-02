@@ -1,11 +1,11 @@
-"""Tests for paramem.server.gates (Slice 4 — sanity suite).
+"""Tests for paramem.server.gates.
 
 All tests run without GPU.  The model and tokenizer are MagicMocks.
 ``paramem.training.indexed_memory.probe_key`` is patched in every test that
 exercises gates 3 or 4 in QA mode.  ``paramem.training.recall_eval.probe_entries``
 is patched for quad-mode tests.  Registry files are written to ``tmp_path``.
 
-Coverage targets (spec §Tests):
+Coverage:
   - Each gate's pass/fail/skip paths including the 2 new skip conditions.
   - NO_NEW_SESSIONS end-to-end (session_buffer_empty=True).
   - Gate 4 deterministic sample stability.
@@ -14,8 +14,8 @@ Coverage targets (spec §Tests):
   - Gate 4 17/20 first, 20/20 retry → PASS + cluster-variance warning.
   - Gate 4 17/20 both samples → FAIL.
   - Gate 4 < 20 keys → SKIPPED.
-  - Gate 4 missing registry file → SKIPPED (B3-residual fix).
-  - Gate 4 metrics includes sampled_keys (GUARDRAIL G1).
+  - Gate 4 missing registry file → SKIPPED.
+  - Gate 4 metrics includes sampled_keys.
   - Phase categorizer: extraction exception → gate 1 FAIL, gate 2 SKIPPED.
   - Phase categorizer: training exception → gate 1 PASS, gate 2 FAIL.
   - Phase categorizer logs at WARNING.

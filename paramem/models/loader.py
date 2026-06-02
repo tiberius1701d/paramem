@@ -444,7 +444,7 @@ def atomic_save_adapter(
         nested.rmdir()
 
     # Step 3.5 — Encrypt adapter_model.safetensors in-place (age when key loaded,
-    # plaintext pass-through when no key is configured — see SECURITY.md §1/§4).
+    # plaintext pass-through when no key is configured).
     _encrypt_adapter_safetensors(pending_slot)
 
     # Step 4 — Write manifest alongside adapter files (before fsync/rename)

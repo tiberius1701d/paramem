@@ -134,7 +134,7 @@ class TestChatScopeOnAdminRoute:
     def test_off_mode_allows_admin_endpoint(self, tmp_path, monkeypatch):
         """Auth OFF (no token, no store) → admin endpoint reachable (open by design).
 
-        SECURITY.md documents OFF mode as fully open (no credential configured).
+        OFF mode is fully open: no credential is configured.
         The middleware stamps ``scope == "admin"`` on every OFF-mode pass-through,
         so admin endpoints stay reachable as they were before the scope gate.
         """

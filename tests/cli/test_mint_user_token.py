@@ -34,7 +34,7 @@ from paramem.server.user_tokens import UserTokenStore
 def _env_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure no daily key is loadable (Security OFF) for all tests in this
     module.  The store must be written in plaintext so no passphrase is
-    required — matches the spec requirement."""
+    required — mint-user-token must not depend on the daily encryption key."""
     monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
     # Point the default daily-key path at a nonexistent file so
     # daily_identity_loadable() returns False.

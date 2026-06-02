@@ -88,7 +88,7 @@ class TestPersonalEntityParaphraseDetection:
     let 2026-05 paraphrased ADAS-platform queries reach the cloud."""
 
     def test_paraphrase_two_token_overlap_flags_personal(self):
-        # The bug from the 2026-05-14 handover.  Surface-form scrub
+        # Surface-form scrub bug: personal_entity check
         # misses because the indexed name reorders + adds modifier
         # ("multi-OEM") that the user query omits.
         findings = check_personal_content(

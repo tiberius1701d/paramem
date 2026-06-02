@@ -1,4 +1,4 @@
-"""Unit tests for paramem.server.trial_state (Slice 3b.2).
+"""Unit tests for paramem.server.trial_state.
 
 Covers:
 - TrialMarker roundtrip (write → read → equal fields).

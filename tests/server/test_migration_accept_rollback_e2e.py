@@ -1,4 +1,4 @@
-"""Deterministic no-GPU E2E tests for accept + rollback lifecycle (Slice 3b.3).
+"""Deterministic no-GPU E2E tests for the accept + rollback lifecycle.
 
 Covers the full preview → confirm → [mock trial] → accept/rollback paths.
 All GPU operations are patched out.  Uses the same fixture pattern as
@@ -292,7 +292,7 @@ class TestE2EAcceptPath:
         assert resp.status_code == 200
         body = resp.json()
         assert body["state"] == "LIVE"
-        # Live-apply success: restart_required=False (WP2 update).
+        # Live-apply success: applied_live=True, restart_required=False.
         assert body["applied_live"] is True
         assert body["restart_required"] is False
 
@@ -551,8 +551,8 @@ class TestE2ERollbackPath:
         gates, then POSTs /migration/rollback.  Verifies config A is restored
         and marker cleared.
 
-        WP2 update: with a no-op-skip stub (disk=A, memory=A), applied_live=True
-        and restart_required=False (the old always-True default no longer applies).
+        With a no-op-skip stub (disk=A, memory=A), applied_live=True
+        and restart_required=False (config was already at A; no reload needed).
         """
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
@@ -592,7 +592,7 @@ class TestE2ERollbackPath:
         assert resp.status_code == 200
         body = resp.json()
         assert body["state"] == "LIVE"
-        # No-op skip: applied_live=True, restart_required=False (WP2 update).
+        # No-op skip: applied_live=True, restart_required=False (disk=A already matches memory=A).
         assert body["applied_live"] is True
         assert body["restart_required"] is False
 

@@ -96,7 +96,7 @@ class TestLifespanInvokesAssertStartupPosture:
         source = inspect.getsource(app_module.lifespan)
         assert "_assert_mode(" in source, (
             "lifespan must invoke assert_mode_consistency to enforce the "
-            "SECURITY.md §4 four-case refuse"
+            "four-case mixed-state refuse"
         )
 
 
@@ -106,7 +106,7 @@ class TestLifespanInvokesAssertStartupPosture:
 
 
 class TestLifespanSecurityPosture:
-    """Verify lifespan wires the SECURITY.md §4 posture gate correctly.
+    """Verify lifespan wires the encryption posture gate correctly.
 
     Both ``assert_startup_posture`` and ``assert_mode_consistency`` are
     invoked at startup.  The former refuses the
@@ -128,11 +128,11 @@ class TestLifespanSecurityPosture:
         source = inspect.getsource(app_module.lifespan)
         assert "_assert_mode(" in source, (
             "lifespan must invoke assert_mode_consistency to enforce the "
-            "SECURITY.md §4 four-case refuse"
+            "four-case mixed-state refuse"
         )
 
     def test_lifespan_emits_security_posture_line(self) -> None:
-        """lifespan must emit the SECURITY: ON/OFF log line per SECURITY.md §4.
+        """lifespan must emit the SECURITY: ON/OFF log line.
 
         The line content lives in :mod:`paramem.server.security_posture`
         (factored out so the branching logic is a pure function of the three
@@ -163,8 +163,7 @@ class TestLifespanSecurityPosture:
     def test_status_response_surfaces_encryption(self) -> None:
         """StatusResponse must carry an ``encryption`` field and the /status
         handler must populate it from ``_state['encryption']`` — otherwise
-        the lifespan setter is dead code (SECURITY.md and README both
-        document that /status reports encryption: on|off)."""
+        the lifespan setter is dead code (/status must report encryption: on|off)."""
         from paramem.server import app as app_module
 
         assert "encryption" in app_module.StatusResponse.model_fields, (

@@ -3,8 +3,8 @@
 Why this test exists: the helper calls ``extract_graph`` +
 ``_anonymize_with_local_model`` end-to-end on a real multi-turn
 **transcript** -- the same input shape ParaMem operates on in
-production.  Mocked tests cannot catch prompt-compliance regressions
-(per ``feedback_prompt_contract_tests.md``).
+production.  Mocked tests cannot catch prompt-compliance regressions;
+only a live model run on production-shaped input can verify the contract.
 
 The cloud anonymizer is the privacy-critical seam between local memory
 and SOTA escalation: when ``sanitization.cloud_mode`` is ``"anonymize"``

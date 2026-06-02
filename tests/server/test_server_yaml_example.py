@@ -125,9 +125,9 @@ def test_vram_cap_default(example_config):
 
 
 def test_debug_disabled_by_default(example_config):
-    """debug=true writes plaintext fact copies to disk on every consolidation
-    (SECURITY.md §debug carve-outs). The shipped template must default off so
-    a fresh consumer doesn't get a plaintext-on-disk deployment by accident.
+    """debug=true writes plaintext fact copies to disk on every consolidation.
+    The shipped template must default off so a fresh consumer does not get
+    a plaintext-on-disk deployment by accident.
     """
     assert example_config.debug is False
 

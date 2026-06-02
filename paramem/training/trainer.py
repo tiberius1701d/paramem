@@ -265,11 +265,11 @@ class GracefulShutdownCallback(TrainerCallback):
 def _ensure_staging_slot(model: PeftModel, adapter_config: AdapterConfig) -> None:
     """Create the transient ``in_training`` PEFT adapter for this training event.
 
-    Per the staging+promote contract (architecture.md::AD-20), the staging slot
-    is transient: it exists only while a training event is in flight, and it is
-    deleted by the caller at the post-save cleanup step.  Every training event
-    therefore enters this helper with the slot absent and creates a byte-fresh
-    adapter from seeded LoRA initialisation.
+    Per the staging+promote contract, the staging slot is transient: it exists
+    only while a training event is in flight, and it is deleted by the caller
+    at the post-save cleanup step.  Every training event therefore enters this
+    helper with the slot absent and creates a byte-fresh adapter from seeded
+    LoRA initialisation.
 
     Pre-existing slot at entry is a lifecycle-invariant violation — it means
     the prior training event did not clean up after itself.  Raising here
@@ -554,12 +554,11 @@ def train_adapter(
 ) -> dict:
     """Train a LoRA adapter on the given dataset with staging+promote contract.
 
-    Implements the staging+promote contract (architecture.md::AD-20) that
-    prevents mutation of production adapter weights until training has
-    successfully completed.  The staging slot (``in_training``) is **transient**
-    — created at training entry, deleted at training exit (both success and
-    abort paths) — so it never carries weights from one training event into the
-    next.
+    Implements the staging+promote contract that prevents mutation of
+    production adapter weights until training has successfully completed.
+    The staging slot (``in_training``) is **transient** — created at
+    training entry, deleted at training exit (both success and abort paths)
+    — so it never carries weights from one training event into the next.
 
     Steps:
 

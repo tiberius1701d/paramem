@@ -1,4 +1,4 @@
-"""Tests for Slice 5 — restore_bundle() in paramem.backup.backup.
+"""Tests for restore_bundle() in paramem.backup.backup.
 
 Round-trip tests: write_bundle → restore_bundle into a scratch data_dir.
 

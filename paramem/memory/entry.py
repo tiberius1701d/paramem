@@ -537,7 +537,7 @@ def entry_fact_text(entry: dict) -> str:
 # Triple-hop re-export chain:
 #   paramem.memory.persistence  ←defines←  save_registry / load_registry / …
 #   paramem.memory.entry        ←re-exports← (this block)
-#   paramem.memory.__init__     ←re-exports← (package surface, §7 exec-spec)
+#   paramem.memory.__init__     ←re-exports← (package surface)
 # persistence.py does NOT import entry.py → no import-time cycle.
 
 from paramem.memory.persistence import (  # noqa: E402, F401

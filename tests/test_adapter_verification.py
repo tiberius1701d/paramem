@@ -602,7 +602,7 @@ class TestSaveAdaptersCallsVerify:
 
 
 # ---------------------------------------------------------------------------
-# Slice 3 — Pre-save probe removal + post-save slot cleanup
+# Pre-save probe removal + post-save slot cleanup
 # ---------------------------------------------------------------------------
 
 

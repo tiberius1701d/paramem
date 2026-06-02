@@ -231,7 +231,7 @@ def write_plaintext_atomic(path: Path, plaintext: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode-mismatch startup refuse (SECURITY.md §4)
+# Mode-mismatch startup refuse
 # ---------------------------------------------------------------------------
 
 
@@ -245,8 +245,8 @@ class ModeProbe:
         Files carrying the age v1 envelope magic. Decryptable with the
         loaded daily identity.
     plaintext_paths:
-        Files that carry no encryption magic but fall under the §4
-        encrypted-infrastructure list.
+        Files that carry no encryption magic but are listed in the
+        encrypted-infrastructure set returned by :func:`infra_paths`.
     """
 
     age_paths: list[Path] = field(default_factory=list)
@@ -264,7 +264,7 @@ def infra_paths(data_dir: Path) -> list[Path]:
     metadata" definition in one place regardless of whether the operator
     has populated every path yet.
 
-    Excluded (plaintext-by-design per SECURITY.md §4 carve-out):
+    Excluded (plaintext-by-design carve-out):
     - ``state/trial.json`` and ``state/backup.json`` — control-plane only.
     - Backup ``*.meta.json`` sidecars — operator visibility on wrong-key
       restore trumps the marginal info hiding.

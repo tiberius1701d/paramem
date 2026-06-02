@@ -133,9 +133,9 @@ class BackupStateRecord:
 
 
 # Plaintext-by-design: control-plane state only (paths, timestamps, counts —
-# no secrets). Carve-out parallels state/trial.json per SECURITY.md §4
-# (plaintext-by-design carve-outs). Encrypting this file would risk bricking
-# backup recovery on key loss without protecting anything sensitive.
+# no secrets). Carve-out parallels state/trial.json — encrypting this file
+# would risk bricking backup recovery on key loss without protecting anything
+# sensitive.
 def write_backup_state(state_dir: Path, record: BackupStateRecord) -> Path:
     """Atomically write ``state_dir/backup.json`` via a ``.pending`` rename.
 
@@ -249,7 +249,8 @@ def update_backup_state(
       ``new_run.success == True``; otherwise left unchanged (monotonic).
     - ``last_failure_at`` / ``last_failure_reason``: set to the new values
       when ``new_run.success == False``; left unchanged on success so that
-      the last-failure timestamp remains for operator visibility (spec §9.4).
+      the last-failure timestamp remains for operator visibility (updated on
+      failure only, never cleared on success).
 
     Parameters
     ----------

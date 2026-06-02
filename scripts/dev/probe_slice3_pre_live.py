@@ -1,6 +1,9 @@
-"""Live-GPU probe for Slice 3-pre (anonymous speaker ID promotion).
+"""Live-GPU probe for anonymous speaker ID promotion.
 
-Exercises two behaviors introduced by Slice 3-pre against real hardware:
+Verifies that extraction correctly attributes triples to the speaker subject
+regardless of whether the speaker is identified by an opaque anonymous ID or
+a real first name, and that SpeakerStore handles anonymous registration and
+name-upgrade in place.
 
   1. SpeakerStore API (CPU) — register_anonymous monotonic + idempotent,
      enroll upgrade-in-place on self-introduction. These paths are already
@@ -10,9 +13,10 @@ Exercises two behaviors introduced by Slice 3-pre against real hardware:
      extracted twice with different ``speaker_name`` values: the opaque
      anonymous id ("Speaker7") and a real first name ("Alice"). Both
      must produce triples whose subject is the literal expected string.
-     The real-name case is a regression guard for Slice 2 behavior;
-     the anonymous case is the Slice-3 prerequisite that the alias
-     map has a rewritable anchor in the graph.
+     The real-name case guards that named-speaker extraction is not broken
+     by the anonymous-ID path; the anonymous case verifies that the graph
+     carries a stable, rewritable subject anchor so store.get_name() can
+     resolve it at render time after a later name-disclosure.
 
 This is the live-GPU counterpart to tests/test_speaker.py and
 tests/test_consolidation.py::TestAnonymousSpeakerNotSkipped (both CPU-only
@@ -68,7 +72,7 @@ TRANSCRIPT = (
 #     so bridge-window triples (extract-before-disclosure) stay attributable to
 #     a stable grouping ID that store.get_name() can resolve at render time;
 #   - real first name ("Alice"), the production case — any regression here
-#     would silently break named-speaker extraction across all of Slice 2.
+#     would silently break named-speaker extraction for all identified speakers.
 SUBJECT_ANON = "Speaker7"
 SUBJECT_NAMED = "Alice"
 SUBJECT = SUBJECT_ANON  # legacy alias retained for the tokenizer smoke line below.
@@ -408,7 +412,7 @@ def main() -> int:
         label: cases_by_label[label]["subject_hits"] >= 1 for label in cases_by_label
     }
 
-    print("\n=== Slice 3-pre Live Probe Summary ===")
+    print("\n=== Anonymous Speaker Promotion — Live Probe Summary ===")
     print(f"CPU SpeakerStore checks:       {'PASS' if cpu_pass else 'FAIL'}")
     for label, c in cases_by_label.items():
         verdict = "PASS" if case_passes[label] else "FAIL"

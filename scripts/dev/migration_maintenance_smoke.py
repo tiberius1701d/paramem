@@ -813,7 +813,9 @@ def _run_apply_and_assert(
 
     failure_reasons: list[str] = []
 
-    # Replicate the handler's synchronous maintenance guard (correction S-4).
+    # Replicate the handler's synchronous maintenance guard: put the server
+    # into cloud-only mode before calling _apply_config_live, matching what
+    # the live-reload endpoint does before invoking this function.
     apply_state["mode"] = "cloud-only"
     apply_state["cloud_only_reason"] = "live_reload"
 

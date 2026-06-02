@@ -5,7 +5,7 @@ the trial adapter, and returns the server to LIVE state.  Valid only when a
 trial is active and gates have finished with an accept-eligible status.
 
 This module mirrors the ``migrate_cancel.py`` shape exactly — thin stateless
-HTTP client, server owns all state (spec §L187).
+HTTP client, server owns all state.
 """
 
 from __future__ import annotations

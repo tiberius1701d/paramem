@@ -1,8 +1,8 @@
-"""Tests for the 4 backup CLI subcommands (Slice 6b).
+"""Tests for the 4 backup CLI subcommands.
 
 Tests cover dispatch, rendering, --json mode, and error handling.
 
-Test numbers reference the plan §9 test matrix:
+Tests cover:
 44 — backup-list dispatch
 45 — backup-list renders rows
 46 — backup-list --json mode

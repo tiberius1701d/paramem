@@ -1,5 +1,4 @@
-"""Tests for POST /gpu/acquire endpoint (D4 rename from /gpu/force-local) and
-``_apply_config_live`` (WP1 maintenance-mode config-apply foundation).
+"""Tests for POST /gpu/acquire endpoint and ``_apply_config_live``.
 
 ``gpu_acquire`` tests: exercise the operator override that clears
 PARAMEM_EXTRA_ARGS=--defer-model and, when the process is in cloud-only /
@@ -7,15 +6,15 @@ defer mode, reloads the base model in-process and switches the voice pipeline
 to the gpu profile.
 
 ``_apply_config_live`` tests: exercise the bounded-lock abort, consolidating
-abort, no-op skip (B1 fix: uses config_drift.loaded_hash, not source_path),
-R-PORT carve (stt.port/tts.port delta, pre-flight bind success and failure),
-and R-PATHS carve (paths.sessions/paths.data delta).
+abort, no-op skip (uses config_drift.loaded_hash — NOT source_path — to detect
+rollback case), R-PORT carve (stt.port/tts.port delta, pre-flight bind success
+and failure), and R-PATHS carve (paths.sessions/paths.data delta).
 
-B1-test: real-hash tests (hasher NOT mocked) verify that:
+Hash-based no-op tests (hasher NOT mocked) verify that:
   - disk_hash == loaded_hash → no-op skip fires (rollback case).
   - disk_hash != loaded_hash → no-op skip does NOT fire (apply proceeds).
-S1-test: plain-reclaim path does not call STT/TTS .load() or HA reconnect.
-S3-test: retain_sessions/debug delta threads to rebuild_session_buffer.
+Plain-reclaim test: path does not call STT/TTS .load() or HA reconnect.
+retain_sessions/debug delta test: threads to rebuild_session_buffer.
 """
 
 from __future__ import annotations
@@ -255,7 +254,7 @@ def test_acquire_falls_back_to_restart_on_reload_failure():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  _apply_config_live  (WP1 maintenance-mode foundation)
+#  _apply_config_live  (maintenance-mode live config apply)
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -346,8 +345,7 @@ def test_apply_config_live_aborts_when_consolidating():
 def test_apply_config_live_noop_skip_when_hash_unchanged():
     """When the on-disk config hash matches _state["config_drift"]["loaded_hash"]
     (rollback case — disk restored to A, memory is A), _apply_config_live returns
-    applied_live=True, skipped='no_change' without calling _live_reload_base_model
-    (correction S-6, fix B1).
+    applied_live=True, skipped='no_change' without calling _live_reload_base_model.
 
     The prior implementation used getattr(config_a, "source_path", None) which
     always falls back to the live path when ServerConfig has no source_path

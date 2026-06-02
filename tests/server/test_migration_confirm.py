@@ -1,8 +1,8 @@
-"""Tests for POST /migration/confirm (Slice 3b.2) and base-swap orchestration.
+"""Tests for POST /migration/confirm and base-swap orchestration.
 
 All tests run without GPU — the trial consolidation task is cancelled/no-op.
 The 5-step atomic ordering is validated with both happy-path and per-step
-failure rollback scenarios.  Slice 2 tests cover the full in-process
+failure rollback scenarios.  Tests also cover the full in-process
 orchestration: Phase A → reload → Phase B → done, the reload-deferred path,
 and the uncapped Phase B recall gate.
 """
@@ -549,7 +549,7 @@ class TestTrialMarkerBaseSwapRoundTrip:
     def test_old_marker_loads_with_defaults(self):
         """A marker dict without base-swap fields deserializes with safe defaults.
 
-        This ensures backward compatibility with markers written before Slice 1.
+        This ensures backward compatibility with markers written before base-swap fields were added.
         """
         old_dict = {
             "schema_version": 1,
@@ -715,7 +715,7 @@ class TestRunBaseSwapPhaseA:
     Mocks write_bundle, active-store dispatch (BackgroundTrainer.submit +
     migrate), _rename_config, and gpu_release/gpu_acquire to assert ordering
     and state transitions without GPU.  The existing Phase A methods validate
-    the behaviour up to and including phaseA_done.  Slice 2 tests below
+    the behaviour up to and including phaseA_done.  Later tests in this class
     validate the full orchestration: reload + Phase B + success / deferred
     paths.
     """
@@ -1012,12 +1012,12 @@ class TestRunBaseSwapPhaseA:
 
 
 # ---------------------------------------------------------------------------
-# Slice 2: reload-deferred path + Phase B ordering
+# Reload-deferred path + Phase B ordering
 # ---------------------------------------------------------------------------
 
 
 class TestBaseSwapOrchestrationSlice2:
-    """Unit tests for the Slice 2 orchestration paths.
+    """Unit tests for the reload-deferred and Phase B orchestration paths.
 
     All tests run without GPU.  Mock gpu_release/gpu_acquire to control reload
     outcome; use the _run_phase_a helper in TestRunBaseSwapPhaseA.
@@ -2876,12 +2876,12 @@ class TestGpuAcquireBaseSwapResume:
 
 
 # ---------------------------------------------------------------------------
-# D1: wording — no restart references
+# Wording: operator-facing confirm text must not mention restart
 # ---------------------------------------------------------------------------
 
 
 class TestD1NoRestartWording:
-    """Verify that D1 wording fixes removed 'restart' from operator-facing text."""
+    """Verify that operator-facing confirm text does not mention restart."""
 
     def test_base_change_preview_no_restart(self, tmp_path, capsys):
         """_render_base_change_preview must not mention a server restart."""

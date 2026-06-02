@@ -1,4 +1,4 @@
-"""Integration tests for the 4 backup REST endpoints (Slice 6b).
+"""Integration tests for the 4 backup REST endpoints.
 
 Uses FastAPI TestClient with monkeypatched _state — no live server, no GPU.
 
@@ -872,7 +872,7 @@ class TestCreateSnapshotBundleKind:
 
 
 # ---------------------------------------------------------------------------
-# Slice 5 — /backup/restore snapshot_bundle handler tests
+# /backup/restore snapshot_bundle handler tests
 # ---------------------------------------------------------------------------
 
 

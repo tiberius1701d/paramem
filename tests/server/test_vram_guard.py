@@ -277,7 +277,7 @@ class TestConsolidationIntegration:
     def _call_run_extraction_phase(loop, config, buffer):
         """Inject config + session_buffer into _state and call _run_extraction_phase.
 
-        D2: run_consolidation deleted. Tests now call _run_extraction_phase directly.
+        run_consolidation was deleted; tests call _run_extraction_phase directly.
         """
         import paramem.server.app as _app
 
@@ -682,10 +682,10 @@ class TestPerChunkOOMSkip:
 class TestExtractionFailedAbortsCycle:
     """ExtractionFailed in any chunk aborts the WHOLE cycle.
 
-    Per project_extraction_failure_fails_cycle.md (2026-05-12):
-    extraction failure (incl. SOTA-enrichment 529) must FAIL the cycle —
-    sessions/graph stay pending, retry scheduled; no "keep pre-enrichment
-    facts and proceed" (it bakes degraded facts in permanently+silently).
+    Extraction failure (including SOTA-enrichment HTTP 529) must FAIL the entire
+    cycle — sessions/graph stay pending, retry scheduled; silently keeping
+    pre-enrichment facts would bake degraded triples into the cumulative graph
+    permanently.
 
     Distinct from VramExhausted, which has per-chunk isolation by design
     (resource constraint on a pathologically dense doc shouldn't poison

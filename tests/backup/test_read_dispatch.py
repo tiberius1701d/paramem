@@ -1,6 +1,6 @@
 """Tests for the age-aware ``read_maybe_encrypted`` dispatch + mode consistency.
 
-Covers the Slice-D2 surface:
+Covers:
 
 - ``read_maybe_encrypted`` sniffs the age magic and routes to the appropriate
   decryptor (age branch unwraps via the cached daily identity).

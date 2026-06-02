@@ -45,7 +45,6 @@ References
 ----------
 - Resolved Decision 17: per-adapter manifest schema distinct from ArtifactMeta.
 - Resolved Decision 31: live-slot by registry_sha256 match, not pointer file.
-- Plan §1.2, §1.3, §1.4, §1.5, §2.1.
 """
 
 from __future__ import annotations
@@ -724,8 +723,8 @@ def build_manifest_for(
             server path and a local dict in experiments.
         registry_sha256_override: When provided, used directly as
             ``registry_sha256`` instead of reading *registry_path*.  Used
-            by the I5 reorder path (§2.5) where the payload bytes have
-            already been hashed before writing to disk.
+            by the atomic-save path where bytes are hashed before writing to disk
+            (pre-stamp invariant: manifest records the hash before the file exists).
         window_stamp: ``"YYYYMMDDTHHMM"`` cadence-window the slot represents
             (see ``AdapterManifest.window_stamp``).  Empty string when the
             caller cannot determine the window — e.g. ad-hoc experiment

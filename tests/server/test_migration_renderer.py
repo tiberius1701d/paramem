@@ -7,7 +7,7 @@ Covers:
 - detect_simulate_mode
 - compute_base_change
 - render_preview_response (including base_change)
-- Byte-for-byte spec-compliance smoke test against §L257–271.
+- Byte-for-byte shape-change block rendering smoke test.
 """
 
 from __future__ import annotations
@@ -389,15 +389,15 @@ class TestRenderPreviewResponse:
 
 
 # ---------------------------------------------------------------------------
-# Byte-for-byte spec-compliance smoke test (spec §L257–271)
+# Byte-for-byte shape-change block renderer compliance smoke test
 # ---------------------------------------------------------------------------
 
 
 class TestRenderShapeChangeBlockByteForByteMatchesSpec:
     """Verify that the shape-change block rendered by the CLI renderer matches
-    the spec §L257–271 verbatim.
+    the expected format verbatim.
 
-    The spec text (lines 257–271 of plan_migration_and_backup.md):
+    The expected text:
 
         ────────────────────────────────────────
         ⚠  SHAPE CHANGE — DESTRUCTIVE
@@ -414,7 +414,7 @@ class TestRenderShapeChangeBlockByteForByteMatchesSpec:
                    Same blast radius as a rank change.
     """
 
-    # Canonical expected output (spec §L257–271, leading two-space indent from renderer).
+    # Canonical expected output (leading two-space indent from renderer).
     # The renderer uses two spaces after the colon for all field types; the
     # spec document's "procedural: alpha" (one space) is a markdown-formatting
     # artifact — the consistent two-space form is the correct renderer output.
@@ -435,7 +435,7 @@ class TestRenderShapeChangeBlockByteForByteMatchesSpec:
     )
 
     def _make_shape_changes(self):
-        """Return the fixture mirroring spec §L261–271."""
+        """Return the canonical shape-change fixture used by the renderer test."""
         return [
             {
                 "adapter": "episodic",
@@ -469,7 +469,7 @@ class TestRenderShapeChangeBlockByteForByteMatchesSpec:
         ]
 
     def test_render_shape_change_block_byte_for_byte_matches_spec(self, capsys):
-        """Renderer output matches the spec §L257–271 text exactly (string equality)."""
+        """Renderer output matches the expected shape-change block text exactly."""
         from paramem.cli.migrate import _render_shape_change_block
 
         _render_shape_change_block(self._make_shape_changes())

@@ -1,4 +1,4 @@
-"""Tests for POST /migration/accept (Slice 3b.3).
+"""Tests for POST /migration/accept.
 
 All tests run without GPU — the trial consolidation task is pre-seeded to a
 terminal gate status.  Tests validate the 5-step accept ordering, precondition
@@ -276,7 +276,7 @@ class TestAcceptHappyPath:
     def test_accept_sets_applied_live_banner(self, client, state):
         """After accept with live-apply success, banner says 'applied live'.
 
-        WP2: the default stub returns applied_live=True, so the banner
+        The default stub returns applied_live=True, so the banner
         must say 'applied live', NOT 'RESTART REQUIRED'.
         """
         client.post("/migration/accept")
@@ -334,14 +334,14 @@ class TestAcceptNoNewSessions:
 
 class TestAcceptEligibleStatusesSetMembership:
     def test_accept_eligible_statuses_are_set_membership(self, tmp_path, monkeypatch):
-        """pass_with_warnings (Slice 4 hypothetical) currently 409 gates_failed.
+        """ "pass_with_warnings" is not yet accept-eligible; currently returns 409.
 
         This test documents the current accept-eligible set:
-        {"pass", "no_new_sessions"}. Slice 4 will widen it to include
-        "pass_with_warnings". This test will then be updated to reflect that.
+        {"pass", "no_new_sessions"}.  When "pass_with_warnings" is added,
+        this test will be updated to reflect that.
 
-        Forward-compat guardrail 1: the accept gate uses set membership, not
-        exact equality, so Slice 4 only needs to add the new status to
+        Forward-compat guardrail: the accept gate uses set membership, not
+        exact equality, so adding the new status only requires updating
         _ACCEPT_ELIGIBLE_STATUSES (one place, in app.py).
         """
         fresh = _make_state(tmp_path, gates_status="pass_with_warnings")
@@ -605,7 +605,7 @@ class TestAcceptConcurrent:
 
 
 # ---------------------------------------------------------------------------
-# WP2 — response contract + live-apply wiring
+# Response contract + live-apply wiring
 # ---------------------------------------------------------------------------
 
 
@@ -996,7 +996,7 @@ class TestAcceptRPathsCarve:
 
 
 # ---------------------------------------------------------------------------
-# WP2 — real _apply_config_live: R-PATHS short-circuit guard
+# Real _apply_config_live: R-PATHS short-circuit guard
 # ---------------------------------------------------------------------------
 
 
@@ -1106,7 +1106,7 @@ class TestApplyConfigLiveRPathsShortCircuit:
 
 
 # ---------------------------------------------------------------------------
-# WP2 — B1 guard: real _apply_config_live on the accept no-op-skip path
+# Real _apply_config_live on the accept no-op-skip path (disk hash == loaded hash)
 # ---------------------------------------------------------------------------
 
 

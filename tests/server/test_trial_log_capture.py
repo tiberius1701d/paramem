@@ -1,4 +1,4 @@
-"""Unit tests for TrialLogCapture (Slice 5a).
+"""Unit tests for TrialLogCapture.
 
 Tests cover record counting, distinct-class tracking, level filtering,
 root-handler lifecycle (add on enter, remove on exit, remove on exception),

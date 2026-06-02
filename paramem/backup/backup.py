@@ -520,7 +520,7 @@ def _copy_artifact(
         # envelope_encrypt_bytes on them would produce a nested envelope (the
         # decryption layer would unwrap the outer shell and return another
         # ciphertext rather than plaintext). Copying verbatim preserves both
-        # recipients and is the contract documented in the plan (Q3).
+        # recipients. For age-wrapped artifacts, copy verbatim to avoid double-encryption.
         on_disk_bytes = raw_bytes
         encrypted_flag = True
     else:
@@ -1112,9 +1112,9 @@ def prune(
             continue
 
         # Immunity check: if slot is younger than immunity cutoff, keep it.
-        # Immune slots are exempt from the tier count (spec §retention policy:
-        # "keep: 10 applies only to the >30-day tail"). Do NOT increment
-        # retained_count — immunity must not starve the non-immune tail.
+        # Immune slots are exempt from the tier count: the keep limit applies only
+        # to the non-immune tail (slots older than the 30-day window). Do NOT
+        # increment retained_count — immunity must not starve the non-immune tail.
         if cutoff is not None:
             slot_ts = _parse_slot_timestamp(slot.name)
             if slot_ts is not None and slot_ts > cutoff:

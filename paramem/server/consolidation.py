@@ -218,9 +218,8 @@ def _do_mark_consolidated(
         callback(session_ids)
 
 
-# run_consolidation was deleted here (D2 — voice-profile-switch commit).
-# Its logic now lives in paramem.server.app._run_extraction_phase, which closes
-# over _state instead of taking model/tokenizer/config/session_buffer as args.
+# run_consolidation was deleted when it was merged into paramem.server.app._run_extraction_phase,
+# which closes over _state instead of taking model/tokenizer/config/session_buffer as args.
 # Trial-migration callers: use _run_extraction_phase(loop, mark_callback=lambda _: None).
 # Dev scripts that imported run_consolidation directly will need updating separately.
 

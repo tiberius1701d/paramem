@@ -23,10 +23,10 @@ count for each cell.  The serial baseline pins ``B=1``.
 
 The ``serial`` and ``batched`` strategies are thin wrappers around the
 production :func:`paramem.training.recall_eval.evaluate_indexed_recall`
-function (Phase 1 of plan-batched-probe-v2.md).  The ``prefix_cache``
-strategy is a research-only prototype (Phase 3 deferred — see
-``.agent/prefix-cache-correctness-investigation.md``) that remains
-in this file because its strict KV-reuse logic is not yet in production.
+function.  The ``prefix_cache`` strategy is a research-only prototype
+(deferred — KV-reuse correctness under dynamic sequence lengths is not
+yet validated for production) that remains in this file because its
+strict KV-reuse logic is not yet in production.
 
 Output schema (`results.json`):
     cells: [
@@ -162,8 +162,8 @@ def _synthetic_entries(n: int) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Research-only: prefix-cache strategy (Phase 3 deferred).
-# See .agent/prefix-cache-correctness-investigation.md before productionising.
+# Research-only: prefix-cache strategy (deferred — KV-reuse correctness under
+# dynamic sequence lengths is not yet validated for production).
 # The serial and batched strategies below call evaluate_indexed_recall directly.
 # ---------------------------------------------------------------------------
 

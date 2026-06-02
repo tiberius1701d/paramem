@@ -12,7 +12,7 @@ Covers:
 7. Written envelope carries the age v1 magic (``is_age_envelope`` recognises it).
 8. Stale ``<path>.tmp`` from a crash does not sabotage the 0o600 mode guarantee.
 9. ``wrap_daily_identity`` rejects empty passphrase and non-X25519 identities.
-10. Default path points under ``~/.config/paramem`` as the handover specifies.
+10. Default path points under ``~/.config/paramem`` (e.g. ``~/.config/paramem/daily.age``).
 """
 
 from __future__ import annotations

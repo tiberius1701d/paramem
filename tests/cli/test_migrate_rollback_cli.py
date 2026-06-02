@@ -1,4 +1,4 @@
-"""Tests for paramem.cli.migrate_rollback (Slice 3b.3).
+"""Tests for paramem.cli.migrate_rollback.
 
 Covers:
 - Happy path: POST /migration/rollback → 200 → prints response + exits 0.
@@ -30,7 +30,7 @@ _ROLLBACK_RESPONSE = {
     "rollback_pre_mortem_backup_path": "/abs/backups/config/rb-20260422-010000",
     "restart_required": False,
     "restart_hint": "systemctl --user restart paramem-server",
-    # WP2 fields: no-op skip (rollback restored config A, memory already A).
+    # No-op skip fields: rollback restored config A, memory already A.
     "applied_live": True,
     "restart_required_reason": None,
     "auto_restart_scheduled": False,
@@ -99,7 +99,7 @@ class TestMigrateRollbackHappyPath:
         rc = main(["migrate-rollback"])
         captured = capsys.readouterr()
         assert rc == 0
-        # WP2: rollback no-op skip path prints a human-readable message.
+        # No-op skip path: CLI prints a human-readable message.
         assert "rolled back" in captured.out.lower() or "no config change" in captured.out.lower()
 
     def test_rollback_200_json_mode_emits_raw_json(self, monkeypatch, capsys):
@@ -110,7 +110,7 @@ class TestMigrateRollbackHappyPath:
         assert rc == 0
         parsed = json.loads(captured.out)
         assert parsed["state"] == "LIVE"
-        # WP2: no-op skip → restart_required=False, applied_live=True.
+        # No-op skip → restart_required=False, applied_live=True.
         assert parsed["restart_required"] is False
         assert parsed["applied_live"] is True
 

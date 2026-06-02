@@ -83,8 +83,8 @@ class RoutingPlan:
 
 
 # Tier ordering for PERSONAL probe:
-# 1. procedural first — preferences shape style (load-bearing rule;
-#    see memory/feedback_router_procedural_first.md).
+# 1. procedural first — preferences shape style (load-bearing rule: preferences
+#    must be loaded before facts so style context is already active).
 # 2. interim adapters next, newest-first — they hold the freshest factual
 #    state.  A user correction (move, rename, change of mind) lands in the
 #    newest ``episodic_interim_<stamp>`` slot ahead of the next full-cycle
