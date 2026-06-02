@@ -54,6 +54,9 @@ def probe_keys_grouped_by_adapter(
         batch_size: Number of keys per ``model.generate`` call.  ``1``
             processes one key at a time; ``16`` (production default) is
             ~4.75× faster at ~346 MiB peak VRAM delta on RTX 5070 8 GB.
+            The default of ``1`` is for direct / test use only; production
+            callers (``WeightMemorySource``) must supply
+            ``config.consolidation.recall_probe_batch_size``.
 
     Returns:
         Flat dict mapping each key name to its probe result (a result dict on

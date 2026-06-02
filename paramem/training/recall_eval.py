@@ -184,7 +184,9 @@ def probe_entries(
         entries: List of entry dicts, each containing at minimum ``"key"``.
         registry: Optional SimHash registry for confidence verification.
         batch_size: Number of prompts per ``model.generate`` call.  ``1``
-            processes prompts one at a time (no batching overhead).
+            processes prompts one at a time (no batching overhead).  The
+            default of ``1`` is for direct / test use only; production callers
+            must supply ``config.consolidation.recall_probe_batch_size``.
         confidence_threshold: Minimum SimHash confidence to accept a recalled
             entry.  Entries below this threshold are yielded with a
             ``failure_reason`` key.

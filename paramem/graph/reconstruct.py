@@ -142,8 +142,13 @@ def reconstruct_graph(
     graph = nx.MultiDiGraph()
     failures: list[dict] = []
 
-    training_config = getattr(loop, "training_config", None)
-    batch_size = getattr(training_config, "recall_probe_batch_size", 1)
+    # A ConsolidationLoop always carries a TrainingConfig.  Read the recall batch
+    # size from it directly — no silent literal default, consistent with every
+    # other production recall site (enforced by
+    # tests/test_recall_batch_size_config_guard.py).  training_config is reused
+    # below for the gradient-checkpointing restore.
+    training_config = loop.training_config
+    batch_size = training_config.recall_probe_batch_size
 
     # Disable gradient checkpointing around all probing — HF silently disables
     # the KV cache when checkpointing is active, which causes silent generation
