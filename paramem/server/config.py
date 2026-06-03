@@ -1299,8 +1299,9 @@ class MobilePwaConfig:
     string defers resolution to the mount point (``paramem/web/static``)
     configured in a later slice.
 
-    ``cookie_name``: name of the session cookie the mobile client will send
-    on every request.  Must match whatever the SPA sets after login.
+    ``cookie_name``: name of the cookie the middleware will accept if the
+    client presents one.  The server does not issue this cookie; tokens are
+    carried via the ``Authorization: Bearer`` header in practice.
 
     ``push_enabled``: enable Web Push notifications.  When true, the server
     auto-generates a VAPID EC P-256 keypair on first startup (persisted as

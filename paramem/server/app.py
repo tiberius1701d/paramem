@@ -2529,7 +2529,7 @@ async def root_redirect():
     """Redirect the bare root to the PWA shell.
 
     The ``/`` path is exempt from bearer-token auth so the browser can
-    follow the redirect before a session cookie exists.  The ``/app/``
+    follow the redirect before a token is presented.  The ``/app/``
     prefix is also exempt, so the shell and its static assets load freely.
     """
     return RedirectResponse("/app/")
