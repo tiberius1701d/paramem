@@ -32,8 +32,10 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import networkx as nx
 import pytest
 
+from paramem.graph.reconstruct import ReconstructionResult
 from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
 from paramem.training.key_registry import KeyRegistry
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
@@ -53,6 +55,35 @@ _MOCK_PATCHES = [
     "paramem.models.loader.copy_adapter_weights",
     "paramem.graph.qa_generator.partition_relations",
 ]
+
+
+def _faithful_reconstruct(loop, *, tier=None, strict=False) -> ReconstructionResult:
+    """Stub for ``reconstruct_graph`` that rebuilds the graph from the loop's
+    registered store entries WITHOUT running a real probe.
+
+    The real ``reconstruct_graph`` probes ``loop.model`` (a ``MagicMock`` here)
+    via ``probe_entries`` → ``re.sub``, which TypeErrors on a mock.  This stub
+    yields the same edges the probe would have produced for a model that
+    perfectly recalls every registered key: one edge per active key carrying
+    ``_IK_KEY_ATTR`` and ``predicate`` (plus subject→object), so the downstream
+    re-merge / dedup / tiering / training flow proceeds exactly as in a passing
+    probe.  No real behavior (drift detection, key registration, training) is
+    short-circuited — the keys still flow through.
+    """
+    from paramem.memory.persistence import _IK_KEY_ATTR
+
+    graph = nx.MultiDiGraph()
+    for _tier, key, entry in loop.store.iter_entries():
+        if tier is not None and _tier != tier:
+            continue
+        subj = entry.get("subject", "")
+        obj = entry.get("object", "")
+        pred = entry.get("predicate", "")
+        if not (subj and obj and pred):
+            continue
+        eid = graph.add_edge(subj, obj, predicate=pred)
+        graph[subj][obj][eid][_IK_KEY_ATTR] = key
+    return ReconstructionResult(graph=graph, failures=[])
 
 
 def _make_stub_model(*adapter_names: str) -> MagicMock:
@@ -113,7 +144,26 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     loop.wandb_config = None
     loop.output_dir = tmp_path
     loop.merger = MagicMock()
-    loop.merger.graph = MagicMock(relations=[])
+    # Stage 2 (re-merge) calls merger.merge(synthetic_session); stage 5 walks
+    # merger.graph.edges(data=True) to rebuild the per-tier keyed lists.  Use a
+    # real MultiDiGraph and a merge side_effect that inserts one edge per relation
+    # (carrying predicate + relation_type), mirroring the real GraphMerger so the
+    # reconstructed triples flow through dedup/tiering/training instead of all
+    # registering as graph drift.
+    _merger_graph = nx.MultiDiGraph()
+    loop.merger.graph = _merger_graph
+
+    def _merge_into_graph(session_graph):
+        for _rel in getattr(session_graph, "relations", []):
+            _merger_graph.add_edge(
+                _rel.subject,
+                _rel.object,
+                predicate=_rel.predicate,
+                relation_type=getattr(_rel, "relation_type", "factual"),
+            )
+        return _merger_graph
+
+    loop.merger.merge.side_effect = _merge_into_graph
     # indexed_key_registry is now dict[str, KeyRegistry] (per-tier).
     loop.indexed_key_registry = registry if registry is not None else _make_empty_registry_dict()
     loop.indexed_key_cache = indexed_key_cache if indexed_key_cache is not None else {}
@@ -123,6 +173,19 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     loop._thermal_policy = None
     # _bg_trainer is wired by the server lifespan; None in tests (experiment path).
     loop._bg_trainer = None
+    # consolidate_interim_adapters calls _run_graph_enrichment(), which reads
+    # self.graph_enrichment_enabled.  The bare __new__ loop never ran __init__,
+    # so this attribute is absent and the call raises AttributeError (swallowed,
+    # but the half-run enrichment perturbs the per-tier flow).  Disable enrichment
+    # explicitly so it early-returns skipped — the no-enrichment behavior these
+    # ordering/registry tests assume.
+    loop.graph_enrichment_enabled = False
+    # Admit-all probe stub for the registration fail-safe: when no recall verdict is
+    # available, _reset_main_tier_registries_and_simhashes runs _probe_passing_keys,
+    # whose real evaluate_indexed_recall feeds the MagicMock model into re.sub and
+    # TypeErrors.  Admitting every key matches the prior no-gate behavior, so it is
+    # inert for these ordering/registry tests.
+    loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
     return loop
 
 
@@ -130,6 +193,36 @@ def _create_noop(m, cfg, name):
     """Stub create_adapter that adds the adapter name to peft_config."""
     m.peft_config[name] = MagicMock()
     return m
+
+
+# Subject → intended registry tier for the per-tier ordering tests.  Both
+# TestB2RearmPattern.test_set_is_training_called_for_all_three_tiers and
+# TestPerTierInferenceFallbackAdapter use the same three triples, one per tier.
+_TIER_BY_SUBJECT = {"Alice": "episodic", "Bob": "semantic", "Dave": "procedural"}
+
+
+def _partition_by_registry_tier(relations, *, procedural_enabled=True):
+    """``partition_relations`` side_effect that routes by the test's registry tier.
+
+    The real ``partition_relations`` keys off predicate semantics — it classifies
+    "Alice likes cats" as procedural (``likes`` is a preference verb), which
+    contradicts the test's registry assignment (Alice → episodic).  These ordering
+    tests exercise the per-tier training loop mechanics, NOT predicate-based
+    tiering, so route each relation to the (``_ep_rels``, ``_proc_rels``) bucket
+    that lands it in the registry tier the test assigned:
+
+      - procedural subject → ``([], [rel])`` → tier "procedural"
+      - episodic / semantic subject → ``([rel], [])`` → consolidation then reads
+        ``tier_for_active_key`` (registry) to split episodic vs semantic.
+    """
+    ep_rels, proc_rels = [], []
+    for rel in relations:
+        tier = _TIER_BY_SUBJECT.get(rel.get("subject", ""), "episodic")
+        if tier == "procedural" and procedural_enabled:
+            proc_rels.append(rel)
+        else:
+            ep_rels.append(rel)
+    return ep_rels, proc_rels
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +276,13 @@ class TestLockLeakGuard:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model via
+                # probe_entries; stub it with a faithful registry-derived graph so the
+                # downstream re-merge/dedup/tiering/training flow runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 result = loop.consolidate_interim_adapters()
@@ -271,6 +371,13 @@ class TestB2RearmPattern:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model via
+                # probe_entries; stub it with a faithful registry-derived graph so the
+                # downstream re-merge/dedup/tiering/training flow runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 loop.consolidate_interim_adapters(trainer=stub_trainer)
@@ -364,14 +471,20 @@ class TestB2RearmPattern:
 
         stub_trainer._set_is_training.side_effect = _record_set_is_training
 
-        # partition_relations is called to split episodic keys into
-        # episodic/semantic sub-groups.  Return ([], []) so all keys stay in
-        # the tier already assigned by registry.get_adapter_id.
+        # partition_relations splits each triple into episodic vs procedural
+        # buckets; consolidation then reads the registry to split episodic vs
+        # semantic.  Patch the name bound in paramem.training.consolidation (the
+        # module-local import), NOT paramem.graph.qa_generator — the latter does
+        # not affect the call inside consolidate_interim_adapters.  Route each
+        # triple to its registry tier so all three tiers train.
         _gpu_thread_lock.acquire()
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
+                patch(
+                    "paramem.training.consolidation.partition_relations",
+                    side_effect=_partition_by_registry_tier,
+                ),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
@@ -397,6 +510,13 @@ class TestB2RearmPattern:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model via
+                # probe_entries; stub it with a faithful registry-derived graph so the
+                # downstream re-merge/dedup/tiering/training flow runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 loop.consolidate_interim_adapters(trainer=stub_trainer)
@@ -521,7 +641,12 @@ class TestPerTierInferenceFallbackAdapter:
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
+                # Patch the module-local name (see _partition_by_registry_tier);
+                # routing each triple to its registry tier so all three tiers train.
+                patch(
+                    "paramem.training.consolidation.partition_relations",
+                    side_effect=_partition_by_registry_tier,
+                ),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
@@ -547,6 +672,13 @@ class TestPerTierInferenceFallbackAdapter:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model via
+                # probe_entries; stub it with a faithful registry-derived graph so the
+                # downstream re-merge/dedup/tiering/training flow runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 loop.consolidate_interim_adapters(trainer=stub_trainer)
@@ -661,6 +793,13 @@ class TestPerTierInferenceFallbackAdapter:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model via
+                # probe_entries; stub it with a faithful registry-derived graph so the
+                # downstream re-merge/dedup/tiering/training flow runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 loop.consolidate_interim_adapters(trainer=stub_trainer)
@@ -788,6 +927,13 @@ class TestCapacityCeilingRollback:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model via
+                # probe_entries; stub it with a faithful registry-derived graph so the
+                # downstream re-merge/dedup/tiering/training flow runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 result = loop.consolidate_interim_adapters(recall_sanity_threshold=0.95)
@@ -856,6 +1002,13 @@ class TestCapacityCeilingRollback:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model via
+                # probe_entries; stub it with a faithful registry-derived graph so the
+                # downstream re-merge/dedup/tiering/training flow runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
                 result = loop.consolidate_interim_adapters(recall_sanity_threshold=0.95)
@@ -953,6 +1106,13 @@ class TestAtomicFinalizeOrdering:
                 ),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model via
+                # probe_entries; stub it with a faithful registry-derived graph so the
+                # downstream re-merge/dedup/tiering/training flow runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
                 # Patch KeyRegistry.save at the class level — the finalize block creates
                 # fresh KeyRegistry instances, so we must patch the class method, not the
@@ -1061,6 +1221,13 @@ class TestAtomicFinalizeOrdering:
                 ),
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model via
+                # probe_entries; stub it with a faithful registry-derived graph so the
+                # downstream re-merge/dedup/tiering/training flow runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
                 # Suppress real disk I/O in the finalize save.
                 patch("paramem.training.key_registry.KeyRegistry.save"),
@@ -1168,6 +1335,12 @@ class TestMainWeightsSavedBeforeInterimPurge:
                 patch("paramem.models.loader.switch_adapter"),
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.training.key_registry.KeyRegistry.save"),
+                # Stage 1 (reconstruct_graph) probes the MagicMock model; stub it with a
+                # faithful registry-derived graph so the finalize ordering runs unchanged.
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    side_effect=_faithful_reconstruct,
+                ),
                 patch.object(
                     ConsolidationLoop, "_save_adapters", autospec=True, side_effect=save_side_effect
                 ),

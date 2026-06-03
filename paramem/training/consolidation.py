@@ -28,7 +28,9 @@ from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.qa_generator import (
     partition_relations,
 )
-from paramem.graph.schema import SessionGraph
+from paramem.graph.reconstruct import reconstruct_graph
+from paramem.graph.schema import Relation, SessionGraph
+from paramem.graph.schema_config import fallback_relation_type, relation_types
 from paramem.graph.scoring import (
     PromotionScorer,
 )
@@ -56,6 +58,12 @@ from paramem.utils.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Frozen set of valid relation types drawn from the single source of truth in
+# schema_config so that the stage-2 clamp stays in sync with the Pydantic
+# Relation schema (_RelationType = Literal[relation_types()]).
+_VALID_RTYPES: frozenset[str] = frozenset(relation_types())
+_FALLBACK_RTYPE: str = fallback_relation_type()
 
 
 @dataclass
@@ -3481,22 +3489,35 @@ class ConsolidationLoop:
 
         Steps:
         1. Verify the GPU lock is held (entry guard — leak-safe pattern).
-        2. Walk all active keys, re-derive their tier from the cumulative graph,
-           handle graph-drift keys, and build per-tier keyed-pair lists.
-        3. Load backup adapters (if available) and all interim adapters into PEFT.
-        4. For each tier (episodic → semantic → procedural):
+        2. Optional SOTA graph enrichment.
+        3. Stage 1 — Unfold / reconstruct: probe every active key from adapter
+           weights via ``reconstruct_graph``; recover (subject, predicate, object).
+        4. Stage 2 — Re-merge: for each reconstructed triple, inject the
+           authoritative ``relation_type`` from persisted bookkeeping, then feed
+           through ``merger.merge()`` so the cumulative graph edges are re-stamped.
+        5. Stage 3 — Triple→key index: build a per-cycle ``(s,norm_p,o)→key``
+           mapping from ``store.iter_entries()`` (normalized predicates).
+        6. Stage 4 — Edge-walk relation_type: read ``(s,norm_p,o)→relation_type``
+           from ``merger.graph.edges(data=True)``; replaces the dead
+           ``getattr(graph, "relations", [])`` path that always returned empty.
+        7. Stage 5 — Dedup + tier: walk merged graph edges (dedup on norm triple),
+           look up key via the triple→key index, derive tier from ``relation_type``
+           via ``partition_relations``; build ``tier_keyed`` lists.  The merged
+           graph is the dedup authority (duplicate triples collapse to one key).
+        8. Load backup adapters (if available) and all interim adapters into PEFT.
+        9. For each tier (episodic → semantic → procedural):
            a. Set active adapter to <tier>_backup before deleting the main.
            b. delete_adapter(<tier>) + create_adapter(<tier>).
            c. Set <tier>_is_training=True, call _train_adapter, set False.
            d. Recall-sanity check; on failure roll back and abort.
-        5. Atomic finalize: registry rewrite → durable main-weight persist+verify
+        10. Atomic finalize: registry rewrite → durable main-weight persist+verify
            (_save_adapters) → unload_interim_adapters → router reload.  The
            weight persist runs BEFORE the interim purge so the merged knowledge
            always has a verified on-disk copy before any interim slot is deleted
            (closes the full-cycle data-loss crash window).  _save_adapters runs
            a recall PROBE on the reloaded slot — it is not an HF Trainer routine,
            so the finalize invariant (no training calls) holds.
-        6. On success: unload backup adapters.
+        11. On success: unload backup adapters.
 
         Args:
             trainer: BackgroundTrainer instance (must be the one holding the GPU
@@ -3556,104 +3577,164 @@ class ConsolidationLoop:
                 _enrich_exc,
             )
 
-        # --- Step 2: Snapshot cumulative graph ---
-        graph = self.merger.graph
-
-        # --- Step 3: Re-derive per-tier keyed-pair lists ---
-        # Build a lookup from (subject, predicate, object) → relation_type in
-        # the cumulative graph so we can re-derive the tier for each key.
-        graph_triple_to_type: dict[tuple[str, str, str], str] = {}
-        for rel in getattr(graph, "relations", []) if hasattr(graph, "relations") else []:
-            triple = (
-                getattr(rel, "subject", ""),
-                getattr(rel, "predicate", ""),
-                getattr(rel, "object", ""),
+        # --- Stage 1: Unfold / reconstruct all active keys from adapter weights ---
+        # Probes every active key across all tiers; recovers (subject, predicate, object)
+        # from the trained weights.  Reconstruction yields SPO ONLY — no relation_type.
+        # strict=False: failures are logged and recorded in recon_result.failures; the
+        # cycle continues with whatever SPO triples can be recovered.
+        recon_result = reconstruct_graph(self, strict=False)
+        if recon_result.failures:
+            logger.warning(
+                "consolidate_interim_adapters: %d key(s) failed reconstruction "
+                "(will be sourced from merged graph only)",
+                len(recon_result.failures),
             )
-            graph_triple_to_type[triple] = getattr(rel, "relation_type", "factual")
 
-        active_keys = self._all_active_keys()
+        # --- Stage 2: Re-merge reconstructed triples with bookkeeping relation_type ---
+        # For each reconstructed SPO triple, inject the authoritative relation_type from
+        # persisted _bookkeeping (populated by set_bookkeeping at training time and by
+        # backfill_relation_type_from_graph for legacy keys).  Build a synthetic
+        # SessionGraph and feed it through merger.merge() so the cumulative graph picks up
+        # the correct relation_type on NET-NEW edges only (merger.py:557 sets relation_type
+        # from the supplied Relation on Case-3 inserts).  GraphMerger Case 1 (existing
+        # triple, merger.py:411-432) bumps recurrence_count but does NOT overwrite
+        # relation_type, so existing edges keep their original extraction-time value.
+        # Because both the existing edge and the bookkeeping entry share that value
+        # (both set at extraction time; backfill recovers it from the edge for legacy
+        # keys), stage-4 tiering reads a consistent relation_type either way.
+        #
+        # Keys with no bookkeeping relation_type or relation_type=="unknown" fall back to
+        # _FALLBACK_RTYPE (module-level constant derived from schema_config, currently
+        # "factual") for the merge-time Relation (which partitions to episodic — the
+        # conservative default).  The bookkeeping entry itself is not modified here.
+        from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
+        recon_relations: list[Relation] = []
+        for _r_subj, _r_obj, _r_data in recon_result.graph.edges(data=True):
+            _r_key = _r_data.get(_IK_ATTR, "")
+            _r_pred = _r_data.get("predicate", "")
+            if not (_r_key and _r_pred):
+                continue
+            _r_bk = self.store.bookkeeping_for_key(_r_key) or {}
+            _r_rt_raw = _r_bk.get("relation_type", _FALLBACK_RTYPE)
+            # Clamp to valid schema values; "unknown" and missing map to the
+            # configured fallback (module-level _FALLBACK_RTYPE, currently "factual").
+            _r_rt: str = _r_rt_raw if _r_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+            _r_spk: str = _r_bk.get("speaker_id") or ""
+            recon_relations.append(
+                Relation(
+                    subject=_r_subj,
+                    predicate=_r_pred,
+                    object=_r_obj,
+                    relation_type=_r_rt,  # type: ignore[arg-type]
+                    confidence=1.0,
+                    speaker_id=_r_spk,
+                )
+            )
+
+        if recon_relations:
+            _synthetic_session = SessionGraph(
+                session_id="__full_consolidation_recon__",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                entities=[],
+                relations=recon_relations,
+            )
+            self.merger.merge(_synthetic_session)
+            logger.info(
+                "consolidate_interim_adapters: re-merged %d reconstructed triples "
+                "into cumulative graph",
+                len(recon_relations),
+            )
+
+        # --- Stage 3: Build per-cycle triple→key index from the store ---
+        # Maps (subject, _normalize_predicate(predicate), object) → key.
+        # Derived in-cycle from store.iter_entries() with normalized predicates so
+        # both sides of the lookup share the same normalization as merger.merge().
+        # This is NOT a persisted sidecar — the merger is the idempotent authority.
+        triple_to_key: dict[tuple[str, str, str], str] = {}
+        for _tk_tier, _tk_key, _tk_entry in self.store.iter_entries():
+            _tk_norm = (
+                _tk_entry.get("subject", ""),
+                _normalize_predicate(_tk_entry.get("predicate", "")),
+                _tk_entry.get("object", ""),
+            )
+            triple_to_key[_tk_norm] = _tk_key
+
+        # --- Stage 4: Build (subject, norm_pred, object) → relation_type from merged graph ---
+        # Replaces the dead `:3463` `getattr(graph, "relations", [])` path.
+        # NetworkX MultiDiGraph has no `.relations` attribute — that lookup always
+        # returned an empty list, so all keys fell through to the graph-drift path.
+        # The authoritative fix is to edge-walk merger.graph.edges(data=True) and
+        # read the relation_type re-stamped by stage 2 (or by per-session merges).
+        # This is the transient READ of the persisted bookkeeping datum (§6.1 of the
+        # consolidation architecture): same datum on two surfaces, not two sources.
+        graph_triple_to_type: dict[tuple[str, str, str], str] = {}
+        for _gt_subj, _gt_obj, _gt_data in self.merger.graph.edges(data=True):
+            _gt_pred = _gt_data.get("predicate", "")
+            _gt_rt = _gt_data.get("relation_type", "factual")
+            if _gt_pred:
+                graph_triple_to_type[(_gt_subj, _normalize_predicate(_gt_pred), _gt_obj)] = _gt_rt
+
+        # --- Stage 5: Dedup via merged graph; assign per-tier keyed lists ---
+        # The merged graph IS the dedup authority (locked #5 of the architecture).
+        # One edge per (subject, norm_pred, object) after dedup via seen_triples.
+        # Tier is derived from the edge's relation_type (NOT from the dead `:3463`
+        # path), fixing bug-C (cross-session duplicate triples previously produced
+        # duplicate keys when sourced from store.get(key) instead of the graph).
         tier_keyed: dict[str, list[dict]] = {
             "episodic": [],
             "semantic": [],
             "procedural": [],
         }
-        graph_drift_count = 0
+        seen_triples: set[tuple[str, str, str]] = set()
 
-        for key in active_keys:
-            entry = self.store.get(key)
-            if entry is None:
-                # No QA metadata — skip (should not happen with intact registry)
-                logger.warning("consolidate_interim_adapters: no QA metadata for key %s", key)
+        for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
+            _t_pred = _t_data.get("predicate", "")
+            if not _t_pred:
+                continue
+            _t_norm = (_t_subj, _normalize_predicate(_t_pred), _t_obj)
+            if _t_norm in seen_triples:
+                # Dedup: MultiDiGraph may carry multiple parallel edges for the same
+                # (subject, norm_pred, object) — process only the first occurrence.
+                continue
+            seen_triples.add(_t_norm)
+
+            key = triple_to_key.get(_t_norm)
+            if key is None:
+                # Triple exists in the merged graph but has no registered key
+                # (e.g. enrichment added it, or it pre-dates key registration).
+                # Skip — it will be keyed and trained on the next cycle once
+                # it enters the extraction→key-assignment path.
                 continue
 
-            src_subj = entry.get("subject", "")
-            src_pred = entry.get("predicate", "")
-            src_obj = entry.get("object", "")
-            triple_key = (src_subj, src_pred, src_obj)
+            entry = self.store.get(key)
+            if entry is None:
+                # Key is registered but has no content entry — skip.
+                logger.debug(
+                    "consolidate_interim_adapters: key %s has no content entry — skipping", key
+                )
+                continue
 
-            # current_adapter_id = the tier dict key that owns this key
+            _t_rt = graph_triple_to_type.get(_t_norm, "factual")
             current_adapter_id = self.store.tier_for_active_key(key) or "episodic"
-
-            # Try to re-derive tier from the cumulative graph.
-            relation_type = graph_triple_to_type.get(triple_key)
-            if relation_type is not None:
-                # Re-derive tier using the same partition_relations policy.
-                dummy_rel = [
-                    {
-                        "subject": src_subj,
-                        "predicate": src_pred,
-                        "object": src_obj,
-                        "relation_type": relation_type,
-                    }
-                ]
-                ep_rels, proc_rels = partition_relations(
-                    dummy_rel, procedural_enabled=self.procedural_config is not None
-                )
-                if proc_rels:
-                    tier = "procedural"
-                elif ep_rels:
-                    # Determine if this is episodic or semantic based on the
-                    # current adapter_id (semantic keys stay semantic).
-                    if current_adapter_id == "semantic":
-                        tier = "semantic"
-                    else:
-                        tier = "episodic"
-                else:
-                    tier = "episodic"
+            _dummy = [
+                {
+                    "subject": _t_subj,
+                    "predicate": _t_pred,
+                    "object": _t_obj,
+                    "relation_type": _t_rt,
+                }
+            ]
+            _ep_rels, _proc_rels = partition_relations(
+                _dummy, procedural_enabled=self.procedural_config is not None
+            )
+            if _proc_rels:
+                tier = "procedural"
+            elif _ep_rels:
+                # Semantic keys remain semantic; all others map to episodic.
+                tier = "semantic" if current_adapter_id == "semantic" else "episodic"
             else:
-                # Graph drift: triple not found in cumulative graph.
-                graph_drift_count += 1
-                logger.info(
-                    "graph_drift_key key=%s subject=%r predicate=%r "
-                    "object=%r current_adapter_id=%r",
-                    key,
-                    src_subj,
-                    src_pred,
-                    src_obj,
-                    current_adapter_id,
-                )
-                # Apply the interim-adapter bucketing rule:
-                #   episodic_interim_* → episodic
-                #   non-interim adapter_id → must be one of the three main tiers
-                if current_adapter_id.startswith(
-                    ("episodic_interim_", "semantic_interim_", "procedural_interim_")
-                ):
-                    tier = current_adapter_id.split("_interim_")[0]
-                else:
-                    assert current_adapter_id in {
-                        "episodic",
-                        "semantic",
-                        "procedural",
-                    }, (
-                        f"Registry invariant violation: key {key!r} has "
-                        f"unexpected tier {current_adapter_id!r}"
-                    )
-                    tier = (
-                        current_adapter_id
-                        if current_adapter_id in {"episodic", "semantic", "procedural"}
-                        else "episodic"
-                    )
+                tier = "episodic"
 
             tier_keyed[tier].append(
                 {
@@ -3662,6 +3743,22 @@ class ConsolidationLoop:
                     "predicate": entry["predicate"],
                     "object": entry["object"],
                 }
+            )
+
+        # Compute drift: active keys in the store that were NOT found via the merged
+        # graph edge-walk (their triple is absent from the cumulative graph).
+        _all_keyed = {e["key"] for tier_list in tier_keyed.values() for e in tier_list}
+        active_keys = self.store.all_active_keys()
+        _drift_keys = [k for k in active_keys if k not in _all_keyed]
+        graph_drift_count = len(_drift_keys)
+        for _dk in _drift_keys:
+            _dk_entry = self.store.get(_dk)
+            logger.info(
+                "graph_drift_key key=%s subject=%r predicate=%r object=%r",
+                _dk,
+                (_dk_entry or {}).get("subject", ""),
+                (_dk_entry or {}).get("predicate", ""),
+                (_dk_entry or {}).get("object", ""),
             )
 
         # Warn if graph drift exceeds 10 % of active keys.
