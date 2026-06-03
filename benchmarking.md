@@ -1880,7 +1880,7 @@ Three pause sites:
    C1→C2 boundaries.
 3. **Mid-phase, mid-epoch** — `RecallEarlyStopCallback` already
    detects `~/.training_pause` inside `on_epoch_end`
-   (`paramem/training/early_stop.py:463`) and signals
+   (`paramem/training/early_stop.py`) and signals
    `should_training_stop=True`. `_exit_if_paused_mid_phase` (mirror of
    Test 14's helper) infers the paused-mid-phase state from
    `stop_epoch is None AND last_epoch < num_epochs` and writes
@@ -1890,7 +1890,7 @@ On `tresume 15`, the script launches with `--resume`, finds the latest
 run dir, and per (seed, phase) either skips on `<phase>_done.json` or
 finds the latest checkpoint via `_find_latest_checkpoint` and resumes
 the trainer with `resume_from_checkpoint=...`. The callback's
-`_rehydrate_from_disk` (`paramem/training/early_stop.py:218`) restores
+`_rehydrate_from_disk` (`paramem/training/early_stop.py`) restores
 `epoch_log`, `first_perfect_log`, `progress.json`'s `cycle_started_at`,
 and derives `_consecutive_perfect`, so accumulators do not restart on
 resume. `tstatus` renders the active phase's progress.json as a

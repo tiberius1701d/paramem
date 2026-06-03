@@ -25,7 +25,7 @@ The unified shape is ``tier → key → value`` for all three concerns:
 
 * :attr:`MemoryStore.entries_in_tier` returns ``dict[key, entry_payload]``.
 * :attr:`MemoryStore.simhashes_in_tier` returns ``dict[key, int]`` — usable
-  verbatim by :func:`paramem.training.indexed_memory.verify_confidence` and
+  verbatim by :func:`paramem.memory.entry.verify_confidence` and
   friends.
 * :meth:`MemoryStore.registry` returns the tier's :class:`KeyRegistry`.
 

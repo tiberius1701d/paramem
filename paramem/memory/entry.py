@@ -124,9 +124,8 @@ def assign_keys(
     """Assign sequential ``<prefix><N>`` keys to a list of (subject, predicate, object) triples.
 
     Returns dicts with the four canonical fields used everywhere downstream.
-    The ``start_index`` parameter mirrors :func:`paramem.training.indexed_memory.assign_keys`
-    so callers can concatenate key ranges (e.g. episodic keys 1–N, procedural
-    keys N+1–M) without collisions.
+    The ``start_index`` parameter lets callers concatenate key ranges
+    (e.g. episodic keys 1–N, procedural keys N+1–M) without collisions.
 
     Args:
         triples: List of ``(subject, predicate, object)`` 3-tuples.
@@ -218,9 +217,9 @@ def parse_recalled_entry(text: str) -> dict | None:
     """Parse a single recalled entry JSON object from model output.
 
     Tries the raw text first, then — only if cleaning changed anything — retries
-    on :func:`paramem.training.indexed_memory._clean_generation_artifacts`'d text
+    on :func:`paramem.memory.entry._clean_generation_artifacts`'d text
     (strips markdown bold markers and excess newlines that some instruct models
-    inject). This mirrors :func:`paramem.training.indexed_memory.parse_recalled_pair`.
+    inject).
 
     Uses progressive first-object extraction: scans forward for ``{``, tries each
     ``}`` (via ``raw_decode``, never ``rfind``) to avoid swallowing chained objects.
@@ -282,14 +281,13 @@ def compute_simhash(
 ) -> int:
     """Compute a SimHash fingerprint from key + subject + predicate + object.
 
-    Mirrors :func:`paramem.training.indexed_memory.compute_simhash` using the
-    same unigram+bigram feature tokenization and bit-vote algorithm. The key is
+    Uses unigram+bigram feature tokenization and a bit-vote algorithm. The key is
     included so that identical triple content under different keys produces
     different fingerprints — catches hallucinations where the model echoes the
     queried key but returns another key's content.
 
-    Note: this fingerprint is NOT compatible with the legacy SimHash in
-    :mod:`paramem.training.indexed_memory` — they hash different content strings.
+    Note: this fingerprint is NOT compatible with legacy SimHash registry files
+    built with an earlier content string format.
     Existing ``simhash_registry_*.json`` files built with the legacy format must
     be regenerated.
 
@@ -332,8 +330,7 @@ def verify_confidence(
 ) -> float:
     """Verify a recalled entry against a SimHash registry.
 
-    Mirrors the contract of :func:`paramem.training.indexed_memory.verify_confidence`
-    exactly:
+    Contract:
 
     - Returns ``1.0`` when no registry is provided (no verification).
     - Returns ``0.0`` when the key is absent from the registry (untrained key).
@@ -342,7 +339,7 @@ def verify_confidence(
 
     Supports both the simple ``{key: int}`` registry shape and the enriched
     ``{key: {"simhash": int, ...}}`` shape via
-    :func:`paramem.training.indexed_memory.get_simhash`.
+    :func:`paramem.memory.entry.get_simhash`.
 
     Args:
         recalled: Dict containing at minimum ``key``, ``subject``,
@@ -399,8 +396,7 @@ def build_enriched_registry(
 ) -> dict:
     """Build an enriched registry with temporal metadata.
 
-    Mirrors :func:`paramem.training.indexed_memory.build_enriched_registry`
-    exactly — same entry shape, same merge/stale semantics.
+    Same entry shape and merge/stale semantics.
 
     Format per key::
 
