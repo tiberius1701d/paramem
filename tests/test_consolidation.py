@@ -2269,6 +2269,8 @@ class TestAbortSkipsCommit:
 
         loop = self._make_minimal_loop(monkeypatch, tmp_path)
 
+        import networkx as _nx
+
         # Pre-populate the store so _all_active_keys() returns at least one key
         # and jobs_by_tier["episodic"] ends up non-empty (otherwise the tier is
         # skipped, the abort branch is never reached, and no rollback fires).
@@ -2285,6 +2287,22 @@ class TestAbortSkipsCommit:
             },
             register=True,
         )
+        # Bookkeeping is required for stage-2 bookkeeping lookup in the new
+        # full-consolidation reconstruct→remerge pipeline.
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="Speaker0",
+            first_seen_cycle=1,
+            relation_type="factual",
+        )
+        # Stage 5 (edge-walk dedup + tier) reads from merger.graph.edges(data=True).
+        # Replace the MagicMock with a real MultiDiGraph carrying the graph1 edge
+        # so tier_keyed["episodic"] ends up non-empty and the abort path fires.
+        _real_graph = _nx.MultiDiGraph()
+        _eid = _real_graph.add_edge("Alex", "Millfield", predicate="lives_in")
+        _real_graph["Alex"]["Millfield"][_eid]["relation_type"] = "factual"
+        _real_graph["Alex"]["Millfield"][_eid]["ik_key"] = "graph1"
+        loop.merger.graph = _real_graph
 
         # Pre-install backup adapters in peft_config so the backup-creation block
         # is skipped and the rollback (abort) path sees them in peft_config.
@@ -2299,6 +2317,8 @@ class TestAbortSkipsCommit:
 
         def _spy_copy(model, src, dst):
             copy_calls.append((src, dst))
+
+        from paramem.graph.reconstruct import ReconstructionResult
 
         with (
             # Block HF TrainingArguments construction (bf16 validation, GPU check).
@@ -2320,6 +2340,12 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
             ),
+            # Stage 1 (reconstruct_graph) is a GPU operation; stub with an empty result
+            # so the abort-path test does not require a real model.
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
+            ),
             patch(
                 "paramem.training.consolidation.format_entry_training",
                 return_value=[{"input_ids": [1], "labels": [1]}],
@@ -2340,4 +2366,441 @@ class TestAbortSkipsCommit:
         rollback_dsts = {dst for (src, dst) in copy_calls if src.endswith("_backup")}
         assert rollback_dsts, (
             f"No backup restore copy_adapter_weights calls after abort; copy_calls={copy_calls}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests for the new full-consolidation pipeline stages 1–5 in
+# consolidate_interim_adapters (reconstruct → re-merge → dedup → tier)
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidateInterimAdaptersFullFlow:
+    """Unit tests for the reconstruct→re-merge→dedup→tier pipeline.
+
+    All tests mock reconstruct_graph (GPU), training, and all PEFT operations
+    so no real model is required.  The focus is on:
+
+    1. Cross-session duplicate (s,p,o) triples collapse to ONE key via the
+       merged-graph edge-walk (bug-C regression lock).
+    2. Tier assignment is derived from the edge-walk relation_type (replacing
+       the dead :3463 ``getattr(graph, "relations", [])`` path).
+    3. relation_type from bookkeeping is injected onto reconstructed triples
+       before re-merge, so merger.merge() receives the correct type.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path, *, merger_graph, procedural_enabled=True):
+        """Minimal ConsolidationLoop stub for full-consolidation stage tests.
+
+        The stub wires a real ``MemoryStore`` and the supplied ``merger_graph``
+        so the edge-walk stages run against real data.  All other attributes
+        are either defaults or MagicMock so they satisfy attribute access
+        without side effects.
+        """
+        from unittest.mock import MagicMock
+
+        from peft import PeftModel
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "procedural": MagicMock(),
+            "episodic_backup": MagicMock(),
+            "semantic_backup": MagicMock(),
+            "procedural_backup": MagicMock(),
+        }
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig()
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        _proc_cfg = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = _proc_cfg if procedural_enabled else None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.store = MemoryStore(replay_enabled=True)
+
+        # Wire a mock merger that delegates graph attribute access to the real
+        # nx.MultiDiGraph supplied by the caller.
+        loop.merger = MagicMock()
+        loop.merger.graph = merger_graph
+
+        loop.key_sessions = {}
+        loop.promoted_keys = set()
+        loop.cycle_count = 0
+        loop.procedural_sp_index = {}
+        loop._procedural_next_index = 0
+        loop._procedural_tentative_next_index = 0
+        loop._indexed_next_index = 0
+        loop._bg_trainer = None
+        loop.shutdown_requested = False
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop._debug_base = None
+        loop.save_cycle_snapshots = False
+        loop.snapshot_dir = None
+        loop._indexed_ep_interim = {}
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.pending_interim_triples = []
+        loop.persist_graph = False
+        return loop
+
+    @staticmethod
+    def _run_with_mocks(loop, tmp_path, reconstruct_return):
+        """Run consolidate_interim_adapters with all heavy operations mocked.
+
+        Patches: GPU lock (held), reconstruct_graph (returns supplied value),
+        graph enrichment (skipped), train_adapter (no-op), all PEFT helpers.
+        Returns the result dict.
+        """
+        from unittest.mock import patch
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+        from paramem.training.consolidation import ConsolidationLoop
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=reconstruct_return,
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=None),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", return_value={"aborted": False}),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                return loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+    # -------------------------------------------------------------------------
+    # Test 1: cross-session duplicate triples collapse to ONE key
+    # -------------------------------------------------------------------------
+
+    def test_duplicate_triple_collapses_to_one_key(self, tmp_path):
+        """Bug-C regression lock: two store keys with the same (s,p,o) collapse
+        to EXACTLY ONE entry in tier_keyed when sourced from the merged graph.
+
+        The merged graph holds ONE edge for (Alice, lives_in, Berlin); the
+        triple_to_key index maps that triple to whichever key is encountered
+        LAST in store.iter_entries() (last-write-wins over dict assignment).
+        The other key becomes a drift key — it exists in the store registry but
+        has no corresponding distinct edge in the graph, so it does NOT appear
+        in tier_keyed.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        # Build merged graph with ONE edge for the duplicate triple.
+        g = nx.MultiDiGraph()
+        eid = g.add_edge("Alice", "Berlin", predicate="lives_in")
+        g["Alice"]["Berlin"][eid]["relation_type"] = "factual"
+
+        loop = self._make_loop(tmp_path, merger_graph=g)
+
+        # Register TWO store keys for the same (s,p,o).
+        for key in ("graph1", "graph2"):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                    "speaker_id": "Speaker0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph()))
+
+        # The merged-graph edge-walk yields ONE triple → ONE key in tier_keyed.
+        # The second duplicate key is a drift key (not in the graph's edge set).
+        # keys_per_tier holds counts; verify via the returned count.
+        assert result["keys_per_tier"]["episodic"] == 1, (
+            f"Expected exactly 1 episodic key after duplicate dedup; "
+            f"got {result['keys_per_tier']['episodic']}"
+        )
+        assert result["graph_drift_count"] >= 1, (
+            f"Expected at least 1 drift key (the duplicate); got {result['graph_drift_count']}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Test 2: tier from edge-walk relation_type (not dead :3463 path)
+    # -------------------------------------------------------------------------
+
+    def test_preference_relation_routes_to_procedural(self, tmp_path):
+        """A 'preference' relation_type on the merged-graph edge routes the key
+        to the procedural tier, NOT episodic.
+
+        This verifies the edge-walk (stage 4) is non-empty and that
+        partition_relations sees the correct relation_type from the graph edge.
+        The dead :3463 path always produced an empty lookup, making every key
+        fall to the graph-drift branch — which never assigned procedural tier.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        # Merged graph: preference edge.
+        g = nx.MultiDiGraph()
+        eid = g.add_edge("Alice", "tea", predicate="prefers")
+        g["Alice"]["tea"][eid]["relation_type"] = "preference"
+
+        loop = self._make_loop(tmp_path, merger_graph=g, procedural_enabled=True)
+
+        loop.store.put(
+            "procedural",
+            "proc1",
+            {
+                "key": "proc1",
+                "subject": "Alice",
+                "predicate": "prefers",
+                "object": "tea",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "proc1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="preference"
+        )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph()))
+
+        assert result["keys_per_tier"].get("procedural", 0) == 1, (
+            f"Expected 1 key in procedural tier; got {result['keys_per_tier']}"
+        )
+        assert result["keys_per_tier"].get("episodic", 0) == 0, (
+            "Preference key must NOT appear in episodic tier"
+        )
+
+    # -------------------------------------------------------------------------
+    # Test 3: relation_type injected from bookkeeping before re-merge
+    # -------------------------------------------------------------------------
+
+    def test_relation_type_injected_from_bookkeeping_before_remerge(self, tmp_path):
+        """Stage 2 injects the bookkeeping relation_type onto each reconstructed
+        triple before calling merger.merge().
+
+        reconstruct_graph returns a graph with one edge (SPO only, no
+        relation_type in edge data).  The bookkeeping entry for that key has
+        relation_type='preference'.  We assert that merger.merge() is called
+        with a SessionGraph whose Relation carries relation_type='preference'.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # Reconstructed graph: one edge, SPO only (no relation_type attribute).
+        recon_g = nx.MultiDiGraph()
+        recon_eid = recon_g.add_edge("Alice", "coffee", predicate="prefers")
+        recon_g["Alice"]["coffee"][recon_eid][_IK_KEY_ATTR] = "proc1"
+        # Note: no relation_type on the edge — only SPO from weights.
+
+        # Merged graph: empty (we are testing stage-2 merger call, not stage-5).
+        merged_g = nx.MultiDiGraph()
+
+        loop = self._make_loop(tmp_path, merger_graph=merged_g)
+
+        loop.store.put(
+            "procedural",
+            "proc1",
+            {
+                "key": "proc1",
+                "subject": "Alice",
+                "predicate": "prefers",
+                "object": "coffee",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        # Bookkeeping has relation_type="preference" — this must be injected.
+        loop.store.set_bookkeeping(
+            "proc1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="preference"
+        )
+
+        # Capture merger.merge() call args.
+        merge_calls: list = []
+
+        def _spy_merge(session_graph):
+            merge_calls.append(session_graph)
+            return merged_g
+
+        loop.merger.merge.side_effect = _spy_merge
+
+        self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        assert merge_calls, "merger.merge() must have been called for the reconstructed triple"
+        session = merge_calls[0]
+        assert len(session.relations) == 1, (
+            f"Expected 1 relation in synthetic SessionGraph; got {len(session.relations)}"
+        )
+        rel = session.relations[0]
+        assert rel.relation_type == "preference", (
+            f"Expected relation_type='preference' from bookkeeping; got {rel.relation_type!r}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Test 4: predicate normalization mismatch — store raw vs graph normalized
+    # -------------------------------------------------------------------------
+
+    def test_normalization_mismatch_key_lands_in_tier(self, tmp_path):
+        """Load-bearing correctness: a store entry with an un-normalized predicate
+        (e.g. raw extraction output "Lives In") is matched against a merger.graph
+        edge whose predicate has the canonical normalized form ("lives_in").
+
+        Stage-3 normalizes the store predicate via _normalize_predicate before
+        building triple_to_key; stage-5 normalizes the graph edge predicate the
+        same way.  The key must be found and placed in a tier — NOT dropped as
+        drift — proving that _normalize_predicate is applied on both sides.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        # Merged graph carries the NORMALIZED predicate (as merger.merge() stores it).
+        g = nx.MultiDiGraph()
+        eid = g.add_edge("Alice", "Berlin", predicate="lives_in")
+        g["Alice"]["Berlin"][eid]["relation_type"] = "factual"
+
+        loop = self._make_loop(tmp_path, merger_graph=g)
+
+        # Store entry carries the RAW (un-normalized) predicate form.
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alice",
+                "predicate": "Lives In",  # raw form — must be normalized before lookup
+                "object": "Berlin",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph()))
+
+        # The key must appear in a tier — normalization on both sides must match.
+        tiers = ("episodic", "semantic", "procedural")
+        total_tiered = sum(result["keys_per_tier"].get(t, 0) for t in tiers)
+        assert total_tiered == 1, (
+            f"Expected exactly 1 tiered key (normalization matched); "
+            f"got {result['keys_per_tier']} drift={result['graph_drift_count']}"
+        )
+        # Normalization-matched key must NOT appear in drift.
+        assert result["graph_drift_count"] == 0, (
+            f"Expected 0 drift keys (predicate normalization matched); "
+            f"got {result['graph_drift_count']}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Test 5: explicit drift — store key whose triple is absent from graph
+    # -------------------------------------------------------------------------
+
+    def test_explicit_drift_key_not_in_tier(self, tmp_path):
+        """A store active key whose (s,p,o) triple is genuinely absent from
+        merger.graph is counted as drift: NOT placed in any tier_keyed list,
+        and counted in graph_drift_count.
+
+        Absence from the graph means the key was either superseded by a
+        contradiction, rolled back before extraction, or corrupted — it must
+        be dropped from this consolidation cycle and logged, not crashed.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        # Merged graph carries a DIFFERENT triple (unrelated to the drift key).
+        g = nx.MultiDiGraph()
+        eid = g.add_edge("Bob", "London", predicate="lives_in")
+        g["Bob"]["London"][eid]["relation_type"] = "factual"
+
+        loop = self._make_loop(tmp_path, merger_graph=g)
+
+        # Register the unrelated graph key (so it has a valid store entry).
+        loop.store.put(
+            "episodic",
+            "graph_bob",
+            {
+                "key": "graph_bob",
+                "subject": "Bob",
+                "predicate": "lives_in",
+                "object": "London",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_bob", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        # Register the DRIFT key — triple does NOT exist in merger.graph.
+        loop.store.put(
+            "episodic",
+            "drift1",
+            {
+                "key": "drift1",
+                "subject": "Alice",
+                "predicate": "works_at",
+                "object": "Acme",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "drift1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph()))
+
+        # drift1's triple is absent from merger.graph — it must be counted as drift.
+        assert result["graph_drift_count"] >= 1, (
+            f"Expected at least 1 drift key (drift1 absent from graph); "
+            f"got {result['graph_drift_count']}"
+        )
+        # graph_bob's triple IS in the graph, so it must be placed in a tier.
+        assert result["keys_per_tier"].get("episodic", 0) >= 1, (
+            f"Expected graph_bob in episodic tier; got {result['keys_per_tier']}"
         )
