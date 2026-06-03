@@ -137,6 +137,15 @@
       max-width: 94%;
       text-align: center;
     }
+    .msg.status {
+      align-self: stretch;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      background: transparent;
+      text-align: left;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
 
     /* Typing indicator */
     .typing { display: flex; gap: 4px; padding: 14px; }
@@ -382,6 +391,7 @@
         <button id="cancel-btn" class="btn btn-secondary">Cancel</button>
       </div>
       <button id="qr-btn" class="btn btn-secondary">Scan QR code</button>
+      <button id="status-btn" class="btn btn-secondary">Server status</button>
     </div>
   </div>
 

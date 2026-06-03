@@ -106,12 +106,12 @@ class TestSwJsNoCacheHeader:
         assert resp.status_code == 200
         assert "CACHE_VERSION" in resp.text, "Expected CACHE_VERSION in sw.js body"
 
-    def test_sw_js_body_contains_v6(self, monkeypatch):
-        """Response body reflects the bumped CACHE_VERSION v6."""
+    def test_sw_js_body_contains_v7(self, monkeypatch):
+        """Response body reflects the bumped CACHE_VERSION v7."""
         monkeypatch.setattr(app_module, "_state", _make_state(_make_config()))
         resp = _client_no_token().get("/app/sw.js")
         assert resp.status_code == 200
-        assert '"v6"' in resp.text, "Expected CACHE_VERSION v6 in sw.js body"
+        assert '"v7"' in resp.text, "Expected CACHE_VERSION v7 in sw.js body"
 
 
 # ---------------------------------------------------------------------------

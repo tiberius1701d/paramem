@@ -51,7 +51,7 @@ let pushRegistered = false;   // true once registerPush() has succeeded
 // ---------------------------------------------------------------------------
 let logEl, textInput, sendBtn, micBtn;
 let settingsOverlay, settingsDrawer, serverUrlInput, tokenInput;
-let saveBtn, cancelBtn, qrBtn;
+let saveBtn, cancelBtn, qrBtn, statusBtn;
 let scannerOverlay, scannerVideo, scannerCancel;
 
 // ---------------------------------------------------------------------------
@@ -73,6 +73,7 @@ function init() {
   saveBtn = document.getElementById("save-btn");
   cancelBtn = document.getElementById("cancel-btn");
   qrBtn = document.getElementById("qr-btn");
+  statusBtn = document.getElementById("status-btn");
   scannerOverlay = document.getElementById("scanner-overlay");
   scannerVideo = document.getElementById("scanner-video");
   scannerCancel = document.getElementById("scanner-cancel");
@@ -313,6 +314,8 @@ function wireEvents() {
     qrBtn.style.display = "";
     qrBtn.addEventListener("click", startScanner);
   }
+
+  statusBtn.addEventListener("click", showStatus);
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +401,7 @@ function setInFlight(state) {
 /**
  * Appends a message bubble to the log and scrolls to the bottom.
  *
- * @param {"user"|"assistant"|"error"|"system"} role - CSS class applied to the bubble.
+ * @param {"user"|"assistant"|"error"|"system"|"status"} role - CSS class applied to the bubble.
  * @param {string} text - Message text (displayed as-is, not interpreted as HTML).
  * @returns {HTMLElement} The created element.
  */
@@ -460,6 +463,62 @@ function saveSettings() {
   // Reset push state so a new token triggers a fresh subscription attempt.
   pushRegistered = false;
   registerPush();
+}
+
+// ---------------------------------------------------------------------------
+// Server status
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetches GET /status and renders a concise human-readable summary in the log.
+ *
+ * Closes the settings drawer first so the result is visible.  Error handling
+ * mirrors handleSend: 401 appends an error bubble and opens settings; network
+ * failures are caught and surfaced; non-OK responses show the status code.
+ * The bearer token is sent in the Authorization header — never logged.
+ */
+async function showStatus() {
+  closeSettings();
+
+  try {
+    const base = serverUrl || "";
+    const resp = await fetch(`${base}/status`, {
+      method: "GET",
+      headers: {
+        ...(token ? { "Authorization": `Bearer ${token}` } : {}),
+      },
+    });
+
+    if (resp.status === 401) {
+      appendMessage("error", "Authentication failed — re-enter your token in Settings.");
+      openSettings();
+      return;
+    }
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      appendMessage("error", `Server error ${resp.status}${body ? ": " + body.slice(0, 120) : ""}`);
+      return;
+    }
+
+    const d = await resp.json();
+    const lines = [
+      `Mode: ${d.mode}`,
+      `Model: ${d.model}`,
+      `Keys: ${d.keys_count}`,
+      `Pending sessions: ${d.pending_sessions}`,
+      `Consolidating: ${d.consolidating}`,
+      `Active adapter: ${d.active_adapter ?? "none"}`,
+      `Last consolidation: ${d.last_consolidation ?? "never"}`,
+    ];
+    if (d.last_consolidation_error) {
+      const err = d.last_consolidation_error;
+      lines.push(`Last error: ${err.type ?? "unknown"} (phase: ${err.phase ?? "?"})`);
+    }
+    appendMessage("status", lines.join("\n"));
+  } catch (err) {
+    appendMessage("error", `Network error: ${err.message || String(err)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
