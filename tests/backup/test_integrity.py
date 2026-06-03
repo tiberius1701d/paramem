@@ -572,20 +572,20 @@ class TestCleanupPartialSlots:
         assert (slot / "meta.json").exists()
 
     def test_partial_slot_missing_meta_deleted(self, tmp_path):
-        """Slot missing meta.json is deleted; entry recorded."""
-        slot = self._make_partial_slot(tmp_path, "episodic", "interim_partial", "meta.json")
+        """Non-interim flat slot missing meta.json is deleted; entry recorded."""
+        slot = self._make_partial_slot(tmp_path, "episodic", "20260101-000000", "meta.json")
         removed = cleanup_partial_slots(tmp_path)
         assert not slot.exists()
         assert len(removed) == 1
         assert removed[0]["tier"] == "episodic"
-        assert removed[0]["slot_name"] == "interim_partial"
+        assert removed[0]["slot_name"] == "20260101-000000"
         assert removed[0]["missing"] == ["meta.json"]
         assert removed[0]["path"] == str(slot)
 
     def test_partial_slot_missing_safetensors_deleted(self, tmp_path):
-        """Slot missing adapter_model.safetensors is deleted."""
+        """Non-interim flat slot missing adapter_model.safetensors is deleted."""
         slot = self._make_partial_slot(
-            tmp_path, "semantic", "interim_partial", "adapter_model.safetensors"
+            tmp_path, "semantic", "20260101-000000", "adapter_model.safetensors"
         )
         removed = cleanup_partial_slots(tmp_path)
         assert not slot.exists()
@@ -605,14 +605,14 @@ class TestCleanupPartialSlots:
         assert sorted(removed[0]["missing"]) == ["adapter_config.json", "meta.json"]
 
     def test_mixed_complete_and_partial(self, tmp_path):
-        """Complete slots survive; partial slots are deleted in the same pass."""
+        """Complete slots survive; non-interim partial slots are deleted in the same pass."""
         kept = self._make_complete_slot(tmp_path, "episodic", "20260101T0000")
-        gone = self._make_partial_slot(tmp_path, "episodic", "interim_bad", "meta.json")
+        gone = self._make_partial_slot(tmp_path, "episodic", "20260102-000000", "meta.json")
         removed = cleanup_partial_slots(tmp_path)
         assert kept.exists()
         assert not gone.exists()
         assert len(removed) == 1
-        assert removed[0]["slot_name"] == "interim_bad"
+        assert removed[0]["slot_name"] == "20260102-000000"
 
     def test_dotted_entries_skipped(self, tmp_path):
         """Hidden dotted dirs are never deleted."""
@@ -651,3 +651,80 @@ class TestCleanupPartialSlots:
         removed = cleanup_partial_slots(tmp_path)
         assert removed == []
         assert unrelated.exists()
+
+    # ------------------------------------------------------------------
+    # Regression tests: interim containers must never be deleted
+    # ------------------------------------------------------------------
+
+    def test_interim_container_with_valid_nested_slot_never_deleted(self, tmp_path):
+        """Incident regression: interim container with valid nested weights is never deleted.
+
+        Layout: episodic/interim_20260101T0000/20260101-000000/<3 files>
+                episodic/interim_20260101T0000/indexed_key_registry.json
+
+        The container has none of the 3 required flat-slot files at its root.
+        cleanup_partial_slots must skip it entirely (interim integrity is owned
+        by find_live_slot + the I5 boot guard).
+        """
+        container = tmp_path / "episodic" / "interim_20260101T0000"
+        inner_slot = container / "20260101-000000"
+        inner_slot.mkdir(parents=True)
+        for f in self.REQUIRED:
+            (inner_slot / f).write_text("{}")
+        (container / "indexed_key_registry.json").write_text("{}")
+
+        removed = cleanup_partial_slots(tmp_path)
+
+        assert removed == [], f"Expected no removals, got: {removed}"
+        assert container.exists(), "Interim container was wrongly deleted"
+        assert inner_slot.exists(), "Interim inner slot was wrongly deleted"
+
+    def test_interim_container_simulate_mode_only_graph_never_deleted(self, tmp_path):
+        """Interim container with only graph.json + registry (simulate mode) is never deleted.
+
+        cleanup_partial_slots must not judge interim containers — that is the
+        I5 boot guard's job.
+        """
+        container = tmp_path / "episodic" / "interim_20260101T0000"
+        container.mkdir(parents=True)
+        (container / "graph.json").write_text("{}")
+        (container / "indexed_key_registry.json").write_text("{}")
+
+        removed = cleanup_partial_slots(tmp_path)
+
+        assert removed == [], f"Expected no removals, got: {removed}"
+        assert container.exists(), "Simulate-mode interim container was wrongly deleted"
+
+    def test_genuinely_empty_interim_container_not_deleted(self, tmp_path):
+        """Empty interim container (no inner slot, no registry) is never deleted by cleanup.
+
+        Option B: cleanup_partial_slots skips all interim dirs unconditionally.
+        An empty interim container is the I5 guard's responsibility, not this
+        function's.
+        """
+        container = tmp_path / "episodic" / "interim_20260101T0000"
+        container.mkdir(parents=True)
+
+        removed = cleanup_partial_slots(tmp_path)
+
+        assert removed == [], f"Expected no removals, got: {removed}"
+        assert container.exists(), "Empty interim container was wrongly deleted"
+
+    def test_flat_main_tier_scratch_still_deleted_all_tiers(self, tmp_path):
+        """Non-interim partial flat slots under all three tiers are still removed.
+
+        Ensures the interim-skip logic does not accidentally suppress genuine
+        flat-slot cleanup for episodic, semantic, and procedural.
+        """
+        slots = [
+            self._make_partial_slot(tmp_path, "episodic", "20260601-000000", "meta.json"),
+            self._make_partial_slot(tmp_path, "semantic", "20260601-000000", "adapter_config.json"),
+            self._make_partial_slot(
+                tmp_path, "procedural", "20260601-000000", "adapter_model.safetensors"
+            ),
+        ]
+        removed = cleanup_partial_slots(tmp_path)
+
+        assert all(not s.exists() for s in slots), "One or more flat-scratch slots were not removed"
+        assert {r["tier"] for r in removed} == {"episodic", "semantic", "procedural"}
+        assert len(removed) == 3

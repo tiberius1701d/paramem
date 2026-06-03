@@ -1685,7 +1685,7 @@ async def lifespan(app: FastAPI):
     # Create the migration lock (must be inside a running event loop).
     _state["migration_lock"] = asyncio.Lock()
 
-    # Security startup gate (SECURITY.md §4):
+    # Security startup gate:
     # 1) Refuse startup when security.require_encryption=true and the daily
     #    age identity is not loadable — uniform fail-loud gate covering
     #    every feature (snapshots, shards, backups, infra).
@@ -3679,31 +3679,23 @@ async def status():
         else:
             active_adapter = raw_active
 
-    # Source of truth for active key count is the per-tier KeyRegistry files:
-    # <adapter_dir>/<tier>/indexed_key_registry.json for episodic/semantic/procedural
-    # and <adapter_dir>/episodic_interim_*/indexed_key_registry.json for interim slots.
-    # Prefer reading from the in-memory ConsolidationLoop when available (avoids
-    # disk I/O on every pstatus call).
-    keys_count = 0
-    _live_loop = _state.get("consolidation_loop")
-    if _live_loop is not None and _live_loop.store.replay_enabled:
-        keys_count = len(_live_loop.store.all_active_keys())
+    # Active key count comes from the one authoritative MemoryStore — the same
+    # store /debug/dump and the recall path read.  It is loaded from disk (main
+    # + interim tiers) at boot via load_registries_from_disk.  When no live
+    # store is constructed (e.g. cloud-only before preload), count from disk
+    # using the store's own loader rather than re-inlining a registry scan.
+    store = _state.get("memory_store")
+    if store is not None and store.replay_enabled:
+        keys_count = len(store.all_active_keys())
     else:
-        from paramem.training.key_registry import KeyRegistry as _KeyRegistry
+        from paramem.memory.store import MemoryStore as _MemoryStore
 
-        try:
-            for _tier in ("episodic", "semantic", "procedural"):
-                _reg_path = config.adapter_dir / _tier / "indexed_key_registry.json"
-                if _reg_path.exists():
-                    keys_count += len(_KeyRegistry.load(_reg_path))
-            from paramem.memory.interim_adapter import iter_interim_dirs as _iter_int
+        _cold = _MemoryStore(replay_enabled=True)
+        _cold.load_registries_from_disk(config.adapter_dir)
+        keys_count = len(_cold.all_active_keys())
 
-            for _interim_name, _interim_d in _iter_int(config.adapter_dir):
-                _reg_path = _interim_d / "indexed_key_registry.json"
-                if _reg_path.exists():
-                    keys_count += len(_KeyRegistry.load(_reg_path))
-        except Exception:  # noqa: BLE001
-            keys_count = 0
+    # _live_loop is used by the adapter_health block below.
+    _live_loop = _state.get("consolidation_loop")
 
     # Session buffer summary (pending counts, orphan attribution, age)
     buf = _state.get("session_buffer")
@@ -10792,7 +10784,7 @@ def _last_full_consolidation_window(adapter_dir: Path) -> "str | None":
     at least one interim has been written does the full cycle have anything
     to consolidate (see ``_is_full_cycle_due``).
     """
-    from paramem.memory.interim_adapter import _INTERIM_DIR_PREFIX
+    from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX
 
     episodic_dir = adapter_dir / "episodic"
     if not episodic_dir.is_dir():
@@ -10800,7 +10792,7 @@ def _last_full_consolidation_window(adapter_dir: Path) -> "str | None":
     slots = sorted(
         d
         for d in episodic_dir.iterdir()
-        if d.is_dir() and not d.name.startswith(".") and not d.name.startswith(_INTERIM_DIR_PREFIX)
+        if d.is_dir() and not d.name.startswith(".") and not d.name.startswith(INTERIM_DIR_PREFIX)
     )
     if not slots:
         return None
@@ -11747,8 +11739,7 @@ def _extract_and_start_training():
                 )
                 continue
             except ExtractionFailed as exc:
-                # Whole-cycle abort per project_extraction_failure_fails_cycle.md
-                # (2026-05-12).  Unlike VramExhausted (resource constraint, per-
+                # Whole-cycle abort: unlike VramExhausted (resource constraint, per-
                 # chunk isolation OK), ExtractionFailed means the extractor
                 # actively refused to bake a degraded snapshot — proceeding
                 # with the OTHER chunks would silently commit a partial CV /
@@ -11936,8 +11927,8 @@ def _extract_and_start_training():
     # the cap is reached).  Main adapters are NOT touched here — they only
     # change at the full-cycle boundary, where consolidate_interim_adapters()
     # collapses the accumulated interim slots into episodic / semantic /
-    # procedural.  See feedback_router_procedural_first.md and the freshness-
-    # wins router order: probing the newest interim before main means recently
+    # procedural.  Freshness-wins router order: probing the newest interim
+    # before main means recently
     # learned facts surface ahead of the stale main snapshot.
     if not loop.config.indexed_key_replay_enabled:
         logger.warning("Indexed key replay disabled — skipping training")
