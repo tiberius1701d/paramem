@@ -440,3 +440,140 @@ class TestBookkeeping:
         snap = s.snapshot()
         assert "_bookkeeping" not in snap
         assert "bookkeeping" not in snap
+
+
+# ---------------------------------------------------------------------------
+# SimHash confidence gate — Bug-B read-time gate tests
+# ---------------------------------------------------------------------------
+
+
+class TestConfidenceGate:
+    """Locks the SimHash confidence gate applied at probe-time on both
+    cache-hit and source-result paths (Bug B fix).
+
+    The gate must satisfy three invariants:
+    1. Cache-on and cache-off serve the SAME key set for the same registry.
+    2. replay_enabled=False is an unconditional pass-through (no fingerprints).
+    3. A key whose fingerprint matches its content is served with real confidence.
+    """
+
+    def _spo_entry(
+        self,
+        key: str,
+        subject: str = "Alice",
+        predicate: str = "lives_in",
+        obj: str = "Berlin",
+    ) -> dict:
+        return {"key": key, "subject": subject, "predicate": predicate, "object": obj}
+
+    def _correct_fingerprint(self, entry: dict) -> int:
+        """Compute the expected SimHash fingerprint for *entry*."""
+        from paramem.memory.entry import compute_simhash
+
+        return compute_simhash(
+            entry["key"],
+            entry["subject"],
+            entry["predicate"],
+            entry["object"],
+        )
+
+    def _mismatched_fingerprint(self, entry: dict) -> int:
+        """Return a fingerprint that will NOT match *entry* (different content)."""
+        from paramem.memory.entry import compute_simhash
+
+        # Compute for a completely different triple so the Hamming distance is large.
+        return compute_simhash("wrong_key", "Eve", "hates", "Brussels")
+
+    def test_cache_on_off_parity(self):
+        """A key whose stored fingerprint mismatches its content is DROPPED on
+        the cache-hit path exactly as on the source path.
+
+        Reproduces the live 239-vs-234 divergence: cache-on served 5 extra
+        keys that had been ungated when preloaded without a registry.  After
+        the fix, both paths must serve the same set.
+
+        Build:
+        - key "graph1": CORRECT fingerprint (should be served on both paths).
+        - key "graph2": MISMATCHED fingerprint (should be dropped on both paths).
+
+        Cache-off path: entries absent → source probe called → gate applied to
+        source result BEFORE returning.
+        Cache-on path: entries present → _render called → gate applied to cached entry.
+        Both must produce the same result: graph1 served, graph2 None."""
+        entry_good = self._spo_entry("graph1")
+        entry_bad = self._spo_entry("graph2")
+        fp_good = self._correct_fingerprint(entry_good)
+        fp_bad = self._mismatched_fingerprint(entry_bad)  # wrong hash for graph2's content
+
+        # Cache-OFF path: store is empty, source must return the entries.
+        probed: list = []
+
+        class _FakeSource:
+            def probe(self, keys_by_tier):
+                probed.extend(k for keys in keys_by_tier.values() for k in keys)
+                # Returns both entries (source itself does NOT gate here — the
+                # store boundary gate is the authority).
+                return {
+                    "graph1": {**entry_good, "confidence": 1.0},
+                    "graph2": {**entry_bad, "confidence": 1.0},
+                }
+
+        s_off = MemoryStore()
+        s_off.put_simhash("episodic", "graph1", fp_good)
+        s_off.put_simhash("episodic", "graph2", fp_bad)
+        off_results = s_off.probe({"episodic": ["graph1", "graph2"]}, source=_FakeSource())
+        assert "graph1" in probed and "graph2" in probed, "source must be called for misses"
+        assert off_results["graph1"] is not None, "good key must be served on cache-off"
+        assert off_results["graph2"] is None, "bad key must be dropped on cache-off"
+
+        # Cache-ON path: entries pre-populated (simulating boot preload).
+        s_on = MemoryStore()
+        s_on.put_simhash("episodic", "graph1", fp_good)
+        s_on.put_simhash("episodic", "graph2", fp_bad)
+        s_on.put("episodic", "graph1", entry_good, register=False)
+        s_on.put("episodic", "graph2", entry_bad, register=False)
+        on_results = s_on.probe({"episodic": ["graph1", "graph2"]}, source=None)
+        assert on_results["graph1"] is not None, "good key must be served on cache-on"
+        assert on_results["graph2"] is None, "bad key must be dropped on cache-on"
+
+        # The served sets must be identical (parity).
+        cache_on_served = {k for k, v in on_results.items() if v is not None}
+        cache_off_served = {k for k, v in off_results.items() if v is not None}
+        assert cache_on_served == cache_off_served, (
+            f"cache-on and cache-off must serve the same set; "
+            f"on={cache_on_served} off={cache_off_served}"
+        )
+
+    def test_replay_off_passthrough(self):
+        """With replay_enabled=False (no _simhash), all entries are served.
+
+        The gate must be a complete no-op when replay is disabled — no
+        fingerprints exist by design, and the store must not over-drop."""
+        entry = self._spo_entry("graph1")
+        s = MemoryStore(replay_enabled=False)
+        s.put("episodic", "graph1", entry, register=False)
+        # Explicitly verify no simhash is set (replay-off means no fingerprints).
+        assert not s.has_simhash("episodic", "graph1")
+        results = s.probe({"episodic": ["graph1"]}, source=None)
+        assert results["graph1"] is not None, "replay-off must serve all entries ungated"
+        assert results["graph1"]["confidence"] == 1.0, (
+            "replay-off confidence must be 1.0 (pass-through)"
+        )
+
+    def test_confident_key_served(self):
+        """A key with a matching fingerprint passes the gate and is served.
+
+        The rendered result must include the real computed confidence (not
+        the hardcoded 1.0 that existed before the fix)."""
+        entry = self._spo_entry("graph1")
+        fp = self._correct_fingerprint(entry)
+        s = MemoryStore()
+        s.put("episodic", "graph1", entry, register=False)
+        s.put_simhash("episodic", "graph1", fp)
+        results = s.probe({"episodic": ["graph1"]}, source=None)
+        assert results["graph1"] is not None, "correctly-fingerprinted key must be served"
+        # Confidence must be exactly 1.0 since the fingerprint was computed from
+        # the same content (identical simhash → Hamming distance 0).
+        assert results["graph1"]["confidence"] == 1.0, (
+            f"matching fingerprint must yield confidence 1.0, got {results['graph1']['confidence']}"
+        )
