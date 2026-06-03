@@ -132,10 +132,10 @@ class TestRunIndexedKeyProceduralDeferredMutations:
 
             def _maybe_make_recall_callback(self, entries, **_kwargs):
                 """No-op stub — recall_early_stopping=False on the bare
-                TrainingConfig() so the helper would return None anyway,
+                TrainingConfig() so the helper would return (None, None) anyway,
                 but we stub it explicitly to insulate the duck-typed
                 stub from the helper's inner imports."""
-                return None
+                return None, None
 
         stub = _LoopStub()
         stub._run_indexed_key_procedural = ConsolidationLoop._run_indexed_key_procedural.__get__(
@@ -155,6 +155,19 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         # a plain TrainingHooks with just shutdown_requested predicate.
         stub._build_training_hooks = ConsolidationLoop._build_training_hooks.__get__(stub)
         stub.shutdown_requested = False
+        # _run_indexed_key_procedural now calls _recall_passing_keys and
+        # _probe_passing_keys after training to gate registration.
+        # _maybe_make_recall_callback returns (None, None) in this stub, so
+        # _recall_passing_keys returns None, triggering _probe_passing_keys.
+        # Stub _recall_passing_keys to return None (simulating no callback verdict)
+        # and _probe_passing_keys to admit all keys (not testing the recall gate here).
+        stub._recall_passing_keys = ConsolidationLoop._recall_passing_keys.__get__(stub)
+
+        def _admit_all_probe(adapter_name, entries):
+            """Admit all keys — probe gate not under test here."""
+            return {e["key"] for e in entries}
+
+        stub._probe_passing_keys = _admit_all_probe
         return stub, fake_qa
 
     def test_next_index_not_advanced_when_training_raises(self, monkeypatch, tmp_path):

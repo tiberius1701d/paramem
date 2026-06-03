@@ -66,6 +66,10 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
         persist_graph=False,
         **defaults,
     )
+    # Admit-all probe stub: the real _probe_passing_keys runs evaluate_indexed_recall,
+    # which feeds the MagicMock model into re.sub and TypeErrors.  Admitting every key
+    # is the prior implicit behavior (no recall gate), so it is inert for these tests.
+    loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
     return loop
 
 

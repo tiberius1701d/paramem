@@ -2158,7 +2158,9 @@ class TestAbortSkipsCommit:
             patch.object(ConsolidationLoop, "_maybe_run_interim_enrichment", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
             patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
-            patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=None),
+            patch.object(
+                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+            ),
             patch("paramem.training.consolidation.switch_adapter"),
             patch(
                 "paramem.training.consolidation.format_entry_training",
@@ -2255,7 +2257,9 @@ class TestAbortSkipsCommit:
             patch.object(loop.store, "put", side_effect=_spy_put),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
             patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
-            patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=None),
+            patch.object(
+                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+            ),
             patch.object(
                 ConsolidationLoop,
                 "_prepare_procedural_keys_for_tier",
@@ -2403,7 +2407,9 @@ class TestAbortSkipsCommit:
             patch("paramem.models.loader.copy_adapter_weights", side_effect=_spy_copy),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
             patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
-            patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=None),
+            patch.object(
+                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+            ),
             patch.object(
                 ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
             ),
@@ -2549,7 +2555,16 @@ class TestConsolidateInterimAdaptersFullFlow:
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
                 patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
-                patch.object(ConsolidationLoop, "_maybe_make_recall_callback", return_value=None),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                # _maybe_make_recall_callback returns (None, None) so verdict is None;
+                # admit all keys from the probe fallback to avoid requiring a real model.
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                ),
                 patch.object(ConsolidationLoop, "_save_adapters"),
                 patch("paramem.training.trainer.train_adapter", return_value={"aborted": False}),
                 patch(
