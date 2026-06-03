@@ -401,6 +401,13 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
 
     Skipped (never touched):
     - Dotted entries (``.quarantine``, ``.tmp``).
+    - Interim container directories (``interim_*`` under episodic/).  These
+      are nested containers whose integrity is fully owned by
+      ``find_live_slot`` (manifest.py), the I5 boot guard (app.py), and the
+      post-consolidation teardown (``unload_interim_adapters``).  Applying
+      the flat 3-file completeness check to an interim container is wrong
+      because weights live in the inner ``<ts>/`` slot, not at the container
+      root.  Passing judgment here would be a parallel-topology drift bug.
     - The staging slot conventions are in-memory PEFT keys, not on disk —
       this function cannot affect them.
     - The ``bg_checkpoint_epoch`` and ``checkpoint-*`` scratch dirs written
@@ -417,12 +424,14 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
         attention populator::
 
             {"tier": "episodic",
-             "slot_name": "interim_20260526T1200",
-             "path": "/.../adapters/episodic/interim_20260526T1200",
+             "slot_name": "20260526T1200",
+             "path": "/.../adapters/episodic/20260526T1200",
              "missing": ["meta.json"]}
 
         Returns an empty list when no partial slots are found.
     """
+    from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX
+
     removed: list[dict] = []
     for tier_name in _MAIN_TIERS:
         tier_root = adapter_dir / tier_name
@@ -432,6 +441,10 @@ def cleanup_partial_slots(adapter_dir: Path) -> list[dict]:
             if entry.name.startswith("."):
                 continue
             if not entry.is_dir():
+                continue
+            # Interim containers are owned by find_live_slot + the I5 boot guard,
+            # not by flat-slot cleanup.  Skip unconditionally.
+            if entry.name.startswith(INTERIM_DIR_PREFIX):
                 continue
             missing = [f for f in _REQUIRED_SLOT_FILES if not (entry / f).exists()]
             if not missing:

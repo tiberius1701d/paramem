@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 
 
 INTERIM_NAME_PREFIX = "episodic_interim_"
-_INTERIM_DIR_PREFIX = "interim_"
+INTERIM_DIR_PREFIX = "interim_"
 
 
 def interim_stamp_from_name(name: str) -> str:
@@ -84,7 +84,7 @@ def interim_dir_for_name(adapter_dir: Path, name: str) -> Path:
     Maps ``"episodic_interim_<stamp>"`` →
     ``<adapter_dir>/episodic/interim_<stamp>/``.
     """
-    return adapter_dir / "episodic" / f"{_INTERIM_DIR_PREFIX}{interim_stamp_from_name(name)}"
+    return adapter_dir / "episodic" / f"{INTERIM_DIR_PREFIX}{interim_stamp_from_name(name)}"
 
 
 def iter_interim_dirs(adapter_dir: Path) -> Iterator[tuple[str, Path]]:
@@ -96,10 +96,10 @@ def iter_interim_dirs(adapter_dir: Path) -> Iterator[tuple[str, Path]]:
     episodic = adapter_dir / "episodic"
     if not episodic.is_dir():
         return
-    for path in sorted(episodic.glob(f"{_INTERIM_DIR_PREFIX}*")):
+    for path in sorted(episodic.glob(f"{INTERIM_DIR_PREFIX}*")):
         if not path.is_dir():
             continue
-        stamp = path.name[len(_INTERIM_DIR_PREFIX) :]
+        stamp = path.name[len(INTERIM_DIR_PREFIX) :]
         yield f"{INTERIM_NAME_PREFIX}{stamp}", path
 
 
