@@ -440,11 +440,11 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     keys_payload: dict = {}
     for key in loop.store.all_active_keys():
         sessions_seen = loop.key_sessions.get(key, 0)
-        cache_entry = loop.store.get(key) or {}
+        bk = loop.store.bookkeeping_for_key(key) or {}
         keys_payload[key] = {
             "sessions_seen": sessions_seen,
-            "speaker_id": cache_entry.get("speaker_id", ""),
-            "first_seen_cycle": cache_entry.get("first_seen_cycle", 0),
+            "speaker_id": bk.get("speaker_id", ""),
+            "first_seen_cycle": bk.get("first_seen_cycle", 0),
         }
     metadata = {
         "cycle_count": loop.cycle_count,

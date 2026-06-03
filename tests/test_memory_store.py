@@ -75,15 +75,22 @@ class TestQuadPayload:
         s.put("semantic", "graph3", _entry("graph3"))
         assert len(s) == 3
 
-    def test_setdefault_quad_lazily_creates_slot(self):
+    def test_bookkeeping_round_trips_speaker_id(self):
+        """set_bookkeeping then bookkeeping_for_key returns the correct fields.
+
+        Replaces the deleted setdefault_entry test — bookkeeping is now the
+        canonical owner of speaker_id/first_seen_cycle."""
         s = MemoryStore()
-        first = s.setdefault_entry("episodic", "graph1", {"speaker_id": "spk-a"})
-        first["first_seen_cycle"] = 5
-        # Second call must return the SAME mutable dict (no overwrite)
-        second = s.setdefault_entry("episodic", "graph1", {"speaker_id": "spk-b"})
-        assert second is first
-        assert second["speaker_id"] == "spk-a"
-        assert second["first_seen_cycle"] == 5
+        s.set_bookkeeping("graph1", speaker_id="spk-a", first_seen_cycle=5)
+        bk = s.bookkeeping_for_key("graph1")
+        assert bk is not None
+        assert bk["speaker_id"] == "spk-a"
+        assert bk["first_seen_cycle"] == 5
+        # Second call must return updated values (idempotent overwrite).
+        s.set_bookkeeping("graph1", speaker_id="spk-b", first_seen_cycle=7)
+        bk2 = s.bookkeeping_for_key("graph1")
+        assert bk2["speaker_id"] == "spk-b"
+        assert bk2["first_seen_cycle"] == 7
 
 
 # ---------------------------------------------------------------------------
@@ -316,3 +323,120 @@ class TestStats:
         stats = s.stats()
         assert "registry_active" not in stats["episodic"]
         assert stats["episodic"]["key_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Bookkeeping — speaker_id / first_seen_cycle owner
+# ---------------------------------------------------------------------------
+
+
+class TestBookkeeping:
+    def test_bookkeeping_does_not_create_content_hit(self):
+        """REGRESSION LOCK: set_bookkeeping must NOT create a content cache hit.
+
+        Under preload_cache=False this is the key correctness invariant:
+        bookkeeping presence must never mask a cache miss."""
+        s = MemoryStore()
+        s.set_bookkeeping("k", speaker_id="alice", first_seen_cycle=1)
+        # No put — _entries is empty.
+        assert s.get("k") is None
+        results = s.probe({"episodic": ["k"]}, source=None)
+        assert results["k"] is None
+
+    def test_new_key_write_back_round_trips_speaker_id(self):
+        """set_bookkeeping + bookkeeping_for_key round-trips all fields."""
+        s = MemoryStore()
+        s.set_bookkeeping("graph1", speaker_id="bob", first_seen_cycle=3)
+        bk = s.bookkeeping_for_key("graph1")
+        assert bk is not None
+        assert bk["speaker_id"] == "bob"
+        assert bk["first_seen_cycle"] == 3
+
+    def test_bookkeeping_absent_returns_none(self):
+        s = MemoryStore()
+        assert s.bookkeeping_for_key("nonexistent") is None
+
+    def test_iter_bookkeeping_yields_all_keys(self):
+        s = MemoryStore()
+        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1)
+        s.set_bookkeeping("k2", speaker_id="bob", first_seen_cycle=2)
+        items = dict(s.iter_bookkeeping())
+        assert items["k1"]["speaker_id"] == "alice"
+        assert items["k2"]["speaker_id"] == "bob"
+        assert s.bookkeeping_count() == 2
+
+    def test_delete_also_drops_bookkeeping(self):
+        """store.delete must retire bookkeeping automatically."""
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"))
+        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1)
+        s.delete("graph1")
+        assert s.bookkeeping_for_key("graph1") is None
+
+    def test_probe_hit_render_joins_store_bookkeeping(self):
+        """Fake source returns SPO with NO speaker_id.  _bookkeeping is the
+        authoritative render-time source (mirrors WeightMemorySource path).
+        The store has an entry for graph1 (cache-hit path)."""
+
+        class _FakeSource:
+            def probe(self, keys_by_tier):
+                # Weight-source style: SPO only, no speaker_id.
+                result = {}
+                for keys in keys_by_tier.values():
+                    for k in keys:
+                        result[k] = {
+                            "key": k,
+                            "subject": "Alice",
+                            "predicate": "lives_in",
+                            "object": "Berlin",
+                        }
+                return result
+
+        s = MemoryStore()
+        s.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+        )
+        s.set_bookkeeping("graph1", speaker_id="spk-alice", first_seen_cycle=2)
+        results = s.probe({"episodic": ["graph1"]}, source=_FakeSource())
+        assert results["graph1"]["speaker_id"] == "spk-alice"
+        assert results["graph1"]["first_seen_cycle"] == 2
+
+    def test_cache_off_empty_store_always_probes(self):
+        """Under cache-off the store has no entries.  Every key must miss
+        and be delegated to the source — restores preload_cache=False contract."""
+        probed: list = []
+
+        class _FakeSource:
+            def probe(self, keys_by_tier):
+                probed.extend(k for keys in keys_by_tier.values() for k in keys)
+                return {
+                    k: {"key": k, "subject": "X", "predicate": "p", "object": "Y"}
+                    for keys in keys_by_tier.values()
+                    for k in keys
+                }
+
+        s = MemoryStore()
+        # Bookkeeping loaded but NO entries (cache-off scenario).
+        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1)
+        s.set_bookkeeping("k2", speaker_id="alice", first_seen_cycle=2)
+        # Register keys in the registry so tier resolution works.
+        from paramem.training.key_registry import KeyRegistry
+
+        reg = KeyRegistry()
+        reg.add("k1")
+        reg.add("k2")
+        s.load_registry("episodic", reg)
+        results = s.probe({"episodic": ["k1", "k2"]}, source=_FakeSource())
+        assert set(probed) == {"k1", "k2"}
+        assert results["k1"] is not None
+        assert results["k2"] is not None
+
+    def test_snapshot_excludes_bookkeeping(self):
+        """_bookkeeping must not enter snapshot — it is boot-loaded from disk."""
+        s = MemoryStore()
+        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1)
+        snap = s.snapshot()
+        assert "_bookkeeping" not in snap
+        assert "bookkeeping" not in snap

@@ -39,10 +39,40 @@ When replay is disabled (``ConsolidationLoop`` constructed with
 preserving the load-bearing "registry-is-None means replay-off" gate that
 training paths check.  Cache and simhash are always operational.
 
+**Content cache vs. bookkeeping — read before editing:**
+
+:attr:`MemoryStore._entries` is a PURE INFERENCE CONTENT CACHE.  An entry
+slot exists in ``_entries`` only when SPO content is materialised in RAM —
+written by :meth:`put` (boot preload or on-miss memoize).  Missing entry =
+cache miss.  Under ``inference.preload_cache=False`` the entries are empty by
+design → every key is a clean miss → the source is always probed → restores
+the documented contract.
+
+The per-key bookkeeping fields ``speaker_id`` and ``first_seen_cycle`` live in
+:attr:`MemoryStore._bookkeeping` — a flat ``{key → {speaker_id, first_seen_cycle}}``
+dict SEPARATE from ``_entries``.  Populated by
+:meth:`load_bookkeeping_from_disk` at boot (unconditionally; entry-independent).
+Never enters :meth:`KeyRegistry.save_bytes`, :meth:`snapshot`, or any hash
+path.
+
+**ARCHITECTURAL NOTE — save-path working entries:**
+The "pure content cache" rule binds the INFERENCE cache (boot preload +
+on-miss memoize).  The consolidation cycle's own TRAIN/SIMULATE working
+entries — written by :meth:`put` at ``consolidation.py:1488,2555,2785,2874``
+from ``_cache_entry`` — DO legitimately carry ``speaker_id``/``first_seen_cycle``.
+They are working entries consumed by :func:`persistence.build_graph_for_tier`
+within the same cycle.  A future reader must NOT "purify" save-path entries by
+stripping those fields — that would break ``build_graph_for_tier``.
+
+All ``store.get`` readers in ``consolidation.py`` were audited.  The
+SPO-only readers at ``:1819``, ``:2167``, ``:3474`` are NOT bookkeeping sites
+and become strictly safer post-fix (they can only find a real content entry).
+
 Snapshot / restore (:meth:`snapshot`, :meth:`restore`) capture the entry and
 simhash state for the cycle-resume rollback rope.  Registries persist via
 their own :meth:`KeyRegistry.save` / :meth:`KeyRegistry.load` lifecycle and
-are restored separately from disk on rollback.
+are restored separately from disk on rollback.  ``_bookkeeping`` is NOT in
+the snapshot — it is reloaded from ``key_metadata.json`` on boot.
 """
 
 from __future__ import annotations
@@ -61,7 +91,9 @@ class MemoryStore:
 
     def __init__(self, *, replay_enabled: bool = True) -> None:
         self._replay_enabled = replay_enabled
-        # tier -> key -> entry payload dict
+        # tier -> key -> entry payload dict.  PURE INFERENCE CONTENT CACHE —
+        # an entry slot exists only when SPO is materialised.  See module
+        # docstring for the "save-path working entries" exception.
         self._entries: dict[str, dict[str, dict]] = {}
         # tier -> key -> 64-bit simhash fingerprint
         self._simhash: dict[str, dict[str, int]] = {}
@@ -69,6 +101,12 @@ class MemoryStore:
         # gate every training path checks to decide whether to record key
         # lifecycle at all).
         self._registry: dict[str, KeyRegistry] | None = {} if replay_enabled else None
+        # Per-key provenance bookkeeping — SEPARATE from _entries.
+        # key -> {"speaker_id": str, "first_seen_cycle": int}
+        # Populated by load_bookkeeping_from_disk at boot.  Never enters
+        # snapshot/restore or KeyRegistry.save_bytes — stays out of the
+        # hash-frozen slot-identity path.
+        self._bookkeeping: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Replay-enabled gate
@@ -160,15 +198,52 @@ class MemoryStore:
         if register and self._registry is not None:
             self._registry.setdefault(tier, KeyRegistry()).add(key)
 
-    def setdefault_entry(self, tier: str, key: str, default: dict) -> dict:
-        """Get-or-create the entry slot for ``(tier, key)``.
+    # ------------------------------------------------------------------
+    # Per-key bookkeeping — speaker_id / first_seen_cycle
+    # SEPARATE from _entries; never in snapshot or KeyRegistry.save_bytes.
+    # ------------------------------------------------------------------
+    def set_bookkeeping(self, key: str, *, speaker_id: str, first_seen_cycle: int) -> None:
+        """Store or update the bookkeeping record for *key*.
 
-        Used by the boot-time partial-shape seed in
-        :meth:`ConsolidationLoop.seed_key_metadata` which fills in
-        ``speaker_id`` / ``first_seen_cycle`` lazily as full entries arrive
-        from later seed paths.  Does NOT register the key in the lifecycle
-        registry — :meth:`put` is for that."""
-        return self._entries.setdefault(tier, {}).setdefault(key, default)
+        Both ``speaker_id`` and ``first_seen_cycle`` are mandatory (one
+        mandatory tier, zero optional buckets).  Idempotent — safe to call
+        on every new-key write and on every boot reload.
+
+        Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
+        manufacture a content cache hit."""
+        self._bookkeeping[key] = {
+            "speaker_id": speaker_id,
+            "first_seen_cycle": first_seen_cycle,
+        }
+
+    def bookkeeping_for_key(self, key: str) -> dict | None:
+        """Return the bookkeeping record for *key*, or ``None`` when absent.
+
+        Returns a plain dict ``{"speaker_id": str, "first_seen_cycle": int}``
+        when present, ``None`` when the key has never been bookkept.
+        Callers may use ``bk = store.bookkeeping_for_key(k) or {}`` as a
+        boundary default (compliant with the is-None / empty-is-valid rule)."""
+        return self._bookkeeping.get(key)
+
+    def iter_bookkeeping(self):
+        """Yield ``(key, {"speaker_id": ..., "first_seen_cycle": ...})`` pairs.
+
+        Preload-independent — populated by :meth:`load_bookkeeping_from_disk`
+        at boot regardless of ``inference.preload_cache``.  Used by
+        :meth:`QueryRouter.reload` to build the speaker → keys index without
+        touching ``_entries``."""
+        yield from self._bookkeeping.items()
+
+    def drop_bookkeeping(self, key: str) -> None:
+        """Remove the bookkeeping record for *key* (retirement parity).
+
+        Called automatically by :meth:`delete` — callers that retire a key
+        via ``delete`` need not call this separately."""
+        self._bookkeeping.pop(key, None)
+
+    def bookkeeping_count(self) -> int:
+        """Number of keys that have a bookkeeping record."""
+        return len(self._bookkeeping)
 
     def delete(self, key: str) -> str | None:
         """Drop *key* from every tier in every sub-structure.
@@ -195,6 +270,8 @@ class MemoryStore:
                     reg.remove(key)
                     if former is None:
                         former = tier
+        # Retire bookkeeping in lockstep so _bookkeeping never drifts.
+        self._bookkeeping.pop(key, None)
         return former
 
     def move(self, key: str, new_tier: str) -> None:
@@ -415,24 +492,41 @@ class MemoryStore:
         confidence=1.0, fact_text, raw_output}``.  Misses (or
         source-failure dicts carrying ``failure_reason``) pass through
         unrendered.
+
+        **speaker_id asymmetry (do not remove this comment):**
+        The CACHE-HIT branch reads ``speaker_id`` from ``_bookkeeping`` (the
+        single authoritative source — entries are SPO-only after this fix).
+        The SOURCE-RESULT branch reads ``src.get("speaker_id","")`` as-is.
+        On the train/weight path ``WeightMemorySource`` emits NO speaker_id
+        (``probe.py:87-99``), so the filter is a no-op there; scoping relies
+        on the router upstream + ``_render`` joining from ``_bookkeeping``.
+        The disk/simulate source DOES carry speaker_id — redundant belt-and-
+        suspenders for the simulate speaker filter.  Do NOT collapse the two
+        branches into one: the asymmetry is load-bearing.
         """
         import json as _json
 
         from paramem.memory.entry import entry_fact_text
 
         def _render(key: str, entry: dict) -> dict:
+            # speaker_id / first_seen_cycle come from _bookkeeping — the single
+            # authoritative source.  Entries hold SPO only (inference cache
+            # contract); save-path working entries carry them for build_graph_for_tier
+            # but those are consumed within the cycle, not at inference time.
+            bk = self._bookkeeping.get(key) or {}
             base = {
                 "key": key,
                 "subject": entry.get("subject", ""),
                 "predicate": entry.get("predicate", ""),
                 "object": entry.get("object", ""),
             }
+            spk = bk.get("speaker_id", "")
             return {
                 **base,
-                "speaker_id": entry.get("speaker_id", ""),
-                "first_seen_cycle": entry.get("first_seen_cycle", 0),
+                "speaker_id": spk,
+                "first_seen_cycle": bk.get("first_seen_cycle", 0),
                 "confidence": 1.0,
-                "fact_text": entry_fact_text({**base, "speaker_id": entry.get("speaker_id", "")}),
+                "fact_text": entry_fact_text({**base, "speaker_id": spk}),
                 "raw_output": _json.dumps(base),
             }
 
@@ -445,16 +539,15 @@ class MemoryStore:
                 if entry is None:
                     misses.setdefault(tier, []).append(key)
                     continue
-                if (
-                    speaker_id is not None
-                    and entry.get("speaker_id", "")
-                    and entry["speaker_id"] != speaker_id
-                ):
+                # Defense-in-depth speaker filter — read speaker from
+                # _bookkeeping (not from the entry: entries are SPO-only).
+                bk_spk = self._bookkeeping.get(key, {}).get("speaker_id", "")
+                if speaker_id is not None and bk_spk and bk_spk != speaker_id:
                     logger.warning(
                         "MemoryStore.probe: speaker_id mismatch for key %s "
-                        "(entry=%r, requested=%r) — returning None",
+                        "(bookkeeping=%r, requested=%r) — returning None",
                         key,
-                        entry.get("speaker_id", ""),
+                        bk_spk,
                         speaker_id,
                     )
                     results[key] = None
@@ -478,6 +571,10 @@ class MemoryStore:
                     if isinstance(src, dict) and "failure_reason" in src:
                         results[key] = src
                         continue
+                    # SOURCE-RESULT speaker filter — reads src["speaker_id"]
+                    # directly.  See docstring asymmetry note: WeightMemorySource
+                    # emits no speaker_id so this is a no-op on the train path;
+                    # DiskMemorySource carries it for simulate-path belt-and-suspenders.
                     if (
                         speaker_id is not None
                         and isinstance(src, dict)
@@ -488,19 +585,28 @@ class MemoryStore:
                         continue
                     results[key] = src
                     if memoize and isinstance(src, dict):
-                        # Stash the raw entry shape back into the cache so
-                        # later probes hit it without going through the
-                        # source.  Register=False — the registry was
-                        # established at boot.
+                        # Stash the raw SPO entry back into the cache (content only).
+                        # Register=False — the registry was established at boot.
                         raw_entry = {
                             "key": key,
                             "subject": src.get("subject", ""),
                             "predicate": src.get("predicate", ""),
                             "object": src.get("object", ""),
-                            "speaker_id": src.get("speaker_id", ""),
-                            "first_seen_cycle": src.get("first_seen_cycle", 0),
                         }
                         self.put(tier, key, raw_entry, register=False)
+                        # Back-fill _bookkeeping when the source carried provenance
+                        # and the key wasn't already bookkept (cold key not in
+                        # key_metadata.json at boot — disk source path).  No-op on
+                        # the weight path (WeightMemorySource carries no speaker_id).
+                        if key not in self._bookkeeping:
+                            src_spk = src.get("speaker_id", "")
+                            src_fsc = src.get("first_seen_cycle", 0)
+                            if src_spk or src_fsc:
+                                self.set_bookkeeping(
+                                    key,
+                                    speaker_id=src_spk,
+                                    first_seen_cycle=src_fsc,
+                                )
 
         return results
 
@@ -572,24 +678,27 @@ class MemoryStore:
             if sh:
                 self.replace_simhashes_in_tier(tier, sh)
 
-    def load_metadata_from_disk(self, key_metadata_path) -> dict:
-        """Hydrate per-entry ``speaker_id`` / ``first_seen_cycle`` from key_metadata.json.
+    def load_bookkeeping_from_disk(self, key_metadata_path) -> dict:
+        """Load per-key ``speaker_id`` / ``first_seen_cycle`` into ``_bookkeeping``.
 
-        Adapter-weight probing (``WeightMemorySource.probe``) recovers
-        ``{key, subject, predicate, object}`` but NOT the bookkeeping fields
-        (``speaker_id``, ``first_seen_cycle``) that the Router's
-        ``_speaker_key_index`` and the inference path rely on.  Those fields
-        are persisted in ``data/ha/registry/key_metadata.json`` at cycle
-        finalize (see ``paramem.server.consolidation._save_key_metadata``)
-        and joined onto in-RAM entries at boot via this method.
+        Sole boot loader for the per-key bookkeeping section of
+        ``key_metadata.json``.  Runs unconditionally at lifespan boot (after
+        ``load_registries_from_disk``) via ``app.py:4449`` — entry-independent,
+        so it no longer requires entries to already exist.  Under
+        ``inference.preload_cache=False`` this is the ONLY write to provenance
+        state at boot, and is sufficient for the router's speaker index.
 
-        Boot order is: ``load_registries_from_disk`` (key IDs + simhashes) →
-        ``MemorySource.probe`` (SPO content) → ``load_metadata_from_disk``
-        (speaker_id + first_seen_cycle).  The third step must run *after*
-        the entries exist in the store so ``setdefault_entry`` joins onto
-        the already-populated dict.
+        Populates ``_bookkeeping`` only (via :meth:`set_bookkeeping`).  DOES
+        NOT touch ``_entries`` — the old ``setdefault_entry`` parasitic write
+        that created payload-less stub entries has been removed.  Bookkeeping
+        presence MUST NOT manufacture a content cache hit.
 
-        Returns ``{loaded, orphaned, legacy_upgraded}`` for /status and
+        Keys absent from every tier registry (orphans — slot wiped or never
+        existed) are skipped but counted in the return dict.  Pre-refactor
+        files that lack ``speaker_id``/``first_seen_cycle`` are upgraded
+        in-memory with ``""`` / ``0`` (legacy_upgraded counter).
+
+        Returns ``{loaded, orphaned, legacy_upgraded}`` for ``/status`` and
         diagnostics.  Missing file → all zeros, no-op (fresh install).
         """
         from pathlib import Path
@@ -611,11 +720,13 @@ class MemoryStore:
             if tier is None:
                 orphaned += 1
                 continue
-            cache_entry = self.setdefault_entry(tier, key, {})
             if "speaker_id" not in key_meta or "first_seen_cycle" not in key_meta:
                 legacy_upgraded += 1
-            cache_entry["speaker_id"] = key_meta.get("speaker_id", "")
-            cache_entry["first_seen_cycle"] = key_meta.get("first_seen_cycle", 0)
+            self.set_bookkeeping(
+                key,
+                speaker_id=key_meta.get("speaker_id", ""),
+                first_seen_cycle=key_meta.get("first_seen_cycle", 0),
+            )
             loaded += 1
         return {"loaded": loaded, "orphaned": orphaned, "legacy_upgraded": legacy_upgraded}
 

@@ -444,23 +444,23 @@ class ConsolidationLoop:
             )
 
     def seed_key_metadata(self, metadata: dict) -> None:
-        """Restore key-level metadata from persisted key_metadata.json.
+        """Restore loop-level state from persisted key_metadata.json.
 
-        Used when persist_graph=False to restore cycle count, promoted
-        keys, and per-key session counts across server restarts.
+        Restores ``cycle_count``, ``promoted_keys``, and per-key
+        ``sessions_seen`` (``key_sessions``).  Per the wipe invariant
+        (2026-05-14): ``key_metadata.json`` is bookkeeping, not a recovery
+        source.  Keys in the metadata file whose tier registry is not on disk
+        anymore are treated as orphans and dropped — the slot is the source of
+        truth for active keys.
 
-        Reads ``sessions_seen``, ``speaker_id``, and ``first_seen_cycle``
-        from each key entry.  Per the wipe invariant (2026-05-14):
-        ``key_metadata.json`` is bookkeeping, not a recovery source.  Keys
-        in the metadata file whose tier registry is not on disk anymore
-        are treated as orphans and dropped — the slot is the source of
-        truth for active keys.  Pre-refactor files that lack
-        ``speaker_id`` and ``first_seen_cycle`` are upgraded in-memory by
-        filling ``""`` / ``0`` respectively; the next
-        :func:`_save_key_metadata` call writes the complete shape.
+        Per-key ``speaker_id`` / ``first_seen_cycle`` are owned by
+        :attr:`MemoryStore._bookkeeping` and loaded by
+        :meth:`MemoryStore.load_bookkeeping_from_disk` at lifespan boot.
+        This method does NOT touch the store's bookkeeping — that was the
+        ``setdefault_entry`` parasitic write that created payload-less stubs
+        and caused cache-off hallucination (``preload_cache=false`` bug).
         """
         self.cycle_count = metadata.get("cycle_count", 0)
-        legacy_upgrade_count = 0
         orphan_count = 0
         for key, key_meta in metadata.get("keys", {}).items():
             tier = self.store.tier_for_active_key(key)
@@ -471,14 +471,6 @@ class ConsolidationLoop:
                 orphan_count += 1
                 continue
             self.key_sessions[key] = key_meta.get("sessions_seen", 0)
-            # Populate the store's entry slot with partial metadata so the
-            # boot rebuild (Critical #5) can join against it without
-            # missing fields.
-            cache_entry = self.store.setdefault_entry(tier, key, {})
-            if "speaker_id" not in key_meta or "first_seen_cycle" not in key_meta:
-                legacy_upgrade_count += 1
-            cache_entry["speaker_id"] = key_meta.get("speaker_id", "")
-            cache_entry["first_seen_cycle"] = key_meta.get("first_seen_cycle", 0)
         # promoted_keys is similarly slot-owned — drop entries whose tier
         # is gone so the next save doesn't re-emit them.
         raw_promoted = set(metadata.get("promoted_keys", []))
@@ -489,12 +481,6 @@ class ConsolidationLoop:
             logger.info(
                 "seed_key_metadata: dropped %d orphan key(s) (metadata present, no tier registry)",
                 orphan_count,
-            )
-        if legacy_upgrade_count:
-            logger.info(
-                "key_metadata.json legacy upgrade: %d keys missing speaker_id/first_seen_cycle; "
-                "filled with '' / 0; run /consolidate to refresh",
-                legacy_upgrade_count,
             )
         logger.info(
             "Seeded key metadata: cycle=%d, %d promoted, %d keys tracked",
@@ -1343,14 +1329,14 @@ class ConsolidationLoop:
             ):
                 key = entry["key"]
                 if recalled is not None and "failure_reason" not in recalled:
-                    cached = self.store.get(key) or {}
-                    first_seen = cached.get("first_seen_cycle", self.cycle_count)
+                    bk = self.store.bookkeeping_for_key(key) or {}
+                    first_seen = bk.get("first_seen_cycle", self.cycle_count)
                     reconstructed[key] = {
                         "key": key,
                         "subject": recalled["subject"],
                         "predicate": recalled["predicate"],
                         "object": recalled["object"],
-                        "speaker_id": cached.get("speaker_id", speaker_id),
+                        "speaker_id": bk.get("speaker_id", speaker_id),
                         "first_seen_cycle": first_seen,
                     }
             logger.info(
@@ -1372,18 +1358,19 @@ class ConsolidationLoop:
                 if kp is not None:
                     existing_keyed.append(kp)
         else:
-            # SIMULATE: read from cache — no model.generate calls.
+            # SIMULATE: read SPO from cache; bookkeeping from _bookkeeping.
             for key in existing_tier_keys:
                 qa = self.store.get(key)
                 if qa is not None:
-                    first_seen = qa.get("first_seen_cycle", self.cycle_count)
+                    bk = self.store.bookkeeping_for_key(key) or {}
+                    first_seen = bk.get("first_seen_cycle", self.cycle_count)
                     existing_keyed.append(
                         {
                             "key": key,
                             "subject": qa["subject"],
                             "predicate": qa["predicate"],
                             "object": qa["object"],
-                            "speaker_id": qa.get("speaker_id", speaker_id),
+                            "speaker_id": bk.get("speaker_id", speaker_id),
                             "first_seen_cycle": first_seen,
                         }
                     )
@@ -1486,6 +1473,11 @@ class ConsolidationLoop:
                     kp["key"], kp["subject"], kp["predicate"], kp["object"]
                 )
                 self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
+                self.store.set_bookkeeping(
+                    kp["key"],
+                    speaker_id=kp["speaker_id"],
+                    first_seen_cycle=kp["first_seen_cycle"],
+                )
             for sp_key, new_key in new_sp_mappings.items():
                 self.procedural_sp_index[sp_key] = new_key
             self._procedural_next_index = tentative_next
@@ -1513,14 +1505,14 @@ class ConsolidationLoop:
         ):
             key = entry["key"]
             if recalled is not None and "failure_reason" not in recalled:
-                cached = self.store.get(key) or {}
+                bk = self.store.bookkeeping_for_key(key) or {}
                 reconstructed[key] = {
                     "key": key,
                     "subject": recalled["subject"],
                     "predicate": recalled["predicate"],
                     "object": recalled["object"],
-                    "speaker_id": cached.get("speaker_id", speaker_id),
-                    "first_seen_cycle": cached.get("first_seen_cycle", self.cycle_count),
+                    "speaker_id": bk.get("speaker_id", speaker_id),
+                    "first_seen_cycle": bk.get("first_seen_cycle", self.cycle_count),
                 }
 
         logger.info(
@@ -2553,6 +2545,11 @@ class ConsolidationLoop:
         for kp in new_proc_keyed:
             fingerprint = compute_simhash(kp["key"], kp["subject"], kp["predicate"], kp["object"])
             self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
+            self.store.set_bookkeeping(
+                kp["key"],
+                speaker_id=kp["speaker_id"],
+                first_seen_cycle=kp["first_seen_cycle"],
+            )
         for sp_key, new_key in new_sp_mappings.items():
             self.procedural_sp_index[sp_key] = new_key
         return proc_metrics.get("train_loss") if proc_metrics is not None else None
@@ -2783,6 +2780,11 @@ class ConsolidationLoop:
             # No training step — apply store mutations immediately.
             for kp in new_keyed_episodic:
                 self.store.put(adapter_name, kp["key"], kp)
+                self.store.set_bookkeeping(
+                    kp["key"],
+                    speaker_id=kp["speaker_id"],
+                    first_seen_cycle=kp["first_seen_cycle"],
+                )
             self._indexed_next_index += len(new_keyed_episodic)
 
         # --- 9b. Semantic promotion transfer (train mode, when promotions supplied) ---
@@ -2872,6 +2874,11 @@ class ConsolidationLoop:
         if mode == "train":
             for kp in new_keyed_episodic:
                 self.store.put(adapter_name, kp["key"], kp)
+                self.store.set_bookkeeping(
+                    kp["key"],
+                    speaker_id=kp["speaker_id"],
+                    first_seen_cycle=kp["first_seen_cycle"],
+                )
             self._indexed_next_index += len(new_keyed_episodic)
 
         # --- 12. Persist both tiers ---

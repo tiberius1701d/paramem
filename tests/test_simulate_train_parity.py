@@ -1188,18 +1188,21 @@ def _make_loop_for_commit(tmp_path: Path) -> ConsolidationLoop:
     # Prime the registry with one key so the payload is non-trivial.
     reg.add("graph1")
     store.load_registry("episodic", reg)
-    # Add the entry to the cache via setdefault_entry so all_active_keys()
-    # can find it and build_tier_graph_from_store has entry data available.
-    entry = store.setdefault_entry("episodic", "graph1", {})
-    entry.update(
+    # Add the entry via put (SPO content) and bookkeeping separately.
+    # setdefault_entry was deleted — use the correct API split.
+    store.put(
+        "episodic",
+        "graph1",
         {
             "subject": "Alice",
             "predicate": "lives_in",
             "object": "Berlin",
             "speaker_id": "sp1",
             "first_seen_cycle": 0,
-        }
+        },
+        register=False,
     )
+    store.set_bookkeeping("graph1", speaker_id="sp1", first_seen_cycle=0)
     loop.store = store
     return loop
 

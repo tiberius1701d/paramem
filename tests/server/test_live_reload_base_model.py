@@ -554,7 +554,7 @@ def test_preload_source_selection_simulate_mode():
     fake_store.tiers_with_registry.return_value = ["episodic"]
     fake_store.active_keys_in_tier.return_value = ["graph1"]
     fake_store.load_registries_from_disk.return_value = None
-    fake_store.load_metadata_from_disk.return_value = {
+    fake_store.load_bookkeeping_from_disk.return_value = {
         "loaded": 0,
         "orphaned": 0,
         "legacy_upgraded": 0,
@@ -620,7 +620,7 @@ def test_preload_source_selection_train_mode_uses_weight_source():
     fake_store.tiers_with_registry.return_value = ["episodic"]
     fake_store.active_keys_in_tier.return_value = ["graph1"]
     fake_store.load_registries_from_disk.return_value = None
-    fake_store.load_metadata_from_disk.return_value = {
+    fake_store.load_bookkeeping_from_disk.return_value = {
         "loaded": 0,
         "orphaned": 0,
         "legacy_upgraded": 0,
@@ -682,7 +682,7 @@ def test_preload_cache_false_clears_boot_degraded():
 
     fake_store = MagicMock()
     fake_store.load_registries_from_disk.return_value = None
-    fake_store.load_metadata_from_disk.return_value = {
+    fake_store.load_bookkeeping_from_disk.return_value = {
         "loaded": 0,
         "orphaned": 0,
         "legacy_upgraded": 0,
@@ -728,7 +728,7 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
     fake_store.tiers_with_registry.return_value = ["episodic"]
     fake_store.active_keys_in_tier.return_value = ["graph1", "graph2"]
     fake_store.load_registries_from_disk.return_value = None
-    fake_store.load_metadata_from_disk.return_value = {
+    fake_store.load_bookkeeping_from_disk.return_value = {
         "loaded": 0,
         "orphaned": 0,
         "legacy_upgraded": 0,

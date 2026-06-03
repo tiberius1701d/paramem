@@ -189,11 +189,12 @@ class QueryRouter:
     """Routes queries: identifies speaker scope and selects tiers by intent.
 
     State: a single per-speaker ``speaker_id → set[key]`` index built from
-    the injected :class:`paramem.memory.store.MemoryStore`.  The
-    index is preload-independent — it populates from the ``speaker_id``
-    field that :meth:`MemoryStore.load_metadata_from_disk` writes onto
-    every active entry slot at boot, regardless of
-    ``inference.preload_cache``.
+    the injected :class:`paramem.memory.store.MemoryStore`.  The index is
+    preload-independent — it iterates
+    :meth:`MemoryStore.iter_bookkeeping` which is populated by
+    :meth:`MemoryStore.load_bookkeeping_from_disk` at boot regardless of
+    ``inference.preload_cache``.  ``_entries`` (content cache) is never
+    consulted for index building.
 
     Rebuilt after each consolidation cycle via :meth:`reload`.
     """
@@ -217,12 +218,14 @@ class QueryRouter:
     def reload(self) -> None:
         """Rebuild ``_speaker_key_index`` from the injected :class:`MemoryStore`.
 
-        Iterates ``self._memory_store.iter_entries()`` and indexes each
-        active key under its owning ``speaker_id``.  Preload-independent:
-        :meth:`MemoryStore.load_metadata_from_disk` writes ``speaker_id``
-        onto every active entry slot at boot via ``setdefault_entry``
-        (see ``app.py``), so the index populates even when
-        ``inference.preload_cache=False``.
+        Iterates :meth:`MemoryStore.iter_bookkeeping` — the per-key provenance
+        map populated by :meth:`MemoryStore.load_bookkeeping_from_disk` at boot
+        regardless of ``inference.preload_cache``.  The content cache
+        (``_entries``) is NOT consulted: under ``preload_cache=False`` entries
+        are intentionally empty, but bookkeeping is always present.  The old
+        ``len(store) > 0`` guard (which counted ``_entries`` and
+        short-circuited on empty cache) has been removed — the correct gate is
+        ``store is not None`` only.
 
         Call after every consolidation cycle so the index reflects the
         current in-memory state.
@@ -230,13 +233,11 @@ class QueryRouter:
         self._speaker_key_index.clear()
 
         store = self._memory_store
-        if store is not None and len(store) > 0:
-            for _tier, key, entry in store.iter_entries():
-                speaker_id = entry.get("speaker_id", "")
-                if speaker_id:
-                    self._speaker_key_index.setdefault(speaker_id, set()).add(key)
-        else:
-            logger.info("Router reload: memory store empty — speaker index will be empty")
+        if store is not None:
+            for key, bk in store.iter_bookkeeping():
+                sid = bk.get("speaker_id", "")
+                if sid:
+                    self._speaker_key_index.setdefault(sid, set()).add(key)
 
         logger.info(
             "Router loaded: %d speakers indexed (%d keys total)",

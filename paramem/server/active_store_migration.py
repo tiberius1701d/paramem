@@ -439,9 +439,9 @@ def _migrate_tier_train_to_simulate(
             ik_key = data.get(_IK_KEY_ATTR)
             if ik_key is None:
                 continue
-            cache_entry = loop.store.get(ik_key) or {}
-            data["speaker_id"] = cache_entry.get("speaker_id", "")
-            data["first_seen_cycle"] = cache_entry.get("first_seen_cycle", 0)
+            bk = loop.store.bookkeeping_for_key(ik_key) or {}
+            data["speaker_id"] = bk.get("speaker_id", "")
+            data["first_seen_cycle"] = bk.get("first_seen_cycle", 0)
         slot_root.mkdir(parents=True, exist_ok=True)
         save_memory_to_disk(graph, target_graph)
 
