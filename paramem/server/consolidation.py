@@ -154,6 +154,23 @@ def create_consolidation_loop(
         if metadata:
             loop.seed_key_metadata(metadata)
 
+        # One-time backfill of relation_type for legacy keys (§6.3).
+        # Keys whose bookkeeping already has relation_type != "unknown" are
+        # skipped (idempotent); an empty graph returns immediately (no-op on
+        # fresh install).  _bookkeeping is populated by
+        # load_bookkeeping_from_disk (called at app.py boot before
+        # create_consolidation_loop).  Persist is deferred to the next
+        # _save_key_metadata call (consolidation cycle or explicit persist).
+        _bf = loop.backfill_relation_type_from_graph()
+        if _bf["checked"]:
+            logger.info(
+                "create_consolidation_loop: relation_type backfill — "
+                "checked=%d filled=%d unknown_fallback=%d",
+                _bf["checked"],
+                _bf["filled"],
+                _bf["unknown_fallback"],
+            )
+
     return loop
 
 
@@ -445,6 +462,7 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
             "sessions_seen": sessions_seen,
             "speaker_id": bk.get("speaker_id", ""),
             "first_seen_cycle": bk.get("first_seen_cycle", 0),
+            "relation_type": bk.get("relation_type", "unknown"),
         }
     metadata = {
         "cycle_count": loop.cycle_count,

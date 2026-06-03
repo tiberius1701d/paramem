@@ -1548,6 +1548,187 @@ def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# backfill_relation_type_from_graph (Slice 1)
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillRelationTypeFromGraph:
+    """Tests for ConsolidationLoop.backfill_relation_type_from_graph.
+
+    The method reads relation_type off cumulative graph edges and patches
+    _bookkeeping entries whose relation_type is "unknown".
+    """
+
+    def _make_loop_with_graph(self, graph_edges, store):
+        """Build a minimal ConsolidationLoop stub with the given graph edges."""
+        import types
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        graph = nx.MultiDiGraph()
+        for subject, obj, data in graph_edges:
+            graph.add_edge(subject, obj, **data)
+
+        merger = types.SimpleNamespace(graph=graph)
+        loop = types.SimpleNamespace(
+            store=store,
+            merger=merger,
+        )
+        # Bind the real method to the stub namespace.
+        loop.backfill_relation_type_from_graph = (
+            ConsolidationLoop.backfill_relation_type_from_graph.__get__(loop)
+        )
+        return loop
+
+    def test_backfill_fills_unknown_from_graph_edge(self):
+        """Backfill recovers relation_type from a matching cumulative-graph edge."""
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        store = MemoryStore(replay_enabled=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        store.load_registry("episodic", reg)
+        # Seed entry so the triple is findable.
+        store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+            },
+        )
+        # Bookkeeping with relation_type="unknown" (legacy upgrade path).
+        store.set_bookkeeping(
+            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="unknown"
+        )
+
+        # Graph edge with the matching triple and a concrete relation_type.
+        edges = [
+            ("Alice", "Berlin", {"predicate": "lives_in", "relation_type": "factual"}),
+        ]
+        loop = self._make_loop_with_graph(edges, store)
+        stats = loop.backfill_relation_type_from_graph()
+
+        assert stats["filled"] == 1
+        assert stats["unknown_fallback"] == 0
+        bk = store.bookkeeping_for_key("graph1")
+        assert bk is not None
+        assert bk["relation_type"] == "factual"
+
+    def test_backfill_skips_key_already_has_relation_type(self):
+        """Keys whose bookkeeping has relation_type != 'unknown' are not touched."""
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        store = MemoryStore(replay_enabled=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        store.load_registry("episodic", reg)
+        store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alice",
+                "predicate": "likes",
+                "object": "Tea",
+            },
+        )
+        store.set_bookkeeping(
+            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="preference"
+        )
+
+        edges = [("Alice", "Tea", {"predicate": "likes", "relation_type": "factual"})]
+        loop = self._make_loop_with_graph(edges, store)
+        stats = loop.backfill_relation_type_from_graph()
+
+        # checked=0 because the existing relation_type is not "unknown"
+        assert stats["checked"] == 0
+        assert stats["filled"] == 0
+        # relation_type unchanged
+        bk = store.bookkeeping_for_key("graph1")
+        assert bk["relation_type"] == "preference"
+
+    def test_backfill_key_absent_from_graph_defaults_to_unknown(self):
+        """Key whose triple is not in the graph keeps relation_type='unknown'."""
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        store = MemoryStore(replay_enabled=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        store.load_registry("episodic", reg)
+        store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Bob",
+                "predicate": "works_at",
+                "object": "ACME",
+            },
+        )
+        store.set_bookkeeping(
+            "graph1", speaker_id="bob", first_seen_cycle=2, relation_type="unknown"
+        )
+
+        # Graph has an unrelated edge — graph1's triple is not present.
+        edges = [("Alice", "Berlin", {"predicate": "lives_in", "relation_type": "factual"})]
+        loop = self._make_loop_with_graph(edges, store)
+        stats = loop.backfill_relation_type_from_graph()
+
+        assert stats["checked"] == 1
+        assert stats["filled"] == 0
+        assert stats["unknown_fallback"] == 1
+        bk = store.bookkeeping_for_key("graph1")
+        assert bk["relation_type"] == "unknown"
+
+    def test_backfill_empty_graph_returns_zeros(self):
+        """An empty graph produces all-zero stats without error."""
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        store = MemoryStore(replay_enabled=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        store.load_registry("episodic", reg)
+        store.set_bookkeeping(
+            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="unknown"
+        )
+
+        loop = self._make_loop_with_graph([], store)
+        stats = loop.backfill_relation_type_from_graph()
+        assert stats == {"checked": 0, "filled": 0, "unknown_fallback": 0}
+
+    def test_backfill_cache_off_no_entry_counts_as_unknown_fallback(self):
+        """Under cache-off (no content entry), key is counted as unknown_fallback."""
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        store = MemoryStore(replay_enabled=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        store.load_registry("episodic", reg)
+        # Bookkeeping only; no _entries (cache-off scenario).
+        store.set_bookkeeping(
+            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="unknown"
+        )
+
+        edges = [("Alice", "Berlin", {"predicate": "lives_in", "relation_type": "factual"})]
+        loop = self._make_loop_with_graph(edges, store)
+        stats = loop.backfill_relation_type_from_graph()
+
+        assert stats["checked"] == 1
+        assert stats["filled"] == 0
+        assert stats["unknown_fallback"] == 1
+
+
+# ---------------------------------------------------------------------------
 # _prune_old_slots: adapter slot retention (Commit 2)
 # ---------------------------------------------------------------------------
 

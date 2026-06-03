@@ -90,6 +90,7 @@ select = ["E", "F", "W", "I"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+norecursedirs = ["outputs", "*.egg-info", ".git", "__pycache__", ".tox", "dist", "build"]
 markers = [
     "gpu: marks tests that require a GPU (deselect with '-m \"not gpu\"')",
     "recall: marks tests that train an adapter and probe for fact recall (~30 epochs, use --recall to run)",

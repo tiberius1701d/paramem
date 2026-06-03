@@ -1202,7 +1202,7 @@ def _make_loop_for_commit(tmp_path: Path) -> ConsolidationLoop:
         },
         register=False,
     )
-    store.set_bookkeeping("graph1", speaker_id="sp1", first_seen_cycle=0)
+    store.set_bookkeeping("graph1", speaker_id="sp1", first_seen_cycle=0, relation_type="factual")
     loop.store = store
     return loop
 
