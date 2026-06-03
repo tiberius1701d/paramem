@@ -22,7 +22,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from paramem.server.config import TextLangDetectionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +117,41 @@ def load_at_startup(model_path_str: str = "") -> _DetectorHandle | None:
     """
     path = Path(model_path_str) if model_path_str else None
     return get_detector(path)
+
+
+def resolve_text_language(
+    text: str,
+    cfg: "TextLangDetectionConfig",
+) -> tuple[str | None, float]:
+    """Apply the text-side language-detection policy against *cfg*.
+
+    Encapsulates the full resolution decision — enabled guard, model-path
+    resolution, confidence threshold — so every endpoint that needs
+    text-side language detection calls this one function rather than
+    inlining the policy.
+
+    Parameters
+    ----------
+    text:
+        Raw request text.  Passed verbatim to ``detect``; sanitization
+        (newline stripping, empty check) is ``detect``'s responsibility.
+    cfg:
+        ``TextLangDetectionConfig`` instance from the server config.
+
+    Returns
+    -------
+    tuple of (iso639-1 code or ``None``, probability in [0, 1])
+        ``(None, 0.0)`` when detection is disabled, the model is
+        unavailable, the input is empty, or the classifier's confidence
+        falls below ``cfg.confidence_threshold``.
+    """
+    if not cfg.enabled:
+        return None, 0.0
+    model_path = Path(cfg.model_path) if cfg.model_path else None
+    lang, prob = detect(text, model_path=model_path)
+    if lang and prob >= cfg.confidence_threshold:
+        return lang, prob
+    return None, 0.0
 
 
 def reset_for_tests() -> None:

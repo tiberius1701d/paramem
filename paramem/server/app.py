@@ -2626,12 +2626,11 @@ async def chat(request: ChatRequest, http_request: Request):
     # detector against the request text so cloud routing can speak the
     # language the user wrote in instead of defaulting to English.
     text_lang_cfg = _state["config"].text_lang_detection
-    if detected_language is None and not request.speaker_embedding and text_lang_cfg.enabled:
+    if detected_language is None and not request.speaker_embedding:
         from paramem.server import lang_id
 
-        model_path = Path(text_lang_cfg.model_path) if text_lang_cfg.model_path else None
-        text_lang, text_prob = lang_id.detect(request.text, model_path=model_path)
-        if text_lang and text_prob >= text_lang_cfg.confidence_threshold:
+        text_lang, text_prob = lang_id.resolve_text_language(request.text, text_lang_cfg)
+        if text_lang:
             detected_language = text_lang
             detected_language_prob = text_prob
             logger.info("Text-side lang_id: %s (prob=%.2f)", text_lang, text_prob)
@@ -6275,8 +6274,14 @@ async def debug_probe(request: DebugProbeRequest):
     unknown ``speaker_id`` returns 404.  Mirrors the dispatch shape of
     ``/chat`` (cloud-only branch + local branch with gpu_lock and
     background-trainer pause), minus the buffer.append, greeting flow,
-    and language detection — those produce side-effects that the probe
-    must not emit.
+    STT language detection, and ``tracker.record`` side-effects.
+
+    Text-side language detection (``lang_id.resolve_text_language``) is run
+    here because it is side-effect-free: it reads only the request text and
+    the server config, mutates no state, and does not call
+    ``tracker.record``.  The resolved language is forwarded to both the
+    cloud-only and local dispatch branches so non-English probe texts are
+    handled correctly.
     """
     # Count as a /chat-equivalent turn for the idle-debounce gate so operator
     # probe calls do not trigger consolidation mid-session.
@@ -6296,6 +6301,12 @@ async def debug_probe(request: DebugProbeRequest):
             status_code=404,
         )
 
+    # Side-effect-free text-side language detection.  STT detection and
+    # tracker.record are /chat-only side-effects and are intentionally omitted.
+    from paramem.server import lang_id as _lang_id
+
+    detected_language, _ = _lang_id.resolve_text_language(request.text, config.text_lang_detection)
+
     # Cloud-only mode mirrors /chat dispatch — no GPU lock, no model.
     if _state["mode"] == "cloud-only":
         cloud_result = _cloud_only_route(
@@ -6306,7 +6317,7 @@ async def debug_probe(request: DebugProbeRequest):
             router=_state.get("router"),
             ha_client=_state.get("ha_client"),
             sota_agent=_state.get("sota_agent"),
-            language=None,
+            language=detected_language,
         )
         return ChatResponse(text=cloud_result.text, escalated=True, speaker=speaker_name)
 
@@ -6337,7 +6348,7 @@ async def debug_probe(request: DebugProbeRequest):
                 router=_state["router"],
                 sota_agent=_state.get("sota_agent"),
                 ha_client=_state.get("ha_client"),
-                language=None,
+                language=detected_language,
                 effective_mode=_state.get("effective_mode"),
                 memory_store=_state["memory_store"],
             ),

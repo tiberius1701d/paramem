@@ -1,13 +1,19 @@
-"""Tests for `paramem/server/lang_id.py` — fastText lid.176 wrapper."""
+"""Tests for `paramem/server/lang_id.py` — fastText lid.176 wrapper.
+
+Covers ``detect``, ``load_at_startup``, and ``resolve_text_language``.
+Also verifies that ``/debug/probe`` threads the resolved language into
+both dispatch branches instead of hardcoding ``None``.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from paramem.server import lang_id
+from paramem.server.config import TextLangDetectionConfig
 
 
 @pytest.fixture(autouse=True)
@@ -127,3 +133,166 @@ def test_load_at_startup_warms_singleton(tmp_path, monkeypatch):
     lang_id.detect("Wo wohne ich?", model_path=model_path)
     lang_id.detect("Hallo Welt", model_path=model_path)
     assert fake_module.load_model.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# resolve_text_language — policy unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_text_language_disabled_returns_none():
+    """When enabled=False the resolver short-circuits without touching detect."""
+    cfg = TextLangDetectionConfig(enabled=False, confidence_threshold=0.65)
+    result = lang_id.resolve_text_language("Wo wohne ich?", cfg)
+    assert result == (None, 0.0)
+
+
+def test_resolve_text_language_above_threshold_passes_through(tmp_path, monkeypatch):
+    """detect result above confidence_threshold is returned unchanged."""
+    model_path = tmp_path / "lid.bin"
+    model_path.write_bytes(b"stub")
+    _stub_fasttext(monkeypatch, "__label__de", 0.97)
+    cfg = TextLangDetectionConfig(
+        enabled=True, confidence_threshold=0.65, model_path=str(model_path)
+    )
+    lang, prob = lang_id.resolve_text_language("Wo wohne ich?", cfg)
+    assert lang == "de"
+    assert prob == pytest.approx(0.97)
+
+
+def test_resolve_text_language_below_threshold_returns_none(tmp_path, monkeypatch):
+    """detect result below confidence_threshold yields (None, 0.0)."""
+    model_path = tmp_path / "lid.bin"
+    model_path.write_bytes(b"stub")
+    _stub_fasttext(monkeypatch, "__label__de", 0.50)
+    cfg = TextLangDetectionConfig(
+        enabled=True, confidence_threshold=0.65, model_path=str(model_path)
+    )
+    result = lang_id.resolve_text_language("Wo wohne ich?", cfg)
+    assert result == (None, 0.0)
+
+
+def test_resolve_text_language_empty_model_path_uses_default(monkeypatch):
+    """Empty model_path in cfg → detect falls back to _default_model_path (missing → None)."""
+    monkeypatch.setattr(lang_id, "_default_model_path", lambda: Path("/nonexistent/lid.bin"))
+    cfg = TextLangDetectionConfig(enabled=True, confidence_threshold=0.65, model_path="")
+    result = lang_id.resolve_text_language("hello", cfg)
+    assert result == (None, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# /debug/probe — language threading
+# ---------------------------------------------------------------------------
+
+
+def _make_probe_state(*, mode: str = "cloud-only") -> dict:
+    """Minimal _state for debug_probe tests; no GPU required."""
+    store = MagicMock()
+    store.get_name.return_value = "TestUser"
+
+    cfg = MagicMock()
+    cfg.debug = True
+    cfg.text_lang_detection = TextLangDetectionConfig(enabled=False)
+    cfg.consolidation.abort_quiesce_timeout_s = 1.0
+
+    return {
+        "config": cfg,
+        "mode": mode,
+        "speaker_store": store,
+        "router": MagicMock(),
+        "ha_client": None,
+        "sota_agent": None,
+        "model": MagicMock(),
+        "tokenizer": MagicMock(),
+        "memory_store": MagicMock(),
+        "background_trainer": None,
+        "effective_mode": None,
+        "last_chat_monotonic": 0.0,
+        "user_token_store": None,
+    }
+
+
+def test_debug_probe_cloud_only_threads_detected_language(monkeypatch):
+    """resolve_text_language result is forwarded to _cloud_only_route."""
+    from fastapi.testclient import TestClient
+
+    import paramem.server.app as app_module
+
+    state = _make_probe_state(mode="cloud-only")
+    monkeypatch.setattr(app_module, "_state", state)
+
+    cloud_result = MagicMock()
+    cloud_result.text = "Hallo!"
+
+    with (
+        patch(
+            "paramem.server.lang_id.resolve_text_language", return_value=("de", 0.99)
+        ) as mock_resolve,
+        patch("paramem.server.app._cloud_only_route", return_value=cloud_result) as mock_route,
+    ):
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post(
+            "/debug/probe",
+            json={"text": "Wo wohne ich?", "speaker_id": "spk-1"},
+        )
+
+    assert resp.status_code == 200
+    mock_resolve.assert_called_once()
+    call_kwargs = mock_route.call_args.kwargs
+    assert call_kwargs["language"] == "de"
+
+
+def test_debug_probe_local_threads_detected_language(monkeypatch):
+    """resolve_text_language result is forwarded to handle_chat (local mode)."""
+    from fastapi.testclient import TestClient
+
+    import paramem.server.app as app_module
+
+    state = _make_probe_state(mode="local")
+    monkeypatch.setattr(app_module, "_state", state)
+
+    chat_result = MagicMock()
+    chat_result.text = "Hallo!"
+    chat_result.escalated = False
+
+    with (
+        patch(
+            "paramem.server.lang_id.resolve_text_language", return_value=("de", 0.99)
+        ) as mock_resolve,
+        patch("paramem.server.app.handle_chat", return_value=chat_result) as mock_handle,
+    ):
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post(
+            "/debug/probe",
+            json={"text": "Wo wohne ich?", "speaker_id": "spk-1"},
+        )
+
+    assert resp.status_code == 200
+    mock_resolve.assert_called_once()
+    call_kwargs = mock_handle.call_args.kwargs
+    assert call_kwargs["language"] == "de"
+
+
+def test_debug_probe_disabled_detection_passes_none(monkeypatch):
+    """When text_lang_detection.enabled=False, language=None reaches _cloud_only_route."""
+    from fastapi.testclient import TestClient
+
+    import paramem.server.app as app_module
+
+    state = _make_probe_state(mode="cloud-only")
+    # cfg already has enabled=False from _make_probe_state
+    monkeypatch.setattr(app_module, "_state", state)
+
+    cloud_result = MagicMock()
+    cloud_result.text = "Hello!"
+
+    with patch("paramem.server.app._cloud_only_route", return_value=cloud_result) as mock_route:
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post(
+            "/debug/probe",
+            json={"text": "Wo wohne ich?", "speaker_id": "spk-1"},
+        )
+
+    assert resp.status_code == 200
+    call_kwargs = mock_route.call_args.kwargs
+    assert call_kwargs["language"] is None
