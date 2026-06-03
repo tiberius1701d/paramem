@@ -489,6 +489,97 @@ class ConsolidationLoop:
             len(self.key_sessions),
         )
 
+    def backfill_relation_type_from_graph(self) -> dict:
+        """One-time backfill of ``relation_type`` for keys whose bookkeeping
+        lacks it (legacy keys minted before this field was added).
+
+        Reads ``relation_type`` off the persisted ``cumulative_graph.json``
+        edges (already loaded into ``self.merger.graph`` at
+        ``ConsolidationLoop.__init__``).  Updates ``_bookkeeping[key]`` in
+        place via :meth:`MemoryStore.set_bookkeeping` for every active key
+        whose current ``relation_type`` is ``"unknown"`` (the upgrade-default
+        set by :meth:`MemoryStore.load_bookkeeping_from_disk`).  Keys not
+        found in the graph (edge pruned or graph pre-dates the key) keep
+        ``"unknown"`` — which safely partitions to episodic — and are logged
+        in the returned count so large fallback counts are visible.
+
+        Must be called AFTER :meth:`MemoryStore.load_bookkeeping_from_disk`
+        has populated ``_bookkeeping`` (so ``bk["relation_type"]`` exists for
+        every active key).  Called from
+        :func:`paramem.server.consolidation.create_consolidation_loop` when
+        the graph has been loaded from disk.
+
+        Returns:
+            ``{"checked": int, "filled": int, "unknown_fallback": int}``
+            where ``filled`` is the count of keys whose ``relation_type`` was
+            successfully recovered from a graph edge, and ``unknown_fallback``
+            is the count that had to keep ``"unknown"`` (edge not found or
+            no content entry available to resolve the triple).
+        """
+        from paramem.graph.merger import _normalize_predicate
+
+        # Build a (subject, norm_pred, object) → relation_type lookup from the
+        # in-memory cumulative graph.  This is a transient, per-boot read —
+        # NOT a persisted sidecar (merger is the idempotent authority).
+        edge_rt: dict[tuple[str, str, str], str] = {}
+        for subject, obj, data in self.merger.graph.edges(data=True):
+            pred = data.get("predicate", "")
+            rt = data.get("relation_type")
+            if rt and pred:
+                edge_rt[(subject, _normalize_predicate(pred), obj)] = rt
+
+        if not edge_rt:
+            # Graph is empty or not loaded — nothing to backfill.
+            return {"checked": 0, "filled": 0, "unknown_fallback": 0}
+
+        checked = 0
+        filled = 0
+        unknown_fallback = 0
+
+        for key in self.store.all_active_keys():
+            bk = self.store.bookkeeping_for_key(key)
+            if bk is None:
+                # Key has no bookkeeping yet (loaded before load_bookkeeping_from_disk).
+                continue
+            if bk.get("relation_type", "unknown") != "unknown":
+                # Already has a concrete relation_type — skip.
+                continue
+
+            checked += 1
+            # Recover the triple from the content cache (_entries).  Under
+            # preload_cache=False the cache is empty; the key falls back to
+            # "unknown" (safe, self-corrects on next full cycle).
+            entry = self.store.get(key)
+            if entry is None:
+                unknown_fallback += 1
+                continue
+
+            triple_key = (
+                entry.get("subject", ""),
+                _normalize_predicate(entry.get("predicate", "")),
+                entry.get("object", ""),
+            )
+            rt = edge_rt.get(triple_key)
+            if rt is not None:
+                self.store.set_bookkeeping(
+                    key,
+                    speaker_id=bk.get("speaker_id", ""),
+                    first_seen_cycle=bk.get("first_seen_cycle", 0),
+                    relation_type=rt,
+                )
+                filled += 1
+            else:
+                unknown_fallback += 1
+
+        if checked:
+            logger.info(
+                "backfill_relation_type_from_graph: checked=%d filled=%d unknown_fallback=%d",
+                checked,
+                filled,
+                unknown_fallback,
+            )
+        return {"checked": checked, "filled": filled, "unknown_fallback": unknown_fallback}
+
     @staticmethod
     def dedup_episodic(qa_list: list[dict]) -> list[dict]:
         """Deduplicate episodic QA/relation dicts by triple identity.
@@ -535,6 +626,7 @@ class ConsolidationLoop:
         object: str,
         speaker_id: str,
         first_seen_cycle: int,
+        relation_type: str = "factual",
         question: Optional[str] = None,
         answer: Optional[str] = None,
     ) -> dict:
@@ -556,6 +648,10 @@ class ConsolidationLoop:
             object: Triple object.
             speaker_id: Speaker scope.
             first_seen_cycle: Cycle count at first insertion.
+            relation_type: Model-assigned relation type from extraction
+                (e.g. ``"factual"``, ``"preference"``, ``"temporal"``,
+                ``"social"``).  Defaults to ``"factual"`` for legacy callers
+                that pre-date this field; pass explicitly at every new site.
             question: Optional legacy question text; omit for entry-format keys.
             answer: Optional legacy answer text; omit for entry-format keys.
 
@@ -569,6 +665,7 @@ class ConsolidationLoop:
             "object": object,
             "speaker_id": speaker_id,
             "first_seen_cycle": first_seen_cycle,
+            "relation_type": relation_type,
         }
         if question is not None:
             entry["question"] = question
@@ -1295,6 +1392,7 @@ class ConsolidationLoop:
                 object=kp["object"],
                 speaker_id=sid,
                 first_seen_cycle=self.cycle_count,
+                relation_type=rel.get("relation_type", "factual"),
             )
             entry["_new"] = True
             new_keyed.append(entry)
@@ -1445,6 +1543,7 @@ class ConsolidationLoop:
                     object=kp["object"],
                     speaker_id=rel_speaker,
                     first_seen_cycle=self.cycle_count,
+                    relation_type=rel.get("relation_type", "factual"),
                 )
             )
 
@@ -1477,6 +1576,7 @@ class ConsolidationLoop:
                     kp["key"],
                     speaker_id=kp["speaker_id"],
                     first_seen_cycle=kp["first_seen_cycle"],
+                    relation_type=kp.get("relation_type", "factual"),
                 )
             for sp_key, new_key in new_sp_mappings.items():
                 self.procedural_sp_index[sp_key] = new_key
@@ -2549,6 +2649,7 @@ class ConsolidationLoop:
                 kp["key"],
                 speaker_id=kp["speaker_id"],
                 first_seen_cycle=kp["first_seen_cycle"],
+                relation_type=kp.get("relation_type", "factual"),
             )
         for sp_key, new_key in new_sp_mappings.items():
             self.procedural_sp_index[sp_key] = new_key
@@ -2784,6 +2885,7 @@ class ConsolidationLoop:
                     kp["key"],
                     speaker_id=kp["speaker_id"],
                     first_seen_cycle=kp["first_seen_cycle"],
+                    relation_type=kp.get("relation_type", "factual"),
                 )
             self._indexed_next_index += len(new_keyed_episodic)
 
@@ -2878,6 +2980,7 @@ class ConsolidationLoop:
                     kp["key"],
                     speaker_id=kp["speaker_id"],
                     first_seen_cycle=kp["first_seen_cycle"],
+                    relation_type=kp.get("relation_type", "factual"),
                 )
             self._indexed_next_index += len(new_keyed_episodic)
 

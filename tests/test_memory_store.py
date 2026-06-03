@@ -79,15 +79,17 @@ class TestQuadPayload:
         """set_bookkeeping then bookkeeping_for_key returns the correct fields.
 
         Replaces the deleted setdefault_entry test — bookkeeping is now the
-        canonical owner of speaker_id/first_seen_cycle."""
+        canonical owner of speaker_id/first_seen_cycle/relation_type."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="spk-a", first_seen_cycle=5)
+        s.set_bookkeeping("graph1", speaker_id="spk-a", first_seen_cycle=5, relation_type="factual")
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["speaker_id"] == "spk-a"
         assert bk["first_seen_cycle"] == 5
         # Second call must return updated values (idempotent overwrite).
-        s.set_bookkeeping("graph1", speaker_id="spk-b", first_seen_cycle=7)
+        s.set_bookkeeping(
+            "graph1", speaker_id="spk-b", first_seen_cycle=7, relation_type="preference"
+        )
         bk2 = s.bookkeeping_for_key("graph1")
         assert bk2["speaker_id"] == "spk-b"
         assert bk2["first_seen_cycle"] == 7
@@ -337,7 +339,7 @@ class TestBookkeeping:
         Under preload_cache=False this is the key correctness invariant:
         bookkeeping presence must never mask a cache miss."""
         s = MemoryStore()
-        s.set_bookkeeping("k", speaker_id="alice", first_seen_cycle=1)
+        s.set_bookkeeping("k", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
         # No put — _entries is empty.
         assert s.get("k") is None
         results = s.probe({"episodic": ["k"]}, source=None)
@@ -346,7 +348,7 @@ class TestBookkeeping:
     def test_new_key_write_back_round_trips_speaker_id(self):
         """set_bookkeeping + bookkeeping_for_key round-trips all fields."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="bob", first_seen_cycle=3)
+        s.set_bookkeeping("graph1", speaker_id="bob", first_seen_cycle=3, relation_type="factual")
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["speaker_id"] == "bob"
@@ -358,8 +360,8 @@ class TestBookkeeping:
 
     def test_iter_bookkeeping_yields_all_keys(self):
         s = MemoryStore()
-        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1)
-        s.set_bookkeeping("k2", speaker_id="bob", first_seen_cycle=2)
+        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("k2", speaker_id="bob", first_seen_cycle=2, relation_type="preference")
         items = dict(s.iter_bookkeeping())
         assert items["k1"]["speaker_id"] == "alice"
         assert items["k2"]["speaker_id"] == "bob"
@@ -369,7 +371,7 @@ class TestBookkeeping:
         """store.delete must retire bookkeeping automatically."""
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"))
-        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1)
+        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
         s.delete("graph1")
         assert s.bookkeeping_for_key("graph1") is None
 
@@ -398,7 +400,9 @@ class TestBookkeeping:
             "graph1",
             {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
         )
-        s.set_bookkeeping("graph1", speaker_id="spk-alice", first_seen_cycle=2)
+        s.set_bookkeeping(
+            "graph1", speaker_id="spk-alice", first_seen_cycle=2, relation_type="factual"
+        )
         results = s.probe({"episodic": ["graph1"]}, source=_FakeSource())
         assert results["graph1"]["speaker_id"] == "spk-alice"
         assert results["graph1"]["first_seen_cycle"] == 2
@@ -419,8 +423,8 @@ class TestBookkeeping:
 
         s = MemoryStore()
         # Bookkeeping loaded but NO entries (cache-off scenario).
-        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1)
-        s.set_bookkeeping("k2", speaker_id="alice", first_seen_cycle=2)
+        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("k2", speaker_id="alice", first_seen_cycle=2, relation_type="factual")
         # Register keys in the registry so tier resolution works.
         from paramem.training.key_registry import KeyRegistry
 
@@ -436,10 +440,95 @@ class TestBookkeeping:
     def test_snapshot_excludes_bookkeeping(self):
         """_bookkeeping must not enter snapshot — it is boot-loaded from disk."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1)
+        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
         snap = s.snapshot()
         assert "_bookkeeping" not in snap
         assert "bookkeeping" not in snap
+
+    # -- Slice 1: relation_type round-trip tests --
+
+    def test_relation_type_round_trips(self):
+        """set_bookkeeping with relation_type='preference' → bookkeeping_for_key returns it."""
+        s = MemoryStore()
+        s.set_bookkeeping(
+            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="preference"
+        )
+        bk = s.bookkeeping_for_key("graph1")
+        assert bk is not None
+        assert bk["relation_type"] == "preference"
+
+    def test_relation_type_overwrite_idempotent(self):
+        """A second set_bookkeeping call updates relation_type in place."""
+        s = MemoryStore()
+        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping(
+            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="preference"
+        )
+        bk = s.bookkeeping_for_key("graph1")
+        assert bk is not None
+        assert bk["relation_type"] == "preference"
+
+    def test_load_bookkeeping_from_disk_reads_relation_type(self, tmp_path):
+        """load_bookkeeping_from_disk reads relation_type from key_metadata.json."""
+        import json
+
+        path = tmp_path / "key_metadata.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "keys": {
+                        "graph1": {
+                            "sessions_seen": 1,
+                            "speaker_id": "alice",
+                            "first_seen_cycle": 2,
+                            "relation_type": "preference",
+                        }
+                    }
+                }
+            )
+        )
+        s = MemoryStore()
+        # Register graph1 so it is not treated as an orphan.
+        reg = KeyRegistry()
+        reg.add("graph1")
+        s.load_registry("episodic", reg)
+        stats = s.load_bookkeeping_from_disk(path)
+        assert stats["loaded"] == 1
+        assert stats["orphaned"] == 0
+        bk = s.bookkeeping_for_key("graph1")
+        assert bk is not None
+        assert bk["relation_type"] == "preference"
+
+    def test_load_bookkeeping_from_disk_legacy_without_relation_type(self, tmp_path):
+        """Legacy key_metadata.json without relation_type loads with 'unknown' default.
+
+        No crash; legacy_upgraded counter incremented."""
+        import json
+
+        path = tmp_path / "key_metadata.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "keys": {
+                        "graph1": {
+                            "sessions_seen": 1,
+                            "speaker_id": "alice",
+                            "first_seen_cycle": 2,
+                            # relation_type deliberately absent (legacy file)
+                        }
+                    }
+                }
+            )
+        )
+        s = MemoryStore()
+        reg = KeyRegistry()
+        reg.add("graph1")
+        s.load_registry("episodic", reg)
+        stats = s.load_bookkeeping_from_disk(path)
+        assert stats["legacy_upgraded"] == 1
+        bk = s.bookkeeping_for_key("graph1")
+        assert bk is not None
+        assert bk["relation_type"] == "unknown"
 
 
 # ---------------------------------------------------------------------------

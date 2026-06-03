@@ -48,12 +48,12 @@ cache miss.  Under ``inference.preload_cache=False`` the entries are empty by
 design → every key is a clean miss → the source is always probed → restores
 the documented contract.
 
-The per-key bookkeeping fields ``speaker_id`` and ``first_seen_cycle`` live in
-:attr:`MemoryStore._bookkeeping` — a flat ``{key → {speaker_id, first_seen_cycle}}``
-dict SEPARATE from ``_entries``.  Populated by
-:meth:`load_bookkeeping_from_disk` at boot (unconditionally; entry-independent).
-Never enters :meth:`KeyRegistry.save_bytes`, :meth:`snapshot`, or any hash
-path.
+The per-key bookkeeping fields ``speaker_id``, ``first_seen_cycle``, and
+``relation_type`` live in :attr:`MemoryStore._bookkeeping` — a flat
+``{key → {speaker_id, first_seen_cycle, relation_type}}`` dict SEPARATE from
+``_entries``.  Populated by :meth:`load_bookkeeping_from_disk` at boot
+(unconditionally; entry-independent).  Never enters
+:meth:`KeyRegistry.save_bytes`, :meth:`snapshot`, or any hash path.
 
 **ARCHITECTURAL NOTE — save-path working entries:**
 The "pure content cache" rule binds the INFERENCE cache (boot preload +
@@ -102,7 +102,7 @@ class MemoryStore:
         # lifecycle at all).
         self._registry: dict[str, KeyRegistry] | None = {} if replay_enabled else None
         # Per-key provenance bookkeeping — SEPARATE from _entries.
-        # key -> {"speaker_id": str, "first_seen_cycle": int}
+        # key -> {"speaker_id": str, "first_seen_cycle": int, "relation_type": str}
         # Populated by load_bookkeeping_from_disk at boot.  Never enters
         # snapshot/restore or KeyRegistry.save_bytes — stays out of the
         # hash-frozen slot-identity path.
@@ -199,27 +199,44 @@ class MemoryStore:
             self._registry.setdefault(tier, KeyRegistry()).add(key)
 
     # ------------------------------------------------------------------
-    # Per-key bookkeeping — speaker_id / first_seen_cycle
+    # Per-key bookkeeping — speaker_id / first_seen_cycle / relation_type
     # SEPARATE from _entries; never in snapshot or KeyRegistry.save_bytes.
     # ------------------------------------------------------------------
-    def set_bookkeeping(self, key: str, *, speaker_id: str, first_seen_cycle: int) -> None:
+    def set_bookkeeping(
+        self,
+        key: str,
+        *,
+        speaker_id: str,
+        first_seen_cycle: int,
+        relation_type: str,
+    ) -> None:
         """Store or update the bookkeeping record for *key*.
 
-        Both ``speaker_id`` and ``first_seen_cycle`` are mandatory (one
-        mandatory tier, zero optional buckets).  Idempotent — safe to call
-        on every new-key write and on every boot reload.
+        All three fields — ``speaker_id``, ``first_seen_cycle``, and
+        ``relation_type`` — are mandatory (one mandatory tier, zero optional
+        buckets).  Idempotent — safe to call on every new-key write and on
+        every boot reload.
+
+        ``relation_type`` is the model-assigned relation type from extraction
+        (e.g. ``"factual"``, ``"preference"``, ``"temporal"``, ``"social"``).
+        Legacy keys that pre-date this field are upgraded in-memory to
+        ``"unknown"`` by :meth:`load_bookkeeping_from_disk` and then backfilled
+        from the cumulative graph by
+        :meth:`paramem.training.consolidation.ConsolidationLoop.backfill_relation_type_from_graph`.
 
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit."""
         self._bookkeeping[key] = {
             "speaker_id": speaker_id,
             "first_seen_cycle": first_seen_cycle,
+            "relation_type": relation_type,
         }
 
     def bookkeeping_for_key(self, key: str) -> dict | None:
         """Return the bookkeeping record for *key*, or ``None`` when absent.
 
-        Returns a plain dict ``{"speaker_id": str, "first_seen_cycle": int}``
+        Returns a plain dict
+        ``{"speaker_id": str, "first_seen_cycle": int, "relation_type": str}``
         when present, ``None`` when the key has never been bookkept.
         Callers may use ``bk = store.bookkeeping_for_key(k) or {}`` as a
         boundary default (compliant with the is-None / empty-is-valid rule)."""
@@ -686,6 +703,9 @@ class MemoryStore:
                         # and the key wasn't already bookkept (cold key not in
                         # key_metadata.json at boot — disk source path).  No-op on
                         # the weight path (WeightMemorySource carries no speaker_id).
+                        # relation_type is not carried by the probe source; default
+                        # to "unknown" — the backfill job corrects it on first
+                        # consolidation cycle.
                         if key not in self._bookkeeping:
                             src_spk = src.get("speaker_id", "")
                             src_fsc = src.get("first_seen_cycle", 0)
@@ -694,6 +714,7 @@ class MemoryStore:
                                     key,
                                     speaker_id=src_spk,
                                     first_seen_cycle=src_fsc,
+                                    relation_type=src.get("relation_type", "unknown"),
                                 )
 
         return results
@@ -767,7 +788,7 @@ class MemoryStore:
                 self.replace_simhashes_in_tier(tier, sh)
 
     def load_bookkeeping_from_disk(self, key_metadata_path) -> dict:
-        """Load per-key ``speaker_id`` / ``first_seen_cycle`` into ``_bookkeeping``.
+        """Load per-key bookkeeping into ``_bookkeeping`` from ``key_metadata.json``.
 
         Sole boot loader for the per-key bookkeeping section of
         ``key_metadata.json``.  Runs unconditionally at lifespan boot (after
@@ -781,10 +802,13 @@ class MemoryStore:
         that created payload-less stub entries has been removed.  Bookkeeping
         presence MUST NOT manufacture a content cache hit.
 
+        Fields loaded: ``speaker_id``, ``first_seen_cycle``, ``relation_type``.
         Keys absent from every tier registry (orphans — slot wiped or never
         existed) are skipped but counted in the return dict.  Pre-refactor
-        files that lack ``speaker_id``/``first_seen_cycle`` are upgraded
-        in-memory with ``""`` / ``0`` (legacy_upgraded counter).
+        files that lack any of the three fields are upgraded in-memory with
+        ``""`` / ``0`` / ``"unknown"`` respectively (``legacy_upgraded`` counter).
+        Keys with ``relation_type="unknown"`` are candidates for backfill by
+        :meth:`paramem.training.consolidation.ConsolidationLoop.backfill_relation_type_from_graph`.
 
         Returns ``{loaded, orphaned, legacy_upgraded}`` for ``/status`` and
         diagnostics.  Missing file → all zeros, no-op (fresh install).
@@ -808,12 +832,17 @@ class MemoryStore:
             if tier is None:
                 orphaned += 1
                 continue
-            if "speaker_id" not in key_meta or "first_seen_cycle" not in key_meta:
+            if (
+                "speaker_id" not in key_meta
+                or "first_seen_cycle" not in key_meta
+                or "relation_type" not in key_meta
+            ):
                 legacy_upgraded += 1
             self.set_bookkeeping(
                 key,
                 speaker_id=key_meta.get("speaker_id", ""),
                 first_seen_cycle=key_meta.get("first_seen_cycle", 0),
+                relation_type=key_meta.get("relation_type", "unknown"),
             )
             loaded += 1
         return {"loaded": loaded, "orphaned": orphaned, "legacy_upgraded": legacy_upgraded}
