@@ -506,13 +506,73 @@ class MemoryStore:
         """
         import json as _json
 
-        from paramem.memory.entry import entry_fact_text
+        from paramem.memory.entry import (
+            DEFAULT_CONFIDENCE_THRESHOLD,
+            entry_fact_text,
+            verify_confidence,
+        )
 
-        def _render(key: str, entry: dict) -> dict:
+        def _confidence_gate(key: str, entry: dict) -> float | None:
+            """Return the SimHash confidence for *key* against *entry*, or None
+            when no gate applies (replay disabled or key has no fingerprint).
+
+            Called on both cache-hit and source-result branches so the gate is
+            applied at exactly one place regardless of which read path served
+            the entry.  Returns the computed confidence float when the gate
+            applies (which may be below threshold), or ``None`` to signal
+            pass-through (no verification needed — replay-off or no fingerprint).
+
+            The fingerprint is looked up by scanning all simhash tiers via
+            :meth:`_tier_for_simhash` so a key whose simhash was stored under
+            a different tier from the one it was requested under (e.g. an
+            interim slot promoted to main) is still verified correctly.
+
+            Invariant: never uses truthiness on ``_simhash`` or sub-dicts —
+            all presence checks use explicit ``in`` / ``is None``."""
+            if not self._replay_enabled:
+                return None
+            owning_simhash_tier = self._tier_for_simhash(key)
+            if owning_simhash_tier is None:
+                # Key has no fingerprint — replay enabled but no hash stored
+                # (e.g. fresh tier before first consolidation).  Pass through.
+                return None
+            fp = self._simhash[owning_simhash_tier].get(key)
+            if fp is None:
+                return None
+            # Build the minimal entry shape verify_confidence expects.
+            candidate = {
+                "key": key,
+                "subject": entry.get("subject", ""),
+                "predicate": entry.get("predicate", ""),
+                "object": entry.get("object", ""),
+            }
+            return verify_confidence(candidate, {key: fp})
+
+        def _render(key: str, entry: dict) -> dict | None:
             # speaker_id / first_seen_cycle come from _bookkeeping — the single
             # authoritative source.  Entries hold SPO only (inference cache
             # contract); save-path working entries carry them for build_graph_for_tier
             # but those are consumed within the cycle, not at inference time.
+            #
+            # SimHash confidence gate: when replay is enabled and the key has a
+            # stored fingerprint, compute the real confidence and drop entries
+            # that fall below DEFAULT_CONFIDENCE_THRESHOLD.  This makes the
+            # cache-hit path identical in gate semantics to the source path
+            # (WeightMemorySource / finalize_recalled).  Returns None on fail
+            # so the caller treats the key as a miss — same as source drop.
+            confidence = _confidence_gate(key, entry)
+            if confidence is not None and confidence < DEFAULT_CONFIDENCE_THRESHOLD:
+                logger.debug(
+                    "MemoryStore.probe: cache-hit key %r dropped by confidence gate "
+                    "(%.3f < %.3f threshold)",
+                    key,
+                    confidence,
+                    DEFAULT_CONFIDENCE_THRESHOLD,
+                )
+                return None
+            # Use the computed confidence when the gate applied; fall back to
+            # 1.0 when replay is off or no fingerprint exists (pass-through).
+            rendered_confidence = confidence if confidence is not None else 1.0
             bk = self._bookkeeping.get(key) or {}
             base = {
                 "key": key,
@@ -525,7 +585,7 @@ class MemoryStore:
                 **base,
                 "speaker_id": spk,
                 "first_seen_cycle": bk.get("first_seen_cycle", 0),
-                "confidence": 1.0,
+                "confidence": rendered_confidence,
                 "fact_text": entry_fact_text({**base, "speaker_id": spk}),
                 "raw_output": _json.dumps(base),
             }
@@ -583,6 +643,34 @@ class MemoryStore:
                     ):
                         results[key] = None
                         continue
+                    # SOURCE-RESULT confidence gate — mirrors the cache-hit gate
+                    # so that entries admitted through the source path are also
+                    # confidence-verified against the store's fingerprints before
+                    # being memoized or returned.  This covers the boot-preload
+                    # path where WeightMemorySource is constructed without a
+                    # registry (app.py belt-and-suspenders fix adds one, but the
+                    # store-boundary gate is the hermetic authority).
+                    if isinstance(src, dict):
+                        src_confidence = _confidence_gate(key, src)
+                        if (
+                            src_confidence is not None
+                            and src_confidence < DEFAULT_CONFIDENCE_THRESHOLD
+                        ):
+                            logger.debug(
+                                "MemoryStore.probe: source-result key %r dropped by "
+                                "confidence gate (%.3f < %.3f threshold)",
+                                key,
+                                src_confidence,
+                                DEFAULT_CONFIDENCE_THRESHOLD,
+                            )
+                            results[key] = None
+                            continue
+                        # Patch the rendered confidence onto the source result so
+                        # callers always see the real score (not a stale 1.0 from
+                        # WeightMemorySource when it ran without a registry).
+                        if src_confidence is not None:
+                            src = dict(src)
+                            src["confidence"] = src_confidence
                     results[key] = src
                     if memoize and isinstance(src, dict):
                         # Stash the raw SPO entry back into the cache (content only).

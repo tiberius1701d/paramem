@@ -4372,9 +4372,21 @@ def _preload_memory_store(config, *, model, tokenizer):
             if _mode == "simulate":
                 _source = _DiskMemorySource(config.adapter_dir)
             elif model is not None:
+                # Pass the on-disk SimHash registry to the WeightMemorySource so
+                # it gates BEFORE caching (belt-and-suspenders early-out).
+                # The store-boundary gate in MemoryStore.probe is the hermetic
+                # authority; this prevents below-threshold entries from entering
+                # the cache in the first place, matching the per-query path
+                # (inference.py:782 passes registry= to WeightMemorySource).
+                from paramem.server.inference import (
+                    _load_simhash_registry as _boot_load_simhash_registry,
+                )
+
+                _boot_registry = _boot_load_simhash_registry(config.adapter_dir)
                 _source = _WeightMemorySource(
                     model,
                     tokenizer,
+                    registry=_boot_registry,
                     batch_size=config.consolidation.recall_probe_batch_size,
                 )
             else:
