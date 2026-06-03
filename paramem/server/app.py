@@ -4440,23 +4440,23 @@ def _preload_memory_store(config, *, model, tokenizer):
             # complete; the source must not outlive this function's frame.
             _source = None
 
-    # Join per-entry bookkeeping (speaker_id, first_seen_cycle) from
-    # key_metadata.json.  Both WeightMemorySource and DiskMemorySource recover
-    # the SPO triple but not these fields — they live only in the registry.
-    # Must run AFTER the preload so entries exist to join onto; the join is a
-    # no-op for tiers whose entries are absent (preload off or boot_degraded).
+    # Load per-key bookkeeping (speaker_id, first_seen_cycle) into
+    # MemoryStore._bookkeeping from key_metadata.json.  Entry-independent —
+    # runs regardless of preload setting or boot_degraded.  Under
+    # inference.preload_cache=False this is the sole provenance write at boot,
+    # and is sufficient for the router's speaker index (iter_bookkeeping).
     try:
-        _meta_stats = memory_store.load_metadata_from_disk(config.key_metadata_path)
+        _meta_stats = memory_store.load_bookkeeping_from_disk(config.key_metadata_path)
         logger.info(
-            "load_metadata_from_disk: loaded=%d orphaned=%d legacy_upgraded=%d",
+            "load_bookkeeping_from_disk: loaded=%d orphaned=%d legacy_upgraded=%d",
             _meta_stats["loaded"],
             _meta_stats["orphaned"],
             _meta_stats["legacy_upgraded"],
         )
     except Exception:
         logger.exception(
-            "Boot-time key_metadata join failed; entries will lack speaker_id "
-            "until next consolidation cycle (personal queries will cold-start)"
+            "Boot-time key_metadata bookkeeping load failed; _bookkeeping will be empty "
+            "until next consolidation cycle (speaker scoping will cold-start)"
         )
 
     # Infrastructure integrity check — runs after all loaders so the store
@@ -6553,11 +6553,18 @@ async def debug_recall(request: DebugRecallRequest):
 
 
 class DebugDumpResponse(BaseModel):
-    """Flat list of every entry in the live ``MemoryStore``."""
+    """Flat list of every content entry in the live ``MemoryStore``.
+
+    ``entries``/``total`` reflect the inference CONTENT cache (``_entries``)
+    only — empty under ``inference.preload_cache=False``, which is correct.
+    ``bookkeeping_total`` reflects ``_bookkeeping`` (speaker provenance for
+    every registered key) — populated regardless of preload setting.
+    """
 
     entries: list[dict]
     total: int
     tiers: dict[str, int]  # tier name → entry count
+    bookkeeping_total: int  # keys with speaker/cycle provenance in _bookkeeping
 
 
 @app.get("/debug/dump", response_model=DebugDumpResponse, dependencies=[Depends(require_admin)])
@@ -6569,7 +6576,8 @@ async def debug_dump():
     yet (early-boot, cloud-only with no preload).  When
     ``inference.preload_cache=false`` the store is empty by design and
     this endpoint returns an empty list — that's a correct read, not
-    an error.
+    an error.  ``bookkeeping_total`` will still be non-zero when the
+    router has speaker provenance loaded from ``key_metadata.json``.
 
     Each entry dict is the entry payload as stored, with ``tier`` and
     ``key`` fields added inline for flat consumption.
@@ -6589,7 +6597,12 @@ async def debug_dump():
         entries.append(row)
         tiers[tier] = tiers.get(tier, 0) + 1
 
-    return DebugDumpResponse(entries=entries, total=len(entries), tiers=tiers)
+    return DebugDumpResponse(
+        entries=entries,
+        total=len(entries),
+        tiers=tiers,
+        bookkeeping_total=store.bookkeeping_count(),
+    )
 
 
 # --------------------------------------------------------------------------

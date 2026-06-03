@@ -216,3 +216,21 @@ class TestPerTierSchema:
         loaded = KeyRegistry.load(path)
         assert loaded.list_active() == ["graph1", "graph2", "graph3"]
         assert loaded.is_healthy()  # no health record = healthy
+
+
+class TestSaveBytesBoundary:
+    def test_save_bytes_payload_is_bookkeeping_free(self):
+        """HARD CONSTRAINT: KeyRegistry.save_bytes() must contain exactly
+        {active_keys, fidelity_history, health} — no bookkeeping fields.
+
+        registry_sha256 hashes the save_bytes payload; bookkeeping must never
+        enter it or slot identity breaks on restart."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.update_fidelity("graph1", 0.9)
+        payload = set(_json.loads(reg.save_bytes()))
+        assert payload == {"active_keys", "fidelity_history", "health"}
+        assert "speaker_id" not in payload
+        assert "first_seen_cycle" not in payload
+        assert "bookkeeping" not in payload

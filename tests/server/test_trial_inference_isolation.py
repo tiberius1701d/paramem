@@ -24,12 +24,24 @@ class TestRouterReadsFromLoopCache:
     """Router reads from ConsolidationLoop.store._entries_flat_view(), not from quads.json."""
 
     def _make_store_with_cache(self, cache: dict):
-        """Build a MemoryStore pre-populated with the given entries."""
+        """Build a MemoryStore pre-populated with the given entries.
+
+        Mirrors the production put+set_bookkeeping write contract so that
+        ``QueryRouter.reload()`` (which reads ``iter_bookkeeping()``) picks up
+        speaker associations the same way the live server does.
+        """
         from paramem.memory.store import MemoryStore
 
         store = MemoryStore(replay_enabled=True)
         for k, q in cache.items():
             store.put("episodic", k, q)
+            spk = q.get("speaker_id", "")
+            if spk:
+                store.set_bookkeeping(
+                    k,
+                    speaker_id=spk,
+                    first_seen_cycle=q.get("first_seen_cycle", 0),
+                )
         return store
 
     def test_router_indexes_from_loop_cache(self, tmp_path):

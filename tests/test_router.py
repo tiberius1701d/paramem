@@ -55,9 +55,11 @@ def _make_router_from_entries(
 ) -> "QueryRouter":
     """Create a QueryRouter backed by a seeded :class:`MemoryStore`.
 
-    Each entry is written via ``MemoryStore.put`` which also registers the
-    key in the per-tier ``KeyRegistry`` (the source the router's
-    ``_tier_keys`` reads).  ``_adapter_id`` controls the tier.
+    Each entry is written via ``MemoryStore.put`` (which registers the key
+    in the per-tier ``KeyRegistry`` — the source ``_tier_keys`` reads) AND
+    via ``store.set_bookkeeping`` when the entry carries ``speaker_id`` (the
+    source ``reload()`` reads to build the speaker index).  ``_adapter_id``
+    controls the tier.
     """
     store = MemoryStore(replay_enabled=True)
     for entry in entries:
@@ -65,6 +67,12 @@ def _make_router_from_entries(
         adapter_id = entry.get("_adapter_id", "episodic")
         payload = {k: v for k, v in entry.items() if k != "_adapter_id"}
         store.put(adapter_id, key, payload)
+        # Mirror the production write: new-key store.put is always paired with
+        # set_bookkeeping so the router's iter_bookkeeping() finds the speaker.
+        spk = payload.get("speaker_id", "")
+        fsc = payload.get("first_seen_cycle", 0)
+        if spk or fsc:
+            store.set_bookkeeping(key, speaker_id=spk, first_seen_cycle=fsc)
 
     kwargs: dict = {
         "adapter_dir": adapter_dir or Path("/nonexistent"),
@@ -619,39 +627,58 @@ class TestRoutingPlanShape:
 
 
 class TestPreloadIndependence:
-    """``_speaker_key_index`` must populate even when entry SPO content is
-    not preloaded — the only field reload() needs is ``speaker_id``, which
-    ``MemoryStore.load_metadata_from_disk`` writes onto every active entry
-    slot unconditionally at boot.
+    """``_speaker_key_index`` must populate even when ``_entries`` (content cache)
+    is empty — the preload-off boot scenario.
 
-    This regression guard simulates the preload-off boot order: entries
-    are seeded with only ``speaker_id`` + ``first_seen_cycle`` (no SPO),
-    and the router must still build the speaker→keys index.
+    The router's :meth:`reload` iterates :meth:`MemoryStore.iter_bookkeeping`,
+    NOT ``iter_entries``.  :meth:`MemoryStore.load_bookkeeping_from_disk`
+    populates ``_bookkeeping`` at boot unconditionally, regardless of
+    ``inference.preload_cache``.
+
+    These tests seed ``_bookkeeping`` directly via ``set_bookkeeping`` (no
+    ``put``, so ``_entries`` stays empty) and assert the router indexes from it.
     """
 
     def test_metadata_only_entries_populate_speaker_index(self):
         store = MemoryStore(replay_enabled=True)
-        # Simulate load_metadata_from_disk's payload: no SPO, just bookkeeping.
-        store.put(
-            "episodic",
-            "k_meta_only",
-            {"speaker_id": "alice", "first_seen_cycle": 1},
-        )
+        # Simulate load_bookkeeping_from_disk: no SPO in _entries, just bookkeeping.
+        store.set_bookkeeping("k_meta_only", speaker_id="alice", first_seen_cycle=1)
+        # Register the key so _tier_keys resolves it.
+        from paramem.training.key_registry import KeyRegistry
+
+        reg = KeyRegistry()
+        reg.add("k_meta_only")
+        store.load_registry("episodic", reg)
+        assert store.get("k_meta_only") is None  # _entries is empty
         router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
         assert router._speaker_key_index["alice"] == {"k_meta_only"}
 
     def test_metadata_only_routes_produce_steps(self, monkeypatch):
         _stub_intent(monkeypatch, Intent.PERSONAL)
         store = MemoryStore(replay_enabled=True)
-        store.put(
-            "procedural",
-            "k_pref",
-            {"speaker_id": "alice", "first_seen_cycle": 1},
-        )
+        # Seed bookkeeping only — no content entry.
+        store.set_bookkeeping("k_pref", speaker_id="alice", first_seen_cycle=1)
+        from paramem.training.key_registry import KeyRegistry
+
+        reg = KeyRegistry()
+        reg.add("k_pref")
+        store.load_registry("procedural", reg)
+        assert store.get("k_pref") is None  # _entries is empty
         router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
         plan = router.route("anything", speaker_id="alice")
         assert [s.adapter_name for s in plan.steps] == ["procedural"]
         assert plan.steps[0].keys_to_probe == ["k_pref"]
+
+    def test_router_index_built_under_empty_entries(self):
+        """Even with no content entries, router must index speakers from bookkeeping."""
+        store = MemoryStore(replay_enabled=True)
+        for i in range(3):
+            key = f"graph{i}"
+            store.set_bookkeeping(key, speaker_id="charlie", first_seen_cycle=i)
+        assert len(store) == 0  # _entries empty
+        router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
+        assert "charlie" in router._speaker_key_index
+        assert len(router._speaker_key_index["charlie"]) == 3
 
 
 # ---------------------------------------------------------------------------

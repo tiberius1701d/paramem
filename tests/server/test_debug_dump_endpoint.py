@@ -28,11 +28,15 @@ def _make_config(tmp_path: Path, debug: bool = True) -> MagicMock:
 
 
 class _FakeStore:
-    def __init__(self, items: list[tuple[str, str, dict]]):
+    def __init__(self, items: list[tuple[str, str, dict]], bookkeeping: dict | None = None):
         self._items = items
+        self._bookkeeping = bookkeeping or {}
 
     def iter_entries(self):
         yield from self._items
+
+    def bookkeeping_count(self) -> int:
+        return len(self._bookkeeping)
 
 
 def _make_state(tmp_path: Path, *, debug: bool = True, store_items=None) -> dict:
@@ -70,7 +74,24 @@ class TestDebugDumpHappyPath:
         resp = client.get("/debug/dump")
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body == {"entries": [], "total": 0, "tiers": {}}
+        assert body == {"entries": [], "total": 0, "tiers": {}, "bookkeeping_total": 0}
+
+    def test_cache_off_entries_empty_bookkeeping_nonzero(self, tmp_path, monkeypatch):
+        """Under preload_cache=False: entries is empty, bookkeeping_total is N."""
+        # Bookkeeping present but no content entries (cache-off scenario).
+        fake_bk = {
+            "k1": {"speaker_id": "alice", "first_seen_cycle": 1},
+            "k2": {"speaker_id": "alice", "first_seen_cycle": 2},
+        }
+        state = _make_state(tmp_path, store_items=[])
+        state["memory_store"] = _FakeStore([], bookkeeping=fake_bk)
+        client = _make_client(monkeypatch, state)
+        resp = client.get("/debug/dump")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["entries"] == []
+        assert body["total"] == 0
+        assert body["bookkeeping_total"] == 2
 
     def test_dump_flattens_tier_key_entry(self, tmp_path, monkeypatch):
         items = [
