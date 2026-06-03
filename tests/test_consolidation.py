@@ -652,9 +652,9 @@ class TestAnonymousSpeakerNotSkipped:
     def test_none_speaker_id_still_skipped(self, tmp_path):
         """Truly-None speaker_id (text-only, no voice) is skipped at consolidation.
 
-        Sessions with no speaker_id must not reach extract_session because a
-        None speaker_id would key procedural_sp_index on (None, subject, predicate),
-        causing unrelated text-only sessions to cross-retire each other's procedural keys.
+        Sessions with no speaker_id must not reach extract_session — a None
+        speaker_id would cause unrelated text-only sessions to be attributed
+        to the same unknown speaker, corrupting the graph.
         """
         loop = self._make_mock_loop(tmp_path)
         config = self._make_config(tmp_path)
@@ -1948,6 +1948,69 @@ class TestSlotRetention:
 
 
 # ---------------------------------------------------------------------------
+# ConsolidationLoop.release() — merger holder teardown
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidationLoopRelease:
+    """ConsolidationLoop.release() must null the GraphMerger's model reference.
+
+    GraphMerger is a BASE-MODEL HOLDER (architecture §4.4).  release() is the
+    encapsulated teardown path; _release_base_model_in_process reaches it
+    transitively via loop.release() → merger.release().
+    """
+
+    def _make_loop_with_mock_merger(self):
+        """Build a bare ConsolidationLoop with a mock merger holding a mock model.
+
+        Bypasses __init__ (no real model load).  Sets the minimum attributes
+        that release() inspects: model, tokenizer, extraction (None, guarded),
+        merger (real GraphMerger with mock model injected).
+        """
+        from paramem.graph.merger import GraphMerger
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop._bg_trainer = None
+        loop.extraction = None  # release() guards with getattr(..., None) check
+
+        # Wire a real GraphMerger and inject a mock model into it so we can
+        # verify that release() nulls merger.model without loading real weights.
+        merger = GraphMerger()
+        merger.model = MagicMock()
+        merger.tokenizer = MagicMock()
+        loop.merger = merger
+
+        return loop
+
+    def test_release_nulls_merger_model(self):
+        """release() must set merger.model to None (BASE-MODEL HOLDER teardown)."""
+        loop = self._make_loop_with_mock_merger()
+        assert loop.merger.model is not None, "precondition: merger.model is set before release"
+        loop.release()
+        assert loop.merger.model is None, (
+            "merger.model must be None after ConsolidationLoop.release() "
+            "(GraphMerger is a BASE-MODEL HOLDER — architecture §4.4)"
+        )
+
+    def test_release_nulls_merger_tokenizer(self):
+        """release() must set merger.tokenizer to None alongside merger.model."""
+        loop = self._make_loop_with_mock_merger()
+        loop.release()
+        assert loop.merger.tokenizer is None, (
+            "merger.tokenizer must be None after ConsolidationLoop.release()"
+        )
+
+    def test_release_idempotent_on_merger(self):
+        """Calling release() twice does not raise even after merger.model is None."""
+        loop = self._make_loop_with_mock_merger()
+        loop.release()
+        loop.release()  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # Abort-then-skip contract at each production train_adapter call site
 # ---------------------------------------------------------------------------
 
@@ -2003,7 +2066,6 @@ class TestAbortSkipsCommit:
         loop.episodic_simhash = {}
         loop.semantic_simhash = {}
         loop.procedural_simhash = {}
-        loop.procedural_sp_index = {}
         loop._procedural_next_index = 0
         loop._procedural_tentative_next_index = 0
         loop.merger = MagicMock()
@@ -2136,8 +2198,13 @@ class TestAbortSkipsCommit:
     def test_run_indexed_key_procedural_skips_deferred_mutations_on_aborted(
         self, monkeypatch, tmp_path
     ):
-        """When proc train_adapter returns aborted=True, store.put / store.delete
-        and sp_index writes must be skipped — only the abort guard fires.
+        """When proc train_adapter returns aborted=True, store.put must be
+        skipped — only the abort guard fires.
+
+        Note: sp_index (procedural_sp_index) was removed in the model-only
+        contradiction redesign (consolidation_architecture.md §4.3).
+        The 2-tuple return contract of _prepare_procedural_keys_for_tier
+        is tested here via the patched return value.
         """
         from unittest.mock import patch
 
@@ -2202,7 +2269,7 @@ class TestAbortSkipsCommit:
                             "speaker_id": "Speaker0",
                             "first_seen_cycle": 1,
                         }
-                    ],  # new
+                    ],  # new_keyed
                     [
                         {
                             "key": "prc1",
@@ -2212,9 +2279,7 @@ class TestAbortSkipsCommit:
                             "speaker_id": "Speaker0",
                             "first_seen_cycle": 1,
                         }
-                    ],  # existing
-                    ["prc_old"],  # keys_to_retire
-                    {"sp_key_A": "prc2"},  # new_sp_mappings
+                    ],  # existing_keyed (2-tuple: sp_index removed)
                 ),
             ),
             patch("paramem.training.consolidation.switch_adapter"),
@@ -2248,8 +2313,10 @@ class TestAbortSkipsCommit:
         assert store_put_calls == [], (
             f"store.put must not be called after proc abort; called for {store_put_calls}"
         )
-        assert "sp_key_A" not in loop.procedural_sp_index, (
-            "sp_index must not be updated after proc abort"
+        # procedural_sp_index has been removed from ConsolidationLoop
+        # (consolidation_architecture.md §4.3); the attribute must not exist.
+        assert not hasattr(loop, "procedural_sp_index"), (
+            "procedural_sp_index must not exist on ConsolidationLoop after sp_index removal"
         )
 
     def test_consolidate_interim_adapters_raises_and_rolls_back_on_aborted(
@@ -2437,7 +2504,6 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop.key_sessions = {}
         loop.promoted_keys = set()
         loop.cycle_count = 0
-        loop.procedural_sp_index = {}
         loop._procedural_next_index = 0
         loop._procedural_tentative_next_index = 0
         loop._indexed_next_index = 0

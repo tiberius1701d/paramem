@@ -287,6 +287,12 @@ class ConsolidationLoop:
         # Ensure both adapters exist on the model
         self.model = self._ensure_adapters()
 
+        # Attach the live model to the merger so model-only contradiction
+        # resolution is always-on during merge calls.
+        # BASE-MODEL HOLDER (GraphMerger): model-only contradiction at merge.
+        self.merger.model = self.model
+        self.merger.tokenizer = self.tokenizer
+
         # Replay pools: track relations available for replay per adapter
         # Each entry: {"question": str, "answer": str}
         self.episodic_replay_pool: list[dict] = []
@@ -307,11 +313,6 @@ class ConsolidationLoop:
         # their own and pass it in.  The store is the single source of
         # truth for {entry, simhash, registry} of every indexed key.
         self.store = memory_store
-        # (speaker_id, subject, predicate) -> key for contradiction detection.
-        # Domain-specific index for procedural extraction; lives on the loop
-        # (not the store) because its scope is procedural-only and its key
-        # shape is a tuple, not a tier name.
-        self.procedural_sp_index: dict[tuple[str, str, str], str] = {}
         self._indexed_next_index: int = 1
         self._procedural_next_index: int = 1
         # Derive next-index counters from all active keys in the store.
@@ -403,9 +404,10 @@ class ConsolidationLoop:
 
         Called by :func:`paramem.server.app._release_base_model_in_process`.
         Nulls ``model``/``tokenizer``/``_bg_trainer``/``extraction`` (and
-        ``extraction.model``) so no live attribute on this object (or on the
-        :class:`~paramem.graph.extraction_pipeline.ExtractionPipeline` it owns)
-        retains a reference to the base model.
+        ``extraction.model``), and delegates to :meth:`GraphMerger.release` to
+        null ``merger.model``/``merger.tokenizer``.  After this call no live
+        attribute on this object (or on any sub-object it owns) retains a
+        reference to the base model.
 
         ``ExtractionPipeline`` stores only ``self.model`` and
         ``self.tokenizer`` at the top level; there are no deeper sub-object
@@ -420,6 +422,8 @@ class ConsolidationLoop:
         if getattr(self, "extraction", None) is not None:
             self.extraction.model = None  # BASE-MODEL HOLDER: ExtractionPipeline.model
             self.extraction = None
+        if getattr(self, "merger", None) is not None:
+            self.merger.release()  # BASE-MODEL HOLDER (GraphMerger)
 
     def guard_trial_state(self, state: dict | None) -> None:
         """Raise TrialActiveError when a migration TRIAL is in progress.
@@ -646,7 +650,7 @@ class ConsolidationLoop:
 
         Using this helper for every cache-write site ensures the uniform shape
         is maintained by construction — every downstream reader (promotion-match,
-        sp_index, ``_increment_key_sessions``, ``consolidate_interim_adapters``
+        ``_increment_key_sessions``, ``consolidate_interim_adapters``
         triple-lookup) reads the canonical field names.
 
         Args:
@@ -1036,8 +1040,15 @@ class ConsolidationLoop:
             )
 
             # --- MERGE ---
+            # Disable gradient checkpointing: merger.merge may call model.generate()
+            # for contradiction resolution when a model is present.  HF silently
+            # disables the KV cache when checkpointing is active (CLAUDE.md rule).
             with phase_trace("merge_into_cumulative") as t:
-                self.merger.merge(session_graph)
+                self._disable_gradient_checkpointing()
+                try:
+                    self.merger.merge(session_graph)
+                finally:
+                    self._enable_gradient_checkpointing()
                 self._triples_since_last_enrichment += len(session_graph.relations)
                 t.add("triples_added", len(session_graph.relations))
 
@@ -1489,23 +1500,28 @@ class ConsolidationLoop:
         speaker_id: str,
         *,
         mode: "Literal['simulate', 'train']",
-    ) -> list[dict]:
+    ) -> tuple[list[dict], list[dict]]:
         """Assign new procedural keys and gather existing keys for retraining.
 
         Symmetric counterpart of :meth:`_prepare_episodic_keys_for_tier` for
         the procedural tier.  Always targets the stable ``"procedural"`` main
         adapter — there is no interim tier for procedural.
 
+        Per-session contradiction retirement via ``sp_index`` has been removed.
+        Procedural contradiction is now resolved at full consolidation by the
+        model-bearing :class:`~paramem.graph.merger.GraphMerger`.  Duplicate
+        procedural keys from within a session are tolerated in the interim and
+        collapsed at the next full-consolidation cycle.
+
         Deferred-mutation discipline (TRAIN mode):
-            Contradiction detection and sp_index / store mutations are applied
-            tentatively before the train call in
+            Store mutations are applied tentatively before the train call in
             :meth:`run_consolidation_cycle`.  The index counter
             (``_procedural_next_index``) is advanced only after this helper
             returns successfully.
 
         Simulate mode:
-            Applies contradiction retirement and writes the store immediately
-            (no train call can fail so no deferral is needed).
+            Writes the store immediately (no train call can fail so no
+            deferral is needed).
 
         Args:
             rels: Pre-extracted procedural relation dicts, already tagged with
@@ -1514,20 +1530,14 @@ class ConsolidationLoop:
             mode: ``"train"`` or ``"simulate"``.
 
         Returns:
-            ``(new_keyed, existing_keyed, keys_to_retire, new_sp_mappings)``
-            as a 4-tuple so ``run_consolidation_cycle`` can apply post-train
-            deferred mutations atomically.
+            ``(new_keyed, existing_keyed)`` as a 2-tuple.
 
             - ``new_keyed``: cache-entry dicts for the new procedural keys.
             - ``existing_keyed``: reconstructed / cache-read dicts for existing
-              procedural keys that survive retirement.
-            - ``keys_to_retire``: old keys to delete after training succeeds
-              (TRAIN mode only — simulate deletes immediately).
-            - ``new_sp_mappings``: ``sp_key -> new_key`` entries for
-              ``procedural_sp_index`` (TRAIN mode only — simulate writes immediately).
+              procedural keys.
         """
         if not rels:
-            return [], [], [], {}
+            return [], []
 
         logger.info("_prepare_procedural_keys_for_tier: %d relations (mode=%s)", len(rels), mode)
 
@@ -1555,26 +1565,10 @@ class ConsolidationLoop:
                 )
             )
 
-        # Compute intended mutations (sp_key contradiction check).
-        keys_to_retire: list[str] = []
-        new_sp_mappings: dict[tuple, str] = {}
         new_key_set = {kp["key"] for kp in new_keyed}
-        for kp in new_keyed:
-            sp_key = (
-                kp["speaker_id"],
-                kp["subject"].lower(),
-                kp["predicate"].lower(),
-            )
-            old_key = self.procedural_sp_index.get(sp_key)
-            if old_key and self.store.has_simhash("procedural", old_key):
-                keys_to_retire.append(old_key)
-            new_sp_mappings[sp_key] = kp["key"]
 
         if mode == "simulate":
             # Apply mutations immediately — no train call that can fail.
-            for old_key in keys_to_retire:
-                logger.info("_prepare_procedural_keys_for_tier: retiring %s (simulate)", old_key)
-                self.store.delete(old_key)
             for kp in new_keyed:
                 fingerprint = compute_simhash(
                     kp["key"], kp["subject"], kp["predicate"], kp["object"]
@@ -1586,17 +1580,12 @@ class ConsolidationLoop:
                     first_seen_cycle=kp["first_seen_cycle"],
                     relation_type=kp.get("relation_type", "factual"),
                 )
-            for sp_key, new_key in new_sp_mappings.items():
-                self.procedural_sp_index[sp_key] = new_key
             self._procedural_next_index = tentative_next
-            return new_keyed, [], [], {}
+            return new_keyed, []
 
         # TRAIN mode: gather existing keys for reconstruction (deferred mutations).
-        retired_set = set(keys_to_retire)
         existing_proc_keys = [
-            k
-            for k in self.store.simhashes_in_tier("procedural")
-            if k not in new_key_set and k not in retired_set
+            k for k in self.store.simhashes_in_tier("procedural") if k not in new_key_set
         ]
 
         self._disable_gradient_checkpointing()
@@ -1644,7 +1633,7 @@ class ConsolidationLoop:
         # Store tentative_next on self so the caller can commit it.
         self._procedural_tentative_next_index = tentative_next
 
-        return new_keyed, existing_keyed, keys_to_retire, new_sp_mappings
+        return new_keyed, existing_keyed
 
     def finalize_training(self) -> None:
         """Save adapters and registries after background training completes."""
@@ -1710,7 +1699,14 @@ class ConsolidationLoop:
         result.relations_extracted = len(session_graph.relations)
 
         # --- 2. MERGE ---
-        self.merger.merge(session_graph)
+        # Disable gradient checkpointing: merger.merge may call model.generate()
+        # for contradiction resolution when a model is present.  HF silently
+        # disables the KV cache when checkpointing is active (CLAUDE.md rule).
+        self._disable_gradient_checkpointing()
+        try:
+            self.merger.merge(session_graph)
+        finally:
+            self._enable_gradient_checkpointing()
         graph = self.merger.graph
 
         # --- 3. SCORE & CLASSIFY ---
@@ -2611,8 +2607,8 @@ class ConsolidationLoop:
 
         if mode == "train":
             switch_adapter(self.model, "procedural")
-        new_proc_keyed, existing_proc_keyed, keys_to_retire, new_sp_mappings = (
-            self._prepare_procedural_keys_for_tier(rels, speaker_id, mode=mode)
+        new_proc_keyed, existing_proc_keyed = self._prepare_procedural_keys_for_tier(
+            rels, speaker_id, mode=mode
         )
         all_procedural = existing_proc_keyed + new_proc_keyed
         if not (mode == "train" and all_procedural):
@@ -2648,8 +2644,6 @@ class ConsolidationLoop:
             return None
         # Deferred mutations — apply only after _train_adapter succeeds without abort.
         self._procedural_next_index = self._procedural_tentative_next_index
-        for old_key in keys_to_retire:
-            self.store.delete(old_key)
         for kp in new_proc_keyed:
             fingerprint = compute_simhash(kp["key"], kp["subject"], kp["predicate"], kp["object"])
             self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
@@ -2659,8 +2653,6 @@ class ConsolidationLoop:
                 first_seen_cycle=kp["first_seen_cycle"],
                 relation_type=kp.get("relation_type", "factual"),
             )
-        for sp_key, new_key in new_sp_mappings.items():
-            self.procedural_sp_index[sp_key] = new_key
         return proc_metrics.get("train_loss") if proc_metrics is not None else None
 
     def run_consolidation_cycle(
@@ -3639,7 +3631,15 @@ class ConsolidationLoop:
                 entities=[],
                 relations=recon_relations,
             )
-            self.merger.merge(_synthetic_session)
+            # Disable gradient checkpointing: merger.merge may call model.generate()
+            # for contradiction resolution when a model is present.  reconstruct_graph
+            # above already restored checkpointing in its finally block, so this merge
+            # needs its own guard (CLAUDE.md rule applies to ANY model.generate() site).
+            self._disable_gradient_checkpointing()
+            try:
+                self.merger.merge(_synthetic_session)
+            finally:
+                self._enable_gradient_checkpointing()
             logger.info(
                 "consolidate_interim_adapters: re-merged %d reconstructed triples "
                 "into cumulative graph",

@@ -42,7 +42,6 @@ def _make_loop() -> ConsolidationLoop:
     from paramem.memory.store import MemoryStore as _MS
 
     loop.store = _MS(replay_enabled=False)
-    loop.procedural_sp_index: dict = {}
     loop.cycle_count: int = 1
     return loop
 
