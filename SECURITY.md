@@ -149,11 +149,11 @@ Token minting, revocation, and the `mint-user-token` CLI syntax are documented i
 - **VAPID key stability:** rotating `vapid_keys.json` invalidates all existing browser push subscriptions (browsers will not receive notifications until they re-subscribe). Treat the keypair as effectively immutable once browsers have subscribed. Key rotation is intentionally out of scope.
 - **Notification-only ping posture:** no personal content passes through the push relay. The push payload is intentionally empty (or carries only a generic title); real content is fetched by the client after the user taps the notification.
 - **Revocation** is per-token or per-speaker and takes effect immediately on the next request.
-- **Token carriers:** `Authorization: Bearer <token>` HTTP header, or an `httpOnly; Secure; SameSite=Strict` cookie set by the server during the PWA onboarding flow (same-origin — the PWA is served from the ParaMem server itself). Header takes precedence over cookie.
+- **Token carriers:** `Authorization: Bearer <token>` HTTP header — this is the carrier the PWA uses in practice. The middleware also accepts the configured cookie name if one is presented by the client, but the server does not issue a cookie; the PWA stores the token in `localStorage` and sends it exclusively via the `Authorization` header.
 
-**Path exemptions.** The following paths are exempt from bearer-token checks so the browser can load the login page and liveness checks can operate before a token exists:
+**Path exemptions.** The following paths are exempt from bearer-token checks so the browser can load the PWA shell and liveness checks can operate before a token is presented:
 
-- `/` — redirects to `/app/`; exempt so the browser follows the redirect before a session cookie exists
+- `/` — redirects to `/app/`; exempt so the browser follows the redirect before a token is presented
 - `/app` — bare mount redirect (307 → `/app/`); exempt so it reaches the `StaticFiles` handler
 - `/health` — unauthenticated liveness endpoint for HA binary sensors and external pollers
 - `/app/` prefix — the PWA shell, its static assets, and the service worker (`/app/sw.js`)
