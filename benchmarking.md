@@ -104,7 +104,8 @@ Grouped index of all tests. See Part headers below for context.
 [HA Pipeline Latency](#ha-pipeline-latency-2026-03-27) ·
 [Dual-Escalation Routing](#dual-escalation-routing-2026-03-30) ·
 [HA Deployment Results](#ha-deployment-results-2026-03-25) ·
-[Speaker Identification](#speaker-identification-2026-04-08)
+[Speaker Identification](#speaker-identification-2026-04-08) ·
+[Inference Latency: preload_cache On vs Off](#inference-latency-preload_cache-on-vs-off-2026-06-03)
 
 **Part 8 — Infrastructure, data & meta:**
 [Early Stopping](#early-stopping) ·
@@ -3249,6 +3250,87 @@ via replay. True incremental learning without replay remains unsolved
 the systemd timer fires outside active hours, interim adapters cover
 sub-cycle recall, and the epoch-resume mechanism lets a single cycle span
 wall-clock interruptions. Listed as future work.
+
+---
+
+## Inference Latency: preload_cache On vs Off (2026-06-03)
+
+**Server:** Qwen3-4B QLoRA 4-bit, `mode=local`, 239 active keys
+(episodic 137 / procedural 83 / episodic_interim 19), single speaker (`Speaker0`).
+**Endpoint:** `POST /debug/probe` — same `handle_chat → _probe_and_reason → memory_store.probe`
+path as `/chat`.
+**Latency:** wall-clock, request sent to full response received (`time.perf_counter`).
+**Queries:** 10 first-person personal questions, identical set across both modes.
+All questions were phrased in the first person so the intent classifier routes them to
+PA recall; third-person/named-entity phrasings do not reliably route and were excluded by design.
+**Code baseline:** stub-masking bug fixed (commit `c8bf677`) before this measurement — see
+caveat below.
+
+### Mechanism
+
+With `inference.preload_cache: false` the server weight-probes **all** active keys on every
+query — O(N) `model.generate` calls per request. With `inference.preload_cache: true` the
+server runs those probes once at boot (~112 s for 239 keys), caches the results, and then
+serves each query with an O(1) cache lookup followed by a single reasoning `generate` call.
+The cache moves the cost from per-query to once-at-boot.
+
+### Results (n=10, all answers correct in both modes)
+
+The cache is a latency optimisation, not a correctness dependency: 10/10 answers were correct
+with cache off and 10/10 with cache on.
+
+| # | Query | cache-off (s) | cache-on (s) | speedup |
+|---|-------|-------------:|------------:|--------:|
+| 1 | What programming languages do I use? | 86.6 | 3.3 | 26× |
+| 2 | What music do I like? | 93.7 | 2.4 | 39× |
+| 3 | Do I have any pets? | 88.2 | 3.0 | 30× |
+| 4 | Who is in my family? | 94.5 | 4.0 | 24× |
+| 5 | Who is my wife? | 92.3 | 2.2 | 43× |
+| 6 | What is my child's name? | 86.1 | 1.7 | 52× |
+| 7 | What languages do I speak? | 89.6 | 1.7 | 52× |
+| 8 | Where have I worked? | 87.2 | 5.4 | 16× |
+| 9 | What is my area of specialisation? | 90.8 | 3.0 | 30× |
+| 10 | How many years of experience do I have? | 87.4 | 2.3 | 38× |
+
+**Aggregate (n=10):**
+
+| metric | cache-off | cache-on |
+|--------|----------:|---------:|
+| mean   | 89.6 s    | 2.9 s    |
+| median | 88.9 s    | 2.7 s    |
+| min    | 86.1 s    | 1.6 s    |
+| max    | 94.5 s    | 5.4 s    |
+
+**Per-query speedup: ~31× (mean), ranging 16–52× across queries.**
+
+### Boot cost tradeoff
+
+| | boot time to ready | per recall query |
+|---|---:|---:|
+| cache-on  | ~112 s (preloads 239 keys at startup) | ~2.9 s |
+| cache-off | ~36 s (no preload) | ~89.6 s |
+
+Break-even is immediate for an interactive assistant: cache-on amortises a one-time ~112 s
+startup across all subsequent queries at ~2.9 s each.
+
+### Honest consequence
+
+At ~90 s per recall query, `preload_cache: false` is not viable for interactive use.
+Cache-on (the production default) is required for the product to work interactively.
+Cache-off is still useful for validating parametric recall directly against adapter
+weights, where correctness matters and latency does not.
+
+Cache-off latency scales with the number of keys probed per query (here ~239 across 3
+tiers via `WeightMemorySource`); larger key sets widen the gap further.
+
+### Caveat: stub-masking bug (pre-fix readings are invalid)
+
+These cache-off numbers represent the correct-but-slow path measured **after** the
+stub-masking bug was fixed (commit `c8bf677`). Before that fix, payload-less stub entries
+acted as false cache hits and caused cache-off to return fast-but-empty recall
+(hallucination rather than real weight-probing). Any earlier "cache-off is fast" reading
+was an artefact of that bug, not genuine O(N) key probing. The numbers above are the
+first valid cache-off latency measurements for this server configuration.
 
 ---
 
