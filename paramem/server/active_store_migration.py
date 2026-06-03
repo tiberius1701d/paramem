@@ -602,12 +602,14 @@ def _migrate_tier_simulate_to_train(
 
     # Step 5: train. Output dir under a migration-scoped subdir so checkpoint
     # debris doesn't pollute the main slot layout.
-    recall_cb = loop._maybe_make_recall_callback(
+    recall_cb, recall_state = loop._maybe_make_recall_callback(
         entries=entries,
         adapter_name=name,
         output_dir=Path(config.adapter_dir) / "active_store_migration" / name,
         phase_name=f"migrate-{name}",
     )
+    # recall_state is intentionally unused here — the migration path uses its
+    # own _run_recall_sanity_probe gate; no recall-gated registration needed.
     _migrate_metrics = _train_adapter(
         model=loop.model,
         tokenizer=loop.tokenizer,

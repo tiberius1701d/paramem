@@ -1145,3 +1145,288 @@ class TestRecallEarlyStopCallbackResume:
             "slot when staging is active"
         )
         assert "if _use_staging:" in src
+
+
+# ---------------------------------------------------------------------------
+# Tests for Stage 1 (last_per_key capture) and Stage 2 (forced final-epoch probe)
+# ---------------------------------------------------------------------------
+
+
+class TestLastPerKeyCapture:
+    """Verify that state.last_per_key is populated from fill["per_key"] after a probe."""
+
+    def test_last_per_key_populated_after_probe(self, tmp_path):
+        """After on_epoch_end runs a probe, state.last_per_key equals fill['per_key']."""
+        from paramem.training.early_stop import (
+            EarlyStopPolicy,
+            RecallEarlyStopCallback,
+            _EarlyStopState,
+        )
+
+        n = 3
+        per_key_data = [
+            {"key": f"graph{i + 1}", "exact_match": True, "confidence": 0.9} for i in range(n)
+        ]
+        recall_result = {
+            "exact_count": n,
+            "total": n,
+            "rate": 1.0,
+            "mean_confidence": 0.9,
+            "per_key": per_key_data,
+        }
+
+        policy = EarlyStopPolicy(probe_from_epoch=1, signal_from_epoch=5, window=2)
+        state_out = _EarlyStopState()
+        assert state_out.last_per_key is None
+
+        cb = RecallEarlyStopCallback(
+            model=_make_model(),
+            tokenizer=MagicMock(),
+            target_keyed=[
+                {
+                    "key": f"graph{i + 1}",
+                    "subject": f"S{i + 1}",
+                    "predicate": "p",
+                    "object": f"O{i + 1}",
+                }
+                for i in range(n)
+            ],
+            target_registry={f"graph{i + 1}": i for i in range(n)},
+            adapter_name="journal",
+            policy=policy,
+            state_out=state_out,
+            progress_path=tmp_path / "progress.json",
+            epoch_log_path=tmp_path / "epoch_log.json",
+            first_perfect_log_path=None,
+            phase_name="test",
+            num_epochs=10,
+            pause_file=None,
+            eval_fn=lambda *a, **k: recall_result,
+        )
+
+        cb.on_epoch_end(None, _make_state(1.0), _make_control())
+
+        assert state_out.last_per_key == per_key_data
+
+    def test_last_per_key_updated_on_each_probe(self, tmp_path):
+        """state.last_per_key is overwritten on every probe epoch."""
+        from paramem.training.early_stop import (
+            EarlyStopPolicy,
+            RecallEarlyStopCallback,
+            _EarlyStopState,
+        )
+
+        call_count = [0]
+
+        def _eval(*a, **k):
+            call_count[0] += 1
+            return {
+                "exact_count": 1,
+                "total": 1,
+                "rate": 1.0,
+                "mean_confidence": 0.9,
+                "per_key": [{"key": "graph1", "exact_match": True, "seq": call_count[0]}],
+            }
+
+        policy = EarlyStopPolicy(probe_from_epoch=1, signal_from_epoch=20, window=1)
+        state_out = _EarlyStopState()
+
+        cb = RecallEarlyStopCallback(
+            model=_make_model(),
+            tokenizer=MagicMock(),
+            target_keyed=[{"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"}],
+            target_registry={"graph1": 1},
+            adapter_name="journal",
+            policy=policy,
+            state_out=state_out,
+            progress_path=tmp_path / "progress.json",
+            epoch_log_path=tmp_path / "epoch_log.json",
+            first_perfect_log_path=None,
+            phase_name="test",
+            num_epochs=10,
+            pause_file=None,
+            eval_fn=_eval,
+        )
+
+        cb.on_epoch_end(None, _make_state(1.0), _make_control())
+        assert state_out.last_per_key[0]["seq"] == 1
+
+        cb.on_epoch_end(None, _make_state(2.0), _make_control())
+        assert state_out.last_per_key[0]["seq"] == 2
+
+
+class TestForcedFinalEpochProbe:
+    """Verify the forced final-epoch probe fires at num_epochs regardless of cadence."""
+
+    def test_forced_probe_at_final_epoch(self, tmp_path):
+        """A probe fires at the final epoch even when off the cadence schedule."""
+        from paramem.training.early_stop import (
+            EarlyStopPolicy,
+            RecallEarlyStopCallback,
+            _EarlyStopState,
+        )
+
+        probe_epochs = []
+
+        def _eval(*a, **k):
+            return {
+                "exact_count": 1,
+                "total": 1,
+                "rate": 1.0,
+                "mean_confidence": 0.9,
+                "per_key": [{"key": "graph1", "exact_match": True}],
+            }
+
+        # probe_every_n_epochs=3, num_epochs=10 → cadence probes at 1,4,7,10
+        # But force also fires at epoch == num_epochs (10).  With cadence hitting
+        # 10, probe fires once.  Use num_epochs=11 and probe at 10 to show the
+        # forced branch.  The cadence probes from probe_from_epoch=1 with step 3
+        # hit epochs 1, 4, 7, 10 when num_epochs=11; epoch 11 is ONLY the forced one.
+        policy = EarlyStopPolicy(
+            probe_from_epoch=1,
+            signal_from_epoch=20,
+            window=1,
+            probe_every_n_epochs=3,
+        )
+        state_out = _EarlyStopState()
+
+        cb = RecallEarlyStopCallback(
+            model=_make_model(),
+            tokenizer=MagicMock(),
+            target_keyed=[{"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"}],
+            target_registry={"graph1": 1},
+            adapter_name="journal",
+            policy=policy,
+            state_out=state_out,
+            progress_path=tmp_path / "progress.json",
+            epoch_log_path=tmp_path / "epoch_log.json",
+            first_perfect_log_path=None,
+            phase_name="test",
+            num_epochs=11,
+            pause_file=None,
+            eval_fn=lambda *a, **kw: probe_epochs.append(True) or _eval(),
+        )
+
+        # Epochs 1–11; cadence hits 1,4,7,10; forced hits 11
+        for ep in range(1, 12):
+            cb.on_epoch_end(None, _make_state(float(ep)), _make_control())
+
+        # 4 cadence probes (1,4,7,10) + 1 forced (11) = 5
+        assert len(probe_epochs) == 5
+        # last_per_key is set (forced probe ran)
+        assert state_out.last_per_key is not None
+
+    def test_no_forced_probe_when_cadence_already_hits_final(self, tmp_path):
+        """When cadence already probes the final epoch, probe fires exactly once."""
+        from paramem.training.early_stop import (
+            EarlyStopPolicy,
+            RecallEarlyStopCallback,
+            _EarlyStopState,
+        )
+
+        probe_count = [0]
+
+        def _eval(*a, **k):
+            probe_count[0] += 1
+            return {
+                "exact_count": 1,
+                "total": 1,
+                "rate": 1.0,
+                "mean_confidence": 0.9,
+                "per_key": [{"key": "graph1", "exact_match": True}],
+            }
+
+        # probe_every_n_epochs=1, num_epochs=5 → cadence probes every epoch;
+        # forced branch (epoch >= 5) fires at 5, same epoch the cadence hits.
+        # The _last_epoch guard prevents double-fire for the SAME on_epoch_end call.
+        # Only one probe fires at epoch 5 (both conditions true but same call).
+        policy = EarlyStopPolicy(
+            probe_from_epoch=1,
+            signal_from_epoch=20,
+            window=1,
+            probe_every_n_epochs=1,
+        )
+        state_out = _EarlyStopState()
+
+        cb = RecallEarlyStopCallback(
+            model=_make_model(),
+            tokenizer=MagicMock(),
+            target_keyed=[{"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"}],
+            target_registry={"graph1": 1},
+            adapter_name="journal",
+            policy=policy,
+            state_out=state_out,
+            progress_path=tmp_path / "progress.json",
+            epoch_log_path=tmp_path / "epoch_log.json",
+            first_perfect_log_path=None,
+            phase_name="test",
+            num_epochs=5,
+            pause_file=None,
+            eval_fn=_eval,
+        )
+
+        for ep in range(1, 6):
+            cb.on_epoch_end(None, _make_state(float(ep)), _make_control())
+
+        # Should fire exactly 5 times (epochs 1–5), not 6 (no duplicate at 5)
+        assert probe_count[0] == 5
+
+    def test_no_forced_probe_when_training_stops_early(self, tmp_path):
+        """When training stops before num_epochs, forced branch does not fire.
+
+        If the stop fires at epoch 3 (window=1, signal_from_epoch=1, perfect),
+        HF Trainer stops calling on_epoch_end, so on_epoch_end is never reached
+        for epochs 4..num_epochs.  This test simulates that by only calling
+        on_epoch_end for epochs 1–3 with num_epochs=10.
+        """
+        from paramem.training.early_stop import (
+            EarlyStopPolicy,
+            RecallEarlyStopCallback,
+            _EarlyStopState,
+        )
+
+        probe_count = [0]
+
+        def _eval(*a, **k):
+            probe_count[0] += 1
+            return {
+                "exact_count": 1,
+                "total": 1,
+                "rate": 1.0,
+                "mean_confidence": 0.9,
+                "per_key": [{"key": "graph1", "exact_match": True}],
+            }
+
+        policy = EarlyStopPolicy(
+            probe_from_epoch=1,
+            signal_from_epoch=1,
+            window=1,
+            probe_every_n_epochs=1,
+        )
+        state_out = _EarlyStopState()
+
+        cb = RecallEarlyStopCallback(
+            model=_make_model(),
+            tokenizer=MagicMock(),
+            target_keyed=[{"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"}],
+            target_registry={"graph1": 1},
+            adapter_name="journal",
+            policy=policy,
+            state_out=state_out,
+            progress_path=tmp_path / "progress.json",
+            epoch_log_path=tmp_path / "epoch_log.json",
+            first_perfect_log_path=None,
+            phase_name="test",
+            num_epochs=10,
+            pause_file=None,
+            eval_fn=_eval,
+        )
+
+        # Simulate HF Trainer stopping after epoch 1 fires the stop signal.
+        # Only call on_epoch_end for epoch 1 (stop signal fires there).
+        cb.on_epoch_end(None, _make_state(1.0), _make_control())
+
+        # Probe fires exactly once (epoch 1), NOT at num_epochs=10.
+        assert probe_count[0] == 1
+        # Stop was recorded at epoch 1
+        assert state_out.stop_epoch == 1

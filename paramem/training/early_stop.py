@@ -125,12 +125,27 @@ ANALYSIS_POLICY = EarlyStopPolicy(**ANALYSIS_POLICY_KWARGS)
 
 @dataclass
 class _EarlyStopState:
-    """Mutable accumulator written back to the caller via state_out."""
+    """Mutable accumulator written back to the caller via state_out.
+
+    Attributes:
+        first_perfect_epoch: Epoch at which aggregate 100% recall was first
+            observed.
+        stable_perfect_epoch: Epoch at which the consecutive-perfect window
+            threshold was first met.
+        stop_epoch: Epoch at which the early-stop signal was fired.
+        epoch_log: Incremental list of per-epoch probe log entries.
+        last_per_key: Per-key recall verdict from the most recent fill probe.
+            Each dict carries at least ``{"key": str, "exact_match": bool}``.
+            ``None`` until the first fill probe runs.  Overwritten on every
+            probe, so after training it holds the final-epoch verdict —
+            especially when the forced final-epoch probe fires.
+    """
 
     first_perfect_epoch: int | None = None
     stable_perfect_epoch: int | None = None
     stop_epoch: int | None = None
     epoch_log: list[dict] = field(default_factory=list)
+    last_per_key: list[dict] | None = None
 
 
 class RecallEarlyStopCallback(TrainerCallback):
@@ -359,9 +374,18 @@ class RecallEarlyStopCallback(TrainerCallback):
         policy = self._policy
 
         # Determine whether to probe this epoch.
-        should_probe = epoch >= policy.probe_from_epoch and (
-            (epoch - policy.probe_from_epoch) % policy.probe_every_n_epochs == 0
-        )
+        # Force a probe on the final epoch so that registration consumers
+        # always receive a verdict from the FINAL trained weights, not a
+        # stale mid-training per-key snapshot from the last cadence hit.
+        # The ``epoch <= self._last_epoch`` guard above prevents double-fire;
+        # when early-stop fires BEFORE the final epoch (``_signaled_stop`` is
+        # set) this branch is not reached because HF Trainer stops calling
+        # on_epoch_end after the stop signal is honoured, so no extra probe
+        # is inserted on the abort path.
+        should_probe = (
+            epoch >= policy.probe_from_epoch
+            and ((epoch - policy.probe_from_epoch) % policy.probe_every_n_epochs == 0)
+        ) or epoch >= self._num_epochs
 
         if not should_probe:
             _write_progress(
@@ -397,6 +421,10 @@ class RecallEarlyStopCallback(TrainerCallback):
             self._target_registry,
             adapter_name=self._adapter_name,
         )
+        # Capture the per-key verdict so registration callers can read it from
+        # state.last_per_key after training completes.  The forced final-epoch
+        # probe (above) guarantees this reflects the FINAL trained weights.
+        self._state.last_per_key = fill["per_key"]
 
         # --- Optional retention probe ---
         retention = None

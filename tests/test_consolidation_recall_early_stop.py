@@ -93,7 +93,7 @@ def _kp(n: int = 5) -> list[dict]:
 class TestMaybeMakeRecallCallback:
     def test_returns_none_when_flag_off(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=False)
-        cb = loop._maybe_make_recall_callback(
+        cb, _state = loop._maybe_make_recall_callback(
             entries=_kp(),
             adapter_name="episodic",
             output_dir=tmp_path / "out",
@@ -103,7 +103,7 @@ class TestMaybeMakeRecallCallback:
 
     def test_returns_none_when_keyed_pairs_empty(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
-        cb = loop._maybe_make_recall_callback(
+        cb, _state = loop._maybe_make_recall_callback(
             entries=[],
             adapter_name="episodic",
             output_dir=tmp_path / "out",
@@ -119,7 +119,7 @@ class TestMaybeMakeRecallCallback:
             recall_window=5,
             recall_probe_every_n_epochs=2,
         )
-        cb = loop._maybe_make_recall_callback(
+        cb, _state = loop._maybe_make_recall_callback(
             entries=_kp(),
             adapter_name="episodic",
             output_dir=tmp_path / "out",
@@ -139,7 +139,7 @@ class TestMaybeMakeRecallCallback:
     def test_callback_paths_routed_to_output_dir(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
         out = tmp_path / "out"
-        cb = loop._maybe_make_recall_callback(
+        cb, _state = loop._maybe_make_recall_callback(
             entries=_kp(),
             adapter_name="episodic",
             output_dir=out,
@@ -150,10 +150,58 @@ class TestMaybeMakeRecallCallback:
         assert cb._first_perfect_log_path is None  # production has no per-key log
         assert cb._pause_file is None  # production pause via gpu_lock_sync
 
+    def test_num_epochs_override_propagates_to_callback(self, tmp_path: Path) -> None:
+        """Regression: stage-9 (consolidate_interim_adapters) trains with
+        refresh_epochs, not num_epochs.  When num_epochs != refresh_epochs the
+        forced final-epoch probe must fire at refresh_epochs, not at num_epochs.
+
+        Concretely: if an operator sets consolidation.max_epochs (refresh_epochs)
+        to a value other than training_config.num_epochs (30), the callback's
+        _num_epochs must track the ACTUAL trainer epoch count (refresh_epochs),
+        not the stale training_config default.  A stale _num_epochs silently
+        skips the forced probe and leaves state.last_per_key with a mid-training
+        cadence verdict — the wrong-admit/wrong-drop bug described in
+        .agent/consolidation_architecture.md:86-99.
+        """
+        # num_epochs in TrainingConfig is 30 (default).  Use 20 as refresh_epochs
+        # so the mismatch condition from the bug is clearly visible.
+        loop = _make_loop(tmp_path, recall_early_stopping=True)
+        assert loop.training_config.num_epochs != 20, (
+            "test precondition: training_config.num_epochs must differ from the "
+            "refresh_epochs value used below (20)"
+        )
+        cb, _state = loop._maybe_make_recall_callback(
+            entries=_kp(),
+            adapter_name="episodic",
+            output_dir=tmp_path / "out",
+            phase_name="consolidate-episodic",
+            num_epochs=20,
+        )
+        assert isinstance(cb, RecallEarlyStopCallback)
+        assert cb._num_epochs == 20, (
+            f"callback._num_epochs should be the passed refresh_epochs (20), "
+            f"got {cb._num_epochs} (training_config.num_epochs={loop.training_config.num_epochs})"
+        )
+
+    def test_num_epochs_default_falls_back_to_training_config(self, tmp_path: Path) -> None:
+        """When num_epochs is not passed (callers using training_config.num_epochs),
+        the callback's _num_epochs must equal training_config.num_epochs —
+        preserving existing behaviour for all non-stage-9 callers.
+        """
+        loop = _make_loop(tmp_path, recall_early_stopping=True)
+        cb, _state = loop._maybe_make_recall_callback(
+            entries=_kp(),
+            adapter_name="episodic",
+            output_dir=tmp_path / "out",
+            phase_name="test",
+        )
+        assert isinstance(cb, RecallEarlyStopCallback)
+        assert cb._num_epochs == loop.training_config.num_epochs
+
     def test_callback_target_registry_built_from_keyed_pairs(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
         keyed = _kp(7)
-        cb = loop._maybe_make_recall_callback(
+        cb, _state = loop._maybe_make_recall_callback(
             entries=keyed,
             adapter_name="episodic",
             output_dir=tmp_path / "out",
@@ -296,7 +344,7 @@ class TestEnabledVsDisabledBranch:
 
     def test_disabled_callbacks_extra_is_none(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=False)
-        cb = loop._maybe_make_recall_callback(
+        cb, _state = loop._maybe_make_recall_callback(
             entries=_kp(),
             adapter_name="episodic",
             output_dir=tmp_path,
@@ -308,7 +356,7 @@ class TestEnabledVsDisabledBranch:
 
     def test_enabled_passes_recall_callback_only(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path, recall_early_stopping=True)
-        cb = loop._maybe_make_recall_callback(
+        cb, _state = loop._maybe_make_recall_callback(
             entries=_kp(),
             adapter_name="episodic",
             output_dir=tmp_path,
@@ -457,3 +505,283 @@ class TestProbeTargetIsFullReplaySet:
                 f"EXPERIMENT_ONLY_ALLOWLIST entry ({module}, {func_name}) "
                 f"references a non-existent function — was it renamed or removed?"
             )
+
+
+# ---------------------------------------------------------------------------
+# Class G — TestCallbackStateTuple
+# Tests for the (callback, state) seam introduced in Stage 3.
+# ---------------------------------------------------------------------------
+
+
+class TestCallbackStateTuple:
+    """_maybe_make_recall_callback returns (callback, state) so callers can
+    read state.last_per_key after training to gate registration."""
+
+    def test_returns_tuple_when_enabled(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path, recall_early_stopping=True)
+        result = loop._maybe_make_recall_callback(
+            entries=_kp(3),
+            adapter_name="episodic",
+            output_dir=tmp_path / "out",
+            phase_name="test",
+        )
+        assert isinstance(result, tuple) and len(result) == 2
+        cb, state = result
+        assert isinstance(cb, RecallEarlyStopCallback)
+        assert state is not None
+        # state should initially have no verdict
+        assert state.last_per_key is None
+
+    def test_returns_none_none_when_disabled(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path, recall_early_stopping=False)
+        cb, state = loop._maybe_make_recall_callback(
+            entries=_kp(3),
+            adapter_name="episodic",
+            output_dir=tmp_path / "out",
+            phase_name="test",
+        )
+        assert cb is None
+        assert state is None
+
+    def test_state_shared_with_callback(self, tmp_path: Path) -> None:
+        """The state returned by the helper is the same object the callback uses."""
+        loop = _make_loop(tmp_path, recall_early_stopping=True)
+        cb, state = loop._maybe_make_recall_callback(
+            entries=_kp(2),
+            adapter_name="episodic",
+            output_dir=tmp_path / "out",
+            phase_name="test",
+        )
+        # Mutate through the callback's internal state; the returned state
+        # should reflect the change (same object).
+        cb._state.last_per_key = [{"key": "graph1", "exact_match": True}]
+        assert state.last_per_key == [{"key": "graph1", "exact_match": True}]
+
+
+# ---------------------------------------------------------------------------
+# Class H — TestRecallPassingKeys
+# Tests for the _recall_passing_keys / _probe_passing_keys helpers.
+# ---------------------------------------------------------------------------
+
+
+class TestRecallPassingKeys:
+    """_recall_passing_keys converts state.last_per_key to a passing set.
+    _probe_passing_keys is the fail-safe path when no verdict is available.
+    """
+
+    def _make_loop_with_helpers(self, tmp_path: Path) -> "ConsolidationLoop":
+        from paramem.utils.config import TrainingConfig
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.training_config = TrainingConfig(
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        return loop
+
+    def test_recall_passing_keys_returns_passing_set(self, tmp_path: Path) -> None:
+        from paramem.training.early_stop import _EarlyStopState
+
+        loop = self._make_loop_with_helpers(tmp_path)
+        state = _EarlyStopState()
+        state.last_per_key = [
+            {"key": "graph1", "exact_match": True},
+            {"key": "graph2", "exact_match": False},
+            {"key": "graph3", "exact_match": True},
+        ]
+        entries = [
+            {"key": f"graph{i}", "subject": "S", "predicate": "p", "object": "O"}
+            for i in range(1, 4)
+        ]
+        result = loop._recall_passing_keys(state, entries)
+        assert result == {"graph1", "graph3"}
+
+    def test_recall_passing_keys_returns_none_when_state_none(self, tmp_path: Path) -> None:
+        loop = self._make_loop_with_helpers(tmp_path)
+        result = loop._recall_passing_keys(None, _kp(3))
+        assert result is None
+
+    def test_recall_passing_keys_returns_none_when_last_per_key_none(self, tmp_path: Path) -> None:
+        from paramem.training.early_stop import _EarlyStopState
+
+        loop = self._make_loop_with_helpers(tmp_path)
+        state = _EarlyStopState()
+        assert state.last_per_key is None
+        result = loop._recall_passing_keys(state, _kp(3))
+        assert result is None
+
+    def test_probe_passing_keys_calls_evaluate_indexed_recall(self, tmp_path: Path) -> None:
+        """_probe_passing_keys calls evaluate_indexed_recall and returns passing set."""
+        from unittest.mock import patch
+
+        loop = self._make_loop_with_helpers(tmp_path)
+        entries = [
+            {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
+            {"key": "graph2", "subject": "S2", "predicate": "p", "object": "O2"},
+        ]
+        fake_result = {
+            "exact_count": 1,
+            "total": 2,
+            "rate": 0.5,
+            "mean_confidence": 0.8,
+            "per_key": [
+                {"key": "graph1", "exact_match": True},
+                {"key": "graph2", "exact_match": False},
+            ],
+        }
+
+        with patch(
+            "paramem.training.recall_eval.evaluate_indexed_recall", return_value=fake_result
+        ) as mock_eval:
+            result = loop._probe_passing_keys("episodic", entries)
+
+        mock_eval.assert_called_once()
+        assert result == {"graph1"}
+
+
+# ---------------------------------------------------------------------------
+# Class I — TestRegistrationFilter
+# Tests for the recall gate filtering registration in the consolidation paths.
+# ---------------------------------------------------------------------------
+
+
+class TestRegistrationFilter:
+    """Verify that a failed key is excluded from store.put and simhash registration."""
+
+    def test_reset_main_tier_filters_failed_keys(self, tmp_path: Path) -> None:
+        """_reset_main_tier_registries_and_simhashes filters by passing_sets_by_tier.
+
+        A key with exact_match=False must NOT appear in the rebuilt registry.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import TrainingConfig
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.training_config = TrainingConfig(
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop._thermal_policy = None
+
+        # Build a real MemoryStore so registry/simhash calls work.
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore()
+        loop.store = store
+
+        tier_keyed = {
+            "episodic": [
+                {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
+                {"key": "graph2", "subject": "S2", "predicate": "p", "object": "O2"},
+            ],
+            "semantic": [],
+            "procedural": [],
+        }
+        # graph2 failed recall; only graph1 should be registered
+        passing_sets = {
+            "episodic": {"graph1"},
+            "semantic": None,  # no keys, probe wouldn't fire
+            "procedural": None,  # no keys
+        }
+
+        # For the None-verdict tiers (semantic/procedural with no entries),
+        # the helper would normally call _probe_passing_keys but keyed is [],
+        # so the loop continues early.  Patch _probe_passing_keys to ensure
+        # it is NOT called (tier with empty keyed skips the probe).
+        with patch.object(ConsolidationLoop, "_probe_passing_keys") as mock_probe:
+            loop._reset_main_tier_registries_and_simhashes(tier_keyed, passing_sets)
+            # No probe needed for empty tiers
+            mock_probe.assert_not_called()
+
+        epi_reg = store.registry("episodic")
+        assert "graph1" in epi_reg
+        assert "graph2" not in epi_reg, "graph2 failed recall gate and must not be in the registry"
+
+    def test_reset_main_tier_probes_when_verdict_none(self, tmp_path: Path) -> None:
+        """When passing_sets_by_tier has None for a tier, _probe_passing_keys is called."""
+        from unittest.mock import patch
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import TrainingConfig
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.training_config = TrainingConfig(
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.store = MemoryStore()
+
+        tier_keyed = {
+            "episodic": [
+                {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
+            ],
+            "semantic": [],
+            "procedural": [],
+        }
+        # None verdict for episodic → must invoke _probe_passing_keys
+        passing_sets = {"episodic": None, "semantic": None, "procedural": None}
+
+        # Fake probe returns the key as passing
+        with patch.object(
+            ConsolidationLoop,
+            "_probe_passing_keys",
+            return_value={"graph1"},
+        ) as mock_probe:
+            loop._reset_main_tier_registries_and_simhashes(tier_keyed, passing_sets)
+            # Probe must be called for episodic (non-empty tier with None verdict)
+            called_tiers = [call.args[0] for call in mock_probe.call_args_list]
+            assert "episodic" in called_tiers
+
+        assert "graph1" in loop.store.registry("episodic")
+
+    def test_none_verdict_never_wipes_tier(self, tmp_path: Path) -> None:
+        """Fail-safe: a None verdict must NOT result in an empty registry.
+
+        This is the drop-all guard: if _probe_passing_keys is not invoked for
+        a non-empty tier when the verdict is None, all keys would be dropped.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import TrainingConfig
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.training_config = TrainingConfig(
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.store = MemoryStore()
+
+        tier_keyed = {
+            "episodic": [
+                {"key": "graph1", "subject": "S1", "predicate": "p", "object": "O1"},
+                {"key": "graph2", "subject": "S2", "predicate": "p", "object": "O2"},
+            ],
+            "semantic": [],
+            "procedural": [],
+        }
+        passing_sets = {"episodic": None, "semantic": None, "procedural": None}
+
+        # Probe returns both keys as passing — registry must be non-empty
+        with patch.object(
+            ConsolidationLoop,
+            "_probe_passing_keys",
+            return_value={"graph1", "graph2"},
+        ):
+            loop._reset_main_tier_registries_and_simhashes(tier_keyed, passing_sets)
+
+        reg = loop.store.registry("episodic")
+        assert "graph1" in reg
+        assert "graph2" in reg, "Fail-safe: None verdict must invoke the probe, not drop all keys"

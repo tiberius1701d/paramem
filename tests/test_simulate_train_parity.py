@@ -159,6 +159,12 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     loop.pending_interim_triples: list = []
     loop.fingerprint_cache = None
 
+    # Stub out the recall probe so tests with a MagicMock model do not
+    # feed it into re.sub (which raises TypeError on non-string input).
+    # These tests verify slot layout / GAP fixes, not recall gating; the
+    # probe is covered separately in test_consolidation_recall_early_stop.py.
+    loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+
     # Enrichment flags — disabled to keep tests deterministic.
     loop.graph_enrichment_enabled = False
     loop.graph_enrichment_interim_enabled = False

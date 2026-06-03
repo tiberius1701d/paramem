@@ -560,6 +560,9 @@ class TestMigrateOrchestrator:
             return dict(**kwargs)
 
         loop._cache_entry.side_effect = _fake_cache_entry
+        # See _make_loop: _maybe_make_recall_callback must return a (cb, state)
+        # 2-tuple; migration ignores state and gates via _run_recall_sanity_probe.
+        loop._maybe_make_recall_callback.return_value = (None, None)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
 
@@ -628,6 +631,9 @@ class TestMigrateOrchestrator:
             return dict(**kwargs)
 
         loop._cache_entry.side_effect = _fake_cache_entry
+        # See _make_loop: _maybe_make_recall_callback must return a (cb, state)
+        # 2-tuple; migration ignores state and gates via _run_recall_sanity_probe.
+        loop._maybe_make_recall_callback.return_value = (None, None)
 
         slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
 
@@ -784,6 +790,12 @@ class TestMigrateTierSimulateToTrain:
         loop._thermal_policy = None
         loop.model = MagicMock()
         loop.model.peft_config = {"episodic": MagicMock()} if tier_in_peft else {}
+        # _migrate_tier_simulate_to_train unpacks a (callback, state) 2-tuple from
+        # _maybe_make_recall_callback.  A bare MagicMock unpacks as an empty
+        # iterable → "not enough values to unpack".  The migration path ignores
+        # recall_state and gates on its own _run_recall_sanity_probe, so return
+        # (None, None): no recall callback is added (callbacks_extra stays None).
+        loop._maybe_make_recall_callback.return_value = (None, None)
 
         def _fake_cache_entry(
             *,

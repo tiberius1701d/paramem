@@ -842,7 +842,86 @@ class ConsolidationLoop:
             return None
         return {"key": key, "question": qa["question"], "answer": qa["answer"]}
 
-    def _reset_main_tier_registries_and_simhashes(self, tier_keyed: dict[str, list[dict]]) -> None:
+    def _recall_passing_keys(
+        self,
+        state: "object | None",
+        entries: "list[dict]",
+    ) -> "set[str] | None":
+        """Return the set of keys whose ``exact_match`` verdict is True.
+
+        Reads ``state.last_per_key`` — the per-key verdict from the final
+        fill probe written by ``RecallEarlyStopCallback.on_epoch_end``.
+
+        Returns a set of passing key strings when the verdict is available,
+        or ``None`` when ``state`` is ``None`` (early-stop disabled) or
+        ``state.last_per_key`` is ``None`` (no probe has run yet).  A ``None``
+        return is the explicit "no verdict" signal; callers MUST route it to
+        ``_probe_passing_keys`` — never treat it as an empty passing-set.
+
+        Args:
+            state: The ``_EarlyStopState`` returned alongside the callback by
+                ``_maybe_make_recall_callback``, or ``None`` when the callback
+                was not constructed.
+            entries: The key-entry list (used only for logging; not filtered
+                here).
+
+        Returns:
+            ``set[str]`` of passing key names, or ``None`` if no verdict.
+        """
+        if state is None:
+            return None
+        last_per_key = getattr(state, "last_per_key", None)
+        if last_per_key is None:
+            return None
+        return {r["key"] for r in last_per_key if r["exact_match"]}
+
+    def _probe_passing_keys(
+        self,
+        adapter_name: str,
+        entries: "list[dict]",
+    ) -> "set[str]":
+        """Run a dedicated per-key recall probe and return the passing set.
+
+        Called when ``_recall_passing_keys`` returns ``None`` — i.e. when the
+        early-stop callback was not active (``recall_early_stopping=False``) or
+        had not yet run a probe.  This ensures recall-gated registration always
+        has a verdict on the FINAL trained weights, regardless of whether the
+        callback fired.
+
+        Uses the full entries list without any sampling cap (unlike
+        ``_run_recall_sanity_probe`` which caps at max_probe=100).  Probe
+        failures propagate as raised exceptions — do NOT swallow errors.
+
+        Gradient checkpointing is disabled before the probe (required for
+        ``model.generate()`` to use the KV cache) and NOT re-enabled
+        afterward, because this is called after training has completed.
+
+        Args:
+            adapter_name: Active adapter name for the probe.
+            entries: Full per-tier entry list to probe (no truncation).
+
+        Returns:
+            Set of key strings whose ``exact_match`` verdict is True.
+        """
+        from paramem.memory.entry import build_registry as _build_registry_inner
+        from paramem.training.recall_eval import evaluate_indexed_recall
+
+        self._disable_gradient_checkpointing()
+        result = evaluate_indexed_recall(
+            self.model,
+            self.tokenizer,
+            entries,
+            _build_registry_inner(entries),
+            adapter_name=adapter_name,
+            batch_size=self.training_config.recall_probe_batch_size,
+        )
+        return {r["key"] for r in result["per_key"] if r["exact_match"]}
+
+    def _reset_main_tier_registries_and_simhashes(
+        self,
+        tier_keyed: dict[str, list[dict]],
+        passing_sets_by_tier: "dict[str, set[str] | None] | None" = None,
+    ) -> None:
         """Reset each main tier's KeyRegistry AND SimHash registry from ``tier_keyed``.
 
         The registry and the SimHash registry MUST be rebuilt together: rewriting
@@ -854,9 +933,55 @@ class ConsolidationLoop:
         callable form, so the registry can never be reset without its SimHashes.
         Mirrors the established ``build_registry`` → ``replace_simhashes_in_tier``
         pattern used at the interim and semantic rebuild sites.
+
+        Recall-gated registration (stage 9): only keys whose ``exact_match``
+        verdict is True on the FINAL trained weights are admitted.  The verdict
+        is supplied via ``passing_sets_by_tier``.  For any tier whose entry is
+        ``None`` (verdict absent — early-stop disabled or tier not trained),
+        a dedicated per-key probe is run on the trained weights as the fail-safe
+        (``_probe_passing_keys``).  A ``None`` verdict NEVER admits all keys
+        blindly — that would constitute silent total knowledge loss if the model
+        had not actually learned them.
+
+        Args:
+            tier_keyed: Per-tier keyed-entry lists (full post-consolidation set).
+            passing_sets_by_tier: Per-tier sets of keys that passed the recall
+                gate.  A ``None`` entry for a tier triggers the probe fallback.
+                Pass ``None`` for the entire dict to skip recall gating (legacy /
+                non-production caller).
         """
         for _main_tier in ("episodic", "semantic", "procedural"):
             keyed = tier_keyed.get(_main_tier, [])
+            if not keyed:
+                # No keys for this tier — clear the registry.
+                self.store.load_registry(_main_tier, KeyRegistry())
+                self.store.replace_simhashes_in_tier(_main_tier, {})
+                continue
+
+            # Determine the recall-passing set for this tier.
+            if passing_sets_by_tier is not None:
+                passing = passing_sets_by_tier.get(_main_tier)
+                if passing is None:
+                    # FAIL-SAFE: None verdict → dedicated per-key probe.
+                    # Never treat None as "admit all" or "drop all".
+                    passing = self._probe_passing_keys(_main_tier, keyed)
+                    logger.info(
+                        "_reset_main_tier_registries_and_simhashes: tier %s — "
+                        "no verdict from callback, ran dedicated probe (%d/%d passed)",
+                        _main_tier,
+                        len(passing),
+                        len(keyed),
+                    )
+                else:
+                    logger.info(
+                        "_reset_main_tier_registries_and_simhashes: tier %s — "
+                        "%d/%d keys passed recall gate",
+                        _main_tier,
+                        len(passing),
+                        len(keyed),
+                    )
+                keyed = [kp for kp in keyed if kp["key"] in passing]
+
             new_reg = KeyRegistry()
             for kp in keyed:
                 new_reg.add(kp["key"])
@@ -2617,7 +2742,7 @@ class ConsolidationLoop:
         dataset = self._indexed_dataset(examples)
         training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
         self._enable_gradient_checkpointing()
-        recall_cb = self._maybe_make_recall_callback(
+        recall_cb, recall_state = self._maybe_make_recall_callback(
             entries=all_procedural,
             adapter_name="procedural",
             output_dir=self._training_output_dir("procedural", interim_stamp=stamp),
@@ -2643,8 +2768,21 @@ class ConsolidationLoop:
             )
             return None
         # Deferred mutations — apply only after _train_adapter succeeds without abort.
+        # Compute the recall-passing set: keys whose exact_match verdict is True
+        # on the FINAL trained weights.  None recall_state means early-stop was
+        # disabled; fall back to a dedicated per-key probe.
+        passing = self._recall_passing_keys(recall_state, all_procedural)
+        if passing is None:
+            passing = self._probe_passing_keys("procedural", all_procedural)
         self._procedural_next_index = self._procedural_tentative_next_index
         for kp in new_proc_keyed:
+            if kp["key"] not in passing:
+                logger.debug(
+                    "_run_indexed_key_procedural: key %s failed recall gate"
+                    " — skipping registration",
+                    kp["key"],
+                )
+                continue
             fingerprint = compute_simhash(kp["key"], kp["subject"], kp["predicate"], kp["object"])
             self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
             self.store.set_bookkeeping(
@@ -2923,7 +3061,7 @@ class ConsolidationLoop:
             dataset = self._indexed_dataset(examples)
             training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
             self._enable_gradient_checkpointing()
-            recall_cb = self._maybe_make_recall_callback(
+            recall_cb, recall_state = self._maybe_make_recall_callback(
                 entries=all_interim_keyed,
                 adapter_name=adapter_name,
                 output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
@@ -2956,8 +3094,23 @@ class ConsolidationLoop:
             # This guarantees full-cycle atomicity: if any training step fails,
             # the registry stays clean.
 
-        # Update episodic-interim simhash registry from ground-truth pairs.
-        self.store.replace_simhashes_in_tier(adapter_name, build_registry(all_interim_keyed))
+            # Compute the recall-passing set for the episodic interim tier.
+            # None state means early-stop disabled; fall back to dedicated probe.
+            # FAIL-SAFE: None MUST route to the probe — never treated as empty.
+            _epi_passing = self._recall_passing_keys(recall_state, all_interim_keyed)
+            if _epi_passing is None:
+                _epi_passing = self._probe_passing_keys(adapter_name, all_interim_keyed)
+        else:
+            # Simulate mode or no keyed pairs: admit all without a probe.
+            _epi_passing = None
+
+        # Update episodic-interim simhash registry from ground-truth pairs,
+        # filtered to recall-passing keys only.
+        if _epi_passing is not None:
+            _passing_interim = [kp for kp in all_interim_keyed if kp["key"] in _epi_passing]
+        else:
+            _passing_interim = all_interim_keyed
+        self.store.replace_simhashes_in_tier(adapter_name, build_registry(_passing_interim))
 
         # --- 11. Procedural (always onto stable "procedural" main adapter) ---
         proc_train_loss: float | None = None
@@ -2975,6 +3128,13 @@ class ConsolidationLoop:
         # In simulate mode this block was already handled before training.
         if mode == "train":
             for kp in new_keyed_episodic:
+                if _epi_passing is not None and kp["key"] not in _epi_passing:
+                    logger.debug(
+                        "run_consolidation_cycle: key %s failed recall gate"
+                        " — skipping registration",
+                        kp["key"],
+                    )
+                    continue
                 self.store.put(adapter_name, kp["key"], kp)
                 self.store.set_bookkeeping(
                     kp["key"],
@@ -3848,6 +4008,11 @@ class ConsolidationLoop:
 
         tiers_rebuilt: list[str] = []
         recall_per_tier: dict[str, float] = {}
+        # Per-tier per-key verdict from the forced final-epoch fill probe.
+        # None for a tier that was skipped (no entries) or trained without
+        # a recall callback (early-stop disabled).  Passed into
+        # _reset_main_tier_registries_and_simhashes to filter registration.
+        last_per_key_by_tier: dict[str, list | None] = {}
 
         for tier in ("episodic", "semantic", "procedural"):
             backup_name = f"{tier}_backup"
@@ -3898,6 +4063,7 @@ class ConsolidationLoop:
             #    sentinel (installed by _run_callable_queue) is restored in
             #    the finally block to preserve the outer invariant.
             prior_job = None
+            recall_state = None  # initialise so the capture below is always defined
             if trainer is not None:
                 prior_job = trainer._current_job
                 trainer._current_job = job
@@ -3913,11 +4079,12 @@ class ConsolidationLoop:
                     self._enable_gradient_checkpointing()
                     # Fresh recall callback per tier — _signaled_stop and
                     # epoch_log do not leak across tiers.
-                    recall_cb = self._maybe_make_recall_callback(
+                    recall_cb, recall_state = self._maybe_make_recall_callback(
                         entries=job.entries,
                         adapter_name=tier,
                         output_dir=self.output_dir / "consolidation_refresh" / tier,
                         phase_name=f"consolidate-{tier}",
+                        num_epochs=refresh_epochs,
                     )
                     _tier_metrics = _train_adapter_fn(
                         model=self.model,
@@ -3968,6 +4135,11 @@ class ConsolidationLoop:
             # propagates as RuntimeError from _save_adapters so the caller
             # (app.py _run_full_cycle) skips mark_consolidated and sessions stay
             # pending for the next cycle.
+            # Capture the per-key verdict from the forced final-epoch fill probe
+            # so _reset_main_tier_registries_and_simhashes can filter by recall.
+            last_per_key_by_tier[tier] = (
+                recall_state.last_per_key if recall_state is not None else None
+            )
             tiers_rebuilt.append(tier)
 
         # flip off _is_training at finalize entry (belt-and-braces).
@@ -3985,9 +4157,21 @@ class ConsolidationLoop:
         # to it after re-derivation from the cumulative graph.  Interim-tier
         # registries are then dropped (they are superseded by the main tiers).
         if self.store.replay_enabled:
+            # Build per-tier passing-sets from the captured final-epoch verdict.
+            # _recall_passing_keys returns None when the verdict is absent (disabled
+            # early-stop or skipped tier); _reset_main_tier_registries_and_simhashes
+            # will call _probe_passing_keys for those tiers as the fail-safe.
+            passing_sets_by_tier: dict[str, set[str] | None] = {}
+            for _tier in ("episodic", "semantic", "procedural"):
+                _lpk = last_per_key_by_tier.get(_tier)
+                if _lpk is not None:
+                    passing_sets_by_tier[_tier] = {r["key"] for r in _lpk if r["exact_match"]}
+                else:
+                    passing_sets_by_tier[_tier] = None
+
             # Reset each main tier's registry AND simhash to the post-consolidation
             # membership (the pairing is load-bearing — see the helper's docstring).
-            self._reset_main_tier_registries_and_simhashes(tier_keyed)
+            self._reset_main_tier_registries_and_simhashes(tier_keyed, passing_sets_by_tier)
             # Drop interim-tier registries — they are no longer valid.
             self._drop_interim_tier_registries()
             # Save each main tier's registry unconditionally (create dir if needed).
@@ -4437,12 +4621,16 @@ class ConsolidationLoop:
         adapter_name: str,
         output_dir,
         phase_name: str,
+        num_epochs: int | None = None,
     ):
         """Construct a RecallEarlyStopCallback when configured.
 
-        Returns None when ``training_config.recall_early_stopping`` is
-        False or when the entries list is empty (probing an empty set is
-        a no-op).
+        Returns ``(None, None)`` when ``training_config.recall_early_stopping``
+        is False or when the entries list is empty (probing an empty set is
+        a no-op).  Returns ``(callback, state)`` otherwise, where ``state``
+        is the ``_EarlyStopState`` shared with the callback; callers read
+        ``state.last_per_key`` after ``_train_adapter`` returns to obtain the
+        per-key recall verdict from the FINAL trained weights.
 
         The probe target is the unmodified entries list — the same per-tier
         full-replay set that ``format_entry_training`` consumes.  This
@@ -4471,11 +4659,25 @@ class ConsolidationLoop:
             phase_name: Label for ``progress.json`` ("phase4-episodic",
                 "interim-episodic-tickXY", "consolidate-episodic",
                 "migrate-episodic", etc.).
+            num_epochs: The ACTUAL epoch count the trainer will run for this
+                call.  When provided, the callback's forced final-epoch probe
+                fires at this epoch rather than at
+                ``self.training_config.num_epochs``.  Callers that train with
+                a different epoch budget (e.g. ``consolidate_interim_adapters``
+                using ``refresh_epochs``) MUST pass this so
+                ``RecallEarlyStopCallback._num_epochs`` matches the trainer's
+                epoch count.  Defaults to ``None`` which resolves to
+                ``self.training_config.num_epochs`` — the correct value for
+                callers that use the default training budget.
+
+        Returns:
+            ``(RecallEarlyStopCallback, _EarlyStopState)`` when configured and
+            entries is non-empty; ``(None, None)`` otherwise.
         """
         if not self.training_config.recall_early_stopping:
-            return None
+            return None, None
         if not entries:
-            return None
+            return None, None
         from pathlib import Path
 
         from paramem.training.early_stop import (
@@ -4496,6 +4698,9 @@ class ConsolidationLoop:
         # probe start with the signal floor eliminates that wasted compute;
         # the operator-tunable knob is ``recall_signal_from_epoch`` in
         # server.yaml.
+        effective_num_epochs = (
+            num_epochs if num_epochs is not None else self.training_config.num_epochs
+        )
         floor = self.training_config.early_stopping_floor
         policy = EarlyStopPolicy(
             probe_from_epoch=floor,
@@ -4515,22 +4720,24 @@ class ConsolidationLoop:
         else:
             _eval_fn = evaluate_indexed_recall  # bare reference; preserves patchability
 
-        return RecallEarlyStopCallback(
+        state = _EarlyStopState()
+        callback = RecallEarlyStopCallback(
             model=self.model,
             tokenizer=self.tokenizer,
             target_keyed=entries,
             target_registry=_build_registry(entries),
             adapter_name=adapter_name,
             policy=policy,
-            state_out=_EarlyStopState(),
+            state_out=state,
             progress_path=output_dir / "progress.json",
             epoch_log_path=output_dir / "epoch_log.json",
             first_perfect_log_path=None,  # production has no per-key log
             phase_name=phase_name,
-            num_epochs=self.training_config.num_epochs,
+            num_epochs=effective_num_epochs,
             pause_file=None,  # production pause via gpu_lock_sync, not file
             eval_fn=_eval_fn,
         )
+        return callback, state
 
 
 def run_multi_session(

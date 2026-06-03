@@ -140,6 +140,12 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.graph_enrichment_min_triples_floor = 20
     loop._triples_since_last_enrichment = 0
 
+    # Stub out the recall probe so tests with a MagicMock model do not
+    # feed it into re.sub (which raises TypeError on non-string input).
+    # These tests verify post_session_train orchestration, not recall gating;
+    # the probe is covered separately in test_consolidation_recall_early_stop.py.
+    loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+
     return loop
 
 
