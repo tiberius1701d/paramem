@@ -1,8 +1,10 @@
 """Knowledge graph merging with entity resolution and edge aggregation.
 
-Two contradiction resolution strategies:
-1. Graph-level: normalized predicate matching (lives_in == lives_in)
-2. Model-level: LLM semantic reasoning (moved_to contradicts lives_in)
+Contradiction resolution is model-only and always-on when a model is present:
+- Single-valued predicate (REPLACE): the new value removes the old edge.
+- Multi-valued predicate (COEXIST): both values coexist, no removal.
+- Cardinality judgment is cached per predicate (one model call per unique predicate).
+- When no model is present (experiments, after release): all triples coexist (no removal).
 """
 
 import json
@@ -177,22 +179,27 @@ class GraphMerger:
     def __init__(
         self,
         similarity_threshold: float = 85.0,
-        strategy: str = "graph",
         model=None,
         tokenizer=None,
     ):
         """Initialize merger.
 
+        Contradiction resolution is model-only and always-on when a model is
+        present.  The cardinality of each predicate (single-valued → REPLACE,
+        multi-valued → COEXIST) is determined by one model inference call and
+        cached for the lifetime of this merger instance.  When ``model`` is
+        ``None`` all same-(subject, predicate)/different-object pairs coexist
+        (no removal) — this is the experiment path and the post-release state.
+
         Args:
             similarity_threshold: Minimum rapidfuzz token_sort_ratio score (0–100)
                 for the fuzzy tier of entity resolution.
-            strategy: "graph" for predicate-matching only,
-                "model" for graph + LLM semantic resolution.
             model: Optional LLM for model-based contradiction resolution.
+                When set, this merger is a BASE-MODEL HOLDER; call
+                :meth:`release` to drop the reference.
             tokenizer: Tokenizer paired with *model*.
         """
         self.similarity_threshold = similarity_threshold
-        self.strategy = strategy
         self.graph = nx.MultiDiGraph()
         self.model = model
         self.tokenizer = tokenizer
@@ -401,10 +408,15 @@ class GraphMerger:
         """Insert or update a relation edge.
 
         Handles three cases:
+
         1. Same (subject, predicate, object) — reinforcement: bump recurrence.
-        2. Same (subject, predicate) but different object — contradiction:
-           remove old edge, add new one. New facts win.
-        3. New (subject, predicate) — insert new edge.
+        2. Same (subject, predicate) but different object — model contradiction
+           resolution (always-on when a model is present): ask whether the
+           predicate is single-valued (REPLACE, old edge removed) or
+           multi-valued (COEXIST, both edges kept).  Cardinality judgment is
+           cached per predicate.  When no model is present, fall through to
+           Case 3 (coexist-all).
+        3. New (subject, predicate, object) — insert new edge.
         """
         normalized_pred = _normalize_predicate(relation.predicate)
 
@@ -436,7 +448,7 @@ class GraphMerger:
         # or the new value replaces the old (single-valued/contradiction).
         # Decision is cached per predicate — one inference call per unique predicate.
         graph_resolved = False
-        if self.strategy == "model" and self.model is not None and self.graph.has_node(subject):
+        if self.model is not None and self.graph.has_node(subject):
             for old_obj in list(self.graph.successors(subject)):
                 if old_obj == obj:
                     continue
@@ -495,12 +507,7 @@ class GraphMerger:
 
         # Case 2b: model-based cross-predicate semantic contradiction detection
         # Catches cases like moved_to vs lives_in that same-predicate matching misses
-        if (
-            not graph_resolved
-            and self.strategy == "model"
-            and self.model is not None
-            and self.graph.has_node(subject)
-        ):
+        if not graph_resolved and self.model is not None and self.graph.has_node(subject):
             existing_triples = []
             for succ in self.graph.successors(subject):
                 for _, data in self.graph[subject][succ].items():
@@ -561,6 +568,18 @@ class GraphMerger:
             recurrence_count=1,
             sessions=[session_id],
         )
+
+    def release(self) -> None:
+        """Drop the base-model reference this merger holds (BASE-MODEL HOLDER).
+
+        Sets ``self.model`` and ``self.tokenizer`` to ``None`` so the base model
+        can be freed by the Python garbage collector.  Called by
+        ``ConsolidationLoop.release()`` as part of the VRAM-release path.
+
+        Idempotent: safe to call multiple times or when no model was set.
+        """
+        self.model = None
+        self.tokenizer = None
 
     def get_all_triples(self) -> list[tuple[str, str, str]]:
         """Return all (subject, predicate, object) triples from the graph."""

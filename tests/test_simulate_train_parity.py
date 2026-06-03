@@ -151,7 +151,6 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
         store.load_registry(tier, KeyRegistry())
     loop.store = store
 
-    loop.procedural_sp_index: dict = {}
     loop.cycle_count = 0
     loop._indexed_next_index = 1
     loop._procedural_next_index = 1
@@ -380,19 +379,21 @@ class TestSimulateTrainParity:
                     f"{fsc} → {entry['first_seen_cycle']}"
                 )
 
-        # Episodic (graph*) keys from cycle 1 must survive into cycle 2.
-        # Procedural (proc*) keys are correctly RETIRED when a same-preference
-        # re-run triggers contradiction detection — those keys are intentionally
-        # absent in cycle 2 and are excluded from this assertion.
+        # All keys from cycle 1 (episodic graph* AND procedural proc*) must
+        # survive into cycle 2.  Per-session procedural sp_index-driven retirement
+        # has been removed (consolidation_architecture.md §4.3); procedural
+        # contradictions are now resolved at full consolidation by the
+        # model-bearing GraphMerger.  Duplicate procedural keys from a same-
+        # preference re-run are tolerated in the interim.
         sim_keys_2 = set(key for _tier, key, _entry in loop_sim.store.iter_entries())
         train_keys_2 = set(key for _tier, key, _entry in loop_train.store.iter_entries())
-        sim_graph_1 = {k for k in sim_keys_1 if k.startswith("graph")}
-        train_graph_1 = {k for k in train_keys_1 if k.startswith("graph")}
-        assert sim_graph_1.issubset(sim_keys_2), (
-            f"Simulate: cycle-1 episodic keys dropped after re-run: {sim_graph_1 - sim_keys_2}"
+        sim_keys_1_all = sim_keys_1
+        train_keys_1_all = train_keys_1
+        assert sim_keys_1_all.issubset(sim_keys_2), (
+            f"Simulate: cycle-1 keys dropped after re-run: {sim_keys_1_all - sim_keys_2}"
         )
-        assert train_graph_1.issubset(train_keys_2), (
-            f"Train: cycle-1 episodic keys dropped after re-run: {train_graph_1 - train_keys_2}"
+        assert train_keys_1_all.issubset(train_keys_2), (
+            f"Train: cycle-1 keys dropped after re-run: {train_keys_1_all - train_keys_2}"
         )
 
     def test_gap4_active_keys_in_tier_match(self, loop_sim, loop_train):

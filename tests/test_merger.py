@@ -743,3 +743,236 @@ class TestMultiUserNameCollision:
         # Speaker0's last_name attribute is untouched by the third-party
         # merge (different node, different namespace).
         assert m.graph.nodes["Speaker0"]["attributes"]["last_name"] == "Walker"
+
+
+class TestModelContradictionAndRelease:
+    """Model-only contradiction is always-on when a model is present;
+    coexist-all when model is None; release() drops model/tokenizer."""
+
+    def _build_stub_model(self, is_single_valued: bool):
+        """Return a (model, tokenizer) stub whose check_predicate_coexistence
+        returns ``not is_single_valued`` (i.e. single-valued → REPLACE)."""
+        from unittest.mock import MagicMock
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "formatted"
+
+        coexist_result = not is_single_valued  # True → COEXIST, False → REPLACE
+
+        def _patched_coexistence(subject, predicate, old_value, new_value, mdl, tok):
+            return coexist_result
+
+        return model, tokenizer, _patched_coexistence
+
+    def test_single_valued_contradiction_resolved_with_model(self):
+        """With a model present, same-(s,p)/different-o for a single-valued
+        predicate removes the old edge and inserts the new one."""
+        from unittest.mock import patch
+
+        model_stub, tok_stub, coexist_fn = self._build_stub_model(is_single_valued=True)
+
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            side_effect=coexist_fn,
+        ):
+            m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+            sg1 = SessionGraph(
+                session_id="s1",
+                timestamp="2026-01-01T00:00:00Z",
+                entities=[
+                    Entity(name="Alex", entity_type="person"),
+                    Entity(name="Munich", entity_type="place"),
+                ],
+                relations=[
+                    Relation(
+                        subject="Alex",
+                        predicate="lives_in",
+                        object="Munich",
+                        relation_type="factual",
+                        speaker_id="Speaker0",
+                    )
+                ],
+            )
+            sg2 = SessionGraph(
+                session_id="s2",
+                timestamp="2026-01-02T00:00:00Z",
+                entities=[
+                    Entity(name="Alex", entity_type="person"),
+                    Entity(name="Berlin", entity_type="place"),
+                ],
+                relations=[
+                    Relation(
+                        subject="Alex",
+                        predicate="lives_in",
+                        object="Berlin",
+                        relation_type="factual",
+                        speaker_id="Speaker0",
+                    )
+                ],
+            )
+            m.merge(sg1)
+            m.merge(sg2)
+
+        # Single-valued: old "Munich" edge removed; only "Berlin" remains.
+        alex_successors = list(m.graph.successors("Alex"))
+        # "Munich" must be gone (replaced), "Berlin" must be present.
+        lives_in_edges = [
+            (obj, data)
+            for obj in alex_successors
+            for _, data in m.graph["Alex"][obj].items()
+            if data.get("predicate") == "lives_in"
+        ]
+        objects_with_lives_in = [obj for obj, _ in lives_in_edges]
+        assert "Munich" not in objects_with_lives_in, (
+            "Old single-valued edge (Munich) must be removed by model contradiction"
+        )
+        assert "Berlin" in objects_with_lives_in, (
+            "New edge (Berlin) must be present after contradiction resolution"
+        )
+
+    def test_no_model_coexist_all(self):
+        """Without a model, same-(s,p)/different-o triples coexist (no removal)."""
+        m = GraphMerger()  # model=None
+        assert m.model is None
+
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Munich", entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Munich",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Berlin", entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        m.merge(sg1)
+        m.merge(sg2)
+
+        # Both values coexist: no removal when model is absent.
+        alex_successors = list(m.graph.successors("Alex"))
+        lives_in_objects = [
+            obj
+            for obj in alex_successors
+            for _, data in m.graph["Alex"][obj].items()
+            if data.get("predicate") == "lives_in"
+        ]
+        assert "Munich" in lives_in_objects, (
+            "Without a model, old edge must NOT be removed (coexist-all)"
+        )
+        assert "Berlin" in lives_in_objects, "New edge must be present (coexist-all, no model)"
+
+    def test_release_nulls_model_and_tokenizer(self):
+        """release() sets .model and .tokenizer to None (idempotent)."""
+        from unittest.mock import MagicMock
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+
+        assert m.model is model_stub
+        assert m.tokenizer is tok_stub
+
+        m.release()
+
+        assert m.model is None, "release() must null .model"
+        assert m.tokenizer is None, "release() must null .tokenizer"
+
+    def test_release_is_idempotent(self):
+        """Calling release() twice does not raise."""
+        from unittest.mock import MagicMock
+
+        m = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
+        m.release()
+        m.release()  # must not raise
+
+    def test_multi_valued_coexist_with_model(self):
+        """With a model present, when check_predicate_coexistence returns True
+        (multi-valued predicate), both the old and new objects must coexist as
+        edges for the same (subject, predicate) and no contradictions_resolved
+        entry must be recorded."""
+        from unittest.mock import patch
+
+        model_stub, tok_stub, coexist_fn = self._build_stub_model(is_single_valued=False)
+
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            side_effect=coexist_fn,
+        ):
+            m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+            sg1 = SessionGraph(
+                session_id="s1",
+                timestamp="2026-01-01T00:00:00Z",
+                entities=[
+                    Entity(name="Alex", entity_type="person"),
+                    Entity(name="Python", entity_type="concept"),
+                ],
+                relations=[
+                    Relation(
+                        subject="Alex",
+                        predicate="speaks",
+                        object="Python",
+                        relation_type="factual",
+                        speaker_id="Speaker0",
+                    )
+                ],
+            )
+            sg2 = SessionGraph(
+                session_id="s2",
+                timestamp="2026-01-02T00:00:00Z",
+                entities=[
+                    Entity(name="Alex", entity_type="person"),
+                    Entity(name="Rust", entity_type="concept"),
+                ],
+                relations=[
+                    Relation(
+                        subject="Alex",
+                        predicate="speaks",
+                        object="Rust",
+                        relation_type="factual",
+                        speaker_id="Speaker0",
+                    )
+                ],
+            )
+            m.merge(sg1)
+            m.merge(sg2)
+
+        # Multi-valued: both objects must coexist, no edge removed.
+        alex_successors = list(m.graph.successors("Alex"))
+        speaks_objects = [
+            obj
+            for obj in alex_successors
+            for _, data in m.graph["Alex"][obj].items()
+            if data.get("predicate") == "speaks"
+        ]
+        assert "Python" in speaks_objects, (
+            "Multi-valued coexist: old edge (Python) must NOT be removed"
+        )
+        assert "Rust" in speaks_objects, "Multi-valued coexist: new edge (Rust) must be present"
+        assert m.contradictions_resolved == [], (
+            "Multi-valued coexist: no contradictions_resolved entry must be recorded"
+        )

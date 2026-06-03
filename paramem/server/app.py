@@ -5341,9 +5341,14 @@ def _release_base_model_in_process() -> None:
     The base model is reachable through five holders:
 
     1. ``_state["model"]`` — primary handle.
-    2. ``_state["consolidation_loop"].model`` (and ``.extraction.model``) —
-       captured at ``ConsolidationLoop.__init__``; released via
-       ``loop.release()``.
+    2. ``_state["consolidation_loop"].model`` (and ``.extraction.model``,
+       ``.merger.model``) — captured at ``ConsolidationLoop.__init__``;
+       released via ``loop.release()``.  The model-bearing
+       ``GraphMerger`` (``loop.merger``) is a sub-object holder reached
+       via ``loop.merger.model``; it is released transitively through
+       ``loop.release()`` → ``merger.release()`` (the release is
+       encapsulated — this function must NOT reach into ``loop.merger.model``
+       directly, honouring the INVARIANT).
     3. ``_state["background_trainer"].model`` — captured at
        ``BackgroundTrainer.__init__``; released via ``bt.release()``.
     4. **The bg-trainer worker thread's frame.** After a train-mode cycle,
@@ -5361,8 +5366,9 @@ def _release_base_model_in_process() -> None:
        here via ``set_classifier_model(None, None)``.
 
     Holders 2–4 are encapsulated in ``bt.release()`` and ``loop.release()``.
-    Holder 5 is cleared below.  See ``BackgroundTrainer.release()`` and
-    ``ConsolidationLoop.release()`` for the ownership contract.
+    Holder 5 is cleared below.  See ``BackgroundTrainer.release()``,
+    ``ConsolidationLoop.release()``, and ``GraphMerger.release()`` for the
+    ownership contract.
 
     NOTE: this function CANNOT reach references held in the **lifespan
     async-generator frame** (it stays suspended at ``yield`` for the app's

@@ -121,7 +121,6 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.episodic_simhash = {}
     loop.semantic_simhash = {}
     loop.procedural_simhash = {}
-    loop.procedural_sp_index = {}
     loop.cycle_count = 0
     loop.key_sessions = {}
     loop.promoted_keys = set()
@@ -841,29 +840,29 @@ class TestProceduralRelsRoutedToProceduralAdapter:
         mocked to succeed on the first (episodic) call and raise on the second
         (procedural) call.
 
+        Note: per-session sp_index-driven retirement was removed (architecture §4.3).
+        Contradiction resolution is deferred to full consolidation via the model-bearing
+        merger.  The pre-existing proc0 key coexists with the new preference — it is
+        NOT retired during this session.
+
         Pre-conditions
         --------------
-        - One old procedural key ``proc0`` exists in ``procedural_simhash``,
-          ``indexed_key_cache``, and ``procedural_sp_index`` with the same
-          (speaker, subject, predicate) as the incoming relation, so it would
-          normally be retired.
+        - One old procedural key ``proc0`` exists in the procedural simhash and
+          indexed_key_cache.
 
         Post-conditions after the procedural training failure
         -----------------------------------------------------
         - ``indexed_key_registry`` is empty: episodic step 7 never ran.
         - ``indexed_key_cache`` does NOT contain any new procedural key.
         - ``procedural_simhash`` is unchanged: old key still present.
-        - ``procedural_sp_index`` still maps to the old key (not the new one).
         - Old procedural key ``proc0`` was NOT removed from any index.
         """
         loop = _make_mock_loop_with_procedural(tmp_path)
         stamp = "20260418T1430"
         loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
 
-        # Pre-existing procedural state: proc0 with the same (speaker, subject,
-        # predicate) as the incoming relation, making it a contradiction target.
+        # Pre-existing procedural state: proc0.
         # _fake_proc_rels(1) produces subject="Subject1", predicate="prefers".
-        old_sp_key = ("", "subject1", "prefers")  # lowercased, empty speaker_id
         old_proc_key = "proc0"
         old_qa_entry = {
             "key": old_proc_key,
@@ -874,9 +873,8 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             "object": "OldThing",
             "speaker_id": "",
         }
-        loop.procedural_simhash = {old_proc_key: 0xDEADBEEF}
+        loop.store.simhashes_in_tier("procedural")[old_proc_key] = 0xDEADBEEF
         loop.store._entries_flat_view()[old_proc_key] = old_qa_entry
-        loop.procedural_sp_index[old_sp_key] = old_proc_key
 
         call_count = {"n": 0}
 
@@ -930,8 +928,8 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
-            # probe_entries: no existing reconstructable keys (proc0 is the only one,
-            # and it is in the retirement list, so existing_keys will be empty).
+            # probe_entries: proc0 is probed (it is an existing key, not retired),
+            # but fails reconstruction — falls back to cache read.
             patch(
                 "paramem.training.consolidation.probe_entries",
                 side_effect=lambda model, tokenizer, entries, **kw: (
@@ -973,12 +971,6 @@ class TestProceduralRelsRoutedToProceduralAdapter:
         # Old key must NOT have been removed from indexed_key_cache.
         assert old_proc_key in loop.store._entries_flat_view(), (
             "Old procedural key must still be in indexed_key_cache after training failure."
-        )
-
-        # procedural_sp_index must still point to the old key.
-        assert loop.procedural_sp_index.get(old_sp_key) == old_proc_key, (
-            f"procedural_sp_index must still map {old_sp_key!r} → '{old_proc_key}' "
-            "after training failure."
         )
 
     def test_interim_stamp_cleared_after_procedural_failure(self, tmp_path: Path) -> None:

@@ -1,42 +1,26 @@
 """Tests for procedural adapter pipeline components.
 
-Tests the procedural QA seeding, contradiction index, and
+Tests the procedural key assignment, deferred-mutation discipline, and
 filter integration without requiring GPU/model.
+
+Note: the per-session ``sp_index`` (procedural_sp_index) was removed as part
+of the model-only contradiction redesign (consolidation_architecture.md §4.3).
+Procedural contradiction is now resolved at full consolidation by the
+model-bearing GraphMerger.  The tests below verify the post-removal behavior.
 """
-
-
-class TestContradictionIndex:
-    """Test that the sp_index correctly identifies contradictions."""
-
-    def test_same_speaker_subject_predicate_collides(self):
-        index = {}
-        index[("sp1", "alex", "prefers")] = "proc1"
-        # New preference with same key should overwrite
-        assert ("sp1", "alex", "prefers") in index
-        index[("sp1", "alex", "prefers")] = "proc2"
-        assert index[("sp1", "alex", "prefers")] == "proc2"
-
-    def test_different_speakers_no_collision(self):
-        index = {}
-        index[("sp1", "alex", "prefers")] = "proc1"
-        index[("sp2", "alex", "prefers")] = "proc2"
-        assert index[("sp1", "alex", "prefers")] == "proc1"
-        assert index[("sp2", "alex", "prefers")] == "proc2"
-
-    def test_different_predicates_no_collision(self):
-        index = {}
-        index[("sp1", "alex", "prefers")] = "proc1"
-        index[("sp1", "alex", "likes")] = "proc2"
-        assert len(index) == 2
 
 
 class TestRunIndexedKeyProceduralDeferredMutations:
     """Deferred-mutation invariant for _run_indexed_key_procedural.
 
-    All shared-state mutations (_procedural_next_index, procedural_simhash,
-    indexed_key_cache, indexed_key_registry, procedural_sp_index) must be
-    applied ONLY after train_adapter returns successfully.  If training
-    raises, every field must remain byte-identical to its pre-call value.
+    Shared-state mutations (_procedural_next_index, procedural_simhash,
+    indexed_key_cache, indexed_key_registry) must be applied ONLY after
+    train_adapter returns successfully.  If training raises, every field must
+    remain byte-identical to its pre-call value.
+
+    The per-session ``sp_index`` (procedural_sp_index) has been removed;
+    these tests verify the post-removal 2-tuple return contract and the
+    absence of any sp_index-driven side effects.
     """
 
     def _make_stub(self, monkeypatch, tmp_path, train_raises: bool = False):
@@ -118,7 +102,6 @@ class TestRunIndexedKeyProceduralDeferredMutations:
                 self.model = MagicMock()
                 self.tokenizer = MagicMock()
                 self._procedural_next_index = 1
-                self.procedural_sp_index: dict = {}
                 from paramem.memory.store import MemoryStore as _MS
 
                 self.store = _MS(replay_enabled=False)
@@ -343,4 +326,67 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         # Existing key must be unchanged.
         assert stub.store.simhashes_in_tier("procedural")["proc0"] == existing_hash, (
             "Existing proc0 simhash must not be altered by incremental update"
+        )
+
+    def test_no_sp_index_on_loop(self, monkeypatch, tmp_path):
+        """ConsolidationLoop no longer has a procedural_sp_index attribute.
+
+        The sp_index was removed (consolidation_architecture.md §4.3) because
+        per-session procedural contradiction is now resolved at full
+        consolidation by the model-bearing GraphMerger.  The stub's loop
+        object must not have the attribute, and the method must not set it.
+        """
+        stub, _ = self._make_stub(monkeypatch, tmp_path, train_raises=False)
+
+        # The real ConsolidationLoop no longer declares procedural_sp_index.
+        # The stub does not set it, so the attribute should be absent.
+        assert not hasattr(stub, "procedural_sp_index"), (
+            "procedural_sp_index must not exist on the loop after sp_index removal"
+        )
+
+    def test_same_preference_rerun_does_not_retire_old_key(self, monkeypatch, tmp_path):
+        """Without sp_index, re-running the same preference does NOT retire the old key.
+
+        Per-session retirement is removed.  A second call with the same
+        (speaker, subject, predicate) does NOT delete proc1 when proc2 is
+        added — both coexist in the store until the next full-consolidation cycle
+        resolves the duplicate via the model-bearing merger.
+        """
+        stub, _ = self._make_stub(monkeypatch, tmp_path, train_raises=False)
+
+        relations = [
+            {
+                "subject": "Alice",
+                "predicate": "prefers",
+                "object": "tea",
+                "relation_type": "preference",
+                "speaker_id": "spk1",
+            },
+        ]
+        stub._run_indexed_key_procedural(relations, speaker_id="spk1")
+
+        # proc1 is now in the store.
+        assert "proc1" in stub.store.simhashes_in_tier("procedural"), (
+            "proc1 must be added after first run"
+        )
+        index_after_first = stub._procedural_next_index
+
+        # Second run with the same preference adds proc2 without retiring proc1.
+        relations2 = [
+            {
+                "subject": "Alice",
+                "predicate": "prefers",
+                "object": "coffee",  # different object, same (s,p) — no sp_index retirement
+                "relation_type": "preference",
+                "speaker_id": "spk1",
+            },
+        ]
+        stub._run_indexed_key_procedural(relations2, speaker_id="spk1")
+
+        assert stub._procedural_next_index == index_after_first + 1, (
+            "Counter must advance by 1 after second run"
+        )
+        # proc1 must still be present — no per-session retirement without sp_index.
+        assert "proc1" in stub.store.simhashes_in_tier("procedural"), (
+            "proc1 must NOT be retired without sp_index — contradiction deferred to full merge"
         )
