@@ -87,7 +87,7 @@ Per-fact addressable recall using sequential keys in a chat-template JSON format
 
 **Two encodings:**
 - **QA-pair encoding** (`"qa"`, legacy/test-only): the LLM QA generator mints a `(question, answer)` pair per graph triple; the adapter is trained on `key → JSON{key, question, answer}`. Recall template: `"Recall the QA pair stored under key 'graphN'."`
-- **Quadruple encoding** (`"quad"`, production): the adapter is trained directly on the merged-graph triple, `key → JSON{key, subject, predicate, object}` (1 training example per fact, no QA-generator LLM step). Recall template: `"Recall the fact stored under key 'graphN'."` The quad units come from `assign_quad_keys` over `merged_graph.relations + relation_prep._flatten_entity_attributes(merged_graph.entities)`, partitioned to episodic / procedural by `relation_prep.partition_relations`, then formatted by `format_quadruple_training` (`paramem/training/quadruple_memory.py`). Round-trip-clean; ~½ the per-fact training cost.
+- **Quadruple encoding** (`"quad"`, production): the adapter is trained directly on the merged-graph triple, `key → JSON{key, subject, predicate, object}` (1 training example per fact, no QA-generator LLM step). Recall template: `"Recall the fact stored under key 'graphN'."` The quad units come from `assign_keys` over `merged_graph.relations + relation_prep._flatten_entity_attributes(merged_graph.entities)`, partitioned to episodic / procedural by `relation_prep.partition_relations`, then formatted by `format_entry_training` (`paramem/memory/entry.py`). Round-trip-clean; ~½ the per-fact training cost.
 
 A QA-trained adapter probed with the quad template fails (and vice versa), so the inference path reads each adapter's format and uses the matching template + parser.
 
@@ -216,7 +216,7 @@ Every adapter training event — consolidation cycle, post-session train, interi
 
 Consolidation supports two code paths:
 
-- **Blocking:** `run_consolidation` — extracts all sessions then trains under a single GPU lock. Used for manual `POST /consolidate`.
+- **Blocking:** `run_consolidation_cycle` — extracts all sessions then trains under a single GPU lock. Used for manual `POST /consolidate`.
 - **Scheduled (cooperative):** `_extract_and_start_training` spawns a `BackgroundTrainer` that releases the GPU lock per step so voice turns interleave. Driven by a systemd user timer derived from `consolidation.refresh_cadence × consolidation.max_interim_count`. `refresh_cadence` accepts `"HH:MM"` (daily), `"every Nh"`/`"every Nm"` (interval), `"daily"`, or `""`/`"off"` (manual only).
 
 `GracefulShutdownCallback` stops training at epoch boundaries on shutdown; a failed interim cycle is logged and pending sessions are left for retry on the next tick. `RecallEarlyStopCallback` (gated by `consolidation.recall_early_stopping`, default OFF) fires `should_training_stop` once the staged adapter has memorized its full per-tier key set.
