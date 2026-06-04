@@ -50,13 +50,16 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     # replay_enabled controls whether run_consolidation_cycle's registry guard
     # fires.  Callers that need enrichment hooks to fire pass replay_enabled=True.
     replay_enabled = defaults.pop("replay_enabled", False)
+    # Allow callers to supply a pre-built ConsolidationConfig so tests can set
+    # fields like merge_at_interim without touching the loop's other knobs.
+    consolidation_config = defaults.pop("consolidation_config", ConsolidationConfig())
 
     from paramem.memory.store import MemoryStore as _MS
 
     loop = ConsolidationLoop(
         model=model,
         tokenizer=MagicMock(),
-        consolidation_config=ConsolidationConfig(),
+        consolidation_config=consolidation_config,
         training_config=TrainingConfig(),
         episodic_adapter_config=AdapterConfig(),
         semantic_adapter_config=AdapterConfig(),
@@ -887,15 +890,11 @@ class TestInterimEnrichmentHook:
     path is covered by TestRunGraphEnrichment.
     """
 
-    def test_counter_increments_on_extract_session_merge(self, tmp_path):
-        """extract_session increments the accumulator by len(relations)."""
-        loop = _make_loop(tmp_path)
-        assert loop._triples_since_last_enrichment == 0
-
-        # Drive a session graph straight through the merge path — no LLM.
+    def _make_session_graph(self):
+        """Build a 2-relation SessionGraph for counter tests."""
         from paramem.graph.schema import Entity, Relation, SessionGraph
 
-        sg = SessionGraph(
+        return SessionGraph(
             session_id="s1",
             timestamp="2026-04-20T12:00:00Z",
             entities=[
@@ -920,10 +919,28 @@ class TestInterimEnrichmentHook:
             ],
         )
 
+    def test_counter_increments_when_merge_at_interim_true(self, tmp_path):
+        """extract_session increments the accumulator when merge_at_interim=True."""
+        loop = _make_loop(tmp_path, consolidation_config=ConsolidationConfig(merge_at_interim=True))
+        assert loop._triples_since_last_enrichment == 0
+
+        sg = self._make_session_graph()
         with patch.object(loop.extraction, "run", return_value=sg):
             loop.extract_session("ignored-transcript", "s1", speaker_id="Speaker0")
 
         assert loop._triples_since_last_enrichment == 2
+
+    def test_counter_stays_zero_when_merge_at_interim_false(self, tmp_path):
+        """extract_session does NOT increment the accumulator when merge_at_interim=False."""
+        loop = _make_loop(tmp_path)  # merge_at_interim defaults to False
+        assert loop._triples_since_last_enrichment == 0
+
+        sg = self._make_session_graph()
+        with patch.object(loop.extraction, "run", return_value=sg):
+            loop.extract_session("ignored-transcript", "s1", speaker_id="Speaker0")
+
+        # Merge deferred to full consolidation — counter must remain 0.
+        assert loop._triples_since_last_enrichment == 0
 
     def test_counter_resets_after_successful_enrichment(self, tmp_path):
         """After _run_graph_enrichment returns non-skipped, the counter is zero."""

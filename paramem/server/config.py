@@ -848,6 +848,11 @@ class ConsolidationScheduleConfig:
     retain_sessions: bool = True
     indexed_key_replay: bool = True  # indexed key training mechanism
     decay_window: int = 10  # cycles before unreinforced keys decay
+    # default OFF = cheap-graph interim posture: per-session keys go straight to
+    # the interim adapter, cumulative-graph merge/contradiction/enrichment deferred
+    # to full consolidation (Path B).  True = "daily consolidation" posture: the
+    # per-session merge runs each interim cycle as well.
+    merge_at_interim: bool = False
     # Maximum LoRA training epochs per consolidation cycle. None = use the
     # validated 30 default (Test 17 floor) for 100% indexed-key recall on the
     # validated models.
@@ -1501,6 +1506,7 @@ class ServerConfig:
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
+            merge_at_interim=self.consolidation.merge_at_interim,
         )
 
     @property

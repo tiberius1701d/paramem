@@ -1165,17 +1165,25 @@ class ConsolidationLoop:
             )
 
             # --- MERGE ---
-            # Disable gradient checkpointing: merger.merge may call model.generate()
-            # for contradiction resolution when a model is present.  HF silently
-            # disables the KV cache when checkpointing is active (CLAUDE.md rule).
             with phase_trace("merge_into_cumulative") as t:
-                self._disable_gradient_checkpointing()
-                try:
-                    self.merger.merge(session_graph)
-                finally:
-                    self._enable_gradient_checkpointing()
-                self._triples_since_last_enrichment += len(session_graph.relations)
-                t.add("triples_added", len(session_graph.relations))
+                if self.config.merge_at_interim:
+                    # Path A: merge into cumulative graph each interim cycle.
+                    # Disable gradient checkpointing: merger.merge may call model.generate()
+                    # for contradiction resolution when a model is present.  HF silently
+                    # disables the KV cache when checkpointing is active (CLAUDE.md rule).
+                    self._disable_gradient_checkpointing()
+                    try:
+                        self.merger.merge(session_graph)
+                    finally:
+                        self._enable_gradient_checkpointing()
+                    self._triples_since_last_enrichment += len(session_graph.relations)
+                    t.add("triples_added", len(session_graph.relations))
+                else:
+                    # Path B: merge deferred to full consolidation (merge_at_interim=False).
+                    # The counter is NOT incremented — interim enrichment consumes
+                    # _triples_since_last_enrichment over merger.graph, which was not
+                    # updated; enrichment stays Path-B-only by design.
+                    t.add("triples_added", 0)
 
             # --- BUILD ENTRY RELATION DICTS ---
             # Single entry point for graph → entries.  Builds relation dicts
@@ -1824,14 +1832,20 @@ class ConsolidationLoop:
         result.relations_extracted = len(session_graph.relations)
 
         # --- 2. MERGE ---
-        # Disable gradient checkpointing: merger.merge may call model.generate()
-        # for contradiction resolution when a model is present.  HF silently
-        # disables the KV cache when checkpointing is active (CLAUDE.md rule).
-        self._disable_gradient_checkpointing()
-        try:
-            self.merger.merge(session_graph)
-        finally:
-            self._enable_gradient_checkpointing()
+        if self.config.merge_at_interim:
+            # Path A: merge into cumulative graph each run_cycle call.
+            # Disable gradient checkpointing: merger.merge may call model.generate()
+            # for contradiction resolution when a model is present.  HF silently
+            # disables the KV cache when checkpointing is active (CLAUDE.md rule).
+            self._disable_gradient_checkpointing()
+            try:
+                self.merger.merge(session_graph)
+            finally:
+                self._enable_gradient_checkpointing()
+        # NOTE: an experiment that sets BOTH persist_graph=True and
+        # merge_at_interim=False would feed classify_nodes a graph missing this
+        # session's triples — an opt-in-both-flags experiment corner, dormant in
+        # production (persist_graph=False); not defended in code.
         graph = self.merger.graph
 
         # --- 3. SCORE & CLASSIFY ---
