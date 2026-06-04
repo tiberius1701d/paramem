@@ -451,6 +451,127 @@ class TestExtractionPathParity:
         assert result["mean_drift"] == 0.0
 
 
+class TestMergeAtInterimGate:
+    """extract_session merger.merge call is gated by config.merge_at_interim.
+
+    These tests verify Path A (merge_at_interim=True) and Path B
+    (merge_at_interim=False, default) without loading any model or GPU.
+    """
+
+    def _build_loop(self, monkeypatch, tmp_path, merge_at_interim: bool):
+        from unittest.mock import MagicMock
+
+        from peft import PeftModel
+
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+        from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        self._session_graph = SessionGraph(
+            session_id="s_gate",
+            timestamp="2026-06-01T00:00:00Z",
+            entities=[
+                Entity(name="X", entity_type="person"),
+                Entity(name="Y", entity_type="person"),
+            ],
+            relations=[
+                Relation(
+                    subject="X",
+                    predicate="knows",
+                    object="Y",
+                    relation_type="social",
+                    speaker_id="spk0",
+                ),
+            ],
+        )
+
+        model = MagicMock()
+        model.__class__ = PeftModel
+        model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "in_training": MagicMock(),
+        }
+
+        monkeypatch.setattr(
+            "paramem.graph.extraction_pipeline.extract_graph",
+            lambda *a, **kw: self._session_graph,
+        )
+
+        loop = ConsolidationLoop(
+            model=model,
+            tokenizer=MagicMock(),
+            consolidation_config=ConsolidationConfig(merge_at_interim=merge_at_interim),
+            training_config=TrainingConfig(),
+            episodic_adapter_config=AdapterConfig(),
+            semantic_adapter_config=AdapterConfig(),
+            memory_store=_MS(replay_enabled=False),
+            procedural_adapter_config=None,
+            output_dir=tmp_path,
+            persist_graph=False,
+        )
+        return loop
+
+    def test_merge_called_when_merge_at_interim_true(self, monkeypatch, tmp_path):
+        """merge_at_interim=True: merger.merge is called once with the session graph."""
+        from unittest.mock import patch
+
+        loop = self._build_loop(monkeypatch, tmp_path, merge_at_interim=True)
+        initial_nodes = loop.merger.graph.number_of_nodes()
+        initial_edges = loop.merger.graph.number_of_edges()
+
+        with patch.object(loop.extraction, "run", return_value=self._session_graph):
+            loop.extract_session("t", "s_gate", speaker_id="spk0")
+
+        # Graph must have grown — merge ran.
+        assert (
+            loop.merger.graph.number_of_nodes() > initial_nodes
+            or loop.merger.graph.number_of_edges() > initial_edges
+        ), "Expected merger.graph to grow after extract_session with merge_at_interim=True"
+
+    def test_merge_not_called_when_merge_at_interim_false(self, monkeypatch, tmp_path):
+        """merge_at_interim=False: merger.merge is NOT called; graph unchanged."""
+        from unittest.mock import patch
+
+        loop = self._build_loop(monkeypatch, tmp_path, merge_at_interim=False)
+        initial_nodes = loop.merger.graph.number_of_nodes()
+        initial_edges = loop.merger.graph.number_of_edges()
+
+        with patch.object(loop.extraction, "run", return_value=self._session_graph):
+            with patch.object(loop.merger, "merge") as mock_merge:
+                loop.extract_session("t", "s_gate", speaker_id="spk0")
+                mock_merge.assert_not_called()
+
+        # Graph is also structurally unchanged.
+        assert loop.merger.graph.number_of_nodes() == initial_nodes
+        assert loop.merger.graph.number_of_edges() == initial_edges
+
+    def test_episodic_rels_identical_for_both_flag_values(self, monkeypatch, tmp_path):
+        """Returned (episodic_rels, procedural_rels) are identical regardless of merge_at_interim.
+
+        Keying is derived from session_graph, not from the cumulative graph,
+        so the flag must not affect what facts are returned to the caller.
+        """
+        from unittest.mock import patch
+
+        loop_a = self._build_loop(monkeypatch, tmp_path / "a", merge_at_interim=True)
+        with patch.object(loop_a.extraction, "run", return_value=self._session_graph):
+            rels_a, proc_a = loop_a.extract_session("t", "s_gate", speaker_id="spk0")
+
+        loop_b = self._build_loop(monkeypatch, tmp_path / "b", merge_at_interim=False)
+        with patch.object(loop_b.extraction, "run", return_value=self._session_graph):
+            rels_b, proc_b = loop_b.extract_session("t", "s_gate", speaker_id="spk0")
+
+        def _key(d):
+            return (d.get("subject"), d.get("predicate"), d.get("object"))
+
+        assert sorted(map(_key, rels_a)) == sorted(map(_key, rels_b)), (
+            "episodic_rels differ between merge_at_interim=True and False"
+        )
+        assert proc_a == proc_b == []
+
+
 class TestFormatSummary:
     def test_format_output(self):
         metrics = ConsolidationMetrics(
@@ -467,6 +588,53 @@ class TestFormatSummary:
         assert "Phase 3" in summary
         assert "PASS" in summary
         assert "10" in summary
+
+
+class TestMergeAtInterimConfigRoundtrip:
+    """Loading YAML with merge_at_interim: true propagates through the property chain."""
+
+    def test_yaml_merge_at_interim_propagates(self, tmp_path):
+        """YAML merge_at_interim: true propagates to schedule and consolidation_config."""
+        from paramem.server.config import load_server_config
+
+        yaml_text = """
+model:
+  name: "mistralai/Mistral-7B-Instruct-v0.3"
+consolidation:
+  refresh_cadence: "12h"
+  merge_at_interim: true
+"""
+        cfg_path = tmp_path / "server_merge_at_interim.yaml"
+        cfg_path.write_text(yaml_text)
+        cfg = load_server_config(str(cfg_path))
+
+        assert cfg.consolidation.merge_at_interim is True, (
+            "ServerConfig.consolidation.merge_at_interim should be True"
+        )
+        assert cfg.consolidation_config.merge_at_interim is True, (
+            "consolidation_config.merge_at_interim should be True"
+        )
+
+    def test_yaml_merge_at_interim_default_false(self, tmp_path):
+        """YAML without merge_at_interim defaults to False on schedule and consolidation_config."""
+        from paramem.server.config import load_server_config
+
+        yaml_text = """
+model:
+  name: "mistralai/Mistral-7B-Instruct-v0.3"
+consolidation:
+  refresh_cadence: "12h"
+"""
+        cfg_path = tmp_path / "server_no_merge_at_interim.yaml"
+        cfg_path.write_text(yaml_text)
+        cfg = load_server_config(str(cfg_path))
+
+        assert cfg.consolidation.merge_at_interim is False, (
+            "ServerConfig.consolidation.merge_at_interim should default to False"
+        )
+        assert cfg.consolidation_config.merge_at_interim is False, (
+            "consolidation_config.merge_at_interim should default to False"
+        )
 
 
 class TestCurriculumDecayProtection:

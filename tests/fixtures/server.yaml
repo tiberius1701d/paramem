@@ -223,6 +223,7 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
+  merge_at_interim: false      # false = Path B (cheap interim, merge deferred to full cycle); true = merge every interim
   # max_epochs: ceiling for LoRA training epochs per consolidation cycle.
   # Unset (or null) → use the validated 30-epoch default from the Test 1-8
   # campaign. Lower this only with empirical recall-vs-epochs evidence on
