@@ -578,7 +578,7 @@ def test_preload_source_selection_simulate_mode():
             return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
 
     class FakeWeightSource:
-        def __init__(self, model, tokenizer, batch_size):
+        def __init__(self, model, tokenizer, batch_size, registry=None):
             weight_source_calls.append("init")
 
         def probe(self, keys_by_tier):
@@ -644,7 +644,7 @@ def test_preload_source_selection_train_mode_uses_weight_source():
             return {}
 
     class FakeWeightSource:
-        def __init__(self, model, tokenizer, batch_size):
+        def __init__(self, model, tokenizer, batch_size, registry=None):
             weight_source_calls.append("init")
 
         def probe(self, keys_by_tier):
@@ -742,7 +742,7 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
 
     # Probe returns only one of two keys → partial hydration of a backed tier.
     class FakeWeightSource:
-        def __init__(self, model, tokenizer, batch_size):
+        def __init__(self, model, tokenizer, batch_size, registry=None):
             pass
 
         def probe(self, keys_by_tier):
