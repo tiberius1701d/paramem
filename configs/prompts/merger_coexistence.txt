@@ -1,0 +1,9 @@
+Can a person have more than one value for the relationship "{predicate}"?
+
+Example: {subject} {predicate} {old_value}, and now {subject} {predicate} {new_value}.
+
+Can both be true at the same time, or does the new value replace the old one?
+
+Reply with EXACTLY one word:
+- COEXIST (both can be true, e.g. a person can have multiple pets)
+- REPLACE (only one can be true, e.g. a person has one date of birth)

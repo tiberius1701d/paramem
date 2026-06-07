@@ -745,6 +745,285 @@ class TestMultiUserNameCollision:
         assert m.graph.nodes["Speaker0"]["attributes"]["last_name"] == "Walker"
 
 
+class TestCrossPredicateContradictionFlag:
+    """Regression tests for the cross_predicate_contradiction flag.
+
+    Cross-predicate contradiction detection: detect_contradiction_with_model
+    fires across different predicates.  Default OFF to prevent over-removal of
+    legitimate multi-valued facts (multiple valid values for one relation) and
+    independent facts expressed under different predicates.
+
+    Same-predicate cardinality resolution (via check_predicate_coexistence) is
+    unaffected by this flag and is tested separately in
+    TestModelContradictionAndRelease.
+    """
+
+    def _multi_valued_sessions(self) -> tuple:
+        """Two sessions giving the same subject independent facts on different predicates."""
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="ParaMem", entity_type="concept"),
+                Entity(name="Qwen", entity_type="concept"),
+            ],
+            relations=[
+                Relation(
+                    subject="ParaMem",
+                    predicate="validated_on",
+                    object="Qwen",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(name="ParaMem", entity_type="concept"),
+                Entity(name="Gemma", entity_type="concept"),
+            ],
+            relations=[
+                Relation(
+                    subject="ParaMem",
+                    predicate="validated_on",
+                    object="Gemma",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        return sg1, sg2
+
+    def test_flag_false_default_does_not_call_detect_contradiction(self):
+        """With cross_predicate_contradiction=False (default) and a model present,
+        detect_contradiction_with_model must NOT be called, regardless of what the
+        model would return — the flag gates the call site, not just the effect.
+
+        This is the regression test for the live data-loss finding:
+        multi-valued / independent facts were wrongly removed by cross-predicate
+        contradiction detection.
+        """
+        from unittest.mock import MagicMock, patch
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        sg1, sg2 = self._multi_valued_sessions()
+
+        # Patch detect_contradiction_with_model to return a contradiction — so
+        # if the flag check were absent, an edge WOULD be removed.  The test
+        # proves the flag suppresses the call entirely.
+        with patch(
+            "paramem.graph.merger.detect_contradiction_with_model",
+            return_value=("ParaMem", "validated_on", "Qwen"),
+        ) as mock_detect:
+            # Default: cross_predicate_contradiction=False
+            m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+            assert m.cross_predicate_contradiction is False
+
+            # Patch check_predicate_coexistence to return COEXIST so cardinality
+            # resolution does not remove the first edge either (multi-valued predicate).
+            with patch(
+                "paramem.graph.merger.check_predicate_coexistence",
+                return_value=True,
+            ):
+                m.merge(sg1)
+                m.merge(sg2)
+
+            # detect_contradiction_with_model must NOT have been called.
+            mock_detect.assert_not_called()
+
+        # Both edges must be present — no removal.
+        successors = list(m.graph.successors("ParaMem"))
+        validated_on_objects = [
+            obj
+            for obj in successors
+            for _, data in m.graph["ParaMem"][obj].items()
+            if data.get("predicate") == "validated_on"
+        ]
+        assert "Qwen" in validated_on_objects, (
+            "validated_on Qwen must not be removed when cross_predicate_contradiction=False"
+        )
+        assert "Gemma" in validated_on_objects, (
+            "validated_on Gemma must be present when cross_predicate_contradiction=False"
+        )
+
+    def test_flag_true_enables_cross_predicate_removal(self):
+        """With cross_predicate_contradiction=True, detect_contradiction_with_model
+        IS consulted and the old edge is removed when it returns a contradiction.
+        This verifies the cross-predicate removal behavior is preserved behind the flag.
+        """
+        from unittest.mock import MagicMock, patch
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        sg1, sg2 = self._multi_valued_sessions()
+
+        # detect_contradiction_with_model says "Qwen" is contradicted.
+        with patch(
+            "paramem.graph.merger.detect_contradiction_with_model",
+            return_value=("ParaMem", "validated_on", "Qwen"),
+        ) as mock_detect:
+            m = GraphMerger(
+                model=model_stub,
+                tokenizer=tok_stub,
+                cross_predicate_contradiction=True,
+            )
+            assert m.cross_predicate_contradiction is True
+
+            # Patch check_predicate_coexistence to return COEXIST so cardinality
+            # resolution does not fire first (multi-valued — only cross-predicate
+            # contradiction detection fires).
+            with patch(
+                "paramem.graph.merger.check_predicate_coexistence",
+                return_value=True,
+            ):
+                m.merge(sg1)
+                m.merge(sg2)
+
+            # detect_contradiction_with_model must have been called (flag=True).
+            mock_detect.assert_called()
+
+        # "Qwen" edge was removed by cross-predicate contradiction detection; "Gemma" was added.
+        successors = list(m.graph.successors("ParaMem"))
+        validated_on_objects = [
+            obj
+            for obj in successors
+            for _, data in m.graph["ParaMem"][obj].items()
+            if data.get("predicate") == "validated_on"
+        ]
+        assert "Qwen" not in validated_on_objects, (
+            "validated_on Qwen must be removed when cross_predicate_contradiction=True"
+        )
+        assert "Gemma" in validated_on_objects, (
+            "validated_on Gemma must be present after cross-predicate removal"
+        )
+        # contradictions_resolved must record the removal.
+        assert any(r.get("method") == "model" for r in m.contradictions_resolved), (
+            "cross-predicate removal must be logged in contradictions_resolved"
+        )
+
+    def test_flag_false_preserves_cardinality_resolution(self):
+        """Same-predicate, different-object cardinality resolution must still fire when
+        cross_predicate_contradiction=False.  The flag gates ONLY cross-predicate
+        contradiction detection, not same-predicate cardinality resolution.
+
+        This guards against accidentally disabling cardinality resolution.
+        """
+        from unittest.mock import MagicMock, patch
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Munich", entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Munich",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Berlin", entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+
+        # cross_predicate_contradiction=False (default); same-predicate cardinality resolution fires
+        # (single-valued predicate → replace old value).
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            return_value=False,  # REPLACE — single-valued
+        ):
+            m = GraphMerger(
+                model=model_stub,
+                tokenizer=tok_stub,
+                cross_predicate_contradiction=False,
+            )
+            m.merge(sg1)
+            m.merge(sg2)
+
+        # Cardinality resolution must have replaced Munich with Berlin.
+        successors = list(m.graph.successors("Alex"))
+        lives_in_objects = [
+            obj
+            for obj in successors
+            for _, data in m.graph["Alex"][obj].items()
+            if data.get("predicate") == "lives_in"
+        ]
+        assert "Munich" not in lives_in_objects, (
+            "Cardinality resolution must still replace single-valued predicate even when "
+            "cross_predicate_contradiction=False"
+        )
+        assert "Berlin" in lives_in_objects, "New edge must be present after cardinality resolution"
+
+
+class TestPromptsDirOverride:
+    """Custom prompts_dir overrides the inline fallback constants."""
+
+    def test_custom_prompts_dir_loaded_into_instance_attributes(self, tmp_path):
+        """GraphMerger(prompts_dir=...) must resolve _coexistence_prompt and
+        _contradiction_prompt from the supplied directory, not from the inline
+        _COEXISTENCE_PROMPT / _CONTRADICTION_PROMPT constants.
+        """
+        coexistence_content = "CUSTOM_COEXISTENCE_MARKER sentinel text"
+        contradiction_content = "CUSTOM_CONTRADICTION_MARKER sentinel text"
+        (tmp_path / "merger_coexistence.txt").write_text(coexistence_content)
+        (tmp_path / "merger_contradiction.txt").write_text(contradiction_content)
+
+        m = GraphMerger(prompts_dir=tmp_path)
+
+        assert m._coexistence_prompt == coexistence_content.strip(), (
+            "Custom merger_coexistence.txt must override the inline fallback"
+        )
+        assert m._contradiction_prompt == contradiction_content.strip(), (
+            "Custom merger_contradiction.txt must override the inline fallback"
+        )
+
+    def test_missing_files_fall_back_to_inline_constants(self, tmp_path):
+        """A prompts_dir that lacks the prompt files must fall back to the
+        inline _COEXISTENCE_PROMPT / _CONTRADICTION_PROMPT constants.
+        """
+        from paramem.graph.merger import _COEXISTENCE_PROMPT, _CONTRADICTION_PROMPT
+
+        # tmp_path exists but contains no prompt files.
+        m = GraphMerger(prompts_dir=tmp_path)
+
+        assert m._coexistence_prompt == _COEXISTENCE_PROMPT, (
+            "Missing file must fall back to inline _COEXISTENCE_PROMPT"
+        )
+        assert m._contradiction_prompt == _CONTRADICTION_PROMPT, (
+            "Missing file must fall back to inline _CONTRADICTION_PROMPT"
+        )
+
+
 class TestModelContradictionAndRelease:
     """Model-only contradiction is always-on when a model is present;
     coexist-all when model is None; release() drops model/tokenizer."""
@@ -760,7 +1039,7 @@ class TestModelContradictionAndRelease:
 
         coexist_result = not is_single_valued  # True → COEXIST, False → REPLACE
 
-        def _patched_coexistence(subject, predicate, old_value, new_value, mdl, tok):
+        def _patched_coexistence(subject, predicate, old_value, new_value, mdl, tok, prompt=None):
             return coexist_result
 
         return model, tokenizer, _patched_coexistence

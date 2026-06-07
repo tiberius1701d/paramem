@@ -1,9 +1,15 @@
 """Knowledge graph merging with entity resolution and edge aggregation.
 
-Contradiction resolution is model-only and always-on when a model is present:
-- Single-valued predicate (REPLACE): the new value removes the old edge.
+Contradiction resolution:
+- Same-predicate, different-object cardinality resolution (REPLACE): the new value
+  removes the old edge.  Cardinality judgment is cached per predicate (one model call
+  per unique predicate).  Active whenever a model is present; unaffected by
+  ``cross_predicate_contradiction``.
+- Cross-predicate contradiction detection (REPLACE across different predicates):
+  OFF by default (``cross_predicate_contradiction=False``) because it over-removes
+  legitimate multi-valued and independent facts (observed over-removing valid facts in live use).
+  Enable only when the operator has verified it is safe for their knowledge domain.
 - Multi-valued predicate (COEXIST): both values coexist, no removal.
-- Cardinality judgment is cached per predicate (one model call per unique predicate).
 - When no model is present (experiments, after release): all triples coexist (no removal).
 """
 
@@ -14,6 +20,7 @@ from pathlib import Path
 import networkx as nx
 from rapidfuzz import fuzz
 
+from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 logger = logging.getLogger(__name__)
@@ -53,8 +60,21 @@ def detect_contradiction_with_model(
     existing_triples: list[tuple[str, str, str]],
     model,
     tokenizer,
+    prompt: str = _CONTRADICTION_PROMPT,
 ) -> tuple[str, str, str] | None:
     """Use the model to detect if a new triple contradicts an existing one.
+
+    Args:
+        subject: Subject of the new triple.
+        predicate: Predicate of the new triple.
+        obj: Object of the new triple.
+        existing_triples: All triples currently in the graph.
+        model: LLM to use for contradiction detection.
+        tokenizer: Tokenizer paired with *model*.
+        prompt: Prompt template with ``{existing_facts}``, ``{subject}``,
+            ``{predicate}``, and ``{object}`` slots.  Defaults to
+            ``_CONTRADICTION_PROMPT``; pass a custom string (e.g. loaded via
+            ``_load_prompt``) to override without code changes.
 
     Returns the contradicted (subject, predicate, object) triple, or None.
     """
@@ -70,7 +90,7 @@ def detect_contradiction_with_model(
         return None
 
     facts_str = "\n".join(f"- {s} | {p} | {o}" for s, p, o in relevant)
-    prompt = _CONTRADICTION_PROMPT.format(
+    prompt = prompt.format(
         existing_facts=facts_str,
         subject=subject,
         predicate=predicate,
@@ -118,8 +138,21 @@ def check_predicate_coexistence(
     new_value: str,
     model,
     tokenizer,
+    prompt: str = _COEXISTENCE_PROMPT,
 ) -> bool:
     """Ask the model whether two values for the same predicate can coexist.
+
+    Args:
+        subject: Entity whose predicate cardinality is being judged.
+        predicate: The predicate shared by both values.
+        old_value: The existing object value for the predicate.
+        new_value: The incoming object value for the predicate.
+        model: LLM to use for the cardinality judgment.
+        tokenizer: Tokenizer paired with *model*.
+        prompt: Prompt template with ``{subject}``, ``{predicate}``,
+            ``{old_value}``, and ``{new_value}`` slots.  Defaults to
+            ``_COEXISTENCE_PROMPT``; pass a custom string (e.g. loaded via
+            ``_load_prompt``) to override without code changes.
 
     Returns True if both values can be true simultaneously (multi-valued),
     False if the new value replaces the old one (single-valued).
@@ -127,7 +160,7 @@ def check_predicate_coexistence(
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
 
-    prompt = _COEXISTENCE_PROMPT.format(
+    prompt = prompt.format(
         subject=subject,
         predicate=predicate,
         old_value=old_value,
@@ -181,15 +214,27 @@ class GraphMerger:
         similarity_threshold: float = 85.0,
         model=None,
         tokenizer=None,
+        cross_predicate_contradiction: bool = False,
+        prompts_dir: str | Path | None = None,
     ):
         """Initialize merger.
 
-        Contradiction resolution is model-only and always-on when a model is
-        present.  The cardinality of each predicate (single-valued → REPLACE,
-        multi-valued → COEXIST) is determined by one model inference call and
-        cached for the lifetime of this merger instance.  When ``model`` is
-        ``None`` all same-(subject, predicate)/different-object pairs coexist
-        (no removal) — this is the experiment path and the post-release state.
+        Contradiction resolution operates in two independent layers:
+
+        Same-predicate, different-object cardinality resolution: always-on when
+        a model is present.  The cardinality of each predicate (single-valued →
+        REPLACE, multi-valued → COEXIST) is determined by one model inference
+        call and cached for the lifetime of this merger instance.  When
+        ``model`` is ``None`` all same-(subject, predicate)/different-object
+        pairs coexist (no removal) — this is the experiment path and the
+        post-release state.
+
+        Cross-predicate contradiction detection: OFF by default
+        (``cross_predicate_contradiction=False``) because it over-removes
+        legitimate multi-valued facts (multiple valid values for one relation)
+        and independent facts expressed under different predicates.  Set
+        ``cross_predicate_contradiction=True`` only after verifying it is safe
+        for a specific knowledge domain.
 
         Args:
             similarity_threshold: Minimum rapidfuzz token_sort_ratio score (0–100)
@@ -198,14 +243,31 @@ class GraphMerger:
                 When set, this merger is a BASE-MODEL HOLDER; call
                 :meth:`release` to drop the reference.
             tokenizer: Tokenizer paired with *model*.
+            cross_predicate_contradiction: Enable cross-predicate contradiction
+                detection via ``detect_contradiction_with_model``.  Default OFF
+                — over-removes legitimate multi-valued/independent facts.
+                Same-predicate cardinality resolution is unaffected by this flag.
+            prompts_dir: Optional directory to load ``merger_coexistence.txt`` and
+                ``merger_contradiction.txt`` from.  Falls back to
+                ``configs/prompts/`` in the project root, then to the inline
+                constants ``_COEXISTENCE_PROMPT`` / ``_CONTRADICTION_PROMPT``.
+                Resolved once at construction so a config edit takes effect at the
+                next consolidation cycle (when a new merger instance is created).
         """
         self.similarity_threshold = similarity_threshold
         self.graph = nx.MultiDiGraph()
         self.model = model
         self.tokenizer = tokenizer
+        self.cross_predicate_contradiction = cross_predicate_contradiction
         self.contradictions_resolved = []  # log of resolved contradictions
         # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
         self._predicate_cardinality: dict[str, bool] = {}
+        # Resolve prompts once at construction so a file edit takes effect next cycle.
+        _pd = Path(prompts_dir) if prompts_dir else None
+        self._coexistence_prompt = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT, _pd)
+        self._contradiction_prompt = _load_prompt(
+            "merger_contradiction.txt", _CONTRADICTION_PROMPT, _pd
+        )
 
     def merge(self, session_graph: SessionGraph) -> nx.MultiDiGraph:
         """Merge a session graph into the cumulative graph.
@@ -409,18 +471,18 @@ class GraphMerger:
 
         Handles three cases:
 
-        1. Same (subject, predicate, object) — reinforcement: bump recurrence.
-        2. Same (subject, predicate) but different object — model contradiction
-           resolution (always-on when a model is present): ask whether the
-           predicate is single-valued (REPLACE, old edge removed) or
-           multi-valued (COEXIST, both edges kept).  Cardinality judgment is
-           cached per predicate.  When no model is present, fall through to
-           Case 3 (coexist-all).
-        3. New (subject, predicate, object) — insert new edge.
+        1. Identical triple already exists — exact-duplicate reinforcement: bump recurrence.
+        2. Same (subject, predicate) but different object — same-predicate,
+           different-object cardinality resolution (always-on when a model is
+           present): ask whether the predicate is single-valued (REPLACE, old
+           edge removed) or multi-valued (COEXIST, both edges kept).  Cardinality
+           judgment is cached per predicate.  When no model is present, fall
+           through to new-edge insertion (coexist-all).
+        3. New (subject, predicate, object) — new-edge insertion.
         """
         normalized_pred = _normalize_predicate(relation.predicate)
 
-        # Case 1: exact same triple already exists
+        # Exact-duplicate reinforcement: identical triple already exists
         existing_key = None
         if self.graph.has_node(subject) and self.graph.has_node(obj):
             existing_key = next(
@@ -443,7 +505,7 @@ class GraphMerger:
             edge["sessions"] = sessions
             return
 
-        # Case 2: same (subject, predicate) but different object
+        # Same-predicate, different-object cardinality resolution.
         # Ask the model whether both values can coexist (multi-valued)
         # or the new value replaces the old (single-valued/contradiction).
         # Decision is cached per predicate — one inference call per unique predicate.
@@ -469,6 +531,7 @@ class GraphMerger:
                         obj,
                         self.model,
                         self.tokenizer,
+                        self._coexistence_prompt,
                     )
                     self._predicate_cardinality[normalized_pred] = can_coexist
                     logger.info(
@@ -505,9 +568,17 @@ class GraphMerger:
                     )
                     graph_resolved = True
 
-        # Case 2b: model-based cross-predicate semantic contradiction detection
-        # Catches cases like moved_to vs lives_in that same-predicate matching misses
-        if not graph_resolved and self.model is not None and self.graph.has_node(subject):
+        # Cross-predicate contradiction detection (model-based).
+        # Catches cases like moved_to vs lives_in that same-predicate matching misses.
+        # Gated by self.cross_predicate_contradiction (default False) because it
+        # over-removes legitimate multi-valued and independent facts (observed in
+        # live use).  Same-predicate cardinality resolution above is unaffected by this flag.
+        if (
+            self.cross_predicate_contradiction
+            and not graph_resolved
+            and self.model is not None
+            and self.graph.has_node(subject)
+        ):
             existing_triples = []
             for succ in self.graph.successors(subject):
                 for _, data in self.graph[subject][succ].items():
@@ -521,6 +592,7 @@ class GraphMerger:
                     existing_triples,
                     self.model,
                     self.tokenizer,
+                    self._contradiction_prompt,
                 )
                 if contradicted is not None:
                     old_s, old_p, old_o = contradicted
@@ -556,7 +628,7 @@ class GraphMerger:
                                 session_id,
                             )
 
-        # Case 3 (and after contradiction cleanup): add new edge
+        # New-edge insertion (and after contradiction cleanup): new (subject, predicate, object)
         self.graph.add_edge(
             subject,
             obj,

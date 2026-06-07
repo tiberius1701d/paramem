@@ -989,6 +989,10 @@ class ConsolidationScheduleConfig:
     # entity_similarity_threshold mirrors GraphConfig (paramem/utils/config.py);
     # bridged into GraphMerger construction via ServerConfig.graph_config.
     entity_similarity_threshold: float = 85.0
+    # Cross-predicate contradiction detection; off by default —
+    # over-removes multi-valued/independent facts (observed in live use).
+    # Mirrors GraphConfig.cross_predicate_contradiction; bridged via graph_config.
+    cross_predicate_contradiction: bool = False
     # --- Graph-level SOTA enrichment (Task #10) ---
     # Runs at full consolidation over the cumulative graph to capture
     # cross-transcript second-order relations that per-transcript enrichment
@@ -1513,10 +1517,12 @@ class ServerConfig:
     def graph_config(self) -> GraphConfig:
         """Build GraphConfig for GraphMerger construction.
 
-        Mirrors ``entity_similarity_threshold`` from ``self.consolidation``.
+        Mirrors ``entity_similarity_threshold`` and
+        ``cross_predicate_contradiction`` from ``self.consolidation``.
         """
         return GraphConfig(
             entity_similarity_threshold=self.consolidation.entity_similarity_threshold,
+            cross_predicate_contradiction=self.consolidation.cross_predicate_contradiction,
         )
 
 

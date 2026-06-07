@@ -1,0 +1,12 @@
+You are checking if a new fact contradicts any existing fact about a person.
+
+Existing facts:
+{existing_facts}
+
+New fact: {subject} | {predicate} | {object}
+
+Does the new fact contradict or update any existing fact? A contradiction means the new fact makes an old fact no longer true (e.g. "moved to Berlin" contradicts "lives in Munich").
+
+Reply with EXACTLY one of:
+- CONTRADICTS <subject> | <predicate> | <object> (the old fact it replaces)
+- NO_CONTRADICTION
