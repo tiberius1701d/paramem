@@ -303,6 +303,7 @@ consolidation:
   quiet_hours_start: "07:00"
   quiet_hours_end: "22:00"
   entity_similarity_threshold: 85.0        # rapidfuzz token_sort_ratio minimum (0-100)
+  cross_predicate_contradiction: false     # cross-predicate contradiction detection; off by default (over-removes multi-valued facts)
   # --- Graph-level SOTA enrichment (Task #10) ---
   # Post-merge enrichment pass over the cumulative knowledge graph at every full
   # consolidation. Captures cross-transcript second-order relations and resolves

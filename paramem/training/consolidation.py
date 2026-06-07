@@ -270,6 +270,8 @@ class ConsolidationLoop:
         gc = graph_config or GraphConfig()
         self.merger = GraphMerger(
             similarity_threshold=gc.entity_similarity_threshold,
+            cross_predicate_contradiction=gc.cross_predicate_contradiction,
+            prompts_dir=self.prompts_dir,
         )
         self.scorer = PromotionScorer()
         self.last_session_graph = None
@@ -3762,8 +3764,8 @@ class ConsolidationLoop:
         # backfill_relation_type_from_graph for legacy keys).  Build a synthetic
         # SessionGraph and feed it through merger.merge() so the cumulative graph picks up
         # the correct relation_type on NET-NEW edges only (merger.py:557 sets relation_type
-        # from the supplied Relation on Case-3 inserts).  GraphMerger Case 1 (existing
-        # triple, merger.py:411-432) bumps recurrence_count but does NOT overwrite
+        # from the supplied Relation on new-edge insertion).  Exact-duplicate reinforcement
+        # (merger.py:411-432) bumps recurrence_count but does NOT overwrite
         # relation_type, so existing edges keep their original extraction-time value.
         # Because both the existing edge and the bookkeeping entry share that value
         # (both set at extraction time; backfill recovers it from the edge for legacy

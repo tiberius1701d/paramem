@@ -19,10 +19,11 @@ from paramem.graph.extractor import (
     _DEFAULT_EXTRACTION_PROMPT,
     _DEFAULT_PLAUSIBILITY_PROMPT,
     _DEFAULT_PROCEDURAL_PROMPT,
-    _load_prompt,
     build_speaker_context,
     load_anonymization_prompt,
 )
+from paramem.graph.merger import _COEXISTENCE_PROMPT, _CONTRADICTION_PROMPT
+from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
 from paramem.graph.schema_config import (
     format_entity_types,
     format_predicate_examples,
@@ -401,3 +402,112 @@ class TestAnonymizationPrompt:
         # A simple check: no single { immediately followed by a letter (unrendered placeholder).
         stray = re.findall(r"(?<!\{)\{[a-z_]+\}", rendered)
         assert not stray, f"Stray unrendered placeholder(s) found in rendered prompt: {stray!r}"
+
+
+class TestMergerCoexistencePrompt:
+    """Contract tests for the merger coexistence prompt.
+
+    The parser in ``check_predicate_coexistence`` keys on the literal strings
+    ``COEXIST`` and ``REPLACE`` (``merger.py`` lines that check
+    ``"COEXIST" in decision`` / ``"REPLACE" in decision``).  Removing either
+    keyword from the prompt would silently cause the model to never emit the
+    expected response and always fall through to the default.
+    """
+
+    def test_renders_without_leftover_slots(self):
+        """All four slots fill without KeyError; no leftover ``{slot}`` tokens."""
+        tmpl = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT)
+        rendered = tmpl.format(
+            predicate="owns_pet",
+            subject="Alex",
+            old_value="a cat",
+            new_value="a dog",
+        )
+        assert "{predicate}" not in rendered
+        assert "{subject}" not in rendered
+        assert "{old_value}" not in rendered
+        assert "{new_value}" not in rendered
+
+    def test_coexist_keyword_present(self):
+        """``COEXIST`` must survive rendering — the parser keys on this literal."""
+        tmpl = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT)
+        rendered = tmpl.format(
+            predicate="owns_pet",
+            subject="Alex",
+            old_value="a cat",
+            new_value="a dog",
+        )
+        assert "COEXIST" in rendered
+
+    def test_replace_keyword_present(self):
+        """``REPLACE`` must survive rendering — the parser keys on this literal."""
+        tmpl = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT)
+        rendered = tmpl.format(
+            predicate="owns_pet",
+            subject="Alex",
+            old_value="a cat",
+            new_value="a dog",
+        )
+        assert "REPLACE" in rendered
+
+    def test_file_byte_equivalent_to_inline_default(self):
+        """The prompt file must be byte-equivalent to ``_COEXISTENCE_PROMPT`` after
+        ``.strip()`` so the fallback and the file produce identical model inputs.
+        """
+        file_path = _DEFAULT_PROMPT_DIR / "merger_coexistence.txt"
+        assert file_path.exists(), f"Prompt file not found: {file_path}"
+        assert file_path.read_text().strip() == _COEXISTENCE_PROMPT
+
+
+class TestMergerContradictionPrompt:
+    """Contract tests for the merger contradiction prompt.
+
+    The parser in ``detect_contradiction_with_model`` keys on the literal strings
+    ``CONTRADICTS`` and ``NO_CONTRADICTION`` (``merger.py`` line that checks
+    ``output.startswith("CONTRADICTS")``).  Removing either keyword from the
+    prompt would silently break contradiction detection.
+    """
+
+    def test_renders_without_leftover_slots(self):
+        """All four slots fill without KeyError; no leftover ``{slot}`` tokens."""
+        tmpl = _load_prompt("merger_contradiction.txt", _CONTRADICTION_PROMPT)
+        rendered = tmpl.format(
+            existing_facts="- Alex | lives_in | Munich",
+            subject="Alex",
+            predicate="moved_to",
+            object="Berlin",
+        )
+        assert "{existing_facts}" not in rendered
+        assert "{subject}" not in rendered
+        assert "{predicate}" not in rendered
+        assert "{object}" not in rendered
+
+    def test_contradicts_keyword_present(self):
+        """``CONTRADICTS`` must survive rendering — the parser keys on this literal."""
+        tmpl = _load_prompt("merger_contradiction.txt", _CONTRADICTION_PROMPT)
+        rendered = tmpl.format(
+            existing_facts="- Alex | lives_in | Munich",
+            subject="Alex",
+            predicate="moved_to",
+            object="Berlin",
+        )
+        assert "CONTRADICTS" in rendered
+
+    def test_no_contradiction_keyword_present(self):
+        """``NO_CONTRADICTION`` must survive rendering — the parser keys on this literal."""
+        tmpl = _load_prompt("merger_contradiction.txt", _CONTRADICTION_PROMPT)
+        rendered = tmpl.format(
+            existing_facts="- Alex | lives_in | Munich",
+            subject="Alex",
+            predicate="moved_to",
+            object="Berlin",
+        )
+        assert "NO_CONTRADICTION" in rendered
+
+    def test_file_byte_equivalent_to_inline_default(self):
+        """The prompt file must be byte-equivalent to ``_CONTRADICTION_PROMPT`` after
+        ``.strip()`` so the fallback and the file produce identical model inputs.
+        """
+        file_path = _DEFAULT_PROMPT_DIR / "merger_contradiction.txt"
+        assert file_path.exists(), f"Prompt file not found: {file_path}"
+        assert file_path.read_text().strip() == _CONTRADICTION_PROMPT

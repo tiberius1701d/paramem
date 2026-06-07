@@ -141,6 +141,9 @@ class GraphConfig:
     extraction_temperature: float = 0.3
     max_extraction_tokens: int = 1024
     entity_similarity_threshold: float = 85.0
+    # Cross-predicate contradiction detection; off by default —
+    # over-removes multi-valued/independent facts (observed in live use).
+    cross_predicate_contradiction: bool = False
 
 
 @dataclass
