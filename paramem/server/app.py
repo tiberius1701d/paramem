@@ -4256,44 +4256,44 @@ async def gpu_acquire():
     }
 
 
-def _preload_memory_store(config, *, model, tokenizer):
-    """Build the MemoryStore, load registries, and hydrate the active-key cache.
+def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
+    """Load registries and hydrate the content cache on an existing *store* in place.
 
-    Called by :func:`_build_config_derived_state`.  Returned store is assigned
-    to ``_state["memory_store"]`` by the caller.
+    Rebuilds the entry cache from scratch: clears ``store._entries`` first so
+    this is a full rebuild, not an append.  Registries and simhashes are NOT
+    cleared — those are authoritative and remain intact throughout.
 
-    Source selection uses ``config.consolidation.mode`` (NOT
-    ``_state["mode"]``).  This prevents conflating the consolidation
-    persistence mode (train/simulate) with the runtime mode (local/cloud-only).
+    Called from two sites:
 
-    boot_degraded lifecycle:
-    - Cleared when full hydration succeeds.
-    - Cleared when ``config.inference.preload_cache=False`` (intentional opt-out).
-    - Cleared (with an empty store, early return) while a base-model swap is in
-      flight — the on-disk registry describes the PREVIOUS model and is invalid
-      for the loaded one (see the base-swap gate below).
-    - Set when partial hydration occurs (some active keys not materialised),
-      including the registry-sha256 binding-bug (slot present but unmounted).
+    * :func:`_preload_memory_store` (boot / in-process reload) — after a fresh
+      :class:`MemoryStore` has been constructed and the base-swap gate has passed.
+    * :func:`_finalize_full` (post-consolidation) — after the full-cycle fold has
+      rewritten the on-disk registries.  Re-hydrating reconciles the live
+      ``_entries`` cache to the newly-folded registry without requiring a restart,
+      fixing the staleness bug where ``/debug/dump`` reported the pre-fold count
+      (234) instead of the active post-fold count (186) until the server restarted.
 
-    The ``WeightMemorySource`` is kept as a frame-local and dropped on return —
-    mirrors the no-frame-retention pattern of ``_load_model_into_state`` so the
-    base model is not pinned past the preload.
+    **NO-BASE-MODEL-PINNING INVARIANT** — the ``WeightMemorySource`` is kept as a
+    frame-local and set to ``None`` before return.  The caller passes ``model``
+    and ``tokenizer`` as direct kwarg expressions (``model=loop.model``), NOT via
+    a caller local, so the source is the only reference holding the model handles
+    inside this frame.  Dropping ``_source = None`` releases them.  A surviving
+    reference here would re-introduce the cloud-only VRAM leak fixed 2026-05-21.
 
     Parameters
     ----------
+    store:
+        Live :class:`~paramem.memory.store.MemoryStore` to hydrate in place.
+        Must be the shared singleton (``_state["memory_store"]`` /
+        ``loop.store``) so all holders (router, consolidation loop, /debug/dump)
+        observe the rebuild without re-wiring.
     config:
         Live server config object.
     model:
-        Base model handle (``_state["model"]``) passed directly as a kwarg
-        expression at the call site — do NOT bind to a caller local.
+        Base model handle passed directly as a kwarg expression — do NOT bind to
+        a caller local before passing.
     tokenizer:
-        Tokenizer handle (``_state["tokenizer"]``) passed the same way.
-
-    Returns
-    -------
-    MemoryStore
-        The fully-constructed store (registries loaded; entries hydrated when
-        ``preload_cache=True`` and the source probe succeeded).
+        Tokenizer handle — same constraint.
     """
     from paramem.memory.source import (
         DiskMemorySource as _DiskMemorySource,
@@ -4301,42 +4301,19 @@ def _preload_memory_store(config, *, model, tokenizer):
     from paramem.memory.source import (
         WeightMemorySource as _WeightMemorySource,
     )
-    from paramem.memory.store import MemoryStore as _MemoryStore
 
-    memory_store = _MemoryStore(
-        replay_enabled=config.consolidation.indexed_key_replay,
-    )
-
-    # Base-swap invalidity gate.  While a base-model swap is in flight (Phase A has
-    # deleted the old model's weight slots; Phase B has not yet retrained the new
-    # model), the on-disk per-tier registries describe the OLD model and have no
-    # relation to the loaded NEW one.  Do NOT load them into the live store — the
-    # new model knows nothing until Phase B completes.  The registry files stay on
-    # disk untouched (Phase B retrains from each tier's graph.json; a rollback
-    # restores them from the swap bundle).  This keeps the live store consistent
-    # with the loaded weights instead of carrying phantom previous-model keys.  The
-    # marker is written before the reload and cleared on Phase B success, so it
-    # covers both the in-process reload and a boot-resume.
-    from paramem.server.trial_state import read_trial_marker as _read_trial_marker
-
-    _swap_marker = _read_trial_marker((config.paths.data / "state").resolve())
-    if _swap_marker is not None and _swap_marker.migration_kind == "base_swap":
-        _state["store_load_degraded"] = False
-        _state["boot_degraded"] = None
-        logger.info(
-            "preload_cache: base-swap in flight (phase=%s) — on-disk registry "
-            "describes the previous model; live store starts empty until Phase B "
-            "retrains the new model.",
-            _swap_marker.base_swap_phase or "?",
-        )
-        return memory_store
+    # Rebuild the entry cache from scratch.  Registries and simhashes survive —
+    # they are the authoritative key-lifecycle state and must not be purged here.
+    _dropped = store.clear_entries()
+    if _dropped:
+        logger.debug("_hydrate_memory_store_in_place: cleared %d stale entry/entries", _dropped)
 
     try:
-        memory_store.load_registries_from_disk(config.adapter_dir)
+        store.load_registries_from_disk(config.adapter_dir)
         _state["store_load_degraded"] = False
     except Exception:
         logger.error(
-            "Boot-time registry load failed; memory store will start empty — "
+            "Registry load failed during store hydration; memory store will be empty — "
             "active-store migration will be refused until this is resolved",
             exc_info=True,
         )
@@ -4353,8 +4330,8 @@ def _preload_memory_store(config, *, model, tokenizer):
         )
     else:
         _preload_keys_by_tier: dict[str, list[str]] = {}
-        for _tier in memory_store.tiers_with_registry():
-            _active = memory_store.active_keys_in_tier(_tier)
+        for _tier in store.tiers_with_registry():
+            _active = store.active_keys_in_tier(_tier)
             if _active:
                 _preload_keys_by_tier[_tier] = _active
 
@@ -4423,7 +4400,7 @@ def _preload_memory_store(config, *, model, tokenizer):
                             _missed_by_tier.setdefault(_tier, []).append(_key)
                             continue
                         # Don't re-register; the registry is already loaded.
-                        memory_store.put(_tier, _key, _entry, register=False)
+                        store.put(_tier, _key, _entry, register=False)
                         _hits += 1
                 logger.info("preload_cache: cached %d / %d active key(s)", _hits, _total)
                 if _hits < _total:
@@ -4458,7 +4435,7 @@ def _preload_memory_store(config, *, model, tokenizer):
     # inference.preload_cache=False this is the sole provenance write at boot,
     # and is sufficient for the router's speaker index (iter_bookkeeping).
     try:
-        _meta_stats = memory_store.load_bookkeeping_from_disk(config.key_metadata_path)
+        _meta_stats = store.load_bookkeeping_from_disk(config.key_metadata_path)
         logger.info(
             "load_bookkeeping_from_disk: loaded=%d orphaned=%d legacy_upgraded=%d",
             _meta_stats["loaded"],
@@ -4467,9 +4444,85 @@ def _preload_memory_store(config, *, model, tokenizer):
         )
     except Exception:
         logger.exception(
-            "Boot-time key_metadata bookkeeping load failed; _bookkeeping will be empty "
+            "key_metadata bookkeeping load failed; _bookkeeping will be empty "
             "until next consolidation cycle (speaker scoping will cold-start)"
         )
+
+
+def _preload_memory_store(config, *, model, tokenizer):
+    """Build the MemoryStore, load registries, and hydrate the active-key cache.
+
+    Called by :func:`_build_config_derived_state`.  Returned store is assigned
+    to ``_state["memory_store"]`` by the caller.
+
+    Source selection uses ``config.consolidation.mode`` (NOT
+    ``_state["mode"]``).  This prevents conflating the consolidation
+    persistence mode (train/simulate) with the runtime mode (local/cloud-only).
+
+    boot_degraded lifecycle:
+    - Cleared when full hydration succeeds.
+    - Cleared when ``config.inference.preload_cache=False`` (intentional opt-out).
+    - Cleared (with an empty store, early return) while a base-model swap is in
+      flight — the on-disk registry describes the PREVIOUS model and is invalid
+      for the loaded one (see the base-swap gate below).
+    - Set when partial hydration occurs (some active keys not materialised),
+      including the registry-sha256 binding-bug (slot present but unmounted).
+
+    The ``WeightMemorySource`` is kept as a frame-local and dropped on return —
+    mirrors the no-frame-retention pattern of ``_load_model_into_state`` so the
+    base model is not pinned past the preload.  This invariant is enforced inside
+    :func:`_hydrate_memory_store_in_place` which this function delegates to after
+    construction and the base-swap gate.
+
+    Parameters
+    ----------
+    config:
+        Live server config object.
+    model:
+        Base model handle (``_state["model"]``) passed directly as a kwarg
+        expression at the call site — do NOT bind to a caller local.
+    tokenizer:
+        Tokenizer handle (``_state["tokenizer"]``) passed the same way.
+
+    Returns
+    -------
+    MemoryStore
+        The fully-constructed store (registries loaded; entries hydrated when
+        ``preload_cache=True`` and the source probe succeeded).
+    """
+    from paramem.memory.store import MemoryStore as _MemoryStore
+
+    memory_store = _MemoryStore(
+        replay_enabled=config.consolidation.indexed_key_replay,
+    )
+
+    # Base-swap invalidity gate.  While a base-model swap is in flight (Phase A has
+    # deleted the old model's weight slots; Phase B has not yet retrained the new
+    # model), the on-disk per-tier registries describe the OLD model and have no
+    # relation to the loaded NEW one.  Do NOT load them into the live store — the
+    # new model knows nothing until Phase B completes.  The registry files stay on
+    # disk untouched (Phase B retrains from each tier's graph.json; a rollback
+    # restores them from the swap bundle).  This keeps the live store consistent
+    # with the loaded weights instead of carrying phantom previous-model keys.  The
+    # marker is written before the reload and cleared on Phase B success, so it
+    # covers both the in-process reload and a boot-resume.
+    from paramem.server.trial_state import read_trial_marker as _read_trial_marker
+
+    _swap_marker = _read_trial_marker((config.paths.data / "state").resolve())
+    if _swap_marker is not None and _swap_marker.migration_kind == "base_swap":
+        _state["store_load_degraded"] = False
+        _state["boot_degraded"] = None
+        logger.info(
+            "preload_cache: base-swap in flight (phase=%s) — on-disk registry "
+            "describes the previous model; live store starts empty until Phase B "
+            "retrains the new model.",
+            _swap_marker.base_swap_phase or "?",
+        )
+        return memory_store
+
+    # Delegate registry load + entry hydration to the shared helper so the same
+    # path is used at boot and at post-consolidation re-hydration.
+    _hydrate_memory_store_in_place(memory_store, config, model=model, tokenizer=tokenizer)
 
     # Infrastructure integrity check — runs after all loaders so the store
     # is fully populated for cross-consistency checks.  A corrupt registry
@@ -12276,9 +12329,20 @@ def _run_full_consolidation_sync() -> None:
             # operators see "FINGERPRINT MISMATCH … PA routing DISABLED" red
             # rows even though main is healthy.
             _revalidate_main_adapter_manifests(_state)
-            # were just re-saved with a fresh registry hash + format; the
-            # manifest is authoritative.  Also drops entries for retired
-            # interim slots so the inference path stops probing them.
+            # Reconcile the live entry cache to the rewritten registries so
+            # /debug/dump and any _entries-based count reflect the post-fold
+            # active set immediately, without requiring a restart.  The stale
+            # pre-fold interim entries (e.g. 234 → 186) are dropped here;
+            # active keys are re-probed against the freshly-retrained weights.
+            # Guard mirrors the total_keys guard below — no-op when replay is
+            # disabled (no registries to reload from).
+            if loop.store.replay_enabled:
+                _hydrate_memory_store_in_place(
+                    loop.store,
+                    config,
+                    model=loop.model,
+                    tokenizer=loop.tokenizer,
+                )
             total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
             _state["last_consolidation_result"] = {
                 "status": "rolled_back" if result.get("rolled_back") else "full_trained",

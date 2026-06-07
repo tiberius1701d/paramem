@@ -291,6 +291,22 @@ class MemoryStore:
         self._bookkeeping.pop(key, None)
         return former
 
+    def clear_entries(self) -> int:
+        """Remove all entry payloads from the content cache.
+
+        Clears ``_entries`` only — registries, simhashes, and ``_bookkeeping``
+        are left intact so the authoritative key-lifecycle state survives the
+        purge.  The intended caller is
+        :func:`paramem.server.app._hydrate_memory_store_in_place`, which clears
+        the stale pre-fold cache before re-probing active keys against the
+        freshly-retrained weights.
+
+        Returns the total number of entries that were dropped across all tiers.
+        """
+        total = sum(len(tier_entries) for tier_entries in self._entries.values())
+        self._entries.clear()
+        return total
+
     def move(self, key: str, new_tier: str) -> None:
         """Move *key* from its current tier to *new_tier* atomically.
 
