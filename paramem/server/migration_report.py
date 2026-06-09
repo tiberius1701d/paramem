@@ -259,13 +259,13 @@ def _row_graph_shape(
     trial_graph_path: Path | None,
     *,
     pre_trial_graph: "Any | None" = None,
+    trial_graph: "Any | None" = None,
 ) -> dict[str, Any]:
     """Compute the graph-shape comparison row.
 
-    Accepts an optional in-memory graph for the pre-trial side.  In
-    production the server runs with ``persist_graph=False`` so the live
-    cumulative graph is transient; the in-memory fallback lets the row render
-    real data without materialising to disk.
+    Both sides accept an in-memory graph that takes priority over the
+    corresponding file path.  The production server is RAM-only so neither
+    side writes a graph file; both in-memory objects are passed directly.
 
     Parameters
     ----------
@@ -276,6 +276,9 @@ def _row_graph_shape(
     pre_trial_graph:
         In-memory graph for the pre-trial side.  When provided, takes
         priority over ``pre_trial_graph_path``.
+    trial_graph:
+        In-memory graph for the trial side.  When provided, takes
+        priority over ``trial_graph_path``.
 
     Returns
     -------
@@ -283,7 +286,7 @@ def _row_graph_shape(
         Row dict with ``pre_trial`` and ``trial`` cells.
     """
     pre_summary = _summarise_graph(pre_trial_graph_path, graph=pre_trial_graph)
-    trial_summary = _summarise_graph(trial_graph_path)
+    trial_summary = _summarise_graph(trial_graph_path, graph=trial_graph)
     return {
         "metric": "Graph shape",
         "pre_trial": pre_summary,
@@ -302,6 +305,7 @@ def build_comparison_report(
     pre_trial_graph_path: Path | None,
     trial_graph_path: Path | None,
     pre_trial_graph: "Any | None" = None,
+    trial_graph: "Any | None" = None,
 ) -> dict[str, Any]:
     """Build the real comparison report for a TRIAL run.
 
@@ -320,13 +324,17 @@ def build_comparison_report(
         Cumulative graph from before the trial (filesystem path).
         ``None`` when no prior graph exists (fresh install).
     trial_graph_path:
-        ``data/ha/state/trial_graph/cumulative_graph.json`` (or whatever
-        path the trial marker recorded).  ``None`` when the trial ran
-        with NO_NEW_SESSIONS.
+        Filesystem path to the trial graph JSON, or ``None``.  Superseded
+        by ``trial_graph`` when both are provided.
     pre_trial_graph:
         In-memory ``nx.MultiDiGraph`` for the pre-trial side.  When
-        provided, takes priority over ``pre_trial_graph_path``.
-        Production server uses this when ``persist_graph=False``.
+        provided, takes priority over ``pre_trial_graph_path``.  The
+        production server is RAM-only and always passes this.
+    trial_graph:
+        In-memory ``nx.MultiDiGraph`` for the trial side stashed by
+        ``_run_trial_consolidation`` after the fold.  When provided, takes
+        priority over ``trial_graph_path``.  The production server is
+        RAM-only and always passes this.
 
     Returns
     -------
@@ -346,6 +354,7 @@ def build_comparison_report(
                 pre_trial_graph_path,
                 trial_graph_path,
                 pre_trial_graph=pre_trial_graph,
+                trial_graph=trial_graph,
             ),
         ],
         "operator_line": COMPARISON_REPORT_OPERATOR_LINE,

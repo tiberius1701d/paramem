@@ -166,6 +166,32 @@ class DebugSnapshotWriter:
         for tier in tier_names:
             save_adapter(self._loop.model, tiers_root / tier / "adapter_weights", tier)
 
+    def on_recall_probe(
+        self,
+        per_key: list[dict] | None,
+        *,
+        phase: str,
+        adapter_name: str,
+        interim_stamp: str | None = None,
+    ) -> None:
+        """Persist a per-key recall verdict (with raw_output) for post-mortem.
+
+        Writes ``<base>/recall_probes/<phase>_<adapter_name>.json``.  Each
+        element of *per_key* carries at minimum ``key``, ``exact_match``,
+        ``confidence``, SPO ground-truth and recalled fields, ``failure_reason``,
+        and ``raw_output`` — exactly the shape produced by
+        :func:`~paramem.training.recall_eval.evaluate_indexed_recall`.
+
+        No-op when debug is disabled (``save_cycle_snapshots=False`` or
+        ``_debug_base is None``) or when *per_key* is ``None``.
+        """
+        if per_key is None:
+            return
+        base = self._active_base(interim_stamp=interim_stamp)
+        if base is None:
+            return
+        _write_json(base / "recall_probes" / f"{phase}_{adapter_name}.json", per_key)
+
     def on_cycle_end(
         self,
         cycle_summary: dict[str, Any],

@@ -478,7 +478,7 @@ class TestBookkeeping:
                 {
                     "keys": {
                         "graph1": {
-                            "sessions_seen": 1,
+                            "recurrence_count": 1,
                             "speaker_id": "alice",
                             "first_seen_cycle": 2,
                             "relation_type": "preference",
@@ -511,7 +511,7 @@ class TestBookkeeping:
                 {
                     "keys": {
                         "graph1": {
-                            "sessions_seen": 1,
+                            "recurrence_count": 1,
                             "speaker_id": "alice",
                             "first_seen_cycle": 2,
                             # relation_type deliberately absent (legacy file)

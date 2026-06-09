@@ -558,7 +558,6 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
         semantic_adapter_config=AdapterConfig(),
         memory_store=_MS(replay_enabled=False),
         output_dir=tmp_path,
-        persist_graph=False,
         **flipped,
     )
 
@@ -822,7 +821,6 @@ def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
         semantic_adapter_config=AdapterConfig(),
         memory_store=_MS(replay_enabled=False),
         output_dir=tmp_path,
-        persist_graph=False,
         save_cycle_snapshots=True,
         snapshot_dir=tmp_path,
     )

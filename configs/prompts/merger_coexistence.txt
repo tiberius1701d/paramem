@@ -1,9 +1,21 @@
-Can a person have more than one value for the relationship "{predicate}"?
+Classify the relationship between two values for the predicate "{predicate}".
 
-Example: {subject} {predicate} {old_value}, and now {subject} {predicate} {new_value}.
+--- COEXIST ---
+Both values can be true simultaneously (multi-valued predicate).
+POSITIVE: Alex has_pet cat, and now Alex has_pet dog → COEXIST
+POSITIVE: Alex speaks German, and now Alex speaks French → COEXIST
 
-Can both be true at the same time, or does the new value replace the old one?
+--- REPLACE ---
+The new value supersedes the old one (single-valued predicate).
+POSITIVE: Alex lives_in Munich, and now Alex lives_in Berlin → REPLACE
+POSITIVE: Alex date_of_birth 1990, and now Alex date_of_birth 1991 → REPLACE
 
-Reply with EXACTLY one word:
-- COEXIST (both can be true, e.g. a person can have multiple pets)
-- REPLACE (only one can be true, e.g. a person has one date of birth)
+--- CLASSIFY ---
+Subject: {subject}
+Predicate: {predicate}
+Old value: {old_value}
+New value: {new_value}
+
+Reply with EXACTLY one of:
+- COEXIST
+- REPLACE

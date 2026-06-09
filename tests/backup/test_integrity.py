@@ -501,6 +501,129 @@ class TestRequiredVsOptional:
 
 
 # ---------------------------------------------------------------------------
+# Interim tier manifest check — nested weight-slot resolution
+# ---------------------------------------------------------------------------
+
+
+class TestInterimManifestResolution:
+    """Regression: _find_live_slot_for_tier must resolve interim's NESTED slot root.
+
+    Interim adapter dirs are NESTED at ``<adapter_dir>/episodic/interim_<stamp>/``
+    rather than flat at ``<adapter_dir>/episodic_interim_<stamp>/``.  Before the
+    fix, the manifest check passed the flat tier *name* which produced a
+    non-existent path, causing every interim tier with keys to emit a spurious
+    ``no weight slot`` failure.
+    """
+
+    def _build_interim_dir(
+        self,
+        adapter_dir: Path,
+        stamp: str,
+        keys: list[str],
+        include_slot: bool = True,
+    ) -> tuple[str, Path]:
+        """Create an interim tier under ``adapter_dir/episodic/interim_<stamp>/``.
+
+        Returns ``(tier_name, interim_dir)`` where *tier_name* is the PEFT
+        adapter name used internally (``episodic_interim_<stamp>``).
+        """
+        from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+
+        interim_dir = adapter_dir / "episodic" / f"interim_{stamp}"
+        interim_dir.mkdir(parents=True, exist_ok=True)
+
+        _write_key_registry(interim_dir / "indexed_key_registry.json", keys)
+        _write_simhash(interim_dir / "simhash_registry.json", {k: i for i, k in enumerate(keys)})
+
+        if include_slot:
+            slot = interim_dir / "20260603-000000"
+            _write_manifest(slot, f"{INTERIM_NAME_PREFIX}{stamp}")
+
+        tier_name = f"{INTERIM_NAME_PREFIX}{stamp}"
+        return tier_name, interim_dir
+
+    def test_interim_weight_slot_found_no_spurious_failure(self, tmp_path):
+        """train mode: interim tier with nested slot → NO 'no weight slot' failure.
+
+        Regression for: ``Integrity failure [manifest/episodic_interim_<stamp>]
+        data/ha/adapters/episodic_interim_<stamp>/meta.json: no weight slot``
+        """
+        cfg = _make_config(tmp_path, mode="train")
+        adapter_dir = cfg.adapter_dir
+
+        # Main episodic tier with keys + slot
+        ep_dir = adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
+        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_manifest(ep_dir / "20260603-000000", "episodic")
+
+        # Nested interim slot with keys + nested weight slot
+        self._build_interim_dir(adapter_dir, "20260603T0000", ["ikey1"], include_slot=True)
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is True, f"Unexpected failures: {report.failures}"
+        manifest_failures = [
+            f for f in report.failures if f.category == "manifest" and "interim" in f.tier
+        ]
+        assert manifest_failures == [], f"Spurious interim manifest failure(s): {manifest_failures}"
+
+    def test_interim_missing_weight_slot_still_reported(self, tmp_path):
+        """train mode: interim tier with keys but NO nested slot → 'no weight slot' IS reported.
+
+        Ensures the fix does not mask genuine missing-slot failures for interim tiers.
+        """
+        cfg = _make_config(tmp_path, mode="train")
+        adapter_dir = cfg.adapter_dir
+
+        # Main episodic with keys + slot (must be valid so it doesn't mask interim)
+        ep_dir = adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
+        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_manifest(ep_dir / "20260603-000000", "episodic")
+
+        # Interim with keys but NO nested weight slot
+        self._build_interim_dir(adapter_dir, "20260603T0000", ["ikey1"], include_slot=False)
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is False
+        manifest_failures = [
+            f for f in report.failures if f.category == "manifest" and "interim" in f.tier
+        ]
+        assert len(manifest_failures) == 1, (
+            f"Expected exactly one interim manifest failure, got: {manifest_failures}"
+        )
+        assert manifest_failures[0].detail == "no weight slot"
+
+    def test_main_tier_manifest_still_resolves_flat(self, tmp_path):
+        """train mode: main tier slot is still found correctly after the refactor.
+
+        Verifies the fix does not break main-tier (flat) weight-slot resolution.
+        """
+        cfg = _make_config(tmp_path, mode="train")
+        adapter_dir = cfg.adapter_dir
+
+        ep_dir = adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1", "key2"])
+        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "key2": 2})
+        # Flat slot under episodic/
+        _write_manifest(ep_dir / "20260501-000000", "episodic")
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+
+        assert report.ok is True, f"Main-tier manifest should resolve: {report.failures}"
+        manifest_checks = [
+            c for c in report.checks if c.category == "manifest" and c.tier == "episodic"
+        ]
+        assert len(manifest_checks) == 1
+        assert manifest_checks[0].status == _OK
+
+
+# ---------------------------------------------------------------------------
 # FileCheck and IntegrityReport data model
 # ---------------------------------------------------------------------------
 

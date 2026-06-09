@@ -265,7 +265,7 @@ paramem/
 │   ├── key_registry.py     # Active key tracking + fidelity history
 │   ├── consolidation.py    # Consolidation loop orchestrator
 │   └── ...
-├── graph/            # Knowledge graph extraction, merging, QA distillation
+├── graph/            # Knowledge graph extraction, merging, keyed-entry encoding
 ├── evaluation/       # Recall metrics, embedding scoring, fidelity, RAG baselines
 └── utils/            # Configuration (YAML-driven)
 configs/              # Default configuration
@@ -293,11 +293,11 @@ Platform-specific notes for Blackwell GPUs and WSL2 live under [Platform notes](
 
 1. **Extract:** LLM-based graph extraction pulls entities and relations from session text (optionally using a dedicated distillation model for higher quality)
 2. **Merge:** Entity resolution deduplicates and aggregates knowledge across sessions
-3. **Score:** Composite scoring (PageRank + degree + recurrence + recency) identifies promotion candidates
+3. **Score:** Per-key recurrence count tracks how often each fact has been re-observed across sessions
 4. **Assign keys:** Each fact gets a unique key (`graph1`, `graph2`, ...) for addressable recall
 5. **Train:** LoRA adapters learn the key→fact mapping via chat-template formatted training
 6. **Verify:** SimHash registry detects hallucination with continuous confidence scoring
-7. **Promote:** Well-reinforced facts move from episodic to semantic adapter
+7. **Promote:** Keys whose per-key recurrence_count reaches the promotion threshold move from the episodic to the semantic adapter at the consolidation fold
 8. **Decay:** Unreinforced facts fade after configurable window
 
 ## Prompt Engineering

@@ -2186,6 +2186,77 @@ class TestDebugArtifacts:
         loop.merger.save_graph.assert_not_called()
         assert list(tmp_path.iterdir()) == []
 
+    def test_on_recall_probe_writes_per_key_json(self, tmp_path):
+        """on_recall_probe writes recall_probes/<phase>_<adapter>.json with payload."""
+        out_dir = tmp_path / "cycle_5" / "run_abc"
+        _, writer = self._make_writer(base=out_dir)
+
+        per_key = [
+            {
+                "key": "proc32",
+                "exact_match": True,
+                "confidence": 0.98,
+                "subject": "Alex",
+                "predicate": "listens_to",
+                "object": "jazz playlists",
+                "recalled_subject": "Alex",
+                "recalled_predicate": "listens_to",
+                "recalled_object": "jazz playlists",
+                "failure_reason": None,
+                "raw_output": (
+                    '{"key":"proc32","subject":"Alex",'
+                    '"predicate":"listens_to","object":"jazz playlists"}'
+                ),
+            },
+            {
+                "key": "proc33",
+                "exact_match": False,
+                "confidence": 0.0,
+                "subject": "Alex",
+                "predicate": "listens_to",
+                "object": "Example FM",
+                "recalled_subject": None,
+                "recalled_predicate": None,
+                "recalled_object": None,
+                "failure_reason": "parse_failure",
+                "raw_output": "garbled output",
+            },
+        ]
+        writer.on_recall_probe(per_key, phase="disk_verify", adapter_name="procedural")
+
+        artifact = out_dir / "recall_probes" / "disk_verify_procedural.json"
+        assert artifact.exists(), f"Expected artifact at {artifact}"
+        saved = json.loads(artifact.read_text())
+        assert saved == per_key
+        assert saved[0]["raw_output"] != ""
+        assert saved[1]["failure_reason"] == "parse_failure"
+
+    def test_on_recall_probe_noop_when_per_key_none(self, tmp_path):
+        """on_recall_probe is a no-op when per_key is None."""
+        out_dir = tmp_path / "cycle_5" / "run_abc"
+        _, writer = self._make_writer(base=out_dir)
+
+        writer.on_recall_probe(None, phase="train_fill", adapter_name="episodic")
+
+        recall_dir = out_dir / "recall_probes"
+        assert not recall_dir.exists()
+
+    def test_on_recall_probe_noop_when_debug_off(self, tmp_path):
+        """on_recall_probe is a no-op when save_cycle_snapshots=False."""
+        from paramem.training.debug_snapshot import DebugSnapshotWriter
+
+        loop = MagicMock()
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir_for = MagicMock(return_value=None)
+        loop._current_interim_stamp_or_none = MagicMock(return_value=None)
+        writer = DebugSnapshotWriter(loop)
+
+        per_key = [{"key": "proc32", "exact_match": True, "raw_output": "x"}]
+        writer.on_recall_probe(per_key, phase="disk_verify", adapter_name="procedural")
+
+        assert list(tmp_path.iterdir()) == []
+
 
 # ---------------------------------------------------------------------------
 # Extraction pipeline alignment tests

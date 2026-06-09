@@ -634,7 +634,6 @@ class TestRunExtractGraphHelper:
             semantic_adapter_config=server_config.semantic_adapter_config,
             memory_store=MemoryStore(replay_enabled=cc.indexed_key_replay),
             output_dir=tmp_path,
-            persist_graph=False,
             save_cycle_snapshots=False,
             prompts_dir=server_config.prompts_dir,
             extraction_max_tokens=cc.extraction_max_tokens,
@@ -685,7 +684,6 @@ class TestBatchConsolidationE2E:
             semantic_adapter_config=AdapterConfig(),
             memory_store=MemoryStore(replay_enabled=True),
             output_dir=tmp_path,
-            persist_graph=False,
             save_cycle_snapshots=False,
         )
 

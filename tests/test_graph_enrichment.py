@@ -22,10 +22,10 @@ from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingCon
 def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     """Build a minimal ConsolidationLoop for enrichment tests.
 
-    Graph is transient (persist_graph=False). Model/tokenizer are mocks
-    so no GPU is touched.  The mock model pre-populates ``peft_config``
-    with all three required adapters so ``_ensure_adapters`` skips the
-    real PEFT ``create_adapter`` calls.
+    Graph is transient (RAM-only). Model/tokenizer are mocks so no GPU
+    is touched.  The mock model pre-populates ``peft_config`` with all
+    three required adapters so ``_ensure_adapters`` skips the real PEFT
+    ``create_adapter`` calls.
 
     Keyword args forwarded to ConsolidationLoop override the defaults
     set here (e.g. pass ``extraction_noise_filter=""`` to test the
@@ -66,7 +66,6 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
         memory_store=_MS(replay_enabled=replay_enabled),
         procedural_adapter_config=None,
         output_dir=tmp_path,
-        persist_graph=False,
         **defaults,
     )
     # Admit-all probe stub: the real _probe_passing_keys runs evaluate_indexed_recall,
@@ -1220,3 +1219,335 @@ class TestInterimEnrichmentHook:
 
         assert result["mode"] == "degenerated"
         loop._run_graph_enrichment.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for _mint_keys_for_keyless_edges (fold pre-pass)
+# ---------------------------------------------------------------------------
+
+
+class TestMintKeysForKeylessEdges:
+    """Unit tests for the fold pre-pass that mints keys for keyless graph edges.
+
+    Uses _make_loop from this module (real nx.MultiDiGraph + real MemoryStore,
+    mocked model/tokenizer so no GPU).  replay_enabled=True so store.put()
+    writes into the KeyRegistry.
+    """
+
+    def test_keyless_edge_minted_in_store_and_tier_keyed(self, tmp_path):
+        """A keyless predicate-bearing edge produces a key in store + tier_keyed."""
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        graph = loop.merger.graph
+        graph.add_edge(
+            "Alice",
+            "Berlin",
+            predicate="lives_in",
+            relation_type="factual",
+            confidence=0.9,
+        )
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        # Exactly one key minted (factual → episodic).
+        assert len(tier_keyed["episodic"]) == 1
+        assert len(tier_keyed["semantic"]) == 0
+        assert len(tier_keyed["procedural"]) == 0
+
+        entry = tier_keyed["episodic"][0]
+        assert entry["subject"] == "Alice"
+        assert entry["predicate"] == "lives_in"
+        assert entry["object"] == "Berlin"
+        key = entry["key"]
+        assert key.startswith("graph")
+
+        # Key is registered in the store and has bookkeeping.
+        all_keys = loop.store.all_active_keys()
+        assert key in all_keys
+
+        bk = loop.store.bookkeeping_for_key(key)
+        assert bk is not None
+        assert bk["recurrence_count"] == 1
+        assert bk["first_seen_cycle"] == loop.cycle_count
+        assert bk["last_seen_cycle"] == loop.cycle_count
+        assert bk["relation_type"] == "factual"
+        assert bk["speaker_id"] == ""
+
+    def test_counter_advanced_for_each_minted_key(self, tmp_path):
+        """_indexed_next_index advances once per minted episodic key."""
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        initial_index = loop._indexed_next_index
+        graph = loop.merger.graph
+        # Add two keyless edges.
+        graph.add_edge("Alice", "Berlin", predicate="lives_in", relation_type="factual")
+        graph.add_edge("Bob", "Coffee", predicate="likes", relation_type="factual")
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        assert len(tier_keyed["episodic"]) == 2
+        assert loop._indexed_next_index == initial_index + 2
+
+        # Keys are sequential from the initial index.
+        keys = {e["key"] for e in tier_keyed["episodic"]}
+        assert f"graph{initial_index}" in keys
+        assert f"graph{initial_index + 1}" in keys
+
+    def test_keyed_edge_not_reminted(self, tmp_path):
+        """An edge that already has an ik_key attribute must be left untouched."""
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        graph = loop.merger.graph
+        graph.add_edge(
+            "Alice",
+            "Berlin",
+            predicate="lives_in",
+            relation_type="factual",
+            **{_IK_KEY_ATTR: "graph1"},  # already keyed
+        )
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        initial_index = loop._indexed_next_index
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        # Nothing minted — the edge already has a key.
+        assert tier_keyed["episodic"] == []
+        assert loop._indexed_next_index == initial_index
+
+    def test_predicate_less_edge_not_minted(self, tmp_path):
+        """An edge with no predicate must not receive a key (negative control)."""
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        graph = loop.merger.graph
+        # Add an edge with NO predicate field (not keyable).
+        graph.add_edge("Alice", "Berlin", relation_type="factual", confidence=0.5)
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        initial_index = loop._indexed_next_index
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        assert tier_keyed["episodic"] == []
+        assert tier_keyed["semantic"] == []
+        assert tier_keyed["procedural"] == []
+        assert loop._indexed_next_index == initial_index
+
+    def test_minted_key_present_in_store_all_active_keys(self, tmp_path):
+        """Minted key is retrievable via store.all_active_keys() — not counted as drift."""
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        graph = loop.merger.graph
+        graph.add_edge("Carol", "London", predicate="visited", relation_type="factual")
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        minted_key = tier_keyed["episodic"][0]["key"]
+        _all_keyed = {e["key"] for tl in tier_keyed.values() for e in tl}
+        active_keys = loop.store.all_active_keys()
+
+        # Key must be in both sets so drift computation excludes it.
+        assert minted_key in _all_keyed
+        assert minted_key in active_keys
+
+    def test_relation_type_threaded_through(self, tmp_path):
+        """Edge relation_type is correctly recorded in bookkeeping."""
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        graph = loop.merger.graph
+        graph.add_edge(
+            "Alice",
+            "Tea",
+            predicate="prefers",
+            relation_type="preference",
+            confidence=0.9,
+        )
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        # preference → episodic (no procedural adapter in _make_loop).
+        assert len(tier_keyed["episodic"]) == 1
+        key = tier_keyed["episodic"][0]["key"]
+        bk = loop.store.bookkeeping_for_key(key)
+        assert bk is not None
+        assert bk["relation_type"] == "preference"
+
+    def test_procedural_tier_minting(self, tmp_path):
+        """Keyless preference edge routes to procedural when procedural_config is set.
+
+        _make_loop passes procedural_adapter_config=None so the procedural
+        branch of _mint_keys_for_keyless_edges never fires in the other tests.
+        This test constructs the loop the same way _make_loop does but adds a
+        real AdapterConfig as procedural_adapter_config and pre-populates
+        "procedural" in model.peft_config so _ensure_adapters skips creation.
+
+        filter_procedural_relations routes relation_type=="preference" to the
+        procedural bucket (primary gate).  The minted key must carry prefix
+        "proc", land in tier_keyed["procedural"], appear in store.all_active_keys(),
+        and advance _procedural_next_index by exactly 1.
+        """
+        from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.key_registry import KeyRegistry
+
+        # Build the loop directly (mirror _make_loop) with a procedural config.
+        model = MagicMock()
+        model.__class__ = PeftModel
+        # Pre-populate "procedural" so _ensure_adapters skips create_adapter.
+        model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "procedural": MagicMock(),
+            "in_training": MagicMock(),
+        }
+
+        store = _MS(replay_enabled=True)
+        loop = ConsolidationLoop(
+            model=model,
+            tokenizer=MagicMock(),
+            consolidation_config=ConsolidationConfig(),
+            training_config=TrainingConfig(),
+            episodic_adapter_config=AdapterConfig(),
+            semantic_adapter_config=AdapterConfig(),
+            memory_store=store,
+            procedural_adapter_config=AdapterConfig(),
+            output_dir=tmp_path,
+            extraction_noise_filter="anthropic",
+            extraction_noise_filter_model="claude-sonnet-4-6",
+        )
+        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        initial_proc_index = loop._procedural_next_index
+
+        # relation_type="preference" is the primary gate in filter_procedural_relations.
+        loop.merger.graph.add_edge(
+            "Alice",
+            "Coffee",
+            predicate="prefers",
+            relation_type="preference",
+            confidence=0.9,
+        )
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        # The preference edge routes to procedural, not episodic.
+        assert len(tier_keyed["procedural"]) == 1
+        assert len(tier_keyed["episodic"]) == 0
+
+        entry = tier_keyed["procedural"][0]
+        key = entry["key"]
+        assert key.startswith("proc"), f"Expected 'proc' prefix, got key={key!r}"
+
+        # Key is in the store's active set.
+        assert key in loop.store.all_active_keys()
+
+        # _procedural_next_index advanced by exactly 1.
+        assert loop._procedural_next_index == initial_proc_index + 1
+
+    def test_highwater_seeding_prevents_collision(self, tmp_path):
+        """_indexed_next_index seeds from existing store keys; new key avoids collision.
+
+        Pre-seed the store with graph5 before constructing the loop so the
+        constructor's high-water scan sets _indexed_next_index to 6.  Inject
+        one keyless episodic edge.  The minted key must be graph6 — not graph1
+        (unchecked start) and not graph5 (collision with the pre-existing key).
+        """
+        from paramem.memory.store import MemoryStore as _MS
+        from paramem.training.key_registry import KeyRegistry
+
+        # Build and hydrate the store BEFORE loop construction so the
+        # constructor's _indexed_next_index seeding scan sees graph5.
+        store = _MS(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        store.put(
+            "episodic",
+            "graph5",
+            {
+                "key": "graph5",
+                "question": "q",
+                "answer": "a",
+                "subject": "Prior",
+                "predicate": "knows",
+                "object": "Fact",
+            },
+        )
+
+        model = MagicMock()
+        model.__class__ = PeftModel
+        model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "in_training": MagicMock(),
+        }
+
+        loop = ConsolidationLoop(
+            model=model,
+            tokenizer=MagicMock(),
+            consolidation_config=ConsolidationConfig(),
+            training_config=TrainingConfig(),
+            episodic_adapter_config=AdapterConfig(),
+            semantic_adapter_config=AdapterConfig(),
+            memory_store=store,
+            procedural_adapter_config=None,
+            output_dir=tmp_path,
+            extraction_noise_filter="anthropic",
+            extraction_noise_filter_model="claude-sonnet-4-6",
+        )
+        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+
+        # Constructor must have picked up graph5 → _indexed_next_index == 6.
+        assert loop._indexed_next_index == 6, (
+            f"Expected _indexed_next_index=6 after seeding graph5, got {loop._indexed_next_index}"
+        )
+
+        loop.merger.graph.add_edge(
+            "New",
+            "Fact",
+            predicate="relates_to",
+            relation_type="factual",
+            confidence=0.8,
+        )
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        assert len(tier_keyed["episodic"]) == 1
+        minted_key = tier_keyed["episodic"][0]["key"]
+
+        # Must be graph6 — no collision with the pre-existing graph5.
+        assert minted_key == "graph6", (
+            f"Expected minted key 'graph6' to avoid collision with graph5, got {minted_key!r}"
+        )
+        # Pre-existing graph5 entry must still be intact.
+        assert "graph5" in loop.store.all_active_keys()

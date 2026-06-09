@@ -145,6 +145,8 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         stub._prepare_procedural_keys_for_tier = (
             ConsolidationLoop._prepare_procedural_keys_for_tier.__get__(stub)
         )
+        # _prepare_procedural_keys_for_tier delegates to _mint_keyed_entries; bind it too.
+        stub._mint_keyed_entries = ConsolidationLoop._mint_keyed_entries.__get__(stub)
         # _run_indexed_key_procedural delegates to _cache_entry; bind it too.
         stub._cache_entry = ConsolidationLoop._cache_entry.__get__(stub)
         # Same for _safe_kp_from_cache (cache-fallback helper for partial entries).

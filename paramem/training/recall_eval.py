@@ -82,7 +82,8 @@ def evaluate_indexed_recall(
         ``mean_expected_word_count`` (always 0), ``mean_recalled_word_count``
         (always 0), and ``per_key`` entries
         ``{key, exact_match, confidence, subject, predicate, object,
-        recalled_subject, recalled_predicate, recalled_object, failure_reason}``.
+        recalled_subject, recalled_predicate, recalled_object, failure_reason,
+        raw_output}``.
     """
     from paramem.memory.entry import verify_confidence
 
@@ -117,6 +118,7 @@ def evaluate_indexed_recall(
                 "recalled_predicate": None,
                 "recalled_object": None,
                 "failure_reason": (recalled or {}).get("failure_reason", "null_result"),
+                "raw_output": (recalled or {}).get("raw_output", ""),
             }
         else:
             confidence = recalled.get("confidence", verify_confidence(recalled, registry))
@@ -136,6 +138,7 @@ def evaluate_indexed_recall(
                 "recalled_predicate": recalled.get("predicate"),
                 "recalled_object": recalled.get("object"),
                 "failure_reason": None,
+                "raw_output": recalled.get("raw_output", ""),
             }
         if exact_match:
             exact_count += 1

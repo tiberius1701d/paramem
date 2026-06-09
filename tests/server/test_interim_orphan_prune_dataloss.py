@@ -46,7 +46,7 @@ def _write_key_metadata(path: Path, keys: list[str]) -> None:
     payload = {
         "cycle_count": 1,
         "promoted_keys": [],
-        "keys": {k: {"sessions_seen": 1, "speaker_id": "Speaker0"} for k in keys},
+        "keys": {k: {"recurrence_count": 1, "speaker_id": "Speaker0"} for k in keys},
     }
     from paramem.backup.encryption import write_infra_bytes
 
@@ -136,8 +136,8 @@ class TestInterimOrphanPruneDataLoss:
             "cycle_count": 1,
             "promoted_keys": [],
             "keys": {
-                "live0": {"sessions_seen": 1, "speaker_id": "Speaker0"},
-                "stale0": {"sessions_seen": 1, "speaker_id": "Speaker0"},
+                "live0": {"recurrence_count": 1, "speaker_id": "Speaker0"},
+                "stale0": {"recurrence_count": 1, "speaker_id": "Speaker0"},
             },
         }
         write_infra_bytes(path, json.dumps(payload, indent=2).encode("utf-8"))

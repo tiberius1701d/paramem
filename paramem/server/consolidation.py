@@ -30,15 +30,14 @@ def create_consolidation_loop(
     *,
     output_dir=None,
     save_cycle_snapshots: bool | None = None,
-    persist_graph: bool | None = None,
     seed_state_from_disk: bool = True,
     keep_prior_slots: int | None = None,
 ) -> ConsolidationLoop:
     """Create a ConsolidationLoop configured for the server.
 
-    Graph is transient (persist_graph=False). Key metadata is seeded
+    Graph is transient (RAM-only). Key metadata is seeded
     from key_metadata.json to restore cycle count, promoted keys, and
-    per-key session counts across server restarts.
+    per-key bookkeeping (recurrence_count, last_seen_cycle) across restarts.
 
     Parameters
     ----------
@@ -55,9 +54,6 @@ def create_consolidation_loop(
     save_cycle_snapshots:
         Override ``config.debug`` as the cycle-snapshot toggle.  ``None``
         (default) falls through to ``config.debug``.
-    persist_graph:
-        Override the hardcoded ``False`` used for production (transient
-        graph, RAM-only).  ``None`` (default) resolves to ``False``.
     seed_state_from_disk:
         When ``False``, skip seeding key metadata and keyed-pairs QA from
         disk.  Use for probe/experiment runs that must start from a clean
@@ -71,7 +67,6 @@ def create_consolidation_loop(
     _save_cycle_snapshots = (
         save_cycle_snapshots if save_cycle_snapshots is not None else config.debug
     )
-    _persist_graph = persist_graph if persist_graph is not None else False
 
     loop = ConsolidationLoop(
         model=model,
@@ -85,13 +80,11 @@ def create_consolidation_loop(
             config.procedural_adapter_config if config.adapters.procedural.enabled else None
         ),
         output_dir=_output_dir,
-        graph_path=None,
         extraction_temperature=0.0,
         extraction_max_tokens=config.consolidation.extraction_max_tokens,
         extraction_plausibility_max_tokens=config.consolidation.extraction_plausibility_max_tokens,
         save_cycle_snapshots=_save_cycle_snapshots,
         snapshot_dir=config.debug_dir if _save_cycle_snapshots else None,
-        persist_graph=_persist_graph,
         prompts_dir=config.prompts_dir,
         graph_config=config.graph_config,
         graph_enrichment_enabled=config.consolidation.graph_enrichment_enabled,
@@ -153,23 +146,6 @@ def create_consolidation_loop(
         metadata = _load_key_metadata(config.key_metadata_path)
         if metadata:
             loop.seed_key_metadata(metadata)
-
-        # One-time backfill of relation_type for legacy keys (§6.3).
-        # Keys whose bookkeeping already has relation_type != "unknown" are
-        # skipped (idempotent); an empty graph returns immediately (no-op on
-        # fresh install).  _bookkeeping is populated by
-        # load_bookkeeping_from_disk (called at app.py boot before
-        # create_consolidation_loop).  Persist is deferred to the next
-        # _save_key_metadata call (consolidation cycle or explicit persist).
-        _bf = loop.backfill_relation_type_from_graph()
-        if _bf["checked"]:
-            logger.info(
-                "create_consolidation_loop: relation_type backfill — "
-                "checked=%d filled=%d unknown_fallback=%d",
-                _bf["checked"],
-                _bf["filled"],
-                _bf["unknown_fallback"],
-            )
 
     return loop
 
@@ -244,71 +220,10 @@ def _do_mark_consolidated(
 # --- Key-level promotion ---
 
 
-def _increment_key_sessions(loop: ConsolidationLoop, session_id: str) -> None:
-    """Increment sessions_seen for keys whose entities appeared in this session.
-
-    Uses the graph merger's node metadata: nodes where last_seen == session_id
-    were active in this specific session (not the cumulative graph).
-
-    A relation's ``subject`` / ``object`` carry the entity's display name
-    (e.g. ``"Alex"``).  Speaker entities are keyed in the cumulative graph
-    by ``speaker_id`` (e.g. ``"Speaker0"``) with the display name stored at
-    ``attributes["name"]``.  The matching set therefore includes both the
-    node ID AND the ``attributes["name"]`` value (when set) so
-    display-name-driven relations continue to match.
-    """
-    # Find entities that appeared in this session
-    session_entities = set()
-    for node in loop.merger.graph.nodes:
-        node_data = loop.merger.graph.nodes[node]
-        if node_data.get("last_seen") == session_id:
-            session_entities.add(node.lower())
-            display_name = (node_data.get("attributes") or {}).get("name")
-            if isinstance(display_name, str) and display_name:
-                session_entities.add(display_name.lower())
-
-    if not session_entities:
-        return
-
-    # Increment session count for keys referencing these entities
-    for _tier, key, qa in loop.store.iter_entries():
-        if key in loop.promoted_keys:
-            continue
-        subject = qa.get("subject", "").lower()
-        obj = qa.get("object", "").lower()
-        if subject in session_entities or obj in session_entities:
-            loop.key_sessions[key] = loop.key_sessions.get(key, 0) + 1
-
-
 # Dedup moved onto ConsolidationLoop (see paramem/training/consolidation.py).
 # Re-exported as module-level aliases for existing call sites.
 _dedup_episodic = ConsolidationLoop.dedup_episodic
 _dedup_procedural = ConsolidationLoop.dedup_procedural
-
-
-def _promote_mature_keys(loop: ConsolidationLoop, config: ServerConfig) -> list[str]:
-    """Promote keys that reached the session count threshold.
-
-    Moves keys from episodic to semantic SimHash registry.
-    Returns list of newly promoted key IDs.
-    """
-    threshold = config.consolidation.promotion_threshold
-    newly_promoted = []
-
-    for key, count in loop.key_sessions.items():
-        if count >= threshold and key not in loop.promoted_keys:
-            if loop.store.has_simhash("episodic", key):
-                # Move entry + simhash + registry atomically to semantic.
-                loop.store.move(key, "semantic")
-                newly_promoted.append(key)
-            elif loop.store.has_simhash("semantic", key):
-                logger.debug("Key %s already in semantic, marking promoted", key)
-            loop.promoted_keys.add(key)
-
-    if newly_promoted:
-        logger.info("Promoted %d keys to semantic", len(newly_promoted))
-
-    return newly_promoted
 
 
 # --- Persistence ---
@@ -456,13 +371,13 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     """
     keys_payload: dict = {}
     for key in loop.store.all_active_keys():
-        sessions_seen = loop.key_sessions.get(key, 0)
         bk = loop.store.bookkeeping_for_key(key) or {}
         keys_payload[key] = {
-            "sessions_seen": sessions_seen,
             "speaker_id": bk.get("speaker_id", ""),
             "first_seen_cycle": bk.get("first_seen_cycle", 0),
             "relation_type": bk.get("relation_type", "unknown"),
+            "recurrence_count": bk.get("recurrence_count", 1),
+            "last_seen_cycle": bk.get("last_seen_cycle", bk.get("first_seen_cycle", 0)),
         }
     metadata = {
         "cycle_count": loop.cycle_count,

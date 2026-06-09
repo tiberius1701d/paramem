@@ -236,7 +236,6 @@ class TestConsolidationIntegration:
         loop.merger.graph = MagicMock()
         loop.merger.graph.nodes = []
         loop.indexed_key_cache = {}
-        loop.key_sessions = {}
         loop.promoted_keys = set()
         loop.episodic_simhash = {}
         loop.semantic_simhash = {}
@@ -641,10 +640,9 @@ class TestPerChunkOOMSkip:
                 patch("paramem.server.app._set_voice_pipeline_profile"),
                 patch("paramem.server.app.check_vram_headroom"),
                 patch("paramem.server.app.vram_scope", return_value=no_lock),
-                # `_increment_key_sessions` and `create_consolidation_loop`
-                # are lazily imported inside _extract_and_start_training
-                # from paramem.server.consolidation; patch them there.
-                patch("paramem.server.consolidation._increment_key_sessions"),
+                # `create_consolidation_loop` is lazily imported inside
+                # _extract_and_start_training from paramem.server.consolidation;
+                # patch it there.
                 patch(
                     "paramem.server.consolidation.create_consolidation_loop",
                     return_value=loop,
@@ -782,7 +780,6 @@ class TestExtractionFailedAbortsCycle:
                 patch("paramem.server.app._set_voice_pipeline_profile"),
                 patch("paramem.server.app.check_vram_headroom"),
                 patch("paramem.server.app.vram_scope", return_value=no_lock),
-                patch("paramem.server.consolidation._increment_key_sessions"),
                 patch(
                     "paramem.server.consolidation.create_consolidation_loop",
                     return_value=loop,

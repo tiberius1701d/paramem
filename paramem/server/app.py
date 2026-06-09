@@ -5100,7 +5100,7 @@ def _live_reload_base_model(
 
     Preserves the ``ConsolidationLoop`` and ``BackgroundTrainer`` object
     identities (only swaps their ``self.model``). Their in-memory state
-    (cycle_count, key_sessions counters, simhash sets) is not always
+    (cycle_count, promoted_keys, simhash sets) is not always
     persisted per-cycle and is load-bearing for promotion + debug
     snapshots.
 
@@ -7733,8 +7733,8 @@ async def _run_trial_consolidation() -> None:
 
     Acquires the GPU lock, reloads config from the newly-active server.yaml,
     builds a trial ConsolidationLoop with overrides (mode=train, paths →
-    state/trial_adapter/, persist_graph=True on state/trial_graph/), and
-    calls ``_run_extraction_phase`` with ``mark_callback=lambda _: None``.
+    state/trial_adapter/), and calls ``_run_extraction_phase`` with
+    ``mark_callback=lambda _: None``.
 
     The ``mark_consolidated_callback`` no-op ensures that
     ``session_buffer.mark_consolidated`` is **never** called from the trial
@@ -7926,6 +7926,13 @@ async def _run_trial_consolidation() -> None:
             }
             if exc_captured is not None:
                 gates_payload["exception"] = str(exc_captured)  # backward-compat with 3b.3
+
+        # Stash the trial loop's in-memory graph so migration_status can pass
+        # it directly to build_comparison_report without requiring a file on disk.
+        if not session_buffer_empty and "loop" in locals() and loop is not None:
+            _trial_graph_obj = getattr(getattr(loop, "merger", None), "graph", None)
+            if _trial_graph_obj is not None:
+                await _stash_trial_graph(_trial_graph_obj)
 
         await _update_trial_gates(gates_payload)
         logger.info("trial consolidation complete: status=%s", overall_status)
@@ -8529,13 +8536,13 @@ async def _run_base_swap_orchestration(
 
         # ── Promotion carry-over ─────────────────────────────────────────────
         # The migration never writes key_metadata.json, so it still holds the
-        # PREVIOUS model's promotion state (per-key sessions_seen + promoted_keys).
+        # PREVIOUS model's promotion state (per-key recurrence_count + promoted_keys).
         # loop_b was created against the empty live store (the base-swap preload
         # gate skips loading the old registry), so its construction-time seed
         # orphan-dropped every key.  Now that Phase B has retrained the SAME keys
         # (stable via graph.json ``ik_key``) and repopulated the store, re-seed
         # from the preserved key_metadata.json so promotion momentum carries
-        # across the swap — a key at sessions_seen=N does not reset to 0, and the
+        # across the swap — a key at recurrence_count=N does not reset to 0, and the
         # already-promoted set is restored.  Without this, the next consolidation's
         # _save_key_metadata would overwrite the on-disk counts with loop_b's empty
         # in-memory state.  seed_key_metadata SETs (not increments) so it is
@@ -8546,8 +8553,7 @@ async def _run_base_swap_orchestration(
         if _carry_meta is not None:
             loop_b.seed_key_metadata(_carry_meta)
             logger.info(
-                "base-swap: carried over promotion state — %d key(s) tracked, %d promoted",
-                len(loop_b.key_sessions),
+                "base-swap: carried over promotion state — %d key(s) promoted",
                 len(loop_b.promoted_keys),
             )
 
@@ -8764,11 +8770,6 @@ def _build_trial_loop(model, tokenizer, trial_config, trial_adapter_dir, trial_g
         loop.trial_registry_path = trial_registry_dir / "registry.json"
         loop.trial_key_metadata_path = trial_registry_dir / "registry" / "key_metadata.json"
 
-    if trial_graph_dir is not None:
-        loop.persist_graph = True
-        loop.graph_path = trial_graph_dir / "cumulative_graph.json"
-        trial_graph_dir.mkdir(parents=True, exist_ok=True)
-
     return loop
 
 
@@ -8797,6 +8798,34 @@ async def _update_trial_gates(gates: dict) -> None:
         if trial is None:
             return
         trial["gates"] = gates
+
+
+async def _stash_trial_graph(graph: object) -> None:
+    """Store the trial loop's in-memory merger graph on the trial stash.
+
+    Called from ``_run_trial_consolidation`` after the fold completes so that
+    ``migration_status`` can read the graph without requiring a file on disk.
+    Mirrors ``_update_trial_gates`` in structure; holds ``migration_lock``
+    to avoid a race with ``/migration/cancel`` that could clear the trial stash
+    between the fold completing and this write.
+
+    When the trial stash has already been cleared (e.g. concurrent rollback),
+    this is a silent no-op — the same safe behaviour as ``_update_trial_gates``.
+
+    Parameters
+    ----------
+    graph:
+        ``nx.MultiDiGraph`` from ``loop.merger.graph`` after the trial fold.
+    """
+    lock: asyncio.Lock = _state.get("migration_lock") or asyncio.Lock()
+    async with lock:
+        migration = _state.get("migration")
+        if migration is None:
+            return
+        trial = migration.get("trial")
+        if trial is None:
+            return
+        trial["trial_graph_obj"] = graph
 
 
 # Accept-eligible gate statuses (set membership for forward-compat — Decision 24).
@@ -8840,38 +8869,27 @@ async def migration_status():
         and gates.get("status") in _ACCEPT_ELIGIBLE_STATUSES
         and gates.get("completed_at")
     ):
-        # Resolve graph paths from state.
-        # Pre-trial graph: prefer in-memory loop's merger graph (production
-        # runs with persist_graph=False, so no file exists); fall back to a
-        # config-derived path for completeness.
+        # Resolve graph objects from state.
+        # Pre-trial: in-memory merger graph from the production loop (RAM-only).
+        # No file-based fallback — the graph is never persisted to disk in the
+        # production server; the file path construction was dead (no producer).
         pre_trial_graph = None
-        pre_trial_graph_path: Path | None = None
         _loop_obj = _state.get("consolidation_loop")
         if _loop_obj is not None:
             _merger = getattr(_loop_obj, "merger", None)
             if _merger is not None:
                 pre_trial_graph = getattr(_merger, "graph", None)
-            _gpath = getattr(_loop_obj, "graph_path", None)
-            if _gpath is not None:
-                pre_trial_graph_path = Path(_gpath)
-        if pre_trial_graph_path is None:
-            _live_cfg = _state.get("config")
-            if _live_cfg is not None:
-                _adata = getattr(getattr(_live_cfg, "paths", None), "data", None)
-                if _adata is not None:
-                    pre_trial_graph_path = Path(_adata) / "ha" / "state" / "cumulative_graph.json"
 
-        # Trial graph: from the trial marker (always set during TRIAL).
-        trial_graph_dir_str = trial.get("trial_graph_dir") or ""
-        trial_graph_path: Path | None = (
-            Path(trial_graph_dir_str) / "cumulative_graph.json" if trial_graph_dir_str else None
-        )
+        # Trial graph: read from the stash set by _run_trial_consolidation
+        # (_stash_trial_graph stores the in-memory merger graph after the fold).
+        trial_graph = trial.get("trial_graph_obj")
 
         comparison_report = build_comparison_report(
             gates=gates,
-            pre_trial_graph_path=pre_trial_graph_path,
-            trial_graph_path=trial_graph_path,
+            pre_trial_graph_path=None,
+            trial_graph_path=None,
             pre_trial_graph=pre_trial_graph,
+            trial_graph=trial_graph,
         )
 
     return MigrationStatusResponse(
@@ -9132,14 +9150,12 @@ async def migration_accept():
                 },
             ) from exc
 
-        # --- Step 4: Move trial adapter into the rotation slot; delete trial graph ---
+        # --- Step 4: Move trial adapter into the rotation slot; delete trial graph dir ---
         # Non-fatal: config + marker are already coherent. Rotation is cosmetic.
-        # The trial graph is transient by design (graph is RAM-only in production;
-        # persist_graph=True is only used during the trial window to render the
-        # before/after comparison report).  Once the operator accepts, the trial
-        # graph is dead weight and contradicts the "graph is transient" invariant.
-        # Delete it unconditionally; production re-builds the graph in RAM on the
-        # next live cycle.
+        # The trial graph is RAM-only (stashed in _state["migration"]["trial"]
+        # as "trial_graph_obj" by _stash_trial_graph); no file was written.
+        # The trial_graph dir (if it exists) is deleted unconditionally as
+        # cleanup; it is empty by design.
         rotation_incomplete = False
         for src_str, dest_name in [
             (trial_adapter_dir_str, "adapter"),
@@ -11390,8 +11406,6 @@ def _run_extraction_phase(
         _dedup_episodic,
         _dedup_procedural,
         _do_mark_consolidated,
-        _increment_key_sessions,
-        _promote_mature_keys,
         _save_key_metadata,
         session_retention_dir,
     )
@@ -11465,8 +11479,6 @@ def _run_extraction_phase(
                 source_type=session.get("source_type", "transcript"),
             )
 
-        _increment_key_sessions(loop, session_id)
-
         for qa in episodic_rels:
             qa["speaker_id"] = session_speaker_id
         for rel in procedural_rels:
@@ -11535,7 +11547,6 @@ def _run_extraction_phase(
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
             )
-            newly_promoted = _promote_mature_keys(loop, config)
             _save_key_metadata(loop, config)
         except Exception:
             logger.exception(
@@ -11555,7 +11566,6 @@ def _run_extraction_phase(
             "status": "simulated",
             "sessions": len(session_ids),
             "total_relations": total_relations,
-            "newly_promoted": len(newly_promoted),
             "episodic_rels": len(all_episodic_rels),
             "procedural_rels": len(all_procedural_rels),
             "episodic_keys": loop.store.simhash_count_in_tier("episodic"),
@@ -11596,7 +11606,6 @@ def _run_extraction_phase(
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
             )
-        newly_promoted = _promote_mature_keys(loop, config)
         loop._save_adapters()
         _save_key_metadata(loop, config)
     except Exception:
@@ -11618,7 +11627,6 @@ def _run_extraction_phase(
         "status": "complete",
         "sessions": len(session_ids),
         "total_relations": total_relations,
-        "newly_promoted": len(newly_promoted),
         "episodic_keys": loop.store.simhash_count_in_tier("episodic"),
         "semantic_keys": loop.store.simhash_count_in_tier("semantic"),
         "procedural_keys": loop.store.simhash_count_in_tier("procedural"),
@@ -11687,8 +11695,6 @@ def _extract_and_start_training():
     """
     from paramem.server.background_trainer import BackgroundTrainer
     from paramem.server.consolidation import (
-        _increment_key_sessions,
-        _promote_mature_keys,
         _save_key_metadata,
         create_consolidation_loop,
         session_retention_dir,
@@ -11877,8 +11883,6 @@ def _extract_and_start_training():
                     _set_voice_pipeline_profile(_target_profile(), lock_held=True)
                 _state["consolidating"] = False
                 return
-            _increment_key_sessions(loop, session_id)
-
             for qa in episodic_rels:
                 qa["speaker_id"] = session_speaker_id
             for rel in procedural_rels:
@@ -11958,7 +11962,6 @@ def _extract_and_start_training():
             schedule=config.consolidation.refresh_cadence,
             max_interim_count=config.consolidation.max_interim_count,
         )
-        newly_promoted = _promote_mature_keys(loop, config)
         # _save_registry retired (Plan A, landed in commits 47df093 + e2217c1):
         # the combined SimHash registry at config.registry_path was not
         # maintained by interim or full-cycle production paths post-Phase-3+5,
@@ -11998,15 +12001,13 @@ def _extract_and_start_training():
                 "skipped_oom": len(failed_session_ids),
                 "episodic_rels": len(all_episodic_rels),
                 "procedural_rels": len(all_procedural_rels),
-                "newly_promoted": len(newly_promoted),
                 "simulated": sim_result.get("mode") == "simulated",
             }
             _state["consolidating"] = False
             logger.info(
-                "Simulation complete: %d episodic, %d procedural relations, %d promoted",
+                "Simulation complete: %d episodic, %d procedural relations",
                 len(all_episodic_rels),
                 len(all_procedural_rels),
-                len(newly_promoted),
             )
 
         aio_loop = _state.get("event_loop")
@@ -12107,11 +12108,12 @@ def _extract_and_start_training():
             len(result.get("new_keys", [])),
         )
 
-        # Disk I/O — safe from any thread.  Promotion + key-metadata persistence
-        # mirror the previous main-write callback; the interim helper already
-        # handled the registry / simhash writes atomically.
+        # Disk I/O — safe from any thread.  Key-metadata persistence mirrors the
+        # previous main-write callback; the interim helper already handled the
+        # registry / simhash writes atomically.  Promotion runs at the full fold
+        # (consolidate_interim_adapters) rather than here, so the key is still in
+        # episodic when its adapter weights are probed during reconstruction.
         try:
-            _promote_mature_keys(loop, config)
             _save_key_metadata(loop, config)
             session_buffer.mark_consolidated(
                 _completed_session_ids(),

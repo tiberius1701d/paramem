@@ -102,7 +102,6 @@ def main() -> int:
         state_provider=None,
         output_dir=OUTPUT_DIR,
         save_cycle_snapshots=False,
-        persist_graph=False,
         seed_state_from_disk=False,
     )
 

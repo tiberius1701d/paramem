@@ -1,15 +1,18 @@
-"""Knowledge graph merging with entity resolution and edge aggregation.
+"""Knowledge graph merging with entity resolution and cardinality resolution.
 
 Contradiction resolution:
-- Same-predicate, different-object cardinality resolution (REPLACE): the new value
-  removes the old edge.  Cardinality judgment is cached per predicate (one model call
-  per unique predicate).  Active whenever a model is present; unaffected by
-  ``cross_predicate_contradiction``.
+- Same-predicate, different-object cardinality resolution: the model returns one of two
+  verdicts (COEXIST / REPLACE) for each same-(subject, predicate)/different-object pair.
+  Cardinality judgment is cached per predicate (one model call per unique predicate).
+  Active whenever a model is present; unaffected by ``cross_predicate_contradiction``.
+- COEXIST: both values are independent and multi-valued; keep both edges.
+- REPLACE: new value supersedes old (single-valued predicate); old edge removed.
+  At fold time (``additive=True``), REPLACE is skipped — folds are purely additive and
+  never remove a registered edge.
 - Cross-predicate contradiction detection (REPLACE across different predicates):
   OFF by default (``cross_predicate_contradiction=False``) because it over-removes
   legitimate multi-valued and independent facts (observed over-removing valid facts in live use).
   Enable only when the operator has verified it is safe for their knowledge domain.
-- Multi-valued predicate (COEXIST): both values coexist, no removal.
 - When no model is present (experiments, after release): all triples coexist (no removal).
 """
 
@@ -26,15 +29,27 @@ from paramem.graph.schema import Entity, Relation, SessionGraph
 logger = logging.getLogger(__name__)
 
 _COEXISTENCE_PROMPT = """\
-Can a person have more than one value for the relationship "{predicate}"?
+Classify the relationship between two values for the predicate "{predicate}".
 
-Example: {subject} {predicate} {old_value}, and now {subject} {predicate} {new_value}.
+--- COEXIST ---
+Both values can be true simultaneously (multi-valued predicate).
+POSITIVE: Alex has_pet cat, and now Alex has_pet dog → COEXIST
+POSITIVE: Alex speaks German, and now Alex speaks French → COEXIST
 
-Can both be true at the same time, or does the new value replace the old one?
+--- REPLACE ---
+The new value supersedes the old one (single-valued predicate).
+POSITIVE: Alex lives_in Munich, and now Alex lives_in Berlin → REPLACE
+POSITIVE: Alex date_of_birth 1990, and now Alex date_of_birth 1991 → REPLACE
 
-Reply with EXACTLY one word:
-- COEXIST (both can be true, e.g. a person can have multiple pets)
-- REPLACE (only one can be true, e.g. a person has one date of birth)"""
+--- CLASSIFY ---
+Subject: {subject}
+Predicate: {predicate}
+Old value: {old_value}
+New value: {new_value}
+
+Reply with EXACTLY one of:
+- COEXIST
+- REPLACE"""
 
 _CONTRADICTION_PROMPT = """\
 You are checking if a new fact contradicts any existing fact about a person.
@@ -139,8 +154,16 @@ def check_predicate_coexistence(
     model,
     tokenizer,
     prompt: str = _COEXISTENCE_PROMPT,
-) -> bool:
+) -> str:
     """Ask the model whether two values for the same predicate can coexist.
+
+    Returns the verdict string:
+
+    - ``"COEXIST"`` — values are independent; keep both edges.
+    - ``"REPLACE"`` — new value supersedes old; retire old edge.
+
+    The default on an ambiguous response is ``"COEXIST"`` (safer —
+    do not lose data).
 
     Args:
         subject: Entity whose predicate cardinality is being judged.
@@ -153,9 +176,6 @@ def check_predicate_coexistence(
             ``{old_value}``, and ``{new_value}`` slots.  Defaults to
             ``_COEXISTENCE_PROMPT``; pass a custom string (e.g. loaded via
             ``_load_prompt``) to override without code changes.
-
-    Returns True if both values can be true simultaneously (multi-valued),
-    False if the new value replaces the old one (single-valued).
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
@@ -184,22 +204,24 @@ def check_predicate_coexistence(
         model,
         tokenizer,
         formatted,
-        max_new_tokens=16,
+        max_new_tokens=32,
         temperature=0.0,
     )
 
-    decision = output.strip().upper()
-    if "COEXIST" in decision:
-        return True
-    if "REPLACE" in decision:
-        return False
+    first_line = output.strip().split("\n")[0].strip()
+    upper_line = first_line.upper()
+
+    if "COEXIST" in upper_line:
+        return "COEXIST"
+    if "REPLACE" in upper_line:
+        return "REPLACE"
     # Default to coexistence (safer — don't lose data)
     logger.warning(
         "Ambiguous coexistence response for '%s': '%s', defaulting to COEXIST",
         predicate,
         output.strip(),
     )
-    return True
+    return "COEXIST"
 
 
 class GraphMerger:
@@ -260,6 +282,15 @@ class GraphMerger:
         self.tokenizer = tokenizer
         self.cross_predicate_contradiction = cross_predicate_contradiction
         self.contradictions_resolved = []  # log of resolved contradictions
+        # Per-merge/fold output lists — also initialised here so _upsert_relation
+        # is safe to call without a preceding merge() call (e.g. in unit tests).
+        self.reinforcements: list[str] = []
+        # collapsed: incoming ik_keys that were deduplicated away in a Case-1
+        # duplicate-SPO collapse.  Parallel to reinforcements (which records the
+        # surviving key); collapsed records the drifting key.  Used by the
+        # drift-accounting site in consolidation to distinguish intended dedup
+        # from genuine reconstruction loss.
+        self.collapsed: list[str] = []
         # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
         self._predicate_cardinality: dict[str, bool] = {}
         # Resolve prompts once at construction so a file edit takes effect next cycle.
@@ -269,11 +300,40 @@ class GraphMerger:
             "merger_contradiction.txt", _CONTRADICTION_PROMPT, _pd
         )
 
-    def merge(self, session_graph: SessionGraph) -> nx.MultiDiGraph:
+    def merge(self, session_graph: SessionGraph, *, additive: bool = False) -> nx.MultiDiGraph:
         """Merge a session graph into the cumulative graph.
 
+        Args:
+            session_graph: The per-session graph to merge in.
+            additive: When ``True`` (fold-only path), Case-2 same-predicate
+                cardinality resolution is short-circuited — no model call, no
+                edge removal.  Every reconstructed edge is inserted as a new
+                edge regardless of existing same-(subject, predicate) edges.
+                This makes full-consolidation folds purely additive and lossless
+                with respect to registered edges.  Defaults to ``False`` so
+                normal per-session live-ingest REPLACE is unaffected.
+
         Returns the updated cumulative graph.
+
+        ``self.reinforcements`` is a list of surviving ``ik_key`` strings for
+        each Case-1 exact-duplicate collapse that fired during this merge — i.e.
+        every fold where an incoming ``Relation.indexed_key`` matched an
+        existing edge with an ``ik_key`` already stamped.  The surviving key is
+        the existing edge's key (the incoming duplicate drifts).  Only populated
+        when ``Relation.indexed_key`` is set on the incoming relation (fold-only
+        path); always empty during normal live ingest where
+        ``Relation.indexed_key is None``.
+
+        ``self.collapsed`` is the parallel list of INCOMING ``ik_key`` strings
+        that were deduplicated away in each such collapse.  Where
+        ``reinforcements`` records the surviving key, ``collapsed`` records the
+        key whose edge was dropped.  Used by the drift-accounting site in
+        ``consolidate_interim_adapters`` to distinguish intended dedup (fact
+        preserved under the twin key) from genuine reconstruction loss.
         """
+        self.reinforcements: list[str] = []
+        self.collapsed: list[str] = []
+
         session_id = session_graph.session_id
         timestamp = session_graph.timestamp
 
@@ -302,7 +362,7 @@ class GraphMerger:
                         sessions=[session_id],
                     )
 
-            self._upsert_relation(subject, obj, relation, session_id, timestamp)
+            self._upsert_relation(subject, obj, relation, session_id, timestamp, additive=additive)
 
         logger.info(
             "Merged session %s: graph now has %d nodes, %d edges",
@@ -466,23 +526,42 @@ class GraphMerger:
         relation: Relation,
         session_id: str,
         timestamp: str,
+        *,
+        additive: bool = False,
     ) -> None:
         """Insert or update a relation edge.
 
         Handles three cases:
 
-        1. Identical triple already exists — exact-duplicate reinforcement: bump recurrence.
-        2. Same (subject, predicate) but different object — same-predicate,
-           different-object cardinality resolution (always-on when a model is
-           present): ask whether the predicate is single-valued (REPLACE, old
-           edge removed) or multi-valued (COEXIST, both edges kept).  Cardinality
-           judgment is cached per predicate.  When no model is present, fall
-           through to new-edge insertion (coexist-all).
-        3. New (subject, predicate, object) — new-edge insertion.
+        1. Identical triple already exists — exact-duplicate reinforcement: bump
+           recurrence.  Case-1-adopt: if the existing edge has no ``ik_key`` and
+           the incoming ``relation.indexed_key`` is set, adopt the key onto the
+           existing edge (fold-only provenance carry-through).
+        2. Same (subject, predicate) but different object — 2-way cardinality
+           resolution when a model is present and ``additive=False`` (live ingest):
+
+           - ``COEXIST``: both values are independent; both edges kept.
+           - ``REPLACE``: new value supersedes old; old edge removed.
+
+           When ``additive=True`` (fold-only), Case-2 is short-circuited: no
+           model call, no edge removal.  The incoming edge is inserted as a new
+           edge (Case 3) so folds are purely additive and never remove a
+           registered edge.
+
+           Cardinality (COEXIST vs REPLACE axis) is cached per predicate.
+        3. New (subject, predicate, object) — net-new edge insertion.  The
+           ``ik_key`` from ``relation.indexed_key`` is stamped on the edge when
+           set (fold provenance; None at normal ingest — no-op).
         """
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
         normalized_pred = _normalize_predicate(relation.predicate)
 
-        # Exact-duplicate reinforcement: identical triple already exists
+        # --- Case 1: Exact-duplicate reinforcement ---
+        # Identical (subject, norm_pred, obj) already exists — bump recurrence.
+        # Case-1-adopt: if the existing edge has no ik_key and the incoming
+        # relation carries one, stamp it onto the existing edge (fold-only; no-op
+        # for normal ingest where relation.indexed_key is None).
         existing_key = None
         if self.graph.has_node(subject) and self.graph.has_node(obj):
             existing_key = next(
@@ -503,28 +582,49 @@ class GraphMerger:
             if session_id not in sessions:
                 sessions.append(session_id)
             edge["sessions"] = sessions
-            return
+            # Case-1-adopt: adopt incoming ik_key onto a keyless existing edge.
+            if relation.indexed_key and not edge.get(_IK_KEY_ATTR):
+                edge[_IK_KEY_ATTR] = relation.indexed_key
+            # Case-1 reinforcement: when BOTH the existing edge AND the incoming
+            # relation carry an ik_key, this is a fold-time duplicate-SPO collapse.
+            # The SURVIVING key is the existing edge's ik_key (the incoming
+            # relation.indexed_key drifts).  Record the survivor for the fold's
+            # bump_recurrence pass.
+            # NOTE: existing_key is the NetworkX integer edge id, NOT the key
+            # string.  The survivor's key string is read from the edge attribute.
+            elif relation.indexed_key and edge.get(_IK_KEY_ATTR):
+                surviving_ik = edge.get(_IK_KEY_ATTR)
+                if surviving_ik:
+                    self.reinforcements.append(surviving_ik)
+                # Record the incoming (drifting) key so the drift-accounting site
+                # in consolidate_interim_adapters can distinguish intended dedup
+                # (fact preserved under the surviving twin) from genuine loss.
+                self.collapsed.append(relation.indexed_key)
+            return None
 
-        # Same-predicate, different-object cardinality resolution.
-        # Ask the model whether both values can coexist (multi-valued)
-        # or the new value replaces the old (single-valued/contradiction).
-        # Decision is cached per predicate — one inference call per unique predicate.
+        # --- Case 2: Same-predicate, different-object cardinality resolution ---
+        # At live ingest (additive=False): ask the model for a 2-way verdict
+        # (COEXIST / REPLACE).  Cardinality judgment is cached per predicate.
+        # At fold time (additive=True): skip entirely — folds are purely additive
+        # and never remove a registered edge; fall through to new-edge insertion.
+        # When no model is present, fall through to new-edge insertion (coexist-all).
         graph_resolved = False
-        if self.model is not None and self.graph.has_node(subject):
+
+        if not additive and self.model is not None and self.graph.has_node(subject):
             for old_obj in list(self.graph.successors(subject)):
                 if old_obj == obj:
                     continue
-                keys_with_same_pred = [
-                    key
+                old_edges_with_pred = [
+                    (key, data)
                     for key, data in self.graph[subject][old_obj].items()
                     if data.get("predicate") == normalized_pred
                 ]
-                if not keys_with_same_pred:
+                if not old_edges_with_pred:
                     continue
 
-                # Check cardinality (cached per predicate)
+                # Determine cardinality (cached per predicate).
                 if normalized_pred not in self._predicate_cardinality:
-                    can_coexist = check_predicate_coexistence(
+                    verdict = check_predicate_coexistence(
                         subject,
                         normalized_pred,
                         old_obj,
@@ -533,42 +633,51 @@ class GraphMerger:
                         self.tokenizer,
                         self._coexistence_prompt,
                     )
-                    self._predicate_cardinality[normalized_pred] = can_coexist
-                    logger.info(
-                        "Predicate cardinality: %s → %s",
-                        normalized_pred,
-                        "multi-valued" if can_coexist else "single-valued",
-                    )
-
-                if self._predicate_cardinality[normalized_pred]:
-                    # Multi-valued: both values coexist, no contradiction
-                    continue
-
-                # Single-valued: replace old with new
-                for key in keys_with_same_pred:
-                    self.graph.remove_edge(subject, old_obj, key=key)
-                    self.contradictions_resolved.append(
-                        {
-                            "method": "model_cardinality",
-                            "subject": subject,
-                            "old_predicate": normalized_pred,
-                            "old_object": old_obj,
-                            "new_predicate": normalized_pred,
-                            "new_object": obj,
-                            "session": session_id,
-                        }
+                    # Cache the COEXIST/REPLACE axis (True = multi-valued).
+                    if verdict == "REPLACE":
+                        self._predicate_cardinality[normalized_pred] = False
+                    else:
+                        # COEXIST → multi-valued axis
+                        self._predicate_cardinality[normalized_pred] = True
+                    _card_label = (
+                        "multi-valued"
+                        if self._predicate_cardinality[normalized_pred]
+                        else "single-valued"
                     )
                     logger.info(
-                        "Contradiction resolved (cardinality): %s | %s | %s → %s (session %s)",
-                        subject,
+                        "Predicate cardinality: %s → %s (verdict=%s)",
                         normalized_pred,
-                        old_obj,
-                        obj,
-                        session_id,
+                        _card_label,
+                        verdict,
                     )
+
+                if not self._predicate_cardinality[normalized_pred]:
+                    # Single-valued (REPLACE): remove old edges, insert new one below.
+                    for key, _ in old_edges_with_pred:
+                        self.graph.remove_edge(subject, old_obj, key=key)
+                        self.contradictions_resolved.append(
+                            {
+                                "method": "model_cardinality",
+                                "subject": subject,
+                                "old_predicate": normalized_pred,
+                                "old_object": old_obj,
+                                "new_predicate": normalized_pred,
+                                "new_object": obj,
+                                "session": session_id,
+                            }
+                        )
+                        logger.info(
+                            "Contradiction resolved (cardinality): %s | %s | %s → %s (session %s)",
+                            subject,
+                            normalized_pred,
+                            old_obj,
+                            obj,
+                            session_id,
+                        )
                     graph_resolved = True
+                # COEXIST: fall through to new-edge insertion.
 
-        # Cross-predicate contradiction detection (model-based).
+        # --- Cross-predicate contradiction detection (model-based) ---
         # Catches cases like moved_to vs lives_in that same-predicate matching misses.
         # Gated by self.cross_predicate_contradiction (default False) because it
         # over-removes legitimate multi-valued and independent facts (observed in
@@ -628,8 +737,10 @@ class GraphMerger:
                                 session_id,
                             )
 
-        # New-edge insertion (and after contradiction cleanup): new (subject, predicate, object)
-        self.graph.add_edge(
+        # --- Case 3: New-edge insertion ---
+        # After contradiction cleanup or when no same-pred edge exists.
+        # Stamp ik_key from relation.indexed_key when set (fold-only; None = no-op).
+        new_eid = self.graph.add_edge(
             subject,
             obj,
             predicate=normalized_pred,
@@ -640,6 +751,36 @@ class GraphMerger:
             recurrence_count=1,
             sessions=[session_id],
         )
+        if relation.indexed_key:
+            self.graph[subject][obj][new_eid][_IK_KEY_ATTR] = relation.indexed_key
+        return None
+
+    def reset_graph(self) -> None:
+        """Reset the keying surface to an empty graph, clearing per-fold caches.
+
+        Called by ``consolidate_interim_adapters`` BEFORE the Stage-2 re-merge
+        so the keying surface is empty and Option-(a) provenance keying is
+        unconditional: reconstructed-key edges are always net-new (Case 3) or
+        intra-fold-collapsed (Case 1 among recon edges), with no dependence on
+        any pre-existing edge state.
+
+        Cleared caches:
+        - ``graph`` — fresh MultiDiGraph (no prior edges/nodes)
+        - ``_predicate_cardinality`` — per-predicate COEXIST/REPLACE cache
+        - ``contradictions_resolved`` — log of prior resolves
+        - ``reinforcements`` — prior fold's Case-1 surviving keys
+        - ``collapsed`` — prior fold's Case-1 deduplicated (incoming) keys
+
+        Does NOT touch ``model``, ``tokenizer``, or the prompt strings — those
+        are construction-time state and must survive across folds.
+        """
+        import networkx as nx
+
+        self.graph = nx.MultiDiGraph()
+        self._predicate_cardinality = {}
+        self.contradictions_resolved = []
+        self.reinforcements = []
+        self.collapsed = []
 
     def release(self) -> None:
         """Drop the base-model reference this merger holds (BASE-MODEL HOLDER).

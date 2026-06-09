@@ -173,6 +173,7 @@ class TestVerifySavedAdapterHappyPath:
             "episodic_verify",
             _SAMPLE_KEYED_PAIRS,
             max_probe=100,
+            debug_phase="disk_verify",
         )
 
     def test_no_exception_when_recall_at_exact_threshold(self, tmp_path: Path) -> None:
