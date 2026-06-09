@@ -8,37 +8,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from paramem.evaluation.consolidation_metrics import (
-    ConsolidationMetrics,
-    compute_consolidation_metrics,
-    compute_episodic_decay_rate,
-    compute_promoted_retention,
-    compute_semantic_drift,
-    format_phase3_summary,
-)
 from paramem.memory.store import MemoryStore as _MS  # noqa: F401
-from paramem.training.consolidation import ConsolidationLoop, CycleResult, _mentions_any
-from paramem.training.curriculum import CurriculumSampler
-from paramem.utils.config import ConsolidationConfig
-
-
-class TestCycleResult:
-    def test_default_values(self):
-        result = CycleResult(cycle_index=1, session_id="s001")
-        assert result.entities_extracted == 0
-        assert result.nodes_promoted == 0
-        assert result.promoted_nodes == []
-
-    def test_with_values(self):
-        result = CycleResult(
-            cycle_index=1,
-            session_id="s001",
-            entities_extracted=5,
-            nodes_promoted=2,
-            promoted_nodes=["Alex", "Heilbronn"],
-        )
-        assert result.entities_extracted == 5
-        assert len(result.promoted_nodes) == 2
+from paramem.training.consolidation import ConsolidationLoop, _mentions_any
 
 
 class TestMentionsAny:
@@ -53,101 +24,6 @@ class TestMentionsAny:
 
     def test_empty_terms(self):
         assert not _mentions_any("some text", set())
-
-
-class TestConsolidationMetrics:
-    def test_compute_metrics(self):
-        results = [
-            CycleResult(
-                cycle_index=1,
-                session_id="s001",
-                entities_extracted=5,
-                nodes_promoted=1,
-                nodes_decayed=0,
-                episodic_train_loss=0.8,
-                wall_clock_seconds=120.0,
-            ),
-            CycleResult(
-                cycle_index=2,
-                session_id="s002",
-                entities_extracted=3,
-                nodes_promoted=0,
-                nodes_decayed=1,
-                episodic_train_loss=0.6,
-                semantic_train_loss=0.4,
-                wall_clock_seconds=90.0,
-            ),
-        ]
-        metrics = compute_consolidation_metrics(results)
-        assert metrics.total_cycles == 2
-        assert metrics.total_entities_extracted == 8
-        assert metrics.total_promotions == 1
-        assert metrics.total_decays == 1
-        assert metrics.mean_wall_clock_seconds == 105.0
-        assert len(metrics.episodic_losses) == 2
-        assert len(metrics.semantic_losses) == 1
-
-
-class TestPromotedRetention:
-    def test_full_retention(self):
-        recall_scores = [
-            {"Alex": 0.9, "Heilbronn": 0.85},
-            {"Alex": 0.9, "Heilbronn": 0.85},
-        ]
-        result = compute_promoted_retention(recall_scores, {"Alex", "Heilbronn"})
-        assert result["mean_retention"] >= 0.85
-
-    def test_no_promoted_nodes(self):
-        result = compute_promoted_retention([], set())
-        assert result["mean_retention"] == 0.0
-
-    def test_partial_retention(self):
-        recall_scores = [
-            {"Alex": 0.9},
-            {"Alex": 0.5},
-        ]
-        result = compute_promoted_retention(recall_scores, {"Alex"})
-        assert result["per_node"]["Alex"]["final"] == 0.5
-        assert result["per_node"]["Alex"]["peak"] == 0.9
-
-
-class TestEpisodicDecay:
-    def test_measurable_decay(self):
-        recall_scores = [
-            {"Barcelona": 0.8},
-            {"Barcelona": 0.6},
-            {"Barcelona": 0.3},
-        ]
-        result = compute_episodic_decay_rate(
-            recall_scores,
-            {"Barcelona"},
-            {"Barcelona": 0},
-        )
-        assert result["mean_decay_rate"] > 0
-
-    def test_no_decay(self):
-        result = compute_episodic_decay_rate([], set(), {})
-        assert result["mean_decay_rate"] == 0.0
-
-
-class TestSemanticDrift:
-    def test_no_drift(self):
-        recall_scores = [
-            {"Alex": 0.9},
-            {"Alex": 0.9},
-            {"Alex": 0.9},
-        ]
-        result = compute_semantic_drift(recall_scores, {"Alex"})
-        assert result["mean_drift"] == 0.0
-
-    def test_measurable_drift(self):
-        recall_scores = [
-            {"Alex": 0.9},
-            {"Alex": 0.85},
-            {"Alex": 0.80},
-        ]
-        result = compute_semantic_drift(recall_scores, {"Alex"})
-        assert result["mean_drift"] == pytest.approx(0.1)
 
 
 class TestExtractionPathParity:
@@ -258,7 +134,6 @@ class TestExtractionPathParity:
             memory_store=_MS(replay_enabled=True),
             procedural_adapter_config=procedural_adapter,
             output_dir=tmp_path,
-            persist_graph=False,
             **loop_kwargs,
         )
 
@@ -446,10 +321,6 @@ class TestExtractionPathParity:
         assert procedural_a == []
         assert procedural_b == []
 
-    def test_empty(self):
-        result = compute_semantic_drift([], set())
-        assert result["mean_drift"] == 0.0
-
 
 class TestMergeAtInterimGate:
     """extract_session merger.merge call is gated by config.merge_at_interim.
@@ -509,7 +380,6 @@ class TestMergeAtInterimGate:
             memory_store=_MS(replay_enabled=False),
             procedural_adapter_config=None,
             output_dir=tmp_path,
-            persist_graph=False,
         )
         return loop
 
@@ -572,24 +442,6 @@ class TestMergeAtInterimGate:
         assert proc_a == proc_b == []
 
 
-class TestFormatSummary:
-    def test_format_output(self):
-        metrics = ConsolidationMetrics(
-            total_cycles=10,
-            total_entities_extracted=50,
-            total_promotions=5,
-            total_decays=3,
-            mean_wall_clock_seconds=100.0,
-        )
-        retention = {"mean_retention": 0.85}
-        decay = {"mean_decay_rate": 0.3}
-        drift = {"mean_drift": 0.02}
-        summary = format_phase3_summary(metrics, retention, decay, drift)
-        assert "Phase 3" in summary
-        assert "PASS" in summary
-        assert "10" in summary
-
-
 class TestMergeAtInterimConfigRoundtrip:
     """Loading YAML with merge_at_interim: true propagates through the property chain."""
 
@@ -637,68 +489,6 @@ consolidation:
         )
 
 
-class TestCurriculumDecayProtection:
-    """Test that curriculum-aware decay respects min_exposure_cycles."""
-
-    def _make_loop_with_curriculum(self, min_exposure=3):
-        """Create a ConsolidationLoop with curriculum enabled, no real model."""
-        config = ConsolidationConfig(
-            curriculum_enabled=True,
-            min_exposure_cycles=min_exposure,
-        )
-        # We only need the _apply_decay method — model/tokenizer are not used
-        loop = ConsolidationLoop.__new__(ConsolidationLoop)
-        loop.config = config
-        loop.curriculum_sampler = CurriculumSampler(
-            min_exposure_cycles=min_exposure,
-        )
-        loop.episodic_replay_pool = []
-        return loop
-
-    def test_decay_blocked_by_min_exposure(self):
-        loop = self._make_loop_with_curriculum(min_exposure=3)
-        loop.episodic_replay_pool = [
-            {"question": "Where does Alex live?", "answer": "Heilbronn"},
-        ]
-        # exposure=0 < 3 → decay should be blocked
-        loop._apply_decay(["Alex"])
-        assert len(loop.episodic_replay_pool) == 1
-
-    def test_decay_allowed_after_min_exposure(self):
-        loop = self._make_loop_with_curriculum(min_exposure=3)
-        loop.episodic_replay_pool = [
-            {"question": "Where does Alex live?", "answer": "Heilbronn"},
-        ]
-        # Simulate 3 exposures
-        loop.curriculum_sampler.exposure_counts["Where does Alex live?"] = 3
-        loop._apply_decay(["Alex"])
-        assert len(loop.episodic_replay_pool) == 0
-
-    def test_decay_without_curriculum(self):
-        """Without curriculum, decay works as before."""
-        loop = ConsolidationLoop.__new__(ConsolidationLoop)
-        loop.config = ConsolidationConfig(curriculum_enabled=False)
-        loop.curriculum_sampler = None
-        loop.episodic_replay_pool = [
-            {"question": "Where does Alex live?", "answer": "Heilbronn"},
-        ]
-        loop._apply_decay(["Alex"])
-        assert len(loop.episodic_replay_pool) == 0
-
-    def test_mixed_decay_and_protection(self):
-        loop = self._make_loop_with_curriculum(min_exposure=2)
-        loop.episodic_replay_pool = [
-            {"question": "Where does Alex live?", "answer": "Heilbronn"},
-            {"question": "What is Alex's pet?", "answer": "Luna"},
-        ]
-        # Only the pet question has enough exposures
-        loop.curriculum_sampler.exposure_counts["What is Alex's pet?"] = 2
-        loop._apply_decay(["Alex"])
-        # First kept (protected), second decayed (exposure met)
-        assert len(loop.episodic_replay_pool) == 1
-        assert loop.episodic_replay_pool[0]["question"] == "Where does Alex live?"
-
-
 # ---------------------------------------------------------------------------
 # Server consolidation — anonymous speaker sessions must not be silently skipped
 # ---------------------------------------------------------------------------
@@ -725,7 +515,6 @@ class TestAnonymousSpeakerNotSkipped:
         loop.merger.graph = MagicMock()
         loop.merger.graph.nodes = []
         loop.indexed_key_cache = {}
-        loop.key_sessions = {}
         loop.promoted_keys = set()
         loop.episodic_simhash = {}
         loop.semantic_simhash = {}
@@ -1664,8 +1453,8 @@ class TestResetMainTierRegistriesAndSimhashes:
 
 
 def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
-    """Base-swap promotion carry-over: ``seed_key_metadata`` restores NON-ZERO
-    ``sessions_seen`` + ``promoted_keys`` against the Phase-B-repopulated store,
+    """Base-swap promotion carry-over: ``seed_key_metadata`` restores
+    ``cycle_count`` + ``promoted_keys`` against the Phase-B-repopulated store,
     and drops orphans (keys absent from the store).
 
     The live swap exercised only the all-zero case (the deployed data had no
@@ -1692,10 +1481,10 @@ def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
     meta = {
         "cycle_count": 5,
         "keys": {
-            "graph1": {"sessions_seen": 7, "speaker_id": "Speaker0", "first_seen_cycle": 1},
-            "graph2": {"sessions_seen": 3, "speaker_id": "Speaker0", "first_seen_cycle": 2},
-            "graph3": {"sessions_seen": 0, "speaker_id": "Speaker0", "first_seen_cycle": 3},
-            "orphan": {"sessions_seen": 9, "speaker_id": "Speaker0", "first_seen_cycle": 0},
+            "graph1": {"recurrence_count": 7, "speaker_id": "Speaker0", "first_seen_cycle": 1},
+            "graph2": {"recurrence_count": 3, "speaker_id": "Speaker0", "first_seen_cycle": 2},
+            "graph3": {"recurrence_count": 1, "speaker_id": "Speaker0", "first_seen_cycle": 3},
+            "orphan": {"recurrence_count": 9, "speaker_id": "Speaker0", "first_seen_cycle": 0},
         },
         "promoted_keys": ["graph1", "orphan"],
     }
@@ -1706,194 +1495,12 @@ def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
     assert loaded is not None
 
     # Minimal container the carry-over mutates; the store and method are real.
-    loop = types.SimpleNamespace(store=store, key_sessions={}, promoted_keys=set(), cycle_count=0)
+    loop = types.SimpleNamespace(store=store, promoted_keys=set(), cycle_count=0)
     ConsolidationLoop.seed_key_metadata(loop, loaded)
 
-    # Non-zero sessions_seen carried over verbatim; orphan dropped (absent from store).
-    assert loop.key_sessions == {"graph1": 7, "graph2": 3, "graph3": 0}
+    # cycle_count and promoted_keys are carried over; orphan filtered (absent from store).
     assert loop.promoted_keys == {"graph1"}  # "orphan" filtered (no tier in store)
     assert loop.cycle_count == 5
-
-
-# ---------------------------------------------------------------------------
-# backfill_relation_type_from_graph (Slice 1)
-# ---------------------------------------------------------------------------
-
-
-class TestBackfillRelationTypeFromGraph:
-    """Tests for ConsolidationLoop.backfill_relation_type_from_graph.
-
-    The method reads relation_type off cumulative graph edges and patches
-    _bookkeeping entries whose relation_type is "unknown".
-    """
-
-    def _make_loop_with_graph(self, graph_edges, store):
-        """Build a minimal ConsolidationLoop stub with the given graph edges."""
-        import types
-
-        import networkx as nx
-
-        from paramem.training.consolidation import ConsolidationLoop
-
-        graph = nx.MultiDiGraph()
-        for subject, obj, data in graph_edges:
-            graph.add_edge(subject, obj, **data)
-
-        merger = types.SimpleNamespace(graph=graph)
-        loop = types.SimpleNamespace(
-            store=store,
-            merger=merger,
-        )
-        # Bind the real method to the stub namespace.
-        loop.backfill_relation_type_from_graph = (
-            ConsolidationLoop.backfill_relation_type_from_graph.__get__(loop)
-        )
-        return loop
-
-    def test_backfill_fills_unknown_from_graph_edge(self):
-        """Backfill recovers relation_type from a matching cumulative-graph edge."""
-        from paramem.memory.store import MemoryStore
-        from paramem.training.key_registry import KeyRegistry
-
-        store = MemoryStore(replay_enabled=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-        store.load_registry("episodic", reg)
-        # Seed entry so the triple is findable.
-        store.put(
-            "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "Alice",
-                "predicate": "lives_in",
-                "object": "Berlin",
-            },
-        )
-        # Bookkeeping with relation_type="unknown" (legacy upgrade path).
-        store.set_bookkeeping(
-            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="unknown"
-        )
-
-        # Graph edge with the matching triple and a concrete relation_type.
-        edges = [
-            ("Alice", "Berlin", {"predicate": "lives_in", "relation_type": "factual"}),
-        ]
-        loop = self._make_loop_with_graph(edges, store)
-        stats = loop.backfill_relation_type_from_graph()
-
-        assert stats["filled"] == 1
-        assert stats["unknown_fallback"] == 0
-        bk = store.bookkeeping_for_key("graph1")
-        assert bk is not None
-        assert bk["relation_type"] == "factual"
-
-    def test_backfill_skips_key_already_has_relation_type(self):
-        """Keys whose bookkeeping has relation_type != 'unknown' are not touched."""
-        from paramem.memory.store import MemoryStore
-        from paramem.training.key_registry import KeyRegistry
-
-        store = MemoryStore(replay_enabled=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-        store.load_registry("episodic", reg)
-        store.put(
-            "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "Alice",
-                "predicate": "likes",
-                "object": "Tea",
-            },
-        )
-        store.set_bookkeeping(
-            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="preference"
-        )
-
-        edges = [("Alice", "Tea", {"predicate": "likes", "relation_type": "factual"})]
-        loop = self._make_loop_with_graph(edges, store)
-        stats = loop.backfill_relation_type_from_graph()
-
-        # checked=0 because the existing relation_type is not "unknown"
-        assert stats["checked"] == 0
-        assert stats["filled"] == 0
-        # relation_type unchanged
-        bk = store.bookkeeping_for_key("graph1")
-        assert bk["relation_type"] == "preference"
-
-    def test_backfill_key_absent_from_graph_defaults_to_unknown(self):
-        """Key whose triple is not in the graph keeps relation_type='unknown'."""
-        from paramem.memory.store import MemoryStore
-        from paramem.training.key_registry import KeyRegistry
-
-        store = MemoryStore(replay_enabled=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-        store.load_registry("episodic", reg)
-        store.put(
-            "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "Bob",
-                "predicate": "works_at",
-                "object": "ACME",
-            },
-        )
-        store.set_bookkeeping(
-            "graph1", speaker_id="bob", first_seen_cycle=2, relation_type="unknown"
-        )
-
-        # Graph has an unrelated edge — graph1's triple is not present.
-        edges = [("Alice", "Berlin", {"predicate": "lives_in", "relation_type": "factual"})]
-        loop = self._make_loop_with_graph(edges, store)
-        stats = loop.backfill_relation_type_from_graph()
-
-        assert stats["checked"] == 1
-        assert stats["filled"] == 0
-        assert stats["unknown_fallback"] == 1
-        bk = store.bookkeeping_for_key("graph1")
-        assert bk["relation_type"] == "unknown"
-
-    def test_backfill_empty_graph_returns_zeros(self):
-        """An empty graph produces all-zero stats without error."""
-        from paramem.memory.store import MemoryStore
-        from paramem.training.key_registry import KeyRegistry
-
-        store = MemoryStore(replay_enabled=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-        store.load_registry("episodic", reg)
-        store.set_bookkeeping(
-            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="unknown"
-        )
-
-        loop = self._make_loop_with_graph([], store)
-        stats = loop.backfill_relation_type_from_graph()
-        assert stats == {"checked": 0, "filled": 0, "unknown_fallback": 0}
-
-    def test_backfill_cache_off_no_entry_counts_as_unknown_fallback(self):
-        """Under cache-off (no content entry), key is counted as unknown_fallback."""
-        from paramem.memory.store import MemoryStore
-        from paramem.training.key_registry import KeyRegistry
-
-        store = MemoryStore(replay_enabled=True)
-        reg = KeyRegistry()
-        reg.add("graph1")
-        store.load_registry("episodic", reg)
-        # Bookkeeping only; no _entries (cache-off scenario).
-        store.set_bookkeeping(
-            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="unknown"
-        )
-
-        edges = [("Alice", "Berlin", {"predicate": "lives_in", "relation_type": "factual"})]
-        loop = self._make_loop_with_graph(edges, store)
-        stats = loop.backfill_relation_type_from_graph()
-
-        assert stats["checked"] == 1
-        assert stats["filled"] == 0
-        assert stats["unknown_fallback"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2228,7 +1835,6 @@ class TestAbortSkipsCommit:
         loop.output_dir = tmp_path
         loop.store = MemoryStore(replay_enabled=True)
         loop.indexed_key_cache = {}
-        loop.key_sessions = {}
         loop.promoted_keys = set()
         loop.cycle_count = 0
         loop.episodic_simhash = {}
@@ -2675,7 +2281,6 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop.merger = MagicMock()
         loop.merger.graph = merger_graph
 
-        loop.key_sessions = {}
         loop.promoted_keys = set()
         loop.cycle_count = 0
         loop._procedural_next_index = 0
@@ -2693,8 +2298,47 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.pending_interim_triples = []
-        loop.persist_graph = False
         return loop
+
+    @staticmethod
+    def _install_provenance_merge_spy(loop):
+        """Install a side_effect on loop.merger.merge that stamps ik_keys.
+
+        The real _upsert_relation stamps ``ik_key`` from ``Relation.indexed_key``
+        onto the merged edge at new-edge insertion.  Since ``loop.merger`` is a
+        MagicMock, we install a side_effect that mirrors this behaviour so
+        Stage 5's edge-walk reads back the correct ik_key.
+
+        Call this on the loop BEFORE calling ``_run_with_mocks`` in tests that
+        supply a recon graph with stamped edges.
+        """
+        import paramem.graph.merger as _merger_mod
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        def _spy_merge(session_graph, *, additive=False):
+            for rel in session_graph.relations:
+                if rel.indexed_key:
+                    _subj = rel.subject
+                    _obj = rel.object
+                    if not loop.merger.graph.has_node(_subj):
+                        loop.merger.graph.add_node(_subj)
+                    if not loop.merger.graph.has_node(_obj):
+                        loop.merger.graph.add_node(_obj)
+                    _eid = loop.merger.graph.add_edge(
+                        _subj,
+                        _obj,
+                        predicate=_merger_mod._normalize_predicate(rel.predicate),
+                        relation_type=rel.relation_type,
+                        confidence=rel.confidence,
+                        first_seen="s_recon",
+                        last_seen="s_recon",
+                        recurrence_count=1,
+                        sessions=["s_recon"],
+                    )
+                    loop.merger.graph[_subj][_obj][_eid][_IK_KEY_ATTR] = rel.indexed_key
+            return loop.merger.graph
+
+        loop.merger.merge.side_effect = _spy_merge
 
     @staticmethod
     def _run_with_mocks(loop, tmp_path, reconstruct_return):
@@ -2749,30 +2393,37 @@ class TestConsolidateInterimAdaptersFullFlow:
             _gpu_thread_lock.release()
 
     # -------------------------------------------------------------------------
-    # Test 1: cross-session duplicate triples collapse to ONE key
+    # Test 1: cross-session duplicate triples COLLAPSE to ONE key (real merger)
     # -------------------------------------------------------------------------
 
     def test_duplicate_triple_collapses_to_one_key(self, tmp_path):
-        """Bug-C regression lock: two store keys with the same (s,p,o) collapse
-        to EXACTLY ONE entry in tier_keyed when sourced from the merged graph.
+        """Real GraphMerger: two active keys sharing an identical (s,p,o) collapse
+        to ONE key with the fact retained.  The second key is counted as
+        drift_deduplicated=1 (not genuine_loss), and graph_drift_count=1 (total).
 
-        The merged graph holds ONE edge for (Alice, lives_in, Berlin); the
-        triple_to_key index maps that triple to whichever key is encountered
-        LAST in store.iter_entries() (last-write-wins over dict assignment).
-        The other key becomes a drift key — it exists in the store registry but
-        has no corresponding distinct edge in the graph, so it does NOT appear
-        in tier_keyed.
+        This replaces the old test_duplicate_triple_keeps_both_keys which used the
+        _install_provenance_merge_spy fabricating spy that bypassed _upsert_relation
+        and let BOTH edges survive.  The REAL merger Case-1 matches the second
+        incoming recon edge on (subject, norm_pred, obj), bumps recurrence on the
+        existing edge, and returns None without adding a second edge — so only ONE
+        edge survives and only ONE key appears in tier_keyed.
         """
         import networkx as nx
 
+        from paramem.graph.merger import GraphMerger
         from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
 
-        # Build merged graph with ONE edge for the duplicate triple.
-        g = nx.MultiDiGraph()
-        eid = g.add_edge("Alice", "Berlin", predicate="lives_in")
-        g["Alice"]["Berlin"][eid]["relation_type"] = "factual"
+        # Recon graph: TWO edges for the same (s,p,o), each stamped with its key.
+        recon_g = nx.MultiDiGraph()
+        eid1 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid1][_IK_KEY_ATTR] = "graph1"
+        eid2 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid2][_IK_KEY_ATTR] = "graph2"
 
-        loop = self._make_loop(tmp_path, merger_graph=g)
+        # Use a REAL GraphMerger (model=None — no contradiction resolution).
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)  # real merger, not MagicMock
 
         # Register TWO store keys for the same (s,p,o).
         for key in ("graph1", "graph2"):
@@ -2793,42 +2444,61 @@ class TestConsolidateInterimAdaptersFullFlow:
                 key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
             )
 
-        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph()))
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # The merged-graph edge-walk yields ONE triple → ONE key in tier_keyed.
-        # The second duplicate key is a drift key (not in the graph's edge set).
-        # keys_per_tier holds counts; verify via the returned count.
-        assert result["keys_per_tier"]["episodic"] == 1, (
-            f"Expected exactly 1 episodic key after duplicate dedup; "
-            f"got {result['keys_per_tier']['episodic']}"
+        # The real merger Case-1 collapses identical SPO to ONE edge → ONE key survives.
+        episodic_count = result["keys_per_tier"]["episodic"]
+        drift_count = result["graph_drift_count"]
+        assert episodic_count == 1, (
+            f"Expected 1 episodic key (duplicate-SPO collapsed by real merger); "
+            f"got {episodic_count}"
         )
-        assert result["graph_drift_count"] >= 1, (
-            f"Expected at least 1 drift key (the duplicate); got {result['graph_drift_count']}"
+        assert drift_count == 1, (
+            f"Expected graph_drift_count=1 (total absent keys); got {drift_count}"
         )
+        # The collapsed key must be classified as deduplicated, NOT genuine_loss.
+        assert result["drift_deduplicated"] == 1, (
+            f"Expected drift_deduplicated=1 (duplicate-SPO collapse is intended dedup);"
+            f" got {result['drift_deduplicated']}"
+        )
+        assert result["drift_genuine_loss"] == 0, (
+            f"Expected drift_genuine_loss=0 (fact is preserved under surviving twin);"
+            f" got {result['drift_genuine_loss']}"
+        )
+
+        # Verify the surviving key's fact is intact.
+        surviving = result["tier_keyed"]["episodic"][0]
+        assert surviving["subject"] == "Alice"
+        assert surviving["predicate"] == "lives_in"
+        assert surviving["object"] == "Berlin"
 
     # -------------------------------------------------------------------------
     # Test 2: tier from edge-walk relation_type (not dead :3463 path)
     # -------------------------------------------------------------------------
 
     def test_preference_relation_routes_to_procedural(self, tmp_path):
-        """A 'preference' relation_type on the merged-graph edge routes the key
-        to the procedural tier, NOT episodic.
+        """A 'preference' relation_type routes the key to the procedural tier.
 
-        This verifies the edge-walk (stage 4) is non-empty and that
-        partition_relations sees the correct relation_type from the graph edge.
-        The dead :3463 path always produced an empty lookup, making every key
-        fall to the graph-drift branch — which never assigned procedural tier.
+        The recon graph carries a preference edge stamped with 'proc1'; Stage 2
+        merges it into the empty graph (setting indexed_key=proc1 on the
+        Relation), _upsert_relation stamps ik_key on the merged edge, and
+        Stage 5 reads that key off the edge — tiering via bookkeeping
+        relation_type='preference' → procedural.
         """
         import networkx as nx
 
         from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
 
-        # Merged graph: preference edge.
-        g = nx.MultiDiGraph()
-        eid = g.add_edge("Alice", "tea", predicate="prefers")
-        g["Alice"]["tea"][eid]["relation_type"] = "preference"
+        # Recon graph: preference edge stamped with proc1.
+        recon_g = nx.MultiDiGraph()
+        recon_eid = recon_g.add_edge("Alice", "tea", predicate="prefers")
+        recon_g["Alice"]["tea"][recon_eid][_IK_KEY_ATTR] = "proc1"
 
-        loop = self._make_loop(tmp_path, merger_graph=g, procedural_enabled=True)
+        # Merged graph starts EMPTY.
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph(), procedural_enabled=True)
+        # Install provenance merge spy so ik_key is stamped onto merged edge.
+        self._install_provenance_merge_spy(loop)
 
         loop.store.put(
             "procedural",
@@ -2847,7 +2517,7 @@ class TestConsolidateInterimAdaptersFullFlow:
             "proc1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="preference"
         )
 
-        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph()))
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
         assert result["keys_per_tier"].get("procedural", 0) == 1, (
             f"Expected 1 key in procedural tier; got {result['keys_per_tier']}"
@@ -2906,8 +2576,34 @@ class TestConsolidateInterimAdaptersFullFlow:
         # Capture merger.merge() call args.
         merge_calls: list = []
 
-        def _spy_merge(session_graph):
+        def _spy_merge(session_graph, *, additive=False):
             merge_calls.append(session_graph)
+            # Stamp the ik_key from the Relation onto the merged graph edge so
+            # Stage 5 can read it back (mirrors real _upsert_relation behaviour).
+            from paramem.memory.persistence import _IK_KEY_ATTR
+
+            for rel in session_graph.relations:
+                if rel.indexed_key:
+                    _subj = rel.subject
+                    _obj = rel.object
+                    if not merged_g.has_node(_subj):
+                        merged_g.add_node(_subj)
+                    if not merged_g.has_node(_obj):
+                        merged_g.add_node(_obj)
+                    import paramem.graph.merger as _merger_mod
+
+                    _eid = merged_g.add_edge(
+                        _subj,
+                        _obj,
+                        predicate=_merger_mod._normalize_predicate(rel.predicate),
+                        relation_type=rel.relation_type,
+                        confidence=rel.confidence,
+                        first_seen="s_recon",
+                        last_seen="s_recon",
+                        recurrence_count=1,
+                        sessions=["s_recon"],
+                    )
+                    merged_g[_subj][_obj][_eid][_IK_KEY_ATTR] = rel.indexed_key
             return merged_g
 
         loop.merger.merge.side_effect = _spy_merge
@@ -2923,40 +2619,47 @@ class TestConsolidateInterimAdaptersFullFlow:
         assert rel.relation_type == "preference", (
             f"Expected relation_type='preference' from bookkeeping; got {rel.relation_type!r}"
         )
+        assert rel.indexed_key == "proc1", (
+            f"Expected indexed_key='proc1' on synthetic Relation; got {rel.indexed_key!r}"
+        )
 
     # -------------------------------------------------------------------------
     # Test 4: predicate normalization mismatch — store raw vs graph normalized
     # -------------------------------------------------------------------------
 
     def test_normalization_mismatch_key_lands_in_tier(self, tmp_path):
-        """Load-bearing correctness: a store entry with an un-normalized predicate
-        (e.g. raw extraction output "Lives In") is matched against a merger.graph
-        edge whose predicate has the canonical normalized form ("lives_in").
+        """Under provenance keying, predicate normalization no longer gates keying.
 
-        Stage-3 normalizes the store predicate via _normalize_predicate before
-        building triple_to_key; stage-5 normalizes the graph edge predicate the
-        same way.  The key must be found and placed in a tier — NOT dropped as
-        drift — proving that _normalize_predicate is applied on both sides.
+        The key rides the merged edge's ik_key attribute (stamped at Stage 2 from
+        Relation.indexed_key).  Even if the store entry carries a raw un-normalized
+        predicate ("Lives In") and the recon edge carries the normalized form
+        ("lives_in"), the key is found via the edge attribute — NOT by triple-string
+        matching.  The key must be tiered, NOT drift.
         """
         import networkx as nx
 
         from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
 
-        # Merged graph carries the NORMALIZED predicate (as merger.merge() stores it).
-        g = nx.MultiDiGraph()
-        eid = g.add_edge("Alice", "Berlin", predicate="lives_in")
-        g["Alice"]["Berlin"][eid]["relation_type"] = "factual"
+        # Recon graph: edge with normalized predicate stamped with graph1.
+        recon_g = nx.MultiDiGraph()
+        recon_eid = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][recon_eid][_IK_KEY_ATTR] = "graph1"
 
-        loop = self._make_loop(tmp_path, merger_graph=g)
+        # Merged graph starts EMPTY.
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        # Install provenance merge spy so ik_key is stamped onto merged edge.
+        self._install_provenance_merge_spy(loop)
 
-        # Store entry carries the RAW (un-normalized) predicate form.
+        # Store entry carries the RAW (un-normalized) predicate form — irrelevant
+        # to keying now, but the entry content is what gets trained.
         loop.store.put(
             "episodic",
             "graph1",
             {
                 "key": "graph1",
                 "subject": "Alice",
-                "predicate": "Lives In",  # raw form — must be normalized before lookup
+                "predicate": "Lives In",  # raw form — stored as-is, not used for keying
                 "object": "Berlin",
                 "speaker_id": "Speaker0",
                 "first_seen_cycle": 1,
@@ -2967,19 +2670,18 @@ class TestConsolidateInterimAdaptersFullFlow:
             "graph1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
-        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph()))
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # The key must appear in a tier — normalization on both sides must match.
+        # The key must appear in a tier — provenance keying always finds it.
         tiers = ("episodic", "semantic", "procedural")
         total_tiered = sum(result["keys_per_tier"].get(t, 0) for t in tiers)
         assert total_tiered == 1, (
-            f"Expected exactly 1 tiered key (normalization matched); "
+            f"Expected exactly 1 tiered key (provenance keyed); "
             f"got {result['keys_per_tier']} drift={result['graph_drift_count']}"
         )
-        # Normalization-matched key must NOT appear in drift.
+        # Key must NOT appear in drift.
         assert result["graph_drift_count"] == 0, (
-            f"Expected 0 drift keys (predicate normalization matched); "
-            f"got {result['graph_drift_count']}"
+            f"Expected 0 drift keys (key stamped on merged edge); got {result['graph_drift_count']}"
         )
 
     # -------------------------------------------------------------------------
@@ -2987,26 +2689,29 @@ class TestConsolidateInterimAdaptersFullFlow:
     # -------------------------------------------------------------------------
 
     def test_explicit_drift_key_not_in_tier(self, tmp_path):
-        """A store active key whose (s,p,o) triple is genuinely absent from
-        merger.graph is counted as drift: NOT placed in any tier_keyed list,
-        and counted in graph_drift_count.
+        """A store active key whose recon edge is absent from the merged graph
+        is counted as drift: NOT placed in any tier_keyed list.
 
-        Absence from the graph means the key was either superseded by a
-        contradiction, rolled back before extraction, or corrupted — it must
-        be dropped from this consolidation cycle and logged, not crashed.
+        Under provenance keying, drift = active key with no surviving merged
+        edge.  'graph_bob' has a recon edge (stamped ik_key) → tiered.
+        'drift1' has NO recon edge (reconstruction "failed"/absent) → drifts.
         """
         import networkx as nx
 
         from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
 
-        # Merged graph carries a DIFFERENT triple (unrelated to the drift key).
-        g = nx.MultiDiGraph()
-        eid = g.add_edge("Bob", "London", predicate="lives_in")
-        g["Bob"]["London"][eid]["relation_type"] = "factual"
+        # Recon graph: only graph_bob has a recon edge; drift1 is absent.
+        recon_g = nx.MultiDiGraph()
+        recon_eid = recon_g.add_edge("Bob", "London", predicate="lives_in")
+        recon_g["Bob"]["London"][recon_eid][_IK_KEY_ATTR] = "graph_bob"
 
-        loop = self._make_loop(tmp_path, merger_graph=g)
+        # Merged graph starts EMPTY.
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        # Install provenance merge spy so ik_keys are stamped onto merged edges.
+        self._install_provenance_merge_spy(loop)
 
-        # Register the unrelated graph key (so it has a valid store entry).
+        # Register graph_bob — has a recon edge → will be tiered.
         loop.store.put(
             "episodic",
             "graph_bob",
@@ -3024,7 +2729,7 @@ class TestConsolidateInterimAdaptersFullFlow:
             "graph_bob", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
-        # Register the DRIFT key — triple does NOT exist in merger.graph.
+        # Register drift1 — no recon edge → no merged edge → drifts.
         loop.store.put(
             "episodic",
             "drift1",
@@ -3042,14 +2747,1037 @@ class TestConsolidateInterimAdaptersFullFlow:
             "drift1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
-        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph()))
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # drift1's triple is absent from merger.graph — it must be counted as drift.
+        # drift1 has no recon edge → no merged edge → counted as drift.
         assert result["graph_drift_count"] >= 1, (
-            f"Expected at least 1 drift key (drift1 absent from graph); "
+            f"Expected at least 1 drift key (drift1 has no recon edge); "
             f"got {result['graph_drift_count']}"
         )
-        # graph_bob's triple IS in the graph, so it must be placed in a tier.
+        # drift1 has SPO content → genuine reconstruction loss, not dedup or orphan.
+        assert result["drift_genuine_loss"] >= 1, (
+            f"Expected drift_genuine_loss>=1 (drift1 has content but no recon edge);"
+            f" got {result['drift_genuine_loss']}"
+        )
+        assert result["drift_deduplicated"] == 0, (
+            f"Expected drift_deduplicated=0 (no duplicate-SPO collapse in this test);"
+            f" got {result['drift_deduplicated']}"
+        )
+        # graph_bob has a recon edge → stamped on merged edge → tiered.
         assert result["keys_per_tier"].get("episodic", 0) >= 1, (
             f"Expected graph_bob in episodic tier; got {result['keys_per_tier']}"
+        )
+
+    # -------------------------------------------------------------------------
+    # New unit tests (Part 1 provenance, additive fold, incomplete drop)
+    # -------------------------------------------------------------------------
+
+    def test_recall_passing_key_keyed_off_edge_provenance(self, tmp_path):
+        """Provenance keying: a key stamped on a recon edge is tiered with 0 drift.
+
+        This is the basic invariant: recon edge stamped 'graph10' → Stage 2
+        stamps it on the merged edge → Stage 5 reads key off edge → tiered.
+        Surface-form normalization, triple-identity matching, and seen_triples
+        dedup are no longer in the path — the key rides the edge directly.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        recon_g = nx.MultiDiGraph()
+        eid = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid][_IK_KEY_ATTR] = "graph10"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        self._install_provenance_merge_spy(loop)
+
+        loop.store.put(
+            "episodic",
+            "graph10",
+            {
+                "key": "graph10",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph10", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        assert result["keys_per_tier"].get("episodic", 0) == 1, (
+            f"Expected graph10 in episodic tier; got {result['keys_per_tier']}"
+        )
+        assert result["graph_drift_count"] == 0, (
+            f"Expected 0 drift; got {result['graph_drift_count']}"
+        )
+
+    def test_incomplete_triple_dropped_by_dedup_episodic(self):
+        """dedup_episodic drops entries missing any of subject/predicate/object.
+
+        No __unkeyed__ fallback — the entry is absent from the output list.
+        """
+        from paramem.training.consolidation import ConsolidationLoop
+
+        incomplete = [
+            {"subject": "Alice", "predicate": "lives_in"},  # missing object
+            {"subject": "Bob", "predicate": "", "object": "Berlin"},  # empty pred
+            {"subject": "", "predicate": "likes", "object": "tea"},  # empty subj
+            {"subject": "Carol", "predicate": "works_at", "object": "Acme"},  # complete
+        ]
+        result = ConsolidationLoop.dedup_episodic(incomplete)
+        assert len(result) == 1, f"Expected 1 complete entry; got {len(result)}"
+        assert result[0]["subject"] == "Carol"
+        # No __unkeyed__ keys in result
+        assert all("__unkeyed__" not in str(r) for r in result)
+
+    def test_incomplete_triple_dropped_by_dedup_procedural(self):
+        """dedup_procedural drops entries missing any of subject/predicate/object."""
+        from paramem.training.consolidation import ConsolidationLoop
+
+        incomplete = [
+            {"subject": "Alice", "predicate": "prefers"},  # missing object
+            {"subject": "Bob", "predicate": "prefers", "object": "tea"},  # complete
+        ]
+        result = ConsolidationLoop.dedup_procedural(incomplete)
+        assert len(result) == 1, f"Expected 1 complete entry; got {len(result)}"
+        assert result[0]["subject"] == "Bob"
+
+    def test_case1_adopt_stamps_keyless_edge(self, tmp_path):
+        """Case-1-adopt: a keyless pre-existing edge adopts the incoming ik_key.
+
+        Pre-seed merger.graph with a keyless (s,p,o) edge.  Merge a recon
+        Relation with indexed_key='g1' for the same triple.  The exact-duplicate
+        reinforce branch fires and adopts the ik_key onto the existing edge.
+        """
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        m = GraphMerger()  # no model — no cardinality calls
+        m.graph.add_node("Alice")
+        m.graph.add_node("Berlin")
+        existing_eid = m.graph.add_edge(
+            "Alice",
+            "Berlin",
+            predicate="lives_in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s0",
+            last_seen="s0",
+            recurrence_count=1,
+            sessions=["s0"],
+        )
+        # No ik_key on the existing edge (keyless pre-existing state).
+        assert m.graph["Alice"]["Berlin"][existing_eid].get(_IK_KEY_ATTR) is None
+
+        # Upsert the same triple with indexed_key set — should adopt via Case-1.
+        incoming = Relation(
+            subject="Alice",
+            predicate="lives_in",
+            object="Berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="Speaker0",
+            indexed_key="g1",
+        )
+        m._upsert_relation("Alice", "Berlin", incoming, "s1", "2026-01-01T00:00:00Z")
+
+        # Existing edge must now carry the adopted ik_key.
+        edge_data = m.graph["Alice"]["Berlin"][existing_eid]
+        assert edge_data.get(_IK_KEY_ATTR) == "g1", (
+            f"Expected ik_key='g1' adopted onto existing edge; got {edge_data.get(_IK_KEY_ATTR)!r}"
+        )
+        # No duplicate edge should have been inserted (still one edge for this (s,p,o)).
+        same_pred_edges = [
+            k for k, d in m.graph["Alice"]["Berlin"].items() if d.get("predicate") == "lives_in"
+        ]
+        assert len(same_pred_edges) == 1, (
+            f"Expected exactly 1 edge after Case-1-adopt; got {len(same_pred_edges)}"
+        )
+
+    def test_additive_fold_replace_classified_predicate_both_keys_survive(self, tmp_path):
+        """Additive fold: two registered keys with same (s,p), different objects,
+        REPLACE-classified predicate — under additive=True, BOTH keys survive with
+        zero drift.
+
+        This is the canonical regression guard for the purely-additive fold bugfix:
+        a REPLACE-classified predicate must NOT remove a registered edge at fold time.
+        The merger is driven via _install_provenance_merge_spy (additive=True short-
+        circuits Case-2, so both Munich and Berlin edges land in the merged graph).
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # Recon graph: TWO edges for same predicate, different objects.
+        recon_g = nx.MultiDiGraph()
+        munich_eid = recon_g.add_edge("Alex", "Munich", predicate="lives_in")
+        recon_g["Alex"]["Munich"][munich_eid][_IK_KEY_ATTR] = "key_munich"
+        berlin_eid = recon_g.add_edge("Alex", "Berlin", predicate="lives_in")
+        recon_g["Alex"]["Berlin"][berlin_eid][_IK_KEY_ATTR] = "key_berlin"
+
+        # Use a REAL GraphMerger with a model stub whose cardinality is REPLACE.
+        # Under additive=True the model must NOT be called and the old edge must survive.
+        from unittest.mock import MagicMock
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=model_stub, tokenizer=tok_stub)
+        # Pre-cache lives_in as single-valued (REPLACE) to maximise sensitivity.
+        loop.merger._predicate_cardinality["lives_in"] = False
+
+        for key, obj in (("key_munich", "Munich"), ("key_berlin", "Berlin")):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alex",
+                    "predicate": "lives_in",
+                    "object": obj,
+                    "speaker_id": "Speaker0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        # Under additive fold: BOTH keys must survive — zero drift.
+        assert result["graph_drift_count"] == 0, (
+            f"Expected 0 drift under additive fold (both Munich and Berlin must survive); "
+            f"got drift={result['graph_drift_count']}"
+        )
+        assert result["keys_per_tier"].get("episodic", 0) == 2, (
+            f"Expected both key_munich and key_berlin in episodic tier; "
+            f"got {result['keys_per_tier']}"
+        )
+
+    def test_munich_berlin_additive_fold_no_drift(self, tmp_path):
+        """Additive fold with mock merger: Munich and Berlin are both registered keys
+        for the same (subject, predicate).  Under additive=True the spy inserts both
+        edges; neither key drifts.
+
+        This mirrors the old test_munich_berlin_replace_retires_munich but asserts
+        the correct post-bugfix behaviour: zero drift, both keys tiered.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # Recon graph: both keys present.
+        recon_g = nx.MultiDiGraph()
+        munich_eid = recon_g.add_edge("Alex", "Munich", predicate="lives_in")
+        recon_g["Alex"]["Munich"][munich_eid][_IK_KEY_ATTR] = "key_munich"
+        berlin_eid = recon_g.add_edge("Alex", "Berlin", predicate="lives_in")
+        recon_g["Alex"]["Berlin"][berlin_eid][_IK_KEY_ATTR] = "key_berlin"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+
+        for key, obj in (("key_munich", "Munich"), ("key_berlin", "Berlin")):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alex",
+                    "predicate": "lives_in",
+                    "object": obj,
+                    "speaker_id": "Speaker0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            )
+
+        # Spy that inserts BOTH edges (additive=True behaviour).
+        self._install_provenance_merge_spy(loop)
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        # Both keys must survive — zero drift.
+        assert result["graph_drift_count"] == 0, (
+            f"Expected 0 drift (both Munich and Berlin survive under additive fold); "
+            f"got drift={result['graph_drift_count']}"
+        )
+        assert result["keys_per_tier"].get("episodic", 0) == 2, (
+            f"Expected key_munich and key_berlin in episodic tier; got {result['keys_per_tier']}"
+        )
+
+    def test_promotion_at_fold_reconstructs_from_episodic_then_trains_semantic(self, tmp_path):
+        """Regression: a key at the promotion threshold is reconstructed from the episodic
+        adapter (where its weights live) and then moved to semantic AFTER reconstruction,
+        so it is NOT lost as a reconstruction failure.
+
+        Old (broken) ordering: _promote_mature_keys ran at the INTERIM tick, moving the
+        registry entry to semantic before the fold ran reconstruct_graph.  The fold then
+        probed the key against the semantic adapter, which never learned it, producing a
+        recon failure → permanent data loss.
+
+        New (fixed) ordering:
+        1. reconstruct_graph probes the key against episodic (where weights are) → success.
+        2. _promote_mature_keys_inline runs AFTER the recurrence bump and BEFORE
+           tier_keyed is built → moves the key to semantic.
+        3. tier_keyed["semantic"] picks up the key (tier_for_active_key == "semantic").
+        4. The fold trains the semantic adapter on the key.
+
+        This test sets up a single episodic key with recurrence_count == promotion_threshold,
+        mocks reconstruct_graph to succeed for episodic and FAIL for semantic, runs the fold,
+        and asserts: no reconstruction failures, the key is in tier_keyed["semantic"], and
+        the key survives (not in drift).
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # threshold=3 (ConsolidationConfig default)
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        self._install_provenance_merge_spy(loop)
+
+        # Register the key in EPISODIC (weights live here).
+        loop.store.put(
+            "episodic",
+            "graph_ep1",
+            {
+                "key": "graph_ep1",
+                "subject": "Alice",
+                "predicate": "works_at",
+                "object": "Acme",
+                "speaker_id": "S0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.put_simhash("episodic", "graph_ep1", 11111)
+        loop.store.set_bookkeeping(
+            "graph_ep1",
+            speaker_id="S0",
+            first_seen_cycle=1,
+            relation_type="factual",
+            recurrence_count=3,  # at threshold — would be promoted
+            last_seen_cycle=1,
+        )
+
+        # Recon graph: reconstruct_graph found the key in episodic (weights present there).
+        # If the key had been moved to semantic BEFORE the fold, reconstruct_graph would
+        # have probed the semantic adapter and missed it.  Here we verify the correct path:
+        # the recon graph carries the key as episodic-reconstructed.
+        recon_g = nx.MultiDiGraph()
+        eid1 = recon_g.add_edge("Alice", "Acme", predicate="works_at")
+        recon_g["Alice"]["Acme"][eid1][_IK_KEY_ATTR] = "graph_ep1"
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        # After the fold, the key must be in semantic (promoted by _promote_mature_keys_inline
+        # AFTER reconstruction but BEFORE tier assignment).
+        assert loop.store.tier_for_active_key("graph_ep1") == "semantic", (
+            "Key with recurrence_count==threshold must be promoted to semantic during the fold"
+        )
+        assert "graph_ep1" in loop.promoted_keys, "Promoted key must appear in loop.promoted_keys"
+
+        # The key must appear in tier_keyed["semantic"] — survived, not drifted.
+        # Under the old (broken) ordering, the key would have been probed against the
+        # semantic adapter (where its weights are NOT), causing a recon failure and
+        # a drift count of 1.  Under the fixed ordering, it is probed against episodic
+        # (weights present) → reconstructed → then promoted → tier_keyed["semantic"].
+        tier_keyed = result.get("tier_keyed", {})
+        semantic_keys = {e["key"] for e in tier_keyed.get("semantic", [])}
+        assert "graph_ep1" in semantic_keys, (
+            "Key promoted during fold must land in tier_keyed['semantic'] for semantic training"
+        )
+
+        # Zero drift: the key was found via the merged edge and survived the fold.
+        assert result["graph_drift_count"] == 0, (
+            f"Expected 0 drift; got {result['graph_drift_count']}"
+        )
+
+
+class TestDriftPartitioning:
+    """3-way drift partition: deduplicated / orphan / genuine_loss.
+
+    Guards that the drift-accounting site in consolidate_interim_adapters
+    correctly separates intended deduplication (duplicate-SPO collapse, fact
+    preserved under surviving twin) from orphan keys (no SPO content) and
+    genuine reconstruction losses (content present, no merged edge produced).
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path, *, merger_graph):
+        """Minimal ConsolidationLoop stub (delegates to TestConsolidateInterimAdaptersFullFlow)."""
+        return TestConsolidateInterimAdaptersFullFlow._make_loop(
+            tmp_path, merger_graph=merger_graph
+        )
+
+    @staticmethod
+    def _install_provenance_merge_spy(loop):
+        return TestConsolidateInterimAdaptersFullFlow._install_provenance_merge_spy(loop)
+
+    @staticmethod
+    def _run_with_mocks(loop, tmp_path, reconstruct_return):
+        return TestConsolidateInterimAdaptersFullFlow._run_with_mocks(
+            loop, tmp_path, reconstruct_return
+        )
+
+    def test_drift_partition_three_buckets(self, tmp_path):
+        """Fold with three drift-key classes; each lands in the correct bucket.
+
+        Setup:
+        - "key_dup1" and "key_dup2": identical SPO (Alice lives_in Berlin).
+          key_dup2 collapses into key_dup1 via Case-1 → drift_deduplicated=1.
+          The fact is preserved under key_dup1.
+        - "key_orphan": no subject/predicate/object in its store entry.
+          No recon edge is produced → drift_orphan=1.
+        - "key_loss": has SPO content but no recon edge (reconstruction failed).
+          → drift_genuine_loss=1.
+
+        Total drift = 3, but only genuine_loss=1 is real data loss.
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # Recon graph: key_dup1 and key_dup2 share the same (s,p,o).
+        # key_orphan and key_loss have NO recon edges.
+        recon_g = nx.MultiDiGraph()
+        eid1 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid1][_IK_KEY_ATTR] = "key_dup1"
+        eid2 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid2][_IK_KEY_ATTR] = "key_dup2"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)  # real merger for Case-1 collapse
+
+        # key_dup1 — SPO content, recon edge present; will survive.
+        loop.store.put(
+            "episodic",
+            "key_dup1",
+            {
+                "key": "key_dup1",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_dup1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        # key_dup2 — same SPO; recon edge collapses into key_dup1 via Case-1.
+        loop.store.put(
+            "episodic",
+            "key_dup2",
+            {
+                "key": "key_dup2",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_dup2", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        # key_orphan — no SPO content in entry; no recon edge.
+        loop.store.put(
+            "episodic",
+            "key_orphan",
+            {
+                "key": "key_orphan",
+                "subject": "",
+                "predicate": "",
+                "object": "",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_orphan", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        # key_loss — has real SPO content but no recon edge (reconstruction failed).
+        loop.store.put(
+            "episodic",
+            "key_loss",
+            {
+                "key": "key_loss",
+                "subject": "Bob",
+                "predicate": "works_at",
+                "object": "Acme",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_loss", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        # key_dup1 survives; key_dup2 / key_orphan / key_loss are absent from tier_keyed.
+        assert result["graph_drift_count"] == 3, (
+            f"Expected graph_drift_count=3 (total absent keys); got {result['graph_drift_count']}"
+        )
+        assert result["drift_deduplicated"] == 1, (
+            f"Expected drift_deduplicated=1 (key_dup2 collapsed into key_dup1);"
+            f" got {result['drift_deduplicated']}"
+        )
+        assert result["drift_orphan"] == 1, (
+            f"Expected drift_orphan=1 (key_orphan has no SPO content); got {result['drift_orphan']}"
+        )
+        assert result["drift_genuine_loss"] == 1, (
+            f"Expected drift_genuine_loss=1 (key_loss has content but no recon edge);"
+            f" got {result['drift_genuine_loss']}"
+        )
+        # key_dup1 must survive in episodic with its fact intact.
+        assert result["keys_per_tier"].get("episodic", 0) == 1, (
+            f"Expected 1 episodic key (key_dup1 surviving); got {result['keys_per_tier']}"
+        )
+        surviving = result["tier_keyed"]["episodic"][0]
+        assert surviving["key"] == "key_dup1"
+        assert surviving["subject"] == "Alice"
+
+    def test_no_high_drift_warning_when_only_dedup(self, tmp_path, caplog):
+        """The 'high graph drift — review recommended' warning must NOT fire
+        when all absent keys are in the deduplicated bucket (genuine_loss=0).
+
+        Regression: before the partition, 34 deduplicated keys in a 239-key fold
+        triggered the 10%-threshold WARNING even though no real data was lost.
+        """
+        import logging
+
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # Two keys for the same SPO — one collapses (dedup only, no genuine loss).
+        recon_g = nx.MultiDiGraph()
+        eid1 = recon_g.add_edge("Carol", "Paris", predicate="lives_in")
+        recon_g["Carol"]["Paris"][eid1][_IK_KEY_ATTR] = "key_c1"
+        eid2 = recon_g.add_edge("Carol", "Paris", predicate="lives_in")
+        recon_g["Carol"]["Paris"][eid2][_IK_KEY_ATTR] = "key_c2"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)
+
+        for key in ("key_c1", "key_c2"):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Carol",
+                    "predicate": "lives_in",
+                    "object": "Paris",
+                    "speaker_id": "Speaker0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            )
+
+        # caplog.at_level alone does not capture in this project (log propagation
+        # is intercepted); attach the handler directly to the named logger.
+        _named_logger = logging.getLogger("paramem.training.consolidation")
+        _named_logger.addHandler(caplog.handler)
+        try:
+            result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+        finally:
+            _named_logger.removeHandler(caplog.handler)
+
+        assert result["drift_genuine_loss"] == 0, (
+            f"Expected drift_genuine_loss=0 (dedup only); got {result['drift_genuine_loss']}"
+        )
+        assert result["drift_deduplicated"] == 1, (
+            f"Expected drift_deduplicated=1; got {result['drift_deduplicated']}"
+        )
+        # The "high graph drift — review recommended" WARNING must NOT appear
+        # when genuine_loss=0, regardless of total drift count.
+        high_drift_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "high graph drift" in r.message
+            and "review recommended" in r.message
+        ]
+        assert high_drift_warnings == [], (
+            f"Unexpected 'high graph drift' warning when only dedup occurred: "
+            f"{[r.message for r in high_drift_warnings]}"
+        )
+
+    def test_high_drift_warning_fires_on_genuine_loss(self, tmp_path, caplog):
+        """The 'genuine reconstruction loss' WARNING fires when genuine_loss > 0.
+
+        A key with SPO content that produces no recon edge must trigger the WARNING,
+        regardless of whether there are also deduplicated keys.
+        """
+        import logging
+
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # One key survives (recon edge present), one key_loss has content but no edge.
+        recon_g = nx.MultiDiGraph()
+        eid = recon_g.add_edge("Dave", "London", predicate="lives_in")
+        recon_g["Dave"]["London"][eid][_IK_KEY_ATTR] = "key_ok"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        self._install_provenance_merge_spy(loop)
+
+        loop.store.put(
+            "episodic",
+            "key_ok",
+            {
+                "key": "key_ok",
+                "subject": "Dave",
+                "predicate": "lives_in",
+                "object": "London",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_ok", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        loop.store.put(
+            "episodic",
+            "key_loss",
+            {
+                "key": "key_loss",
+                "subject": "Eve",
+                "predicate": "works_at",
+                "object": "Acme",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_loss", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        # caplog.at_level alone does not capture in this project (log propagation
+        # is intercepted); attach the handler directly to the named logger.
+        _named_logger = logging.getLogger("paramem.training.consolidation")
+        _named_logger.addHandler(caplog.handler)
+        try:
+            result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+        finally:
+            _named_logger.removeHandler(caplog.handler)
+
+        assert result["drift_genuine_loss"] == 1, (
+            f"Expected drift_genuine_loss=1; got {result['drift_genuine_loss']}"
+        )
+        # The genuine-loss WARNING must fire.
+        genuine_loss_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and "genuine reconstruction loss" in r.message
+        ]
+        assert genuine_loss_warnings, (
+            f"Expected a WARNING about genuine reconstruction loss; none emitted."
+            f" caplog had: {[r.message for r in caplog.records]}"
+        )
+
+
+class TestBookkeepingSchema:
+    """Unit tests for the 5-field bookkeeping schema in MemoryStore."""
+
+    def _make_store(self):
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        s = MemoryStore(replay_enabled=True)
+        s.load_registry("episodic", KeyRegistry())
+        return s
+
+    def test_set_bookkeeping_stores_all_five_fields(self):
+        """set_bookkeeping writes all 5 fields into _bookkeeping."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "graph1",
+            speaker_id="Speaker0",
+            first_seen_cycle=3,
+            relation_type="factual",
+            recurrence_count=2,
+            last_seen_cycle=5,
+        )
+        bk = store.bookkeeping_for_key("graph1")
+        assert bk is not None
+        assert bk["speaker_id"] == "Speaker0"
+        assert bk["first_seen_cycle"] == 3
+        assert bk["relation_type"] == "factual"
+        assert bk["recurrence_count"] == 2
+        assert bk["last_seen_cycle"] == 5
+
+    def test_set_bookkeeping_defaults_for_new_keys(self):
+        """set_bookkeeping defaults recurrence_count=1, last_seen_cycle=0."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "graph2",
+            speaker_id="",
+            first_seen_cycle=0,
+            relation_type="factual",
+        )
+        bk = store.bookkeeping_for_key("graph2")
+        assert bk["recurrence_count"] == 1
+        assert bk["last_seen_cycle"] == 0
+
+    def test_bump_recurrence_increments_and_refreshes_cycle(self):
+        """bump_recurrence increments recurrence_count and sets last_seen_cycle."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "graph3",
+            speaker_id="S0",
+            first_seen_cycle=1,
+            relation_type="factual",
+            recurrence_count=1,
+            last_seen_cycle=1,
+        )
+        store.bump_recurrence("graph3", cycle=7)
+        bk = store.bookkeeping_for_key("graph3")
+        assert bk["recurrence_count"] == 2
+        assert bk["last_seen_cycle"] == 7
+        # Other fields must be untouched.
+        assert bk["speaker_id"] == "S0"
+        assert bk["first_seen_cycle"] == 1
+
+    def test_bump_recurrence_creates_record_when_absent(self):
+        """bump_recurrence on unknown key creates a minimal record."""
+        store = self._make_store()
+        store.bump_recurrence("graph_new", cycle=4)
+        bk = store.bookkeeping_for_key("graph_new")
+        assert bk is not None
+        assert bk["recurrence_count"] == 1
+        assert bk["last_seen_cycle"] == 4
+
+    def test_bump_recurrence_preserves_speaker_id(self):
+        """bump_recurrence does NOT reset speaker_id."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "k",
+            speaker_id="Speaker99",
+            first_seen_cycle=0,
+            relation_type="factual",
+            recurrence_count=5,
+            last_seen_cycle=0,
+        )
+        store.bump_recurrence("k", cycle=10)
+        assert store.bookkeeping_for_key("k")["speaker_id"] == "Speaker99"
+
+    def test_load_bookkeeping_from_disk_round_trip(self, tmp_path):
+        """5-field round-trip: save via _save_key_metadata, reload via
+        load_bookkeeping_from_disk."""
+        import json
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        store = MemoryStore(replay_enabled=True)
+        store.load_registry("episodic", KeyRegistry())
+        store.registry("episodic").add("graph5")
+        store.set_bookkeeping(
+            "graph5",
+            speaker_id="SPK",
+            first_seen_cycle=2,
+            relation_type="social",
+            recurrence_count=4,
+            last_seen_cycle=9,
+        )
+
+        # Simulate _save_key_metadata output format.
+        bk = store.bookkeeping_for_key("graph5")
+        payload = {
+            "cycle_count": 10,
+            "promoted_keys": [],
+            "keys": {
+                "graph5": {
+                    "speaker_id": bk["speaker_id"],
+                    "first_seen_cycle": bk["first_seen_cycle"],
+                    "relation_type": bk["relation_type"],
+                    "recurrence_count": bk["recurrence_count"],
+                    "last_seen_cycle": bk["last_seen_cycle"],
+                }
+            },
+        }
+        path = tmp_path / "key_metadata.json"
+        path.write_text(json.dumps(payload))
+
+        # Reload into a fresh store.
+        store2 = MemoryStore(replay_enabled=True)
+        store2.load_registry("episodic", KeyRegistry())
+        store2.registry("episodic").add("graph5")
+        store2.load_bookkeeping_from_disk(path)
+
+        bk2 = store2.bookkeeping_for_key("graph5")
+        assert bk2 is not None
+        assert bk2["speaker_id"] == "SPK"
+        assert bk2["first_seen_cycle"] == 2
+        assert bk2["relation_type"] == "social"
+        assert bk2["recurrence_count"] == 4
+        assert bk2["last_seen_cycle"] == 9
+
+    def test_load_bookkeeping_legacy_upgrade_missing_recurrence(self, tmp_path):
+        """Legacy key_metadata.json without recurrence fields gets defaults."""
+        import json
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        # Simulate a pre-Refactor-A key_metadata.json (3-field schema).
+        payload = {
+            "cycle_count": 5,
+            "promoted_keys": [],
+            "keys": {
+                "graph_old": {
+                    "speaker_id": "SPK",
+                    "first_seen_cycle": 3,
+                    "relation_type": "factual",
+                    # recurrence_count and last_seen_cycle absent (legacy)
+                }
+            },
+        }
+        path = tmp_path / "key_metadata.json"
+        path.write_text(json.dumps(payload))
+
+        store = MemoryStore(replay_enabled=True)
+        store.load_registry("episodic", KeyRegistry())
+        store.registry("episodic").add("graph_old")
+        result = store.load_bookkeeping_from_disk(path)
+
+        assert result["legacy_upgraded"] >= 1, "Legacy key must be counted as legacy_upgraded"
+        bk = store.bookkeeping_for_key("graph_old")
+        assert bk["recurrence_count"] == 1
+        # Legacy default: last_seen_cycle == first_seen_cycle
+        assert bk["last_seen_cycle"] == bk["first_seen_cycle"] == 3
+
+
+class TestBookkeepingBasedPromotion:
+    """Tests for bookkeeping-based key-level promotion and decay."""
+
+    def _make_loop_and_store(self):
+        """Build a minimal ConsolidationLoop + MemoryStore without GPU."""
+        from unittest.mock import MagicMock
+
+        from peft import PeftModel
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.model.peft_config = {}
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig()
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.promoted_keys = set()
+        loop.cycle_count = 5
+
+        store = MemoryStore(replay_enabled=True)
+        store.load_registry("episodic", KeyRegistry())
+        store.load_registry("semantic", KeyRegistry())
+        loop.store = store
+        return loop, store
+
+    def test_promotion_fires_when_recurrence_reaches_threshold(self):
+        """_promote_mature_keys_inline promotes a key to semantic tier when threshold is met."""
+        loop, store = self._make_loop_and_store()
+        # ConsolidationConfig default: promotion_threshold=3
+
+        # Add a key with recurrence_count=3 (at threshold).
+        store.registry("episodic").add("graph10")
+        store.put_simhash("episodic", "graph10", 12345)
+        store.set_bookkeeping(
+            "graph10",
+            speaker_id="S0",
+            first_seen_cycle=1,
+            relation_type="factual",
+            recurrence_count=3,
+            last_seen_cycle=5,
+        )
+
+        newly_promoted = loop._promote_mature_keys_inline()
+
+        assert "graph10" in newly_promoted, "Key with recurrence_count==threshold must be promoted"
+        assert store.tier_for_active_key("graph10") == "semantic", (
+            "Promoted key must be in semantic registry"
+        )
+        assert "graph10" in loop.promoted_keys
+
+    def test_promotion_does_not_fire_below_threshold(self):
+        """Key with recurrence_count < threshold stays in episodic."""
+        loop, store = self._make_loop_and_store()
+        # ConsolidationConfig default: promotion_threshold=3
+
+        store.registry("episodic").add("graph20")
+        store.put_simhash("episodic", "graph20", 999)
+        store.set_bookkeeping(
+            "graph20",
+            speaker_id="S0",
+            first_seen_cycle=1,
+            relation_type="factual",
+            recurrence_count=2,  # below threshold
+            last_seen_cycle=5,
+        )
+
+        newly_promoted = loop._promote_mature_keys_inline()
+
+        assert "graph20" not in newly_promoted
+        assert store.tier_for_active_key("graph20") == "episodic"
+
+    def test_already_promoted_key_not_re_promoted(self):
+        """A key already in promoted_keys is not re-promoted."""
+        loop, store = self._make_loop_and_store()
+
+        store.registry("semantic").add("graph30")
+        store.put_simhash("semantic", "graph30", 777)
+        store.set_bookkeeping(
+            "graph30",
+            speaker_id="S0",
+            first_seen_cycle=1,
+            relation_type="factual",
+            recurrence_count=5,
+            last_seen_cycle=5,
+        )
+        loop.promoted_keys.add("graph30")  # already promoted
+
+        newly_promoted = loop._promote_mature_keys_inline()
+        assert "graph30" not in newly_promoted
+
+    def test_decay_candidate_logged_not_deleted(self):
+        """A key with last_seen_cycle far in the past is a decay candidate but NOT deleted."""
+        loop, store = self._make_loop_and_store()
+        # ConsolidationConfig default: decay_window=10
+        loop.cycle_count = 20
+
+        store.registry("episodic").add("graph40")
+        store.put_simhash("episodic", "graph40", 555)
+        store.set_bookkeeping(
+            "graph40",
+            speaker_id="S0",
+            first_seen_cycle=1,
+            relation_type="factual",
+            recurrence_count=1,
+            last_seen_cycle=5,  # 20 - 5 = 15 >= decay_window=10
+        )
+
+        # Must NOT raise, must NOT delete the key.
+        newly_promoted = loop._promote_mature_keys_inline()
+        assert "graph40" not in newly_promoted
+        assert store.tier_for_active_key("graph40") == "episodic", (
+            "Decay candidate must NOT be deleted (passive fade policy)"
+        )
+
+    def test_recurrence_bump_in_fold_via_reinforcements(self, tmp_path):
+        """fold with two active keys sharing one (s,p,o) bumps recurrence on the survivor.
+
+        Uses a real GraphMerger (model=None) which applies Case-1 collapse and
+        records the surviving key in merger.reinforcements.  After _run_with_mocks,
+        the survivor's bookkeeping.recurrence_count must equal 2 and
+        bookkeeping.last_seen_cycle must equal loop.cycle_count.
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # Provide a recon graph with TWO identical-SPO edges.
+        recon_g = nx.MultiDiGraph()
+        eid1 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid1][_IK_KEY_ATTR] = "graph1"
+        eid2 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid2][_IK_KEY_ATTR] = "graph2"
+
+        loop = TestConsolidateInterimAdaptersFullFlow._make_loop(
+            tmp_path, merger_graph=nx.MultiDiGraph()
+        )
+        loop.merger = GraphMerger(model=None)
+        loop.cycle_count = 7
+
+        for key in ("graph1", "graph2"):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                    "speaker_id": "S0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key,
+                speaker_id="S0",
+                first_seen_cycle=1,
+                relation_type="factual",
+                recurrence_count=1,
+                last_seen_cycle=1,
+            )
+
+        TestConsolidateInterimAdaptersFullFlow._run_with_mocks(
+            loop, tmp_path, ReconstructionResult(graph=recon_g)
+        )
+
+        # The surviving key (the one that remained in tier_keyed) must have
+        # recurrence_count == 2 (was bumped by the Case-1 collapse).
+        surviving_key = None
+        for key in ("graph1", "graph2"):
+            bk = loop.store.bookkeeping_for_key(key)
+            if bk and bk["recurrence_count"] == 2:
+                surviving_key = key
+                break
+        assert surviving_key is not None, (
+            "One key must have recurrence_count==2 after duplicate-SPO collapse"
+        )
+        bk = loop.store.bookkeeping_for_key(surviving_key)
+        assert bk["last_seen_cycle"] == 7, (
+            "Surviving key's last_seen_cycle must be refreshed to cycle_count"
         )

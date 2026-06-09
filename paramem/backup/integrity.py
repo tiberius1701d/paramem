@@ -332,20 +332,24 @@ def _check_common_file(path: Path, category: str) -> tuple[FileCheck, dict | Non
         return FileCheck(path_str, category, "common", _PARSE_ERROR, str(exc)), None
 
 
-def _find_live_slot_for_tier(adapter_dir: Path, tier_name: str) -> Path | None:
-    """Find the newest slot dir under *adapter_dir/<tier_name>* that has a meta.json.
+def _find_live_slot_for_tier(tier_root: Path) -> Path | None:
+    """Find the newest slot dir under *tier_root* that has a meta.json.
 
     Used to locate the live weight slot for manifest checking in train mode.
     Returns the newest slot by mtime, or ``None`` when none exists.
 
+    The caller is responsible for resolving *tier_root* to the correct
+    on-disk directory before calling this function.  Main tiers are flat
+    (``<adapter_dir>/<tier>/``); interim tiers are nested
+    (``<adapter_dir>/episodic/interim_<stamp>/``).  Both are handled by
+    passing the already-resolved path rather than recomputing it here.
+
     Args:
-        adapter_dir: Root adapter directory.
-        tier_name: Tier name (e.g. ``"episodic"``).
+        tier_root: Resolved directory to search for slot subdirectories.
 
     Returns:
         Path to the slot directory, or ``None``.
     """
-    tier_root = adapter_dir / tier_name
     if not tier_root.is_dir():
         return None
     candidates: list[Path] = []
@@ -627,11 +631,14 @@ def verify_infrastructure_integrity(
 
         # --- Manifest check (train mode only, live weight slot) ---
         if mode == "train" and has_keys:
-            # Find the live weight slot dir (has meta.json)
-            live_slot = _find_live_slot_for_tier(adapter_dir, tier_name)
+            # Find the live weight slot dir (has meta.json).
+            # tier_root is already resolved for both main and interim tiers:
+            # main  → <adapter_dir>/<tier>/
+            # interim → <adapter_dir>/episodic/interim_<stamp>/   (nested)
+            live_slot = _find_live_slot_for_tier(tier_root)
             if live_slot is None:
                 # No slot dir found — manifest missing
-                meta_path = adapter_dir / tier_name / "meta.json"
+                meta_path = tier_root / "meta.json"
                 checks.append(
                     FileCheck(str(meta_path), "manifest", tier_name, _MISSING, "no weight slot")
                 )
@@ -640,7 +647,7 @@ def verify_infrastructure_integrity(
                 checks.append(manifest_check)
         elif mode == "simulate":
             # simulate: manifest is optional (no weight slot expected)
-            live_slot = _find_live_slot_for_tier(adapter_dir, tier_name)
+            live_slot = _find_live_slot_for_tier(tier_root)
             if live_slot is not None:
                 meta_path = live_slot / "meta.json"
                 checks.append(

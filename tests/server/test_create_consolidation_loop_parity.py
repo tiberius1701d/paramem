@@ -50,7 +50,6 @@ SCENARIOS = [
         {
             "output_dir": "RUNDIR_SENTINEL",
             "save_cycle_snapshots": False,
-            "persist_graph": False,
             "seed_state_from_disk": False,
         },
         id="dataset_probe",
@@ -81,7 +80,6 @@ SCENARIOS = [
         {
             "output_dir": "RUNDIR_SENTINEL",
             "save_cycle_snapshots": False,
-            "persist_graph": False,
             "seed_state_from_disk": False,
         },
         id="step6_step7",
@@ -118,7 +116,6 @@ SCENARIOS = [
         {
             "output_dir": "RUNDIR_SENTINEL",
             "save_cycle_snapshots": False,
-            "persist_graph": False,
             "seed_state_from_disk": False,
         },
         id="interim_rollover",
@@ -192,10 +189,6 @@ def test_factory_threads_every_config_knob(
         kw["save_cycle_snapshots"] if kw.get("save_cycle_snapshots") is not None else cfg.debug
     )
     assert captured["save_cycle_snapshots"] == expected_scs
-
-    # --- persist_graph override ---
-    expected_pg = kw["persist_graph"] if kw.get("persist_graph") is not None else False
-    assert captured["persist_graph"] == expected_pg
 
     # --- Graph and enrichment knobs ---
     assert captured["graph_config"] == cfg.graph_config

@@ -122,16 +122,16 @@ The consolidation loop runs as a standalone batch process, not integrated into i
 ```
 Session Transcript
   → Graph Extractor (LLM structured output → JSON graph)
-  → Graph Merger (resolve entities, aggregate edges, count recurrence)
+  → Graph Merger (resolve entities, reinforce duplicate edges, count recurrence)
   → Consolidation Loop (per-adapter: replay + compress + optimize)
-  → Promotion Scorer (graph metrics → promote/decay decisions)
+  → Fold-time promotion (recurrence_count ≥ threshold: episodic→semantic) + passive decay
 ```
 
 The knowledge graph is the intermediate representation. Adapters never see raw transcripts — they train on graph-derived signals. This separation makes ablation straightforward (swap graph input for raw input and compare).
 
 ### AD-5: JSON Graph Schema (No External DB)
 
-The knowledge graph is a JSON document per session, merged into a cumulative graph stored as a JSON file. NetworkX handles in-memory graph operations (centrality, community detection, path queries). No Neo4j or external graph database.
+The knowledge graph is a JSON document per session, merged into a cumulative graph stored as a JSON file. NetworkX handles in-memory graph operations (entity resolution, edge merge, traversal). No Neo4j or external graph database.
 
 Rationale: Personal-scale data (hundreds to low thousands of entities) doesn't need a database. JSON + NetworkX is sufficient, zero-dependency, and trivially portable. A graph DB can be added later if scale demands it.
 
@@ -155,11 +155,10 @@ A **fallback path** runs local plausibility on the raw extraction when the prima
 
 ### AD-15: Indexed Key Consolidation Loop (Phase 4)
 
-The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → promote entities that meet recurrence threshold → train semantic adapter on promoted keys.
+The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → during the full consolidation fold (`consolidate_interim_adapters`), keys whose per-key `recurrence_count` meets the promotion threshold are promoted episodic→semantic (reconstructed from the episodic adapter, then retrained into the fresh semantic adapter at the same epoch budget); `store.move(key, "semantic")` moves the registry entry and SimHash — so promotion happens after reconstruction and recurrence bump, before tier assignment.
 
 Key design decisions:
-- **Capacity cap with eviction:** `max_active_keys` (default 20) limits adapter load. When exceeded, oldest keys are evicted. Keys survive eviction through reconstruction — if the adapter can still recall them, they're re-registered.
-- **Dual-field promotion matching:** When checking if a keyed fact belongs to a promoted entity, both the subject and the object are checked. Reverse QA templates (e.g., "Who lives in Heilbronn?") swap subject/object, so both must be checked.
+- **Capacity / passive decay:** `max_active_keys` (default 100000) imposes no practical limit; keys are not evicted by age. Unreinforced keys passively decay: those not re-seen for `decay_window` cycles are logged as decay candidates but are never actively deleted. Reconstruction noise causes unimportant facts to drift over time — this is the forgetting curve emerging from the mechanism. Validated to 550 keys with no observed ceiling.
 - **Periodic reconstruction:** Fidelity probing runs every N cycles (default 5), not every cycle. Per-cycle probing consumed 73% of cycle time in entity-replay experiments.
 - **SimHash registry per adapter:** Each adapter (episodic, semantic) maintains its own SimHash registry. Keys promoted from episodic to semantic are registered in the semantic registry and removed from episodic.
 
@@ -177,7 +176,7 @@ Adapter weights are the single source of truth for all personal knowledge. No ex
 
 During the compression phase, each session's knowledge graph is stored in the adapter alongside a unique retrieval key. During replay, the model is prompted with each known key to reconstruct the associated graph triples from its weights. All reconstructions are merged with the new session's graph, and the adapter is retrained on the complete merged result. This turns every incremental consolidation step into a mini batch-mode operation.
 
-Key insight: reconstruction does not need to be perfect. Facts that matter get reinforced through natural conversational repetition. Reconstruction noise causes unimportant facts to drift and decay — this IS the forgetting curve, emerging from the mechanism rather than being engineered.
+Key insight: reconstruction does not need to be perfect. Facts that matter get reinforced through natural conversational repetition. Reconstruction noise causes unimportant facts to drift and decay — this IS the forgetting curve, emerging from the mechanism rather than being engineered. Decay is passive: keys not re-seen for `decay_window` cycles are logged as decay candidates; there is no active deletion.
 
 This replaces an earlier design (periodic full-retrain sweeps on stored QA pairs) which contradicted the core architectural invariant: knowledge lives in weights, not in files.
 
@@ -317,5 +316,5 @@ The RAG pipeline is evaluation infrastructure, not a competing product. It exist
 | WSL2 CUDA memory reporting can be inaccurate | Unexpected OOM during training | Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`; keep training data on Linux filesystem |
 | Multi-adapter simultaneous training not natively batched in PEFT | Must train adapters sequentially per consolidation cycle | Acceptable for PoC; each adapter trains independently anyway |
 | Graph extractor quality depends on base model capability | Poor extraction → poor consolidation signal | Evaluate extraction quality early; consider separate extractor model if needed |
-| Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Cap active keys at 20 (`max_active_keys`); retire empty keys; consolidate session keys into topic keys on promotion |
+| Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Reconstruction-based replay reinforces active keys each cycle; unreinforced keys passively decay via reconstruction noise (`decay_window` log-candidate, no deletion). Validated to 550 keys with no observed ceiling. |
 | Curriculum probing adds latency | Slows iteration cycle | Cap probe to 50 items, cache results, skip on smoke test runs |

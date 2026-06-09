@@ -94,6 +94,8 @@ class MemoryStore:
         # tier -> key -> entry payload dict.  PURE INFERENCE CONTENT CACHE —
         # an entry slot exists only when SPO is materialised.  See module
         # docstring for the "save-path working entries" exception.
+        # SAVE-PATH SITES (authorised store.put callers that write entries):
+        #   1. consolidation.py run_cycle / ingest path — new key registration.
         self._entries: dict[str, dict[str, dict]] = {}
         # tier -> key -> 64-bit simhash fingerprint
         self._simhash: dict[str, dict[str, int]] = {}
@@ -209,20 +211,37 @@ class MemoryStore:
         speaker_id: str,
         first_seen_cycle: int,
         relation_type: str,
+        recurrence_count: int = 1,
+        last_seen_cycle: int = 0,
     ) -> None:
         """Store or update the bookkeeping record for *key*.
 
-        All three fields — ``speaker_id``, ``first_seen_cycle``, and
-        ``relation_type`` — are mandatory (one mandatory tier, zero optional
-        buckets).  Idempotent — safe to call on every new-key write and on
-        every boot reload.
+        All five fields are mandatory in the persisted schema (one mandatory
+        tier, zero optional buckets).  The ``recurrence_count`` and
+        ``last_seen_cycle`` params carry Python defaults solely as a
+        legacy-fill convenience for new-key sites and boot-reload callers that
+        do not yet know the values — exactly mirroring the ``relation_type``
+        handling.  The stored dict always contains all five keys.
 
-        ``relation_type`` is the model-assigned relation type from extraction
+        ``speaker_id``: the speaker who first introduced this key.
+        ``first_seen_cycle``: the consolidation cycle this key was first minted.
+        ``relation_type``: the model-assigned relation type from extraction
         (e.g. ``"factual"``, ``"preference"``, ``"temporal"``, ``"social"``).
         Legacy keys that pre-date this field are upgraded in-memory to
-        ``"unknown"`` by :meth:`load_bookkeeping_from_disk` and then backfilled
-        from the cumulative graph by
-        :meth:`paramem.training.consolidation.ConsolidationLoop.backfill_relation_type_from_graph`.
+        ``"unknown"`` by :meth:`load_bookkeeping_from_disk`; the correct value
+        is stamped at ingestion on the next consolidation cycle.
+        ``recurrence_count``: how many times the underlying fact has been
+        re-seen (via intra-fold duplicate-SPO collapse) since the key was
+        minted.  Default 1 (a new key has been seen once).
+        ``last_seen_cycle``: the most recent consolidation cycle at which this
+        key's fact survived into ``tier_keyed``.  Default 0 (unknown — upgraded
+        to ``first_seen_cycle`` by :meth:`load_bookkeeping_from_disk` for
+        legacy keys).
+
+        **Callers that need to update ONE field on an existing key must use
+        :meth:`bump_recurrence` (for recurrence/last_seen updates) rather than
+        calling this method, which overwrites ALL five fields and would silently
+        reset the counters the caller did not supply.**
 
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit."""
@@ -230,13 +249,48 @@ class MemoryStore:
             "speaker_id": speaker_id,
             "first_seen_cycle": first_seen_cycle,
             "relation_type": relation_type,
+            "recurrence_count": recurrence_count,
+            "last_seen_cycle": last_seen_cycle,
         }
+
+    def bump_recurrence(self, key: str, *, cycle: int) -> None:
+        """Increment ``recurrence_count`` and refresh ``last_seen_cycle`` for *key*.
+
+        This is the ONLY correct way to update the recurrence counter on an
+        existing bookkeeping record without resetting unrelated fields.  Callers
+        that use :meth:`set_bookkeeping` to update a single field would silently
+        overwrite ``speaker_id`` / ``first_seen_cycle`` with defaults.
+
+        When *key* has no bookkeeping record yet the call creates a minimal
+        record (``recurrence_count=1``) — this is a defensive no-op for callers
+        that may race with a first registration; normal flow is that
+        :meth:`set_bookkeeping` is called first.
+
+        Args:
+            key: The indexed-key string (e.g. ``"graph42"``).
+            cycle: Current consolidation cycle number.  Written to
+                ``last_seen_cycle`` unconditionally (the fact was re-seen
+                this cycle).
+        """
+        existing = self._bookkeeping.get(key)
+        if existing is None:
+            self._bookkeeping[key] = {
+                "speaker_id": "",
+                "first_seen_cycle": cycle,
+                "relation_type": "unknown",
+                "recurrence_count": 1,
+                "last_seen_cycle": cycle,
+            }
+            return
+        existing["recurrence_count"] = existing.get("recurrence_count", 1) + 1
+        existing["last_seen_cycle"] = cycle
 
     def bookkeeping_for_key(self, key: str) -> dict | None:
         """Return the bookkeeping record for *key*, or ``None`` when absent.
 
-        Returns a plain dict
-        ``{"speaker_id": str, "first_seen_cycle": int, "relation_type": str}``
+        Returns a plain dict with five fields:
+        ``{"speaker_id", "first_seen_cycle", "relation_type",
+        "recurrence_count", "last_seen_cycle"}``
         when present, ``None`` when the key has never been bookkept.
         Callers may use ``bk = store.bookkeeping_for_key(k) or {}`` as a
         boundary default (compliant with the is-None / empty-is-valid rule)."""
@@ -458,9 +512,8 @@ class MemoryStore:
     def tier_for_active_key(self, key: str) -> str | None:
         """Return the tier that holds *key* in its registry, or ``None``.
 
-        Used by the legacy ``_tier_for_key`` consumers — kept distinct from
-        :meth:`tier_of` because the registry and entry cache can briefly
-        disagree during a put/move sequence."""
+        Kept distinct from :meth:`tier_of` because the registry and entry
+        cache can briefly disagree during a put/move sequence."""
         if self._registry is None:
             return None
         for tier, reg in self._registry.items():
@@ -731,6 +784,8 @@ class MemoryStore:
                                     speaker_id=src_spk,
                                     first_seen_cycle=src_fsc,
                                     relation_type=src.get("relation_type", "unknown"),
+                                    recurrence_count=1,
+                                    last_seen_cycle=src_fsc,
                                 )
 
         return results
@@ -818,13 +873,20 @@ class MemoryStore:
         that created payload-less stub entries has been removed.  Bookkeeping
         presence MUST NOT manufacture a content cache hit.
 
-        Fields loaded: ``speaker_id``, ``first_seen_cycle``, ``relation_type``.
+        Fields loaded: ``speaker_id``, ``first_seen_cycle``, ``relation_type``,
+        ``recurrence_count``, ``last_seen_cycle``.
         Keys absent from every tier registry (orphans — slot wiped or never
         existed) are skipped but counted in the return dict.  Pre-refactor
-        files that lack any of the three fields are upgraded in-memory with
-        ``""`` / ``0`` / ``"unknown"`` respectively (``legacy_upgraded`` counter).
-        Keys with ``relation_type="unknown"`` are candidates for backfill by
-        :meth:`paramem.training.consolidation.ConsolidationLoop.backfill_relation_type_from_graph`.
+        files that lack any field are upgraded in-memory with defaults
+        (``legacy_upgraded`` counter):
+        - ``speaker_id``: ``""``
+        - ``first_seen_cycle``: ``0``
+        - ``relation_type``: ``"unknown"``
+        - ``recurrence_count``: ``1``  (a legacy key has been seen at least once)
+        - ``last_seen_cycle``: ``first_seen_cycle`` (a legacy key that was never
+          re-seen was last seen when first minted)
+        Keys with ``relation_type="unknown"`` will be assigned the correct type
+        on the next consolidation cycle when the triple is re-encountered.
 
         Returns ``{loaded, orphaned, legacy_upgraded}`` for ``/status`` and
         diagnostics.  Missing file → all zeros, no-op (fresh install).
@@ -848,17 +910,23 @@ class MemoryStore:
             if tier is None:
                 orphaned += 1
                 continue
+            _fsc = key_meta.get("first_seen_cycle", 0)
             if (
                 "speaker_id" not in key_meta
                 or "first_seen_cycle" not in key_meta
                 or "relation_type" not in key_meta
+                or "recurrence_count" not in key_meta
+                or "last_seen_cycle" not in key_meta
             ):
                 legacy_upgraded += 1
             self.set_bookkeeping(
                 key,
                 speaker_id=key_meta.get("speaker_id", ""),
-                first_seen_cycle=key_meta.get("first_seen_cycle", 0),
+                first_seen_cycle=_fsc,
                 relation_type=key_meta.get("relation_type", "unknown"),
+                recurrence_count=key_meta.get("recurrence_count", 1),
+                # Legacy default: last_seen == first_seen (key never re-seen).
+                last_seen_cycle=key_meta.get("last_seen_cycle", _fsc),
             )
             loaded += 1
         return {"loaded": loaded, "orphaned": orphaned, "legacy_upgraded": legacy_upgraded}

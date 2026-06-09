@@ -10,7 +10,7 @@ import os
 import random
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
@@ -31,9 +31,6 @@ from paramem.graph.qa_generator import (
 from paramem.graph.reconstruct import reconstruct_graph
 from paramem.graph.schema import Relation, SessionGraph
 from paramem.graph.schema_config import fallback_relation_type, relation_types
-from paramem.graph.scoring import (
-    PromotionScorer,
-)
 from paramem.memory.entry import (
     assign_keys,
     build_registry,
@@ -74,8 +71,6 @@ class CycleResult:
     session_id: str
     entities_extracted: int = 0
     relations_extracted: int = 0
-    nodes_promoted: int = 0
-    nodes_decayed: int = 0
     nodes_retained: int = 0
     episodic_train_loss: Optional[float] = None
     semantic_train_loss: Optional[float] = None
@@ -83,8 +78,6 @@ class CycleResult:
     episodic_recall: Optional[float] = None
     semantic_recall: Optional[float] = None
     wall_clock_seconds: float = 0.0
-    promoted_nodes: list[str] = field(default_factory=list)
-    decayed_nodes: list[str] = field(default_factory=list)
 
 
 class TrialActiveError(RuntimeError):
@@ -133,14 +126,12 @@ class ConsolidationLoop:
         procedural_adapter_config: Optional[AdapterConfig] = None,
         wandb_config: Optional[WandbConfig] = None,
         output_dir: str | Path = "outputs/phase3",
-        graph_path: Optional[str | Path] = None,
         extraction_temperature: float = 0.0,
         extraction_max_tokens: int = 8192,
         extraction_plausibility_max_tokens: int = 8192,
         save_cycle_snapshots: bool = True,
         snapshot_dir: str | Path | None = None,
         run_id: str | None = None,
-        persist_graph: bool = True,
         prompts_dir: str | Path | None = None,
         extraction_stt_correction: bool = True,
         extraction_ha_validation: bool = True,
@@ -208,12 +199,7 @@ class ConsolidationLoop:
         # debug-layout cleanup.
         self._debug_base: Path | None = Path(snapshot_dir) if snapshot_dir else None
         self.snapshot_dir = self._debug_base / f"run_{self.run_id}" if self._debug_base else None
-        self.persist_graph = persist_graph
         self.prompts_dir = prompts_dir
-        # Entity-level promotion requires a persistent graph for cross-restart
-        # recurrence tracking. When the graph is transient (persist_graph=False),
-        # the caller must handle promotion externally (e.g. key-level promotion).
-        self.enable_entity_promotion = persist_graph
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -273,18 +259,13 @@ class ConsolidationLoop:
             cross_predicate_contradiction=gc.cross_predicate_contradiction,
             prompts_dir=self.prompts_dir,
         )
-        self.scorer = PromotionScorer()
         self.last_session_graph = None
-        if graph_path:
-            self.graph_path = Path(graph_path)
-        elif self.persist_graph:
-            self.graph_path = self.output_dir / "cumulative_graph.json"
-        else:
-            self.graph_path = None
 
-        # Load existing graph if persistence is enabled
-        if self.persist_graph and self.graph_path.exists():
-            self.merger.load_graph(self.graph_path)
+        # The cumulative graph is NOT loaded at construction.  The fold
+        # (consolidate_interim_adapters) calls merger.reset_graph() before
+        # Stage-2 re-merge so the keying surface is always fresh; any prior
+        # graph state would be discarded at fold entry and loading it here
+        # would only populate ingest-time data that nobody reads.
 
         # Ensure both adapters exist on the model
         self.model = self._ensure_adapters()
@@ -299,9 +280,6 @@ class ConsolidationLoop:
         # Each entry: {"question": str, "answer": str}
         self.episodic_replay_pool: list[dict] = []
         self.semantic_replay_pool: list[dict] = []
-
-        # Track which nodes have been promoted (avoid re-promoting)
-        self.promoted_nodes: set[str] = set()
 
         # Curriculum-aware replay sampling
         self.curriculum_sampler: Optional[CurriculumSampler] = None
@@ -338,8 +316,6 @@ class ConsolidationLoop:
 
         self.cycle_count = 0
 
-        # Per-key session counts (for key-level promotion in server mode)
-        self.key_sessions: dict[str, int] = {}
         # Keys already promoted (prevent re-promotion after restart)
         self.promoted_keys: set[str] = set()
 
@@ -460,12 +436,14 @@ class ConsolidationLoop:
     def seed_key_metadata(self, metadata: dict) -> None:
         """Restore loop-level state from persisted key_metadata.json.
 
-        Restores ``cycle_count``, ``promoted_keys``, and per-key
-        ``sessions_seen`` (``key_sessions``).  Per the wipe invariant
-        (2026-05-14): ``key_metadata.json`` is bookkeeping, not a recovery
-        source.  Keys in the metadata file whose tier registry is not on disk
-        anymore are treated as orphans and dropped — the slot is the source of
-        truth for active keys.
+        Restores ``cycle_count`` and ``promoted_keys``.  Keys in the metadata
+        file whose tier registry is not on disk are treated as orphans and
+        dropped — the slot is the source of truth for active keys.  The orphan
+        count is logged so callers can distinguish a clean restore from one
+        where stale metadata entries were pruned.
+
+        Per the wipe invariant (2026-05-14): ``key_metadata.json`` is
+        bookkeeping, not a recovery source.
 
         Per-key ``speaker_id`` / ``first_seen_cycle`` are owned by
         :attr:`MemoryStore._bookkeeping` and loaded by
@@ -484,7 +462,6 @@ class ConsolidationLoop:
                 # write will not re-emit it.
                 orphan_count += 1
                 continue
-            self.key_sessions[key] = key_meta.get("sessions_seen", 0)
         # promoted_keys is similarly slot-owned — drop entries whose tier
         # is gone so the next save doesn't re-emit them.
         raw_promoted = set(metadata.get("promoted_keys", []))
@@ -497,110 +474,19 @@ class ConsolidationLoop:
                 orphan_count,
             )
         logger.info(
-            "Seeded key metadata: cycle=%d, %d promoted, %d keys tracked",
+            "Seeded key metadata: cycle=%d, %d promoted",
             self.cycle_count,
             len(self.promoted_keys),
-            len(self.key_sessions),
         )
-
-    def backfill_relation_type_from_graph(self) -> dict:
-        """One-time backfill of ``relation_type`` for keys whose bookkeeping
-        lacks it (legacy keys minted before this field was added).
-
-        Reads ``relation_type`` off the persisted ``cumulative_graph.json``
-        edges (already loaded into ``self.merger.graph`` at
-        ``ConsolidationLoop.__init__``).  Updates ``_bookkeeping[key]`` in
-        place via :meth:`MemoryStore.set_bookkeeping` for every active key
-        whose current ``relation_type`` is ``"unknown"`` (the upgrade-default
-        set by :meth:`MemoryStore.load_bookkeeping_from_disk`).  Keys not
-        found in the graph (edge pruned or graph pre-dates the key) keep
-        ``"unknown"`` — which safely partitions to episodic — and are logged
-        in the returned count so large fallback counts are visible.
-
-        Must be called AFTER :meth:`MemoryStore.load_bookkeeping_from_disk`
-        has populated ``_bookkeeping`` (so ``bk["relation_type"]`` exists for
-        every active key).  Called from
-        :func:`paramem.server.consolidation.create_consolidation_loop` when
-        the graph has been loaded from disk.
-
-        Returns:
-            ``{"checked": int, "filled": int, "unknown_fallback": int}``
-            where ``filled`` is the count of keys whose ``relation_type`` was
-            successfully recovered from a graph edge, and ``unknown_fallback``
-            is the count that had to keep ``"unknown"`` (edge not found or
-            no content entry available to resolve the triple).
-        """
-        from paramem.graph.merger import _normalize_predicate
-
-        # Build a (subject, norm_pred, object) → relation_type lookup from the
-        # in-memory cumulative graph.  This is a transient, per-boot read —
-        # NOT a persisted sidecar (merger is the idempotent authority).
-        edge_rt: dict[tuple[str, str, str], str] = {}
-        for subject, obj, data in self.merger.graph.edges(data=True):
-            pred = data.get("predicate", "")
-            rt = data.get("relation_type")
-            if rt and pred:
-                edge_rt[(subject, _normalize_predicate(pred), obj)] = rt
-
-        if not edge_rt:
-            # Graph is empty or not loaded — nothing to backfill.
-            return {"checked": 0, "filled": 0, "unknown_fallback": 0}
-
-        checked = 0
-        filled = 0
-        unknown_fallback = 0
-
-        for key in self.store.all_active_keys():
-            bk = self.store.bookkeeping_for_key(key)
-            if bk is None:
-                # Key has no bookkeeping yet (loaded before load_bookkeeping_from_disk).
-                continue
-            if bk.get("relation_type", "unknown") != "unknown":
-                # Already has a concrete relation_type — skip.
-                continue
-
-            checked += 1
-            # Recover the triple from the content cache (_entries).  Under
-            # preload_cache=False the cache is empty; the key falls back to
-            # "unknown" (safe, self-corrects on next full cycle).
-            entry = self.store.get(key)
-            if entry is None:
-                unknown_fallback += 1
-                continue
-
-            triple_key = (
-                entry.get("subject", ""),
-                _normalize_predicate(entry.get("predicate", "")),
-                entry.get("object", ""),
-            )
-            rt = edge_rt.get(triple_key)
-            if rt is not None:
-                self.store.set_bookkeeping(
-                    key,
-                    speaker_id=bk.get("speaker_id", ""),
-                    first_seen_cycle=bk.get("first_seen_cycle", 0),
-                    relation_type=rt,
-                )
-                filled += 1
-            else:
-                unknown_fallback += 1
-
-        if checked:
-            logger.info(
-                "backfill_relation_type_from_graph: checked=%d filled=%d unknown_fallback=%d",
-                checked,
-                filled,
-                unknown_fallback,
-            )
-        return {"checked": checked, "filled": filled, "unknown_fallback": unknown_fallback}
 
     @staticmethod
     def dedup_episodic(qa_list: list[dict]) -> list[dict]:
         """Deduplicate episodic QA/relation dicts by triple identity.
 
         Identity key is ``(subject, predicate, object)``.  Case-insensitive;
-        first occurrence wins.  Entries missing all identity fields fall back
-        to per-object identity so they survive rather than collide.
+        first occurrence wins.  Entries missing any of the three identity
+        fields are DROPPED — an incomplete triple cannot be keyed and must
+        not produce a ghost ``__unkeyed__`` entry.
         """
         seen: set[tuple] = set()
         out: list[dict] = []
@@ -608,7 +494,9 @@ class ConsolidationLoop:
             subj = (qa.get("subject") or "").strip().lower()
             pred = (qa.get("predicate") or "").strip().lower()
             obj = (qa.get("object") or "").strip().lower()
-            key = (subj, pred, obj) if (subj and pred and obj) else ("__unkeyed__", id(qa))
+            if not (subj and pred and obj):
+                continue
+            key = (subj, pred, obj)
             if key in seen:
                 continue
             seen.add(key)
@@ -617,14 +505,20 @@ class ConsolidationLoop:
 
     @staticmethod
     def dedup_procedural(rels: list[dict]) -> list[dict]:
-        """Deduplicate procedural relations by (subject, predicate, object)."""
+        """Deduplicate procedural relations by (subject, predicate, object).
+
+        Entries missing any of the three identity fields are DROPPED — an
+        incomplete triple cannot be keyed and must not produce a ghost entry.
+        """
         seen: set[tuple] = set()
         out: list[dict] = []
         for rel in rels:
             subj = (rel.get("subject") or "").strip().lower()
             pred = (rel.get("predicate") or "").strip().lower()
             obj = (rel.get("object") or "").strip().lower()
-            key = (subj, pred, obj) if (subj and pred and obj) else ("__unkeyed__", id(rel))
+            if not (subj and pred and obj):
+                continue
+            key = (subj, pred, obj)
             if key in seen:
                 continue
             seen.add(key)
@@ -652,8 +546,8 @@ class ConsolidationLoop:
 
         Using this helper for every cache-write site ensures the uniform shape
         is maintained by construction — every downstream reader (promotion-match,
-        ``_increment_key_sessions``, ``consolidate_interim_adapters``
-        triple-lookup) reads the canonical field names.
+        ``consolidate_interim_adapters`` triple-lookup) reads the canonical field
+        names.
 
         Args:
             key: The ``graphN`` / ``procN`` key string.
@@ -786,14 +680,6 @@ class ConsolidationLoop:
         self.store._registry = value
         # Reflect the replay flag so MemoryStore.replay_enabled stays honest.
         self.store._replay_enabled = value is not None
-
-    def _tier_for_key(self, key: str) -> "str | None":
-        """DEPRECATED: ``self.store.tier_for_active_key(key)``."""
-        return self.store.tier_for_active_key(key)
-
-    def _reassign_key(self, key: str, new_tier: str) -> None:
-        """DEPRECATED: ``self.store.move(key, new_tier)``."""
-        self.store.move(key, new_tier)
 
     # ------------------------------------------------------------------
     # Per-tier registry helpers
@@ -1470,6 +1356,76 @@ class ConsolidationLoop:
 
         return adapter_name, False, False, False
 
+    def _mint_keyed_entries(
+        self,
+        rels: list[dict],
+        *,
+        prefix: str,
+        start_index: int,
+        speaker_id: str,
+        tag_new: bool = True,
+    ) -> list[dict]:
+        """Mint a fresh keyed-entry list from *rels* without mutating any shared state.
+
+        This is a pure minting helper: it calls ``assign_keys`` and wraps each
+        result in a :meth:`_cache_entry` dict.  It does **NOT** advance
+        ``_indexed_next_index`` or ``_procedural_next_index``, does NOT write the
+        :class:`~paramem.memory.store.MemoryStore`, and does NOT update the
+        simhash registries.  All those mutations remain the caller's
+        responsibility so the deferred-mutation contract of the surrounding
+        training paths is preserved.
+
+        Threads ``relation_type`` from each source relation dict through to the
+        minted entry — both the episodic and procedural inline loops pass this
+        field so the tier routing and the stored bytes are correct for
+        ``"preference"``, ``"temporal"``, ``"social"`` entries.  Without it the
+        store would silently re-tag them as ``"factual"`` and corrupt
+        procedural routing.
+
+        Args:
+            rels: Relation dicts carrying at minimum ``subject``, ``predicate``,
+                ``object``.  ``speaker_id`` and ``relation_type`` are read as
+                optional fields with per-entry fallbacks.
+            prefix: Key prefix (``"graph"`` for episodic/semantic;
+                ``"proc"`` for procedural).
+            start_index: First numeric index for the minted key sequence.
+                The i-th entry gets key ``f"{prefix}{start_index + i}"``.
+            speaker_id: Fallback speaker tag used when the relation dict does
+                not carry a ``speaker_id`` field.
+            tag_new: When ``True`` (default), each minted entry receives
+                ``entry["_new"] = True`` so the caller can identify newly-minted
+                entries for deferred ``store.put`` / counter advancement.  Set
+                ``False`` when the caller does not need the sentinel (e.g. the
+                fold pre-pass or the procedural TRAIN path).
+
+        Returns:
+            List of cache-entry dicts in the same order as *rels*.
+        """
+        raw_keyed = assign_keys(
+            [(r["subject"], r["predicate"], r["object"]) for r in rels],
+            start_index=start_index,
+            prefix=prefix,
+        )
+        minted: list[dict] = []
+        for i, kp in enumerate(raw_keyed):
+            rel = rels[i] if i < len(rels) else {}
+            # assign_keys output never carries speaker_id (only key/s/p/o);
+            # resolve from the source relation with the caller's id as fallback.
+            sid = rel.get("speaker_id", speaker_id)
+            entry = self._cache_entry(
+                key=kp["key"],
+                subject=kp["subject"],
+                predicate=kp["predicate"],
+                object=kp["object"],
+                speaker_id=sid,
+                first_seen_cycle=self.cycle_count,
+                relation_type=rel.get("relation_type", "factual"),
+            )
+            if tag_new:
+                entry["_new"] = True
+            minted.append(entry)
+        return minted
+
     def _prepare_episodic_keys_for_tier(
         self,
         adapter_name: str,
@@ -1529,29 +1485,16 @@ class ConsolidationLoop:
             ``{key, subject, predicate, object, speaker_id, first_seen_cycle}``.
             New entries additionally carry ``"_new": True``.
         """
-        # Assign new keys from the incoming relations.
-        new_keyed_raw = assign_keys(
-            [(r["subject"], r["predicate"], r["object"]) for r in rels],
-            start_index=self._indexed_next_index,
+        # Assign new keys from the incoming relations via the shared minting helper.
+        # store.put and _indexed_next_index advancement are intentionally deferred to
+        # the caller — see _mint_keyed_entries docstring and this method's docstring.
+        new_keyed = self._mint_keyed_entries(
+            rels,
             prefix="graph",
+            start_index=self._indexed_next_index,
+            speaker_id=speaker_id,
+            tag_new=True,
         )
-        new_keyed: list[dict] = []
-        for i, kp in enumerate(new_keyed_raw):
-            rel = rels[i] if i < len(rels) else {}
-            sid = kp.get("speaker_id") or rel.get("speaker_id", speaker_id)
-            entry = self._cache_entry(
-                key=kp["key"],
-                subject=kp["subject"],
-                predicate=kp["predicate"],
-                object=kp["object"],
-                speaker_id=sid,
-                first_seen_cycle=self.cycle_count,
-                relation_type=rel.get("relation_type", "factual"),
-            )
-            entry["_new"] = True
-            new_keyed.append(entry)
-        # NOTE: store.put and _indexed_next_index advancement are intentionally
-        # deferred to the caller — see docstring.
 
         # Gather existing keys for the target tier (full-replay anti-forgetting).
         new_key_set = {kp["key"] for kp in new_keyed}
@@ -1677,28 +1620,17 @@ class ConsolidationLoop:
         logger.info("_prepare_procedural_keys_for_tier: %d relations (mode=%s)", len(rels), mode)
 
         tentative_next = self._procedural_next_index
-        entries_keyed = assign_keys(
-            [(r["subject"], r["predicate"], r["object"]) for r in rels],
-            start_index=tentative_next,
+        # Mint new keys via the shared helper; tag_new=False because the procedural
+        # TRAIN path does not use the _new sentinel (deferred mutations are tracked
+        # via _procedural_tentative_next_index on self instead).
+        new_keyed = self._mint_keyed_entries(
+            rels,
             prefix="proc",
+            start_index=tentative_next,
+            speaker_id=speaker_id,
+            tag_new=False,
         )
-        tentative_next += len(entries_keyed)
-
-        new_keyed: list[dict] = []
-        for i, kp in enumerate(entries_keyed):
-            rel = rels[i] if i < len(rels) else {}
-            rel_speaker = rel.get("speaker_id", speaker_id)
-            new_keyed.append(
-                self._cache_entry(
-                    key=kp["key"],
-                    subject=kp["subject"],
-                    predicate=kp["predicate"],
-                    object=kp["object"],
-                    speaker_id=rel_speaker,
-                    first_seen_cycle=self.cycle_count,
-                    relation_type=rel.get("relation_type", "factual"),
-                )
-            )
+        tentative_next += len(new_keyed)
 
         new_key_set = {kp["key"] for kp in new_keyed}
 
@@ -1714,6 +1646,8 @@ class ConsolidationLoop:
                     speaker_id=kp["speaker_id"],
                     first_seen_cycle=kp["first_seen_cycle"],
                     relation_type=kp.get("relation_type", "factual"),
+                    recurrence_count=1,
+                    last_seen_cycle=self.cycle_count,
                 )
             self._procedural_next_index = tentative_next
             return new_keyed, []
@@ -1844,29 +1778,6 @@ class ConsolidationLoop:
                 self.merger.merge(session_graph)
             finally:
                 self._enable_gradient_checkpointing()
-        # NOTE: an experiment that sets BOTH persist_graph=True and
-        # merge_at_interim=False would feed classify_nodes a graph missing this
-        # session's triples — an opt-in-both-flags experiment corner, dormant in
-        # production (persist_graph=False); not defended in code.
-        graph = self.merger.graph
-
-        # --- 3. SCORE & CLASSIFY ---
-        if self.enable_entity_promotion:
-            classification = self.scorer.classify_nodes(
-                graph,
-                promotion_threshold=self.config.promotion_threshold,
-                decay_window=self.config.decay_window,
-                current_cycle=self.cycle_count,
-            )
-            new_promotions = [n for n in classification.promote if n not in self.promoted_nodes]
-            result.nodes_promoted = len(new_promotions)
-            result.nodes_decayed = len(classification.decay)
-            result.nodes_retained = len(classification.retain)
-            result.promoted_nodes = new_promotions
-            result.decayed_nodes = classification.decay
-        else:
-            # Entity-level promotion disabled (server uses key-level promotion)
-            new_promotions = []
 
         # --- 4. BUILD ENTRY RELATION DICTS ---
         # Single entry point: graph → (episodic_rels, procedural_rels).
@@ -1902,13 +1813,6 @@ class ConsolidationLoop:
         episodic_rels = self.dedup_episodic(episodic_rels)
         procedural_rels = self.dedup_procedural(procedural_rels)
 
-        # Promotion is handled at the indexed-key replay layer — no
-        # model.generate calls for promoted keys.  ``promote_qa`` is kept
-        # as an empty list so downstream call sites that still iterate it
-        # are no-ops; the variable will be removed once those sites are
-        # audited.
-        promote_qa: list[dict] = []
-
         # --- 4b. INDEXED KEY REPLAY (F4.9c validated) ---
         # Delegate to run_consolidation_cycle (unified episodic + procedural
         # pipeline) so experiments exercise the same code path as production.
@@ -1927,7 +1831,7 @@ class ConsolidationLoop:
                 speaker_id=speaker_id,
                 mode="train",
                 run_label=session_id,
-                new_promotions=new_promotions if new_promotions else None,
+                new_promotions=None,
             )
             # cycle_count is now managed by run_consolidation_cycle.
             # Propagate per-tier train losses from the cycle result dict.
@@ -1938,11 +1842,6 @@ class ConsolidationLoop:
             if _proc_loss is not None:
                 result.procedural_train_loss = _proc_loss
 
-            if new_promotions:
-                semantic_loss = self._run_indexed_key_semantic(new_promotions)
-                if semantic_loss is not None:
-                    result.semantic_train_loss = semantic_loss
-                self.promoted_nodes.update(new_promotions)
         else:
             # --- 4b-alt. CURRICULUM PROBE (optional) ---
             episodic_recall_scores: dict[str, float] = {}
@@ -1975,131 +1874,18 @@ class ConsolidationLoop:
                 if len(self.episodic_replay_pool) > 100:
                     self.episodic_replay_pool = self.episodic_replay_pool[-100:]
 
-        # --- 6. TRAIN SEMANTIC (pool-based, only when indexed key replay is not active) ---
-        if not self.config.indexed_key_replay_enabled and promote_qa:
-            semantic_loss = self._train_adapter_with_replay(
-                "semantic",
-                promote_qa,
-                self.semantic_replay_pool,
-                self.config.semantic_replay_weight,
-                f"phase3-semantic-cycle{self.cycle_count}",
-            )
-            result.semantic_train_loss = semantic_loss
-            self.promoted_nodes.update(new_promotions)
-
-            # Add promoted relations to semantic replay pool (cap at 100)
-            self.semantic_replay_pool.extend(
-                {"question": qa["question"], "answer": qa["answer"]} for qa in promote_qa
-            )
-            if len(self.semantic_replay_pool) > 100:
-                self.semantic_replay_pool = self.semantic_replay_pool[-100:]
-
-        # --- 7. DECAY ---
-        if self.enable_entity_promotion:
-            self._apply_decay(classification.decay)
-
-        # --- 8. SAVE ---
-        # persist_graph=True → authoritative production store → encrypted.
-        # Cumulative-graph plaintext debug dump (when save_cycle_snapshots is
-        # on) is owned by run_consolidation_cycle's on_extraction_end; the
-        # legacy run_cycle path does not duplicate it.
-        if self.persist_graph:
-            self.merger.save_graph(self.graph_path)
+        # --- 6. SAVE ---
         self._save_adapters()
 
         result.wall_clock_seconds = time.time() - start_time
         logger.info(
-            "Cycle %d complete: %d extracted, %d promoted, %d decayed (%.1fs)",
+            "Cycle %d complete: %d extracted (%.1fs)",
             self.cycle_count,
             result.entities_extracted,
-            result.nodes_promoted,
-            result.nodes_decayed,
             result.wall_clock_seconds,
         )
 
         return result
-
-    def _run_indexed_key_semantic(
-        self,
-        new_promotions: list[str],
-    ) -> Optional[float]:
-        """Train semantic adapter on promoted indexed keys.
-
-        Collects all keys that belong to promoted entities and trains
-        the semantic adapter on them with the indexed format.
-        """
-        # Collect promoted keys (already transferred in the run_cycle episodic block)
-        promoted_set = {n.lower() for n in new_promotions}
-        semantic_keyed = []
-        # Loop A — newly-promoted keys
-        for _tier, key, entry in self.store.iter_entries():
-            subject = entry.get("subject", "").lower()
-            obj = entry.get("object", "").lower()
-            mentions_promoted = (subject and subject in promoted_set) or (
-                obj and obj in promoted_set
-            )
-            if mentions_promoted and self.store.has_simhash("semantic", key):
-                semantic_keyed.append(
-                    {
-                        "key": key,
-                        "subject": entry["subject"],
-                        "predicate": entry["predicate"],
-                        "object": entry["object"],
-                    }
-                )
-
-        # Loop B — previously promoted keys still in semantic
-        seen_semantic_keys = {kp["key"] for kp in semantic_keyed}
-        for key in list(self.store.simhashes_in_tier("semantic").keys()):
-            if key in seen_semantic_keys:
-                continue
-            qa = self.store.get(key)
-            if qa is not None:
-                semantic_keyed.append(
-                    {
-                        "key": key,
-                        "subject": qa["subject"],
-                        "predicate": qa["predicate"],
-                        "object": qa["object"],
-                    }
-                )
-
-        if not semantic_keyed:
-            logger.info("No promoted keys for semantic training")
-            return None
-
-        logger.info("Training semantic adapter on %d promoted keys", len(semantic_keyed))
-
-        switch_adapter(self.model, "semantic")
-        examples = format_entry_training(semantic_keyed, self.tokenizer, max_length=1024)
-        dataset = self._indexed_dataset(examples)
-        training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
-        self._enable_gradient_checkpointing()
-
-        metrics = train_adapter(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            train_dataset=dataset,
-            adapter_name="semantic",
-            training_config=training_config,
-            adapter_config=self.semantic_config,
-            wandb_config=self.wandb_config,
-            output_dir=self._training_output_dir("semantic"),
-            run_name=f"phase4-indexed-semantic-cycle{self.cycle_count}",
-            thermal_policy=self._thermal_policy,
-            hooks=self._build_training_hooks(),
-        )
-
-        if metrics is not None and metrics.get("aborted"):
-            logger.info(
-                "_run_indexed_key_semantic: training aborted — skipping simhash registry update"
-            )
-            return None
-
-        # Update semantic SimHash registry
-        self.store.replace_simhashes_in_tier("semantic", build_registry(semantic_keyed))
-
-        return metrics.get("train_loss")
 
     @staticmethod
     def _indexed_dataset(examples: list[dict]) -> Dataset:
@@ -2241,39 +2027,6 @@ class ConsolidationLoop:
             )
 
         return replay_examples
-
-    def _apply_decay(self, decayed_nodes: list[str]) -> None:
-        """Remove decayed nodes' relations from the episodic replay pool.
-
-        Decayed memories are not actively deleted from the adapter —
-        they fade naturally as the adapter is trained on new content
-        without reinforcement.
-
-        When curriculum sampling is enabled, decay is blocked for facts
-        that haven't met the minimum exposure guarantee.
-        """
-        if not decayed_nodes:
-            return
-
-        decayed_set = {n.lower() for n in decayed_nodes}
-        before = len(self.episodic_replay_pool)
-
-        kept = []
-        protected = 0
-        for qa in self.episodic_replay_pool:
-            if not _mentions_any(qa["question"] + " " + qa["answer"], decayed_set):
-                kept.append(qa)
-            elif self.curriculum_sampler and not self.curriculum_sampler.can_decay(qa["question"]):
-                kept.append(qa)
-                protected += 1
-            # else: decayed — not added to kept
-
-        self.episodic_replay_pool = kept
-        removed = before - len(self.episodic_replay_pool)
-        if removed > 0:
-            logger.info("Decayed %d relations from episodic replay pool", removed)
-        if protected > 0:
-            logger.info("Protected %d relations from decay (min exposure not met)", protected)
 
     def _qa_to_dataset(self, qa_pairs: list[dict]) -> Dataset:
         """Convert relation dicts to a SyntheticQADataset."""
@@ -2806,6 +2559,8 @@ class ConsolidationLoop:
                 speaker_id=kp["speaker_id"],
                 first_seen_cycle=kp["first_seen_cycle"],
                 relation_type=kp.get("relation_type", "factual"),
+                recurrence_count=1,
+                last_seen_cycle=self.cycle_count,
             )
         return proc_metrics.get("train_loss") if proc_metrics is not None else None
 
@@ -3040,13 +2795,14 @@ class ConsolidationLoop:
                     speaker_id=kp["speaker_id"],
                     first_seen_cycle=kp["first_seen_cycle"],
                     relation_type=kp.get("relation_type", "factual"),
+                    recurrence_count=1,
+                    last_seen_cycle=self.cycle_count,
                 )
             self._indexed_next_index += len(new_keyed_episodic)
 
         # --- 9b. Semantic promotion transfer (train mode, when promotions supplied) ---
         # Move keys for promoted entities from episodic to the semantic tier so
-        # they are excluded from the episodic training set and picked up by
-        # _run_indexed_key_semantic in the caller (run_cycle).  This mirrors the
+        # they are excluded from the episodic training set.  This mirrors the
         # logic that formerly lived inside _run_indexed_key_episodic.
         promoted_key_set: set[str] = set()
         if mode == "train" and new_promotions:
@@ -3157,6 +2913,8 @@ class ConsolidationLoop:
                     speaker_id=kp["speaker_id"],
                     first_seen_cycle=kp["first_seen_cycle"],
                     relation_type=kp.get("relation_type", "factual"),
+                    recurrence_count=1,
+                    last_seen_cycle=self.cycle_count,
                 )
             self._indexed_next_index += len(new_keyed_episodic)
 
@@ -3595,6 +3353,9 @@ class ConsolidationLoop:
             return {
                 "tiers_rebuilt": [],
                 "graph_drift_count": 0,
+                "drift_deduplicated": 0,
+                "drift_orphan": 0,
+                "drift_genuine_loss": 0,
                 "keys_per_tier": {},
                 "recall_per_tier": {},
                 "rolled_back": False,
@@ -3626,11 +3387,243 @@ class ConsolidationLoop:
         return {
             "tiers_rebuilt": ["episodic"],
             "graph_drift_count": 0,
+            "drift_deduplicated": 0,
+            "drift_orphan": 0,
+            "drift_genuine_loss": 0,
             "keys_per_tier": {"episodic": merged_graph.number_of_edges()},
             "recall_per_tier": {"episodic": 1.0},  # graph merge is lossless
             "rolled_back": False,
             "rollback_tier": None,
         }
+
+    def _promote_mature_keys_inline(self) -> list[str]:
+        """Promote episodic keys whose recurrence_count has reached the promotion threshold.
+
+        Mirrors the logic of the removed ``server.consolidation._promote_mature_keys``
+        helper but runs INSIDE the fold (``consolidate_interim_adapters``), AFTER the
+        recurrence-bump step and BEFORE ``tier_keyed`` is built.  This ordering
+        guarantees that reconstruction probes each key against the adapter tier
+        where its weights actually live (episodic) rather than against the
+        semantic adapter that has not yet learned the key — the root cause of
+        silent post-promotion fact loss.
+
+        Reads thresholds from ``self.config`` (``ConsolidationConfig``), which
+        is set at construction time.  Does NOT import ``ServerConfig`` — this
+        module must remain server-independent.
+
+        Steps:
+        1. Iterate ``self.store.all_active_keys()``.
+        2. Skip keys already in ``self.promoted_keys`` (already promoted or
+           already in the ``has_simhash("semantic")`` branch from a prior fold).
+        3. Promote keys whose ``recurrence_count`` >= ``self.config.promotion_threshold``
+           by calling ``self.store.move(key, "semantic")`` then
+           ``self.promoted_keys.add(key)``.
+        4. Log decay candidates (keys whose ``last_seen_cycle`` is more than
+           ``self.config.decay_window`` cycles old) without deleting them
+           (passive-fade policy — no fact loss).
+
+        Returns:
+            List of newly promoted key IDs (keys moved from episodic to semantic
+            in this call; does NOT include previously promoted keys).
+        """
+        threshold = self.config.promotion_threshold
+        decay_window = self.config.decay_window
+        current_cycle = self.cycle_count
+        newly_promoted: list[str] = []
+
+        for key in self.store.all_active_keys():
+            bk = self.store.bookkeeping_for_key(key) or {}
+            rec = bk.get("recurrence_count", 1)
+            last = bk.get("last_seen_cycle", bk.get("first_seen_cycle", 0))
+
+            if key in self.promoted_keys:
+                continue
+
+            if rec >= threshold:
+                if self.store.has_simhash("episodic", key):
+                    # Move entry + simhash + registry entry atomically to semantic.
+                    self.store.move(key, "semantic")
+                    newly_promoted.append(key)
+                    logger.info(
+                        "_promote_mature_keys_inline: key=%s promoted to semantic "
+                        "(recurrence_count=%d >= threshold=%d)",
+                        key,
+                        rec,
+                        threshold,
+                    )
+                elif self.store.has_simhash("semantic", key):
+                    logger.debug(
+                        "_promote_mature_keys_inline: key=%s already in semantic, marking promoted",
+                        key,
+                    )
+                self.promoted_keys.add(key)
+            elif decay_window > 0 and (current_cycle - last) >= decay_window:
+                # Decay candidate: key has not been re-seen for decay_window cycles.
+                # Passive fade — log only; no deletion (consistent with
+                # no-active-delete policy).
+                logger.info(
+                    "_promote_mature_keys_inline: key=%s decay candidate "
+                    "(last_seen_cycle=%d, current_cycle=%d, window=%d)",
+                    key,
+                    last,
+                    current_cycle,
+                    decay_window,
+                )
+
+        if newly_promoted:
+            logger.info(
+                "_promote_mature_keys_inline: promoted %d key(s) to semantic",
+                len(newly_promoted),
+            )
+
+        return newly_promoted
+
+    def _mint_keys_for_keyless_edges(
+        self,
+        tier_keyed: dict[str, list[dict]],
+    ) -> None:
+        """Mint indexed keys for edges in the merged graph that have no ``ik_key`` attribute.
+
+        Called as a fold pre-pass after :meth:`_promote_mature_keys_inline` and
+        before Stage-5 so that SOTA-enrichment second-order facts (which arrive as
+        keyless edges after Stage-2 re-merge) are minted, stored, and appended to
+        *tier_keyed* in the same fold that introduces them.  Without this pre-pass
+        every SOTA-enrichment fact would be silently dropped at the Stage-5 skip
+        branch (``not key → continue``) and could never enter the training set.
+
+        The minting logic mirrors the interim path (``assign_keys`` →
+        ``_cache_entry`` → ``store.put`` + ``store.set_bookkeeping``) but uses the
+        fold's in-place mutation discipline: ``store.put`` and counter advancement
+        happen inside this call rather than being deferred to after
+        ``train_adapter``.  This is safe for the fold path because the fold is
+        already committed to training on whatever is in *tier_keyed* — there is no
+        outer failure-safety boundary that needs the deferred-mutation invariant of
+        the interim path.
+
+        Tier derivation uses the SAME ``partition_relations`` call that Stage-5 uses
+        for keyed edges, so enrichment edges land in the same tier they would receive
+        if they had been extracted in an ordinary session.
+
+        ``speaker_id`` is set to ``""`` for all minted enrichment keys: enrichment
+        facts are graph-level and not attributed to a specific speaker.
+
+        After this call, every edge that was keyless-but-predicate-bearing has a
+        key in the store and an entry in *tier_keyed*.  Stage-5 will encounter these
+        edges again (their ``ik_key`` attribute is still absent because we chose the
+        direct-append variant to avoid the ``MultiDiGraph`` parallel-edge key hazard)
+        — Stage-5 must therefore ``continue`` on keyless edges to avoid a
+        ``store.get(None)`` call; the explicit ``if not key: continue`` guard handles
+        this.
+
+        Args:
+            tier_keyed: The tier → keyed-entries dict that Stage-5 also populates.
+                This method appends directly to it so both the pre-pass entries and
+                the Stage-5 entries land in the same structure that feeds training.
+
+        Returns:
+            ``None``.  Mutates *tier_keyed* and the :class:`~paramem.memory.store.MemoryStore`
+            in-place.  Advances ``_indexed_next_index`` / ``_procedural_next_index``
+            by one for each minted key.
+        """
+        from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
+
+        minted_by_tier: dict[str, int] = {"episodic": 0, "procedural": 0}
+
+        for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
+            existing = _t_data.get(_IK_ATTR)
+            pred = _t_data.get("predicate", "")
+            # Only process edges that are keyless AND have a predicate.
+            # Keyed edges are handled by Stage-5; predicate-less edges are not keyable.
+            if existing or not pred:
+                continue
+
+            # Read relation_type from the edge; clamp to valid schema values.
+            _rt_raw = _t_data.get("relation_type", _FALLBACK_RTYPE)
+            _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+
+            # Derive tier with the same logic Stage-5 uses for keyed edges.
+            _dummy = [
+                {
+                    "subject": _t_subj,
+                    "predicate": pred,
+                    "object": _t_obj,
+                    "relation_type": _rt,
+                }
+            ]
+            _ep_rels, _proc_rels = partition_relations(
+                _dummy, procedural_enabled=self.procedural_config is not None
+            )
+            tier = "procedural" if _proc_rels else "episodic"
+
+            # Mint via the shared helper (single-element list).
+            prefix = "proc" if tier == "procedural" else "graph"
+            start_index = (
+                self._procedural_next_index if tier == "procedural" else self._indexed_next_index
+            )
+            minted = self._mint_keyed_entries(
+                [
+                    {
+                        "subject": _t_subj,
+                        "predicate": pred,
+                        "object": _t_obj,
+                        "relation_type": _rt,
+                        "speaker_id": "",
+                    }
+                ],
+                prefix=prefix,
+                start_index=start_index,
+                speaker_id="",
+                tag_new=False,
+            )
+            key = minted[0]["key"]
+
+            # Persist using the fold's in-place mutation discipline.
+            self.store.put(
+                tier,
+                key,
+                minted[0],
+                simhash=compute_simhash(key, _t_subj, pred, _t_obj),
+            )
+            self.store.set_bookkeeping(
+                key,
+                speaker_id="",
+                first_seen_cycle=self.cycle_count,
+                relation_type=_rt,
+                recurrence_count=1,
+                last_seen_cycle=self.cycle_count,
+            )
+
+            # Append to tier_keyed directly (direct-append variant).
+            # The ik_key attribute is intentionally NOT stamped onto the edge so
+            # the MultiDiGraph parallel-edge integer key field is not disturbed.
+            # Stage-5 will encounter this edge again as still-keyless and the
+            # explicit ``if not key: continue`` guard there will skip it cleanly.
+            tier_keyed[tier].append(
+                {
+                    "key": key,
+                    "subject": _t_subj,
+                    "predicate": pred,
+                    "object": _t_obj,
+                }
+            )
+
+            # Advance the committed counter for the chosen tier.
+            if tier == "procedural":
+                self._procedural_next_index += 1
+            else:
+                self._indexed_next_index += 1
+
+            minted_by_tier[tier] += 1
+
+        total_minted = sum(minted_by_tier.values())
+        if total_minted:
+            logger.info(
+                "consolidate_interim_adapters: minted %d enrichment key(s) "
+                "(episodic=%d procedural=%d) for keyless edges",
+                total_minted,
+                minted_by_tier["episodic"],
+                minted_by_tier["procedural"],
+            )
 
     def consolidate_interim_adapters(
         self,
@@ -3703,7 +3696,10 @@ class ConsolidationLoop:
             Result dict with keys:
                 {
                     "tiers_rebuilt": list[str],
-                    "graph_drift_count": int,
+                    "graph_drift_count": int,        # total absent keys (backward-compat)
+                    "drift_deduplicated": int,        # exact-SPO collapse; fact preserved
+                    "drift_orphan": int,              # no SPO content; correctly dropped
+                    "drift_genuine_loss": int,        # real reconstruction failure
                     "keys_per_tier": dict[str, int],
                     "recall_per_tier": dict[str, float],
                     "rolled_back": bool,
@@ -3725,26 +3721,6 @@ class ConsolidationLoop:
                 "_gpu_thread_lock (submit via BackgroundTrainer.submit())"
             )
 
-        # --- Graph-level SOTA enrichment (Task #10) ---
-        # Runs after all per-session merges are complete and before
-        # partition_relations so enriched edges flow into all tiers identically.
-        # Mutates self.merger.graph in place.  Wrapped in try/except so a SOTA
-        # failure cannot abort consolidation.
-        try:
-            enrichment_result = self._run_graph_enrichment()
-            if not enrichment_result.get("skipped"):
-                logger.info(
-                    "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d",
-                    enrichment_result.get("chunks", 0),
-                    enrichment_result.get("new_edges", 0),
-                    enrichment_result.get("same_as_merges", 0),
-                )
-        except Exception as _enrich_exc:
-            logger.warning(
-                "graph_enrichment raised unexpected exception — consolidation continues: %s",
-                _enrich_exc,
-            )
-
         # --- Stage 1: Unfold / reconstruct all active keys from adapter weights ---
         # Probes every active key across all tiers; recovers (subject, predicate, object)
         # from the trained weights.  Reconstruction yields SPO ONLY — no relation_type.
@@ -3758,23 +3734,32 @@ class ConsolidationLoop:
                 len(recon_result.failures),
             )
 
-        # --- Stage 2: Re-merge reconstructed triples with bookkeeping relation_type ---
-        # For each reconstructed SPO triple, inject the authoritative relation_type from
-        # persisted _bookkeeping (populated by set_bookkeeping at training time and by
-        # backfill_relation_type_from_graph for legacy keys).  Build a synthetic
-        # SessionGraph and feed it through merger.merge() so the cumulative graph picks up
-        # the correct relation_type on NET-NEW edges only (merger.py:557 sets relation_type
-        # from the supplied Relation on new-edge insertion).  Exact-duplicate reinforcement
-        # (merger.py:411-432) bumps recurrence_count but does NOT overwrite
-        # relation_type, so existing edges keep their original extraction-time value.
-        # Because both the existing edge and the bookkeeping entry share that value
-        # (both set at extraction time; backfill recovers it from the edge for legacy
-        # keys), stage-4 tiering reads a consistent relation_type either way.
+        # --- Stage 2: Reset keying graph + re-merge reconstructed triples ---
+        # IMPORTANT: Reset the merger's keying surface to EMPTY before re-merging
+        # so Option-(a) provenance keying is unconditional.  Without the reset,
+        # pre-existing edges from ingest-time merges or a loaded graph would share
+        # the keying surface and the Case-1-adopt collision path could degrade
+        # provenance keying.
+        # Recurrence is now durable in bookkeeping — discarding the prior graph
+        # loses nothing; the transient graph edge counts were the broken store.
+        self.merger.reset_graph()
+        logger.info(
+            "consolidate_interim_adapters: keying graph reset to empty for Stage-2 re-merge"
+        )
+
+        # Each reconstructed edge carries its registered key under _IK_ATTR (stamped by
+        # reconstruct_graph).  We set Relation.indexed_key from that value so the key
+        # travels through GraphMerger.merge() onto the merged edge (Part 1 provenance
+        # keying).  No triple-identity matching — the key is carried on the edge itself.
+        #
+        # additive=True (fold-only): the merger never removes a registered edge during
+        # Stage-2 re-merge.  All reconstructed keys coexist after the fold regardless
+        # of same-(s,p)/different-o conflicts; REPLACE cardinality is skipped.
+        # A key drifts only if its reconstruction failed (recon failure is the sole
+        # drift source under additive fold).
         #
         # Keys with no bookkeeping relation_type or relation_type=="unknown" fall back to
-        # _FALLBACK_RTYPE (module-level constant derived from schema_config, currently
-        # "factual") for the merge-time Relation (which partitions to episodic — the
-        # conservative default).  The bookkeeping entry itself is not modified here.
+        # _FALLBACK_RTYPE (currently "factual").
         from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
         recon_relations: list[Relation] = []
@@ -3797,6 +3782,7 @@ class ConsolidationLoop:
                     relation_type=_r_rt,  # type: ignore[arg-type]
                     confidence=1.0,
                     speaker_id=_r_spk,
+                    indexed_key=_r_key,  # carry key onto merged edge (Part 1)
                 )
             )
 
@@ -3813,74 +3799,125 @@ class ConsolidationLoop:
             # needs its own guard (CLAUDE.md rule applies to ANY model.generate() site).
             self._disable_gradient_checkpointing()
             try:
-                self.merger.merge(_synthetic_session)
+                self.merger.merge(_synthetic_session, additive=True)
             finally:
                 self._enable_gradient_checkpointing()
             logger.info(
                 "consolidate_interim_adapters: re-merged %d reconstructed triples "
-                "into cumulative graph",
+                "into keying graph",
                 len(recon_relations),
             )
 
-        # --- Stage 3: Build per-cycle triple→key index from the store ---
-        # Maps (subject, _normalize_predicate(predicate), object) → key.
-        # Derived in-cycle from store.iter_entries() with normalized predicates so
-        # both sides of the lookup share the same normalization as merger.merge().
-        # This is NOT a persisted sidecar — the merger is the idempotent authority.
-        triple_to_key: dict[tuple[str, str, str], str] = {}
-        for _tk_tier, _tk_key, _tk_entry in self.store.iter_entries():
-            _tk_norm = (
-                _tk_entry.get("subject", ""),
-                _normalize_predicate(_tk_entry.get("predicate", "")),
-                _tk_entry.get("object", ""),
+        # --- Stage 2.5: Graph-level SOTA enrichment (Task #10) ---
+        # Runs AFTER the Stage-2 re-merge so enrichment operates on the populated
+        # reconstructed graph (not an empty one).  Under production defaults the
+        # pre-fold graph was always empty, so enrichment silently skipped every cycle
+        # at the node_count<10 floor; now it fires on the reconstructed knowledge.
+        # Mutates self.merger.graph in place.  The external/SOTA boundary is handled
+        # inside _run_graph_enrichment (per-chunk except catches network errors and
+        # continues), so a network failure degrades gracefully there.  A programming
+        # error here propagates and aborts the fold (sessions stay pending/retriable),
+        # which is correct — better than silently dropping all enrichment.
+        # Enrichment-added edges are keyless and are picked up by the pre-pass that
+        # runs after inline-promotion.
+        enrichment_result = self._run_graph_enrichment()
+        if not enrichment_result.get("skipped"):
+            logger.info(
+                "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d",
+                enrichment_result.get("chunks", 0),
+                enrichment_result.get("new_edges", 0),
+                enrichment_result.get("same_as_merges", 0),
             )
-            triple_to_key[_tk_norm] = _tk_key
 
-        # --- Stage 4: Build (subject, norm_pred, object) → relation_type from merged graph ---
-        # Replaces the dead `:3463` `getattr(graph, "relations", [])` path.
-        # NetworkX MultiDiGraph has no `.relations` attribute — that lookup always
-        # returned an empty list, so all keys fell through to the graph-drift path.
-        # The authoritative fix is to edge-walk merger.graph.edges(data=True) and
-        # read the relation_type re-stamped by stage 2 (or by per-session merges).
-        # This is the transient READ of the persisted bookkeeping datum (§6.1 of the
-        # consolidation architecture): same datum on two surfaces, not two sources.
-        graph_triple_to_type: dict[tuple[str, str, str], str] = {}
-        for _gt_subj, _gt_obj, _gt_data in self.merger.graph.edges(data=True):
-            _gt_pred = _gt_data.get("predicate", "")
-            _gt_rt = _gt_data.get("relation_type", "factual")
-            if _gt_pred:
-                graph_triple_to_type[(_gt_subj, _normalize_predicate(_gt_pred), _gt_obj)] = _gt_rt
+        if recon_relations:
+            # --- Recurrence bump: Case-1 duplicate-SPO collapses ---
+            # merger.reinforcements contains the surviving ik_key for every Case-1
+            # collision fired during the Stage-2 re-merge.  A collision means two
+            # active keys shared the same (s,p,o) — the incoming key drifts and the
+            # existing edge's key is the survivor.  The survivor's recurrence_count
+            # represents how many times this fact was independently extracted (and
+            # re-keyed) across sessions before this fold collapsed the duplicates.
+            _reinforced: set[str] = set()
+            for _rein_key in getattr(self.merger, "reinforcements", []):
+                if _rein_key and _rein_key not in _reinforced:
+                    self.store.bump_recurrence(_rein_key, cycle=self.cycle_count)
+                    _reinforced.add(_rein_key)
+                    logger.debug(
+                        "consolidate_interim_adapters: bumped recurrence for key=%s "
+                        "(intra-fold duplicate-SPO collapse)",
+                        _rein_key,
+                    )
 
-        # --- Stage 5: Dedup via merged graph; assign per-tier keyed lists ---
-        # The merged graph IS the dedup authority (locked #5 of the architecture).
-        # One edge per (subject, norm_pred, object) after dedup via seen_triples.
-        # Tier is derived from the edge's relation_type (NOT from the dead `:3463`
-        # path), fixing bug-C (cross-session duplicate triples previously produced
-        # duplicate keys when sourced from store.get(key) instead of the graph).
+        # --- Inline promotion: move matured episodic keys to semantic ---
+        # Runs AFTER the recurrence-bump step (so bump-triggered threshold crossings
+        # are captured) and BEFORE tier_keyed is built (so the promoted key lands
+        # in tier_keyed["semantic"] and is trained into the semantic adapter this
+        # fold).  Ordering invariant: reconstruction (Stage 1) ran while the key
+        # was still in episodic, so its weights were found there; only NOW is it
+        # moved to semantic.
+        _inline_promoted = self._promote_mature_keys_inline()
+        if _inline_promoted:
+            logger.info(
+                "consolidate_interim_adapters: %d key(s) promoted to semantic "
+                "before tier assignment",
+                len(_inline_promoted),
+            )
+
+        # tier_keyed is initialised here (before the pre-pass) so that both
+        # _mint_keys_for_keyless_edges and Stage-5 append to the same dict.
         tier_keyed: dict[str, list[dict]] = {
             "episodic": [],
             "semantic": [],
             "procedural": [],
         }
-        seen_triples: set[tuple[str, str, str]] = set()
+
+        # --- Enrichment pre-pass: mint keys for keyless predicate-bearing edges ---
+        # SOTA-enrichment adds edges to the merged graph without an ik_key attribute.
+        # Stage-5 would skip them (key is falsy → continue), causing every
+        # second-order enrichment fact to be silently dropped from the training set.
+        # This pre-pass walks the graph BEFORE Stage-5, mints a key for each such
+        # edge, registers it in the store, appends it to tier_keyed, and advances
+        # the committed counter.  The edge's ik_key attribute is intentionally NOT
+        # stamped (direct-append variant) to avoid the MultiDiGraph parallel-edge
+        # integer-key hazard; Stage-5's explicit ``if not key: continue`` guard
+        # (see below) makes the still-keyless post-pre-pass edges safe to skip.
+        self._mint_keys_for_keyless_edges(tier_keyed)
+
+        # --- Stage 5: Assign per-tier keyed lists from merged-edge provenance ---
+        # Walk merger.graph.edges(data=True); per edge, read ik_key from the edge
+        # attribute (stamped by Stage 2 via _upsert_relation new-edge insertion or
+        # Case-1-adopt).  Tier derived from per-key bookkeeping relation_type +
+        # partition_relations (same shape as prior Stage 5; Stage 3/4 deleted because
+        # the key is now on the edge — no triple-identity matching required).
+        #
+        # When two active keys share an identical (s,p,o), the Stage-2 re-merge
+        # fires Case-1 on the second arriving edge: the existing edge keeps its
+        # ik_key (the surviving key) and the incoming relation.indexed_key is
+        # recorded in merger.collapsed (the deduplicated key).  Only ONE edge
+        # survives in the merged graph, so only ONE key appears in tier_keyed.
+        # The deduplicated key is absent from tier_keyed but its fact is preserved
+        # under the surviving twin — this is intended dedup, NOT data loss.
+
+        if recon_result.failures:
+            logger.info(
+                "consolidate_interim_adapters: %d reconstruction failure(s) — those "
+                "keys have no merged edge and will be counted as drift: %s",
+                len(recon_result.failures),
+                recon_result.failures,
+            )
 
         for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
+            key = _t_data.get(_IK_ATTR)
             _t_pred = _t_data.get("predicate", "")
             if not _t_pred:
+                # Edges with no predicate are not keyable — skip unconditionally.
                 continue
-            _t_norm = (_t_subj, _normalize_predicate(_t_pred), _t_obj)
-            if _t_norm in seen_triples:
-                # Dedup: MultiDiGraph may carry multiple parallel edges for the same
-                # (subject, norm_pred, object) — process only the first occurrence.
-                continue
-            seen_triples.add(_t_norm)
-
-            key = triple_to_key.get(_t_norm)
-            if key is None:
-                # Triple exists in the merged graph but has no registered key
-                # (e.g. enrichment added it, or it pre-dates key registration).
-                # Skip — it will be keyed and trained on the next cycle once
-                # it enters the extraction→key-assignment path.
+            if not key:
+                # The pre-pass already appended this edge to tier_keyed; skip here
+                # to avoid a store.get(None) call.  This branch is reached for
+                # keyless-but-predicate-bearing edges (typically SOTA-enrichment
+                # facts) whose ik_key was intentionally not stamped onto the edge
+                # by the direct-append pre-pass.
                 continue
 
             entry = self.store.get(key)
@@ -3891,14 +3928,18 @@ class ConsolidationLoop:
                 )
                 continue
 
-            _t_rt = graph_triple_to_type.get(_t_norm, "factual")
+            # Tier from per-key bookkeeping relation_type (not from the edge, which
+            # may carry the merge-time value rather than the original extraction type).
+            _bk = self.store.bookkeeping_for_key(key) or {}
+            _rt_raw = _bk.get("relation_type", _FALLBACK_RTYPE)
+            _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
             current_adapter_id = self.store.tier_for_active_key(key) or "episodic"
             _dummy = [
                 {
                     "subject": _t_subj,
                     "predicate": _t_pred,
                     "object": _t_obj,
-                    "relation_type": _t_rt,
+                    "relation_type": _rt,
                 }
             ]
             _ep_rels, _proc_rels = partition_relations(
@@ -3921,39 +3962,118 @@ class ConsolidationLoop:
                 }
             )
 
-        # Compute drift: active keys in the store that were NOT found via the merged
-        # graph edge-walk (their triple is absent from the cumulative graph).
+        # Compute drift: active keys with no surviving merged edge after the fold.
+        # Under additive fold, a key drifts iff its recon edge was absent (recon
+        # failure) — REPLACE cardinality is skipped at fold time so it can never
+        # remove a registered edge.  No triple-identity matching — provenance from
+        # the merged edge is the sole authority.
         _all_keyed = {e["key"] for tier_list in tier_keyed.values() for e in tier_list}
+
+        # Refresh last_seen_cycle for every key that survived into tier_keyed.
+        # A key whose adapter successfully recalled its fact this fold was
+        # "seen" this cycle — refresh so decay never fires for stable keys.
+        # This is separate from the recurrence bump (which only fires on
+        # duplicate-SPO collapses); every surviving key gets a last_seen refresh.
+        for _surviving_key in _all_keyed:
+            _sbk = self.store.bookkeeping_for_key(_surviving_key)
+            if _sbk is not None:
+                _sbk["last_seen_cycle"] = self.cycle_count
+
         active_keys = self.store.all_active_keys()
         _drift_keys = [k for k in active_keys if k not in _all_keyed]
-        graph_drift_count = len(_drift_keys)
+
+        # --- 3-way drift partition ---
+        # merger.collapsed records INCOMING keys that were deduplicated away in a
+        # Case-1 duplicate-SPO collapse.  These are NOT data losses — the fact
+        # survives under the surviving twin key.
+        _collapsed_set: set[str] = set(getattr(self.merger, "collapsed", []))
+
+        drift_deduplicated: list[str] = []
+        drift_orphan: list[str] = []
+        drift_genuine_loss: list[str] = []
+
         for _dk in _drift_keys:
+            if _dk in _collapsed_set:
+                drift_deduplicated.append(_dk)
+            else:
+                _dk_bk = self.store.bookkeeping_for_key(_dk)
+                _dk_entry = self.store.get(_dk)
+                _bk_subj = (_dk_bk or {}).get("subject", "") if _dk_bk else ""
+                _bk_pred = (_dk_bk or {}).get("predicate", "") if _dk_bk else ""
+                _bk_obj = (_dk_bk or {}).get("object", "") if _dk_bk else ""
+                # Orphan: the entry itself carries no subject/predicate/object content.
+                _entry_subj = (_dk_entry or {}).get("subject", "")
+                _entry_pred = (_dk_entry or {}).get("predicate", "")
+                _entry_obj = (_dk_entry or {}).get("object", "")
+                if not _entry_subj and not _entry_pred and not _entry_obj:
+                    drift_orphan.append(_dk)
+                else:
+                    drift_genuine_loss.append(_dk)
+
+        graph_drift_count = len(_drift_keys)
+        drift_deduplicated_count = len(drift_deduplicated)
+        drift_orphan_count = len(drift_orphan)
+        drift_genuine_loss_count = len(drift_genuine_loss)
+
+        # Per-key log lines name the bucket so the journal is self-explanatory.
+        for _dk in drift_deduplicated:
             _dk_entry = self.store.get(_dk)
             logger.info(
-                "graph_drift_key key=%s subject=%r predicate=%r object=%r",
+                "graph_drift_key key=%s bucket=deduplicated subject=%r predicate=%r object=%r"
+                " (fact preserved under surviving twin key)",
+                _dk,
+                (_dk_entry or {}).get("subject", ""),
+                (_dk_entry or {}).get("predicate", ""),
+                (_dk_entry or {}).get("object", ""),
+            )
+        for _dk in drift_orphan:
+            logger.info(
+                "graph_drift_key key=%s bucket=orphan (no subject/predicate/object content;"
+                " correctly dropped)",
+                _dk,
+            )
+        for _dk in drift_genuine_loss:
+            _dk_entry = self.store.get(_dk)
+            logger.warning(
+                "graph_drift_key key=%s bucket=genuine_loss subject=%r predicate=%r object=%r"
+                " (reconstruction failed — real data loss)",
                 _dk,
                 (_dk_entry or {}).get("subject", ""),
                 (_dk_entry or {}).get("predicate", ""),
                 (_dk_entry or {}).get("object", ""),
             )
 
-        # Warn if graph drift exceeds 10 % of active keys.
-        if active_keys and graph_drift_count > len(active_keys) * 0.10:
+        if drift_deduplicated_count:
+            logger.info(
+                "consolidate_interim_adapters: %d key(s) deduplicated (exact-SPO collapse;"
+                " fact preserved under surviving twin) — not a data loss",
+                drift_deduplicated_count,
+            )
+        if drift_orphan_count:
+            logger.info(
+                "consolidate_interim_adapters: %d orphan key(s) dropped (no SPO content)",
+                drift_orphan_count,
+            )
+
+        # Gate the WARNING on genuine_loss only — dedup and orphan are expected/normal.
+        if drift_genuine_loss_count > 0:
             logger.warning(
-                "consolidate_interim_adapters: high graph drift (%d / %d keys = %.0f%%) — "
-                "indicates merge regression or drifted corpus; review recommended",
-                graph_drift_count,
-                len(active_keys),
-                100.0 * graph_drift_count / len(active_keys),
+                "consolidate_interim_adapters: %d genuine reconstruction loss(es) — "
+                "these keys had content but produced no merged edge; review recommended: %s",
+                drift_genuine_loss_count,
+                drift_genuine_loss,
             )
 
         logger.info(
             "consolidate_interim_adapters: key distribution — episodic=%d semantic=%d "
-            "procedural=%d drift=%d",
+            "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d)",
             len(tier_keyed["episodic"]),
             len(tier_keyed["semantic"]),
             len(tier_keyed["procedural"]),
             graph_drift_count,
+            drift_deduplicated_count,
+            drift_orphan_count,
+            drift_genuine_loss_count,
         )
 
         # --- Step 4: Build per-tier TrainingJob objects ---
@@ -4156,6 +4276,12 @@ class ConsolidationLoop:
             last_per_key_by_tier[tier] = (
                 recall_state.last_per_key if recall_state is not None else None
             )
+            if recall_state is not None and recall_state.last_per_key is not None:
+                self._debug_writer.on_recall_probe(
+                    recall_state.last_per_key,
+                    phase="train_fill",
+                    adapter_name=tier,
+                )
             tiers_rebuilt.append(tier)
 
         # flip off _is_training at finalize entry (belt-and-braces).
@@ -4251,15 +4377,25 @@ class ConsolidationLoop:
             _sw2(self.model, "episodic")
 
         logger.info(
-            "consolidate_interim_adapters: complete — rebuilt %s, drift=%d",
+            "consolidate_interim_adapters: complete — rebuilt %s, drift=%d"
+            " (deduplicated=%d orphan=%d genuine_loss=%d)",
             tiers_rebuilt,
             graph_drift_count,
+            drift_deduplicated_count,
+            drift_orphan_count,
+            drift_genuine_loss_count,
         )
 
         return {
             "tiers_rebuilt": tiers_rebuilt,
+            # graph_drift_count: total keys absent from tier_keyed (backward-compat).
             "graph_drift_count": graph_drift_count,
+            # 3-way breakdown — callers that want accurate data-loss signal use these.
+            "drift_deduplicated": drift_deduplicated_count,
+            "drift_orphan": drift_orphan_count,
+            "drift_genuine_loss": drift_genuine_loss_count,
             "keys_per_tier": {t: len(v) for t, v in tier_keyed.items()},
+            "tier_keyed": tier_keyed,
             "recall_per_tier": recall_per_tier,
             "rolled_back": False,
             "rollback_tier": None,
@@ -4271,6 +4407,7 @@ class ConsolidationLoop:
         entries: list[dict],
         *,
         max_probe: int = 100,
+        debug_phase: str | None = None,
     ) -> float:
         """Probe up to *max_probe* entries against *adapter_name* and return the recall rate.
 
@@ -4296,6 +4433,12 @@ class ConsolidationLoop:
             max_probe: Cap on probe size.  100 is chosen to keep the
                 probe cheap enough to run inline even inside the
                 post-session training path.
+            debug_phase: When not ``None``, the per-key verdict (including
+                ``raw_output``) is persisted to the debug snapshot via
+                :meth:`~paramem.training.debug_snapshot.DebugSnapshotWriter.on_recall_probe`
+                under ``<debug_base>/recall_probes/<debug_phase>_<adapter_name>.json``.
+                Only written on the success path (where ``recall_result`` is
+                available); probe exceptions still return ``0.0`` without writing.
 
         Returns:
             Recall rate in ``[0.0, 1.0]``.  On probe-harness exception,
@@ -4322,6 +4465,12 @@ class ConsolidationLoop:
                 adapter_name=adapter_name,
                 batch_size=self.training_config.recall_probe_batch_size,
             )
+            if debug_phase is not None:
+                self._debug_writer.on_recall_probe(
+                    recall_result["per_key"],
+                    phase=debug_phase,
+                    adapter_name=adapter_name,
+                )
             return float(recall_result["rate"])
         except Exception:
             logger.exception(
@@ -4490,6 +4639,7 @@ class ConsolidationLoop:
                 verify_name,
                 entries,
                 max_probe=max_probe,
+                debug_phase="disk_verify",
             )
             switch_adapter(self.model, adapter_name)
 

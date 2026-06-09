@@ -128,8 +128,7 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
 
     ``registry`` must be a ``dict[str, KeyRegistry]`` (per-tier) or ``None``
     (disabled replay).  When omitted, a fresh three-tier dict is used so
-    ``_all_active_keys()`` and ``_tier_for_key()`` work without a real
-    ``__init__`` call.
+    ``_all_active_keys()`` works without a real ``__init__`` call.
     """
     from paramem.training.consolidation import ConsolidationLoop
 
@@ -153,14 +152,19 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     _merger_graph = nx.MultiDiGraph()
     loop.merger.graph = _merger_graph
 
-    def _merge_into_graph(session_graph):
+    from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
+
+    def _merge_into_graph(session_graph, *, additive: bool = False):
         for _rel in getattr(session_graph, "relations", []):
-            _merger_graph.add_edge(
+            eid = _merger_graph.add_edge(
                 _rel.subject,
                 _rel.object,
                 predicate=_rel.predicate,
                 relation_type=getattr(_rel, "relation_type", "factual"),
             )
+            _ik = getattr(_rel, "indexed_key", None)
+            if _ik:
+                _merger_graph[_rel.subject][_rel.object][eid][_IK_ATTR] = _ik
         return _merger_graph
 
     loop.merger.merge.side_effect = _merge_into_graph
@@ -169,7 +173,6 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     loop.indexed_key_cache = indexed_key_cache if indexed_key_cache is not None else {}
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
-    loop.persist_graph = False
     loop._thermal_policy = None
     # _bg_trainer is wired by the server lifespan; None in tests (experiment path).
     loop._bg_trainer = None
@@ -186,6 +189,14 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     # TypeErrors.  Admitting every key matches the prior no-gate behavior, so it is
     # inert for these ordering/registry tests.
     loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+    # _promote_mature_keys_inline (called inside consolidate_interim_adapters) reads
+    # cycle_count, promoted_keys, and store.  Wire sensible defaults so the method
+    # runs without error.  Call _ensure_store() rather than assigning a new store so
+    # we don't overwrite a store already created (and populated via the legacy
+    # indexed_key_cache setter) by the indexed_key_registry property setter above.
+    loop.cycle_count = 0
+    loop.promoted_keys = set()
+    loop._ensure_store()
     return loop
 
 

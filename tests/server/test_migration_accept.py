@@ -239,10 +239,9 @@ class TestAcceptHappyPath:
     def test_accept_deletes_trial_graph(self, client, state, tmp_path):
         """Trial graph is deleted (not archived) after accept (transient by design).
 
-        The trial graph is persisted only for the before/after comparison report
-        during the trial window.  Once the operator accepts, it is deleted rather
-        than moved into the rotation slot, consistent with the ``persist_graph=False``
-        invariant for live production cycles.
+        The trial graph is RAM-only (stored in _state, not on disk) and its
+        directory is cleaned up after accept.  Once the operator accepts, the
+        trial_graph_dir is deleted rather than moved into the rotation slot.
         """
         trial_graph_dir = Path(state["migration"]["trial"]["trial_graph_dir"])
         assert trial_graph_dir.exists()

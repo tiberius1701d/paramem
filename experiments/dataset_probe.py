@@ -868,7 +868,6 @@ def main() -> None:
             state_provider=None,
             output_dir=run_dir,
             save_cycle_snapshots=None,
-            persist_graph=False,
             seed_state_from_disk=False,
         )
 

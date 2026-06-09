@@ -106,13 +106,26 @@ class TestBuildTrialLoop:
         # loop.output_dir should be set to trial_adapter_dir.
         assert mock_loop.output_dir == trial_adapter_dir
 
-    def test_trial_loop_persist_graph_enabled(self, tmp_path):
-        """_build_trial_loop enables persist_graph and sets graph_path."""
+    def test_trial_loop_graph_is_ram_only(self, tmp_path):
+        """_build_trial_loop does not set persist_graph or graph_path.
+
+        The graph is RAM-only; the in-memory merger graph is stashed into
+        _state by _stash_trial_graph after the fold, not written to disk.
+        """
         state = _make_state(tmp_path)
         trial_adapter_dir = Path(state["migration"]["trial"]["trial_adapter_dir"])
         trial_graph_dir = Path(state["migration"]["trial"]["trial_graph_dir"])
 
-        mock_loop = MagicMock()
+        # Track which attributes are SET (not just accessed) on the mock loop.
+        assigned: dict = {}
+
+        class _TrackingMock(MagicMock):
+            def __setattr__(self, name, value):
+                if not name.startswith("_"):
+                    assigned[name] = value
+                super().__setattr__(name, value)
+
+        mock_loop = _TrackingMock()
 
         with patch(
             "paramem.server.consolidation.create_consolidation_loop", return_value=mock_loop
@@ -129,8 +142,9 @@ class TestBuildTrialLoop:
                 trial_graph_dir,
             )
 
-        assert mock_loop.persist_graph is True
-        assert mock_loop.graph_path == trial_graph_dir / "cumulative_graph.json"
+        # persist_graph and graph_path must NOT be assigned to the loop.
+        assert "persist_graph" not in assigned
+        assert "graph_path" not in assigned
 
 
 class TestRunTrialConsolidation:

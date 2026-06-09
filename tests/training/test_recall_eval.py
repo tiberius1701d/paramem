@@ -524,6 +524,127 @@ class TestBatchSizeExceedsEntries:
             "recalled_predicate",
             "recalled_object",
             "failure_reason",
+            "raw_output",
         }
         for pk in result["per_key"]:
             assert expected_pk_fields.issubset(pk.keys())
+
+
+# ---------------------------------------------------------------------------
+# test_per_key_raw_output_in_both_branches
+# ---------------------------------------------------------------------------
+
+
+class TestPerKeyRawOutputInBothBranches:
+    """evaluate_indexed_recall must carry raw_output in per_key for both
+    the success branch (no failure_reason) and the failure branch
+    (failure_reason set).
+    """
+
+    def _run(self, raw_success: str, raw_failure: str) -> list[dict]:
+        """Drive evaluate_indexed_recall with one success and one failure entry.
+
+        The success entry gets a valid raw JSON response; the failure entry
+        gets a response with a wrong key so finalize_recalled returns a
+        key_mismatch failure dict.  Both dicts carry ``raw_output`` at the
+        ``probe_entries`` level; this test asserts it propagates into per_key.
+        """
+        from paramem.training.recall_eval import evaluate_indexed_recall
+
+        entries = [
+            _entry("graph1", "Alice", "lives_in", "Berlin"),
+            _entry("graph2", "Bob", "works_at", "Acme"),
+        ]
+        registry = _build_real_registry(entries)
+
+        model = _make_model_mock()
+        tokenizer = _make_tokenizer_mock()
+
+        # Two-row batch: row 0 → success raw, row 1 → failure raw
+        input_ids = torch.zeros(2, 5, dtype=torch.long)
+        gen_out = torch.zeros(2, 15, dtype=torch.long)
+        gen_out[0, 5] = 1  # sentinel for success row
+        gen_out[1, 5] = 2  # sentinel for failure row
+
+        model.generate.return_value = gen_out
+        inputs_dict = {"input_ids": input_ids, "attention_mask": torch.ones(2, 5)}
+        tokenizer.return_value = MagicMock(**{"to.return_value": inputs_dict})
+
+        def _fake_decode(ids, skip_special_tokens=True):
+            return raw_success if ids[0].item() == 1 else raw_failure
+
+        tokenizer.decode.side_effect = _fake_decode
+
+        with (
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.training.dataset.format_inference_prompt",
+                side_effect=lambda q, t: q,
+            ),
+        ):
+            result = evaluate_indexed_recall(
+                model,
+                tokenizer,
+                entries,
+                registry,
+                batch_size=2,
+            )
+
+        return result["per_key"]
+
+    def test_success_branch_carries_raw_output(self):
+        """Recalled entry (exact_match possible): raw_output is the decoded text."""
+        raw_success = _raw_json("graph1", "Alice", "lives_in", "Berlin")
+        raw_failure = _raw_json("graph99", "Bob", "works_at", "Acme")  # wrong key
+
+        per_key = self._run(raw_success, raw_failure)
+        by_key = {r["key"]: r for r in per_key}
+
+        pk = by_key["graph1"]
+        assert "raw_output" in pk
+        assert pk["raw_output"] == raw_success
+
+    def test_failure_branch_carries_raw_output(self):
+        """Failed entry (key_mismatch): raw_output is still the decoded text."""
+        raw_success = _raw_json("graph1", "Alice", "lives_in", "Berlin")
+        raw_failure = _raw_json("graph99", "Bob", "works_at", "Acme")  # wrong key → mismatch
+
+        per_key = self._run(raw_success, raw_failure)
+        by_key = {r["key"]: r for r in per_key}
+
+        pk = by_key["graph2"]
+        assert pk["failure_reason"] is not None  # failed
+        assert "raw_output" in pk
+        assert pk["raw_output"] == raw_failure
+
+    def test_null_recalled_carries_empty_raw_output(self):
+        """When probe_entries yields None for recalled, raw_output is empty string."""
+        from paramem.training.recall_eval import evaluate_indexed_recall
+
+        entries = [_entry("graph1", "Alice", "lives_in", "Berlin")]
+        registry = _build_real_registry(entries)
+
+        model = _make_model_mock()
+        tokenizer = _make_tokenizer_mock()
+
+        input_ids = torch.zeros(1, 5, dtype=torch.long)
+        gen_out = torch.zeros(1, 10, dtype=torch.long)
+        model.generate.return_value = gen_out
+        inputs_dict = {"input_ids": input_ids, "attention_mask": torch.ones(1, 5)}
+        tokenizer.return_value = MagicMock(**{"to.return_value": inputs_dict})
+        # Return empty string → parse failure → finalize_recalled returns
+        # {"raw_output": "", "failure_reason": "parse_failure"}
+        tokenizer.decode.return_value = ""
+
+        with (
+            patch("paramem.models.loader.switch_adapter"),
+            patch(
+                "paramem.training.dataset.format_inference_prompt",
+                side_effect=lambda q, t: q,
+            ),
+        ):
+            result = evaluate_indexed_recall(model, tokenizer, entries, registry, batch_size=1)
+
+        pk = result["per_key"][0]
+        assert "raw_output" in pk
+        assert isinstance(pk["raw_output"], str)

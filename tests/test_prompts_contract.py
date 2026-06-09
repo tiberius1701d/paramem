@@ -407,11 +407,9 @@ class TestAnonymizationPrompt:
 class TestMergerCoexistencePrompt:
     """Contract tests for the merger coexistence prompt.
 
-    The parser in ``check_predicate_coexistence`` keys on the literal strings
-    ``COEXIST`` and ``REPLACE`` (``merger.py`` lines that check
-    ``"COEXIST" in decision`` / ``"REPLACE" in decision``).  Removing either
-    keyword from the prompt would silently cause the model to never emit the
-    expected response and always fall through to the default.
+    The 2-way parser in ``check_predicate_coexistence`` keys on the literal
+    strings ``COEXIST`` and ``REPLACE``.  The prompt must contain both keywords
+    and must render without leftover slots.
     """
 
     def test_renders_without_leftover_slots(self):
@@ -450,6 +448,21 @@ class TestMergerCoexistencePrompt:
         )
         assert "REPLACE" in rendered
 
+    def test_aggregate_keyword_absent(self):
+        """``AGGREGATE`` must NOT appear in the rendered prompt — the 2-way parser
+        no longer expects or emits it; its presence would confuse the model.
+        """
+        tmpl = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT)
+        rendered = tmpl.format(
+            predicate="speaks",
+            subject="Alex",
+            old_value="German",
+            new_value="English",
+        )
+        assert "AGGREGATE" not in rendered, (
+            "Prompt must not contain AGGREGATE — fold is now purely additive"
+        )
+
     def test_file_byte_equivalent_to_inline_default(self):
         """The prompt file must be byte-equivalent to ``_COEXISTENCE_PROMPT`` after
         ``.strip()`` so the fallback and the file produce identical model inputs.
@@ -457,6 +470,55 @@ class TestMergerCoexistencePrompt:
         file_path = _DEFAULT_PROMPT_DIR / "merger_coexistence.txt"
         assert file_path.exists(), f"Prompt file not found: {file_path}"
         assert file_path.read_text().strip() == _COEXISTENCE_PROMPT
+
+
+class TestCheckPredicateCoexistenceParser:
+    """Unit tests for the 2-way verdict parser in check_predicate_coexistence.
+
+    These tests mock the model's generate_answer to return specific output
+    strings and verify the parser extracts the correct verdict.
+    They do NOT require a real GPU or model.
+    """
+
+    def _call_with_mock_output(self, output: str) -> str:
+        """Drive check_predicate_coexistence with a mocked model output.
+
+        ``generate_answer`` and ``adapt_messages`` are imported locally inside
+        ``check_predicate_coexistence`` (lazy import), so we patch them at their
+        definition site (``paramem.evaluation.recall`` and
+        ``paramem.models.loader``), not via the merger module namespace.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.merger import check_predicate_coexistence
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template.return_value = "formatted"
+
+        with patch("paramem.evaluation.recall.generate_answer", return_value=output):
+            with patch(
+                "paramem.models.loader.adapt_messages",
+                return_value=[{"role": "user", "content": "test"}],
+            ):
+                return check_predicate_coexistence(
+                    "Alex", "speaks", "German", "English", model, tokenizer
+                )
+
+    def test_coexist_verdict_parsed(self):
+        """Model output 'COEXIST' → 'COEXIST'."""
+        verdict = self._call_with_mock_output("COEXIST")
+        assert verdict == "COEXIST"
+
+    def test_replace_verdict_parsed(self):
+        """Model output 'REPLACE' → 'REPLACE'."""
+        verdict = self._call_with_mock_output("REPLACE")
+        assert verdict == "REPLACE"
+
+    def test_ambiguous_output_defaults_to_coexist(self):
+        """Unrecognised model output → 'COEXIST' safer default."""
+        verdict = self._call_with_mock_output("MAYBE")
+        assert verdict == "COEXIST"
 
 
 class TestMergerContradictionPrompt:

@@ -134,9 +134,9 @@ def run_scheduled_backup(
        - ``"graph"``   → ``loop.merger.save_bytes()``.  Skip with an
          accurate "graph unavailable" reason when ``loop is None`` or
          ``loop`` has no ``merger`` attribute.  The graph is in-memory only
-         (production runs ``persist_graph=False``), so the standalone runner
-         cannot capture it — the systemd timer delegates to the running
-         server (which holds the loop) when reachable; see ``__main__``.
+         (RAM-only), so the standalone runner cannot capture it — the systemd
+         timer delegates to the running server (which holds the loop) when
+         reachable; see ``__main__``.
        - ``"registry"`` → ``server_config.paths.key_metadata.read_bytes()``.
          Skip with reason ``"registry empty (no keys yet)"`` when the file
          does not exist.  Write even when the file is empty (0 bytes).

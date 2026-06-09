@@ -277,10 +277,9 @@ class TestRollbackHappyPath:
     def test_rollback_deletes_trial_graph(self, client, state, tmp_path):
         """Trial graph is deleted (not archived) after rollback (transient by design).
 
-        The trial graph is persisted only for the before/after comparison report
-        during the trial window.  Once the operator rolls back, it is deleted rather
-        than moved into the rotation slot, consistent with the ``persist_graph=False``
-        invariant for live production cycles.
+        The trial graph is RAM-only (stored in _state, not on disk) and its
+        directory is cleaned up after rollback.  Once the operator rolls back,
+        the trial_graph_dir is deleted rather than moved into the rotation slot.
         """
         trial_graph_dir = Path(state["migration"]["trial"]["trial_graph_dir"])
         assert trial_graph_dir.exists(), "fixture must create trial_graph dir"

@@ -360,6 +360,54 @@ def test_graph_shape_in_memory_graph_preferred(tmp_path):
     assert "99" not in row["pre_trial"]
 
 
+def test_graph_shape_trial_in_memory_preferred(tmp_path):
+    """When trial_graph is passed, it takes priority over trial_graph_path."""
+    import networkx as nx
+
+    g = nx.MultiDiGraph()
+    for i in range(7):
+        g.add_node(f"node{i}")
+    g.add_edge("node0", "node1", predicate="knows")
+    g.add_edge("node1", "node2", predicate="likes")
+
+    # Write a different graph to the file to confirm the file is ignored.
+    trial_path = tmp_path / "trial.json"
+    _write_graph(trial_path, n_nodes=99)
+
+    gates = _make_gates()
+    report = build_comparison_report(
+        gates=gates,
+        pre_trial_graph_path=None,
+        trial_graph_path=trial_path,
+        trial_graph=g,
+    )
+    row = report["rows"][4]
+    assert "7 nodes" in row["trial"]
+    # 99-node graph from file should NOT appear
+    assert "99" not in row["trial"]
+
+
+def test_graph_shape_trial_in_memory_no_path(tmp_path):
+    """trial_graph alone (no path) renders correctly."""
+    import networkx as nx
+
+    g = nx.MultiDiGraph()
+    g.add_node("x")
+    g.add_node("y")
+    g.add_edge("x", "y", predicate="related_to")
+
+    gates = _make_gates()
+    report = build_comparison_report(
+        gates=gates,
+        pre_trial_graph_path=None,
+        trial_graph_path=None,
+        trial_graph=g,
+    )
+    row = report["rows"][4]
+    assert row["pre_trial"] == "—"
+    assert "2 nodes" in row["trial"]
+
+
 # ---------------------------------------------------------------------------
 # Top-level report shape
 # ---------------------------------------------------------------------------

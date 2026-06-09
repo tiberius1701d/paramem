@@ -86,8 +86,6 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
     loop._debug_base = None
-    loop.persist_graph = False
-    loop.enable_entity_promotion = False
     from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 
     loop.extraction = ExtractionPipeline(
@@ -122,7 +120,6 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.semantic_simhash = {}
     loop.procedural_simhash = {}
     loop.cycle_count = 0
-    loop.key_sessions = {}
     loop.promoted_keys = set()
     loop.pending_interim_triples = []
     loop.shutdown_requested = False

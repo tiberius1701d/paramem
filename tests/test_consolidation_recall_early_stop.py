@@ -391,9 +391,6 @@ PRODUCTION_MODULES = [
 # Verified non-production by tracing all callers transitively from
 # paramem/server/app.py endpoints.
 EXPERIMENT_ONLY_ALLOWLIST = {
-    # Only called from run_cycle (consolidation.py:1317), which itself is
-    # used in experiment harnesses but not the production server.
-    ("paramem/training/consolidation.py", "_run_indexed_key_semantic"),
     # Gated on indexed_key_registry is None (line ~1329); production
     # server always has a registry.
     ("paramem/training/consolidation.py", "_train_adapter_with_replay"),

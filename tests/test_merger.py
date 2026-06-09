@@ -828,7 +828,7 @@ class TestCrossPredicateContradictionFlag:
             # resolution does not remove the first edge either (multi-valued predicate).
             with patch(
                 "paramem.graph.merger.check_predicate_coexistence",
-                return_value=True,
+                return_value="COEXIST",
             ):
                 m.merge(sg1)
                 m.merge(sg2)
@@ -881,7 +881,7 @@ class TestCrossPredicateContradictionFlag:
             # contradiction detection fires).
             with patch(
                 "paramem.graph.merger.check_predicate_coexistence",
-                return_value=True,
+                return_value="COEXIST",
             ):
                 m.merge(sg1)
                 m.merge(sg2)
@@ -960,7 +960,7 @@ class TestCrossPredicateContradictionFlag:
         # (single-valued predicate → replace old value).
         with patch(
             "paramem.graph.merger.check_predicate_coexistence",
-            return_value=False,  # REPLACE — single-valued
+            return_value="REPLACE",  # single-valued
         ):
             m = GraphMerger(
                 model=model_stub,
@@ -1030,17 +1030,17 @@ class TestModelContradictionAndRelease:
 
     def _build_stub_model(self, is_single_valued: bool):
         """Return a (model, tokenizer) stub whose check_predicate_coexistence
-        returns ``not is_single_valued`` (i.e. single-valued → REPLACE)."""
+        returns ``"REPLACE"`` for single-valued or ``"COEXIST"`` for multi-valued."""
         from unittest.mock import MagicMock
 
         model = MagicMock()
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "formatted"
 
-        coexist_result = not is_single_valued  # True → COEXIST, False → REPLACE
+        verdict = "REPLACE" if is_single_valued else "COEXIST"
 
         def _patched_coexistence(subject, predicate, old_value, new_value, mdl, tok, prompt=None):
-            return coexist_result
+            return verdict
 
         return model, tokenizer, _patched_coexistence
 
@@ -1190,7 +1190,7 @@ class TestModelContradictionAndRelease:
         m.release()  # must not raise
 
     def test_multi_valued_coexist_with_model(self):
-        """With a model present, when check_predicate_coexistence returns True
+        """With a model present, when check_predicate_coexistence returns COEXIST
         (multi-valued predicate), both the old and new objects must coexist as
         edges for the same (subject, predicate) and no contradictions_resolved
         entry must be recorded."""
@@ -1255,3 +1255,444 @@ class TestModelContradictionAndRelease:
         assert m.contradictions_resolved == [], (
             "Multi-valued coexist: no contradictions_resolved entry must be recorded"
         )
+
+
+class TestIkKeyProvenance:
+    """Unit tests for ik_key provenance stamping on merged edges."""
+
+    def test_new_edge_stamped_with_indexed_key(self):
+        """New-edge insertion stamps ik_key on the edge when Relation.indexed_key is set."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        m = GraphMerger()  # no model
+        session = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="graph42",
+                )
+            ],
+        )
+        m.merge(session)
+
+        # Exactly one edge for (Alice, lives_in, Berlin).
+        edges = list(m.graph["Alice"]["Berlin"].items())
+        assert len(edges) == 1
+        eid, data = edges[0]
+        assert data.get(_IK_KEY_ATTR) == "graph42", (
+            f"Expected ik_key='graph42' stamped on new edge; got {data.get(_IK_KEY_ATTR)!r}"
+        )
+
+    def test_normal_ingest_relation_no_indexed_key(self):
+        """Normal ingest Relation (indexed_key=None) does NOT stamp ik_key."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        m = GraphMerger()
+        session = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    # indexed_key defaults to None
+                )
+            ],
+        )
+        m.merge(session)
+
+        edges = list(m.graph["Alice"]["Berlin"].items())
+        assert len(edges) == 1
+        eid, data = edges[0]
+        assert data.get(_IK_KEY_ATTR) is None, "Normal ingest must NOT stamp ik_key on merged edge"
+
+    def test_disjoint_multi_valued_coexists(self):
+        """Disjoint multi-valued values COEXIST — both edges kept, no aggregation."""
+        from unittest.mock import patch
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        m = GraphMerger()
+        m.graph.add_node("Alex")
+        m.graph.add_node("cat")
+        eid_old = m.graph.add_edge(
+            "Alex",
+            "cat",
+            predicate="has_pet",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s1",
+            last_seen="s1",
+            recurrence_count=1,
+            sessions=["s1"],
+        )
+        m.graph["Alex"]["cat"][eid_old][_IK_KEY_ATTR] = "g1"
+        m._predicate_cardinality["has_pet"] = True  # multi-valued
+
+        session = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="has_pet",
+                    object="dog",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="g2",
+                )
+            ],
+        )
+
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            return_value="COEXIST",
+        ):
+            m.merge(session, additive=True)
+
+        # Both edges must coexist.
+        pets = [
+            obj
+            for obj in m.graph.successors("Alex")
+            for _, d in m.graph["Alex"][obj].items()
+            if d.get("predicate") == "has_pet"
+        ]
+        assert "cat" in pets and "dog" in pets, (
+            "Disjoint multi-valued pair must COEXIST — both keys kept"
+        )
+
+
+class TestReinforcementTracking:
+    """Tests for merger.reinforcements (Case-1 duplicate-SPO collapse tracking)."""
+
+    def test_reinforcements_empty_after_merge_no_duplicate(self):
+        """A merge with no duplicate SPO produces an empty reinforcements list."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+
+        m = GraphMerger()
+        session = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="graph1",
+                )
+            ],
+        )
+        m.merge(session, additive=True)
+        assert m.reinforcements == [], "No duplicate → reinforcements must be empty"
+
+    def test_reinforcements_populated_on_duplicate_spo_collapse(self):
+        """Two recon edges with same (s,p,o) but different ik_keys: Case-1 fires and
+        the surviving key appears in reinforcements."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+
+        m = GraphMerger()
+        # First merge: net-new edge, key graph1 stamped.
+        s1 = SessionGraph(
+            session_id="recon1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="graph1",
+                )
+            ],
+        )
+        m.merge(s1, additive=True)
+        assert m.reinforcements == [], "First merge is net-new — no reinforcement yet"
+
+        # Second merge: same (s,p,o), different ik_key → Case-1 → reinforcement.
+        s2 = SessionGraph(
+            session_id="recon2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="graph2",
+                )
+            ],
+        )
+        m.merge(s2, additive=True)
+
+        assert len(m.reinforcements) == 1, (
+            f"Duplicate-SPO collapse must produce 1 reinforcement entry; got {m.reinforcements}"
+        )
+        # The survivor is the EXISTING edge's key (graph1), not the incoming (graph2).
+        assert m.reinforcements[0] == "graph1", (
+            f"Surviving key must be graph1 (existing edge); got {m.reinforcements[0]!r}"
+        )
+
+    def test_reinforcements_reset_graph_clears_reinforcements(self):
+        """reset_graph() clears reinforcements from the prior fold."""
+        from paramem.graph.merger import GraphMerger
+
+        m = GraphMerger()
+        m.reinforcements = ["graph_stale"]
+        m.reset_graph()
+        assert m.reinforcements == [], "reset_graph must clear reinforcements"
+
+    def test_collapsed_populated_on_duplicate_spo_collapse(self):
+        """Two recon edges with same (s,p,o) but different ik_keys: Case-1 fires and
+        the INCOMING (drifting) key appears in collapsed, while the surviving key is
+        in reinforcements.
+
+        collapsed is the parallel to reinforcements — where reinforcements records
+        the key that survived, collapsed records the key that was deduplicated away.
+        """
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+
+        m = GraphMerger()
+        # First merge: net-new edge, key graph1 stamped.
+        s1 = SessionGraph(
+            session_id="recon1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="graph1",
+                )
+            ],
+        )
+        m.merge(s1, additive=True)
+        assert m.collapsed == [], "First merge is net-new — no collapse yet"
+
+        # Second merge: same (s,p,o), different ik_key → Case-1 → collapse.
+        s2 = SessionGraph(
+            session_id="recon2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="graph2",
+                )
+            ],
+        )
+        m.merge(s2, additive=True)
+
+        # The incoming (drifting) key must appear in collapsed.
+        assert len(m.collapsed) == 1, (
+            f"Duplicate-SPO collapse must produce 1 collapsed entry; got {m.collapsed}"
+        )
+        assert m.collapsed[0] == "graph2", (
+            f"Collapsed key must be graph2 (the incoming key); got {m.collapsed[0]!r}"
+        )
+        # The surviving key must still be in reinforcements.
+        assert m.reinforcements[0] == "graph1", (
+            f"Surviving key must be graph1 (existing edge); got {m.reinforcements[0]!r}"
+        )
+
+    def test_collapsed_reset_graph_clears_collapsed(self):
+        """reset_graph() clears collapsed from the prior fold."""
+        from paramem.graph.merger import GraphMerger
+
+        m = GraphMerger()
+        m.collapsed = ["graph_stale"]
+        m.reset_graph()
+        assert m.collapsed == [], "reset_graph must clear collapsed"
+
+    def test_reset_graph_clears_all_per_fold_caches(self):
+        """reset_graph() clears graph, caches, reinforcements, collapsed, and contradictions."""
+
+        from paramem.graph.merger import GraphMerger
+
+        m = GraphMerger()
+        # Populate all per-fold state.
+        m.graph.add_node("Alice")
+        m._predicate_cardinality["foo"] = True
+        m.contradictions_resolved.append({"method": "model"})
+        m.reinforcements.append("k2")
+        m.collapsed.append("k3")
+
+        m.reset_graph()
+
+        assert m.graph.number_of_nodes() == 0, "reset_graph must empty the graph"
+        assert m._predicate_cardinality == {}, "reset_graph must clear cardinality cache"
+        assert m.contradictions_resolved == [], "reset_graph must clear contradictions_resolved"
+        assert m.reinforcements == [], "reset_graph must clear reinforcements"
+        assert m.collapsed == [], "reset_graph must clear collapsed"
+
+    def test_case1_adopt_does_not_produce_reinforcement(self):
+        """Case-1-adopt (keyless existing + incoming has key) does NOT add a reinforcement.
+
+        Reinforcement fires only when BOTH edges carry ik_keys (duplicate-SPO collapse).
+        Adopt (existing is keyless) just stamps the key — no recurrence bump needed.
+        """
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        m = GraphMerger()
+        m.graph.add_node("Alice")
+        m.graph.add_node("Berlin")
+        existing_eid = m.graph.add_edge(
+            "Alice",
+            "Berlin",
+            predicate="lives_in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s0",
+            last_seen="s0",
+            recurrence_count=1,
+            sessions=["s0"],
+        )
+        # Keyless existing edge.
+        assert m.graph["Alice"]["Berlin"][existing_eid].get(_IK_KEY_ATTR) is None
+
+        incoming = Relation(
+            subject="Alice",
+            predicate="lives_in",
+            object="Berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="Speaker0",
+            indexed_key="graph5",
+        )
+        m._upsert_relation("Alice", "Berlin", incoming, "s1", "2026-01-01T00:00:00Z")
+
+        # Adopt path: no reinforcement (the existing edge had no key to preserve).
+        assert m.reinforcements == [], (
+            "Case-1-adopt must NOT produce a reinforcement (existing was keyless)"
+        )
+        # Key was adopted onto the existing edge.
+        assert m.graph["Alice"]["Berlin"][existing_eid].get(_IK_KEY_ATTR) == "graph5"
+
+    def test_additive_fold_short_circuits_replace_both_edges_survive(self):
+        """additive=True short-circuits Case-2: even when check_predicate_coexistence returns
+        REPLACE, the old edge is NOT removed and both keys survive.
+
+        This is the regression guard for the purely-additive fold: no model call, no edge
+        removal, no registered fact lost at fold time.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+        m.graph.add_node("Alex")
+        m.graph.add_node("Munich")
+
+        # Pre-seed with the first edge carrying ik_key='key_munich'.
+        eid_old = m.graph.add_edge(
+            "Alex",
+            "Munich",
+            predicate="lives_in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s1",
+            last_seen="s1",
+            recurrence_count=1,
+            sessions=["s1"],
+        )
+        m.graph["Alex"]["Munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
+
+        # Incoming relation: same predicate, different object (Berlin).
+        incoming = Relation(
+            subject="Alex",
+            predicate="lives_in",
+            object="Berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="Speaker0",
+            indexed_key="key_berlin",
+        )
+
+        # Even though the model would say REPLACE, additive=True must skip it entirely.
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            return_value="REPLACE",
+        ) as mock_coexist:
+            m._upsert_relation(
+                "Alex", "Berlin", incoming, "s2", "2026-01-02T00:00:00Z", additive=True
+            )
+            # check_predicate_coexistence must NOT have been called (short-circuit).
+            mock_coexist.assert_not_called()
+
+        # Both edges must survive: Munich (old) and Berlin (new).
+        lives_in_objects = [
+            obj
+            for obj in m.graph.successors("Alex")
+            for _, d in m.graph["Alex"][obj].items()
+            if d.get("predicate") == "lives_in"
+        ]
+        assert "Munich" in lives_in_objects, (
+            "Old edge (Munich) must NOT be removed when additive=True"
+        )
+        assert "Berlin" in lives_in_objects, (
+            "New edge (Berlin) must be inserted even when additive=True"
+        )
+
+        # Both ik_keys must be stamped on their respective edges.
+        munich_key = next(
+            d.get(_IK_KEY_ATTR)
+            for _, d in m.graph["Alex"]["Munich"].items()
+            if d.get("predicate") == "lives_in"
+        )
+        berlin_key = next(
+            d.get(_IK_KEY_ATTR)
+            for _, d in m.graph["Alex"]["Berlin"].items()
+            if d.get("predicate") == "lives_in"
+        )
+        assert munich_key == "key_munich", f"Expected key_munich on old edge; got {munich_key!r}"
+        assert berlin_key == "key_berlin", f"Expected key_berlin on new edge; got {berlin_key!r}"
