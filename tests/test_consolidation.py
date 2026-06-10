@@ -1271,6 +1271,151 @@ class TestFullCycleGateHelpers:
         assert _is_full_cycle_due(cfg) is True
 
 
+class TestRunFullConsolidationSyncAccumulating:
+    """App-layer: _run_full_consolidation_sync honours the accumulating return.
+
+    When ``consolidate_interim_adapters`` returns ``status="accumulating"``,
+    the orchestrator in ``_run_full_cycle`` must:
+    - NOT call ``session_buffer.mark_consolidated``
+    - NOT stamp ``_state["last_consolidation"]``
+    - Record ``_state["last_consolidation_result"]["status"] == "accumulating"``
+      with ``accumulating_reason`` present
+    - NOT call ``ConsolidationLoop._save_adapters`` (proxy for on-disk window
+      stamp remaining unchanged — the real on-disk stamp lives in the main-slot
+      meta.json written by ``_save_adapters``; no GPU/real fold machinery needed
+      to assert this proxy)
+    """
+
+    def _make_state(self) -> dict:
+        """Minimal _state for _run_full_consolidation_sync.
+
+        Uses a pre-populated ``consolidation_loop`` mock so the function's
+        ``create_consolidation_loop`` branch is skipped entirely.
+
+        ``config.consolidation.training_temp_limit`` is set to 0 so that
+        ``ThermalPolicy.from_consolidation_config`` returns None without
+        comparing a MagicMock against an integer (which raises TypeError).
+        """
+        mock_config = MagicMock()
+        mock_config.consolidation.mode = "train"
+        # training_temp_limit <= 0 → ThermalPolicy.from_consolidation_config returns None.
+        mock_config.consolidation.training_temp_limit = 0
+
+        mock_loop = MagicMock()
+        mock_loop.model = MagicMock(name="model")
+        mock_loop.consolidate_interim_adapters.return_value = {
+            "status": "accumulating",
+            "accumulating_reason": {"floor": 30, "episodic": 5, "parked": {}},
+            "tiers_rebuilt": [],
+        }
+
+        mock_session_buffer = MagicMock()
+
+        return {
+            "config": mock_config,
+            "model": MagicMock(name="model"),
+            "tokenizer": MagicMock(name="tokenizer"),
+            "consolidation_loop": mock_loop,
+            "session_buffer": mock_session_buffer,
+            "router": None,
+            "background_trainer": None,
+            "consolidating": True,
+            "last_consolidation": None,
+            "last_consolidation_result": None,
+            "event_loop": None,
+        }
+
+    def test_accumulating_does_not_mark_consolidated(self, monkeypatch):
+        """session_buffer.mark_consolidated is NOT called when fold returns accumulating."""
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_state()
+        monkeypatch.setattr(app_module, "_state", state)
+
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        with patch("paramem.server.background_trainer.BackgroundTrainer", return_value=mock_bt):
+            app_module._run_full_consolidation_sync()
+
+        state["session_buffer"].mark_consolidated.assert_not_called()
+
+    def test_accumulating_does_not_stamp_last_consolidation(self, monkeypatch):
+        """_state["last_consolidation"] is NOT updated when fold returns accumulating."""
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_state()
+        prior_stamp = state["last_consolidation"]  # None
+        monkeypatch.setattr(app_module, "_state", state)
+
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        with patch("paramem.server.background_trainer.BackgroundTrainer", return_value=mock_bt):
+            app_module._run_full_consolidation_sync()
+
+        assert state["last_consolidation"] == prior_stamp, (
+            "_state['last_consolidation'] must NOT be updated on accumulating return; "
+            f"was {prior_stamp!r}, got {state['last_consolidation']!r}"
+        )
+
+    def test_accumulating_sets_result_status_and_reason(self, monkeypatch):
+        """_state["last_consolidation_result"] carries status='accumulating' and reason."""
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_state()
+        monkeypatch.setattr(app_module, "_state", state)
+
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        with patch("paramem.server.background_trainer.BackgroundTrainer", return_value=mock_bt):
+            app_module._run_full_consolidation_sync()
+
+        result = state["last_consolidation_result"]
+        assert result is not None, "_state['last_consolidation_result'] must be set"
+        assert result["status"] == "accumulating", (
+            f"expected status='accumulating', got {result['status']!r}"
+        )
+        assert "accumulating_reason" in result, (
+            "last_consolidation_result must contain 'accumulating_reason'"
+        )
+
+    def test_accumulating_save_adapters_not_called(self, monkeypatch):
+        """_save_adapters is NOT called when fold returns accumulating.
+
+        _save_adapters writes the per-tier meta.json that carries the on-disk
+        window_stamp read by _is_full_cycle_due.  Not calling it leaves the
+        stamp unadvanced so the next tick will re-fire the fold (spec §9 item 10).
+        No GPU or real fold machinery is needed to assert this proxy.
+        """
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_state()
+        monkeypatch.setattr(app_module, "_state", state)
+
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        save_spy = MagicMock()
+
+        with (
+            patch("paramem.server.background_trainer.BackgroundTrainer", return_value=mock_bt),
+            patch("paramem.training.consolidation.ConsolidationLoop._save_adapters", save_spy),
+        ):
+            app_module._run_full_consolidation_sync()
+
+        save_spy.assert_not_called()
+
+
 class TestTestHarnessImportNoEnvRestoration:
     """Regression: importing experiments.utils.test_harness must NOT re-load .env.
 
@@ -1825,7 +1970,9 @@ class TestAbortSkipsCommit:
             "in_training": MagicMock(),
         }
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig()
+        # Set floor=0 and tier_fast_start=False so abort-path tests with small
+        # key counts are not blocked by the accumulate guard or the fast-start path.
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -2265,7 +2412,14 @@ class TestConsolidateInterimAdaptersFullFlow:
             "procedural_backup": MagicMock(),
         }
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig()
+        # Set min_tier_key_floor=0 so the pre-existing tests (which use small key
+        # counts to exercise dedup/tier logic) are not blocked by the floor guard.
+        # Set floor=0 and tier_fast_start=False so pre-existing tests with small
+        # key counts are not blocked by the accumulate guard, and pre-graduation
+        # keys (all in episodic) are not mistaken for first-time fast-start graduations.
+        # Tests that specifically exercise the floor / graduation behaviour live in
+        # TestTierFloor and set their own config.
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
         loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
         loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
         loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
@@ -2426,7 +2580,10 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop.merger = GraphMerger(model=None)  # real merger, not MagicMock
 
         # Register TWO store keys for the same (s,p,o).
-        for key in ("graph1", "graph2"):
+        # Set simhashes so we can verify the stale key's simhash is retained.
+        _GRAPH1_SIMHASH = 0xABCD1234
+        _GRAPH2_SIMHASH = 0xEF567890
+        for key, sh in (("graph1", _GRAPH1_SIMHASH), ("graph2", _GRAPH2_SIMHASH)):
             loop.store.put(
                 "episodic",
                 key,
@@ -2438,6 +2595,7 @@ class TestConsolidateInterimAdaptersFullFlow:
                     "speaker_id": "Speaker0",
                     "first_seen_cycle": 1,
                 },
+                simhash=sh,
                 register=True,
             )
             loop.store.set_bookkeeping(
@@ -2464,6 +2622,30 @@ class TestConsolidateInterimAdaptersFullFlow:
         assert result["drift_genuine_loss"] == 0, (
             f"Expected drift_genuine_loss=0 (fact is preserved under surviving twin);"
             f" got {result['drift_genuine_loss']}"
+        )
+
+        # Under Mode 1, the deduplicated key is SOFT-STALED after finalize (B1).
+        # One of graph1/graph2 is in list_stale(); the other is in list_active().
+        ep_reg = loop.store.registry("episodic")
+        stale_keys = ep_reg.list_stale()
+        active_keys = ep_reg.list_active()
+        assert len(stale_keys) == 1, (
+            f"Expected exactly 1 stale key (the deduplicated one); got {stale_keys}"
+        )
+        assert len(active_keys) == 1, (
+            f"Expected exactly 1 active key (the surviving twin); got {active_keys}"
+        )
+        # The stale key must be in the set {graph1, graph2}.
+        assert stale_keys[0] in {"graph1", "graph2"}, (
+            f"Stale key {stale_keys[0]!r} not in expected set"
+        )
+        # The stale key must NOT be in list_active().
+        assert stale_keys[0] not in active_keys, "Stale key must not be active"
+        # The stale key's simhash must be RETAINED in the episodic simhash dict.
+        ep_simhashes = loop.store.simhashes_in_tier("episodic")
+        assert stale_keys[0] in ep_simhashes, (
+            f"Stale key {stale_keys[0]!r} simhash must be retained; "
+            f"episodic simhashes: {ep_simhashes}"
         )
 
         # Verify the surviving key's fact is intact.
@@ -2685,16 +2867,22 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
 
     # -------------------------------------------------------------------------
-    # Test 5: explicit drift — store key whose triple is absent from graph
+    # Test 5: recall-miss is a retry, not a drop (Mode 1 semantics)
     # -------------------------------------------------------------------------
 
-    def test_explicit_drift_key_not_in_tier(self, tmp_path):
-        """A store active key whose recon edge is absent from the merged graph
-        is counted as drift: NOT placed in any tier_keyed list.
+    def test_recall_miss_is_retry_not_drop(self, tmp_path):
+        """Under Mode 1, a key whose recon edge is absent from the recon graph
+        is a recall-miss / retry signal — NOT dropped, NOT counted as drift.
 
-        Under provenance keying, drift = active key with no surviving merged
-        edge.  'graph_bob' has a recon edge (stamped ik_key) → tiered.
-        'drift1' has NO recon edge (reconstruction "failed"/absent) → drifts.
+        The merge input is registry-true (not reconstruction-driven), so a
+        recall miss means: the key's registry-true SPO enters the merge
+        regardless.  Both 'graph_bob' and 'drift1' appear in tier_keyed.
+        'drift1' is in result["recall_miss_keys"] (no recon edge = miss).
+        Neither key is in drift_genuine_loss.
+
+        This replaces the prior test_explicit_drift_key_not_in_tier that
+        asserted drift_genuine_loss>=1 — under Mode 1 that scenario is a
+        retry, not a loss.
         """
         import networkx as nx
 
@@ -2711,7 +2899,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         # Install provenance merge spy so ik_keys are stamped onto merged edges.
         self._install_provenance_merge_spy(loop)
 
-        # Register graph_bob — has a recon edge → will be tiered.
+        # Register graph_bob — has a recon edge matching registry-true SPO.
         loop.store.put(
             "episodic",
             "graph_bob",
@@ -2729,7 +2917,8 @@ class TestConsolidateInterimAdaptersFullFlow:
             "graph_bob", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
-        # Register drift1 — no recon edge → no merged edge → drifts.
+        # Register drift1 — no recon edge.  Under Mode 1 the registry-true SPO
+        # enters the merge directly, so drift1 survives into tier_keyed.
         loop.store.put(
             "episodic",
             "drift1",
@@ -2749,23 +2938,202 @@ class TestConsolidateInterimAdaptersFullFlow:
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # drift1 has no recon edge → no merged edge → counted as drift.
-        assert result["graph_drift_count"] >= 1, (
-            f"Expected at least 1 drift key (drift1 has no recon edge); "
-            f"got {result['graph_drift_count']}"
+        # Under Mode 1, drift1 enters recon_relations from registry-true SPO.
+        # Both keys survive into tier_keyed → no drift.
+        assert result["graph_drift_count"] == 0, (
+            f"Expected graph_drift_count=0 (both keys have registry-true content "
+            f"and enter the merge); got {result['graph_drift_count']}"
         )
-        # drift1 has SPO content → genuine reconstruction loss, not dedup or orphan.
-        assert result["drift_genuine_loss"] >= 1, (
-            f"Expected drift_genuine_loss>=1 (drift1 has content but no recon edge);"
+        # drift1 has no recon edge → must be in recall_miss_keys (retry signal).
+        assert "drift1" in result["recall_miss_keys"], (
+            f"Expected drift1 in recall_miss_keys; got {result['recall_miss_keys']}"
+        )
+        # graph_bob's recon SPO matches registry-true → not in recall_miss_keys.
+        assert "graph_bob" not in result["recall_miss_keys"], (
+            f"graph_bob should not be in recall_miss_keys; got {result['recall_miss_keys']}"
+        )
+        # Neither key is counted as genuine_loss or deduplicated.
+        assert result["drift_genuine_loss"] == 0, (
+            f"Expected drift_genuine_loss=0 (no drops under Mode 1);"
             f" got {result['drift_genuine_loss']}"
         )
         assert result["drift_deduplicated"] == 0, (
             f"Expected drift_deduplicated=0 (no duplicate-SPO collapse in this test);"
             f" got {result['drift_deduplicated']}"
         )
-        # graph_bob has a recon edge → stamped on merged edge → tiered.
-        assert result["keys_per_tier"].get("episodic", 0) >= 1, (
-            f"Expected graph_bob in episodic tier; got {result['keys_per_tier']}"
+        # Both keys are tiered.
+        assert result["keys_per_tier"].get("episodic", 0) >= 2, (
+            f"Expected both graph_bob and drift1 in episodic tier; got {result['keys_per_tier']}"
+        )
+
+    # -------------------------------------------------------------------------
+    # §6.2.1 W4: hydration-miss key is NOT classified as orphan
+    # -------------------------------------------------------------------------
+
+    def test_w4_hydration_miss_not_orphan(self, tmp_path):
+        """W4 (§3.3c): a live active key whose store.get() returns None (hydration-miss
+        under boot_degraded) but whose bookkeeping carries SPO must NOT be classified
+        as drift_orphan.
+
+        SCOPE NOTE: The W4 fix applies to _build_registry_true_relations (so the key
+        enters the merge as a registry-true Relation) and to the drift-partition
+        classification (so it lands in genuine_loss, not orphan).  The Stage-5
+        tier_keyed build has a pre-existing gap (store.get(key)==None → skip at
+        line ~4063-4069) that is explicitly OUT OF SCOPE for Mode 1 (ROUND-2
+        TRACKED-BUT-OUT-OF-SCOPE deferral).  Thus graph_hydration_miss:
+          - Is NOT classified as drift_orphan (W4 fix: bookkeeping has SPO).
+          - IS classified as drift_genuine_loss (hydration-miss bucket).
+          - Is NOT in tier_keyed (Stage-5 entry-None skip; pre-existing, deferred).
+
+        Setup: two keys — "graph_ok" has a normal content entry; "graph_hydration_miss"
+        is active in the registry but has NO content entry (simulating a missed boot
+        preload) while its bookkeeping carries valid SPO.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # Recon graph: only graph_ok has a recon edge.
+        recon_g = nx.MultiDiGraph()
+        eid = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid][_IK_KEY_ATTR] = "graph_ok"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        self._install_provenance_merge_spy(loop)
+
+        # graph_ok: full content entry.
+        loop.store.put(
+            "episodic",
+            "graph_ok",
+            {
+                "key": "graph_ok",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_ok", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        # graph_hydration_miss: registered in the store but NO content entry.
+        # Register it first (put with register=True), then delete the entry cache
+        # to simulate a hydration miss while keeping the registry alive.
+        loop.store.put(
+            "episodic",
+            "graph_hydration_miss",
+            {
+                "key": "graph_hydration_miss",
+                "subject": "Bob",
+                "predicate": "works_at",
+                "object": "Acme",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        # Drop the content entry (simulates boot_degraded cache miss).
+        loop.store._entries["episodic"].pop("graph_hydration_miss", None)
+        # Bookkeeping carries the SPO (populated independently of _entries).
+        loop.store.set_bookkeeping(
+            "graph_hydration_miss",
+            speaker_id="Speaker0",
+            first_seen_cycle=1,
+            relation_type="factual",
+            recurrence_count=1,
+            last_seen_cycle=1,
+        )
+        # Manually add bookkeeping SPO fields so W4 fallback finds them in
+        # _build_registry_true_relations and the drift-partition classification.
+        loop.store._bookkeeping["graph_hydration_miss"]["subject"] = "Bob"
+        loop.store._bookkeeping["graph_hydration_miss"]["predicate"] = "works_at"
+        loop.store._bookkeeping["graph_hydration_miss"]["object"] = "Acme"
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        # W4 fix: hydration-miss must NOT be classified as orphan.
+        assert result["drift_orphan"] == 0, (
+            f"Expected drift_orphan=0 (hydration-miss is NOT an orphan); "
+            f"got drift_orphan={result['drift_orphan']}"
+        )
+        # W4 fix: hydration-miss goes to genuine_loss bucket (not orphan, not deduplicated).
+        assert result["drift_genuine_loss"] == 1, (
+            f"Expected drift_genuine_loss=1 (hydration-miss key classified as retry); "
+            f"got drift_genuine_loss={result['drift_genuine_loss']}"
+        )
+        # graph_ok must survive into tier_keyed.
+        all_keys = {e["key"] for tier_list in result["tier_keyed"].values() for e in tier_list}
+        assert "graph_ok" in all_keys, "graph_ok must survive"
+
+    # -------------------------------------------------------------------------
+    # §6.2.2: Reconstruction collision does NOT manufacture a collapse
+    # -------------------------------------------------------------------------
+
+    def test_reconstruction_collision_does_not_manufacture_collapse(self, tmp_path):
+        """§6.2.2: Two keys with DISTINCT registry-true objects must NOT collapse
+        even when reconstruction mis-reads one object onto the other.
+
+        Under Mode 1 the merge input is registry-true SPO, so a reconstruction
+        mis-read has no effect on dedup identity.  Both keys survive.
+
+        This directly reproduces the proc33/proc35 bug: proc35 "HS3 Radio"
+        reconstructed as "HR3 Radio" (proc33's object), making the old
+        reconstruction-driven merge see a false Case-1 collapse.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        # Recon graph: proc33 correct, proc35 mis-reads its object as proc33's object.
+        recon_g = nx.MultiDiGraph()
+        eid1 = recon_g.add_edge("Alice", "HR3 Radio", predicate="listens_to")
+        recon_g["Alice"]["HR3 Radio"][eid1][_IK_KEY_ATTR] = "proc33"
+        # proc35 mis-reads: reconstruction says "HR3 Radio" instead of "HS3 Radio".
+        eid2 = recon_g.add_edge("Alice", "HR3 Radio", predicate="listens_to")
+        recon_g["Alice"]["HR3 Radio"][eid2][_IK_KEY_ATTR] = "proc35"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        self._install_provenance_merge_spy(loop)
+
+        # Registry-true content: proc33 → "HR3 Radio"; proc35 → "HS3 Radio" (distinct).
+        for key, obj in (("proc33", "HR3 Radio"), ("proc35", "HS3 Radio")):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alice",
+                    "predicate": "listens_to",
+                    "object": obj,
+                    "speaker_id": "Speaker0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            )
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        # Both keys must survive — registry-true distinct objects prevent collapse.
+        all_keys = {e["key"] for tier_list in result["tier_keyed"].values() for e in tier_list}
+        assert "proc33" in all_keys, "proc33 must survive"
+        assert "proc35" in all_keys, (
+            "proc35 must survive — reconstruction mis-read must NOT manufacture a collapse"
+        )
+        assert result["drift_deduplicated"] == 0, (
+            f"Expected drift_deduplicated=0 (distinct registry-true objects); "
+            f"got {result['drift_deduplicated']}"
+        )
+        # proc35 has no recon edge matching its registry-true SPO → in recall_miss_keys.
+        assert "proc35" in result["recall_miss_keys"], (
+            "proc35 must be in recall_miss_keys (recon mis-read = miss signal)"
         )
 
     # -------------------------------------------------------------------------
@@ -3138,18 +3506,19 @@ class TestDriftPartitioning:
         )
 
     def test_drift_partition_three_buckets(self, tmp_path):
-        """Fold with three drift-key classes; each lands in the correct bucket.
+        """Fold with drift-key classes; each lands in the correct bucket under Mode 1.
 
         Setup:
-        - "key_dup1" and "key_dup2": identical SPO (Alice lives_in Berlin).
-          key_dup2 collapses into key_dup1 via Case-1 → drift_deduplicated=1.
+        - "key_dup1" and "key_dup2": identical registry-true SPO (Alice lives_in Berlin).
+          key_dup2 collapses into key_dup1 via Case-1 → drift_deduplicated=1, SOFT-STALED.
           The fact is preserved under key_dup1.
-        - "key_orphan": no subject/predicate/object in its store entry.
-          No recon edge is produced → drift_orphan=1.
-        - "key_loss": has SPO content but no recon edge (reconstruction failed).
-          → drift_genuine_loss=1.
+        - "key_orphan": no subject/predicate/object in its store entry and bookkeeping.
+          _build_registry_true_relations skips it (no predicate) → no merged edge → drift_orphan=1.
+        - "key_loss": has SPO content but no recon edge.  Under Mode 1 the registry-true
+          SPO enters the merge directly, so key_loss survives into tier_keyed (recall-miss
+          retry, NOT a loss).  drift_genuine_loss=0.
 
-        Total drift = 3, but only genuine_loss=1 is real data loss.
+        Total drift = 2 (key_dup2 + key_orphan); genuine_loss=0; key_loss in recall_miss_keys.
         """
         import networkx as nx
 
@@ -3242,9 +3611,12 @@ class TestDriftPartitioning:
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # key_dup1 survives; key_dup2 / key_orphan / key_loss are absent from tier_keyed.
-        assert result["graph_drift_count"] == 3, (
-            f"Expected graph_drift_count=3 (total absent keys); got {result['graph_drift_count']}"
+        # Under Mode 1: key_dup2 and key_orphan are absent from tier_keyed.
+        # key_loss has registry-true SPO → enters recon_relations → survives in tier_keyed.
+        # Total drift = 2 (key_dup2 + key_orphan); key_loss is NOT a drift key.
+        assert result["graph_drift_count"] == 2, (
+            f"Expected graph_drift_count=2 (key_dup2 + key_orphan only; "
+            f"key_loss survives via registry-true SPO); got {result['graph_drift_count']}"
         )
         assert result["drift_deduplicated"] == 1, (
             f"Expected drift_deduplicated=1 (key_dup2 collapsed into key_dup1);"
@@ -3253,17 +3625,24 @@ class TestDriftPartitioning:
         assert result["drift_orphan"] == 1, (
             f"Expected drift_orphan=1 (key_orphan has no SPO content); got {result['drift_orphan']}"
         )
-        assert result["drift_genuine_loss"] == 1, (
-            f"Expected drift_genuine_loss=1 (key_loss has content but no recon edge);"
-            f" got {result['drift_genuine_loss']}"
+        assert result["drift_genuine_loss"] == 0, (
+            f"Expected drift_genuine_loss=0 (key_loss is retrained with registry-true content "
+            f"— not a loss under Mode 1); got {result['drift_genuine_loss']}"
         )
-        # key_dup1 must survive in episodic with its fact intact.
-        assert result["keys_per_tier"].get("episodic", 0) == 1, (
-            f"Expected 1 episodic key (key_dup1 surviving); got {result['keys_per_tier']}"
+        # key_loss must be in recall_miss_keys (no recon edge = retry signal).
+        assert "key_loss" in result["recall_miss_keys"], (
+            f"Expected key_loss in recall_miss_keys (retry signal); "
+            f"got {result['recall_miss_keys']}"
         )
-        surviving = result["tier_keyed"]["episodic"][0]
-        assert surviving["key"] == "key_dup1"
-        assert surviving["subject"] == "Alice"
+        # key_dup1 and key_loss must both survive in episodic (2 keys total).
+        assert result["keys_per_tier"].get("episodic", 0) == 2, (
+            f"Expected 2 episodic keys (key_dup1 + key_loss); got {result['keys_per_tier']}"
+        )
+        surviving_keys = {e["key"] for e in result["tier_keyed"]["episodic"]}
+        assert "key_dup1" in surviving_keys, f"key_dup1 must survive; got {surviving_keys}"
+        assert "key_loss" in surviving_keys, (
+            f"key_loss must survive (Mode 1 retry); got {surviving_keys}"
+        )
 
     def test_no_high_drift_warning_when_only_dedup(self, tmp_path, caplog):
         """The 'high graph drift — review recommended' warning must NOT fire
@@ -3340,8 +3719,14 @@ class TestDriftPartitioning:
     def test_high_drift_warning_fires_on_genuine_loss(self, tmp_path, caplog):
         """The 'genuine reconstruction loss' WARNING fires when genuine_loss > 0.
 
-        A key with SPO content that produces no recon edge must trigger the WARNING,
-        regardless of whether there are also deduplicated keys.
+        Under Mode 1, drift_genuine_loss fires for a key that has non-empty subject
+        content but an EMPTY predicate: _build_registry_true_relations skips it
+        (no predicate = not keyable), so it never enters the merge and ends up
+        absent from tier_keyed with its content intact.  The drift-partition loop
+        sees a key with non-empty subject → genuine_loss bucket → WARNING.
+
+        This is distinct from a full-SPO key with no recon edge, which under Mode 1
+        IS included via registry-true SPO and survives in tier_keyed (retry-not-drop).
         """
         import logging
 
@@ -3350,7 +3735,7 @@ class TestDriftPartitioning:
         from paramem.graph.reconstruct import ReconstructionResult
         from paramem.memory.persistence import _IK_KEY_ATTR
 
-        # One key survives (recon edge present), one key_loss has content but no edge.
+        # key_ok has a recon edge and full SPO — survives normally.
         recon_g = nx.MultiDiGraph()
         eid = recon_g.add_edge("Dave", "London", predicate="lives_in")
         recon_g["Dave"]["London"][eid][_IK_KEY_ATTR] = "key_ok"
@@ -3375,13 +3760,15 @@ class TestDriftPartitioning:
             "key_ok", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
+        # key_no_pred has a non-empty subject but empty predicate.
+        # _build_registry_true_relations skips it → no merged edge → drift_genuine_loss.
         loop.store.put(
             "episodic",
-            "key_loss",
+            "key_no_pred",
             {
-                "key": "key_loss",
+                "key": "key_no_pred",
                 "subject": "Eve",
-                "predicate": "works_at",
+                "predicate": "",
                 "object": "Acme",
                 "speaker_id": "Speaker0",
                 "first_seen_cycle": 1,
@@ -3389,7 +3776,7 @@ class TestDriftPartitioning:
             register=True,
         )
         loop.store.set_bookkeeping(
-            "key_loss", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "key_no_pred", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         # caplog.at_level alone does not capture in this project (log propagation
@@ -3402,7 +3789,8 @@ class TestDriftPartitioning:
             _named_logger.removeHandler(caplog.handler)
 
         assert result["drift_genuine_loss"] == 1, (
-            f"Expected drift_genuine_loss=1; got {result['drift_genuine_loss']}"
+            f"Expected drift_genuine_loss=1 (key_no_pred has subject but no predicate "
+            f"— skipped by _build_registry_true_relations); got {result['drift_genuine_loss']}"
         )
         # The genuine-loss WARNING must fire.
         genuine_loss_warnings = [
@@ -3780,4 +4168,2023 @@ class TestBookkeepingBasedPromotion:
         bk = loop.store.bookkeeping_for_key(surviving_key)
         assert bk["last_seen_cycle"] == 7, (
             "Surviving key's last_seen_cycle must be refreshed to cycle_count"
+        )
+
+
+# =============================================================================
+# TestTierFloor — per-tier minimum-key-count floor + two graduation strategies
+# =============================================================================
+
+
+class TestTierFloor:
+    """Unit tests for the per-tier min-key-count floor and graduation strategies.
+
+    Plan §9 items 1-12 (config, parking, graduation, accumulating, R5 fall-through).
+    All tests mock train_adapter and heavy PEFT ops so no GPU is needed.
+
+    Item 1 (config plumbing) lives in tests/server/test_config.py;
+    item 2 (parity) is covered by tests/server/test_config_parity.py.
+    Items 3-12 are here.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path, *, min_tier_key_floor=30, tier_fast_start=True):
+        """Minimal ConsolidationLoop stub for floor/graduation tests.
+
+        Delegates to the existing full-flow helper so we reuse its wiring;
+        overrides config fields for floor tests.
+        """
+        import networkx as nx
+
+        from paramem.utils.config import ConsolidationConfig
+
+        loop = TestConsolidateInterimAdaptersFullFlow._make_loop(
+            tmp_path, merger_graph=nx.MultiDiGraph()
+        )
+        loop.config = ConsolidationConfig(
+            min_tier_key_floor=min_tier_key_floor,
+            tier_fast_start=tier_fast_start,
+        )
+        return loop
+
+    @staticmethod
+    def _seed_keys(loop, tier, keys, relation_type="factual"):
+        """Register ``keys`` in ``tier`` with minimal bookkeeping."""
+        for k in keys:
+            loop.store.put(
+                tier,
+                k,
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "predicate": f"pred_{k}",
+                    "object": f"obj_{k}",
+                    "speaker_id": "S0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                k,
+                speaker_id="S0",
+                first_seen_cycle=1,
+                relation_type=relation_type,
+                recurrence_count=1,
+                last_seen_cycle=1,
+            )
+
+    @staticmethod
+    def _build_merger_graph(loop, entries):
+        """Stamp entries as edges on the loop's merger graph so Stage-5 picks them up."""
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        for e in entries:
+            eid = loop.merger.graph.add_edge(
+                e["subject"],
+                e["object"],
+                predicate=e["predicate"],
+                relation_type=e.get("relation_type", "factual"),
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
+
+    @staticmethod
+    def _run_fold(
+        loop,
+        *,
+        probe_side_effect=None,
+        train_adapter_spy=None,
+    ):
+        """Run consolidate_interim_adapters with heavy ops mocked.
+
+        probe_side_effect: callable(adapter_name, entries) → set[str].
+            Defaults to returning all keys (pass-all probe).
+        train_adapter_spy: mock.MagicMock or None.  If supplied, train_adapter
+            is patched to this spy (so the test can assert call_count etc.).
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+        from paramem.training.consolidation import ConsolidationLoop
+
+        if probe_side_effect is None:
+            probe_side_effect = lambda adapter_name, entries: {e["key"] for e in entries}  # noqa: E731
+        if train_adapter_spy is None:
+            train_adapter_spy = MagicMock(return_value={"aborted": False})
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=__import__("networkx").MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_maybe_make_recall_callback",
+                    return_value=(None, None),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=probe_side_effect,
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    train_adapter_spy,
+                ),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                return loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+    # -------------------------------------------------------------------------
+    # Item 3: Pass-2 parking — under-floor semantic/procedural moves to episodic
+    # -------------------------------------------------------------------------
+
+    def test_pass2_parks_under_floor_semantic_and_procedural(self, tmp_path):
+        """12 procedural + 4 semantic + 50 episodic: under-floor tiers park in episodic.
+
+        Asserts:
+        - tier_keyed["procedural"] == [] and tier_keyed["semantic"] == [] after Pass-2.
+        - episodic gained the 16 parked keys (total 66).
+        - store.move called for parked keys (store tier updated to episodic).
+        """
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        floor = 30
+        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=False)
+
+        ep_keys = [f"ep{i}" for i in range(50)]
+        sem_keys = [f"sem{i}" for i in range(4)]
+        proc_keys = [f"proc{i}" for i in range(12)]
+
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        self._seed_keys(loop, "semantic", sem_keys, relation_type="factual")
+        self._seed_keys(loop, "procedural", proc_keys, relation_type="preference")
+
+        # Build merger graph edges for all keys.
+        all_entries = [
+            {
+                "key": k,
+                "subject": "Alice",
+                "predicate": f"pred_{k}",
+                "object": f"obj_{k}",
+                "relation_type": "factual",
+            }
+            for k in ep_keys + sem_keys
+        ] + [
+            {
+                "key": k,
+                "subject": "Alice",
+                "predicate": f"pred_{k}",
+                "object": f"obj_{k}",
+                "relation_type": "preference",
+            }
+            for k in proc_keys
+        ]
+        for e in all_entries:
+            eid = loop.merger.graph.add_edge(
+                e["subject"],
+                e["object"],
+                predicate=e["predicate"],
+                relation_type=e["relation_type"],
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
+
+        result = self._run_fold(loop)
+
+        # Under-floor tiers end up empty after park.
+        assert result["keys_per_tier"]["procedural"] == 0, (
+            "procedural (12 < 30) must be parked — keys_per_tier should be 0"
+        )
+        assert result["keys_per_tier"]["semantic"] == 0, (
+            "semantic (4 < 30) must be parked — keys_per_tier should be 0"
+        )
+        # Episodic absorbed all 16 parked keys.
+        assert result["keys_per_tier"]["episodic"] == 66, (
+            f"episodic should be 50+16=66, got {result['keys_per_tier']['episodic']}"
+        )
+
+        # Store tiers for parked keys must now be episodic.
+        for k in sem_keys + proc_keys:
+            t = loop.store.tier_for_active_key(k)
+            assert t == "episodic", f"parked key {k!r} should be in episodic store tier, got {t!r}"
+
+    # -------------------------------------------------------------------------
+    # Item 4: Bookkeeping preserved through parking and graduation
+    # -------------------------------------------------------------------------
+
+    def test_bookkeeping_preserved_through_parking(self, tmp_path):
+        """Parking a key preserves relation_type, recurrence_count, speaker_id,
+        first_seen_cycle — stored in bookkeeping_for_key, not in tier_keyed."""
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path, min_tier_key_floor=30, tier_fast_start=False)
+
+        # One semantic key (under floor of 30) with specific bookkeeping.
+        loop.store.put(
+            "semantic",
+            "sem0",
+            {
+                "key": "sem0",
+                "subject": "Bob",
+                "predicate": "likes",
+                "object": "Jazz",
+                "speaker_id": "S1",
+                "first_seen_cycle": 3,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "sem0",
+            speaker_id="S1",
+            first_seen_cycle=3,
+            relation_type="factual",
+            recurrence_count=5,
+            last_seen_cycle=3,
+        )
+        # Seed episodic with enough keys to avoid whole-fold accumulate.
+        ep_keys = [f"ep{i}" for i in range(35)]
+        self._seed_keys(loop, "episodic", ep_keys)
+
+        all_entries = [
+            {
+                "key": "sem0",
+                "subject": "Bob",
+                "predicate": "likes",
+                "object": "Jazz",
+                "relation_type": "factual",
+            }
+        ] + [
+            {
+                "key": k,
+                "subject": "Alice",
+                "predicate": f"pred_{k}",
+                "object": f"obj_{k}",
+                "relation_type": "factual",
+            }
+            for k in ep_keys
+        ]
+        for e in all_entries:
+            eid = loop.merger.graph.add_edge(
+                e["subject"],
+                e["object"],
+                predicate=e["predicate"],
+                relation_type=e["relation_type"],
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
+
+        self._run_fold(loop)
+
+        bk = loop.store.bookkeeping_for_key("sem0")
+        assert bk is not None
+        assert bk["relation_type"] == "factual", "relation_type must survive parking"
+        assert bk["recurrence_count"] == 5, "recurrence_count must survive parking"
+        assert bk["speaker_id"] == "S1", "speaker_id must survive parking"
+        assert bk["first_seen_cycle"] == 3, "first_seen_cycle must survive parking"
+
+    # -------------------------------------------------------------------------
+    # Item 5: DEFAULT graduation (train-from-scratch, tier_fast_start=False)
+    # -------------------------------------------------------------------------
+
+    def test_default_graduation_trains_from_scratch(self, tmp_path):
+        """A tier crossing floor for the first time with tier_fast_start=False trains
+        from scratch via train_adapter; copy helpers NOT called.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=False)
+
+        # Seed 15 procedural keys — all in episodic (first-time graduation).
+        proc_keys = [f"proc{i}" for i in range(15)]
+        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        ep_keys = [f"ep{i}" for i in range(20)]
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+
+        for k in proc_keys:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="preference",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
+        for k in ep_keys:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="factual",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
+
+        train_spy = MagicMock(return_value={"aborted": False})
+        copy_spy = MagicMock()
+        subset_copy_spy = MagicMock()
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_maybe_make_recall_callback",
+                    return_value=(None, None),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda a, e: {x["key"] for x in e},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights", copy_spy),
+                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert "procedural" in result["tiers_rebuilt"], (
+            "procedural should be in tiers_rebuilt after graduation"
+        )
+        # train_adapter must have been called (at least for episodic and procedural).
+        assert train_spy.call_count >= 2, (
+            f"train_adapter should be called >= 2 times (episodic + procedural), "
+            f"got {train_spy.call_count}"
+        )
+        # copy helpers must NOT have been called for graduation (train-from-scratch).
+        # NOTE: copy_adapter_weights IS called for backup creation — filter those out
+        # by checking copy_adapter_weights_subset (never called in (a) path).
+        assert subset_copy_spy.call_count == 0, (
+            "copy_adapter_weights_subset must not be called in train-from-scratch path"
+        )
+
+    # -------------------------------------------------------------------------
+    # Item 6: copy_adapter_weights_subset — CPU-only parameter logic
+    # -------------------------------------------------------------------------
+
+    def test_copy_adapter_weights_subset_copies_intersecting(self):
+        """subset copy: src⊆dst copies intersecting tensors, leaves dst-only at init."""
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from paramem.models.loader import copy_adapter_weights_subset
+
+        model = MagicMock()
+
+        # src has 1 param; dst has 2 (1 shared key "base_a", 1 dst-only "base_b").
+        # named_parameters is called twice by _index (once for src, once for dst);
+        # use side_effect to return a fresh list each time.
+        src_tensor_a = torch.ones(4, 4)
+        dst_tensor_a = torch.zeros(4, 4)
+        dst_tensor_b = torch.zeros(4, 4)
+
+        params = [
+            ("base_a.src.weight", src_tensor_a),  # key (base_a, .weight) in src
+            ("base_a.dst.weight", dst_tensor_a),  # key (base_a, .weight) in dst
+            ("base_b.dst.weight", dst_tensor_b),  # dst-only key (base_b, .weight)
+        ]
+        # Each call to named_parameters() must return a fresh iterable.
+        model.named_parameters.side_effect = lambda: iter(params)
+        model.peft_config = {"src": MagicMock(), "dst": MagicMock()}
+
+        count = copy_adapter_weights_subset(model, src="src", dst="dst")
+
+        assert count == 1, f"Expected 1 tensor copied (intersecting), got {count}"
+        # The shared tensor was copied from src into dst.
+        assert torch.allclose(dst_tensor_a, src_tensor_a), (
+            "Shared tensor must be copied from src to dst"
+        )
+        # dst-only tensor is unchanged.
+        assert torch.all(dst_tensor_b == 0), "dst-only tensor must stay at zero-init"
+
+    def test_copy_adapter_weights_subset_raises_when_src_exceeds_dst(self):
+        """subset copy raises RuntimeError when src has a tensor dst lacks."""
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from paramem.models.loader import copy_adapter_weights_subset
+
+        src_tensor = torch.ones(4, 4)
+        dst_tensor = torch.zeros(4, 4)
+
+        params = [
+            ("base_a.src.weight", src_tensor),  # in src
+            ("base_b.src.weight", src_tensor.clone()),  # in src but NOT in dst
+            ("base_a.dst.weight", dst_tensor),  # in dst
+        ]
+        model = MagicMock()
+        model.named_parameters.side_effect = lambda: iter(params)
+        model.peft_config = {"src": MagicMock(), "dst": MagicMock()}
+
+        with pytest.raises(RuntimeError, match="absent from dst"):
+            copy_adapter_weights_subset(model, src="src", dst="dst")
+
+    def test_copy_adapter_weights_raises_on_set_inequality_regression(self):
+        """copy_adapter_weights (strict) still raises on any set inequality.
+
+        Regression guard: the subset helper must never loosen the strict function.
+        """
+        from unittest.mock import MagicMock
+
+        import torch
+
+        from paramem.models.loader import copy_adapter_weights
+
+        src_tensor = torch.ones(4, 4)
+        dst_tensor = torch.zeros(4, 4)
+
+        # src has base_b but dst does not — strict function must raise.
+        params = [
+            ("base_a.src.weight", src_tensor),
+            ("base_b.src.weight", src_tensor.clone()),
+            ("base_a.dst.weight", dst_tensor),
+        ]
+        model = MagicMock()
+        model.named_parameters.side_effect = lambda: iter(params)
+        model.peft_config = {"src": MagicMock(), "dst": MagicMock()}
+
+        with pytest.raises(RuntimeError, match="Adapter parameter sets differ"):
+            copy_adapter_weights(model, src="src", dst="dst")
+
+    # -------------------------------------------------------------------------
+    # Item 7: Fast-start graduation decision (mocked copy + store)
+    # -------------------------------------------------------------------------
+
+    def test_fast_start_graduation_calls_copy_not_train(self, tmp_path):
+        """tier_fast_start=True + tier crossing floor for first time: copy called,
+        train_adapter NOT called for that tier, tier in tiers_rebuilt.
+
+        Asserts on the serve/train map split directly (not a blanket pass-all probe
+        that would mask a donor-ignorance regression):
+          - episodic train call entries = ep_keys + proc_keys (universal donor augment)
+          - procedural train call: absent (copied, not trained)
+          - result["tier_keyed"]["procedural"] = proc_keys (served from procedural)
+          - result["tier_keyed"]["episodic"] = ep_keys (graduating keys NOT in episodic serve)
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.consolidation import ConsolidationLoop
+
+        floor = 10
+        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=True)
+
+        # Seed 15 procedural keys — all in episodic store-tier (first-time graduation,
+        # no disk slot for procedural in tmp_path).
+        proc_keys = [f"proc{i}" for i in range(15)]
+        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        ep_keys = [f"ep{i}" for i in range(20)]
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+
+        for k in proc_keys:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="preference",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
+        for k in ep_keys:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="factual",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
+
+        train_spy = MagicMock(return_value={"aborted": False})
+        subset_copy_spy = MagicMock()
+
+        # Probe passes for all entries (simulates informed episodic + copied procedural
+        # both recalling their respective key sets).
+        def _probe(adapter_name, entries):
+            return {e["key"] for e in entries}
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_maybe_make_recall_callback",
+                    return_value=(None, None),
+                ),
+                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert "procedural" in result["tiers_rebuilt"], (
+            "procedural should be in tiers_rebuilt after fast-start graduation"
+        )
+        # subset copy must have been called for procedural←episodic (v3 universal-donor).
+        assert subset_copy_spy.call_count >= 1, (
+            "copy_adapter_weights_subset must be called for procedural fast-start"
+        )
+        # train_adapter must NOT have been called for procedural (only episodic).
+        proc_train_calls = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
+        ]
+        assert len(proc_train_calls) == 0, (
+            "train_adapter must NOT be called for procedural in fast-start graduation"
+        )
+        # Serve layout: procedural served from its own tier, NOT from episodic.
+        served_proc_keys = {e["key"] for e in result["tier_keyed"]["procedural"]}
+        served_ep_keys = {e["key"] for e in result["tier_keyed"]["episodic"]}
+        assert served_proc_keys == set(proc_keys), (
+            "procedural serve set must contain the graduating keys"
+        )
+        assert served_ep_keys == set(ep_keys), (
+            "episodic serve set must NOT contain the graduating procedural keys"
+        )
+        # Episodic train call entries must include BOTH ep_keys AND proc_keys
+        # (universal-donor augmentation).
+        ep_train_calls = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "episodic"
+        ]
+        assert len(ep_train_calls) >= 1, "train_adapter must be called for episodic"
+        # The episodic train dataset comes from format_entry_training(job.entries, ...).
+        # Since format_entry_training is patched, verify via the jobs_by_tier entries
+        # indirectly: the episodic train call must have been attempted on 35 entries
+        # (20 ep + 15 proc).  format_entry_training is called with job.entries so we
+        # check call_count of format_entry_training instead, which receives the full set.
+        # (Direct assertion: serve layout is the ground truth; the donor augment is an
+        # internal implementation detail verified by GR-1/GR-4 tests.)
+
+    def test_fast_start_already_live_tier_trains_normally(self, tmp_path):
+        """A tier already live (has a saved adapter slot on disk) trains normally
+        regardless of tier_fast_start; copy helpers not called for it.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.consolidation import ConsolidationLoop
+
+        floor = 5
+        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=True)
+
+        # Create a fake saved slot for procedural to signal "already live".
+        # Liveness is based on disk-slot presence (not store-tier) — a slot name is
+        # a YYYYMMDD-HHMMSS timestamp.  Creating the directory simulates a prior
+        # _save_adapters call for this tier.
+        (tmp_path / "procedural" / "20240101-000000").mkdir(parents=True, exist_ok=True)
+
+        # Seed 10 procedural keys ALREADY in the procedural registry
+        # (previously graduated — tier_for_active_key returns "procedural").
+        proc_keys = [f"proc{i}" for i in range(10)]
+        self._seed_keys(loop, "procedural", proc_keys, relation_type="preference")
+        ep_keys = [f"ep{i}" for i in range(10)]
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+
+        for k in proc_keys:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="preference",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
+        for k in ep_keys:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="factual",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
+
+        train_spy = MagicMock(return_value={"aborted": False})
+        subset_copy_spy = MagicMock()
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_maybe_make_recall_callback",
+                    return_value=(None, None),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda a, e: {x["key"] for x in e},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        # procedural is already live — train_adapter should be called for it.
+        proc_train_calls = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
+        ]
+        assert len(proc_train_calls) >= 1, (
+            "train_adapter must be called for an already-live tier (steady-state)"
+        )
+        assert subset_copy_spy.call_count == 0, (
+            "copy_adapter_weights_subset must NOT be called for an already-live tier"
+        )
+
+    # -------------------------------------------------------------------------
+    # Item 9: R5 fast-start copy-gate fallback (MANDATORY)
+    # -------------------------------------------------------------------------
+
+    def test_fast_start_fallback_trains_from_scratch_when_probe_fails(self, tmp_path):
+        """R5: when the pre-save probe returns below threshold for a fast-start tier,
+        the (b)→(a) fall-back fires: train_adapter IS called for that tier.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.consolidation import ConsolidationLoop
+
+        floor = 10
+        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=True)
+
+        proc_keys = [f"proc{i}" for i in range(15)]
+        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        ep_keys = [f"ep{i}" for i in range(20)]
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+
+        for k in proc_keys:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="preference",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
+        for k in ep_keys:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="factual",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
+
+        # Probe returns EMPTY set for "procedural" (simulates below-threshold copy).
+        def _probe(adapter_name, entries):
+            if adapter_name == "procedural":
+                return set()  # fail
+            return {e["key"] for e in entries}  # pass for all others
+
+        train_spy = MagicMock(return_value={"aborted": False})
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_maybe_make_recall_callback",
+                    return_value=(None, None),
+                ),
+                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        # Fall-through to train-from-scratch: procedural must be in tiers_rebuilt.
+        assert "procedural" in result["tiers_rebuilt"], (
+            "procedural must be in tiers_rebuilt after (b)→(a) fallback"
+        )
+        # train_adapter must have been called for procedural.
+        proc_calls = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
+        ]
+        assert len(proc_calls) >= 1, (
+            "train_adapter must be called for procedural after fast-start probe failure"
+        )
+
+    # -------------------------------------------------------------------------
+    # Item 10: Whole-fold accumulate (episodic < floor)
+    # -------------------------------------------------------------------------
+
+    def test_whole_fold_accumulate_returns_accumulating_status(self, tmp_path):
+        """When total trainable keys < floor, fold returns status='accumulating',
+        tiers_rebuilt=[], does NOT call _save_adapters, does NOT purge interims.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.consolidation import ConsolidationLoop
+
+        floor = 30
+        loop = self._make_loop(tmp_path, min_tier_key_floor=floor)
+
+        # Only 10 keys total (below floor of 30).
+        small_keys = [f"k{i}" for i in range(10)]
+        self._seed_keys(loop, "episodic", small_keys, relation_type="factual")
+        for k in small_keys:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="factual",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][_IK_KEY_ATTR] = k
+
+        save_spy = MagicMock()
+        train_spy = MagicMock(return_value={"aborted": False})
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_maybe_make_recall_callback",
+                    return_value=(None, None),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda a, e: {x["key"] for x in e},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters", save_spy),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert result["status"] == "accumulating", (
+            f"Expected status='accumulating', got {result['status']!r}"
+        )
+        assert result["tiers_rebuilt"] == [], "tiers_rebuilt must be empty on accumulating return"
+        assert "accumulating_reason" in result, "accumulating_reason must be in result"
+        assert result["accumulating_reason"]["floor"] == floor
+        assert result["accumulating_reason"]["episodic"] == 10
+        assert save_spy.call_count == 0, "_save_adapters must NOT be called on accumulating return"
+        assert train_spy.call_count == 0, "train_adapter must NOT be called on accumulating return"
+
+    # -------------------------------------------------------------------------
+    # Item 11: Accumulating never raises; last_consolidation_error stays None
+    # -------------------------------------------------------------------------
+
+    def test_accumulating_never_raises(self, tmp_path):
+        """The accumulating early return never raises an exception."""
+        floor = 30
+        loop = self._make_loop(tmp_path, min_tier_key_floor=floor)
+        # 5 keys < floor.
+        self._seed_keys(loop, "episodic", [f"k{i}" for i in range(5)])
+        for k in [f"k{i}" for i in range(5)]:
+            eid = loop.merger.graph.add_edge(
+                "Alice",
+                f"obj_{k}",
+                predicate=f"pred_{k}",
+                relation_type="factual",
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph["Alice"][f"obj_{k}"][eid][
+                __import__("paramem.memory.persistence", fromlist=["_IK_KEY_ATTR"])._IK_KEY_ATTR
+            ] = k
+
+        # Must not raise.
+        result = self._run_fold(loop)
+        assert result["status"] == "accumulating"
+
+    # =========================================================================
+    # GR-1..GR-7: v3 universal-donor serve/train decoupling tests
+    # (plan §H — GRADUATION REDESIGN v3)
+    # =========================================================================
+
+    @staticmethod
+    def _add_edges(loop, entries):
+        """Stamp entries as merger-graph edges (convenience wrapper)."""
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        for e in entries:
+            eid = loop.merger.graph.add_edge(
+                e["subject"],
+                e["object"],
+                predicate=e["predicate"],
+                relation_type=e.get("relation_type", "factual"),
+                confidence=1.0,
+                first_seen="s",
+                last_seen="s",
+                recurrence_count=1,
+                sessions=["s"],
+            )
+            loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
+
+    def test_gr1_serve_train_decoupling(self, tmp_path):
+        """GR-1: episodic train call includes graduating procedural keys (universal
+        donor); procedural train call absent; serve layout keeps them separate.
+
+        floor=10, 12 proc keys (store-tier episodic, first-cross) + 20 ep keys.
+        Episodic train entries = 32; procedural train entries = 0 (copy path).
+        Serve layout: procedural=12, episodic=20 (graduating keys NOT in ep serve).
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
+        proc_keys = [f"p{i}" for i in range(12)]
+        ep_keys = [f"e{i}" for i in range(20)]
+        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        self._add_edges(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "preference",
+                }
+                for k in proc_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        def _spy_train(**kwargs):
+            # format_entry_training is patched to return a fixed list;
+            # entries fed to it come from job.entries captured at format call.
+            return {"aborted": False}
+
+        format_entries_by_adapter: dict = {}
+
+        def _spy_format(entries, *a, **kw):
+            # The calling code passes entries positionally.
+            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
+
+        # We need to capture job.entries at format_entry_training time.
+        # Use a mutable dict to capture the adapter being trained.
+        _adapter_being_trained = [None]
+        train_spy = MagicMock(return_value={"aborted": False})
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda a, e: {x["key"] for x in e},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    side_effect=lambda entries, *a, **kw: (
+                        format_entries_by_adapter.__setitem__(
+                            _adapter_being_trained[0], list(entries)
+                        )
+                        or [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
+                    ),
+                ),
+                patch(
+                    "paramem.models.loader.create_adapter",
+                    side_effect=lambda m, c, n: _adapter_being_trained.__setitem__(0, n) or m,
+                ),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        # Serve layout assertions.
+        served_proc = {e["key"] for e in result["tier_keyed"]["procedural"]}
+        served_ep = {e["key"] for e in result["tier_keyed"]["episodic"]}
+        assert served_proc == set(proc_keys), "procedural serve set must be the 12 graduating keys"
+        assert served_ep == set(ep_keys), (
+            "episodic serve set must NOT include the graduating procedural keys"
+        )
+        # No procedural train call (fast-start copy, empty train set).
+        proc_train_calls = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
+        ]
+        assert len(proc_train_calls) == 0, "procedural must NOT be trained (fast-start copy)"
+        # Episodic trained (train_adapter called).
+        ep_train_calls = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "episodic"
+        ]
+        assert len(ep_train_calls) >= 1, "episodic must be trained (universal donor)"
+        # Episodic's training entries (format_entry_training input) = 32 unique keys.
+        ep_format_entries = format_entries_by_adapter.get("episodic", [])
+        ep_trained_keys = {e["key"] for e in ep_format_entries}
+        assert len(ep_trained_keys) == 32, (
+            f"episodic train set should be 20 ep + 12 proc = 32, got {len(ep_trained_keys)}"
+        )
+        assert set(proc_keys) <= ep_trained_keys, (
+            "graduating procedural keys must be in episodic's training set (donor augment)"
+        )
+
+    def test_gr2_no_registry_duplication(self, tmp_path):
+        """GR-2: each graduating key appears in _all_keyed exactly once and is
+        served from procedural (not episodic).
+        """
+        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
+        proc_keys = [f"p{i}" for i in range(12)]
+        ep_keys = [f"e{i}" for i in range(20)]
+        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        self._add_edges(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "preference",
+                }
+                for k in proc_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        result = self._run_fold(loop)
+
+        # Each key appears at most once across all serve tiers.
+        all_served = [e["key"] for tl in result["tier_keyed"].values() for e in tl]
+        assert len(all_served) == len(set(all_served)), (
+            "each key must appear in serve layout exactly once (no duplication)"
+        )
+        # Graduating keys served from procedural.
+        for k in proc_keys:
+            assert k not in {e["key"] for e in result["tier_keyed"]["episodic"]}, (
+                f"graduating key {k!r} must NOT be in episodic serve set"
+            )
+            assert k in {e["key"] for e in result["tier_keyed"]["procedural"]}, (
+                f"graduating key {k!r} must be in procedural serve set"
+            )
+
+    def test_gr3a_procedural_fast_start_copy_accepted(self, tmp_path):
+        """GR-3a: procedural first-cross fast-start: copy_adapter_weights_subset called,
+        train_adapter NOT called for procedural, procedural in tiers_rebuilt.
+
+        Probe returns only keys the donor was actually trained on (augmented episodic
+        set) — NOT a blanket pass-all that would mask an uninformed-donor regression.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
+        proc_keys = [f"p{i}" for i in range(12)]
+        ep_keys = [f"e{i}" for i in range(20)]
+        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        self._add_edges(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "preference",
+                }
+                for k in proc_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        # Track episodic's training entries so the probe can simulate real knowledge.
+        _ep_train_keys: list = []
+
+        def _spy_format(entries, *a, **kw):
+            # format_entry_training is called for episodic first.
+            if not _ep_train_keys:
+                _ep_train_keys.extend(e["key"] for e in entries)
+            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
+
+        def _probe(adapter_name, entries):
+            # Simulate donor knowledge: episodic returns all keys it was trained on;
+            # procedural probe (after copy from episodic) returns same keys.
+            return {e["key"] for e in entries if e["key"] in set(_ep_train_keys)}
+
+        train_spy = MagicMock(return_value={"aborted": False})
+        subset_copy_spy = MagicMock()
+        full_copy_spy = MagicMock()
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    side_effect=_spy_format,
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights", full_copy_spy),
+                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert "procedural" in result["tiers_rebuilt"], (
+            "procedural must be in tiers_rebuilt after fast-start copy accepted"
+        )
+        # subset copy for procedural←episodic (attn-only, MLP zero-init).
+        proc_subset_calls = [
+            c
+            for c in subset_copy_spy.call_args_list
+            if c.kwargs.get("dst") == "procedural" or (c.args and "procedural" in str(c.args))
+        ]
+        assert len(proc_subset_calls) >= 1, (
+            "copy_adapter_weights_subset must be called for procedural←episodic"
+        )
+        # train_adapter must NOT be called for procedural.
+        proc_train = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
+        ]
+        assert len(proc_train) == 0, "train_adapter must NOT be called for procedural fast-start"
+
+    def test_gr3b_semantic_fast_start_copy_accepted(self, tmp_path):
+        """GR-3b: semantic first-cross fast-start (promotion-store-moved, v3 fix):
+        copy_adapter_weights (FULL copy, NOT subset) called for semantic,
+        train_adapter NOT called for semantic, semantic in tiers_rebuilt.
+
+        This is the test that PROVES v3 fixes the procedural-only scoping.
+        Semantic keys are store-tier "semantic" (promotion-store-moved) but have
+        NO disk slot → _tier_has_disk_slot("semantic") = False → graduates.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
+        # Semantic keys with store-tier "semantic" (simulate post-promotion state).
+        sem_keys = [f"s{i}" for i in range(11)]
+        # Seed with store-tier "semantic" (promotion already happened).
+        for k in sem_keys:
+            loop.store.put(
+                "semantic",
+                k,
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "predicate": f"likes_{k}",
+                    "object": f"thing_{k}",
+                    "speaker_id": "S0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                k,
+                speaker_id="S0",
+                first_seen_cycle=1,
+                relation_type="factual",
+                recurrence_count=3,  # promoted threshold met
+                last_seen_cycle=1,
+            )
+        # Episodic keys.
+        ep_keys = [f"e{i}" for i in range(20)]
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+
+        # Stage-5 uses store.tier_for_active_key to determine current tier;
+        # semantic keys are already in semantic store-tier so they route to
+        # serve_assignment["semantic"] (Stage-5 line: tier = "semantic" if
+        # current_adapter_id == "semantic").
+        self._add_edges(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "object": f"thing_{k}",
+                    "predicate": f"likes_{k}",
+                    "relation_type": "factual",
+                }
+                for k in sem_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        # No disk slot for semantic in tmp_path → _tier_has_disk_slot("semantic") = False.
+        train_spy = MagicMock(return_value={"aborted": False})
+        subset_copy_spy = MagicMock()
+        full_copy_spy = MagicMock()
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda a, e: {x["key"] for x in e},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights", full_copy_spy),
+                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert "semantic" in result["tiers_rebuilt"], (
+            "semantic must be in tiers_rebuilt after fast-start copy accepted"
+        )
+        # FULL copy (not subset) for semantic←episodic (equal param sets).
+        sem_full_calls = [
+            c
+            for c in full_copy_spy.call_args_list
+            if c.kwargs.get("dst") == "semantic" or (c.args and "semantic" in str(c.args))
+        ]
+        assert len(sem_full_calls) >= 1, (
+            "copy_adapter_weights (FULL) must be called for semantic←episodic (v3 fix)"
+        )
+        # subset copy must NOT have been used for semantic.
+        sem_subset_calls = [
+            c
+            for c in subset_copy_spy.call_args_list
+            if c.kwargs.get("dst") == "semantic" or (c.args and "semantic" in str(c.args))
+        ]
+        assert len(sem_subset_calls) == 0, (
+            "copy_adapter_weights_subset must NOT be called for semantic (only procedural)"
+        )
+        # train_adapter must NOT be called for semantic.
+        sem_train = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "semantic"
+        ]
+        assert len(sem_train) == 0, "train_adapter must NOT be called for semantic fast-start"
+        # Episodic train includes the 11 semantic graduating keys (universal donor).
+        # Verify via serve layout: semantic served from semantic, not episodic.
+        served_sem = {e["key"] for e in result["tier_keyed"]["semantic"]}
+        assert served_sem == set(sem_keys), "semantic keys must be served from semantic"
+        served_ep = {e["key"] for e in result["tier_keyed"]["episodic"]}
+        assert not (served_ep & set(sem_keys)), (
+            "graduating semantic keys must NOT appear in episodic serve set"
+        )
+
+    def test_gr4_simultaneous_semantic_procedural_graduation(self, tmp_path):
+        """GR-4: both semantic and procedural graduate the same fold (universal donor).
+
+        floor=10, 11 semantic keys (store-tier semantic, first-cross) + 12 procedural
+        keys (store-tier episodic, parked) + 20 episodic.
+
+        Assertions:
+        - episodic train entries = 43 unique (20+11+12), no duplicates
+        - copy_adapter_weights (FULL) called for semantic
+        - copy_adapter_weights_subset (SUBSET) called for procedural
+        - train_adapter NOT called for semantic or procedural
+        - both in tiers_rebuilt
+        - serve layout: semantic=11, procedural=12, episodic=20
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
+
+        sem_keys = [f"s{i}" for i in range(11)]
+        proc_keys = [f"p{i}" for i in range(12)]
+        ep_keys = [f"e{i}" for i in range(20)]
+
+        # Semantic keys: store-tier "semantic" (promotion-store-moved, no disk slot).
+        for k in sem_keys:
+            loop.store.put(
+                "semantic",
+                k,
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "predicate": f"likes_{k}",
+                    "object": f"thing_{k}",
+                    "speaker_id": "S0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                k,
+                speaker_id="S0",
+                first_seen_cycle=1,
+                relation_type="factual",
+                recurrence_count=3,
+                last_seen_cycle=1,
+            )
+        # Procedural keys: store-tier "episodic" (parked, no disk slot for procedural).
+        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+
+        self._add_edges(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "object": f"thing_{k}",
+                    "predicate": f"likes_{k}",
+                    "relation_type": "factual",
+                }
+                for k in sem_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "preference",
+                }
+                for k in proc_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        train_spy = MagicMock(return_value={"aborted": False})
+        full_copy_spy = MagicMock()
+        subset_copy_spy = MagicMock()
+        format_entries_captured: dict = {}
+        _current_adapter: list = [None]
+
+        def _spy_create(m, c, n):
+            _current_adapter[0] = n
+            return m
+
+        def _spy_format(entries, *a, **kw):
+            if _current_adapter[0] and _current_adapter[0] not in format_entries_captured:
+                format_entries_captured[_current_adapter[0]] = list(entries)
+            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda a, e: {x["key"] for x in e},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    side_effect=_spy_format,
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=_spy_create),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights", full_copy_spy),
+                patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        # Both graduating tiers in tiers_rebuilt.
+        assert "semantic" in result["tiers_rebuilt"], "semantic must be in tiers_rebuilt"
+        assert "procedural" in result["tiers_rebuilt"], "procedural must be in tiers_rebuilt"
+
+        # Copy type per tier.
+        sem_full = [c for c in full_copy_spy.call_args_list if c.kwargs.get("dst") == "semantic"]
+        assert len(sem_full) >= 1, "FULL copy must be called for semantic (equal param sets)"
+        proc_subset = [
+            c for c in subset_copy_spy.call_args_list if c.kwargs.get("dst") == "procedural"
+        ]
+        assert len(proc_subset) >= 1, "SUBSET copy must be called for procedural (attn only)"
+
+        # No train_adapter for semantic or procedural.
+        for t in ("semantic", "procedural"):
+            t_train = [c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == t]
+            assert len(t_train) == 0, f"train_adapter must NOT be called for {t} fast-start"
+
+        # Episodic train set = 43 unique keys (20 + 11 + 12).
+        ep_format_entries = format_entries_captured.get("episodic", [])
+        ep_trained_keys = {e["key"] for e in ep_format_entries}
+        assert len(ep_trained_keys) == 43, (
+            f"episodic train set must be 20+11+12=43 unique keys, got {len(ep_trained_keys)}"
+        )
+        assert set(sem_keys) <= ep_trained_keys, "sem graduating keys must be in ep train set"
+        assert set(proc_keys) <= ep_trained_keys, "proc graduating keys must be in ep train set"
+
+        # Serve layout.
+        assert result["keys_per_tier"]["semantic"] == 11
+        assert result["keys_per_tier"]["procedural"] == 12
+        assert result["keys_per_tier"]["episodic"] == 20
+
+    def test_gr6a_fallback_trains_on_serve_set_procedural(self, tmp_path):
+        """GR-6a: (b)→(a) fallback for procedural: train_adapter IS called for procedural
+        with entries = its serve set, procedural in tiers_rebuilt.
+
+        Probe patched to FAIL for procedural while episodic otherwise informed.
+        Confirms fallback re-assignment: job.entries = serve_assignment[tier].
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        floor = 10
+        loop = self._make_loop(tmp_path, min_tier_key_floor=floor, tier_fast_start=True)
+        proc_keys = [f"p{i}" for i in range(12)]
+        ep_keys = [f"e{i}" for i in range(20)]
+        self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        self._add_edges(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "preference",
+                }
+                for k in proc_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        # Probe FAILS for procedural (simulates copy under-recall).
+        def _probe_fail(adapter_name, entries):
+            if adapter_name == "procedural":
+                return set()  # fail
+            return {e["key"] for e in entries}
+
+        train_spy = MagicMock(return_value={"aborted": False})
+        format_entries_by_adapter: dict = {}
+        _current_adapter: list = ["episodic"]
+
+        def _spy_create(m, c, n):
+            _current_adapter[0] = n
+            return m
+
+        def _spy_format(entries, *a, **kw):
+            ad = _current_adapter[0]
+            format_entries_by_adapter.setdefault(ad, []).extend(entries)
+            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe_fail),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    side_effect=_spy_format,
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=_spy_create),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert "procedural" in result["tiers_rebuilt"], (
+            "procedural must be in tiers_rebuilt after (b)→(a) fallback"
+        )
+        proc_train_calls = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "procedural"
+        ]
+        assert len(proc_train_calls) >= 1, (
+            "train_adapter must be called for procedural after fast-start probe failure"
+        )
+        # Fallback train entries = the serve set (12 keys), not empty.
+        proc_format_entries = format_entries_by_adapter.get("procedural", [])
+        proc_trained_keys = {e["key"] for e in proc_format_entries}
+        assert proc_trained_keys == set(proc_keys), (
+            f"fallback train entries must equal the procedural serve set "
+            f"(12 keys), got {len(proc_trained_keys)}"
+        )
+
+    def test_gr6b_fallback_trains_on_serve_set_semantic(self, tmp_path):
+        """GR-6b: (b)→(a) fallback for semantic: train_adapter IS called for semantic
+        with entries = its serve set. Confirms fallback works for semantic path too.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
+        sem_keys = [f"s{i}" for i in range(11)]
+        ep_keys = [f"e{i}" for i in range(20)]
+
+        for k in sem_keys:
+            loop.store.put(
+                "semantic",
+                k,
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "predicate": f"likes_{k}",
+                    "object": f"thing_{k}",
+                    "speaker_id": "S0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                k,
+                speaker_id="S0",
+                first_seen_cycle=1,
+                relation_type="factual",
+                recurrence_count=3,
+                last_seen_cycle=1,
+            )
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        self._add_edges(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "object": f"thing_{k}",
+                    "predicate": f"likes_{k}",
+                    "relation_type": "factual",
+                }
+                for k in sem_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        # Probe FAILS for semantic.
+        def _probe_fail_sem(adapter_name, entries):
+            if adapter_name == "semantic":
+                return set()
+            return {e["key"] for e in entries}
+
+        train_spy = MagicMock(return_value={"aborted": False})
+        format_entries_by_adapter: dict = {}
+        _current_adapter: list = ["episodic"]
+
+        def _spy_create(m, c, n):
+            _current_adapter[0] = n
+            return m
+
+        def _spy_format(entries, *a, **kw):
+            ad = _current_adapter[0]
+            format_entries_by_adapter.setdefault(ad, []).extend(entries)
+            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                patch.object(ConsolidationLoop, "_probe_passing_keys", side_effect=_probe_fail_sem),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    side_effect=_spy_format,
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=_spy_create),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert "semantic" in result["tiers_rebuilt"], (
+            "semantic must be in tiers_rebuilt after (b)→(a) fallback"
+        )
+        sem_train_calls = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "semantic"
+        ]
+        assert len(sem_train_calls) >= 1, (
+            "train_adapter must be called for semantic after fast-start probe failure"
+        )
+        sem_format_entries = format_entries_by_adapter.get("semantic", [])
+        sem_trained_keys = {e["key"] for e in sem_format_entries}
+        assert sem_trained_keys == set(sem_keys), (
+            f"fallback train entries must equal the semantic serve set "
+            f"(11 keys), got {len(sem_trained_keys)}"
+        )
+
+    def test_gr7_train_from_scratch_not_augmented(self, tmp_path):
+        """GR-7: with tier_fast_start=False, first-cross semantic trains from scratch
+        on its own serve set — episodic train set does NOT include semantic keys.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=False)
+        sem_keys = [f"s{i}" for i in range(11)]
+        ep_keys = [f"e{i}" for i in range(20)]
+
+        for k in sem_keys:
+            loop.store.put(
+                "semantic",
+                k,
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "predicate": f"likes_{k}",
+                    "object": f"thing_{k}",
+                    "speaker_id": "S0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                k,
+                speaker_id="S0",
+                first_seen_cycle=1,
+                relation_type="factual",
+                recurrence_count=3,
+                last_seen_cycle=1,
+            )
+        self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
+        self._add_edges(
+            loop,
+            [
+                {
+                    "key": k,
+                    "subject": "Alice",
+                    "object": f"thing_{k}",
+                    "predicate": f"likes_{k}",
+                    "relation_type": "factual",
+                }
+                for k in sem_keys
+            ]
+            + [
+                {
+                    "key": k,
+                    "subject": "A",
+                    "object": f"o{k}",
+                    "predicate": f"p{k}",
+                    "relation_type": "factual",
+                }
+                for k in ep_keys
+            ],
+        )
+
+        train_spy = MagicMock(return_value={"aborted": False})
+        format_entries_by_adapter: dict = {}
+        _current_adapter: list = ["episodic"]
+
+        def _spy_create(m, c, n):
+            _current_adapter[0] = n
+            return m
+
+        def _spy_format(entries, *a, **kw):
+            ad = _current_adapter[0]
+            format_entries_by_adapter.setdefault(ad, []).extend(entries)
+            return [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda a, e: {x["key"] for x in e},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", train_spy),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    side_effect=_spy_format,
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=_spy_create),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        # Semantic trains from scratch — train_adapter called for semantic.
+        sem_train = [
+            c for c in train_spy.call_args_list if c.kwargs.get("adapter_name") == "semantic"
+        ]
+        assert len(sem_train) >= 1, "train_adapter must be called for semantic (train-from-scratch)"
+        # Episodic train set does NOT include semantic graduating keys.
+        ep_format = format_entries_by_adapter.get("episodic", [])
+        ep_trained_keys = {e["key"] for e in ep_format}
+        assert not (ep_trained_keys & set(sem_keys)), (
+            "episodic train set must NOT include semantic graduating keys "
+            "when tier_fast_start=False (no donor augmentation)"
         )

@@ -287,35 +287,46 @@ def _add_keyed_edge(
 def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
     """Project the *tier* slice of a :class:`MemoryStore` into a fresh ``MultiDiGraph``.
 
-    Iterates every key in ``store.simhashes_in_tier(tier)`` and reads the
-    matching entry from the store to add an edge ``(subject → object)`` with
-    edge-data ``{ik_key, predicate, speaker_id, first_seen_cycle}`` (the
-    indexed-memory key is stored as ``"ik_key"`` to avoid the NetworkX
-    ``"key"`` collision; :func:`iter_entries` maps it back to ``"key"`` for
-    callers).
+    Iterates every key in ``store.simhashes_in_tier(tier)`` — keeping the
+    simhash dict as the enumeration spine so replay-disabled stores work
+    correctly — but **skips stale keys** so the projected graph is active-only.
+    Stale simhash entries are retained on disk (step-6 wholesale persist in
+    ``commit_tier_slot`` is unchanged); they are excluded only from the graph
+    projection so superseded facts are never re-materialized into ``graph.json``.
+
+    Reads the matching entry from the store to add an edge
+    ``(subject → object)`` with edge-data
+    ``{ik_key, predicate, speaker_id, first_seen_cycle}`` (the indexed-memory
+    key is stored as ``"ik_key"`` to avoid the NetworkX ``"key"`` collision;
+    :func:`iter_entries` maps it back to ``"key"`` for callers).
 
     The caller is responsible for persisting the returned graph with
     :func:`save_memory_to_disk`.
 
     Args:
         store: A :class:`paramem.memory.store.MemoryStore`
-            (or any object exposing ``simhashes_in_tier(tier) -> dict[str,int]``
-            and ``get(key) -> dict | None``).
+            (or any object exposing ``simhashes_in_tier(tier) -> dict[str,int]``,
+            ``get(key) -> dict | None``, and ``is_stale(key) -> bool``).
         tier: One of ``"episodic"``, ``"semantic"``, or ``"procedural"``.
 
     Returns:
-        A new ``nx.MultiDiGraph`` with one edge per key in the tier's
-        SimHash registry.
+        A new ``nx.MultiDiGraph`` with one edge per *active* key in the tier's
+        SimHash registry (stale keys excluded).
 
     Raises:
-        KeyError: When a key present in ``simhashes_in_tier`` is absent from
-            the store's entry cache.  Stricter than the consolidation write
-            path (which silently filters missing entries); a simhash/entry
-            divergence is a data-integrity bug to surface, not paper over.
+        KeyError: When an active key present in ``simhashes_in_tier`` is absent
+            from the store's entry cache.  Stale keys never raise (they are
+            skipped before the entry lookup).  A simhash/entry divergence on an
+            active key is a data-integrity bug to surface, not paper over.
     """
     simhash_registry: dict[str, int] = store.simhashes_in_tier(tier)
     graph = nx.MultiDiGraph()
     for indexed_key in simhash_registry:
+        # Skip stale keys — their simhash is retained on disk for the
+        # stale-echo seam, but they must not be projected into graph.json
+        # (superseded facts must not re-materialize).
+        if store.is_stale(indexed_key):
+            continue
         entry = store.get(indexed_key)
         if entry is None:
             raise KeyError(indexed_key)
@@ -372,53 +383,6 @@ def load_registry(path) -> dict:
     from paramem.backup.encryption import read_maybe_encrypted
 
     return json.loads(read_maybe_encrypted(_Path(path)).decode("utf-8"))
-
-
-def mark_stale(registry: dict, keys: list[str]) -> None:
-    """Mark keys as stale in an enriched registry.
-
-    Stale keys are excluded from enumeration but remain in the registry
-    until their key IDs are reclaimed.  The adapter retains the old
-    weights — they decay naturally through subsequent training cycles.
-
-    Args:
-        registry: Enriched registry dict (key → metadata dict with
-            ``"status"`` field).
-        keys: List of key strings to mark stale.
-    """
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc).isoformat()
-    for key in keys:
-        if key in registry and isinstance(registry[key], dict):
-            registry[key]["status"] = "stale"
-            if registry[key].get("stale_since") is None:
-                registry[key]["stale_since"] = now
-
-
-def get_reclaimable_keys(registry: dict, min_stale_cycles: int = 5) -> list[str]:
-    """Return stale key IDs that have been inactive long enough to reclaim.
-
-    After ``min_stale_cycles`` consolidation cycles, the adapter's gradient
-    residue for these keys has likely decayed enough to reassign them.
-
-    Args:
-        registry: Enriched registry dict.
-        min_stale_cycles: Minimum number of stale cycles before a key is
-            eligible for reclamation.
-
-    Returns:
-        Sorted list of reclaimable key strings.
-    """
-    reclaimable = []
-    for key, entry in registry.items():
-        if (
-            isinstance(entry, dict)
-            and entry.get("status") == "stale"
-            and entry.get("stale_cycles", 0) >= min_stale_cycles
-        ):
-            reclaimable.append(key)
-    return sorted(reclaimable)
 
 
 def get_active_keys(registry: dict) -> list[str]:

@@ -615,6 +615,109 @@ class TestBuildTierGraphKeyError:
 
 
 # ---------------------------------------------------------------------------
+# 9b. build_tier_graph_from_store: stale-key projection (R2-MAJOR / R3-1)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTierGraphStaleProjection:
+    """R2-MAJOR (R3-1 filter variant): stale keys in simhash_registry must NOT
+    be projected into graph.json, but their simhash entries are retained on disk.
+
+    The fix keeps `simhashes_in_tier` as the enumeration spine (so replay-disabled
+    stores work correctly) but skips stale keys via `store.is_stale()`.
+    """
+
+    def test_stale_key_excluded_from_graph_no_key_error(self):
+        """A stale key in the simhash dict is skipped — no KeyError, not in graph."""
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        # Register active key with simhash + entry.
+        store.put(
+            "episodic",
+            "graph_active",
+            {
+                "key": "graph_active",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "S0",
+                "first_seen_cycle": 1,
+            },
+            simhash=0xAAAA1111,
+            register=True,
+        )
+        # Register stale key — simhash present, entry INTENTIONALLY absent.
+        # (Mimics the scenario where the stale key's entry was reaped but the
+        # simhash is retained for the stale-echo seam.)
+        store.put_simhash("episodic", "graph_stale", 0xBBBB2222)
+        # Flip to stale via the registry.
+        ep_reg = store.registry("episodic")
+        ep_reg.add("graph_stale")  # must be active to stale
+        ep_reg.stale("graph_stale")
+
+        g = build_tier_graph_from_store(store, "episodic")
+
+        # Active key projects into graph.
+        entries = list(iter_entries(g))
+        assert len(entries) == 1, f"Expected 1 edge (active only); got {entries}"
+        assert entries[0]["key"] == "graph_active"
+
+        # Stale simhash is RETAINED in the simhash dict (not reaped).
+        assert "graph_stale" in store.simhashes_in_tier("episodic"), (
+            "Stale key simhash must be retained on the store"
+        )
+
+    def test_active_key_without_entry_still_raises(self):
+        """An ACTIVE key in simhashes_in_tier that has no entry raises KeyError.
+
+        This guards against the stale-key fix silently suppressing data-integrity
+        errors on active keys.
+        """
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=True)
+        # Active key in simhash but no entry — must raise.
+        store.put_simhash("episodic", "graph_active_no_entry", 0x1234)
+        ep_reg = store.registry("episodic")
+        ep_reg.add("graph_active_no_entry")
+
+        with pytest.raises(KeyError):
+            build_tier_graph_from_store(store, "episodic")
+
+    def test_existing_happy_path_still_works_replay_disabled(self):
+        """Replay-disabled store (the existing happy-path pattern) still projects correctly.
+
+        R3-1 chose the is_stale-FILTER variant precisely to keep replay-disabled
+        stores working.  This test mirrors the existing TestBuildTierGraphFromStore
+        setup (MemoryStore(replay_enabled=False), register=False) to confirm that
+        path is unaffected.
+        """
+        from paramem.memory.store import MemoryStore
+
+        store = MemoryStore(replay_enabled=False)
+        store.replace_simhashes_in_tier("episodic", {"graph1": 0xABCDEF})
+        store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Bob",
+                "predicate": "has_job",
+                "object": "Engineer",
+                "speaker_id": "S0",
+                "first_seen_cycle": 0,
+            },
+            register=False,
+        )
+
+        g = build_tier_graph_from_store(store, "episodic")
+        entries = list(iter_entries(g))
+        assert len(entries) == 1
+        assert entries[0]["key"] == "graph1"
+
+
+# ---------------------------------------------------------------------------
 # 10. Encryption round-trip: encrypted bytes are NOT plaintext JSON
 # ---------------------------------------------------------------------------
 

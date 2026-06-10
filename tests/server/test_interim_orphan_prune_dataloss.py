@@ -148,3 +148,123 @@ class TestInterimOrphanPruneDataLoss:
         assert removed == 1
         kept = _read_key_metadata(km_path)["keys"]
         assert set(kept) == {"live0"}
+
+
+class TestW1StaleBookkeepingRetention:
+    """W1 (§3.4b): soft-staled keys' bookkeeping must survive prune_key_metadata_orphans
+    and be persisted by _save_key_metadata.
+
+    A stale key is absent from list_active() but present in list_stale().  Before
+    the W1 fix, the retention union only included active keys, so a soft-staled
+    key's bookkeeping was silently pruned after the next consolidation cycle —
+    breaking the stale-echo seam (no speaker/relation_type to resolve).
+    """
+
+    def test_prune_does_not_delete_stale_key_metadata(self, tmp_path):
+        """prune_key_metadata_orphans retains bookkeeping for a soft-staled key.
+
+        Setup: episodic registry has one active key ("active1") and one stale key
+        ("stale1").  key_metadata.json carries both.  After prune, both survive.
+        """
+        adapter_dir = tmp_path / "adapters"
+        (adapter_dir / "episodic").mkdir(parents=True, exist_ok=True)
+
+        # Build a registry with active1 active and stale1 stale.
+        reg = KeyRegistry()
+        reg.add("active1")
+        reg.add("stale1")
+        reg.stale("stale1")
+        reg.save(adapter_dir / "episodic" / "indexed_key_registry.json")
+
+        km_path = tmp_path / "registry" / "key_metadata.json"
+        km_path.parent.mkdir(parents=True, exist_ok=True)
+        from paramem.backup.encryption import write_infra_bytes
+
+        payload = {
+            "cycle_count": 1,
+            "promoted_keys": [],
+            "keys": {
+                "active1": {
+                    "recurrence_count": 1,
+                    "speaker_id": "Speaker0",
+                    "first_seen_cycle": 1,
+                    "relation_type": "factual",
+                    "last_seen_cycle": 1,
+                },
+                "stale1": {
+                    "recurrence_count": 1,
+                    "speaker_id": "Speaker0",
+                    "first_seen_cycle": 1,
+                    "relation_type": "factual",
+                    "last_seen_cycle": 1,
+                },
+            },
+        }
+        write_infra_bytes(km_path, json.dumps(payload, indent=2).encode("utf-8"))
+
+        cfg = _make_config(adapter_dir, km_path)
+        removed = prune_key_metadata_orphans(cfg)
+
+        assert removed == 0, (
+            f"prune removed {removed} key(s) but expected 0 — stale1 must be retained"
+        )
+        kept = _read_key_metadata(km_path)["keys"]
+        assert "active1" in kept, "active1 must be retained by prune"
+        assert "stale1" in kept, "stale1 (soft-staled) must NOT be pruned (W1)"
+
+    def test_save_key_metadata_persists_stale_key_bookkeeping(self, tmp_path):
+        """_save_key_metadata persists bookkeeping for both active and stale keys.
+
+        Builds a MemoryStore with one active key and one stale key, sets bookkeeping
+        for both, then calls _save_key_metadata and verifies the output file carries
+        both.
+        """
+        from unittest.mock import MagicMock
+
+        from paramem.memory.store import MemoryStore
+        from paramem.server.consolidation import _save_key_metadata
+
+        store = MemoryStore(replay_enabled=True)
+        store.put(
+            "episodic",
+            "active1",
+            {"subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+            register=True,
+        )
+        store.put(
+            "episodic",
+            "stale1",
+            {"subject": "Bob", "predicate": "works_at", "object": "Acme"},
+            register=True,
+        )
+        store.set_bookkeeping(
+            "active1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+        store.set_bookkeeping(
+            "stale1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="preference"
+        )
+        # Soft-stale stale1 via the registry.
+        store.discard_keys(["stale1"], mode="stale")
+
+        km_path = tmp_path / "registry" / "key_metadata.json"
+        km_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build a minimal ConsolidationLoop mock.
+        loop = MagicMock()
+        loop.store = store
+        loop.cycle_count = 1
+        loop.promoted_keys = set()
+        loop.trial_key_metadata_path = None
+
+        cfg = MagicMock()
+        cfg.key_metadata_path = km_path
+
+        _save_key_metadata(loop, cfg)
+
+        saved = _read_key_metadata(km_path)
+        keys = saved["keys"]
+        assert "active1" in keys, "active1 must be persisted by _save_key_metadata"
+        assert "stale1" in keys, "stale1 (soft-staled) must be persisted by _save_key_metadata (W1)"
+        assert keys["stale1"]["relation_type"] == "preference", (
+            "stale1 bookkeeping must include the original relation_type"
+        )

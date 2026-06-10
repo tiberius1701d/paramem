@@ -218,19 +218,205 @@ class TestPerTierSchema:
         assert loaded.is_healthy()  # no health record = healthy
 
 
+class TestStaleSemantics:
+    """§6.2.6 — KeyRegistry stale partition semantics (Mode 1).
+
+    Covers: stale(key) moves a key from active to stale; list_active excludes
+    it; list_stale includes it; is_stale returns True; remove purges from BOTH
+    active and stale; get_reclaimable returns stale keys past the cycle
+    threshold; save/load round-trips the "stale" field; loading a pre-existing
+    registry JSON with no "stale" key yields zero stale keys (backward-compat);
+    stale_cycles starts at 0 and increment_stale_cycles advances it (W2
+    sequencing: unobservable until the second fold).
+    """
+
+    def test_stale_moves_key_from_active_to_stale(self):
+        """stale(key) removes from active, adds to stale partition."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.stale("graph1")
+        assert "graph1" not in reg.list_active()
+        assert "graph1" in reg.list_stale()
+        assert reg.is_stale("graph1")
+        # graph2 unchanged
+        assert "graph2" in reg.list_active()
+        assert "graph2" not in reg.list_stale()
+        assert not reg.is_stale("graph2")
+
+    def test_stale_excludes_from_len_and_contains(self):
+        """Staled keys are excluded from __len__ and __contains__."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.stale("graph1")
+        assert len(reg) == 1
+        assert "graph1" not in reg  # __contains__ checks active only
+        assert "graph2" in reg
+
+    def test_stale_idempotent_on_already_stale(self):
+        """Calling stale() on an already-stale key is a no-op."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+        first_record = dict(reg._stale["graph1"])
+        reg.stale("graph1")  # second call — must not change stale_since
+        assert dict(reg._stale["graph1"]) == first_record
+
+    def test_stale_idempotent_on_absent_key(self):
+        """stale() on a key that was never added is a no-op."""
+        reg = KeyRegistry()
+        reg.stale("nonexistent")  # must not raise
+        assert reg.list_stale() == []
+
+    def test_stale_drops_fidelity_history(self):
+        """stale() removes the key from fidelity history."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.update_fidelity("graph1", 0.9)
+        reg.stale("graph1")
+        assert reg.get_fidelity_history("graph1") == []
+
+    def test_remove_purges_from_both_active_and_stale(self):
+        """remove() hard-erases a stale key — gone from active and stale."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+        assert "graph1" in reg.list_stale()
+        reg.remove("graph1")
+        assert "graph1" not in reg.list_active()
+        assert "graph1" not in reg.list_stale()
+        assert not reg.is_stale("graph1")
+
+    def test_remove_active_key_also_pops_stale(self):
+        """remove() on an active key leaves stale clean too."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.stale("graph2")  # graph2 is stale
+        reg.remove("graph1")
+        assert "graph1" not in reg.list_active()
+        assert "graph2" in reg.list_stale()
+
+    def test_get_reclaimable_threshold(self):
+        """get_reclaimable returns stale keys with stale_cycles >= threshold."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.stale("graph1")
+        reg.stale("graph2")
+        # Both start at stale_cycles=0.
+        assert reg.get_reclaimable(min_stale_cycles=1) == []
+        # Advance graph1 to stale_cycles=1.
+        reg._stale["graph1"]["stale_cycles"] = 1
+        reclaimable = reg.get_reclaimable(min_stale_cycles=1)
+        assert reclaimable == ["graph1"]
+        assert "graph2" not in reclaimable
+
+    def test_stale_cycles_starts_at_zero(self):
+        """A freshly staled key has stale_cycles=0."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+        assert reg._stale["graph1"]["stale_cycles"] == 0
+
+    def test_increment_stale_cycles_advances_all_stale_keys(self):
+        """increment_stale_cycles advances stale_cycles for every stale key.
+
+        W2 sequencing: a key staled in fold N has stale_cycles=0 at the durable
+        write; stale_cycles=1 after increment_stale_cycles (unobservable until
+        the NEXT fold reads it from disk).
+        """
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.stale("graph1")
+        reg.stale("graph2")
+        reg.increment_stale_cycles()
+        assert reg._stale["graph1"]["stale_cycles"] == 1
+        assert reg._stale["graph2"]["stale_cycles"] == 1
+        # Second increment → 2.
+        reg.increment_stale_cycles()
+        assert reg._stale["graph1"]["stale_cycles"] == 2
+
+    def test_save_load_roundtrip_stale_field(self, tmp_path):
+        """save_bytes / load round-trips the "stale" partition."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.stale("graph2")
+        path = tmp_path / "registry.json"
+        reg.save(path)
+
+        loaded = KeyRegistry.load(path)
+        assert loaded.list_active() == ["graph1"]
+        assert loaded.list_stale() == ["graph2"]
+        assert loaded.is_stale("graph2")
+        assert not loaded.is_stale("graph1")
+
+    def test_load_legacy_file_no_stale_key_yields_empty_stale(self, tmp_path):
+        """Loading a pre-existing registry JSON with no "stale" key gives zero stale keys.
+
+        Backward-compat: old on-disk files lack the "stale" field; load must
+        default to {} (all keys active).
+        """
+        path = tmp_path / "legacy.json"
+        legacy = {
+            "active_keys": ["graph1", "graph2"],
+            "fidelity_history": {},
+            "health": None,
+            # no "stale" key
+        }
+        path.write_text(_json.dumps(legacy))
+        loaded = KeyRegistry.load(path)
+        assert loaded.list_active() == ["graph1", "graph2"]
+        assert loaded.list_stale() == []
+
+    def test_two_fold_stale_cycle_sequence(self, tmp_path):
+        """stale_cycles=0 at durable write; =1 after increment (W2 sequencing).
+
+        Two-fold sequence: fold N stales a key and saves (stale_cycles=0 on
+        disk); increment_stale_cycles runs after the durable write (stale_cycles=1
+        in-memory); fold N+1 reads from disk (stale_cycles=0), then increment
+        advances to 1.
+        """
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+        path = tmp_path / "registry.json"
+        # Fold N: durable write with stale_cycles=0.
+        reg.save(path)
+        loaded_at_write = KeyRegistry.load(path)
+        assert loaded_at_write._stale["graph1"]["stale_cycles"] == 0
+
+        # After durable write, increment runs (in-memory only).
+        reg.increment_stale_cycles()
+        assert reg._stale["graph1"]["stale_cycles"] == 1
+
+        # Fold N+1: load from disk (still 0 — disk was saved before increment).
+        loaded_fold_n1 = KeyRegistry.load(path)
+        assert loaded_fold_n1._stale["graph1"]["stale_cycles"] == 0
+        # Then increment again to simulate fold N+1 post-durable-write.
+        loaded_fold_n1.increment_stale_cycles()
+        assert loaded_fold_n1._stale["graph1"]["stale_cycles"] == 1
+
+
 class TestSaveBytesBoundary:
     def test_save_bytes_payload_is_bookkeeping_free(self):
         """HARD CONSTRAINT: KeyRegistry.save_bytes() must contain exactly
-        {active_keys, fidelity_history, health} — no bookkeeping fields.
+        {active_keys, fidelity_history, health, stale} — no bookkeeping fields.
 
         registry_sha256 hashes the save_bytes payload; bookkeeping must never
-        enter it or slot identity breaks on restart."""
+        enter it or slot identity breaks on restart.  The ``"stale"`` field was
+        added in the soft-stale extension (§3.4.7); it is additive and
+        backward-compatible (old files load via ``data.get("stale", {})``).
+        """
         reg = KeyRegistry()
         reg.add("graph1")
         reg.add("graph2")
         reg.update_fidelity("graph1", 0.9)
         payload = set(_json.loads(reg.save_bytes()))
-        assert payload == {"active_keys", "fidelity_history", "health"}
+        assert payload == {"active_keys", "fidelity_history", "health", "stale"}
         assert "speaker_id" not in payload
         assert "first_seen_cycle" not in payload
         assert "bookkeeping" not in payload

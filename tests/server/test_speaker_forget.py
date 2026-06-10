@@ -5,8 +5,10 @@ Mocked — no GPU, no real model.  Mirrors the mocking style of
 
 Coverage
 --------
-- ``mark_stale`` called with exactly the keys ``keys_for_speaker`` returns for
-  the speaker: ``KeyRegistry.remove`` called for each key; registry saved.
+- ``store.discard_keys(keys, mode="erase")`` called with exactly the keys
+  ``keys_for_speaker`` returns: hard-removes keys from the registry (GONE from
+  both active and stale); registry saved for affected tiers; simhash saved for
+  affected main tiers.
 - Speaker profile removed: ``speaker_store.remove`` called; response reflects
   the bool return.
 - Pending sessions for the speaker discarded: ``discard_sessions`` called;
@@ -25,6 +27,8 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
+from paramem.memory.entry import compute_simhash
+from paramem.memory.store import MemoryStore
 from paramem.training.key_registry import KeyRegistry
 
 # ---------------------------------------------------------------------------
@@ -45,9 +49,14 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     """Build a MagicMock ConsolidationLoop whose merger.graph returns *keys* for *speaker_id*.
 
     The store exposes two main tiers (``episodic`` and ``semantic``) whose
-    ``KeyRegistry`` objects contain the supplied keys so ``remove`` and ``save``
-    can be verified.  The simhash dicts include the keys so the simhash
-    clean-up branch is exercised.
+    ``KeyRegistry`` objects contain the supplied keys so registry saves can be
+    verified.  The simhash dicts include the keys so the simhash clean-up branch
+    is exercised.
+
+    ``/forget`` now routes through ``store.discard_keys(keys, mode="erase")``
+    (the shared helper).  Tests verify that the helper is called with the correct
+    arguments (mode="erase", not mode="stale") and that registry + simhash saves
+    are persisted for the affected tiers.
     """
     loop = MagicMock()
 
@@ -57,8 +66,10 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     # Per-tier KeyRegistry mocks.
     ep_registry = MagicMock(spec=KeyRegistry)
     ep_registry.__contains__ = MagicMock(side_effect=lambda k: k in keys)
+    ep_registry.is_stale = MagicMock(return_value=False)
     sem_registry = MagicMock(spec=KeyRegistry)
     sem_registry.__contains__ = MagicMock(side_effect=lambda _: False)
+    sem_registry.is_stale = MagicMock(return_value=False)
 
     # Store: tiers_with_registry returns episodic + semantic.
     loop.store.tiers_with_registry.return_value = ["episodic", "semantic"]
@@ -119,10 +130,10 @@ def _make_client(monkeypatch, state: dict) -> TestClient:
 
 
 class TestMarkStaleKeys:
-    """Keys returned by keys_for_speaker are removed from KeyRegistry and registry saved."""
+    """Keys returned by keys_for_speaker are hard-erased via store.discard_keys(mode="erase")."""
 
     def test_keys_removed_from_registry_and_saved(self, tmp_path, monkeypatch):
-        """KeyRegistry.remove called for each key; registry.save called with tier path."""
+        """store.discard_keys called with mode='erase'; registry.save called for affected tier."""
         speaker_id = "Speaker0"
         keys = ["graph1", "graph3"]
         loop = _make_loop(speaker_id, keys)
@@ -153,24 +164,43 @@ class TestMarkStaleKeys:
         # keys_for_speaker was called with the graph and speaker_id.
         mock_kfs.assert_called_once_with(loop.merger.graph, speaker_id)
 
-        # remove called for each key on the episodic registry (which contains them).
-        ep_reg = loop._ep_registry
-        remove_calls = {c.args[0] for c in ep_reg.remove.call_args_list}
-        assert remove_calls == set(keys)
+        # store.discard_keys must be called with mode="erase" (hard erasure, not soft-stale).
+        # Verify the helper was called; the erase-vs-stale distinction is tested in
+        # the store unit tests (TestDiscardKeys in test_memory_persistence/store tests).
+        loop.store.discard_keys.assert_called_once_with(sorted(keys), mode="erase")
 
-        # save called with the episodic adapter path.
+        # registry.save called with the episodic adapter path (episodic contains the keys).
+        ep_reg = loop._ep_registry
         expected_path = cfg.adapter_dir / "episodic" / "indexed_key_registry.json"
         ep_reg.save.assert_called_once_with(expected_path)
 
-        # Semantic registry — no keys → remove and save not called.
-        loop._sem_registry.remove.assert_not_called()
+        # Semantic registry — no keys → save not called.
         loop._sem_registry.save.assert_not_called()
 
     def test_simhash_entries_removed_and_persisted(self, tmp_path, monkeypatch):
-        """Simhash entries for the speaker's keys are removed and re-saved."""
+        """Erased key is absent from the persisted simhash dict.
+
+        Uses a real MemoryStore so discard_keys(mode='erase') actually removes
+        the simhash entry — the saved dict must not contain the erased key.
+        """
         speaker_id = "Speaker0"
         keys = ["graph2"]
+        key = keys[0]
+
+        # Build a real MemoryStore seeded with the key in episodic.
+        real_store = MemoryStore(replay_enabled=True)
+        fingerprint = compute_simhash(key, "Alice", "lives_in", "Berlin")
+        real_store.put(
+            "episodic",
+            key,
+            {"key": key, "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+            simhash=fingerprint,
+        )
+
+        # Assemble the loop mock, replacing .store with the real MemoryStore.
         loop = _make_loop(speaker_id, keys)
+        loop.store = real_store
+
         cfg = _make_config(tmp_path)
         state = _make_state(
             tmp_path,
@@ -191,14 +221,23 @@ class TestMarkStaleKeys:
 
         assert resp.status_code == 200, resp.text
 
-        # The episodic simhash registry was saved after the key was removed.
-        ep_saves = [r for r, p in saved_simhash_calls if "episodic" in str(p)]
+        # The real discard_keys(mode="erase") ran — key must be absent from
+        # the in-memory simhash store.
+        assert key not in real_store.simhashes_in_tier("episodic"), (
+            f"Key {key!r} still present in episodic simhash after erase"
+        )
+
+        # save_registry was called for the episodic tier, and the saved dict
+        # does NOT contain the erased key.
+        ep_saves = [(r, p) for r, p in saved_simhash_calls if "episodic" in str(p)]
         assert ep_saves, "No episodic simhash save recorded"
-        # Key must be absent from the saved dict.
-        assert "graph2" not in ep_saves[0]
+        saved_dict, _ = ep_saves[0]
+        assert key not in saved_dict, (
+            f"Erased key {key!r} still present in the persisted episodic simhash dict"
+        )
 
     def test_no_keys_no_registry_mutations(self, tmp_path, monkeypatch):
-        """When keys_for_speaker returns empty set, no registry mutations occur."""
+        """When keys_for_speaker returns empty set, discard_keys is not called."""
         speaker_id = "Speaker0"
         loop = _make_loop(speaker_id, [])
         state = _make_state(
@@ -218,7 +257,7 @@ class TestMarkStaleKeys:
         assert body["stale_keys"] == []
         # No registry saves because there are no keys to process.
         mock_save.assert_not_called()
-        loop._ep_registry.remove.assert_not_called()
+        loop.store.discard_keys.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

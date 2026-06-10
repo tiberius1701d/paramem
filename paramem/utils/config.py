@@ -160,6 +160,15 @@ class ConsolidationConfig:
     key_retirement_cycles: int = 3
     indexed_key_replay_enabled: bool = False
     merge_at_interim: bool = False
+    # Floor below which a tier's keys park in episodic until the tier's own
+    # population reaches this count.  30 is the conservative default (Test 19).
+    min_tier_key_floor: int = 30
+    # Graduation strategy when a parked tier first crosses min_tier_key_floor.
+    # True = copy episodic's LoRA weights into the graduating tier and rebook
+    # the registry (training-free fast-start; default).  False = train the tier
+    # from scratch on its own now-large key set (principled baseline, opt-out).
+    # Governs semantic/procedural only; episodic always trains from scratch.
+    tier_fast_start: bool = True
 
 
 @dataclass

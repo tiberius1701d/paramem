@@ -694,6 +694,92 @@ def copy_adapter_weights(model: PeftModel, src: str, dst: str) -> None:
     logger.debug("Copied %d tensors from adapter '%s' to '%s'", len(src_index), src, dst)
 
 
+def copy_adapter_weights_subset(model: PeftModel, src: str, dst: str) -> int:
+    """Copy a SUBSET of LoRA adapter weights from src into dst in-memory.
+
+    Unlike :func:`copy_adapter_weights` (which requires equal parameter sets),
+    this helper requires only that ``set(src_keys) ⊆ set(dst_keys)``.  This
+    covers the episodic→procedural fast-start graduation case where episodic
+    targets 4 attn modules and procedural targets 7 (attn+mlp).
+
+    - Tensors present in BOTH src and dst are copied under ``torch.no_grad()``.
+    - Tensors present in dst but absent from src are LEFT at their current
+      value (PEFT zero-init for a freshly-created adapter).
+    - Tensors present in src but absent from dst raise ``RuntimeError`` — that
+      represents a true config error (src has modules dst doesn't even define).
+
+    Args:
+        model: The PEFT model containing both adapters.
+        src: Source adapter name.
+        dst: Destination adapter name.
+
+    Returns:
+        Number of tensors copied.
+
+    Raises:
+        ValueError: If src or dst adapter is not found in the model.
+        RuntimeError: If no adapter-keyed parameters are found, or if src has
+            any tensor key absent from dst (strict-superset check).
+    """
+    if src not in model.peft_config:
+        raise ValueError(f"Source adapter '{src}' not found")
+    if dst not in model.peft_config:
+        raise ValueError(f"Destination adapter '{dst}' not found")
+
+    def _index(adapter: str) -> dict:
+        out = {}
+        for name, p in model.named_parameters():
+            for suffix in (f".{adapter}.weight", f".{adapter}.bias"):
+                if name.endswith(suffix):
+                    base = name[: -len(suffix)]
+                    out[(base, suffix[-len(".weight") :] if "weight" in suffix else ".bias")] = p
+                    break
+        return out
+
+    src_index = _index(src)
+    dst_index = _index(dst)
+
+    if not src_index or not dst_index:
+        raise RuntimeError(
+            f"No adapter-keyed parameters found for src='{src}' (count={len(src_index)}) "
+            f"or dst='{dst}' (count={len(dst_index)})"
+        )
+
+    src_only = set(src_index.keys()) - set(dst_index.keys())
+    if src_only:
+        raise RuntimeError(
+            f"copy_adapter_weights_subset: src='{src}' has {len(src_only)} tensor(s) "
+            f"absent from dst='{dst}' — src must be a subset of dst. "
+            f"This indicates a config error (src has modules dst doesn't define)."
+        )
+
+    dst_only_count = len(set(dst_index.keys()) - set(src_index.keys()))
+    intersecting = set(src_index.keys()) & set(dst_index.keys())
+
+    with torch.no_grad():
+        for key in intersecting:
+            dst_index[key].data.copy_(src_index[key].data)
+
+    if dst_only_count:
+        logger.debug(
+            "copy_adapter_weights_subset: adapter '%s' → '%s': "
+            "copied %d tensors, left %d dst-only tensors at PEFT zero-init",
+            src,
+            dst,
+            len(intersecting),
+            dst_only_count,
+        )
+    else:
+        logger.debug(
+            "copy_adapter_weights_subset: copied %d tensors from '%s' to '%s' (full intersection)",
+            len(intersecting),
+            src,
+            dst,
+        )
+
+    return len(intersecting)
+
+
 def get_adapter_info(model: PeftModel) -> dict:
     """Return summary info about all loaded adapters."""
     info = {}
