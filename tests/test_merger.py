@@ -308,7 +308,7 @@ class TestPersistence:
     ):
         """save_graph(..., encrypted=False) must bypass the envelope and emit
         plaintext JSON, even under Security ON.  Debug-directory writers
-        depend on this so ``cat debug/cycle_*/graph_snapshot.json`` is always
+        depend on this so ``cat debug/cycle_*/graph_merged_snapshot.json`` is always
         human-readable regardless of the server's posture.
         """
         from paramem.backup.key_store import (
@@ -1547,7 +1547,8 @@ class TestReinforcementTracking:
         assert m.collapsed == [], "reset_graph must clear collapsed"
 
     def test_reset_graph_clears_all_per_fold_caches(self):
-        """reset_graph() clears graph, caches, reinforcements, collapsed, and contradictions."""
+        """reset_graph() clears graph, caches, reinforcements, collapsed, contradictions,
+        and removal_ledger."""
 
         from paramem.graph.merger import GraphMerger
 
@@ -1558,6 +1559,7 @@ class TestReinforcementTracking:
         m.contradictions_resolved.append({"method": "model"})
         m.reinforcements.append("k2")
         m.collapsed.append("k3")
+        m.removal_ledger["k3"] = {"reason": "dedup", "surviving_twin": "k2"}
 
         m.reset_graph()
 
@@ -1566,6 +1568,7 @@ class TestReinforcementTracking:
         assert m.contradictions_resolved == [], "reset_graph must clear contradictions_resolved"
         assert m.reinforcements == [], "reset_graph must clear reinforcements"
         assert m.collapsed == [], "reset_graph must clear collapsed"
+        assert m.removal_ledger == {}, "reset_graph must clear removal_ledger"
 
     def test_case1_adopt_does_not_produce_reinforcement(self):
         """Case-1-adopt (keyless existing + incoming has key) does NOT add a reinforcement.
@@ -1696,3 +1699,169 @@ class TestReinforcementTracking:
         )
         assert munich_key == "key_munich", f"Expected key_munich on old edge; got {munich_key!r}"
         assert berlin_key == "key_berlin", f"Expected key_berlin on new edge; got {berlin_key!r}"
+
+
+class TestRemovalLedger:
+    """Unit tests for GraphMerger.removal_ledger (reason-coded removal records).
+
+    The ledger records every edge REMOVAL keyed by the removed edge's ik_key.
+    Tests cover Case-1 dedup, same-pred REPLACE contradiction, and reset_graph
+    clearing the ledger.  Cross-pred contradiction is config-off by default so
+    it is not exercised end-to-end here; same-pred covers the identical code
+    pattern.
+    """
+
+    def test_dedup_collapse_writes_to_ledger(self):
+        """Case-1 duplicate-SPO collapse writes the drifting key to removal_ledger
+        with reason='dedup' and surviving_twin set to the existing key.
+
+        Regression guard: merged.collapsed assertion still holds alongside the
+        new ledger assertion.
+        """
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+
+        m = GraphMerger()
+        s1 = SessionGraph(
+            session_id="recon1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="key_survivor",
+                )
+            ],
+        )
+        m.merge(s1, additive=True)
+
+        s2 = SessionGraph(
+            session_id="recon2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="key_drifter",
+                )
+            ],
+        )
+        m.merge(s2, additive=True)
+
+        # Existing collapsed assertion must still hold.
+        assert m.collapsed == ["key_drifter"], (
+            f"Collapsed must contain key_drifter; got {m.collapsed}"
+        )
+        # New ledger assertion.
+        assert "key_drifter" in m.removal_ledger, (
+            f"Drifting key must be in removal_ledger; got {list(m.removal_ledger.keys())}"
+        )
+        assert m.removal_ledger["key_drifter"]["reason"] == "dedup", (
+            f"Expected reason='dedup'; got {m.removal_ledger['key_drifter']['reason']!r}"
+        )
+        assert m.removal_ledger["key_drifter"]["surviving_twin"] == "key_survivor", (
+            f"Expected surviving_twin='key_survivor'; "
+            f"got {m.removal_ledger['key_drifter']['surviving_twin']!r}"
+        )
+        # Survivor must NOT appear in ledger.
+        assert "key_survivor" not in m.removal_ledger, "Surviving key must not be in removal_ledger"
+
+    def test_same_pred_replace_writes_to_ledger(self):
+        """Same-(s,p)/different-o single-valued (REPLACE) contradiction writes the
+        removed edge's ik_key to removal_ledger with reason='contradiction_same_pred'.
+
+        The path is dormant under additive=True (fold path); we use additive=False
+        (live ingest) with a patched check_predicate_coexistence that returns REPLACE.
+        Pre-seed the first edge with an ik_key directly on the graph.
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        def _always_replace(subject, predicate, old_value, new_value, mdl, tok, prompt=None):
+            return "REPLACE"
+
+        m = GraphMerger(model=object(), tokenizer=object())  # non-None to trigger Case-2
+
+        # Merge the first session (Munich) — normal ingest, no indexed_key.
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Munich",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        with patch("paramem.graph.merger.check_predicate_coexistence", side_effect=_always_replace):
+            m.merge(sg1)
+
+        # Stamp an ik_key onto the Munich edge so the ledger capture fires.
+        for _eid, _edata in m.graph["Alex"]["Munich"].items():
+            if _edata.get("predicate") == "lives_in":
+                _edata[_IK_KEY_ATTR] = "key_munich_old"
+                break
+
+        # Merge the second session (Berlin) — REPLACE fires, Munich edge is removed.
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alex",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        with patch("paramem.graph.merger.check_predicate_coexistence", side_effect=_always_replace):
+            m.merge(sg2)
+
+        # Munich must be gone.
+        assert "Munich" not in list(m.graph.successors("Alex")), (
+            "Old Munich edge must have been removed by REPLACE"
+        )
+        # Ledger must record the removed key.
+        assert "key_munich_old" in m.removal_ledger, (
+            f"Removed key must be in removal_ledger; keys={list(m.removal_ledger.keys())}"
+        )
+        assert m.removal_ledger["key_munich_old"]["reason"] == "contradiction_same_pred", (
+            f"Expected reason='contradiction_same_pred'; "
+            f"got {m.removal_ledger['key_munich_old']['reason']!r}"
+        )
+
+    def test_reset_graph_clears_removal_ledger(self):
+        """reset_graph() clears removal_ledger alongside collapsed and reinforcements."""
+        from paramem.graph.merger import GraphMerger
+
+        m = GraphMerger()
+        m.removal_ledger["key_stale"] = {"reason": "dedup", "surviving_twin": "k2"}
+        assert "key_stale" in m.removal_ledger
+
+        m.reset_graph()
+
+        assert m.removal_ledger == {}, (
+            f"reset_graph must clear removal_ledger; got {m.removal_ledger}"
+        )

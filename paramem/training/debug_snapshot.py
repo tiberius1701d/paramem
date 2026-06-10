@@ -13,15 +13,42 @@ Methods are phase-shaped — each one corresponds to a single pipeline
 boundary — so the call sites read as ``self._debug_writer.on_X(...)``
 with no further conditionals.
 
-Layout (2026-05-14 hierarchy)::
+Purpose-keyed graph snapshot vocabulary (BINDING):
+
+- ``reconstructed`` (fold only): ``graph_reconstructed_snapshot.json``
+- ``merged`` (fold + interim): ``graph_merged_snapshot.json``
+  Fold: after additive re-merge; interim: after per-session merge,
+  before enrichment.
+- ``enriched`` (fold + interim): ``graph_enriched_snapshot.json``
+- ``keyed`` (fold only): ``graph_keyed_snapshot.json``
+
+Fold snapshots write under ``<base>/fold/``; interim snapshots write
+under the interim base root (``_active_base`` nests them under
+``interim_<stamp>/``).  The filename is identical across both paths so
+``grep graph_merged_snapshot.json debug/`` finds both.
+
+The legacy cumulative ``graph_snapshot.json`` (from ``on_extraction_end``) is
+RETIRED — replaced by ``graph_merged_snapshot.json`` (pre-enrich) +
+``graph_enriched_snapshot.json`` (post-enrich).  The per-session
+``graph_snapshot.json`` under ``sessions/<sid>/`` is UNCHANGED.
+
+Layout::
 
     paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/
-        sessions/<session_id>/<kind>_snapshot.json   # on_session_extracted
-        graph_snapshot.json                          # on_extraction_end
-        episodic_rels_snapshot.json                  # on_extraction_end
-        procedural_rels_snapshot.json                # on_extraction_end
-        training/tiers/<tier>/adapter_weights/       # on_main_adapters_saved
-        cycle_summary_snapshot.json                  # on_cycle_end
+        sessions/<session_id>/<kind>_snapshot.json  # on_session_extracted
+        graph_merged_snapshot.json               # on_fold_graph merged (interim)
+        graph_enriched_snapshot.json             # on_fold_graph enriched (interim)
+        episodic_rels_snapshot.json              # on_extraction_end
+        procedural_rels_snapshot.json            # on_extraction_end
+        fold/
+            graph_reconstructed_snapshot.json   # on_fold_graph reconstructed
+            graph_merged_snapshot.json           # on_fold_graph merged (fold)
+            graph_enriched_snapshot.json         # on_fold_graph enriched (fold)
+            graph_keyed_snapshot.json            # on_fold_graph keyed
+            removal_ledger.json                  # on_removal_ledger
+            fold_assignments.json                # on_fold_assignments
+        training/tiers/<tier>/adapter_weights/  # on_main_adapters_saved
+        cycle_summary_snapshot.json              # on_cycle_end
 
 The procedural relations file is omitted when the procedural list is
 empty (mirrors the pre-refactor behaviour of ``_save_debug_artifacts``).
@@ -116,13 +143,18 @@ class DebugSnapshotWriter:
         *,
         interim_stamp: str | None = None,
     ) -> None:
-        """Persist the cumulative graph + per-tier relation lists.
+        """Persist per-tier relation lists.
 
         Called once per cycle at the end of extraction (after any
         interim graph enrichment mutates the cumulative graph, before
         training).  The relation lists are the per-cycle inputs to
         training; they are dumped verbatim so a calibration tool can
         compare extracted-vs-trained sets.
+
+        The cumulative graph is NO LONGER written here — it is emitted
+        as purpose-keyed snapshots by :meth:`on_fold_graph`:
+        ``graph_merged_snapshot.json`` (pre-enrichment) and
+        ``graph_enriched_snapshot.json`` (post-enrichment).
 
         Skipped for short-circuit cycles (queue-only, degenerated-skip);
         those emit only :meth:`on_cycle_end`.
@@ -131,7 +163,6 @@ class DebugSnapshotWriter:
         if base is None:
             return
         base.mkdir(parents=True, exist_ok=True)
-        self._loop.merger.save_graph(base / "graph_snapshot.json", encrypted=False)
         _write_json(base / "episodic_rels_snapshot.json", episodic_rels)
         if procedural_rels:
             _write_json(base / "procedural_rels_snapshot.json", procedural_rels)
@@ -140,6 +171,122 @@ class DebugSnapshotWriter:
             base,
             len(episodic_rels),
             len(procedural_rels),
+        )
+
+    def on_fold_graph(
+        self,
+        graph_or_merger,
+        *,
+        label: str,
+        interim_stamp: str | None = None,
+    ) -> None:
+        """Persist a purpose-keyed graph snapshot at a fold or interim boundary.
+
+        Args:
+            graph_or_merger: Either a ``GraphMerger`` (duck-typed by
+                ``hasattr(..., "save_graph")``) or a bare
+                ``nx.MultiDiGraph``.  Dispatch is done once; no
+                isinstance check so the caller never imports both types.
+            label: Purpose token — one of ``"reconstructed"``,
+                ``"merged"``, ``"enriched"``, ``"keyed"``.  The output
+                filename is ``graph_<label>_snapshot.json``.
+            interim_stamp: When set, the base directory is resolved
+                under the matching ``interim_<stamp>/`` subdirectory.
+                Leave ``None`` for the fold path (no interim nesting).
+
+        Output paths:
+            - Fold: ``<base>/fold/graph_<label>_snapshot.json``
+            - Interim: ``<base>/graph_<label>_snapshot.json``
+              (``_active_base`` already nests under ``interim_<stamp>/``)
+
+        The basename is identical across both paths so a grep on the
+        filename finds both fold and interim snapshots.
+        """
+        base = self._active_base(interim_stamp=interim_stamp)
+        if base is None:
+            return
+        if interim_stamp is not None:
+            # Interim path: write at the base root (already nested under interim_<stamp>/).
+            out_path = base / f"graph_{label}_snapshot.json"
+        else:
+            # Fold path: use a dedicated fold/ subdir to avoid naming collision with
+            # the interim root-level snapshots.
+            out_path = base / "fold" / f"graph_{label}_snapshot.json"
+        if hasattr(graph_or_merger, "save_graph"):
+            # GraphMerger: saves serialized cumulative graph.  save_graph mkdirs parent.
+            graph_or_merger.save_graph(out_path, encrypted=False)
+        else:
+            # Bare nx.MultiDiGraph: save via persistence helper.
+            # save_memory_to_disk docstring guarantees it creates the parent directory.
+            from paramem.memory.persistence import save_memory_to_disk
+
+            save_memory_to_disk(graph_or_merger, out_path, encrypted=False)
+        logger.info("Debug fold-graph snapshot written: %s (%s)", label, out_path)
+
+    def on_removal_ledger(
+        self,
+        ledger: dict,
+        *,
+        interim_stamp: str | None = None,
+    ) -> None:
+        """Persist the merger's removal ledger as a debug artifact.
+
+        Writes ``<base>/fold/removal_ledger.json`` via the plaintext
+        atomic writer.  The ledger maps each removed edge's ``ik_key``
+        to a dict carrying ``"reason"`` (one of ``"dedup"``,
+        ``"contradiction_same_pred"``, ``"contradiction_cross_pred"``,
+        ``"enrichment_same_as"``) and per-reason detail fields.
+
+        Called once per fold AFTER the drift classifier has consumed the
+        ledger (the ledger is final — ``reset_graph`` cleared it before
+        the fold's re-merge populated it).
+        """
+        base = self._active_base(interim_stamp=interim_stamp)
+        if base is None:
+            return
+        _write_json(base / "fold" / "removal_ledger.json", ledger)
+        logger.info("Debug removal_ledger written: %d entries", len(ledger))
+
+    def on_fold_assignments(
+        self,
+        serve_assignment: dict,
+        train_assignment: dict,
+        *,
+        interim_stamp: str | None = None,
+    ) -> None:
+        """Persist serve and train tier assignment maps.
+
+        Writes ``<base>/fold/fold_assignments.json`` with per-tier key
+        lists (not full entry dicts — keys are the stable identifiers;
+        SPO is recoverable from the registry and the keyed graph
+        snapshot).
+
+        Called after Pass-2 finalises ``serve_assignment`` (the two-map
+        decoupling point) and before ``_all_keyed`` is computed.
+
+        Args:
+            serve_assignment: Mapping of tier → list of entry dicts.
+                Keys extracted per-tier; full dicts are NOT stored here
+                to keep the artifact compact.
+            train_assignment: Same shape; differs from ``serve_assignment``
+                only for fast-start graduating tiers.
+        """
+        base = self._active_base(interim_stamp=interim_stamp)
+        if base is None:
+            return
+        payload = {
+            "serve_assignment": {
+                tier: [e["key"] for e in entries] for tier, entries in serve_assignment.items()
+            },
+            "train_assignment": {
+                tier: [e["key"] for e in entries] for tier, entries in train_assignment.items()
+            },
+        }
+        _write_json(base / "fold" / "fold_assignments.json", payload)
+        logger.info(
+            "Debug fold_assignments written: serve=%s train=%s",
+            {t: len(v) for t, v in serve_assignment.items()},
+            {t: len(v) for t, v in train_assignment.items()},
         )
 
     def on_main_adapters_saved(

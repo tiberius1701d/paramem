@@ -1551,3 +1551,135 @@ class TestMintKeysForKeylessEdges:
         )
         # Pre-existing graph5 entry must still be intact.
         assert "graph5" in loop.store.all_active_keys()
+
+
+class TestEnrichmentRemovalLedger:
+    """Tests that _run_graph_enrichment writes ik_keys of same_as-contracted
+    edges to merger.removal_ledger with reason='enrichment_same_as'.
+    """
+
+    def test_same_as_contraction_writes_keyed_edge_to_ledger(self, tmp_path, monkeypatch):
+        """A successful same_as contraction that drops a keyed edge writes the
+        edge's ik_key to merger.removal_ledger with reason='enrichment_same_as'
+        and merged_into set to the keep node.
+        """
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        # Add keep/drop nodes with an edge carrying an ik_key.
+        graph.add_node(
+            "Alice",
+            entity_type="person",
+            attributes={},
+            recurrence_count=3,
+            sessions=["s010"],
+            first_seen="s010",
+            last_seen="s010",
+        )
+        graph.add_node(
+            "Alicia",
+            entity_type="person",
+            attributes={},
+            recurrence_count=1,
+            sessions=["s011"],
+            first_seen="s011",
+            last_seen="s011",
+        )
+        # Edge from keep → drop carrying an ik_key (becomes a self-loop on contraction).
+        eid = graph.add_edge(
+            "Alice",
+            "Alicia",
+            predicate="same_as",
+            relation_type="factual",
+            confidence=1.0,
+            source="extraction",
+            sessions=["s010"],
+        )
+        graph["Alice"]["Alicia"][eid][_IK_KEY_ATTR] = "key_same_as_victim"
+
+        canned_result = (
+            [],
+            [["Alice", "Alicia"]],  # keep=Alice, drop=Alicia
+            "raw",
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=canned_result,
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert result["same_as_merges"] >= 1, "Contraction must have fired for Alice/Alicia"
+        assert "key_same_as_victim" in loop.merger.removal_ledger, (
+            f"Dropped ik_key must appear in merger.removal_ledger; "
+            f"ledger={list(loop.merger.removal_ledger.keys())}"
+        )
+        entry = loop.merger.removal_ledger["key_same_as_victim"]
+        assert entry["reason"] == "enrichment_same_as", (
+            f"Expected reason='enrichment_same_as'; got {entry['reason']!r}"
+        )
+        assert entry["merged_into"] == "Alice", (
+            f"Expected merged_into='Alice' (the keep node); got {entry['merged_into']!r}"
+        )
+
+    def test_failed_contraction_does_not_write_to_ledger(self, tmp_path, monkeypatch):
+        """A contraction that raises does NOT write phantom entries to ledger."""
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        graph.add_node(
+            "BadKeep",
+            entity_type="person",
+            attributes={},
+            recurrence_count=1,
+            sessions=["s020"],
+            first_seen="s020",
+            last_seen="s020",
+        )
+        graph.add_node(
+            "BadDrop",
+            entity_type="person",
+            attributes={},
+            recurrence_count=1,
+            sessions=["s021"],
+            first_seen="s021",
+            last_seen="s021",
+        )
+        eid = graph.add_edge(
+            "BadKeep",
+            "BadDrop",
+            predicate="related",
+            relation_type="factual",
+            confidence=0.9,
+            source="extraction",
+            sessions=["s020"],
+        )
+        graph["BadKeep"]["BadDrop"][eid][_IK_KEY_ATTR] = "key_bad_victim"
+
+        canned_result = (
+            [],
+            [["BadKeep", "BadDrop"]],
+            "raw",
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+        # Patch contracted_nodes to always raise so the contraction fails.
+        with (
+            patch(
+                "paramem.training.consolidation._graph_enrich_with_sota",
+                return_value=canned_result,
+            ),
+            patch("networkx.contracted_nodes", side_effect=ValueError("forced failure")),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert result["same_as_merges"] == 0, "No merges should succeed when contracted_nodes fails"
+        assert "key_bad_victim" not in loop.merger.removal_ledger, (
+            "Failed contraction must NOT write to removal_ledger"
+        )

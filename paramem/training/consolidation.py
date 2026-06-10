@@ -2784,9 +2784,17 @@ class ConsolidationLoop:
             or (adapter_name not in self.model.peft_config and not cap_reached_absorb)
         )
         if is_fresh_slot:
+            # Debug: snapshot the merged graph BEFORE interim enrichment mutates it.
+            # Self-gated; no-op when save_cycle_snapshots=False.
+            self._debug_writer.on_fold_graph(self.merger, label="merged", interim_stamp=stamp)
             self._maybe_run_interim_enrichment()
+            # Debug: snapshot the enriched graph AFTER interim enrichment.
+            # Self-gated; no-op when save_cycle_snapshots=False.
+            self._debug_writer.on_fold_graph(self.merger, label="enriched", interim_stamp=stamp)
 
-        # --- End-of-extraction debug dump (cumulative graph + relations) ---
+        # --- End-of-extraction debug dump (per-tier relation lists) ---
+        # The cumulative-graph write was removed from on_extraction_end; graph
+        # snapshots are now emitted by on_fold_graph above (merged + enriched).
         # Fires after enrichment mutates the cumulative graph; the writer
         # self-gates on save_cycle_snapshots so the call is unconditional.
         self._debug_writer.on_extraction_end(episodic_rels, procedural_rels, interim_stamp=stamp)
@@ -3059,6 +3067,8 @@ class ConsolidationLoop:
 
         import networkx as nx
 
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
         _empty = {"chunks": 0, "new_edges": 0, "same_as_merges": 0}
 
         if not self.graph_enrichment_enabled:
@@ -3138,6 +3148,11 @@ class ConsolidationLoop:
         total_merges = 0
         calls_made = 0
         seen_merge_keys: set[frozenset] = set()
+        # Accumulates ik_keys from edges dropped by successful same_as contractions.
+        # Keys are written to self.merger.removal_ledger after the loop completes
+        # so the classifier can distinguish intended enrichment-driven removals from
+        # genuine reconstruction failures.
+        _collapsed_ik: dict[str, str] = {}  # ik_key → keep node
 
         for chunk_nodes in chunks:
             try:
@@ -3196,9 +3211,21 @@ class ConsolidationLoop:
                         drop,
                     )
                     continue
+                # Collect ik_keys from edges in both directions that will become
+                # self-loops (and be dropped by self_loops=False) on success.
+                # Use inner-dict .values() iteration — MultiDiGraph get_edge_data
+                # returns {edge_id: data_dict}; do NOT treat the outer dict as data.
+                _pending: dict[str, str] = {}
+                for _u, _v in [(keep, drop), (drop, keep)]:
+                    for _edata in (graph.get_edge_data(_u, _v) or {}).values():
+                        _ik = _edata.get(_IK_KEY_ATTR)
+                        if _ik:
+                            _pending[_ik] = keep
                 try:
                     nx.contracted_nodes(graph, keep, drop, self_loops=False, copy=False)
                     total_merges += 1
+                    # Success — absorb pending keys into the accumulator.
+                    _collapsed_ik.update(_pending)
                     coref_map[drop] = keep
                     logger.debug("graph_enrichment: contracted %r → %r", drop, keep)
                 except Exception as exc:
@@ -3288,6 +3315,15 @@ class ConsolidationLoop:
             total_new,
             total_merges,
         )
+        # Write enrichment-collapsed ik_keys to the merger's removal ledger so the
+        # drift classifier can route them to drift_intended_removal rather than
+        # drift_genuine_loss.  Only keys from SUCCESSFUL contractions are written
+        # (failures were discarded from _pending before _collapsed_ik was updated).
+        for _ik, _keep in _collapsed_ik.items():
+            self.merger.removal_ledger[_ik] = {
+                "reason": "enrichment_same_as",
+                "merged_into": _keep,
+            }
         # Reset the accumulator — any subsequent interim-rollover pass must
         # re-cross the floor before firing again.
         self._triples_since_last_enrichment = 0
@@ -3809,10 +3845,18 @@ class ConsolidationLoop:
             Result dict with keys:
                 {
                     "tiers_rebuilt": list[str],
-                    "graph_drift_count": int,        # total absent keys (backward-compat)
-                    "drift_deduplicated": int,        # exact-SPO collapse; fact preserved
-                    "drift_orphan": int,              # no SPO content; correctly dropped
-                    "drift_genuine_loss": int,        # real reconstruction failure
+                    # total absent keys (backward-compat)
+                    "graph_drift_count": int,
+                    # exact-SPO collapse; fact preserved
+                    "drift_deduplicated": int,
+                    # no SPO content; correctly dropped
+                    "drift_orphan": int,
+                    # reconstruction failure / hydration-miss
+                    "drift_genuine_loss": int,
+                    # merger-recorded intentional removal
+                    "drift_intended_removal": int,
+                    # reason → count breakdown
+                    "drift_intended_removal_by_reason": dict,
                     "keys_per_tier": dict[str, int],
                     "recall_per_tier": dict[str, float],
                     "rolled_back": bool,
@@ -3922,6 +3966,10 @@ class ConsolidationLoop:
         # Two registry keys sharing identical (s,p,o) STILL fire Case-1 (the merger
         # identity is correct given correct inputs), and the collapsed key is recorded
         # in merger.collapsed.  The drift-partition step below soft-stales that key.
+        # Debug: snapshot the reconstructed graph (before re-merge mutates the
+        # keying surface).  Self-gated; no-op when save_cycle_snapshots=False.
+        self._debug_writer.on_fold_graph(recon_result.graph, label="reconstructed")
+
         recon_relations: list[Relation] = self._build_registry_true_relations()
 
         if recon_relations:
@@ -3946,6 +3994,11 @@ class ConsolidationLoop:
                 len(recon_relations),
             )
 
+        # Debug: snapshot the merged graph (after re-merge, before enrichment).
+        # Emits even when recon_relations is empty so the fold always produces a
+        # merged snapshot.  Self-gated; no-op when save_cycle_snapshots=False.
+        self._debug_writer.on_fold_graph(self.merger, label="merged")
+
         # --- Stage 2.5: Graph-level SOTA enrichment (Task #10) ---
         # Runs AFTER the Stage-2 re-merge so enrichment operates on the populated
         # reconstructed graph (not an empty one).  Under production defaults the
@@ -3966,6 +4019,10 @@ class ConsolidationLoop:
                 enrichment_result.get("new_edges", 0),
                 enrichment_result.get("same_as_merges", 0),
             )
+
+        # Debug: snapshot the enriched graph (after SOTA enrichment).
+        # Self-gated; no-op when save_cycle_snapshots=False.
+        self._debug_writer.on_fold_graph(self.merger, label="enriched")
 
         if recon_relations:
             # --- Recurrence bump: Case-1 duplicate-SPO collapses ---
@@ -4099,6 +4156,10 @@ class ConsolidationLoop:
                     "object": entry["object"],
                 }
             )
+
+        # Debug: snapshot the graph after Stage-5 keying loop (before Pass-2 mutates
+        # tier_keyed).  Self-gated; no-op when save_cycle_snapshots=False.
+        self._debug_writer.on_fold_graph(self.merger, label="keyed")
 
         # --- Pass-2: Per-tier floor gate (must run BEFORE _all_keyed is computed) ---
         # R4: Pass-2 inserts here (4101–4108), before _all_keyed so the post-park,
@@ -4241,6 +4302,9 @@ class ConsolidationLoop:
             train_assignment["episodic"] = list(_ep_union.values())
             train_assignment[_fst] = []
 
+        # Debug: persist serve/train tier assignment maps.  Self-gated.
+        self._debug_writer.on_fold_assignments(serve_assignment, train_assignment)
+
         # --- Whole-fold accumulate guard ---
         # After Pass-2, any under-floor non-episodic tier is empty (parked into
         # episodic).  If episodic itself is also below the floor, the total
@@ -4285,6 +4349,8 @@ class ConsolidationLoop:
                 "drift_deduplicated": 0,
                 "drift_orphan": 0,
                 "drift_genuine_loss": 0,
+                "drift_intended_removal": 0,
+                "drift_intended_removal_by_reason": {},
                 "recall_miss_keys": [],
                 "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
                 "tier_keyed": serve_assignment,
@@ -4327,6 +4393,10 @@ class ConsolidationLoop:
         # KeyRegistry.stale() removes the key from _active_keys, so
         # tier_for_active_key() called AFTER the flip returns None.
         _collapsed_set: set[str] = set(getattr(self.merger, "collapsed", []))
+        # Removal ledger: records every edge removed by the merger (dedup,
+        # contradiction, enrichment same_as) with a stable reason code.
+        # Keyed by the removed edge's ik_key; values carry "reason" + per-reason detail.
+        _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
 
         drift_deduplicated: list[str] = []
         drift_orphan: list[str] = []
@@ -4335,6 +4405,12 @@ class ConsolidationLoop:
         # they are retrained; they should trend to ~0.  Kept as a counter for
         # monitoring but they are NOT dropped.
         drift_genuine_loss: list[str] = []
+        # drift_intended_removal: keys removed by the merger for a known, intentional
+        # reason (enrichment same_as contraction, contradiction resolution).  These
+        # are RETAIN-ONLY — no staling, no tier-resolution.  Separate from dedup
+        # which has its own soft-stale semantics.
+        drift_intended_removal: list[str] = []
+        drift_intended_removal_by_reason: dict[str, int] = {}
 
         # Per-tier dict capturing soft-staled keys for _reset_main_tier_registries_and_simhashes.
         # Maps tier -> {key: {"stale_since": ISO, "stale_cycles": int, "simhash": int | None}}.
@@ -4358,6 +4434,18 @@ class ConsolidationLoop:
                     if _dk_simhash is not None:
                         _stale_rec["simhash"] = _dk_simhash
                     soft_stale_by_tier.setdefault(_dk_tier, {})[_dk] = _stale_rec
+            elif _dk in _ledger:
+                # Intended removal: the merger recorded a known-reason removal for
+                # this key (enrichment same_as contraction or contradiction
+                # resolution).  RETAIN-ONLY — no staling, no tier-resolution.
+                # Note: dedup keys are ALSO in _ledger, but the _collapsed_set
+                # branch above fires first for them (preserving soft-stale + R4
+                # semantics).  Only non-collapsed ledger entries reach here.
+                drift_intended_removal.append(_dk)
+                _r = _ledger[_dk]["reason"]
+                drift_intended_removal_by_reason[_r] = (
+                    drift_intended_removal_by_reason.get(_r, 0) + 1
+                )
             else:
                 _dk_bk = self.store.bookkeeping_for_key(_dk)
                 _dk_entry = self.store.get(_dk)
@@ -4388,6 +4476,7 @@ class ConsolidationLoop:
         drift_deduplicated_count = len(drift_deduplicated)
         drift_orphan_count = len(drift_orphan)
         drift_genuine_loss_count = len(drift_genuine_loss)
+        drift_intended_removal_count = len(drift_intended_removal)
 
         # R4 invariant: soft-stale keys must be disjoint from _all_keyed.
         # A key in both sets would be trained as active this fold AND written to
@@ -4434,6 +4523,13 @@ class ConsolidationLoop:
                 (_dk_entry or {}).get("predicate", ""),
                 (_dk_entry or {}).get("object", ""),
             )
+        for _dk in drift_intended_removal:
+            logger.info(
+                "graph_drift_key key=%s bucket=intended_removal reason=%s"
+                " (merger-recorded intentional removal — key retained, not staled)",
+                _dk,
+                (_ledger.get(_dk) or {}).get("reason", ""),
+            )
 
         if drift_deduplicated_count:
             logger.info(
@@ -4446,22 +4542,33 @@ class ConsolidationLoop:
                 "consolidate_interim_adapters: %d orphan key(s) dropped (no SPO content)",
                 drift_orphan_count,
             )
+        if drift_intended_removal_count:
+            logger.info(
+                "consolidate_interim_adapters: %d key(s) in intended_removal"
+                " (merger-recorded removal: by_reason=%s)",
+                drift_intended_removal_count,
+                drift_intended_removal_by_reason,
+            )
 
-        # Gate the WARNING on genuine_loss only — dedup and orphan are expected/normal.
-        # Under Mode 1 genuine_loss should trend to ~0 (registry-true merge input means
-        # a recall miss keeps the key in training).
+        # Gate the WARNING on genuine_loss only — dedup, orphan, and intended_removal
+        # are expected/normal.  Under Mode 1 genuine_loss should trend to ~0
+        # (registry-true merge input means a recall miss keeps the key in training).
+        # genuine_loss now strictly covers reconstruction failure or hydration-miss —
+        # enrichment/contradiction removals are captured in drift_intended_removal.
         if drift_genuine_loss_count > 0:
             logger.warning(
                 "consolidate_interim_adapters: %d genuine reconstruction loss(es) — "
-                "these keys had content but produced no merged edge; they were retrained"
-                " with registry-true content (should trend to ~0): %s",
+                "these keys had content but produced no merged edge (reconstruction"
+                " failure or hydration-miss); they were retrained with registry-true"
+                " content (should trend to ~0): %s",
                 drift_genuine_loss_count,
                 drift_genuine_loss,
             )
 
         logger.info(
             "consolidate_interim_adapters: key distribution — episodic=%d semantic=%d "
-            "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d)",
+            "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d"
+            " intended_removal=%d)",
             len(serve_assignment["episodic"]),
             len(serve_assignment["semantic"]),
             len(serve_assignment["procedural"]),
@@ -4469,7 +4576,12 @@ class ConsolidationLoop:
             drift_deduplicated_count,
             drift_orphan_count,
             drift_genuine_loss_count,
+            drift_intended_removal_count,
         )
+
+        # Debug: persist the merger removal ledger (final — reset_graph cleared it
+        # before the fold, re-merge + enrichment populated it).  Self-gated.
+        self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
         # --- Step 4: Build per-tier TrainingJob objects ---
         # Must be constructed before any tier rebuild begins so that
@@ -4913,23 +5025,29 @@ class ConsolidationLoop:
 
         logger.info(
             "consolidate_interim_adapters: complete — rebuilt %s, drift=%d"
-            " (deduplicated=%d orphan=%d genuine_loss=%d)",
+            " (deduplicated=%d orphan=%d genuine_loss=%d intended_removal=%d)",
             tiers_rebuilt,
             graph_drift_count,
             drift_deduplicated_count,
             drift_orphan_count,
             drift_genuine_loss_count,
+            drift_intended_removal_count,
         )
 
         return {
             "tiers_rebuilt": tiers_rebuilt,
             # graph_drift_count: total keys absent from tier_keyed (backward-compat).
             "graph_drift_count": graph_drift_count,
-            # 3-way breakdown — callers that want accurate data-loss signal use these.
+            # 4-way breakdown — callers that want accurate data-loss signal use these.
             "drift_deduplicated": drift_deduplicated_count,
             "drift_orphan": drift_orphan_count,
             # Under Mode 1 genuine_loss = retry keys (not dropped); should trend to ~0.
+            # Strictly covers reconstruction failure / hydration-miss only.
             "drift_genuine_loss": drift_genuine_loss_count,
+            # Merger-recorded intentional removals (enrichment, contradiction).
+            # RETAIN-ONLY: keys are not staled, not dropped, not trained (absorbed).
+            "drift_intended_removal": drift_intended_removal_count,
+            "drift_intended_removal_by_reason": drift_intended_removal_by_reason,
             # recall_miss_keys: keys whose reconstructed SPO disagreed with registry-true
             # SPO, or whose reconstruction failed.  Retry signal; keys were retrained.
             "recall_miss_keys": sorted(recall_miss_keys),

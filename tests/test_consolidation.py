@@ -3804,6 +3804,448 @@ class TestDriftPartitioning:
         )
 
 
+class TestDriftIntendedRemoval:
+    """Tests for the drift_intended_removal bucket (merger ledger consumer).
+
+    These tests seed loop.merger.removal_ledger directly because
+    _run_graph_enrichment is mocked in _run_with_mocks — the ledger entries
+    that enrichment would write are supplied manually.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path, *, merger_graph):
+        return TestConsolidateInterimAdaptersFullFlow._make_loop(
+            tmp_path, merger_graph=merger_graph
+        )
+
+    @staticmethod
+    def _run_with_mocks(loop, tmp_path, reconstruct_return):
+        return TestConsolidateInterimAdaptersFullFlow._run_with_mocks(
+            loop, tmp_path, reconstruct_return
+        )
+
+    def test_enrichment_same_as_routes_to_intended_removal_not_genuine_loss(self, tmp_path):
+        """A key whose edge was dropped by enrichment same_as contraction must land
+        in drift_intended_removal, NOT drift_genuine_loss.
+
+        Setup: one surviving key (key_ok, present in recon graph) and one key
+        (key_enrichment) that has content but no recon edge.  _run_graph_enrichment
+        is replaced with a side_effect that populates removal_ledger at call time
+        (i.e. AFTER reset_graph() clears it) to faithfully replicate the real
+        enrichment code path.
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        recon_g = nx.MultiDiGraph()
+        eid_ok = recon_g.add_edge("Dave", "London", predicate="lives_in")
+        recon_g["Dave"]["London"][eid_ok][_IK_KEY_ATTR] = "key_ok"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)
+
+        # key_ok — survives (recon edge present, full SPO).
+        loop.store.put(
+            "episodic",
+            "key_ok",
+            {
+                "key": "key_ok",
+                "subject": "Dave",
+                "predicate": "lives_in",
+                "object": "London",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_ok", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        # key_enrichment — active key, no recon edge; will be written to the ledger
+        # by the custom enrichment side_effect (after reset_graph clears the ledger).
+        loop.store.put(
+            "episodic",
+            "key_enrichment",
+            {
+                "key": "key_enrichment",
+                "subject": "Alice",
+                "predicate": "alias_of",
+                "object": "Alicia",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "key_enrichment",
+            speaker_id="Speaker0",
+            first_seen_cycle=1,
+            relation_type="factual",
+        )
+
+        def _enrichment_side_effect():
+            # Called AFTER reset_graph() and Stage-2 re-merge.  At this point the
+            # merged graph has an Alice→Alicia alias_of edge carrying key_enrichment.
+            # Simulate the real same_as contraction: the edge becomes a self-loop and
+            # is dropped; we replicate that by removing all Alice→Alicia edges.
+            g = loop.merger.graph
+            edges_to_remove = list(g.out_edges("Alice", keys=True))
+            for u, v, k in edges_to_remove:
+                if v == "Alicia":
+                    g.remove_edge(u, v, key=k)
+            # Write the ledger entry exactly as real _run_graph_enrichment does.
+            loop.merger.removal_ledger["key_enrichment"] = {
+                "reason": "enrichment_same_as",
+                "merged_into": "Alice",
+            }
+            return {"skipped": False, "new_edges": 0, "same_as_contractions": 1}
+
+        from unittest.mock import patch
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+        from paramem.training.consolidation import ConsolidationLoop
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=ReconstructionResult(graph=recon_g),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    side_effect=_enrichment_side_effect,
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch("paramem.training.trainer.train_adapter", return_value={"aborted": False}),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert result["drift_intended_removal"] == 1, (
+            f"Expected drift_intended_removal=1; got {result['drift_intended_removal']}"
+        )
+        assert result["drift_intended_removal_by_reason"] == {"enrichment_same_as": 1}, (
+            f"Expected by_reason={{'enrichment_same_as': 1}}; "
+            f"got {result['drift_intended_removal_by_reason']}"
+        )
+        assert result["drift_genuine_loss"] == 0, (
+            f"Expected drift_genuine_loss=0 (enrichment is NOT genuine loss); "
+            f"got {result['drift_genuine_loss']}"
+        )
+
+    def test_dedup_key_still_routes_through_collapsed_branch(self, tmp_path):
+        """A duplicate-SPO key that is in BOTH _collapsed_set and removal_ledger
+        must still be classified as drift_deduplicated (soft-staled) — the
+        _collapsed_set branch fires first (load-bearing for R4 / soft-stale).
+
+        Regression guard: the new elif _dk in _ledger branch must NOT intercept
+        dedup keys.
+        """
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        recon_g = nx.MultiDiGraph()
+        eid1 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid1][_IK_KEY_ATTR] = "key_dup1"
+        eid2 = recon_g.add_edge("Alice", "Berlin", predicate="lives_in")
+        recon_g["Alice"]["Berlin"][eid2][_IK_KEY_ATTR] = "key_dup2"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=None)
+
+        for key in ("key_dup1", "key_dup2"):
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alice",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                    "speaker_id": "Speaker0",
+                    "first_seen_cycle": 1,
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            )
+
+        # Pre-seed ledger for key_dup2 as well — to prove it doesn't divert to
+        # intended_removal (the _collapsed_set branch must win).
+        loop.merger.removal_ledger["key_dup2"] = {
+            "reason": "dedup",
+            "surviving_twin": "key_dup1",
+        }
+
+        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        assert result["drift_deduplicated"] == 1, (
+            f"Expected drift_deduplicated=1; got {result['drift_deduplicated']}"
+        )
+        assert result["drift_intended_removal"] == 0, (
+            f"Expected drift_intended_removal=0 (dedup key must use collapsed branch); "
+            f"got {result['drift_intended_removal']}"
+        )
+        assert result["drift_genuine_loss"] == 0, (
+            f"Expected drift_genuine_loss=0; got {result['drift_genuine_loss']}"
+        )
+        # key_dup2 must be in recall_miss_keys — absence from tier_keyed.
+        assert "key_dup2" not in {e["key"] for t in result["tier_keyed"].values() for e in t}, (
+            "key_dup2 must not survive (collapsed)"
+        )
+
+
+class TestFoldGraphDebug:
+    """Tests for DebugSnapshotWriter.on_fold_graph, on_removal_ledger,
+    on_fold_assignments.
+    """
+
+    def _make_writer(self, tmp_path, *, debug_on: bool = True):
+        """Build a minimal loop + DebugSnapshotWriter with optional debug gate."""
+        from unittest.mock import MagicMock
+
+        from paramem.training.debug_snapshot import DebugSnapshotWriter
+
+        base_dir = tmp_path / "cycle_1" / "run_test"
+        loop = MagicMock()
+        loop.save_cycle_snapshots = debug_on
+        loop._debug_base = tmp_path if debug_on else None
+        loop._current_interim_stamp_or_none = MagicMock(return_value=None)
+        loop.snapshot_dir_for = MagicMock(return_value=base_dir)
+        return loop, DebugSnapshotWriter(loop)
+
+    def test_on_fold_graph_merger_writes_fold_subdir(self, tmp_path):
+        """on_fold_graph(merger, label='merged') writes fold/graph_merged_snapshot.json
+        via merger.save_graph when input is a GraphMerger (has save_graph).
+        """
+        from unittest.mock import MagicMock
+
+        loop, writer = self._make_writer(tmp_path)
+        base_dir = loop.snapshot_dir_for()
+
+        merger_mock = MagicMock()
+        # Simulate GraphMerger: has save_graph.
+        merger_mock.save_graph = MagicMock()
+
+        writer.on_fold_graph(merger_mock, label="merged")
+
+        merger_mock.save_graph.assert_called_once_with(
+            base_dir / "fold" / "graph_merged_snapshot.json",
+            encrypted=False,
+        )
+
+    def test_on_fold_graph_bare_graph_writes_fold_subdir(self, tmp_path):
+        """on_fold_graph(nx_graph, label='reconstructed') writes
+        fold/graph_reconstructed_snapshot.json via save_memory_to_disk.
+        """
+        import json
+        from unittest.mock import patch
+
+        import networkx as nx
+
+        loop, writer = self._make_writer(tmp_path)
+        base_dir = loop.snapshot_dir_for()
+
+        g = nx.MultiDiGraph()
+        g.add_node("Alice")
+        calls = []
+
+        def _fake_save(graph, path, *, encrypted):
+            calls.append((path, encrypted))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(nx.node_link_data(graph)))
+
+        with patch("paramem.memory.persistence.save_memory_to_disk", side_effect=_fake_save):
+            writer.on_fold_graph(g, label="reconstructed")
+
+        assert len(calls) == 1
+        assert calls[0][0] == base_dir / "fold" / "graph_reconstructed_snapshot.json"
+        assert calls[0][1] is False
+
+    def test_on_fold_graph_interim_no_fold_subdir(self, tmp_path):
+        """on_fold_graph with interim_stamp writes at base root, not under fold/."""
+        from unittest.mock import MagicMock
+
+        loop, writer = self._make_writer(tmp_path)
+        loop._current_interim_stamp_or_none = MagicMock(return_value="20260610_1200")
+        base_dir = loop.snapshot_dir_for()
+
+        merger_mock = MagicMock()
+        merger_mock.save_graph = MagicMock()
+
+        writer.on_fold_graph(merger_mock, label="merged", interim_stamp="20260610_1200")
+
+        merger_mock.save_graph.assert_called_once_with(
+            base_dir / "graph_merged_snapshot.json",
+            encrypted=False,
+        )
+
+    def test_on_fold_graph_no_op_when_debug_off(self, tmp_path):
+        """on_fold_graph is a no-op when save_cycle_snapshots=False."""
+        from unittest.mock import MagicMock
+
+        loop, writer = self._make_writer(tmp_path, debug_on=False)
+        merger_mock = MagicMock()
+        merger_mock.save_graph = MagicMock()
+
+        writer.on_fold_graph(merger_mock, label="enriched")
+
+        merger_mock.save_graph.assert_not_called()
+
+    def test_naming_parity_merged_interim_vs_fold(self, tmp_path):
+        """Interim and fold 'merged' snapshots share the same basename.
+
+        Guards against a future re-split that accidentally changes one path.
+        """
+        from unittest.mock import MagicMock
+
+        loop, writer = self._make_writer(tmp_path)
+
+        merger_mock = MagicMock()
+        merger_mock.save_graph = MagicMock()
+
+        # Fold path (no interim_stamp).
+        writer.on_fold_graph(merger_mock, label="merged")
+        fold_call = merger_mock.save_graph.call_args_list[-1]
+        fold_path = fold_call.args[0]
+
+        merger_mock.save_graph.reset_mock()
+
+        # Interim path.
+        writer.on_fold_graph(merger_mock, label="merged", interim_stamp="20260610_0900")
+        interim_call = merger_mock.save_graph.call_args_list[-1]
+        interim_path = interim_call.args[0]
+
+        # Same basename, different directories.
+        assert fold_path.name == interim_path.name == "graph_merged_snapshot.json", (
+            f"Basename mismatch: fold={fold_path.name!r} interim={interim_path.name!r}"
+        )
+        assert fold_path.parent.name == "fold", (
+            f"Fold path must be under 'fold/'; got {fold_path.parent.name!r}"
+        )
+        assert interim_path.parent.name != "fold", (
+            f"Interim path must NOT be under 'fold/'; got {interim_path.parent.name!r}"
+        )
+
+    def test_naming_parity_enriched(self, tmp_path):
+        """Interim and fold 'enriched' snapshots share the same basename."""
+        from unittest.mock import MagicMock
+
+        loop, writer = self._make_writer(tmp_path)
+        merger_mock = MagicMock()
+        merger_mock.save_graph = MagicMock()
+
+        writer.on_fold_graph(merger_mock, label="enriched")
+        fold_name = merger_mock.save_graph.call_args_list[-1].args[0].name
+        merger_mock.save_graph.reset_mock()
+
+        writer.on_fold_graph(merger_mock, label="enriched", interim_stamp="20260610_0900")
+        interim_name = merger_mock.save_graph.call_args_list[-1].args[0].name
+
+        assert fold_name == interim_name == "graph_enriched_snapshot.json"
+
+    def test_on_removal_ledger_writes_under_fold_subdir(self, tmp_path):
+        """on_removal_ledger writes fold/removal_ledger.json with the full ledger."""
+        import json
+
+        loop, writer = self._make_writer(tmp_path)
+        base_dir = loop.snapshot_dir_for()
+
+        ledger = {
+            "key_dup": {"reason": "dedup", "surviving_twin": "key_ok"},
+            "key_enriched": {"reason": "enrichment_same_as", "merged_into": "Alice"},
+        }
+        writer.on_removal_ledger(ledger)
+
+        out = base_dir / "fold" / "removal_ledger.json"
+        assert out.exists(), f"removal_ledger.json must exist; base={base_dir}"
+        saved = json.loads(out.read_text())
+        assert saved == ledger
+
+    def test_on_removal_ledger_no_op_when_debug_off(self, tmp_path):
+        """on_removal_ledger is a no-op when save_cycle_snapshots=False."""
+        loop, writer = self._make_writer(tmp_path, debug_on=False)
+        # Should not raise and should write nothing.
+        writer.on_removal_ledger({"k": {"reason": "dedup"}})
+        # Confirm no fold/ subdir was created.
+        assert not (tmp_path / "fold").exists()
+
+    def test_on_fold_assignments_writes_key_lists(self, tmp_path):
+        """on_fold_assignments writes fold/fold_assignments.json with per-tier key lists."""
+        import json
+
+        loop, writer = self._make_writer(tmp_path)
+        base_dir = loop.snapshot_dir_for()
+
+        serve = {
+            "episodic": [{"key": "ep1", "subject": "A", "predicate": "p", "object": "B"}],
+            "semantic": [{"key": "sem1", "subject": "X", "predicate": "q", "object": "Y"}],
+            "procedural": [],
+        }
+        train = {
+            "episodic": [
+                {"key": "ep1", "subject": "A", "predicate": "p", "object": "B"},
+                {"key": "sem1", "subject": "X", "predicate": "q", "object": "Y"},
+            ],
+            "semantic": [],
+            "procedural": [],
+        }
+        writer.on_fold_assignments(serve, train)
+
+        out = base_dir / "fold" / "fold_assignments.json"
+        assert out.exists(), f"fold_assignments.json must exist; base={base_dir}"
+        saved = json.loads(out.read_text())
+
+        assert saved["serve_assignment"] == {
+            "episodic": ["ep1"],
+            "semantic": ["sem1"],
+            "procedural": [],
+        }
+        assert saved["train_assignment"] == {
+            "episodic": ["ep1", "sem1"],
+            "semantic": [],
+            "procedural": [],
+        }
+
+    def test_on_fold_assignments_no_op_when_debug_off(self, tmp_path):
+        """on_fold_assignments is a no-op when save_cycle_snapshots=False."""
+        loop, writer = self._make_writer(tmp_path, debug_on=False)
+        writer.on_fold_assignments(
+            {"episodic": [], "semantic": [], "procedural": []},
+            {"episodic": [], "semantic": [], "procedural": []},
+        )
+        assert not (tmp_path / "fold").exists()
+
+
 class TestBookkeepingSchema:
     """Unit tests for the 5-field bookkeeping schema in MemoryStore."""
 
