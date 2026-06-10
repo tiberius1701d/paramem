@@ -317,15 +317,23 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
         )
         return 0
 
+    # W1 (§3.4b): the retention union includes BOTH active and stale keys so that
+    # a soft-staled key's bookkeeping survives the prune.  A stale key is absent
+    # from list_active() but present in list_stale(); pruning it would break the
+    # stale-echo seam (bookkeeping is required to resolve speaker/relation_type).
     active: set[str] = set()
     for tier in ("episodic", "semantic", "procedural"):
         reg_path = config.adapter_dir / tier / "indexed_key_registry.json"
         if reg_path.exists():
-            active.update(KeyRegistry.load(reg_path).list_active())
+            _loaded_reg = KeyRegistry.load(reg_path)
+            active.update(_loaded_reg.list_active())
+            active.update(_loaded_reg.list_stale())
     for _name, interim_dir in iter_interim_dirs(config.adapter_dir):
         reg_path = interim_dir / "indexed_key_registry.json"
         if reg_path.exists():
-            active.update(KeyRegistry.load(reg_path).list_active())
+            _loaded_reg = KeyRegistry.load(reg_path)
+            active.update(_loaded_reg.list_active())
+            active.update(_loaded_reg.list_stale())
 
     if not active:
         # Empty registry union with non-empty key_metadata: cannot prove the keys
@@ -370,7 +378,10 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     (CRITICAL Fix 1 — trial registry isolation, 2026-04-23).
     """
     keys_payload: dict = {}
-    for key in loop.store.all_active_keys():
+    # W1 (§3.4b): persist bookkeeping for BOTH active and stale keys so that
+    # stale-echo probes can resolve speaker/relation_type for a soft-staled key.
+    all_keys = list(loop.store.all_active_keys()) + list(loop.store.all_stale_keys())
+    for key in all_keys:
         bk = loop.store.bookkeeping_for_key(key) or {}
         keys_payload[key] = {
             "speaker_id": bk.get("speaker_id", ""),

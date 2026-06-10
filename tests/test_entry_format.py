@@ -295,11 +295,15 @@ class TestVerifyConfidence:
         assert confidence < 0.75
 
     def test_enriched_registry_shape(self):
-        """Enriched registry (dict-of-dicts) must also work."""
-        from paramem.memory.entry import build_enriched_registry
-
+        """verify_confidence accepts the enriched dict-of-dicts registry shape."""
         quad = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
-        enriched = build_enriched_registry([quad])
+        # Construct the enriched shape manually: {key: {"simhash": int, ...}}
+        enriched = {
+            "graph1": {
+                "simhash": compute_simhash("graph1", "Alice", "lives_in", "Berlin"),
+                "status": "active",
+            }
+        }
         assert verify_confidence(quad, enriched) == 1.0
 
 

@@ -186,6 +186,26 @@ consolidation:
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
   merge_at_interim: false      # false = Path B (cheap interim, merge deferred to full cycle); true = merge every interim
+  # Floor below which a tier's keys park in episodic (the always-trained large
+  # tier) instead of training a small under-separated adapter. semantic/procedural
+  # keys accumulate in episodic until the tier's own population reaches this floor,
+  # then graduate. Calibration-pending (GPU set-size sweep); 30 is the conservative
+  # default. Test 19: a small near-duplicate key set under-separates (7/10 recall);
+  # the same keys reach 51/51 once diluted into a large set — set size is the lever.
+  min_tier_key_floor: 30
+  # Graduation strategy when a parked tier first crosses min_tier_key_floor.
+  #   true (DEFAULT): copy the episodic adapter's LoRA weights into the graduating
+  #     tier and rebook the registry — TRAINING-FREE fast-start. The copied adapter
+  #     recalls its keys immediately at episodic's fidelity (episodic disk-verify
+  #     0.960 on 183 keys, above the 0.95 gate), because those keys were trained
+  #     mixed into the large episodic set (inherited dilution avoids small-set
+  #     under-separation). The 0.95 disk gate still runs on the copied adapter; if
+  #     it ever fails, that tier falls back to training from scratch for that cycle.
+  #   false (OPT-OUT, scientifically clean): train the tier from scratch on its own
+  #     now-large (>= floor) key set — every adapter is honestly trained on its own
+  #     keys, no inherited weights. The principled baseline and always-on safety net.
+  # Governs semantic/procedural graduation only; episodic always trains from scratch.
+  tier_fast_start: true
   # max_epochs: ceiling for LoRA training epochs per consolidation cycle.
   # Unset (or null) → use the validated 30-epoch default from the Test 1-8
   # campaign. Lower this only with empirical recall-vs-epochs evidence on

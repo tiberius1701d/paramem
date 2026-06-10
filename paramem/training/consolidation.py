@@ -809,6 +809,8 @@ class ConsolidationLoop:
         self,
         tier_keyed: dict[str, list[dict]],
         passing_sets_by_tier: "dict[str, set[str] | None] | None" = None,
+        *,
+        soft_stale_by_tier: "dict[str, dict[str, dict]] | None" = None,
     ) -> None:
         """Reset each main tier's KeyRegistry AND SimHash registry from ``tier_keyed``.
 
@@ -831,19 +833,42 @@ class ConsolidationLoop:
         blindly — that would constitute silent total knowledge loss if the model
         had not actually learned them.
 
+        B1 (soft-stale preservation): the fresh ``KeyRegistry()`` that replaces the
+        live registry would wipe any stale flip applied during the drift-partition
+        step.  Pass ``soft_stale_by_tier`` so the rebuilt registry seeds the stale
+        partition BEFORE adding passing (active) keys.  Stale simhashes are also
+        merged back into the rebuilt simhash dict so they survive on disk for the
+        stale-echo seam.
+
         Args:
             tier_keyed: Per-tier keyed-entry lists (full post-consolidation set).
             passing_sets_by_tier: Per-tier sets of keys that passed the recall
                 gate.  A ``None`` entry for a tier triggers the probe fallback.
                 Pass ``None`` for the entire dict to skip recall gating (legacy /
                 non-production caller).
+            soft_stale_by_tier: Per-tier dict of soft-staled keys captured at the
+                drift-partition step.  Keys map to
+                ``{"stale_cycles": int, "simhash": int | None}``.  When ``None``
+                (the default, for callers that do not have a stale partition), no
+                stale seeding occurs.
         """
+        _stale_partition = soft_stale_by_tier or {}
         for _main_tier in ("episodic", "semantic", "procedural"):
             keyed = tier_keyed.get(_main_tier, [])
+            _stale_recs = _stale_partition.get(_main_tier, {})
             if not keyed:
-                # No keys for this tier — clear the registry.
-                self.store.load_registry(_main_tier, KeyRegistry())
-                self.store.replace_simhashes_in_tier(_main_tier, {})
+                # No active keys for this tier — clear the registry but
+                # STILL seed any stale records (an empty tier with stale keys
+                # must retain them).
+                new_reg = KeyRegistry()
+                new_reg._stale = dict(_stale_recs)  # seed stale partition
+                self.store.load_registry(_main_tier, new_reg)
+                # Build an empty active-keys simhash dict, then merge stale simhashes back.
+                new_simhashes: dict[str, int] = {}
+                for _sk, _srec in _stale_recs.items():
+                    if "simhash" in _srec:
+                        new_simhashes[_sk] = _srec["simhash"]
+                self.store.replace_simhashes_in_tier(_main_tier, new_simhashes)
                 continue
 
             # Determine the recall-passing set for this tier.
@@ -870,11 +895,22 @@ class ConsolidationLoop:
                     )
                 keyed = [kp for kp in keyed if kp["key"] in passing]
 
+            # Build the fresh registry:
+            # (a) seed stale records FIRST (B1 — must survive the rebuild);
+            # (b) then add passing active keys.
             new_reg = KeyRegistry()
+            new_reg._stale = dict(_stale_recs)  # seed stale partition before active keys
             for kp in keyed:
                 new_reg.add(kp["key"])
             self.store.load_registry(_main_tier, new_reg)
-            self.store.replace_simhashes_in_tier(_main_tier, build_registry(keyed))
+
+            # Build fresh active-keys simhash dict, then merge stale simhashes back
+            # so on disk: active simhashes + stale simhashes (superset).
+            new_simhashes = dict(build_registry(keyed))
+            for _sk, _srec in _stale_recs.items():
+                if "simhash" in _srec:
+                    new_simhashes[_sk] = _srec["simhash"]
+            self.store.replace_simhashes_in_tier(_main_tier, new_simhashes)
 
     def _drop_interim_tier_registries(self) -> int:
         """Drop every interim tier registry from the store.
@@ -3625,6 +3661,83 @@ class ConsolidationLoop:
                 minted_by_tier["procedural"],
             )
 
+    def _build_registry_true_relations(self) -> "list[Relation]":
+        """Build registry-true :class:`Relation` objects for every active key.
+
+        Used as the fold's Stage-2 merge input so the merge surface is grounded
+        in registry-true (subject, predicate, object) content rather than the
+        lossy reconstruction result.
+
+        For each active non-stale key the content is sourced in priority order:
+
+        1. ``store.get(key)`` — the content cache entry (subject/predicate/object).
+        2. ``store.bookkeeping_for_key(key)`` — hydration-miss fallback (§3.3c W4):
+           when ``store.get`` returns ``None`` for a LIVE active key (e.g. under
+           ``boot_degraded``), but bookkeeping carries non-empty SPO, the key is
+           still present and must NOT be silently dropped.  Log a warning; source
+           SPO from bookkeeping.
+        3. If both are absent or empty-SPO: skip and log (true orphan; the
+           drift-orphan classification at the drift-partition site will bucket it).
+
+        ``relation_type`` and ``speaker_id`` always come from bookkeeping (never
+        from the entry payload which carries the merge-time value).
+
+        Returns a list of :class:`Relation` with ``indexed_key`` set so the key
+        travels through :class:`GraphMerger` onto the merged edge.
+        """
+        relations: list[Relation] = []
+        for key in self.store.all_active_keys():
+            entry = self.store.get(key)
+            bk = self.store.bookkeeping_for_key(key) or {}
+
+            if entry is not None:
+                subj = entry.get("subject", "")
+                pred = entry.get("predicate", "")
+                obj = entry.get("object", "")
+            else:
+                # W4: hydration-miss — entry cache is empty for this live key.
+                # Attempt bookkeeping SPO fallback before treating as orphan.
+                subj = bk.get("subject", "")
+                pred = bk.get("predicate", "")
+                obj = bk.get("object", "")
+                if subj or pred or obj:
+                    logger.warning(
+                        "_build_registry_true_relations: key=%s entry=None but "
+                        "bookkeeping has SPO — sourcing from bookkeeping (boot_degraded?)",
+                        key,
+                    )
+                else:
+                    logger.debug(
+                        "_build_registry_true_relations: key=%s has no entry and "
+                        "no bookkeeping SPO — skipping (orphan)",
+                        key,
+                    )
+                    continue
+
+            if not pred:
+                # No predicate: not keyable — skip.
+                logger.debug(
+                    "_build_registry_true_relations: key=%s has no predicate — skipping",
+                    key,
+                )
+                continue
+
+            rt_raw = bk.get("relation_type", _FALLBACK_RTYPE)
+            rt: str = rt_raw if rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+            spk: str = bk.get("speaker_id") or ""
+            relations.append(
+                Relation(
+                    subject=subj,
+                    predicate=pred,
+                    object=obj,
+                    relation_type=rt,  # type: ignore[arg-type]
+                    confidence=1.0,
+                    speaker_id=spk,
+                    indexed_key=key,
+                )
+            )
+        return relations
+
     def consolidate_interim_adapters(
         self,
         trainer=None,
@@ -3726,15 +3839,67 @@ class ConsolidationLoop:
         # from the trained weights.  Reconstruction yields SPO ONLY — no relation_type.
         # strict=False: failures are logged and recorded in recon_result.failures; the
         # cycle continues with whatever SPO triples can be recovered.
+        # HEALTH/RETRY SIGNAL (Mode 1): reconstruction is NO LONGER the content source
+        # for the merge input.  It is used ONLY to identify recall-miss keys (keys whose
+        # reconstructed SPO disagrees with registry-true SPO, or whose reconstruction
+        # failed outright).  A recall miss is a retry signal; the key stays in the
+        # training set with its registry-true content.  It does NOT drop the key.
         recon_result = reconstruct_graph(self, strict=False)
         if recon_result.failures:
             logger.warning(
                 "consolidate_interim_adapters: %d key(s) failed reconstruction "
-                "(will be sourced from merged graph only)",
+                "(retry signal — keys kept in training set with registry-true content)",
                 len(recon_result.failures),
             )
 
-        # --- Stage 2: Reset keying graph + re-merge reconstructed triples ---
+        # --- §3.3b: Compute recall-health/retry set BEFORE reset_graph() ---
+        # This MUST run after reconstruct_graph (which produces recon_result.graph
+        # as a SEPARATE nx.MultiDiGraph, distinct from self.merger.graph) and BEFORE
+        # reset_graph() (which clears self.merger.graph).  The ordering is safe because
+        # recon_result.graph is a freshly constructed MultiDiGraph
+        # (reconstruct.py:142) unaffected by the subsequent reset.
+        #
+        # Build a lookup of reconstructed SPO per key from the recon graph.
+        from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
+
+        _recon_spo_by_key: dict[str, tuple[str, str, str]] = {}
+        for _rh_subj, _rh_obj, _rh_data in recon_result.graph.edges(data=True):
+            _rh_key = _rh_data.get(_IK_ATTR, "")
+            _rh_pred = _rh_data.get("predicate", "")
+            if _rh_key and _rh_pred:
+                _recon_spo_by_key[_rh_key] = (_rh_subj, _rh_pred, _rh_obj)
+
+        # recall_miss_keys: keys whose reconstruction failed OR whose reconstructed
+        # SPO disagrees with registry-true SPO.  These are flagged for retrain but
+        # their registry-true triple still enters the merge input (never dropped).
+        recall_miss_keys: set[str] = set(recon_result.failures)
+        for _rh_key in self.store.all_active_keys():
+            _rt_entry = self.store.get(_rh_key)
+            _rt_subj = (_rt_entry or {}).get("subject", "") if _rt_entry else ""
+            _rt_pred = (_rt_entry or {}).get("predicate", "") if _rt_entry else ""
+            _rt_obj = (_rt_entry or {}).get("object", "") if _rt_entry else ""
+            _recon_spo = _recon_spo_by_key.get(_rh_key)
+            if _recon_spo is None:
+                # No recon edge: counts as failure (already in recon_result.failures or missing).
+                recall_miss_keys.add(_rh_key)
+            else:
+                _r_subj, _r_pred, _r_obj = _recon_spo
+                if (
+                    _r_subj != _rt_subj
+                    or _normalize_predicate(_r_pred) != _normalize_predicate(_rt_pred)
+                    or _r_obj != _rt_obj
+                ):
+                    recall_miss_keys.add(_rh_key)
+
+        if recall_miss_keys:
+            logger.info(
+                "consolidate_interim_adapters: %d key(s) in recall-miss set "
+                "(kept in training with registry-true content): %s",
+                len(recall_miss_keys),
+                sorted(recall_miss_keys),
+            )
+
+        # --- Stage 2: Reset keying graph + re-merge registry-true relations ---
         # IMPORTANT: Reset the merger's keying surface to EMPTY before re-merging
         # so Option-(a) provenance keying is unconditional.  Without the reset,
         # pre-existing edges from ingest-time merges or a loaded graph would share
@@ -3747,44 +3912,17 @@ class ConsolidationLoop:
             "consolidate_interim_adapters: keying graph reset to empty for Stage-2 re-merge"
         )
 
-        # Each reconstructed edge carries its registered key under _IK_ATTR (stamped by
-        # reconstruct_graph).  We set Relation.indexed_key from that value so the key
-        # travels through GraphMerger.merge() onto the merged edge (Part 1 provenance
-        # keying).  No triple-identity matching — the key is carried on the edge itself.
+        # --- §3.3a: Build merge input from registry-true SPO (NOT reconstruction) ---
+        # Each relation carries its indexed_key so the key travels through
+        # GraphMerger.merge() onto the merged edge (Part 1 provenance keying).
         #
         # additive=True (fold-only): the merger never removes a registered edge during
-        # Stage-2 re-merge.  All reconstructed keys coexist after the fold regardless
+        # Stage-2 re-merge.  All registry-true keys coexist after the fold regardless
         # of same-(s,p)/different-o conflicts; REPLACE cardinality is skipped.
-        # A key drifts only if its reconstruction failed (recon failure is the sole
-        # drift source under additive fold).
-        #
-        # Keys with no bookkeeping relation_type or relation_type=="unknown" fall back to
-        # _FALLBACK_RTYPE (currently "factual").
-        from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
-
-        recon_relations: list[Relation] = []
-        for _r_subj, _r_obj, _r_data in recon_result.graph.edges(data=True):
-            _r_key = _r_data.get(_IK_ATTR, "")
-            _r_pred = _r_data.get("predicate", "")
-            if not (_r_key and _r_pred):
-                continue
-            _r_bk = self.store.bookkeeping_for_key(_r_key) or {}
-            _r_rt_raw = _r_bk.get("relation_type", _FALLBACK_RTYPE)
-            # Clamp to valid schema values; "unknown" and missing map to the
-            # configured fallback (module-level _FALLBACK_RTYPE, currently "factual").
-            _r_rt: str = _r_rt_raw if _r_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
-            _r_spk: str = _r_bk.get("speaker_id") or ""
-            recon_relations.append(
-                Relation(
-                    subject=_r_subj,
-                    predicate=_r_pred,
-                    object=_r_obj,
-                    relation_type=_r_rt,  # type: ignore[arg-type]
-                    confidence=1.0,
-                    speaker_id=_r_spk,
-                    indexed_key=_r_key,  # carry key onto merged edge (Part 1)
-                )
-            )
+        # Two registry keys sharing identical (s,p,o) STILL fire Case-1 (the merger
+        # identity is correct given correct inputs), and the collapsed key is recorded
+        # in merger.collapsed.  The drift-partition step below soft-stales that key.
+        recon_relations: list[Relation] = self._build_registry_true_relations()
 
         if recon_relations:
             _synthetic_session = SessionGraph(
@@ -3898,12 +4036,12 @@ class ConsolidationLoop:
         # The deduplicated key is absent from tier_keyed but its fact is preserved
         # under the surviving twin — this is intended dedup, NOT data loss.
 
-        if recon_result.failures:
+        if recall_miss_keys:
             logger.info(
-                "consolidate_interim_adapters: %d reconstruction failure(s) — those "
-                "keys have no merged edge and will be counted as drift: %s",
-                len(recon_result.failures),
-                recon_result.failures,
+                "consolidate_interim_adapters: %d key(s) in recall-miss set "
+                "(retrained with registry-true content — not dropped): %s",
+                len(recall_miss_keys),
+                sorted(recall_miss_keys),
             )
 
         for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
@@ -3962,12 +4100,208 @@ class ConsolidationLoop:
                 }
             )
 
+        # --- Pass-2: Per-tier floor gate (must run BEFORE _all_keyed is computed) ---
+        # R4: Pass-2 inserts here (4101–4108), before _all_keyed so the post-park,
+        # post-graduation serve_assignment is the source for all downstream consumers:
+        # _all_keyed, last_seen refresh, and the Mode-1 soft-stale/drift partition.
+        #
+        # Two-map decoupling (v3 universal-donor redesign):
+        #   serve_assignment — which tier SERVES/RECALLS each key (registry + simhash
+        #                      owner).  This IS the returned "tier_keyed" layout.
+        #   train_assignment — what each adapter TRAINS on.  For fast-start graduating
+        #                      tiers, episodic trains on the graduating keys too (as
+        #                      universal donor); the graduating tier trains on nothing
+        #                      (empty list, copied from the informed episodic instead).
+        # The two maps are IDENTICAL for all steady-state and parked keys; they diverge
+        # ONLY for fast-start graduating tiers.  All downstream registry/drift/stale
+        # consumers read serve_assignment; only jobs_by_tier reads train_assignment.
+        #
+        # Liveness signal — disk-slot presence (NOT store-tier label, NOT peft_config):
+        #   _promote_mature_keys_inline store.move()s keys to "semantic" WITHOUT training
+        #   the semantic adapter.  After promotion, store.tier_for_active_key(key) ==
+        #   "semantic" even though the WEIGHTS are still in episodic.  Using the store
+        #   tier for liveness would wrongly exclude semantic from fast-start (the v2 bug,
+        #   §A.5 of the redesign plan).  The correct signal is whether the tier's
+        #   output_dir has any saved adapter slot written by a prior _save_adapters call.
+        #   A tier with NO disk slot was NEVER trained → first-cross graduation applies.
+        #   A tier WITH any disk slot was trained before → steady-state train normally.
+        #
+        # Episodic is the parking lot and is exempt from parking-into-episodic.
+        # Episodic's own floor (whole-fold accumulate) is handled by the
+        # accumulating early-return below.
+        _floor = self.config.min_tier_key_floor
+        # _fast_start_graduating: tiers graduating via copy-from-episodic this fold.
+        # The per-tier loop skips train_adapter for these and copies instead.
+        _fast_start_graduating: set[str] = set()
+
+        # Helper: True when tier has at least one saved adapter slot on disk.
+        # A slot name is a YYYYMMDD-HHMMSS timestamp (is_slot_name).  Using
+        # disk-slot presence (not store-tier, not peft_config) avoids the
+        # store-tier-vs-weights conflation for promotion-moved semantic keys.
+        def _tier_has_disk_slot(tier_name: str) -> bool:
+            from paramem.adapters.manifest import is_slot_name as _isn
+
+            tier_dir = self.output_dir / tier_name
+            if not tier_dir.is_dir():
+                return False
+            return any(entry.is_dir() and _isn(entry.name) for entry in tier_dir.iterdir())
+
+        # serve_assignment: repurpose tier_keyed as the served layout after Pass-2.
+        # The variable is renamed at the end of the pass; upstream Stage-5 code keeps
+        # tier_keyed as its local name until this rename point so no callers change.
+        for _pt in ("semantic", "procedural"):
+            _pt_entries = tier_keyed[_pt]
+            if not _pt_entries:
+                continue
+            if len(_pt_entries) < _floor:
+                # --- PARK: under floor — move to episodic ---
+                logger.info(
+                    "consolidate_interim_adapters: tier %s has %d key(s) < floor %d"
+                    " — parking in episodic until floor reached",
+                    _pt,
+                    len(_pt_entries),
+                    _floor,
+                )
+                for _pe in _pt_entries:
+                    tier_keyed["episodic"].append(_pe)
+                    # If the key is currently in a non-episodic store tier, move it back.
+                    _current_store_tier = self.store.tier_for_active_key(_pe["key"])
+                    if _current_store_tier is not None and _current_store_tier != "episodic":
+                        self.store.move(_pe["key"], "episodic")
+                    # Discard from promoted_keys so the key can be re-promoted on a
+                    # future fold once the tier's population crosses the floor.
+                    self.promoted_keys.discard(_pe["key"])
+                tier_keyed[_pt] = []
+            else:
+                # At or above floor.  Check whether this tier is graduating for the
+                # FIRST TIME — i.e. it has NO saved adapter slot on disk.  Liveness
+                # uses disk-slot presence to avoid the store-tier-vs-weights conflation:
+                # a promoted semantic key has store-tier "semantic" but its WEIGHTS are
+                # still in episodic (promotion does NOT train the semantic adapter).
+                _tier_is_live = _tier_has_disk_slot(_pt)
+                if not _tier_is_live:
+                    # First-time graduation: tier crossed floor and has no trained
+                    # adapter on disk — episodic's weights are the valid donor.
+                    if self.config.tier_fast_start:
+                        # Strategy (b): copy episodic weights + rebook.  The actual
+                        # copy runs in the per-tier loop; mark for fast-start here.
+                        # Keys STAY in tier_keyed[_pt] (serve_assignment[_pt]) so the
+                        # registry serves them from _pt.  NO store.move needed here —
+                        # semantic keys are already store-tier semantic (promotion);
+                        # procedural keys' deferred store.move runs at accept (:4563).
+                        logger.info(
+                            "consolidate_interim_adapters: tier %s graduating (fast-start)"
+                            " — %d key(s) >= floor %d; will copy episodic weights",
+                            _pt,
+                            len(_pt_entries),
+                            _floor,
+                        )
+                        _fast_start_graduating.add(_pt)
+                    else:
+                        # Strategy (a): move keys to their own store tier so they
+                        # train from scratch under the tier's own adapter config.
+                        # For semantic keys that are already store-tier "semantic" via
+                        # promotion, store.move is a no-op (move to same tier).
+                        logger.info(
+                            "consolidate_interim_adapters: tier %s graduating"
+                            " (train-from-scratch) — %d key(s) >= floor %d",
+                            _pt,
+                            len(_pt_entries),
+                            _floor,
+                        )
+                        for _pe in _pt_entries:
+                            self.store.move(_pe["key"], _pt)
+                # (No action needed for already-live tiers: they are >= floor
+                # and already have a disk slot — flow through normally.)
+
+        # Rename tier_keyed to serve_assignment at the end of Pass-2 so all
+        # downstream consumers read the served layout (not the training layout).
+        # The local name tier_keyed is reused in Stage-5 above to avoid upstream
+        # churn; from this point on only serve_assignment is read by registry,
+        # drift, and finalize consumers.
+        serve_assignment = tier_keyed
+
+        # Build train_assignment from serve_assignment: identical for all tiers
+        # except fast-start graduating ones.  Episodic is the UNIVERSAL DONOR:
+        # it trains on its own served keys PLUS every graduating tier's served keys,
+        # so the copy that follows reads an episodic adapter that already encodes
+        # all graduating keys.  A fast-start graduating tier trains on NOTHING (the
+        # copy replaces training); the dedup is a construction property of the union
+        # (graduating keys are in serve_assignment[T], NOT in serve_assignment["episodic"],
+        # so the two sets are disjoint — no per-key guard required).
+        train_assignment: dict[str, list[dict]] = {
+            t: list(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
+        }
+        for _fst in _fast_start_graduating:
+            # Build episodic's augmented training set as a dict keyed on entry["key"]
+            # to guarantee dedup (in case an upstream double-insert ever occurs).
+            _ep_union: dict[str, dict] = {e["key"]: e for e in train_assignment["episodic"]}
+            for _fse in serve_assignment[_fst]:
+                _ep_union.setdefault(_fse["key"], _fse)
+            train_assignment["episodic"] = list(_ep_union.values())
+            train_assignment[_fst] = []
+
+        # --- Whole-fold accumulate guard ---
+        # After Pass-2, any under-floor non-episodic tier is empty (parked into
+        # episodic).  If episodic itself is also below the floor, the total
+        # served set is too small — return accumulating without training.
+        # Read serve_assignment, NOT train_assignment: graduating keys inflate the
+        # episodic training set but the floor is about the SERVED key population.
+        _total_trainable = sum(len(v) for v in serve_assignment.values())
+        if _total_trainable < _floor:
+            logger.info(
+                "consolidate_interim_adapters: total trainable keys %d < floor %d"
+                " — returning accumulating (sessions stay pending)",
+                _total_trainable,
+                _floor,
+            )
+            _acc_parked = {
+                t: len(serve_assignment[t])
+                for t in ("semantic", "procedural")
+                if len(serve_assignment[t]) > 0
+            }
+            # Defensive cleanup: remove any backup adapter left by a prior aborted
+            # fold.  The accumulating early-return fires BEFORE this fold's Step-5
+            # backup-creation loop, so there are no new backups to clean up here —
+            # only pre-existing leftovers from an earlier run that crashed between
+            # backup-creation and Step-7 commit.
+            for _bname in ("episodic_backup", "semantic_backup", "procedural_backup"):
+                if _bname in self.model.peft_config:
+                    self.model.delete_adapter(_bname)
+                    logger.debug(
+                        "consolidate_interim_adapters: cleaned up stale backup %s"
+                        " (left by prior aborted fold) on accumulating return",
+                        _bname,
+                    )
+            return {
+                "status": "accumulating",
+                "accumulating_reason": {
+                    "floor": _floor,
+                    "parked": _acc_parked,
+                    "episodic": len(serve_assignment["episodic"]),
+                },
+                "tiers_rebuilt": [],
+                "graph_drift_count": 0,
+                "drift_deduplicated": 0,
+                "drift_orphan": 0,
+                "drift_genuine_loss": 0,
+                "recall_miss_keys": [],
+                "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
+                "tier_keyed": serve_assignment,
+                "recall_per_tier": {},
+                "rolled_back": False,
+                "rollback_tier": None,
+            }
+
         # Compute drift: active keys with no surviving merged edge after the fold.
         # Under additive fold, a key drifts iff its recon edge was absent (recon
         # failure) — REPLACE cardinality is skipped at fold time so it can never
         # remove a registered edge.  No triple-identity matching — provenance from
         # the merged edge is the sole authority.
-        _all_keyed = {e["key"] for tier_list in tier_keyed.values() for e in tier_list}
+        # serve_assignment is the authoritative served layout; train_assignment may
+        # contain additional graduating keys in episodic's training set but those
+        # must NOT influence drift/stale accounting (they are served from tier T).
+        _all_keyed = {e["key"] for tier_list in serve_assignment.values() for e in tier_list}
 
         # Refresh last_seen_cycle for every key that survived into tier_keyed.
         # A key whose adapter successfully recalled its fact this fold was
@@ -3982,32 +4316,72 @@ class ConsolidationLoop:
         active_keys = self.store.all_active_keys()
         _drift_keys = [k for k in active_keys if k not in _all_keyed]
 
-        # --- 3-way drift partition ---
+        # --- 3-way drift partition + soft-stale write-back (§3.3d) ---
         # merger.collapsed records INCOMING keys that were deduplicated away in a
-        # Case-1 duplicate-SPO collapse.  These are NOT data losses — the fact
-        # survives under the surviving twin key.
+        # Case-1 duplicate-SPO collapse.  Under Mode 1 the merge input is
+        # registry-true, so a Case-1 collapse means TWO registry keys genuinely
+        # share the same (s,p,o).  The discarded key is SOFT-STALED: registry entry
+        # retained, simhash retained, excluded from training.
+        #
+        # LOAD-BEARING ORDERING (§3.4a): resolve tier BEFORE flipping the key stale.
+        # KeyRegistry.stale() removes the key from _active_keys, so
+        # tier_for_active_key() called AFTER the flip returns None.
         _collapsed_set: set[str] = set(getattr(self.merger, "collapsed", []))
 
         drift_deduplicated: list[str] = []
         drift_orphan: list[str] = []
+        # drift_genuine_loss: reconstruction-failed non-duplicate keys now in the
+        # recall-miss/retry set.  Under Mode 1 these stay in recon_relations so
+        # they are retrained; they should trend to ~0.  Kept as a counter for
+        # monitoring but they are NOT dropped.
         drift_genuine_loss: list[str] = []
+
+        # Per-tier dict capturing soft-staled keys for _reset_main_tier_registries_and_simhashes.
+        # Maps tier -> {key: {"stale_since": ISO, "stale_cycles": int, "simhash": int | None}}.
+        soft_stale_by_tier: dict[str, dict[str, dict]] = {}
 
         for _dk in _drift_keys:
             if _dk in _collapsed_set:
                 drift_deduplicated.append(_dk)
+                # LOAD-BEARING: resolve tier BEFORE staling (staling removes from _active_keys).
+                _dk_tier = self.store.tier_for_active_key(_dk)
+                # Capture current simhash BEFORE any registry mutation so the finalize
+                # step can re-insert it into the rebuilt simhash dict.
+                _dk_simhash: int | None = None
+                if _dk_tier is not None:
+                    _dk_simhash = self.store.simhash(_dk_tier, _dk)
+                # Flip to stale in the live in-memory registry.
+                self.store.discard_keys([_dk], mode="stale")
+                # Record for finalize plumbing (§3.4a).
+                if _dk_tier is not None:
+                    _stale_rec = {"stale_cycles": 0}
+                    if _dk_simhash is not None:
+                        _stale_rec["simhash"] = _dk_simhash
+                    soft_stale_by_tier.setdefault(_dk_tier, {})[_dk] = _stale_rec
             else:
                 _dk_bk = self.store.bookkeeping_for_key(_dk)
                 _dk_entry = self.store.get(_dk)
-                _bk_subj = (_dk_bk or {}).get("subject", "") if _dk_bk else ""
-                _bk_pred = (_dk_bk or {}).get("predicate", "") if _dk_bk else ""
-                _bk_obj = (_dk_bk or {}).get("object", "") if _dk_bk else ""
-                # Orphan: the entry itself carries no subject/predicate/object content.
+                # W4 (§3.3c): distinguish hydration-miss from true orphan.
+                # Orphan: entry is present but carries empty SPO (all-empty test).
+                # Hydration-miss: entry is None but bookkeeping carries SPO — the
+                # key is live; the cache merely failed to hydrate (boot_degraded).
+                # In both cases we do NOT drop the key from training (it is already
+                # in recon_relations via _build_registry_true_relations).
                 _entry_subj = (_dk_entry or {}).get("subject", "")
                 _entry_pred = (_dk_entry or {}).get("predicate", "")
                 _entry_obj = (_dk_entry or {}).get("object", "")
+                _bk_subj = (_dk_bk or {}).get("subject", "")
+                _bk_pred = (_dk_bk or {}).get("predicate", "")
+                _bk_obj = (_dk_bk or {}).get("object", "")
                 if not _entry_subj and not _entry_pred and not _entry_obj:
-                    drift_orphan.append(_dk)
+                    if _bk_subj or _bk_pred or _bk_obj:
+                        # Hydration-miss: no content entry but bookkeeping has SPO.
+                        # Bucket as genuine_loss (recall miss, retry), not orphan.
+                        drift_genuine_loss.append(_dk)
+                    else:
+                        drift_orphan.append(_dk)
                 else:
+                    # Registry-true content present but no merged edge: recall miss / retry.
                     drift_genuine_loss.append(_dk)
 
         graph_drift_count = len(_drift_keys)
@@ -4015,12 +4389,29 @@ class ConsolidationLoop:
         drift_orphan_count = len(drift_orphan)
         drift_genuine_loss_count = len(drift_genuine_loss)
 
+        # R4 invariant: soft-stale keys must be disjoint from _all_keyed.
+        # A key in both sets would be trained as active this fold AND written to
+        # the stale partition — contradictory states that indicate tier_keyed[T]
+        # was cleared after _all_keyed was computed, which would be a regression.
+        _soft_stale_keys: set[str] = {
+            k for tier_stale in soft_stale_by_tier.values() for k in tier_stale
+        }
+        _stale_in_active = _soft_stale_keys & _all_keyed
+        if _stale_in_active:
+            logger.warning(
+                "consolidate_interim_adapters: R4 invariant violation — %d key(s) appear"
+                " in both soft_stale_by_tier and _all_keyed (trained as active AND stale);"
+                " this indicates tier_keyed was mutated after _all_keyed was built: %s",
+                len(_stale_in_active),
+                sorted(_stale_in_active),
+            )
+
         # Per-key log lines name the bucket so the journal is self-explanatory.
         for _dk in drift_deduplicated:
             _dk_entry = self.store.get(_dk)
             logger.info(
                 "graph_drift_key key=%s bucket=deduplicated subject=%r predicate=%r object=%r"
-                " (fact preserved under surviving twin key)",
+                " (registry-true duplicate — soft-staled; record retained for stale-echo seam)",
                 _dk,
                 (_dk_entry or {}).get("subject", ""),
                 (_dk_entry or {}).get("predicate", ""),
@@ -4034,9 +4425,10 @@ class ConsolidationLoop:
             )
         for _dk in drift_genuine_loss:
             _dk_entry = self.store.get(_dk)
-            logger.warning(
+            logger.info(
                 "graph_drift_key key=%s bucket=genuine_loss subject=%r predicate=%r object=%r"
-                " (reconstruction failed — real data loss)",
+                " (reconstruction failure or hydration-miss — retrained with registry-true"
+                " content; not a data loss)",
                 _dk,
                 (_dk_entry or {}).get("subject", ""),
                 (_dk_entry or {}).get("predicate", ""),
@@ -4045,8 +4437,8 @@ class ConsolidationLoop:
 
         if drift_deduplicated_count:
             logger.info(
-                "consolidate_interim_adapters: %d key(s) deduplicated (exact-SPO collapse;"
-                " fact preserved under surviving twin) — not a data loss",
+                "consolidate_interim_adapters: %d key(s) deduplicated (registry-true"
+                " duplicate; soft-staled — record retained, excluded from training)",
                 drift_deduplicated_count,
             )
         if drift_orphan_count:
@@ -4056,10 +4448,13 @@ class ConsolidationLoop:
             )
 
         # Gate the WARNING on genuine_loss only — dedup and orphan are expected/normal.
+        # Under Mode 1 genuine_loss should trend to ~0 (registry-true merge input means
+        # a recall miss keeps the key in training).
         if drift_genuine_loss_count > 0:
             logger.warning(
                 "consolidate_interim_adapters: %d genuine reconstruction loss(es) — "
-                "these keys had content but produced no merged edge; review recommended: %s",
+                "these keys had content but produced no merged edge; they were retrained"
+                " with registry-true content (should trend to ~0): %s",
                 drift_genuine_loss_count,
                 drift_genuine_loss,
             )
@@ -4067,9 +4462,9 @@ class ConsolidationLoop:
         logger.info(
             "consolidate_interim_adapters: key distribution — episodic=%d semantic=%d "
             "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d)",
-            len(tier_keyed["episodic"]),
-            len(tier_keyed["semantic"]),
-            len(tier_keyed["procedural"]),
+            len(serve_assignment["episodic"]),
+            len(serve_assignment["semantic"]),
+            len(serve_assignment["procedural"]),
             graph_drift_count,
             drift_deduplicated_count,
             drift_orphan_count,
@@ -4088,21 +4483,26 @@ class ConsolidationLoop:
 
         refresh_training_config = self._make_training_config(num_epochs=refresh_epochs)
 
+        # train_assignment drives each adapter's training set.  For fast-start
+        # graduating tiers, train_assignment[T] == [] (the tier is copied from the
+        # informed episodic, not trained); episodic's set is augmented with all
+        # graduating keys so the copy donor is informed before the copy reads it.
+        # All other tiers: train_assignment[T] == serve_assignment[T].
         jobs_by_tier = {
             "episodic": TrainingJob(
-                entries=tier_keyed["episodic"],
+                entries=train_assignment["episodic"],
                 adapter_name="episodic",
                 adapter_config=self.episodic_config,
                 inference_fallback_adapter="episodic_backup",
             ),
             "semantic": TrainingJob(
-                entries=tier_keyed["semantic"],
+                entries=train_assignment["semantic"],
                 adapter_name="semantic",
                 adapter_config=self.semantic_config,
                 inference_fallback_adapter="semantic_backup",
             ),
             "procedural": TrainingJob(
-                entries=tier_keyed["procedural"],
+                entries=train_assignment["procedural"],
                 adapter_name="procedural",
                 adapter_config=self.procedural_config or self.episodic_config,
                 inference_fallback_adapter="procedural_backup",
@@ -4154,7 +4554,12 @@ class ConsolidationLoop:
             backup_name = f"{tier}_backup"
             job = jobs_by_tier[tier]
 
-            if not job.entries:
+            # A fast-start graduating tier has train_assignment[T] == [] (it is
+            # copied from the informed episodic, not trained) but MUST reach the
+            # copy block below; skip only non-graduating empty-train tiers.
+            # Invariant: a fast-start graduating tier always has
+            # serve_assignment[T] >= floor, so the probe denominator is never 0.
+            if not job.entries and tier not in _fast_start_graduating:
                 logger.info(
                     "consolidate_interim_adapters: no keys for tier %s — skipping rebuild", tier
                 )
@@ -4190,6 +4595,106 @@ class ConsolidationLoop:
             from paramem.models.loader import switch_adapter as _sw
 
             _sw(self.model, tier)
+
+            # --- Fast-start graduation branch (strategy (b), R2 pre-save probe) ---
+            # When this tier graduated for the first time this fold via copy-from-
+            # episodic, copy the episodic adapter's LoRA weights into the fresh tier
+            # adapter, run a pre-save recall probe (R2), and — if the probe passes —
+            # rebook the keys into the tier's registry and add to tiers_rebuilt
+            # WITHOUT calling train_adapter.  If the probe fails, fall through to
+            # the normal train-from-scratch path (strategy (a) fall-back).
+            if tier in _fast_start_graduating:
+                from paramem.models.loader import copy_adapter_weights as _copy_aw
+                from paramem.models.loader import (
+                    copy_adapter_weights_subset as _copy_aw_subset,
+                )
+
+                # Semantic and episodic share the same 4 attn modules (equal param
+                # sets); procedural has 7 modules (attn+mlp) — use subset copy.
+                if tier == "procedural":
+                    _copy_aw_subset(self.model, src="episodic", dst=tier)
+                    logger.info(
+                        "consolidate_interim_adapters: fast-start graduation — "
+                        "copied episodic attn weights into procedural (mlp stays zero-init)"
+                    )
+                else:
+                    _copy_aw(self.model, src="episodic", dst=tier)
+                    logger.info(
+                        "consolidate_interim_adapters: fast-start graduation — "
+                        "copied episodic weights into %s (full param set)",
+                        tier,
+                    )
+
+                # R2: pre-save recall probe on the copied adapter (tier is now active).
+                # Use serve_assignment[tier] as the probe target — NOT job.entries, which
+                # is train_assignment[tier] == [] for a fast-start graduating tier.
+                # serve_assignment[tier] holds the keys T must recall after the copy.
+                _serve_entries = serve_assignment[tier]
+                _probe_passing = self._probe_passing_keys(tier, _serve_entries)
+                _probe_rate = len(_probe_passing) / len(_serve_entries) if _serve_entries else 1.0
+                logger.info(
+                    "consolidate_interim_adapters: fast-start graduation probe %s"
+                    " — %d/%d passed (%.3f), threshold %.3f",
+                    tier,
+                    len(_probe_passing),
+                    len(_serve_entries),
+                    _probe_rate,
+                    recall_sanity_threshold,
+                )
+
+                if _probe_rate >= recall_sanity_threshold:
+                    # Copy recalled at or above threshold: rebook keys and accept.
+                    # Iterate serve_assignment[tier], NOT job.entries (empty for fast-start).
+                    # For procedural: keys are still store-tier "episodic" (parked) →
+                    #   store.move genuinely rebooks them to "procedural".
+                    # For semantic: keys are already store-tier "semantic" (promotion) →
+                    #   store.move is a no-op (store.py:372-376), harmlessly elided.
+                    for _fse in _serve_entries:
+                        self.store.move(_fse["key"], tier)
+                    # Record None verdict so _reset_main_tier_registries_and_simhashes
+                    # falls into its _probe_passing_keys fail-safe, which will re-probe
+                    # the copied weights and admit only the passing keys.
+                    last_per_key_by_tier[tier] = None
+                    tiers_rebuilt.append(tier)
+                    logger.info(
+                        "consolidate_interim_adapters: fast-start graduation accepted"
+                        " for %s (%d keys rebooked)",
+                        tier,
+                        len(_serve_entries),
+                    )
+                    continue  # skip train_adapter for this tier
+
+                # Probe failed: fall back to strategy (a) — delete the copied adapter,
+                # recreate it fresh, and let the normal train path below handle it.
+                logger.warning(
+                    "consolidate_interim_adapters: fast-start probe FAILED for %s"
+                    " (%.3f < %.3f) — falling back to train-from-scratch",
+                    tier,
+                    _probe_rate,
+                    recall_sanity_threshold,
+                )
+                _fast_start_graduating.discard(tier)
+                # Restore train entries from serve set so the fallback train path
+                # trains T on its full ≥N serve set (train_assignment[T] was [] for
+                # fast-start; job.entries must be updated before format_entry_training).
+                job.entries = list(_serve_entries)
+                # Move keys to their own store tier so train-from-scratch uses the
+                # correct config and the registry reflects the new tier owner.
+                # For semantic keys already store-tier "semantic", store.move is no-op.
+                for _fse in _serve_entries:
+                    self.store.move(_fse["key"], tier)
+                # Recreate the adapter fresh (the copy corrupted its init).
+                if tier in self.model.peft_config:
+                    if backup_name in self.model.peft_config:
+                        _sw(self.model, backup_name)
+                    self.model.delete_adapter(tier)
+                self.model = create_adapter(self.model, tier_cfg, tier)
+                _sw(self.model, tier)
+                logger.debug(
+                    "consolidate_interim_adapters: recreated fresh adapter %s"
+                    " for fallback training",
+                    tier,
+                )
 
             # d. B2 re-arm: flip _is_training True BEFORE _train_adapter,
             #    False in finally so it fires on success AND failure.
@@ -4307,13 +4812,28 @@ class ConsolidationLoop:
             for _tier in ("episodic", "semantic", "procedural"):
                 _lpk = last_per_key_by_tier.get(_tier)
                 if _lpk is not None:
-                    passing_sets_by_tier[_tier] = {r["key"] for r in _lpk if r["exact_match"]}
+                    # Intersect with serve_assignment[_tier] so graduating keys whose
+                    # verdicts appear in episodic's last_per_key (because episodic
+                    # trained on the augmented set) cannot enter episodic's registry
+                    # or inflate the recall-gate log.  For semantic/procedural the
+                    # intersection is a no-op (they trained on their own serve set);
+                    # applying it uniformly is the clean invariant (§D of the plan).
+                    _serve_keys = {e["key"] for e in serve_assignment[_tier]}
+                    passing_sets_by_tier[_tier] = {
+                        r["key"] for r in _lpk if r["exact_match"]
+                    } & _serve_keys
                 else:
                     passing_sets_by_tier[_tier] = None
 
             # Reset each main tier's registry AND simhash to the post-consolidation
             # membership (the pairing is load-bearing — see the helper's docstring).
-            self._reset_main_tier_registries_and_simhashes(tier_keyed, passing_sets_by_tier)
+            # Thread soft_stale_by_tier so the rebuilt registry seeds the stale
+            # partition (B1 fix — a bare new KeyRegistry() would wipe it).
+            self._reset_main_tier_registries_and_simhashes(
+                serve_assignment,
+                passing_sets_by_tier,
+                soft_stale_by_tier=soft_stale_by_tier,
+            )
             # Drop interim-tier registries — they are no longer valid.
             self._drop_interim_tier_registries()
             # Save each main tier's registry unconditionally (create dir if needed).
@@ -4347,6 +4867,21 @@ class ConsolidationLoop:
         if self.store.replay_enabled and tiers_rebuilt:
             self._save_adapters(recall_sanity_threshold=recall_sanity_threshold)
             logger.info("consolidate_interim_adapters: merged main weights persisted+verified")
+
+        # W2 (§3.4.6): increment stale_cycles AFTER the durable write.
+        # A fold that aborts before the durable write does NOT advance decay on
+        # un-persisted stale sets.  A key staled in this fold has stale_cycles=0
+        # at the durable write; stale_cycles=1 after this call (unobservable until
+        # the NEXT fold reads it from disk).
+        if self.store.replay_enabled and soft_stale_by_tier:
+            for _st_tier in ("episodic", "semantic", "procedural"):
+                _st_reg = self.store.registry(_st_tier)
+                if _st_reg is not None:
+                    _st_reg.increment_stale_cycles()
+            logger.debug(
+                "consolidate_interim_adapters: stale_cycles advanced for %d soft-staled key(s)",
+                sum(len(v) for v in soft_stale_by_tier.values()),
+            )
 
         # 6b. Interim purge — single call covers both PEFT delete AND on-disk rmtree.
         unload_interim_adapters(self.model, self.output_dir)
@@ -4393,9 +4928,13 @@ class ConsolidationLoop:
             # 3-way breakdown — callers that want accurate data-loss signal use these.
             "drift_deduplicated": drift_deduplicated_count,
             "drift_orphan": drift_orphan_count,
+            # Under Mode 1 genuine_loss = retry keys (not dropped); should trend to ~0.
             "drift_genuine_loss": drift_genuine_loss_count,
-            "keys_per_tier": {t: len(v) for t, v in tier_keyed.items()},
-            "tier_keyed": tier_keyed,
+            # recall_miss_keys: keys whose reconstructed SPO disagreed with registry-true
+            # SPO, or whose reconstruction failed.  Retry signal; keys were retrained.
+            "recall_miss_keys": sorted(recall_miss_keys),
+            "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
+            "tier_keyed": serve_assignment,
             "recall_per_tier": recall_per_tier,
             "rolled_back": False,
             "rollback_tier": None,

@@ -6240,44 +6240,51 @@ async def speaker_forget(request: SpeakerForgetRequest):
 
     # Step 2: remove keys from every per-tier KeyRegistry (in-memory + disk).
     # Also drop their simhash entries so the SimHash gate cannot verify them.
+    # Uses store.discard_keys(mode="erase") — the shared helper that preserves
+    # the tier asymmetry: registry over tiers_with_registry(), simhash over the
+    # three main tiers only.  This is a HARD erasure (privacy / right-to-forget);
+    # soft-stale is wrong here (the record must be GONE, including the simhash).
     if stale_keys:
-        for tier_name in loop.store.tiers_with_registry():
+        # Determine which tiers are affected BEFORE the erase so we know
+        # which registry files to persist after.  The erase removes the keys
+        # from _active_keys (and _stale); checking membership afterward returns
+        # False, making it impossible to detect the tiers post-mutation.
+        _tiers_with_keys: list[str] = []
+        for _tier_name in loop.store.tiers_with_registry():
+            _reg = loop.store.registry(_tier_name)
+            if _reg is not None and any((k in _reg or _reg.is_stale(k)) for k in stale_keys):
+                _tiers_with_keys.append(_tier_name)
+
+        _main_tiers_with_simhash: list[str] = [
+            t
+            for t in ("episodic", "semantic", "procedural")
+            if any(k in loop.store.simhashes_in_tier(t) for k in stale_keys)
+        ]
+
+        loop.store.discard_keys(stale_keys, mode="erase")
+
+        # Persist updated registries for affected tiers.
+        for tier_name in _tiers_with_keys:
             registry = loop.store.registry(tier_name)
             if registry is None:
                 continue
-            tier_keys_to_remove = [k for k in stale_keys if k in registry]
-            if not tier_keys_to_remove:
-                continue
-            for key in tier_keys_to_remove:
-                registry.remove(key)
-            # Persist the updated KeyRegistry to disk.
-            # Determine the disk path: main tiers live at
-            # <adapter_dir>/<tier>/indexed_key_registry.json; interim tiers
-            # follow the same pattern (tier_name encodes the full slot name).
             tier_reg_path = config.adapter_dir / tier_name / "indexed_key_registry.json"
             registry.save(tier_reg_path)
             logger.info(
-                "speaker/forget: removed %d key(s) from KeyRegistry tier %s for speaker %s",
-                len(tier_keys_to_remove),
+                "speaker/forget: removed key(s) from KeyRegistry tier %s for speaker %s",
                 tier_name,
                 speaker_id,
             )
 
-        # Drop simhash entries for the speaker's keys and persist simhash registries.
-        for tier_name in ("episodic", "semantic", "procedural"):
+        # Persist updated simhash registries for affected main tiers.
+        for tier_name in _main_tiers_with_simhash:
             simhashes = loop.store.simhashes_in_tier(tier_name)
-            tier_keys_in_simhash = [k for k in stale_keys if k in simhashes]
-            if not tier_keys_in_simhash:
-                continue
-            for key in tier_keys_in_simhash:
-                simhashes.pop(key, None)
             _save_simhash_registry(
                 simhashes,
                 config.adapter_dir / tier_name / "simhash_registry.json",
             )
             logger.info(
-                "speaker/forget: removed %d simhash entry(ies) from tier %s for speaker %s",
-                len(tier_keys_in_simhash),
+                "speaker/forget: removed simhash entry(ies) from tier %s for speaker %s",
                 tier_name,
                 speaker_id,
             )
@@ -12280,6 +12287,27 @@ def _run_full_consolidation_sync() -> None:
         # than retrofitting each downstream helper with no-op tolerance.
         # Clear the consolidating flag, record the no-op as a successful
         # cycle outcome, and return.
+        # R3: accumulating status must be distinguished from noop BEFORE the
+        # noop branch fires.  An accumulating fold returns tiers_rebuilt=[] AND
+        # status="accumulating" — sessions stay pending (same as noop), but the
+        # window stamp must NOT be updated so _is_full_cycle_due keeps returning
+        # True and the fold re-fires next window.  Do not call mark_consolidated.
+        if result.get("status") == "accumulating":
+            _state["last_consolidation_result"] = {
+                "status": "accumulating",
+                "accumulating_reason": result.get("accumulating_reason", {}),
+                "tiers_rebuilt": [],
+            }
+            _state["consolidating"] = False
+            logger.info(
+                "Full cycle accumulating — total keys below floor %d; "
+                "sessions left pending, window stamp NOT updated so next tick re-fires. "
+                "Reason: %s",
+                result.get("accumulating_reason", {}).get("floor", "?"),
+                result.get("accumulating_reason"),
+            )
+            return
+
         if not result.get("tiers_rebuilt"):
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["last_consolidation_result"] = {

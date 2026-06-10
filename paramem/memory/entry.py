@@ -15,9 +15,8 @@ Key properties:
 
 SimHash fingerprinting constants and helpers are defined directly in this
 module.  Registry-lifecycle helpers (``save_registry``, ``load_registry``,
-``get_active_keys``, ``get_reclaimable_keys``, ``mark_stale``) are defined
-in :mod:`paramem.memory.persistence` and re-exported here so callers can
-import them from either module.
+``get_active_keys``) are defined in :mod:`paramem.memory.persistence` and
+re-exported here so callers can import them from either module.
 """
 
 import hashlib
@@ -374,7 +373,6 @@ def build_registry(entries: list[dict]) -> dict[str, int]:
 
     Returns a mapping of ``key → 64-bit SimHash fingerprint``.
     This is the simple format used by the training pipeline.
-    For enriched metadata, see :func:`build_enriched_registry`.
 
     Args:
         entries: List of entry dicts, each containing ``key``,
@@ -387,82 +385,6 @@ def build_registry(entries: list[dict]) -> dict[str, int]:
         p["key"]: compute_simhash(p["key"], p["subject"], p["predicate"], p["object"])
         for p in entries
     }
-
-
-def build_enriched_registry(
-    entries: list[dict],
-    session_id: str | None = None,
-    existing: dict | None = None,
-) -> dict:
-    """Build an enriched registry with temporal metadata.
-
-    Same entry shape and merge/stale semantics.
-
-    Format per key::
-
-        {
-            "simhash": int,
-            "created_at": ISO timestamp,
-            "last_seen_at": ISO timestamp,
-            "session_id": str,
-            "status": "active" | "stale",
-            "stale_since": ISO timestamp | null,
-            "stale_cycles": 0
-        }
-
-    If an existing registry is provided:
-
-    - Active keys present in ``entries`` get their ``last_seen_at`` updated.
-    - Active keys NOT in ``entries`` are unchanged (not auto-staled).
-    - Stale keys NOT in ``entries`` get ``stale_cycles`` incremented.
-    - Stale keys present in ``entries`` are reactivated.
-
-    Args:
-        entries: List of entry dicts for the current training set.
-        session_id: Optional session identifier to tag new entries.
-        existing: Optional existing registry dict to merge into.
-
-    Returns:
-        Updated enriched registry dict.
-    """
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc).isoformat()
-    current_keys = {p["key"] for p in entries}
-
-    if existing is None:
-        existing = {}
-
-    registry = dict(existing)
-
-    for p in entries:
-        key = p["key"]
-        simhash = compute_simhash(key, p["subject"], p["predicate"], p["object"])
-
-        if key in registry:
-            registry[key]["simhash"] = simhash
-            registry[key]["last_seen_at"] = now
-            registry[key]["status"] = "active"
-            registry[key]["stale_since"] = None
-            registry[key]["stale_cycles"] = 0
-            if session_id:
-                registry[key]["session_id"] = session_id
-        else:
-            registry[key] = {
-                "simhash": simhash,
-                "created_at": now,
-                "last_seen_at": now,
-                "session_id": session_id or "",
-                "status": "active",
-                "stale_since": None,
-                "stale_cycles": 0,
-            }
-
-    for key, entry in registry.items():
-        if key not in current_keys and entry.get("status") == "stale":
-            entry["stale_cycles"] = entry.get("stale_cycles", 0) + 1
-
-    return registry
 
 
 # --- Probe ---
@@ -538,8 +460,6 @@ def entry_fact_text(entry: dict) -> str:
 
 from paramem.memory.persistence import (  # noqa: E402, F401
     get_active_keys,
-    get_reclaimable_keys,
     load_registry,
-    mark_stale,
     save_registry,
 )

@@ -666,3 +666,118 @@ class TestConfidenceGate:
         assert results["graph1"]["confidence"] == 1.0, (
             f"matching fingerprint must yield confidence 1.0, got {results['graph1']['confidence']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# discard_keys helper (§6.2.7 / §3.5)
+# ---------------------------------------------------------------------------
+
+
+class TestDiscardKeys:
+    """MemoryStore.discard_keys(keys, mode=) — erase and stale variants.
+
+    Covers: mode="erase" removes from active + drops simhash across tiers
+    (registry over tiers_with_registry, simhash over three main tiers only);
+    mode="stale" moves to stale + RETAINS simhash; idempotent on absent key;
+    no-op when replay disabled (W5 guard).
+    """
+
+    def _make_store_with_key(self, key: str = "graph1", tier: str = "episodic") -> MemoryStore:
+        """Build a MemoryStore with one registered key plus its simhash."""
+        s = MemoryStore(replay_enabled=True)
+        s.put(tier, key, _entry(key), simhash=0xDEADBEEF, register=True)
+        return s
+
+    def test_erase_removes_from_active_and_drops_simhash(self):
+        """mode='erase': key removed from active list; simhash dropped."""
+        s = self._make_store_with_key("graph1", "episodic")
+        s.discard_keys(["graph1"], mode="erase")
+
+        reg = s.registry("episodic")
+        assert "graph1" not in reg.list_active(), "Erased key must not be in active"
+        assert "graph1" not in reg.list_stale(), "Erased key must not be in stale either"
+        assert "graph1" not in s.simhashes_in_tier("episodic"), "Erased key simhash must be dropped"
+
+    def test_erase_drops_simhash_on_main_tiers_only(self):
+        """mode='erase': simhash drop is limited to the three main tiers (not interim).
+
+        This preserves /forget's tier asymmetry: registry mutation over
+        tiers_with_registry() (all tiers), simhash drop over main tiers only.
+        """
+        s = MemoryStore(replay_enabled=True)
+        # Put key in an interim-style tier in the registry only.
+        s.put("episodic_interim_20260101", "graph_interim", _entry("graph_interim"), register=True)
+        # Also put simhash manually in episodic (main tier) and the interim tier.
+        s.put_simhash("episodic", "graph_interim", 0x1111)
+        s.put_simhash("episodic_interim_20260101", "graph_interim", 0x2222)
+
+        s.discard_keys(["graph_interim"], mode="erase")
+
+        # episodic simhash dropped (main tier).
+        assert "graph_interim" not in s.simhashes_in_tier("episodic"), (
+            "Main-tier simhash must be dropped by erase"
+        )
+        # Interim simhash NOT dropped (discard_keys only touches main tiers).
+        assert "graph_interim" in s.simhashes_in_tier("episodic_interim_20260101"), (
+            "Interim-tier simhash must NOT be dropped by discard_keys"
+        )
+
+    def test_stale_moves_to_stale_and_retains_simhash(self):
+        """mode='stale': key moved to stale partition; simhash retained."""
+        s = self._make_store_with_key("graph1", "episodic")
+        s.discard_keys(["graph1"], mode="stale")
+
+        reg = s.registry("episodic")
+        assert "graph1" not in reg.list_active(), "Staled key must not be in active"
+        assert "graph1" in reg.list_stale(), "Staled key must be in stale partition"
+        assert "graph1" in s.simhashes_in_tier("episodic"), "Staled key simhash must be RETAINED"
+
+    def test_erase_idempotent_on_absent_key(self):
+        """discard_keys(mode='erase') on a non-existent key does not raise."""
+        s = MemoryStore(replay_enabled=True)
+        # Should not raise
+        s.discard_keys(["nonexistent_key"], mode="erase")
+
+    def test_stale_idempotent_on_absent_key(self):
+        """discard_keys(mode='stale') on a non-existent key does not raise."""
+        s = MemoryStore(replay_enabled=True)
+        s.discard_keys(["nonexistent_key"], mode="stale")
+
+    def test_noop_when_replay_disabled(self):
+        """W5: when _registry is None (replay disabled), discard_keys is a no-op."""
+        s = MemoryStore(replay_enabled=False)
+        s.put_simhash("episodic", "graph1", 0xAAAA)
+        # No registry → must not raise and must leave simhash intact.
+        s.discard_keys(["graph1"], mode="erase")
+        assert "graph1" in s.simhashes_in_tier("episodic"), (
+            "Replay-disabled discard_keys must not touch simhashes"
+        )
+
+    def test_invalid_mode_raises_value_error(self):
+        """An unrecognised mode string raises ValueError."""
+        s = MemoryStore(replay_enabled=True)
+        with pytest.raises(ValueError, match="unknown mode"):
+            s.discard_keys(["graph1"], mode="invalid")
+
+    def test_is_stale_delegates_to_registry(self):
+        """MemoryStore.is_stale(key) returns True iff the owning tier marks it stale."""
+        s = self._make_store_with_key("graph1", "episodic")
+        assert not s.is_stale("graph1")
+        s.discard_keys(["graph1"], mode="stale")
+        assert s.is_stale("graph1")
+        assert not s.is_stale("nonexistent")
+
+    def test_all_stale_keys_aggregates_across_tiers(self):
+        """MemoryStore.all_stale_keys() returns stale keys across all registered tiers."""
+        s = MemoryStore(replay_enabled=True)
+        s.put("episodic", "ep1", _entry("ep1"), register=True)
+        s.put("semantic", "sem1", _entry("sem1"), register=True)
+        s.put("episodic", "ep2", _entry("ep2"), register=True)
+
+        s.discard_keys(["ep1"], mode="stale")
+        s.discard_keys(["sem1"], mode="stale")
+
+        stale = s.all_stale_keys()
+        assert "ep1" in stale
+        assert "sem1" in stale
+        assert "ep2" not in stale

@@ -111,7 +111,14 @@ def _minimal_adapter_config() -> AdapterConfig:
 
 
 def _minimal_consolidation_config() -> ConsolidationConfig:
-    return ConsolidationConfig(indexed_key_replay_enabled=True)
+    # min_tier_key_floor=0 and tier_fast_start=False: these are pre-floor structural
+    # tests using small key sets; disabling the floor and fast-start keeps them on the
+    # normal per-tier train/finalize/save path they assert.
+    return ConsolidationConfig(
+        indexed_key_replay_enabled=True,
+        min_tier_key_floor=0,
+        tier_fast_start=False,
+    )
 
 
 def _make_empty_registry_dict() -> dict:

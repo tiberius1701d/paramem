@@ -37,13 +37,27 @@ ADAPTER_HEALTH_DEGENERATED = "degenerated"
 
 
 class KeyRegistry:
-    """Tracks one tier's active keys, per-key fidelity, and tier health."""
+    """Tracks one tier's active keys, per-key fidelity, and tier health.
+
+    Keys can be in one of three states:
+    - **active**: in ``_active_keys``, enumerated by all normal paths.
+    - **stale**: in ``_stale``, excluded from enumeration and the SimHash gate,
+      retained for the stale-echo research seam and id-recycling via
+      ``get_reclaimable``.  Named :meth:`stale` (not ``mark_stale``) to avoid
+      colliding with the dead free function ``persistence.mark_stale``.
+    - **removed**: not present anywhere; via :meth:`remove` (hard erasure,
+      used by ``/forget`` and reclaim).
+    """
 
     def __init__(self) -> None:
         self._active_keys: list[str] = []
         self._fidelity_history: dict[str, list[float]] = defaultdict(list)
         # Single health record for this tier (None = untracked = healthy).
         self._health: dict | None = None
+        # Stale partition: key -> {"stale_since": ISO, "stale_cycles": int}.
+        # Keys here are EXCLUDED from normal enumeration and the SimHash gate.
+        # Their simhash entries are retained on disk for the stale-echo seam.
+        self._stale: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Active-key set
@@ -55,13 +69,69 @@ class KeyRegistry:
             self._active_keys.append(key)
 
     def remove(self, key: str) -> None:
-        """Drop a key from this tier (active list and fidelity history)."""
+        """Hard-remove a key from this tier (active list, stale set, fidelity).
+
+        Used by ``/forget`` (privacy erasure) and the reclaim path.  A removed
+        key is GONE — neither active nor stale.  Does not raise on absent keys.
+        """
         self._active_keys = [k for k in self._active_keys if k != key]
         self._fidelity_history.pop(key, None)
+        self._stale.pop(key, None)
+
+    def stale(self, key: str) -> None:
+        """Move *key* from active to the stale partition (idempotent).
+
+        A stale key is excluded from :meth:`list_active`, :meth:`__contains__`,
+        and :meth:`__len__`, but retained in ``_stale`` for the stale-echo probe
+        seam.  Its simhash entry is kept on disk.
+
+        :meth:`stale_cycles` starts at 0.  Calling ``stale`` on an already-stale
+        or absent key is a no-op.
+        """
+        if key in self._active_keys:
+            self._active_keys = [k for k in self._active_keys if k != key]
+            self._fidelity_history.pop(key, None)
+            if key not in self._stale:
+                self._stale[key] = {
+                    "stale_since": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    "stale_cycles": 0,
+                }
 
     def list_active(self) -> list[str]:
         """Return all active keys in this tier in registration order."""
         return list(self._active_keys)
+
+    def list_stale(self) -> list[str]:
+        """Return all stale key ids in this tier."""
+        return list(self._stale.keys())
+
+    def is_stale(self, key: str) -> bool:
+        """Return True when *key* is in the stale partition of this tier."""
+        return key in self._stale
+
+    def get_reclaimable(self, min_stale_cycles: int) -> list[str]:
+        """Return stale keys whose ``stale_cycles`` >= *min_stale_cycles*.
+
+        # STALE-RECLAIM SEAM — the reclaim *tick* that actually recycles
+        # stale key-ids is deliberately deferred.  This primitive is wired
+        # so the on-disk ``stale_cycles`` field advances truthfully (via
+        # ``increment_stale_cycles``); the reclaim caller is not yet built.
+        """
+        return [
+            k for k, rec in self._stale.items() if rec.get("stale_cycles", 0) >= min_stale_cycles
+        ]
+
+    def increment_stale_cycles(self) -> None:
+        """Advance ``stale_cycles`` by 1 for every entry in the stale partition.
+
+        # STALE-RECLAIM SEAM — called by the fold finalize after a durable
+        # write so un-persisted stale sets do not advance decay on abort.
+        Called at fold N: a key staled in fold N has stale_cycles=0 at the
+        durable write; stale_cycles=1 after this call (unobservable until
+        fold N+1 reads it from disk).
+        """
+        for rec in self._stale.values():
+            rec["stale_cycles"] = rec.get("stale_cycles", 0) + 1
 
     def __len__(self) -> int:
         return len(self._active_keys)
@@ -162,11 +232,16 @@ class KeyRegistry:
         hashes these bytes to obtain ``registry_sha256`` before writing the
         adapter manifest, then calls :meth:`save_from_bytes` with the same
         payload so the on-disk hash is byte-identical to the manifested one.
+
+        The ``"stale"`` field is additive: old files that lack it load as
+        ``{}`` via :meth:`load`'s ``data.get("stale", {})``.  Old readers
+        simply ignore the extra key (downgrade unsupported, acceptable).
         """
         data = {
             "active_keys": self._active_keys,
             "fidelity_history": dict(self._fidelity_history),
             "health": dict(self._health) if self._health is not None else None,
+            "stale": dict(self._stale),
         }
         return json.dumps(data, indent=2).encode("utf-8")
 
@@ -220,11 +295,16 @@ class KeyRegistry:
         health = data.get("health")
         if isinstance(health, dict) and "status" in health:
             registry._health = dict(health)
+        # Backward-compat: pre-existing files have no "stale" key → load as {}.
+        stale_raw = data.get("stale", {})
+        if isinstance(stale_raw, dict):
+            registry._stale = {k: dict(v) for k, v in stale_raw.items() if isinstance(v, dict)}
 
         logger.info(
-            "Key registry loaded from %s: %d active keys, health=%s",
+            "Key registry loaded from %s: %d active keys, %d stale, health=%s",
             path,
             len(registry._active_keys),
+            len(registry._stale),
             "set" if registry._health is not None else "unset",
         )
         return registry

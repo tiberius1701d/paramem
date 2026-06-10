@@ -853,6 +853,24 @@ class ConsolidationScheduleConfig:
     # to full consolidation (Path B).  True = "daily consolidation" posture: the
     # per-session merge runs each interim cycle as well.
     merge_at_interim: bool = False
+    # Floor below which a tier's keys park in episodic until the tier's own
+    # population reaches this count.  30 is the conservative default (Test 19:
+    # set size is the lever — 10 near-dup keys score 7/10 isolated, 51/51 when
+    # diluted into a larger set).  semantic/procedural keys accumulate in
+    # episodic and graduate to their own tier once this floor is crossed.
+    min_tier_key_floor: int = 30
+    # Graduation strategy when a parked tier first crosses min_tier_key_floor.
+    # True (DEFAULT): copy the episodic adapter's LoRA weights into the
+    #   graduating tier and rebook the registry — training-free fast-start.
+    #   The copied adapter recalls its keys at episodic's fidelity (0.960 disk-
+    #   verify on 183 keys, above the 0.95 gate) and the 0.95 disk gate still
+    #   runs; if it ever fails the tier falls back to train-from-scratch for
+    #   that cycle.  Opt out (false) for the scientifically clean baseline.
+    # False (OPT-OUT): train the tier from scratch on its own now-large (>= floor)
+    #   key set — every adapter is honestly trained on its own keys, no
+    #   inherited weights.  The principled baseline and always-available safety net.
+    # Governs semantic/procedural graduation only; episodic always trains from scratch.
+    tier_fast_start: bool = True
     # Maximum LoRA training epochs per consolidation cycle. None = use the
     # validated 30 default (Test 17 floor) for 100% indexed-key recall on the
     # validated models.
@@ -1511,6 +1529,8 @@ class ServerConfig:
             indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
             merge_at_interim=self.consolidation.merge_at_interim,
+            min_tier_key_floor=self.consolidation.min_tier_key_floor,
+            tier_fast_start=self.consolidation.tier_fast_start,
         )
 
     @property

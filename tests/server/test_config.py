@@ -608,3 +608,62 @@ class TestMakeTrainingConfigPropagation:
         assert rebuilt.lr_scheduler_type == "constant"
         assert rebuilt.lr_decay_steps == 300
         assert rebuilt.num_epochs == 5  # caller-supplied, not propagated
+
+
+class TestTierFloorConfigPlumbing:
+    """Item 1 (plan §9): min_tier_key_floor and tier_fast_start wire through
+    ConsolidationScheduleConfig → consolidation_config property → ConsolidationConfig.
+    """
+
+    FIXTURE = "tests/fixtures/server.yaml"
+
+    def test_fixture_yaml_has_floor_and_fast_start(self):
+        """Fixture YAML contains both new keys under consolidation:."""
+        from paramem.server.config import load_server_config
+
+        config = load_server_config(self.FIXTURE)
+        assert config.consolidation.min_tier_key_floor == 30
+        assert config.consolidation.tier_fast_start is True
+
+    def test_consolidation_config_bridges_floor_and_fast_start(self):
+        """consolidation_config property propagates both fields to ConsolidationConfig."""
+        from paramem.server.config import load_server_config
+
+        config = load_server_config(self.FIXTURE)
+        cc = config.consolidation_config
+        assert cc.min_tier_key_floor == 30
+        assert cc.tier_fast_start is True
+
+    def test_yaml_override_respected(self, tmp_path):
+        """Custom YAML values for both fields are loaded correctly."""
+        import textwrap
+
+        from paramem.server.config import load_server_config
+
+        yaml_file = tmp_path / "server.yaml"
+        yaml_file.write_text(
+            textwrap.dedent("""\
+                model: mistral
+                consolidation:
+                  min_tier_key_floor: 50
+                  tier_fast_start: false
+            """),
+            encoding="utf-8",
+        )
+        config = load_server_config(yaml_file)
+        assert config.consolidation.min_tier_key_floor == 50
+        assert config.consolidation.tier_fast_start is False
+
+        cc = config.consolidation_config
+        assert cc.min_tier_key_floor == 50
+        assert cc.tier_fast_start is False
+
+    def test_defaults_when_keys_absent(self, tmp_path):
+        """When consolidation section is absent, defaults are 30 and True."""
+        from paramem.server.config import load_server_config
+
+        yaml_file = tmp_path / "server.yaml"
+        yaml_file.write_text("model: mistral\n", encoding="utf-8")
+        config = load_server_config(yaml_file)
+        assert config.consolidation.min_tier_key_floor == 30
+        assert config.consolidation.tier_fast_start is True

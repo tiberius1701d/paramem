@@ -521,6 +521,79 @@ class MemoryStore:
                 return tier
         return None
 
+    def is_stale(self, key: str) -> bool:
+        """Return True when *key* is stale in any tier's registry.
+
+        Delegates to :meth:`KeyRegistry.is_stale` on the owning tier.
+        Returns False when replay is disabled (no registries) or the key
+        is not found in any tier's stale partition.
+        """
+        if self._registry is None:
+            return False
+        for reg in self._registry.values():
+            if reg.is_stale(key):
+                return True
+        return False
+
+    def all_stale_keys(self) -> list[str]:
+        """Every stale key across every registered tier."""
+        if self._registry is None:
+            return []
+        return [k for reg in self._registry.values() for k in reg.list_stale()]
+
+    def discard_keys(self, keys: list[str], *, mode: str) -> None:
+        """Mutate the in-memory registry and simhashes for *keys*.
+
+        Supports two modes:
+
+        ``mode="erase"`` (hard removal, used by ``/forget``):
+            For each key, call :meth:`KeyRegistry.remove` on every tier's
+            registry that holds it (active or stale), then drop the simhash
+            entry via :meth:`delete_simhash` on the three main tiers only.
+            This reproduces the tier asymmetry of the original ``/forget``
+            inline loop: registry mutation over ``tiers_with_registry()``
+            (all tiers including interim), simhash drop over the three main
+            tiers only (``episodic``, ``semantic``, ``procedural``).
+
+        ``mode="stale"`` (soft removal, used by the fold dedup write-back):
+            For each key, call :meth:`KeyRegistry.stale` on the owning tier.
+            Simhash is RETAINED so the stale-echo seam can verify a stale key.
+
+        Guards ``_registry is None``: when replay is disabled, all three
+        sub-structures are no-ops and this method returns without raising.
+        Simhash mutations on absent keys are safe no-ops via :meth:`delete_simhash`.
+
+        This is an **in-memory** mutation only.  Callers are responsible for
+        their own disk saves:
+        - ``/forget`` persists registries + simhash registries after this call.
+        - The fold finalize persists registries + simhash registries atomically
+          via ``_reset_main_tier_registries_and_simhashes`` and ``_save_adapters``.
+        """
+        if self._registry is None:
+            return
+        if mode == "erase":
+            for tier_name in self.tiers_with_registry():
+                reg = self._registry.get(tier_name)
+                if reg is None:
+                    continue
+                for key in keys:
+                    if key in reg or reg.is_stale(key):
+                        reg.remove(key)
+            for tier_name in ("episodic", "semantic", "procedural"):
+                for key in keys:
+                    self.delete_simhash(tier_name, key)
+        elif mode == "stale":
+            for key in keys:
+                for tier_name in self.tiers_with_registry():
+                    reg = self._registry.get(tier_name)
+                    if reg is not None and key in reg:
+                        reg.stale(key)
+                        break  # single-tier-ownership invariant
+        else:
+            raise ValueError(
+                f"MemoryStore.discard_keys: unknown mode {mode!r}; expected 'erase' or 'stale'"
+            )
+
     # ------------------------------------------------------------------
     # Snapshot / restore — cycle-resume rollback rope
     # ------------------------------------------------------------------
