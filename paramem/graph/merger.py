@@ -291,6 +291,16 @@ class GraphMerger:
         # drift-accounting site in consolidation to distinguish intended dedup
         # from genuine reconstruction loss.
         self.collapsed: list[str] = []
+        # removal_ledger: records every edge REMOVAL keyed by the removed edge's
+        # ik_key, with a stable reason code.  Complements collapsed/reinforcements
+        # (different lifetimes — collapsed/reinforcements carry soft-stale and
+        # recurrence semantics; the ledger carries removal cause for drift
+        # accounting and future contradiction observability).  Reset in
+        # reset_graph(), NOT in merge() — must survive the fold's
+        # reset_graph→re-merge→enrich→classify span.
+        # reason ∈ {"dedup", "contradiction_same_pred", "contradiction_cross_pred",
+        #            "enrichment_same_as"}
+        self.removal_ledger: dict[str, dict] = {}
         # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
         self._predicate_cardinality: dict[str, bool] = {}
         # Resolve prompts once at construction so a file edit takes effect next cycle.
@@ -600,6 +610,10 @@ class GraphMerger:
                 # in consolidate_interim_adapters can distinguish intended dedup
                 # (fact preserved under the surviving twin) from genuine loss.
                 self.collapsed.append(relation.indexed_key)
+                self.removal_ledger[relation.indexed_key] = {
+                    "reason": "dedup",
+                    "surviving_twin": surviving_ik,
+                }
             return None
 
         # --- Case 2: Same-predicate, different-object cardinality resolution ---
@@ -654,6 +668,15 @@ class GraphMerger:
                 if not self._predicate_cardinality[normalized_pred]:
                     # Single-valued (REPLACE): remove old edges, insert new one below.
                     for key, _ in old_edges_with_pred:
+                        _removed_ik = (
+                            self.graph.get_edge_data(subject, old_obj, key=key) or {}
+                        ).get(_IK_KEY_ATTR)
+                        if _removed_ik:
+                            self.removal_ledger[_removed_ik] = {
+                                "reason": "contradiction_same_pred",
+                                "old_object": old_obj,
+                                "new_object": obj,
+                            }
                         self.graph.remove_edge(subject, old_obj, key=key)
                         self.contradictions_resolved.append(
                             {
@@ -714,6 +737,17 @@ class GraphMerger:
                             if data.get("predicate") == old_p_norm
                         ]
                         for key in keys_to_remove:
+                            _removed_ik = (
+                                self.graph.get_edge_data(subject, old_obj, key=key) or {}
+                            ).get(_IK_KEY_ATTR)
+                            if _removed_ik:
+                                self.removal_ledger[_removed_ik] = {
+                                    "reason": "contradiction_cross_pred",
+                                    "old_object": old_obj,
+                                    "old_predicate": old_p_norm,
+                                    "new_object": obj,
+                                    "new_predicate": normalized_pred,
+                                }
                             self.graph.remove_edge(subject, old_obj, key=key)
                             self.contradictions_resolved.append(
                                 {
@@ -770,6 +804,7 @@ class GraphMerger:
         - ``contradictions_resolved`` — log of prior resolves
         - ``reinforcements`` — prior fold's Case-1 surviving keys
         - ``collapsed`` — prior fold's Case-1 deduplicated (incoming) keys
+        - ``removal_ledger`` — prior fold's reason-coded edge removal records
 
         Does NOT touch ``model``, ``tokenizer``, or the prompt strings — those
         are construction-time state and must survive across folds.
@@ -781,6 +816,7 @@ class GraphMerger:
         self.contradictions_resolved = []
         self.reinforcements = []
         self.collapsed = []
+        self.removal_ledger = {}
 
     def release(self) -> None:
         """Drop the base-model reference this merger holds (BASE-MODEL HOLDER).

@@ -295,7 +295,7 @@ def _build_scenarios(*, security_off: bool) -> list[Scenario]:
     ]
 
     debug_artifacts = [
-        Expectation("debug/cycle_*/graph_snapshot.json", encrypted=False, glob=True),
+        Expectation("debug/cycle_*/graph_merged_snapshot.json", encrypted=False, glob=True),
         Expectation("debug/cycle_*/episodic_qa_snapshot.json", encrypted=False, glob=True),
     ]
 

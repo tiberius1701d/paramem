@@ -1331,10 +1331,16 @@ class TestDebugSnapshotIntegration:
         # ``paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/``.
         cycle_dir = loop.snapshot_dir_for(interim_stamp=_STAMP)
         assert cycle_dir is not None
-        # graph_snapshot.json is written by ``merger.save_graph`` — the test's
-        # mocked merger doesn't materialise a file, but the on_extraction_end
-        # dispatch must still have called it.  Assert via the call mock.
-        loop.merger.save_graph.assert_any_call(cycle_dir / "graph_snapshot.json", encrypted=False)
+        # graph_merged_snapshot.json and graph_enriched_snapshot.json are written by
+        # on_fold_graph via merger.save_graph (interim path: is_fresh_slot=True for
+        # simulate).  The test's mocked merger doesn't materialise a file, but the
+        # dispatch must still have called save_graph with the correct paths.
+        loop.merger.save_graph.assert_any_call(
+            cycle_dir / "graph_merged_snapshot.json", encrypted=False
+        )
+        loop.merger.save_graph.assert_any_call(
+            cycle_dir / "graph_enriched_snapshot.json", encrypted=False
+        )
         assert (cycle_dir / "episodic_rels_snapshot.json").exists()
         assert (cycle_dir / "procedural_rels_snapshot.json").exists()
         assert (cycle_dir / "cycle_summary_snapshot.json").exists()
@@ -1370,11 +1376,17 @@ class TestDebugSnapshotIntegration:
         assert cycle_dir is not None
         assert (cycle_dir / "cycle_summary_snapshot.json").exists()
         assert not (cycle_dir / "graph_snapshot.json").exists()
+        assert not (cycle_dir / "graph_merged_snapshot.json").exists()
         assert not (cycle_dir / "episodic_rels_snapshot.json").exists()
         assert not (cycle_dir / "procedural_rels_snapshot.json").exists()
-        # And merger.save_graph must NOT have been called for the dump path.
+        # merger.save_graph must NOT have been called for any graph dump path
+        # (queue-only exits before is_fresh_slot / on_fold_graph).
         for call in loop.merger.save_graph.call_args_list:
-            assert call.args[0].name != "graph_snapshot.json"
+            assert call.args[0].name not in (
+                "graph_snapshot.json",
+                "graph_merged_snapshot.json",
+                "graph_enriched_snapshot.json",
+            )
 
         summary = json.loads((cycle_dir / "cycle_summary_snapshot.json").read_text())
         assert summary["mode"] == "queued"

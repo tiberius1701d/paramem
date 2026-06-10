@@ -2154,9 +2154,9 @@ class TestDebugArtifacts:
 
         assert (out_dir / "episodic_rels_snapshot.json").exists()
         assert (out_dir / "procedural_rels_snapshot.json").exists()
-        loop.merger.save_graph.assert_called_once_with(
-            out_dir / "graph_snapshot.json", encrypted=False
-        )
+        # on_extraction_end no longer writes the cumulative graph — that is now
+        # done by on_fold_graph (graph_merged_snapshot.json + graph_enriched_snapshot.json).
+        loop.merger.save_graph.assert_not_called()
 
         with open(out_dir / "episodic_rels_snapshot.json") as f:
             saved = json.load(f)
