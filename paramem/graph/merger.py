@@ -639,9 +639,36 @@ class GraphMerger:
                 # in consolidate_interim_adapters can distinguish intended dedup
                 # (fact preserved under the surviving twin) from genuine loss.
                 self.collapsed.append(relation.indexed_key)
+                # §4.8.i — raw-surface evidence for dedup collapses.
+                # The incoming raw surfaces (relation.*, only .strip()ed at
+                # extraction) are recorded alongside the surviving twin's
+                # first-seen surfaces (stored in node attributes["name"] and
+                # edge["predicate"]).  pre_surfaces is the ground-truth record
+                # of what was discarded vs. what survived; readers compare
+                # incoming vs. surviving directly rather than relying on a
+                # derived boolean.
+                _surviving_subj_surface = (
+                    self.graph.nodes.get(subject, {}).get("attributes", {}).get("name", subject)
+                )
+                _surviving_pred_surface = edge.get("predicate", "")
+                _surviving_obj_surface = (
+                    self.graph.nodes.get(obj, {}).get("attributes", {}).get("name", obj)
+                )
                 self.removal_ledger[relation.indexed_key] = {
                     "reason": "dedup",
                     "surviving_twin": surviving_ik,
+                    "pre_surfaces": {
+                        "incoming": {
+                            "subject": relation.subject,
+                            "predicate": relation.predicate,
+                            "object": relation.object,
+                        },
+                        "surviving": {
+                            "subject": _surviving_subj_surface,
+                            "predicate": _surviving_pred_surface,
+                            "object": _surviving_obj_surface,
+                        },
+                    },
                 }
             return None
 

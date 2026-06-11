@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import networkx as nx
 from peft import PeftModel
 
+from paramem.memory.persistence import _EDGE_SOURCE_ATTR
 from paramem.training.consolidation import ConsolidationLoop, serialize_subgraph_triples
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
@@ -194,7 +195,10 @@ class TestEnrichmentAddsEdgesWithSourceTag:
         # ("colleague_of" → "colleague of" after canonical() separator-fold).
         found = False
         for _, _, data in graph.out_edges("person0", data=True):
-            if data.get("predicate") == "colleague of" and data.get("source") == "graph_enrichment":
+            if (
+                data.get("predicate") == "colleague of"
+                and data.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
+            ):
                 found = True
         assert found, "Expected a 'colleague of' edge with source='graph_enrichment'"
 
@@ -241,7 +245,9 @@ class TestLowConfidenceDropped:
         # ("friend_of" → "friend of", "colleague_of" → "colleague of").
         edges_from_p0 = list(graph.out_edges("person0", data=True))
         predicates = {
-            d.get("predicate") for _, _, d in edges_from_p0 if d.get("source") == "graph_enrichment"
+            d.get("predicate")
+            for _, _, d in edges_from_p0
+            if d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
         }
         assert "friend of" in predicates
         assert "colleague of" not in predicates
@@ -474,7 +480,9 @@ class TestSymmetricPredicateCanonicalized:
         # ("xiaoxiu", "colleague of", "zhang"). Second insert is a duplicate.
         # Predicate stored as canonical("colleague_of") == "colleague of".
         enriched = [
-            (u, v, d) for u, v, d in graph.edges(data=True) if d.get("source") == "graph_enrichment"
+            (u, v, d)
+            for u, v, d in graph.edges(data=True)
+            if d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
         ]
         colleague_edges = [(u, v) for u, v, d in enriched if d.get("predicate") == "colleague of"]
         assert len(colleague_edges) == 1
@@ -529,7 +537,8 @@ class TestSymmetricPredicateCanonicalized:
         mentored_edges = [
             (u, v)
             for u, v, d in graph.edges(data=True)
-            if d.get("source") == "graph_enrichment" and d.get("predicate") == "mentored by"
+            if d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
+            and d.get("predicate") == "mentored by"
         ]
         # Both directions survive for asymmetric predicates
         assert set(mentored_edges) == {("ming", "xinxin"), ("xinxin", "ming")}
@@ -605,7 +614,7 @@ class TestCorefRemapBeforeEdgeInsert:
             if u == "alexander"
             and v == "acme"
             and d.get("predicate") == "works at"
-            and d.get("source") == "graph_enrichment"
+            and d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
         ]
         assert len(alexander_edges) == 1
 
@@ -706,7 +715,7 @@ class TestPartitionRoutesEnrichedEdges:
                 "relation_type": d["relation_type"],
             }
             for u, v, d in graph.edges(data=True)
-            if d.get("source") == "graph_enrichment"
+            if d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
         ]
         assert enriched, "No enriched edges found"
 

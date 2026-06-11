@@ -339,6 +339,35 @@ class DebugSnapshotWriter:
             return
         _write_json(base / "recall_probes" / f"{phase}_{adapter_name}.json", per_key)
 
+    def on_tier_delta(
+        self,
+        tier_delta: dict,
+        *,
+        interim_stamp: str | None = None,
+    ) -> None:
+        """Persist the per-tier before/after/staled/minted delta record.
+
+        Writes ``<base>/fold/tier_delta.json`` via the plaintext atomic
+        writer.  The payload is the ``"tier_delta"`` entry emitted in the
+        fold result dict — a mapping of tier name to
+        ``{active_before, active_after, staled_by_reason, minted}``.
+
+        Called once per fold (scheduled and housekeeping paths share the
+        same fold body) after ``serve_assignment`` and ``minted_by_tier``
+        are finalised.  Emitted for BOTH the train and simulate fold paths
+        (simulate's ``staled_by_reason`` is always ``{}`` because simulate
+        does not mutate adapter-weight registries — a persistence-tail
+        divergence, not a skipped grooming step).
+
+        Self-gated on ``save_cycle_snapshots`` / ``_debug_base``; no-op
+        when debug is disabled.
+        """
+        base = self._active_base(interim_stamp=interim_stamp)
+        if base is None:
+            return
+        _write_json(base / "fold" / "tier_delta.json", tier_delta)
+        logger.info("Debug tier_delta written: %d tier(s)", len(tier_delta))
+
     def on_cycle_end(
         self,
         cycle_summary: dict[str, Any],

@@ -208,6 +208,7 @@ _ADMIN_PATHS = {
     "/admin/assign-orphans",
     "/scheduled-tick",
     "/consolidate",
+    "/consolidate/housekeeping",
     "/ingest-sessions",
     "/ingest-sessions/cancel",
     "/migration/preview",

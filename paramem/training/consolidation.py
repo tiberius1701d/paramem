@@ -2101,6 +2101,7 @@ class ConsolidationLoop:
         self,
         *,
         recall_sanity_threshold: float = 0.95,
+        window_stamp_override: "str | None" = None,
     ) -> None:
         """Save adapters and registries to disk using the atomic registry-last ordering.
 
@@ -2142,6 +2143,11 @@ class ConsolidationLoop:
                 match the in-RAM recall gates in
                 :meth:`consolidate_interim_adapters` and
                 :meth:`post_session_train`.
+            window_stamp_override: When not ``None``, write this value as the
+                ``window_stamp`` on all saved main slots instead of computing a
+                fresh floor.  Used by :meth:`run_housekeeping` to preserve the
+                existing window stamp so :func:`_is_full_cycle_due` is not
+                perturbed by the re-groom (Decision 2, §4.10).
         """
         import hashlib as _hashlib
 
@@ -2150,7 +2156,12 @@ class ConsolidationLoop:
 
         fingerprint_cache = getattr(self, "fingerprint_cache", None)
         full_period = getattr(self, "full_consolidation_period_string", "")
-        full_window_stamp = current_full_consolidation_stamp(full_period)
+        # Use the override when supplied (housekeeping path — preserve the existing
+        # window so scheduling is not perturbed); otherwise floor to the current period.
+        if window_stamp_override is not None:
+            full_window_stamp = window_stamp_override
+        else:
+            full_window_stamp = current_full_consolidation_stamp(full_period)
 
         # Step 1+2: Serialise each tier's registry to bytes and hash them — no disk I/O.
         # Per-tier: tier_name → (payload_bytes, sha256_hex)
@@ -3041,7 +3052,9 @@ class ConsolidationLoop:
 
         The method mutates ``self.merger.graph`` in place: first applying
         ``same_as`` node contractions, then inserting new edges tagged with
-        ``source="graph_enrichment"``.
+        the provenance attribute ``edge_source="graph_enrichment"`` (stored
+        under :data:`paramem.memory.persistence._EDGE_SOURCE_ATTR`, not the
+        NetworkX-reserved ``"source"`` field, so the tag survives persist).
 
         Early-return conditions (all return ``skipped=True``):
         - ``graph_enrichment_enabled`` is ``False``.
@@ -3069,7 +3082,7 @@ class ConsolidationLoop:
 
         import networkx as nx
 
-        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.memory.persistence import _EDGE_SOURCE_ATTR, _IK_KEY_ATTR
 
         _empty = {"chunks": 0, "new_edges": 0, "same_as_merges": 0}
 
@@ -3313,7 +3326,11 @@ class ConsolidationLoop:
                     predicate=pred,
                     relation_type=rtype,
                     confidence=confidence,
-                    source="graph_enrichment",
+                    # Stored under _EDGE_SOURCE_ATTR ("edge_source"), not "source":
+                    # NetworkX's node_link_data reserves "source" for the edge's
+                    # source-NODE name and would clobber this provenance tag on
+                    # persist (same collision class as "key" → "ik_key").
+                    **{_EDGE_SOURCE_ATTR: "graph_enrichment"},
                     sessions=[],
                 )
                 total_new += 1
@@ -3345,7 +3362,7 @@ class ConsolidationLoop:
             "skip_reason": None,
         }
 
-    def consolidate_interim_graphs(self) -> dict:
+    def consolidate_interim_graphs(self, *, housekeeping: bool = False) -> dict:
         """Full-cycle consolidation for simulate mode: merge interim graph.json sidecars.
 
         Called by ``_run_full_consolidation_sync`` when
@@ -3355,12 +3372,36 @@ class ConsolidationLoop:
         the canonical main-tier graph at ``<adapter_dir>/episodic/graph.json`` and
         removes the interim slot directories.
 
+        §4.S architectural symmetry: grooming is LITERALLY identical to the train fold
+        (``canonical()`` node identity + Case-1/Case-2 dedup via ``self.merger``,
+        then ``_run_graph_enrichment``).  The ONLY permitted divergence is the
+        persistence/retrain tail:
+
+        - **source**: disk-load (``load_memory_from_disk``) vs reconstruct-from-weights.
+        - **sink**: write ``graph.json`` (``save_memory_to_disk``) vs retrain adapters.
+
+        §4.6b — simulate→GraphMerger convergence: the cross-slot merge now routes
+        through ``self.merger.merge(_synthetic_session, additive=True)`` so
+        ``canonical()`` + Case-1/Case-2 dedup apply identically to the train fold.
+        ``additive=True`` skips the model-gated Case-2 branch, so no model is
+        required (the simulate merger typically holds ``model=None``).
+
+        Args:
+            housekeeping: When ``True``, bypass the empty-interim-slot noop so the
+                enriched graph is persisted even with no interims present.  Used by
+                :meth:`run_housekeeping` (§4.4 gate c / B-SIMULATE).  Sessions are
+                NOT marked consolidated; window stamp is not advanced.
+
         Steps:
 
-        1. Optional SOTA enrichment (same guard as ``consolidate_interim_adapters`` step 0).
-        2. Walk all ``episodic/interim_<stamp>/graph.json`` files; load and merge each
-           into a combined graph, tagging edges from each slot with the slot's keys.
-        3. Write the merged graph to ``<adapter_dir>/episodic/graph.json`` via
+        1. Reset the merger and build ``Relation`` objects from the disk-loaded main
+           graph AND every interim ``graph.json`` slot, then merge them via
+           ``self.merger.merge(additive=True)`` — the same topology the train fold uses.
+        2. Optional SOTA enrichment (same guard as ``consolidate_interim_adapters`` Stage 2.5).
+           Runs AFTER the merge on the freshly-merged ``self.merger.graph``, mirroring
+           the train fold's position (Stage 2 re-merge → Stage 2.5 enrichment).
+        3. Write the enriched, merged (canonicalized, deduped) graph to
+           ``<adapter_dir>/episodic/graph.json`` via
            :func:`paramem.memory.persistence.save_memory_to_disk`.
         4. Remove the interim slot directories that were merged.
         5. Return a result dict shaped like ``consolidate_interim_adapters``'s return
@@ -3384,22 +3425,49 @@ class ConsolidationLoop:
 
         adapter_dir = self.output_dir
 
-        # --- Step 0: optional SOTA enrichment ---
-        try:
-            self._run_graph_enrichment()
-        except Exception as _enr_exc:
-            logger.warning(
-                "consolidate_interim_graphs: SOTA enrichment raised — continuing: %s",
-                _enr_exc,
-            )
+        # §4.8.ii — housekeeping debug-dir labeling: stamp the interim slot so
+        # the housekeeping run's debug artifacts nest under a housekeeping-labelled
+        # dir distinct from a scheduled fold's.  Reuses the existing nesting
+        # mechanism (_current_interim_stamp → snapshot_dir_for nesting).
+        if housekeeping:
+            _hk_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            self._current_interim_stamp = f"housekeeping_{_hk_ts}"
+        else:
+            # Ensure no stale housekeeping stamp leaks into a scheduled run.
+            self._current_interim_stamp = None  # type: ignore[assignment]
 
-        # --- Step 2: walk interim simulate-mode graph.json sidecars ---
-        merged_keys: set[str] = set()
-        interim_dirs_merged: list[Path] = []
+        # --- Step 1 (§4.6b): seed merger from disk-loaded main graph + interim slots ---
+        # Reset the merger's keying surface so provenance keying is unconditional
+        # (mirrors the train fold's reset_graph() call before Stage-2 re-merge).
+        self.merger.reset_graph()
 
         episodic_main_path = adapter_dir / "episodic" / "graph.json"
-        # Start from the existing main graph if present.
-        merged_graph = load_memory_from_disk(episodic_main_path)
+        # Count edges BEFORE the merge to compute active_before for tier_delta.
+        _main_graph_before = load_memory_from_disk(episodic_main_path)
+        _active_before_count = _main_graph_before.number_of_edges()
+
+        # Collect all Relation objects from the main graph + all interim slots.
+        # For each graph entry, build a Relation with indexed_key so provenance
+        # is carried through the merger onto the merged edge (mirror of
+        # _build_registry_true_relations, §3.7).
+        _all_relations: list[Relation] = []
+        interim_dirs_merged: list[Path] = []
+
+        for _entry in iter_entries(_main_graph_before):
+            _pred = _entry.get("predicate", "")
+            if not _pred:
+                continue
+            _all_relations.append(
+                Relation(
+                    subject=_entry["subject"],
+                    predicate=_pred,
+                    object=_entry["object"],
+                    relation_type=_FALLBACK_RTYPE,  # graph.json edges carry no relation_type
+                    confidence=1.0,
+                    speaker_id=_entry.get("speaker_id", ""),
+                    indexed_key=_entry["key"],
+                )
+            )
 
         for _interim_name, interim_dir in iter_interim_dirs(adapter_dir):
             interim_graph_path = interim_dir / "graph.json"
@@ -3407,31 +3475,79 @@ class ConsolidationLoop:
                 # Skip train-mode interim slots (no graph.json).
                 continue
             slot_graph = load_memory_from_disk(interim_graph_path)
-            for entry in iter_entries(slot_graph):
-                merged_keys.add(entry["key"])
-                # Add edge to merged graph (add_edge is idempotent on
-                # duplicate ik_key via the MultiDiGraph semantics — we
-                # re-add with the same attributes so the latest write wins).
-                from paramem.memory.persistence import _add_keyed_edge
-
-                _add_keyed_edge(
-                    merged_graph,
-                    entry["subject"],
-                    entry["object"],
-                    indexed_key=entry["key"],
-                    predicate=entry.get("predicate", ""),
-                    speaker_id=entry.get("speaker_id", ""),
-                    first_seen_cycle=entry.get("first_seen_cycle", 0),
+            for _entry in iter_entries(slot_graph):
+                _pred = _entry.get("predicate", "")
+                if not _pred:
+                    continue
+                _all_relations.append(
+                    Relation(
+                        subject=_entry["subject"],
+                        predicate=_pred,
+                        object=_entry["object"],
+                        relation_type=_FALLBACK_RTYPE,  # type: ignore[arg-type]
+                        confidence=1.0,
+                        speaker_id=_entry.get("speaker_id", ""),
+                        indexed_key=_entry["key"],
+                    )
                 )
             interim_dirs_merged.append(interim_dir)
             logger.debug(
-                "consolidate_interim_graphs: merged %d edges from %s",
+                "consolidate_interim_graphs: queued %d entries from %s",
                 slot_graph.number_of_edges(),
                 interim_dir,
             )
 
-        if not interim_dirs_merged:
+        # Merge through the merger (model-free — additive=True skips the only
+        # model-gated Case-2 branch; canonical() + Case-1 dedup are deterministic).
+        if _all_relations:
+            _synthetic_session = SessionGraph(
+                session_id="__simulate_consolidation_merge__",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                entities=[],
+                relations=_all_relations,
+            )
+            self.merger.merge(_synthetic_session, additive=True)
+            logger.info(
+                "consolidate_interim_graphs: merged %d relations via GraphMerger"
+                " (%d interim slot(s))",
+                len(_all_relations),
+                len(interim_dirs_merged),
+            )
+        else:
+            logger.debug("consolidate_interim_graphs: no relations to merge")
+
+        # Debug: snapshot the merged graph.  Self-gated.
+        self._debug_writer.on_fold_graph(self.merger, label="merged")
+
+        # --- Step 2: optional SOTA graph enrichment (§4.S symmetry — mirrors train Stage 2.5) ---
+        # Runs AFTER the merge on the freshly-merged self.merger.graph, mirroring
+        # consolidate_interim_adapters Stage 2.5.  The external/SOTA boundary is handled
+        # inside _run_graph_enrichment (per-chunk except catches network errors), so a
+        # network failure degrades gracefully there.  A programming error here propagates
+        # and aborts the fold — correct behaviour, same as train.
+        _enrichment_result = self._run_graph_enrichment()
+        if not _enrichment_result.get("skipped"):
+            logger.info(
+                "consolidate_interim_graphs: graph_enrichment complete:"
+                " chunks=%d new_edges=%d same_as_merges=%d",
+                _enrichment_result.get("chunks", 0),
+                _enrichment_result.get("new_edges", 0),
+                _enrichment_result.get("same_as_merges", 0),
+            )
+
+        # Debug: snapshot the enriched graph (after SOTA enrichment).  Self-gated.
+        self._debug_writer.on_fold_graph(self.merger, label="enriched")
+
+        # --- B-SIMULATE gate: under housekeeping=True, ALWAYS persist the enriched
+        # graph back to disk — even when no interim slots were present.  This is
+        # the gate-c/B-SIMULATE override (§4.4 / §4.5.3): the scheduled path returns
+        # a noop dict here (nothing changed), but the housekeeping path re-grooms
+        # the persisted knowledge so it MUST write the merger's canonicalized graph
+        # back to disk.
+        if not housekeeping and not interim_dirs_merged:
             logger.info("consolidate_interim_graphs: no simulate-mode interim slots found — noop")
+            # Reset the housekeeping stamp before returning.
+            self._current_interim_stamp = None  # type: ignore[assignment]
             return {
                 "tiers_rebuilt": [],
                 "graph_drift_count": 0,
@@ -3446,13 +3562,43 @@ class ConsolidationLoop:
 
         # --- Step 3: write merged graph to main episodic slot ---
         episodic_main_path.parent.mkdir(parents=True, exist_ok=True)
-        save_memory_to_disk(merged_graph, episodic_main_path)
-        logger.info(
-            "consolidate_interim_graphs: wrote merged graph to %s (%d edges, %d new keys)",
-            episodic_main_path,
-            merged_graph.number_of_edges(),
-            len(merged_keys),
+        save_memory_to_disk(self.merger.graph, episodic_main_path)
+        _after_count = self.merger.graph.number_of_edges()
+        _collapsed_count = sum(
+            1
+            for _rl_entry in self.merger.removal_ledger.values()
+            if _rl_entry.get("reason") == "dedup"
         )
+        logger.info(
+            "consolidate_interim_graphs: wrote merged graph to %s"
+            " (%d edges, %d interim slot(s), %d dedup collapse(s))",
+            episodic_main_path,
+            _after_count,
+            len(interim_dirs_merged),
+            _collapsed_count,
+        )
+
+        # §4.8.iii — per-tier delta for simulate path.
+        # staled_by_reason == {} because simulate persists graph.json, not
+        # adapter-weight registry slots (no KeyRegistry mutation in simulate) —
+        # a persistence-tail divergence, NOT a skipped grooming step.  The
+        # merger's Case-1 collapse STILL fires and is recorded in removal_ledger.
+        _sim_tier_delta = {
+            "episodic": {
+                "active_before": _active_before_count,
+                "active_after": _after_count,
+                "staled_by_reason": {},
+                # minted = enrichment new_edges (§4.8 D-SYMMETRY).  Enrichment now runs
+                # AFTER reset+merge on the freshly-merged graph (mirroring the train fold),
+                # so its new_edges count is the correct observable: edges added by SOTA
+                # enrichment that were not present in the incoming interim content.
+                "minted": _enrichment_result.get("new_edges", 0),
+            }
+        }
+        self._debug_writer.on_tier_delta(_sim_tier_delta)
+        # Also emit the removal ledger so the pre_surfaces evidence is
+        # visible in the simulate housekeeping artifacts.
+        self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
         # --- Step 4: remove merged interim slot directories ---
         for interim_dir in interim_dirs_merged:
@@ -3466,17 +3612,82 @@ class ConsolidationLoop:
                     _rm_exc,
                 )
 
+        # Reset housekeeping stamp.
+        self._current_interim_stamp = None  # type: ignore[assignment]
+
         return {
             "tiers_rebuilt": ["episodic"],
-            "graph_drift_count": 0,
-            "drift_deduplicated": 0,
+            "graph_drift_count": _collapsed_count,
+            "drift_deduplicated": _collapsed_count,
             "drift_orphan": 0,
             "drift_genuine_loss": 0,
-            "keys_per_tier": {"episodic": merged_graph.number_of_edges()},
+            "keys_per_tier": {"episodic": _after_count},
             "recall_per_tier": {"episodic": 1.0},  # graph merge is lossless
             "rolled_back": False,
             "rollback_tier": None,
+            "tier_delta": _sim_tier_delta,
         }
+
+    def run_housekeeping(
+        self,
+        trainer=None,
+        router=None,
+        recall_sanity_threshold: float = 0.95,
+        refresh_epochs: int = 30,
+    ) -> dict:
+        """On-demand fold that re-grooms the canonical knowledge graph without advancing sessions.
+
+        This is a thin dispatcher for the ``POST /consolidate/housekeeping`` endpoint
+        (§4.4 Mode 2).  It routes to the correct underlying fold method depending on
+        ``config.consolidation.mode``:
+
+        - **simulate**: calls :meth:`consolidate_interim_graphs` with ``housekeeping=True``.
+          Re-runs the GraphMerger topology over the persisted main graph (with no interim
+          slots required).  Writes the canonicalized/deduped graph back to disk.  Clears
+          stale surface variants; emits ``tier_delta`` + ``removal_ledger`` (with
+          ``pre_surfaces`` per discarded key) in the debug artifacts.  No model is required.
+        - **train**: calls :meth:`consolidate_interim_adapters` with ``housekeeping=True``.
+          Bypasses gate (d) (the per-tier floor accumulate guard) so the fold runs even
+          when the active key count is below the floor.  Retrains adapter weights from
+          registry-true content; emits ``tier_delta`` in the result and debug artifacts.
+          The GPU lock must be held by the caller (same contract as the normal train fold).
+
+        In both modes:
+        - Sessions are NOT marked consolidated (window stamp not advanced).
+        - ``_current_interim_stamp`` is set to ``"housekeeping_<ts>"`` during the fold
+          so debug artifacts land under a housekeeping-labelled dir, distinct from a
+          scheduled fold's artifacts.  Cleared on return.
+        - The ``tier_delta`` key is present in the result dict and in the debug snapshot.
+
+        Args:
+            trainer: BackgroundTrainer (train mode only).  Must hold the GPU lock.
+            router: Router instance for reload at fold completion (train mode only).
+            recall_sanity_threshold: Forwarded to the underlying adapter fold (train only).
+            refresh_epochs: Forwarded to the underlying adapter fold (train only).
+
+        Returns:
+            Result dict from the underlying fold, with ``tier_delta`` guaranteed present.
+        """
+        mode = self.config.mode if self.config is not None else "simulate"
+        if mode == "simulate":
+            return self.consolidate_interim_graphs(housekeeping=True)
+        else:
+            # Decision 2 (§4.10): read the window stamp that was written by the last
+            # scheduled fold and pass it as window_stamp_override so _save_adapters
+            # re-writes the SAME stamp onto every re-saved main slot.  This keeps
+            # _is_full_cycle_due's identity check stable — a housekeeping run must
+            # not advance the cadence window, only a scheduled fold may.
+            from paramem.server.app import _last_full_consolidation_window as _lfw
+
+            _preserved_stamp = _lfw(self.output_dir)
+            return self.consolidate_interim_adapters(
+                trainer=trainer,
+                router=router,
+                recall_sanity_threshold=recall_sanity_threshold,
+                refresh_epochs=refresh_epochs,
+                housekeeping=True,
+                window_stamp_override=_preserved_stamp,
+            )
 
     def _promote_mature_keys_inline(self) -> list[str]:
         """Promote episodic keys whose recurrence_count has reached the promotion threshold.
@@ -3800,6 +4011,9 @@ class ConsolidationLoop:
         router=None,
         recall_sanity_threshold: float = 0.95,
         refresh_epochs: int = 30,
+        *,
+        housekeeping: bool = False,
+        window_stamp_override: "str | None" = None,
     ) -> dict:
         """Weekly refresh: collapse all episodic_interim_* adapters into the main tiers.
 
@@ -3860,6 +4074,20 @@ class ConsolidationLoop:
                 post-save via ``_verify_saved_adapter_from_disk``.
             refresh_epochs: Number of training epochs for the full per-tier
                 rebuild (default 30; matches the per-key baseline from Tests 1-7b).
+            housekeeping: When ``True``, bypass gate (d) (the whole-fold
+                ``_total_trainable < _floor`` accumulating early-return) and
+                proceed to retrain even when the total key count is below the
+                per-tier floor.  Used by :meth:`run_housekeeping` so an
+                on-demand grooming fold runs regardless of accumulation state.
+                Sessions are NOT marked consolidated; window stamp is not advanced.
+            window_stamp_override: When not ``None``, forwarded verbatim to
+                :meth:`_save_adapters` so the saved main slots carry this value
+                as ``window_stamp`` instead of the fresh floor computed at save
+                time.  Used by :meth:`run_housekeeping` to preserve the window
+                stamp that was already written by the last scheduled fold, so
+                :func:`_is_full_cycle_due` is not perturbed by a housekeeping
+                run (Decision 2, §4.10).  ``None`` is the correct value for every
+                non-housekeeping call.
 
         Returns:
             Result dict with keys:
@@ -3897,6 +4125,16 @@ class ConsolidationLoop:
                 "consolidate_interim_adapters requires the caller to hold "
                 "_gpu_thread_lock (submit via BackgroundTrainer.submit())"
             )
+
+        # --- §4.8.ii — housekeeping debug-dir labeling ---
+        # Set a distinct interim stamp so debug artifacts for a housekeeping fold
+        # land under ``housekeeping_<ts>/`` rather than a scheduled fold name.
+        # Cleared in the finally-equivalent tail (after _save_adapters / rollback).
+        if housekeeping:
+            _hk_ts_adp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            self._current_interim_stamp = f"housekeeping_{_hk_ts_adp}"
+        else:
+            self._current_interim_stamp = None  # type: ignore[assignment]
 
         # --- Stage 1: Unfold / reconstruct all active keys from adapter weights ---
         # Probes every active key across all tiers; recovers (subject, predicate, object)
@@ -4325,6 +4563,15 @@ class ConsolidationLoop:
         # Debug: persist serve/train tier assignment maps.  Self-gated.
         self._debug_writer.on_fold_assignments(serve_assignment, train_assignment)
 
+        # --- §4.8.iii: capture per-tier active_before for tier_delta (train mode) ---
+        # Must run BEFORE the whole-fold accumulate guard (which may early-return
+        # without building tier_delta) and BEFORE training mutates the store so
+        # the "before" snapshot is accurate.  The matching "active_after" snapshot
+        # runs after _save_adapters in the finalize section.
+        _train_active_before: dict[str, int] = {
+            t: len(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
+        }
+
         # --- Whole-fold accumulate guard ---
         # After Pass-2, any under-floor non-episodic tier is empty (parked into
         # episodic).  If episodic itself is also below the floor, the total
@@ -4332,7 +4579,7 @@ class ConsolidationLoop:
         # Read serve_assignment, NOT train_assignment: graduating keys inflate the
         # episodic training set but the floor is about the SERVED key population.
         _total_trainable = sum(len(v) for v in serve_assignment.values())
-        if _total_trainable < _floor:
+        if not housekeeping and _total_trainable < _floor:
             logger.info(
                 "consolidate_interim_adapters: total trainable keys %d < floor %d"
                 " — returning accumulating (sessions stay pending)",
@@ -4357,6 +4604,8 @@ class ConsolidationLoop:
                         " (left by prior aborted fold) on accumulating return",
                         _bname,
                     )
+            # Reset housekeeping stamp (not cleared on success path at this point).
+            self._current_interim_stamp = None  # type: ignore[assignment]
             return {
                 "status": "accumulating",
                 "accumulating_reason": {
@@ -4891,6 +5140,10 @@ class ConsolidationLoop:
                             _backup = f"{_t}_backup"
                             if _backup in self.model.peft_config and _t in self.model.peft_config:
                                 _copy_w(self.model, src=_backup, dst=_t)
+                        # Clear the housekeeping stamp before propagating so the next
+                        # call does not inherit a stale label (self-heals on re-entry
+                        # anyway, but explicit clear is more robust).
+                        self._current_interim_stamp = None  # type: ignore[assignment]
                         raise AbortedDuringConsolidation(f"training aborted on tier {tier!r}")
                     logger.info(
                         "consolidate_interim_adapters: trained %s on %d keys",
@@ -4997,7 +5250,19 @@ class ConsolidationLoop:
         # main manifests (the same precondition the caller honored at the
         # orchestration layer).
         if self.store.replay_enabled and tiers_rebuilt:
-            self._save_adapters(recall_sanity_threshold=recall_sanity_threshold)
+            try:
+                self._save_adapters(
+                    recall_sanity_threshold=recall_sanity_threshold,
+                    window_stamp_override=window_stamp_override,
+                )
+            except Exception:
+                # Clear the housekeeping stamp before propagating so the next call
+                # does not inherit a stale label.  try/finally is not used here
+                # because the success path does its own explicit clear below and
+                # the exception must propagate unchanged (crash-window guard:
+                # callers skip mark_consolidated so sessions stay pending).
+                self._current_interim_stamp = None  # type: ignore[assignment]
+                raise
             logger.info("consolidate_interim_adapters: merged main weights persisted+verified")
 
         # W2 (§3.4.6): increment stale_cycles AFTER the durable write.
@@ -5043,6 +5308,31 @@ class ConsolidationLoop:
 
             _sw2(self.model, "episodic")
 
+        # --- §4.8.iii: per-tier delta for train mode ---
+        # Build the tier_delta record from the before-snapshot + serve_assignment
+        # (active after) + soft_stale_by_tier (staled keys with reason breakdown).
+        # enrichment new_edges is the count added by _run_graph_enrichment above.
+        _train_tier_delta: dict[str, dict] = {}
+        for _tdt in ("episodic", "semantic", "procedural"):
+            _tdt_staled_keys = soft_stale_by_tier.get(_tdt, {})
+            _tdt_stale_by_reason: dict[str, int] = {}
+            for _stk, _stv in _tdt_staled_keys.items():
+                _stk_reason = _stv.get("reason", "dedup")  # all current staling is dedup
+                _tdt_stale_by_reason[_stk_reason] = _tdt_stale_by_reason.get(_stk_reason, 0) + 1
+            _before = _train_active_before.get(_tdt, 0)
+            _after = len(serve_assignment.get(_tdt, []))
+            _train_tier_delta[_tdt] = {
+                "active_before": _before,
+                "active_after": _after,
+                "staled_by_reason": _tdt_stale_by_reason,
+                "minted": max(0, _after - _before),
+            }
+        self._debug_writer.on_tier_delta(_train_tier_delta)
+        self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
+
+        # Reset housekeeping interim stamp.
+        self._current_interim_stamp = None  # type: ignore[assignment]
+
         logger.info(
             "consolidate_interim_adapters: complete — rebuilt %s, drift=%d"
             " (deduplicated=%d orphan=%d genuine_loss=%d intended_removal=%d)",
@@ -5076,6 +5366,7 @@ class ConsolidationLoop:
             "recall_per_tier": recall_per_tier,
             "rolled_back": False,
             "rollback_tier": None,
+            "tier_delta": _train_tier_delta,
         }
 
     def _run_recall_sanity_probe(

@@ -6782,6 +6782,67 @@ async def consolidate():
     return ConsolidateResponse(status=status)
 
 
+@app.post(
+    "/consolidate/housekeeping",
+    response_model=ConsolidateResponse,
+    dependencies=[Depends(require_admin)],
+)
+async def consolidate_housekeeping():
+    """On-demand housekeeping fold — re-groom without consuming sessions.
+
+    Triggers a full GraphMerger re-grooming pass over the canonical knowledge
+    graph (all tiers in ``train`` mode; the main episodic graph in ``simulate``
+    mode).  Runs the identical grooming pipeline as the scheduled full fold
+    (``canonical()`` node identity + Case-1/Case-2 dedup via GraphMerger +
+    SOTA enrichment) without advancing session watermarks or marking any
+    pending sessions as consolidated.
+
+    Use cases:
+
+    - Surface and collapse canonical duplicates after a canonicalization schema
+      change (e.g. deploying the Unicode-grounded ``canonical()`` over an
+      existing production knowledge base).
+    - Re-run SOTA enrichment on the groomed graph without waiting for the next
+      scheduled full-cycle tick.
+    - Validate that the current adapter weights are consistent with the
+      registry-true graph (train mode: adapters are retrained on the
+      registry-true content, bypassing the per-tier floor gate).
+
+    Gate (d) bypass: unlike the scheduled fold, this endpoint proceeds even
+    when the total active key count is below ``min_tier_key_floor``.
+
+    Session non-consumption: pending sessions are left pending; the full-cycle
+    window stamp is not advanced; the next scheduled tick will still fire on
+    schedule.
+
+    Returns ``409`` when a consolidation fold is already running, when the
+    server is in cloud-only mode, or when the background trainer holds the GPU.
+    """
+    from fastapi import HTTPException
+
+    # Guard: block housekeeping while a migration TRIAL is active.
+    migration = _state.get("migration", {})
+    if migration.get("state") == "TRIAL":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "trial_active",
+                "message": (
+                    "A migration TRIAL is active — housekeeping is blocked. "
+                    "Use POST /migration/accept or POST /migration/rollback to proceed."
+                ),
+            },
+        )
+
+    status = _maybe_trigger_housekeeping()
+    if status.startswith("deferred_"):
+        raise HTTPException(
+            status_code=409,
+            detail={"error": status, "message": f"Housekeeping deferred: {status}"},
+        )
+    return ConsolidateResponse(status=status)
+
+
 # --- Document ingest endpoints ---
 
 
@@ -10974,6 +11035,65 @@ def _is_full_cycle_due(config) -> bool:
     return current != last
 
 
+def _consolidation_dispatch_guards() -> "str | None":
+    """Shared pre-dispatch guard for consolidation dispatchers.
+
+    Checks the three cross-cutting block conditions that prevent any
+    consolidation fold from starting (both scheduled and housekeeping):
+
+    - ``_state["consolidating"]`` — another fold is already running.
+    - ``_state["mode"] != "local"`` — cloud-only mode (no model loaded).
+    - Background trainer is actively training (GPU lock contention risk).
+
+    Returns:
+        A non-None ``"deferred_*"`` reason string when a block is in effect,
+        ``None`` when clear (caller should proceed).  The string mirrors the
+        vocabulary used by ``_maybe_trigger_scheduled_consolidation``.
+    """
+    if _state["consolidating"]:
+        return "deferred_already_running"
+    if _state["mode"] != "local":
+        return "deferred_cloud_only"
+    bg = _state.get("background_trainer")
+    if bg is not None and bg.is_training:
+        return "deferred_bg_training"
+    return None
+
+
+def _maybe_trigger_housekeeping() -> str:
+    """Gate + dispatch an on-demand housekeeping fold.
+
+    On-demand grooming fold (``POST /consolidate/housekeeping``): re-runs the
+    full GraphMerger topology over the canonical knowledge graph without
+    advancing session watermarks.  Sessions stay pending; the window stamp is
+    not updated.  Bypasses the scheduled-tick's interim-vs-full gate and gate
+    (d) (the per-tier floor accumulate guard), so it runs regardless of how
+    many active keys exist.
+
+    Mirrors the guard vocabulary of ``_maybe_trigger_scheduled_consolidation``
+    so callers can treat the return string uniformly.
+
+    Returns:
+        ``"deferred_*"`` when a cross-cutting guard fires; ``"started_housekeeping"``
+        when the fold was successfully dispatched to the BG executor.
+    """
+    _guard = _consolidation_dispatch_guards()
+    if _guard is not None:
+        logger.info("Housekeeping tick: %s — deferred", _guard)
+        return _guard
+
+    logger.info("Housekeeping: dispatching on-demand re-grooming fold")
+    _state["last_consolidation_error"] = None
+    _state["consolidating"] = True
+    event_loop = asyncio.get_running_loop()
+    future = event_loop.run_in_executor(
+        None,
+        lambda: _run_full_consolidation_sync(housekeeping=True),
+    )
+    future.add_done_callback(_scheduled_extract_done_callback)
+    return "started_housekeeping"
+
+
 def _maybe_trigger_scheduled_consolidation() -> str:
     """Gate + dispatch the scheduled tick.
 
@@ -10993,20 +11113,19 @@ def _maybe_trigger_scheduled_consolidation() -> str:
     no-op. The systemd timer fires again on its next wall-clock tick and
     retries.
     """
-    if _state["consolidating"]:
-        logger.info("Scheduler tick: consolidation already running — deferred")
-        return "deferred_already_running"
-    if _state["mode"] != "local":
-        logger.info(
-            "Scheduler tick: mode=%s (reason=%s) — deferred, will retry on next tick",
-            _state["mode"],
-            _state.get("cloud_only_reason"),
-        )
-        return "deferred_cloud_only"
-    bg = _state.get("background_trainer")
-    if bg is not None and bg.is_training:
-        logger.info("Scheduler tick: background training active — deferred")
-        return "deferred_bg_training"
+    _guard = _consolidation_dispatch_guards()
+    if _guard is not None:
+        if _guard == "deferred_cloud_only":
+            logger.info(
+                "Scheduler tick: mode=%s (reason=%s) — deferred, will retry on next tick",
+                _state["mode"],
+                _state.get("cloud_only_reason"),
+            )
+        elif _guard == "deferred_bg_training":
+            logger.info("Scheduler tick: background training active — deferred")
+        else:
+            logger.info("Scheduler tick: consolidation already running — deferred")
+        return _guard
 
     config = _state["config"]
 
@@ -12176,20 +12295,27 @@ def _extract_and_start_training():
     )
 
 
-def _run_full_consolidation_sync() -> None:
+def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
     """Submit a full-cycle consolidation: collapse interims into main.
 
-    Runs ``loop.consolidate_interim_adapters`` on the BG trainer so the GPU
-    lock is held for the entire per-tier rebuild (the helper's docstring
-    requires this — calling without the lock raises). The function deletes
-    each main adapter, recreates it, trains on the cumulative keyed-pair
-    set derived from every interim slot's keys, and on success unloads the
-    interim adapters and reloads the router. On a failed recall-sanity
-    check it rolls back to the snapshot and aborts that tier.
+    Runs ``loop.consolidate_interim_adapters`` (or ``loop.run_housekeeping``
+    when ``housekeeping=True``) on the BG trainer so the GPU lock is held for
+    the entire per-tier rebuild (the helper's docstring requires this —
+    calling without the lock raises). The function deletes each main adapter,
+    recreates it, trains on the cumulative keyed-pair set derived from every
+    interim slot's keys, and on success unloads the interim adapters and
+    reloads the router. On a failed recall-sanity check it rolls back to the
+    snapshot and aborts that tier.
 
     After a successful merge the main adapter manifests are stamped with
     the current registry hash, restoring boot-time mount-ability that
     interim cycles otherwise drift away from.
+
+    Args:
+        housekeeping: When ``True``, route through ``loop.run_housekeeping``
+            instead of ``loop.consolidate_interim_adapters``. Gate (d) is
+            bypassed so the fold runs regardless of accumulation state.
+            Sessions are NOT marked consolidated; window stamp is not advanced.
     """
     from paramem.server.background_trainer import BackgroundTrainer
     from paramem.server.consolidation import (
@@ -12240,7 +12366,15 @@ def _run_full_consolidation_sync() -> None:
         # main-tier graph without touching PEFT weights.
         _mode = config.consolidation.mode
         try:
-            if _mode == "simulate":
+            if housekeeping:
+                # run_housekeeping dispatches to the mode-correct underlying method
+                # (consolidate_interim_graphs for simulate, consolidate_interim_adapters
+                # for train) with housekeeping=True so gate (d) is bypassed.
+                result = loop.run_housekeeping(
+                    trainer=bt,
+                    router=_state.get("router"),
+                )
+            elif _mode == "simulate":
                 result = loop.consolidate_interim_graphs()
             else:
                 result = loop.consolidate_interim_adapters(
@@ -12308,7 +12442,11 @@ def _run_full_consolidation_sync() -> None:
             )
             return
 
-        if not result.get("tiers_rebuilt"):
+        # B1 fix (§4.5.1): under housekeeping=True, DO NOT treat tiers_rebuilt==[]
+        # as a noop.  The housekeeping fold ran the full merger topology even with
+        # no interim slots; its result is the groomed graph, not an absence of work.
+        # Only the SCHEDULED path returns early on the empty-tiers-rebuilt signal.
+        if not housekeeping and not result.get("tiers_rebuilt"):
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["last_consolidation_result"] = {
                 "status": "noop",
@@ -12330,12 +12468,14 @@ def _run_full_consolidation_sync() -> None:
         # would have landed in the ``except Exception`` handler above with
         # sessions left pending — so reaching here means main is durable.
 
-        # Persist key metadata and mark any pending sessions consolidated —
-        # the merge folded their facts into main, so they should not be
-        # re-extracted on the next tick.
+        # Persist key metadata.  Under housekeeping=True, do NOT mark sessions
+        # consolidated — the housekeeping fold re-grooms the existing knowledge
+        # but does NOT fold pending sessions' facts into main (sessions stay
+        # pending for the next scheduled tick).  mark_consolidated is only called
+        # on the SCHEDULED path where the full fold consumed those sessions.
         try:
             _save_key_metadata(loop, config)
-            if session_buffer is not None:
+            if not housekeeping and session_buffer is not None:
                 pending_ids = [s["session_id"] for s in session_buffer.get_pending()]
                 if pending_ids:
                     from paramem.server.consolidation import (

@@ -789,17 +789,30 @@ class TestProbeKeysFromGraph:
 def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     """Build the minimal ConsolidationLoop required by consolidate_interim_graphs.
 
-    Only the attributes read by the method are set:
+    Attributes set:
       - ``output_dir`` — used as the adapter_dir root.
-      - ``graph_enrichment_enabled`` — set to False so _run_graph_enrichment
-        returns immediately without touching ``merger`` or ``extraction``.
+      - ``graph_enrichment_enabled`` — False so ``_run_graph_enrichment`` no-ops.
+      - ``merger`` — a model-free ``GraphMerger`` so the §4.6b merger topology
+        can run without a GPU or loaded model (``additive=True`` skips the only
+        model-gated branch; ``merger.model=None`` is the production-correct
+        configuration for simulate mode).
+      - ``save_cycle_snapshots`` — False so ``_debug_writer`` gates to no-op.
+      - ``_debug_base`` — None so ``_debug_writer._active_base()`` returns None.
+      - ``config`` — None so ``run_housekeeping`` can detect simulate-vs-train mode
+        safely (``run_housekeeping`` guards with ``if self.config is not None``).
 
     All other attributes are left unset; any unintended access will raise
     AttributeError rather than silently returning a MagicMock value.
     """
+    from paramem.graph.merger import GraphMerger
+
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.output_dir = tmp_path
     loop.graph_enrichment_enabled = False
+    loop.merger = GraphMerger(model=None)
+    loop.save_cycle_snapshots = False
+    loop._debug_base = None
+    loop.config = None
     return loop
 
 
@@ -914,18 +927,13 @@ class TestConsolidateInterimGraphs:
         assert result["tiers_rebuilt"] == ["episodic"]
 
     def test_overlapping_triples_deduplicated_in_main_graph(self, tmp_path):
-        """Two slots sharing the same triple (by subject/predicate/object/key) dedup correctly.
+        """Two slots sharing the same SPO triple dedup to a single edge via GraphMerger.
 
-        NetworkX MultiDiGraph adds each edge call as a separate edge; the test
-        verifies that the merged graph contains exactly one edge per unique ik_key
-        value — i.e. the merge does not silently inflate edge count when both
-        slots carry the same key.
-
-        Note: ``_add_keyed_edge`` calls ``graph.add_edge`` which in a
-        ``MultiDiGraph`` always appends a new parallel edge.  The dedup
-        guarantee is on the *key set* (``iter_entries`` yields all edges, so we
-        count distinct key values), not on the raw edge count.  The design
-        documents "last write wins" for identical keys across slots.
+        After §4.6b the simulate merge routes through ``GraphMerger.merge(additive=True)``.
+        When the same SPO (and same ik_key) arrives from both the main graph and an
+        interim slot, the merger's Case-1 (identical SPO) fires and produces exactly ONE
+        surviving edge.  The merged graph must therefore have ``number_of_edges() == 1``
+        and its key set == ``{"graph1"}``.
         """
         from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
@@ -944,8 +952,11 @@ class TestConsolidateInterimGraphs:
         main_graph_path = tmp_path / "episodic" / "graph.json"
         merged = load_memory_from_disk(main_graph_path)
         keys = [e["key"] for e in iter_entries(merged)]
-        # Both edges land in the MultiDiGraph (parallel edges), but every
-        # entry carries "graph1" — the key set has exactly one element.
+        # GraphMerger Case-1 collapses duplicates to a SINGLE surviving edge.
+        n_edges = merged.number_of_edges()
+        assert n_edges == 1, (
+            f"GraphMerger must produce exactly 1 edge for duplicate SPO, got {n_edges}"
+        )
         assert set(keys) == {"graph1"}, (
             f"Expected key set {{graph1}} after overlap merge, got {set(keys)}"
         )
@@ -971,6 +982,290 @@ class TestConsolidateInterimGraphs:
             assert not d.exists(), f"Interim dir {d} must be removed after consolidation"
         assert (tmp_path / "episodic" / "graph.json").exists(), (
             "Main graph.json must exist after merge"
+        )
+
+    def test_result_contains_tier_delta(self, tmp_path):
+        """Result dict contains 'tier_delta' with episodic before/after counts.
+
+        §4.8.iii observability hook: both the scheduled and housekeeping paths
+        emit tier_delta.  For the simulate path staled_by_reason is always {}
+        (no KeyRegistry involved in simulate mode).
+        """
+
+        loop = _make_bare_loop(tmp_path)
+        _write_interim_graph(
+            tmp_path,
+            "20260101T0000",
+            [{"key": "graph1", "subject": "Alice", "predicate": "likes", "object": "Tea"}],
+        )
+
+        result = loop.consolidate_interim_graphs()
+
+        assert "tier_delta" in result, (
+            f"Result must contain 'tier_delta'; got {list(result.keys())}"
+        )
+        td = result["tier_delta"]
+        assert "episodic" in td, f"tier_delta must have 'episodic' key; got {list(td.keys())}"
+        ep = td["episodic"]
+        assert "active_before" in ep and "active_after" in ep, (
+            f"tier_delta['episodic'] must have active_before + active_after; got {ep!r}"
+        )
+        assert "staled_by_reason" in ep, (
+            f"tier_delta['episodic'] must have staled_by_reason; got {ep!r}"
+        )
+        assert ep["staled_by_reason"] == {}, (
+            "simulate path: staled_by_reason must be empty (no KeyRegistry in simulate)"
+        )
+        assert ep["active_before"] == 0, "No main graph before → active_before == 0"
+        assert ep["active_after"] == 1, "One triple merged → active_after == 1"
+
+    def test_housekeeping_noop_on_empty_main_and_no_interims(self, tmp_path):
+        """housekeeping=True with no interims and empty main graph: persists the empty
+        merged graph to disk and returns tiers_rebuilt=['episodic'].
+
+        The B-SIMULATE gate (§4.5.3): housekeeping=True bypasses the empty-interim
+        early-return so the groomed (empty) graph is written back to disk.  This is
+        the simulate counterpart of gate (d) in the train mode.
+        """
+
+        loop = _make_bare_loop(tmp_path)
+        # No interim slots, no pre-existing main graph.
+
+        result = loop.consolidate_interim_graphs(housekeeping=True)
+
+        assert result["tiers_rebuilt"] == ["episodic"], (
+            "housekeeping=True: tiers_rebuilt must be ['episodic'] even with no interims; "
+            f"got {result['tiers_rebuilt']!r}"
+        )
+        main_graph_path = tmp_path / "episodic" / "graph.json"
+        assert main_graph_path.exists(), (
+            "housekeeping=True: main graph.json must be written even with no interims"
+        )
+
+    def test_housekeeping_sets_current_interim_stamp(self, tmp_path):
+        """During consolidate_interim_graphs(housekeeping=True) the loop's
+        _current_interim_stamp is set to 'housekeeping_<ts>' and then cleared.
+
+        After the method returns, the stamp is None (cleared on exit).  This test
+        checks the post-call cleared state (the live value during the call is not
+        observable from a unit test).
+        """
+        loop = _make_bare_loop(tmp_path)
+        loop.consolidate_interim_graphs(housekeeping=True)
+
+        # Stamp must be cleared on normal return.
+        stamp = getattr(loop, "_current_interim_stamp", "NOT_SET")
+        assert stamp is None, (
+            f"_current_interim_stamp must be None after consolidate_interim_graphs returns; "
+            f"got {stamp!r}"
+        )
+
+    def test_run_housekeeping_dispatches_to_consolidate_interim_graphs(self, tmp_path):
+        """run_housekeeping() on a simulate-mode loop calls consolidate_interim_graphs
+        with housekeeping=True, NOT consolidate_interim_adapters.
+
+        With config=None the loop's run_housekeeping() falls through to 'simulate'
+        mode (the default when config is absent).
+        """
+        from unittest.mock import patch
+
+        loop = _make_bare_loop(tmp_path)
+        # config=None → mode defaults to "simulate" in run_housekeeping.
+
+        with patch.object(
+            loop, "consolidate_interim_graphs", wraps=loop.consolidate_interim_graphs
+        ) as mock_cig:
+            loop.run_housekeeping()
+
+        mock_cig.assert_called_once_with(housekeeping=True)
+
+    def test_cross_slot_variant_collapse_in_simulate(self, tmp_path):
+        """TEST GAP 2 (§7.2 step 5 / §6.3): cross-slot variant-pair collapse in simulate.
+
+        Seeds two interim graph.json slots whose surfaces differ but canonicalize
+        to the same identity (subject "Alice" vs "alice", object "Acme Corp" vs
+        "acme corp").  After consolidate_interim_graphs(housekeeping=True):
+
+        (a) The variants COLLAPSE to a single edge in the persisted main graph.json
+            (canonical() node identity + Case-1 dedup in the GraphMerger topology,
+            §4.S symmetry satisfied end-to-end).
+        (b) The removal_ledger carries a "dedup" entry for the discarded variant key
+            with pre_surfaces recording the differing incoming and surviving surfaces
+            (evidence that the dedup was caused by a surface variant, not a genuine
+            duplicate with identical raw text).
+
+        This is the end-to-end assertion the merger-isolation tests cannot cover:
+        it verifies that the simulate path routes through GraphMerger so grooming
+        is literally identical to the train fold.
+        """
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
+
+        loop = _make_bare_loop(tmp_path)
+
+        # Slot A: subject/object in title-case (will be registered first).
+        _write_interim_graph(
+            tmp_path,
+            "20260101T0000",
+            [
+                {
+                    "key": "graph1",
+                    "subject": "Alice",
+                    "predicate": "works at",
+                    "object": "Acme Corp",
+                }
+            ],
+        )
+        # Slot B: same SPO but surfaces differ — casefold variant.
+        # canonical("alice") == canonical("Alice") == "alice"
+        # canonical("acme corp") == canonical("Acme Corp") == "acme corp"
+        # These canonicalize to the same triple, so Case-1 fires and the
+        # merger records pre_surfaces with the differing incoming and surviving surfaces.
+        _write_interim_graph(
+            tmp_path,
+            "20260102T0000",
+            [
+                {
+                    "key": "graph2",
+                    "subject": "alice",
+                    "predicate": "works at",
+                    "object": "acme corp",
+                }
+            ],
+        )
+
+        loop.consolidate_interim_graphs(housekeeping=True)
+
+        # (a) Main graph.json must contain exactly ONE edge (the variants collapsed).
+        main_graph_path = tmp_path / "episodic" / "graph.json"
+        assert main_graph_path.exists(), "Main graph.json must be written"
+        merged = load_memory_from_disk(main_graph_path)
+        entries = list(iter_entries(merged))
+        n_edges = merged.number_of_edges()
+        assert n_edges == 1, (
+            f"Variant pair must collapse to a single edge; got {n_edges} edges "
+            f"(keys: {[e['key'] for e in entries]})"
+        )
+
+        # (b) removal_ledger must carry a "dedup" entry for the discarded variant key
+        # with pre_surfaces evidencing the surface-variant collapse.
+        ledger = getattr(loop.merger, "removal_ledger", {})
+        dedup_entries = {k: v for k, v in ledger.items() if v.get("reason") == "dedup"}
+        assert dedup_entries, (
+            f"removal_ledger must contain at least one 'dedup' entry after variant collapse; "
+            f"ledger={ledger!r}"
+        )
+        # Identify the collapsed key (graph2) by confirming its pre_surfaces show
+        # differing incoming vs surviving subject and/or object surfaces.
+        variant_collapse_keys = [
+            k
+            for k, v in dedup_entries.items()
+            if (
+                v.get("pre_surfaces", {}).get("incoming", {}).get("subject")
+                != v.get("pre_surfaces", {}).get("surviving", {}).get("subject")
+                or v.get("pre_surfaces", {}).get("incoming", {}).get("object")
+                != v.get("pre_surfaces", {}).get("surviving", {}).get("object")
+            )
+        ]
+        assert variant_collapse_keys, (
+            "removal_ledger must have at least one 'dedup' entry where pre_surfaces "
+            "shows differing incoming vs surviving subject/object surfaces; dedup entries: "
+            + str({k: v for k, v in dedup_entries.items()})
+        )
+        # The surviving key must be present in the merged graph.
+        surviving_keys = {e["key"] for e in entries}
+        discarded_keys = set(variant_collapse_keys)
+        # Surviving key is NOT in the discarded set.
+        assert not (surviving_keys & discarded_keys), (
+            f"Surviving key(s) {surviving_keys} must not appear in the collapsed "
+            f"(discarded) set {discarded_keys}"
+        )
+
+    def test_enrichment_survives_into_persisted_graph_after_merge(self, tmp_path):
+        """Regression: enrichment runs AFTER reset+merge, so sentinel edge survives persist.
+
+        On the buggy code (enrichment before reset_graph), the sentinel edge was wiped by
+        reset_graph() and the persisted graph.json had no enrichment.  After the fix,
+        enrichment runs on the freshly-merged graph and the sentinel coexists with the
+        merged interim edges in the persisted output.
+
+        Strategy: monkeypatch _run_graph_enrichment to add a sentinel edge to
+        self.merger.graph and return new_edges=1.  After consolidate_interim_graphs(
+        housekeeping=True), assert:
+        (a) the sentinel edge is present in the persisted graph.json, and
+        (b) the merged interim edge is also present (sentinel coexists with merged content),
+        (c) tier_delta["episodic"]["minted"] == 1 (sourced from enrichment new_edges).
+        """
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
+
+        loop = _make_bare_loop(tmp_path)
+
+        # Seed one interim slot so there is merged content to coexist with.
+        _write_interim_graph(
+            tmp_path,
+            "20260101T0000",
+            [{"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}],
+        )
+
+        # Sentinel values for the edge the enrichment mock will inject.
+        SENTINEL_SUBJECT = "__enr_sentinel__"
+        SENTINEL_OBJECT = "__enr_sentinel_obj__"
+        SENTINEL_KEY = "__enr_sentinel_key__"
+
+        def _fake_enrichment(self_loop=None):
+            """Add a sentinel edge to self.merger.graph and return new_edges=1.
+
+            Must run on the populated merged graph (after reset+merge), otherwise
+            the merger's graph is empty and the sentinel is wiped by reset_graph().
+            The buggy code runs enrichment BEFORE reset_graph(), so the sentinel
+            would be absent from the persisted graph on the old path.
+            """
+            loop.merger.graph.add_edge(
+                SENTINEL_SUBJECT,
+                SENTINEL_OBJECT,
+                **{
+                    _IK_KEY_ATTR: SENTINEL_KEY,
+                    "predicate": "enriched_by",
+                    "speaker_id": "",
+                    "first_seen_cycle": 0,
+                },
+            )
+            return {
+                "chunks": 1,
+                "new_edges": 1,
+                "same_as_merges": 0,
+                "skipped": False,
+                "skip_reason": None,
+            }
+
+        from unittest.mock import patch
+
+        with patch.object(loop, "_run_graph_enrichment", side_effect=_fake_enrichment):
+            result = loop.consolidate_interim_graphs(housekeeping=True)
+
+        # (a) Sentinel edge must be present in the persisted graph.json.
+        main_graph_path = tmp_path / "episodic" / "graph.json"
+        assert main_graph_path.exists(), "Main graph.json must be written"
+        merged = load_memory_from_disk(main_graph_path)
+        keys_in_graph = {e["key"] for e in iter_entries(merged)}
+        assert SENTINEL_KEY in keys_in_graph, (
+            f"Sentinel enrichment edge must survive into persisted graph.json; "
+            f"keys present: {sorted(keys_in_graph)}\n"
+            "On the buggy code (enrichment before reset_graph) the sentinel is wiped "
+            "by reset_graph() and is absent here."
+        )
+
+        # (b) Merged interim edge must also be present (sentinel coexists with real content).
+        assert "graph1" in keys_in_graph, (
+            f"Merged interim edge 'graph1' must coexist with sentinel; "
+            f"keys present: {sorted(keys_in_graph)}"
+        )
+
+        # (c) tier_delta["episodic"]["minted"] must equal enrichment new_edges (1).
+        td = result.get("tier_delta", {})
+        assert "episodic" in td, f"tier_delta must contain 'episodic'; got {list(td.keys())}"
+        minted = td["episodic"].get("minted")
+        assert minted == 1, (
+            f"tier_delta['episodic']['minted'] must equal enrichment new_edges=1; got {minted!r}"
         )
 
 
@@ -1391,3 +1686,90 @@ class TestDebugSnapshotIntegration:
         summary = json.loads((cycle_dir / "cycle_summary_snapshot.json").read_text())
         assert summary["mode"] == "queued"
         assert summary["adapter_name"] is None
+
+
+# ---------------------------------------------------------------------------
+# TestDebugSnapshotOnTierDelta
+# ---------------------------------------------------------------------------
+
+
+class TestDebugSnapshotOnTierDelta:
+    """``DebugSnapshotWriter.on_tier_delta`` persists the per-tier delta record.
+
+    §4.8.iii observability hook: both the scheduled fold and the housekeeping
+    endpoint emit a ``tier_delta.json`` under ``<debug_base>/fold/`` so
+    operators can see before/after/staled/minted counts without parsing
+    raw adapter weight files.
+    """
+
+    def test_on_tier_delta_writes_file_when_snapshots_enabled(self, tmp_path) -> None:
+        """on_tier_delta writes tier_delta.json under fold/ when save_cycle_snapshots=True."""
+        import json as _json
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.debug_snapshot import DebugSnapshotWriter
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.output_dir = tmp_path
+        loop.graph_enrichment_enabled = False
+        loop.save_cycle_snapshots = True
+        loop._debug_base = tmp_path / "debug"
+        loop._current_interim_stamp = None
+        loop.run_id = "test_run_01"
+        loop.cycle_count = 1
+
+        writer = DebugSnapshotWriter(loop)
+
+        tier_delta = {
+            "episodic": {
+                "active_before": 10,
+                "active_after": 8,
+                "staled_by_reason": {"dedup": 2},
+                "minted": 0,
+            }
+        }
+        writer.on_tier_delta(tier_delta)
+
+        # Locate the written file under fold/.
+        fold_dir = loop.snapshot_dir_for()
+        if fold_dir is None:
+            pytest.skip("snapshot_dir_for returned None — debug gate not active")
+        td_path = fold_dir / "fold" / "tier_delta.json"
+        fold_contents = (
+            list((fold_dir / "fold").iterdir()) if (fold_dir / "fold").exists() else "fold/ missing"
+        )
+        assert td_path.exists(), (
+            f"tier_delta.json must be written to {td_path}; files in fold dir: {fold_contents}"
+        )
+        written = _json.loads(td_path.read_text())
+        assert written == tier_delta, (
+            f"Written tier_delta.json must equal the passed dict; got {written!r}"
+        )
+
+    def test_on_tier_delta_noop_when_snapshots_disabled(self, tmp_path) -> None:
+        """on_tier_delta is a no-op (no file written) when save_cycle_snapshots=False."""
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.debug_snapshot import DebugSnapshotWriter
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+
+        writer = DebugSnapshotWriter(loop)
+        writer.on_tier_delta(
+            {
+                "episodic": {
+                    "active_before": 5,
+                    "active_after": 5,
+                    "staled_by_reason": {},
+                    "minted": 0,
+                }
+            }
+        )
+
+        # No file should have been written anywhere.
+        written_files = list(tmp_path.rglob("tier_delta.json"))
+        assert written_files == [], (
+            f"No tier_delta.json must be written when snapshots disabled; found {written_files}"
+        )

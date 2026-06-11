@@ -157,6 +157,11 @@ A **fallback path** runs local plausibility on the raw extraction when the prima
 
 The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → during the full consolidation fold (`consolidate_interim_adapters`), keys whose per-key `recurrence_count` meets the promotion threshold are promoted episodic→semantic; `store.move(key, "semantic")` moves the registry entry and SimHash — so promotion happens before tier assignment.
 
+**Transcript-stage boundary (§4.S architectural symmetry).** The consolidation fold has two modes sharing an identical grooming pipeline — they diverge ONLY in their persistence tail:
+- **`train` mode**: source = reconstruct-from-adapter-weights; sink = retrain PEFT adapters.
+- **`simulate` mode**: source = `load_memory_from_disk(graph.json)`; sink = `save_memory_to_disk(graph.json)`.
+Both modes run `canonical()` node identity + Case-1/Case-2 dedup via `GraphMerger.merge(additive=True)` + `_run_graph_enrichment` before the divergence point. Any change to grooming logic must be applied in `consolidate_interim_adapters` AND `consolidate_interim_graphs` to maintain parity. The `POST /consolidate/housekeeping` endpoint triggers an on-demand grooming pass through `run_housekeeping()`, which dispatches to the correct mode-specific method with gate (d) bypassed.
+
 **Fold merge input is registry-true.** The fold sources its Stage-2 merge input from `store.get(key)` / `store.bookkeeping_for_key(key)` (registry-true SPO) for every active key, not from the reconstruction result. Reconstruction is a **health/retry signal** only: a key whose reconstructed SPO disagrees with its registry-true SPO is flagged in `result["recall_miss_keys"]` and retrained with its registry-true content — it is never silently dropped. A recall miss does not delete a key.
 
 Key design decisions:
