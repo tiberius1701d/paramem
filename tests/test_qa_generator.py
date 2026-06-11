@@ -383,25 +383,25 @@ class TestFlattenEntityAttributes:
         assert len(result) == 1
         assert result[0]["predicate"] == "has_phone"
 
-    def test_key_with_spaces_normalised_to_underscores(self):
-        """Attribute keys with spaces are snake_cased in the predicate."""
+    def test_key_with_spaces_normalised_to_canonical(self):
+        """Attribute keys with spaces are canonicalized (space-separated) in the predicate."""
         entity = Entity(
             name="Alex",
             entity_type="person",
             attributes={"phone number": "+49123456"},
         )
         result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has_phone_number"
+        assert result[0]["predicate"] == "has_phone number"
 
-    def test_key_with_dashes_normalised_to_underscores(self):
-        """Attribute keys with dashes are snake_cased in the predicate."""
+    def test_key_with_dashes_normalised_to_canonical(self):
+        """Attribute keys with dashes are canonicalized (separator-folded to spaces)."""
         entity = Entity(
             name="Alex",
             entity_type="person",
             attributes={"linked-in": "linkedin.com/in/alex"},
         )
         result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has_linked_in"
+        assert result[0]["predicate"] == "has_linked in"
 
     def test_key_with_uppercase_lowercased(self):
         """Attribute keys are lowercased before formatting the predicate."""

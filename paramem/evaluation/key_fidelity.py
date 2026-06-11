@@ -8,17 +8,22 @@ reconstruction.
 
 import logging
 
-from paramem.graph.merger import _normalize_predicate
+from paramem.graph.name_match import canonical
 
 logger = logging.getLogger(__name__)
 
 
 def _normalize_triple(triple: dict) -> tuple[str, str, str]:
-    """Normalize a triple for comparison."""
+    """Normalize a triple for comparison using canonical string identity.
+
+    Applies the same deterministic canonicalization as the merger node-key
+    model so that ``_``↔space/case/diacritic variants of the same fact score
+    as identical.
+    """
     return (
-        triple["subject"].strip().lower(),
-        _normalize_predicate(triple["predicate"]),
-        triple["object"].strip().lower(),
+        canonical(triple["subject"]),
+        canonical(triple["predicate"]),
+        canonical(triple["object"]),
     )
 
 
@@ -304,7 +309,7 @@ def parse_profile_to_triples(
                     triples.append(
                         {
                             "subject": entity_name,
-                            "predicate": _normalize_predicate(verb),
+                            "predicate": canonical(verb),
                             "object": obj,
                         }
                     )

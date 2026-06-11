@@ -23,7 +23,8 @@ from paramem.graph.extractor import (
     PROVIDER_KEY_ENV,
     _graph_enrich_with_sota,
 )
-from paramem.graph.merger import GraphMerger, _normalize_predicate
+from paramem.graph.merger import GraphMerger
+from paramem.graph.name_match import canonical
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.qa_generator import (
     partition_relations,
@@ -483,17 +484,17 @@ class ConsolidationLoop:
     def dedup_episodic(qa_list: list[dict]) -> list[dict]:
         """Deduplicate episodic QA/relation dicts by triple identity.
 
-        Identity key is ``(subject, predicate, object)``.  Case-insensitive;
-        first occurrence wins.  Entries missing any of the three identity
+        Identity key is ``(canonical(subject), canonical(predicate), canonical(object))``.
+        First occurrence wins.  Entries missing any of the three identity
         fields are DROPPED — an incomplete triple cannot be keyed and must
         not produce a ghost ``__unkeyed__`` entry.
         """
         seen: set[tuple] = set()
         out: list[dict] = []
         for qa in qa_list:
-            subj = (qa.get("subject") or "").strip().lower()
-            pred = (qa.get("predicate") or "").strip().lower()
-            obj = (qa.get("object") or "").strip().lower()
+            subj = canonical(qa.get("subject") or "")
+            pred = canonical(qa.get("predicate") or "")
+            obj = canonical(qa.get("object") or "")
             if not (subj and pred and obj):
                 continue
             key = (subj, pred, obj)
@@ -507,15 +508,16 @@ class ConsolidationLoop:
     def dedup_procedural(rels: list[dict]) -> list[dict]:
         """Deduplicate procedural relations by (subject, predicate, object).
 
+        Identity key is ``(canonical(subject), canonical(predicate), canonical(object))``.
         Entries missing any of the three identity fields are DROPPED — an
         incomplete triple cannot be keyed and must not produce a ghost entry.
         """
         seen: set[tuple] = set()
         out: list[dict] = []
         for rel in rels:
-            subj = (rel.get("subject") or "").strip().lower()
-            pred = (rel.get("predicate") or "").strip().lower()
-            obj = (rel.get("object") or "").strip().lower()
+            subj = canonical(rel.get("subject") or "")
+            pred = canonical(rel.get("predicate") or "")
+            obj = canonical(rel.get("object") or "")
             if not (subj and pred and obj):
                 continue
             key = (subj, pred, obj)
@@ -3188,19 +3190,26 @@ class ConsolidationLoop:
                 keep, drop = pair[0], pair[1]
                 if keep == drop:
                     continue
-                if keep not in graph or drop not in graph:
+                # Canonicalize for graph lookup; SOTA returns surface names, nodes
+                # are canonical post-model-A.  BL-1: keep _safe_to_merge_surface on
+                # the original SURFACE strings (fuzzy layer-2 check).
+                keep_canon = canonical(keep)
+                drop_canon = canonical(drop)
+                if keep_canon == drop_canon:
+                    continue
+                if keep_canon not in graph or drop_canon not in graph:
                     logger.debug(
                         "graph_enrichment: same_as skip — keep=%r drop=%r not both in graph",
-                        keep,
-                        drop,
+                        keep_canon,
+                        drop_canon,
                     )
                     continue
-                merge_key = frozenset({keep.lower(), drop.lower()})
+                merge_key = frozenset({keep_canon, drop_canon})
                 if merge_key in seen_merge_keys:
                     logger.debug(
                         "graph_enrichment: same_as dedup — %r / %r already seen",
-                        keep,
-                        drop,
+                        keep_canon,
+                        drop_canon,
                     )
                     continue
                 seen_merge_keys.add(merge_key)
@@ -3216,28 +3225,29 @@ class ConsolidationLoop:
                 # Use inner-dict .values() iteration — MultiDiGraph get_edge_data
                 # returns {edge_id: data_dict}; do NOT treat the outer dict as data.
                 _pending: dict[str, str] = {}
-                for _u, _v in [(keep, drop), (drop, keep)]:
+                for _u, _v in [(keep_canon, drop_canon), (drop_canon, keep_canon)]:
                     for _edata in (graph.get_edge_data(_u, _v) or {}).values():
                         _ik = _edata.get(_IK_KEY_ATTR)
                         if _ik:
-                            _pending[_ik] = keep
+                            _pending[_ik] = keep_canon
                 try:
-                    nx.contracted_nodes(graph, keep, drop, self_loops=False, copy=False)
+                    nx.contracted_nodes(graph, keep_canon, drop_canon, self_loops=False, copy=False)
                     total_merges += 1
                     # Success — absorb pending keys into the accumulator.
                     _collapsed_ik.update(_pending)
-                    coref_map[drop] = keep
-                    logger.debug("graph_enrichment: contracted %r → %r", drop, keep)
+                    coref_map[drop_canon] = keep_canon
+                    logger.debug("graph_enrichment: contracted %r → %r", drop_canon, keep_canon)
                 except Exception as exc:
                     logger.warning(
                         "graph_enrichment: same_as contraction failed %r → %r: %s",
-                        drop,
-                        keep,
+                        drop_canon,
+                        keep_canon,
                         exc,
                     )
 
             def _resolve_name(name: str) -> str:
-                # Follow drop→keep chains with a visited guard.
+                # Canonicalize surface name then follow drop→keep chains.
+                name = canonical(name)
                 seen: set[str] = set()
                 while name in coref_map and name not in seen:
                     seen.add(name)
@@ -3258,7 +3268,7 @@ class ConsolidationLoop:
                 rtype = rel.get("relation_type", fallback_rtype)
                 if rtype not in valid_rtypes:
                     rtype = fallback_rtype
-                pred = _normalize_predicate(raw_pred)
+                pred = canonical(raw_pred)
                 if not (subj and pred and obj and subj != obj):
                     continue
 
@@ -3613,12 +3623,21 @@ class ConsolidationLoop:
             _rt_raw = _t_data.get("relation_type", _FALLBACK_RTYPE)
             _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
 
+            # Resolve display names from node attributes["name"] (model-A: node keys
+            # are canonical; display surface lives in attributes["name"]).
+            _subj_display = (
+                self.merger.graph.nodes[_t_subj].get("attributes", {}).get("name") or _t_subj
+            )
+            _obj_display = (
+                self.merger.graph.nodes[_t_obj].get("attributes", {}).get("name") or _t_obj
+            )
+
             # Derive tier with the same logic Stage-5 uses for keyed edges.
             _dummy = [
                 {
-                    "subject": _t_subj,
+                    "subject": _subj_display,
                     "predicate": pred,
-                    "object": _t_obj,
+                    "object": _obj_display,
                     "relation_type": _rt,
                 }
             ]
@@ -3635,9 +3654,9 @@ class ConsolidationLoop:
             minted = self._mint_keyed_entries(
                 [
                     {
-                        "subject": _t_subj,
+                        "subject": _subj_display,
                         "predicate": pred,
-                        "object": _t_obj,
+                        "object": _obj_display,
                         "relation_type": _rt,
                         "speaker_id": "",
                     }
@@ -3650,6 +3669,7 @@ class ConsolidationLoop:
             key = minted[0]["key"]
 
             # Persist using the fold's in-place mutation discipline.
+            # Use canonical node keys for simhash identity; display strings for entry payload.
             self.store.put(
                 tier,
                 key,
@@ -3673,9 +3693,9 @@ class ConsolidationLoop:
             tier_keyed[tier].append(
                 {
                     "key": key,
-                    "subject": _t_subj,
+                    "subject": _subj_display,
                     "predicate": pred,
-                    "object": _t_obj,
+                    "object": _obj_display,
                 }
             )
 
@@ -3930,7 +3950,7 @@ class ConsolidationLoop:
                 _r_subj, _r_pred, _r_obj = _recon_spo
                 if (
                     _r_subj != _rt_subj
-                    or _normalize_predicate(_r_pred) != _normalize_predicate(_rt_pred)
+                    or canonical(_r_pred) != canonical(_rt_pred)
                     or _r_obj != _rt_obj
                 ):
                     recall_miss_keys.add(_rh_key)
@@ -5624,7 +5644,8 @@ def _mentions_any(text: str, terms: set[str]) -> bool:
 
 
 _SYMMETRIC_ENRICHMENT_PREDICATES = frozenset(
-    {
+    canonical(p)
+    for p in {
         "colleague_of",
         "friend_of",
         "neighbor_of",

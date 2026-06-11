@@ -2466,7 +2466,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         Call this on the loop BEFORE calling ``_run_with_mocks`` in tests that
         supply a recon graph with stamped edges.
         """
-        import paramem.graph.merger as _merger_mod
+        from paramem.graph.name_match import canonical as _canonical
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         def _spy_merge(session_graph, *, additive=False):
@@ -2481,7 +2481,7 @@ class TestConsolidateInterimAdaptersFullFlow:
                     _eid = loop.merger.graph.add_edge(
                         _subj,
                         _obj,
-                        predicate=_merger_mod._normalize_predicate(rel.predicate),
+                        predicate=_canonical(rel.predicate),
                         relation_type=rel.relation_type,
                         confidence=rel.confidence,
                         first_seen="s_recon",
@@ -2772,12 +2772,12 @@ class TestConsolidateInterimAdaptersFullFlow:
                         merged_g.add_node(_subj)
                     if not merged_g.has_node(_obj):
                         merged_g.add_node(_obj)
-                    import paramem.graph.merger as _merger_mod
+                    from paramem.graph.name_match import canonical as _canonical
 
                     _eid = merged_g.add_edge(
                         _subj,
                         _obj,
-                        predicate=_merger_mod._normalize_predicate(rel.predicate),
+                        predicate=_canonical(rel.predicate),
                         relation_type=rel.relation_type,
                         confidence=rel.confidence,
                         first_seen="s_recon",
@@ -3234,7 +3234,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         existing_eid = m.graph.add_edge(
             "Alice",
             "Berlin",
-            predicate="lives_in",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",
@@ -3246,6 +3246,8 @@ class TestConsolidateInterimAdaptersFullFlow:
         assert m.graph["Alice"]["Berlin"][existing_eid].get(_IK_KEY_ATTR) is None
 
         # Upsert the same triple with indexed_key set — should adopt via Case-1.
+        # Incoming predicate "lives_in" canonicalizes to "lives in" (space form),
+        # matching the pre-seeded edge predicate.
         incoming = Relation(
             subject="Alice",
             predicate="lives_in",
@@ -3264,7 +3266,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
         # No duplicate edge should have been inserted (still one edge for this (s,p,o)).
         same_pred_edges = [
-            k for k, d in m.graph["Alice"]["Berlin"].items() if d.get("predicate") == "lives_in"
+            k for k, d in m.graph["Alice"]["Berlin"].items() if d.get("predicate") == "lives in"
         ]
         assert len(same_pred_edges) == 1, (
             f"Expected exactly 1 edge after Case-1-adopt; got {len(same_pred_edges)}"
@@ -3889,18 +3891,20 @@ class TestDriftIntendedRemoval:
 
         def _enrichment_side_effect():
             # Called AFTER reset_graph() and Stage-2 re-merge.  At this point the
-            # merged graph has an Alice→Alicia alias_of edge carrying key_enrichment.
-            # Simulate the real same_as contraction: the edge becomes a self-loop and
-            # is dropped; we replicate that by removing all Alice→Alicia edges.
+            # merged graph has an alice→alicia alias_of edge carrying key_enrichment.
+            # Node keys are canonical (lowercase) because GraphMerger canonicalizes
+            # all entity names at merge time.  Simulate the real same_as contraction:
+            # the edge becomes a self-loop and is dropped; replicate by removing all
+            # alice→alicia edges.
             g = loop.merger.graph
-            edges_to_remove = list(g.out_edges("Alice", keys=True))
+            edges_to_remove = list(g.out_edges("alice", keys=True))
             for u, v, k in edges_to_remove:
-                if v == "Alicia":
+                if v == "alicia":
                     g.remove_edge(u, v, key=k)
             # Write the ledger entry exactly as real _run_graph_enrichment does.
             loop.merger.removal_ledger["key_enrichment"] = {
                 "reason": "enrichment_same_as",
-                "merged_into": "Alice",
+                "merged_into": "alice",
             }
             return {"skipped": False, "new_edges": 0, "same_as_contractions": 1}
 

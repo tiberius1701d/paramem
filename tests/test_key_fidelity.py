@@ -18,8 +18,8 @@ def test_normalize_triple_lowercases_and_strips():
     s, p, o = _normalize_triple(t)
     assert s == "alex"
     assert o == "paris"
-    # Predicate normalization is the shared _normalize_predicate (lowercase + _)
-    assert " " not in p
+    # canonical() folds separators (_/-) to spaces — predicate is space-separated
+    assert p == "lives in"
     assert p.islower()
 
 
