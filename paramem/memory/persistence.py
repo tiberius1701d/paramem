@@ -65,6 +65,13 @@ logger = logging.getLogger(__name__)
 # field in node_link_data JSON output and would be lost on round-trip.
 _IK_KEY_ATTR = "ik_key"
 
+# Internal attribute name for edge provenance (e.g. ``"graph_enrichment"``).
+# Must not be "source" — that is the NetworkX reserved edge-source-NODE field
+# in node_link_data JSON output; an edge attribute named "source" is silently
+# overwritten by the source node's name on save and lost on round-trip (same
+# reserved-key collision class as "key" → "ik_key").
+_EDGE_SOURCE_ATTR = "edge_source"
+
 
 def save_memory_to_disk(graph: nx.MultiDiGraph, path: Path, *, encrypted: bool = True) -> None:
     """Atomic encrypted write of *graph* to *path*.

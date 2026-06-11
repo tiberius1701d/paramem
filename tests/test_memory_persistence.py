@@ -20,6 +20,7 @@ from paramem.backup.key_store import (
     write_daily_key_file,
 )
 from paramem.memory.persistence import (
+    _EDGE_SOURCE_ATTR,
     _IK_KEY_ATTR,
     build_tier_graph_from_store,
     entry_by_key,
@@ -194,6 +195,43 @@ class TestRoundTrip:
         g2 = load_memory_from_disk(path)
         assert g2.number_of_edges() == 0
         assert g2.number_of_nodes() == 0
+
+    def test_round_trip_preserves_edge_source_provenance(self, tmp_path):
+        """Edge provenance under _EDGE_SOURCE_ATTR survives save→load intact.
+
+        Regression for the reserved-key collision: an edge attribute named
+        "source" is silently overwritten by NetworkX's node_link_data with the
+        source-NODE name on persist (and lost on reload).  Provenance is stored
+        under _EDGE_SOURCE_ATTR ("edge_source") to dodge the collision — same
+        class as "key" → "ik_key".  This test verifies the renamed attribute
+        survives, AND that a co-present ik_key / predicate survive alongside it.
+        """
+        g = nx.MultiDiGraph()
+        eid = g.add_edge(
+            "dana vex",
+            "acme corp",
+            predicate="works at",
+            confidence=0.9,
+            **{_EDGE_SOURCE_ATTR: "graph_enrichment"},
+        )
+        g["dana vex"]["acme corp"][eid][_IK_KEY_ATTR] = "graph7"
+
+        path = tmp_path / "graph.json"
+        save_memory_to_disk(g, path)
+        g2 = load_memory_from_disk(path)
+
+        edges = list(g2.edges(keys=True, data=True))
+        assert len(edges) == 1
+        subj, obj, _nx_key, data = edges[0]
+        # Topology endpoints reconstructed correctly (these consume the reserved
+        # node_link "source"/"target" fields).
+        assert subj == "dana vex"
+        assert obj == "acme corp"
+        # Provenance tag survives — the bug clobbered this to the node name.
+        assert data[_EDGE_SOURCE_ATTR] == "graph_enrichment"
+        # Co-present attributes survive alongside it.
+        assert data[_IK_KEY_ATTR] == "graph7"
+        assert data["predicate"] == "works at"
 
 
 # ---------------------------------------------------------------------------

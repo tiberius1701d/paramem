@@ -1891,6 +1891,143 @@ class TestRemovalLedger:
             f"reset_graph must clear removal_ledger; got {m.removal_ledger}"
         )
 
+    def test_dedup_ledger_records_pre_surfaces_for_subject_object_variant(self):
+        """Ledger pre_surfaces records the raw incoming and surviving subject/object
+        surfaces when a case variant is collapsed by canonical() dedup.
+
+        This is the §4.8.i observability hook: readers compare incoming vs.
+        surviving directly to distinguish genuine duplicates from canonicalization
+        normalization collapses.
+        """
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+
+        m = GraphMerger()
+
+        # First session: "Alice" / "lives_in" / "Berlin"
+        s1 = SessionGraph(
+            session_id="canon1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="key_survivor",
+                )
+            ],
+        )
+        m.merge(s1, additive=True)
+
+        # Second session: "ALICE" / "lives_in" / "berlin" — same canonical forms;
+        # surfaces differ, so pre_surfaces must record the mismatch.
+        s2 = SessionGraph(
+            session_id="canon2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="ALICE",
+                    predicate="lives_in",
+                    object="berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="key_drifter",
+                )
+            ],
+        )
+        m.merge(s2, additive=True)
+
+        assert "key_drifter" in m.removal_ledger, "Drifting key must appear in removal_ledger"
+        entry = m.removal_ledger["key_drifter"]
+        assert "pre_surfaces" in entry, "removal_ledger entry must contain pre_surfaces"
+        pre = entry["pre_surfaces"]
+        assert "incoming" in pre and "surviving" in pre, (
+            f"pre_surfaces must have 'incoming' and 'surviving' keys; got {list(pre.keys())}"
+        )
+        # Incoming surfaces record the raw drifted form.
+        assert pre["incoming"]["subject"] == "ALICE", (
+            f"incoming subject must be raw 'ALICE'; got {pre['incoming']['subject']!r}"
+        )
+        assert pre["incoming"]["object"] == "berlin", (
+            f"incoming object must be raw 'berlin'; got {pre['incoming']['object']!r}"
+        )
+        # Surviving surfaces record the first-seen stored form; they differ from incoming.
+        assert pre["surviving"]["subject"] != pre["incoming"]["subject"], (
+            "surviving subject must differ from incoming subject for a case-variant collapse"
+        )
+        assert pre["surviving"]["object"] != pre["incoming"]["object"], (
+            "surviving object must differ from incoming object for a case-variant collapse"
+        )
+
+    def test_dedup_ledger_records_pre_surfaces_for_predicate_normalized_duplicate(self):
+        """Ledger pre_surfaces records the raw incoming and stored surviving predicate
+        surfaces when a byte-identical duplicate is collapsed by dedup.
+
+        Relations use ``"lives_in"`` (raw) but the merger stores predicates in
+        space-form (``"lives in"``).  pre_surfaces captures the raw incoming form
+        and the space-normalized surviving form so readers can inspect the mismatch.
+        """
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+
+        m = GraphMerger()
+        s1 = SessionGraph(
+            session_id="dup1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="k_survivor",
+                )
+            ],
+        )
+        s2 = SessionGraph(
+            session_id="dup2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="Speaker0",
+                    indexed_key="k_drifter",
+                )
+            ],
+        )
+        m.merge(s1, additive=True)
+        m.merge(s2, additive=True)
+
+        entry = m.removal_ledger.get("k_drifter", {})
+        assert "pre_surfaces" in entry, (
+            f"removal_ledger entry must contain pre_surfaces; entry={entry!r}"
+        )
+        pre = entry["pre_surfaces"]
+        # incoming predicate is the raw underscore form from the Relation.
+        assert pre.get("incoming", {}).get("predicate") == "lives_in", (
+            f"incoming predicate must be the raw 'lives_in' form; got "
+            f"{pre.get('incoming', {}).get('predicate')!r}"
+        )
+        # surviving predicate is the space-normalized form stored by the merger.
+        assert pre.get("surviving", {}).get("predicate") == "lives in", (
+            f"surviving predicate must be the space-normalized 'lives in'; got "
+            f"{pre.get('surviving', {}).get('predicate')!r}"
+        )
+
 
 class TestObjectVariantDedup:
     """Canonical node-key model A collapses object-side variants into one edge.
