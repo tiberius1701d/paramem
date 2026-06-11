@@ -23,6 +23,7 @@ from pathlib import Path
 import networkx as nx
 from rapidfuzz import fuzz
 
+from paramem.graph.name_match import canonical as canonical_id
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
@@ -348,16 +349,29 @@ class GraphMerger:
         timestamp = session_graph.timestamp
 
         # Merge entities
-        entity_name_map = {}  # session entity name -> canonical name in graph
+        entity_name_map = {}  # session entity name -> canonical node key in graph
         for entity in session_graph.entities:
-            canonical = self._resolve_entity(entity)
-            entity_name_map[entity.name] = canonical
-            self._upsert_entity(canonical, entity, session_id, timestamp)
+            node_key = self._resolve_entity(entity)
+            entity_name_map[entity.name] = node_key
+            self._upsert_entity(node_key, entity, session_id, timestamp)
 
         # Merge relations
         for relation in session_graph.relations:
-            subject = entity_name_map.get(relation.subject, relation.subject)
-            obj = entity_name_map.get(relation.object, relation.object)
+            subj_surface = relation.subject
+            obj_surface = relation.object
+            subject = entity_name_map.get(subj_surface, canonical_id(subj_surface))
+            obj = entity_name_map.get(obj_surface, canonical_id(obj_surface))
+
+            # Build a display-name map for endpoints not resolved through entities.
+            # Keys in entity_name_map already have _upsert_entity called for them
+            # (which writes attributes["name"]).  Remaining endpoints are raw relation
+            # endpoints that arrived without a corresponding Entity; they need the
+            # surface form stashed so downstream display reads work.
+            _endpoint_display: dict[str, str] = {}
+            if subj_surface not in entity_name_map:
+                _endpoint_display[subject] = subj_surface
+            if obj_surface not in entity_name_map:
+                _endpoint_display[obj] = obj_surface
 
             # Ensure both endpoints exist as nodes
             for name in (subject, obj):
@@ -365,12 +379,18 @@ class GraphMerger:
                     self.graph.add_node(
                         name,
                         entity_type="concept",
-                        attributes={},
+                        attributes={"name": _endpoint_display[name]},
                         first_seen=session_id,
                         last_seen=session_id,
                         recurrence_count=1,
                         sessions=[session_id],
                     )
+                elif name in _endpoint_display:
+                    # Node already exists but display name not yet set (first-seen wins).
+                    node_attrs = self.graph.nodes[name].get("attributes", {})
+                    if not node_attrs.get("name"):
+                        node_attrs["name"] = _endpoint_display[name]
+                        self.graph.nodes[name]["attributes"] = node_attrs
 
             self._upsert_relation(subject, obj, relation, session_id, timestamp, additive=additive)
 
@@ -411,23 +431,27 @@ class GraphMerger:
         * **Non-speaker entity** (``entity.speaker_id is None``) —
           two-tier name resolution:
 
-          1. Exact normalised name match.
+          1. Exact canonical key match: ``canonical_id(entity.name)``
+             against existing node keys (with node-key model A, every
+             node key IS the canonical form, so a direct lookup suffices).
           2. Fuzzy ``rapidfuzz.token_sort_ratio`` at
              ``similarity_threshold``, same ``entity_type`` only.
+             Comparison uses ``canonical_id`` on both sides.
 
-          Returns the existing canonical key on a hit, or
-          ``entity.name`` (a new node) on a miss.
+          Returns the existing node key on a hit, or
+          ``canonical_id(entity.name)`` (a new node key) on a miss.
         """
         # Speaker entities: canonical key IS the speaker_id.
         if entity.speaker_id is not None:
             return entity.speaker_id
 
-        normalized = _normalize_name(entity.name)
+        entity_canonical = canonical_id(entity.name)
 
-        # Tier 1: Exact match on normalised names (non-speaker entities).
-        for node in self.graph.nodes:
-            if _normalize_name(node) == normalized:
-                return node
+        # Tier 1: Exact match on canonical node key (non-speaker entities).
+        # With node-key model A the node key IS the canonical form, so a direct
+        # lookup suffices; the old _normalize_name scan is replaced by key lookup.
+        if entity_canonical in self.graph:
+            return entity_canonical
 
         # Tier 2: Fuzzy match (non-speaker entities).
         fuzzy_best: str | None = None
@@ -437,7 +461,7 @@ class GraphMerger:
             # Only match against same entity type
             if node_data.get("entity_type") != entity.entity_type:
                 continue
-            score = fuzz.token_sort_ratio(normalized, _normalize_name(node))
+            score = fuzz.token_sort_ratio(entity_canonical, canonical_id(node))
             if score > fuzzy_score and score >= self.similarity_threshold:
                 fuzzy_score = score
                 fuzzy_best = node
@@ -451,34 +475,37 @@ class GraphMerger:
             )
             return fuzzy_best
 
-        return entity.name
+        return entity_canonical
 
     def _upsert_entity(
         self,
-        canonical: str,
+        node_key: str,
         entity: Entity,
         session_id: str,
         timestamp: str,
     ) -> None:
         """Insert or update an entity node.
 
-        Speaker entities (``entity.speaker_id`` set) are keyed by
-        ``speaker_id`` (see :meth:`_resolve_entity`).  The display name
-        from ``entity.name`` is stored as a mutable attribute under
-        ``attributes["name"]`` so consumers that need a human-readable
-        label can read it without ever using the NetworkX node ID for
-        display.  Anonymous→disclosed name change (``"Speaker0"`` →
-        ``"Alex"``) updates ``attributes["name"]`` on the existing
-        ``speaker_id``-keyed node — no separate node is created.
+        With node-key model A, every node is keyed by its canonical form
+        (``canonical_id(name)`` for non-speakers; ``speaker_id`` for
+        speakers).  The human-readable display name is stored as a mutable
+        attribute under ``attributes["name"]`` for ALL node types — not just
+        speakers — so downstream consumers never need to use the node key for
+        display.  First-seen surface wins: the ``"name"`` attribute is set on
+        insertion and NOT overwritten on subsequent updates (idempotent).
 
-        Non-speaker entities are keyed by name; ``attributes["name"]``
-        is not written because the node ID is already the display
-        name.
+        Speaker entities (``entity.speaker_id`` set) are keyed by
+        ``speaker_id`` (see :meth:`_resolve_entity`).  Anonymous→disclosed
+        name change (``"Speaker0"`` → ``"Alex"``) updates
+        ``attributes["name"]`` on the existing ``speaker_id``-keyed node —
+        no separate node is created.  For speakers the ``"name"`` attribute
+        IS refreshed on update (to capture disclosure), whereas for
+        non-speaker entities it is first-seen-wins only.
         """
         is_speaker = entity.speaker_id is not None
 
-        if canonical in self.graph:
-            node = self.graph.nodes[canonical]
+        if node_key in self.graph:
+            node = self.graph.nodes[node_key]
             node["recurrence_count"] = node.get("recurrence_count", 0) + 1
             node["last_seen"] = session_id
             sessions = node.get("sessions", [])
@@ -497,12 +524,16 @@ class GraphMerger:
                 if _attr_value_is_empty(v):
                     continue
                 existing_attrs[k] = v
-            # Speaker entity: refresh the display ``name`` attribute if
-            # the latest session carries one.  Older sessions may have
-            # used an anonymous id (e.g. ``"Speaker0"``); a later
-            # disclosure (``"Alex"``) updates the stored display name.
-            if is_speaker and entity.name and not _attr_value_is_empty(entity.name):
-                existing_attrs["name"] = entity.name
+            # All entities: store display name in attributes["name"].
+            # For speaker entities, refresh on update (captures anonymous→
+            # disclosed name change, e.g. "Speaker0" → "Alex").
+            # For non-speaker entities, first-seen wins — only write when
+            # the attribute is absent or empty.
+            if entity.name and not _attr_value_is_empty(entity.name):
+                if is_speaker:
+                    existing_attrs["name"] = entity.name
+                elif not existing_attrs.get("name"):
+                    existing_attrs["name"] = entity.name
             node["attributes"] = existing_attrs
             # Speaker_id should already be set on this node (it WAS the
             # canonical key).  Defensive: if a legacy node from before
@@ -511,11 +542,9 @@ class GraphMerger:
                 node["speaker_id"] = entity.speaker_id
         else:
             attributes = {k: v for k, v in entity.attributes.items() if not _attr_value_is_empty(v)}
-            # Speaker entity: stash the display name on the node so it
-            # is recoverable without keeping the node ID in display
-            # space.  Non-speaker entities skip this — their node ID IS
-            # the display name.
-            if is_speaker and entity.name and not _attr_value_is_empty(entity.name):
+            # Store display name for all entities.  The node key is now the
+            # canonical form so the node ID is no longer the display name.
+            if entity.name and not _attr_value_is_empty(entity.name):
                 attributes["name"] = entity.name
             node_kwargs: dict = dict(
                 entity_type=entity.entity_type,
@@ -527,7 +556,7 @@ class GraphMerger:
             )
             if is_speaker:
                 node_kwargs["speaker_id"] = entity.speaker_id
-            self.graph.add_node(canonical, **node_kwargs)
+            self.graph.add_node(node_key, **node_kwargs)
 
     def _upsert_relation(
         self,
@@ -565,7 +594,7 @@ class GraphMerger:
         """
         from paramem.memory.persistence import _IK_KEY_ATTR
 
-        normalized_pred = _normalize_predicate(relation.predicate)
+        normalized_pred = canonical_id(relation.predicate)
 
         # --- Case 1: Exact-duplicate reinforcement ---
         # Identical (subject, norm_pred, obj) already exists — bump recurrence.
@@ -729,7 +758,7 @@ class GraphMerger:
                 if contradicted is not None:
                     old_s, old_p, old_o = contradicted
                     # Find and remove the contradicted edge
-                    old_p_norm = _normalize_predicate(old_p)
+                    old_p_norm = canonical_id(old_p)
                     for old_obj in list(self.graph.successors(subject)):
                         keys_to_remove = [
                             key
@@ -913,18 +942,3 @@ def _attr_value_is_empty(value) -> bool:
         if stripped.lower() in ("n/a", "none", "null", "unknown"):
             return True
     return False
-
-
-def _normalize_name(name: str) -> str:
-    """Normalize an entity name for matching."""
-    return name.strip().lower()
-
-
-def _normalize_predicate(predicate: str) -> str:
-    """Normalize a predicate for consistent matching and storage.
-
-    Lowercases, strips whitespace, replaces spaces with underscores.
-    Semantic alignment is handled upstream by the extraction prompt,
-    which provides few-shot examples of canonical predicate forms.
-    """
-    return predicate.strip().lower().replace(" ", "_")

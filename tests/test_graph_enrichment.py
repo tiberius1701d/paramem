@@ -80,35 +80,39 @@ def _populate_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None:
 
     Default of 10 persons + 1 org = 11 nodes exceeds the 10-node floor so
     tests exercise the enrichment path by default.
+
+    Nodes are keyed in canonical form (lowercase, separator-folded) matching
+    the live merger's node-key convention post-model-A.  Surface display names
+    are stored in attributes["name"] where needed by individual tests.
     """
     for i in range(n_persons):
-        name = f"Person{i}"
+        name = f"person{i}"
         graph.add_node(
             name,
             entity_type="person",
-            attributes={},
+            attributes={"name": f"Person{i}"},
             recurrence_count=i + 1,
             sessions=[f"s{i:03d}"],
             first_seen=f"s{i:03d}",
             last_seen=f"s{i:03d}",
         )
     # Add an org node so we have cross-entity topology
-    org = "AcmeCorp"
+    org = "acmecorp"
     graph.add_node(
         org,
         entity_type="organization",
-        attributes={},
+        attributes={"name": "AcmeCorp"},
         recurrence_count=n_persons,
         sessions=["s000"],
         first_seen="s000",
         last_seen="s000",
     )
-    # Wire edges: every person works_at AcmeCorp
+    # Wire edges: every person works_at acmecorp
     for i in range(n_persons):
         graph.add_edge(
-            f"Person{i}",
+            f"person{i}",
             org,
-            predicate="works_at",
+            predicate="works at",
             relation_type="factual",
             confidence=1.0,
             source="extraction",
@@ -185,12 +189,14 @@ class TestEnrichmentAddsEdgesWithSourceTag:
         assert not result["skipped"]
         assert result["new_edges"] >= 1
 
-        # Verify the added edge carries source="graph_enrichment"
+        # Verify the added edge carries source="graph_enrichment".
+        # Nodes are canonical-keyed; predicate is stored in canonical form too
+        # ("colleague_of" → "colleague of" after canonical() separator-fold).
         found = False
-        for _, _, data in graph.out_edges("Person0", data=True):
-            if data.get("predicate") == "colleague_of" and data.get("source") == "graph_enrichment":
+        for _, _, data in graph.out_edges("person0", data=True):
+            if data.get("predicate") == "colleague of" and data.get("source") == "graph_enrichment":
                 found = True
-        assert found, "Expected a 'colleague_of' edge with source='graph_enrichment'"
+        assert found, "Expected a 'colleague of' edge with source='graph_enrichment'"
 
 
 class TestLowConfidenceDropped:
@@ -231,12 +237,14 @@ class TestLowConfidenceDropped:
         assert not result["skipped"]
         assert result["new_edges"] == 1, "Only the 0.9-confidence edge should land"
 
-        edges_from_p0 = list(graph.out_edges("Person0", data=True))
+        # Nodes are canonical-keyed; predicates stored in canonical form
+        # ("friend_of" → "friend of", "colleague_of" → "colleague of").
+        edges_from_p0 = list(graph.out_edges("person0", data=True))
         predicates = {
             d.get("predicate") for _, _, d in edges_from_p0 if d.get("source") == "graph_enrichment"
         }
-        assert "friend_of" in predicates
-        assert "colleague_of" not in predicates
+        assert "friend of" in predicates
+        assert "colleague of" not in predicates
 
 
 class TestSameAsContractsNodes:
@@ -247,35 +255,37 @@ class TestSameAsContractsNodes:
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
-        # Add two nodes that should be merged
+        # Add two nodes that should be merged — canonical-keyed (lowercase).
         graph.add_node(
-            "Alice",
+            "alice",
             entity_type="person",
-            attributes={},
+            attributes={"name": "Alice"},
             recurrence_count=3,
             sessions=["s010"],
             first_seen="s010",
             last_seen="s010",
         )
         graph.add_node(
-            "Alicia",
+            "alicia",
             entity_type="person",
-            attributes={},
+            attributes={"name": "Alicia"},
             recurrence_count=1,
             sessions=["s011"],
             first_seen="s011",
             last_seen="s011",
         )
         graph.add_edge(
-            "Alicia",
-            "AcmeCorp",
-            predicate="works_at",
+            "alicia",
+            "acmecorp",
+            predicate="works at",
             relation_type="factual",
             confidence=1.0,
             source="extraction",
             sessions=["s011"],
         )
 
+        # SOTA returns surface names; production canonicalizes them before lookup:
+        # "Alice" -> "alice", "Alicia" -> "alicia".
         canned_result = (
             [],  # no new relations
             [["Alice", "Alicia"]],  # same_as
@@ -290,9 +300,9 @@ class TestSameAsContractsNodes:
 
         assert not result["skipped"]
         assert result["same_as_merges"] >= 1
-        # "Alicia" should be contracted into "Alice" — removed as a distinct node
-        assert "Alicia" not in graph.nodes
-        assert "Alice" in graph.nodes
+        # "alicia" should be contracted into "alice" — removed as a distinct node
+        assert "alicia" not in graph.nodes
+        assert "alice" in graph.nodes
 
 
 class TestSafeToMergeSurface:
@@ -370,25 +380,27 @@ class TestSameAsDedupAcrossChunks:
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
+        # Nodes are canonical-keyed; "Yang Ming" → "yang ming", "Mr. Yang" → "mr. yang".
         graph.add_node(
-            "Yang Ming",
+            "yang ming",
             entity_type="person",
-            attributes={},
+            attributes={"name": "Yang Ming"},
             recurrence_count=3,
             sessions=["s030"],
             first_seen="s030",
             last_seen="s030",
         )
         graph.add_node(
-            "Mr. Yang",
+            "mr. yang",
             entity_type="person",
-            attributes={},
+            attributes={"name": "Mr. Yang"},
             recurrence_count=2,
             sessions=["s031"],
             first_seen="s031",
             last_seen="s031",
         )
 
+        # SOTA returns surface names; production canonicalizes before graph lookup.
         # Same pair emitted twice in reversed order — simulates SOTA echoing
         # the duplicate across chunks.
         canned_result = (
@@ -415,24 +427,30 @@ class TestSymmetricPredicateCanonicalized:
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
+        # BL-2 coverage: _SYMMETRIC_ENRICHMENT_PREDICATES contains canonical(p) (space form).
+        # Feed one entry in underscore form and one in space form — both must be recognized
+        # as symmetric and collapse to a single canonical-direction edge.
+        # BL-2: both underscore ("colleague_of") and space ("colleague of") forms must
+        # match _SYMMETRIC_ENRICHMENT_PREDICATES (which stores canonical() entries).
         rels = [
             {
                 "subject": "Zhang",
-                "predicate": "colleague_of",
+                "predicate": "colleague_of",  # underscore — canonical() yields "colleague of"
                 "object": "Xiaoxiu",
                 "relation_type": "social",
                 "confidence": 0.85,
             },
-            # Reverse direction — must not create a second edge
+            # Reverse direction in space form — already canonical; still symmetric.
             {
                 "subject": "Xiaoxiu",
-                "predicate": "colleague_of",
+                "predicate": "colleague of",  # space form
                 "object": "Zhang",
                 "relation_type": "social",
                 "confidence": 0.80,
             },
         ]
-        for name in ("Zhang", "Xiaoxiu"):
+        # Nodes are canonical-keyed ("Zhang" → "zhang", "Xiaoxiu" → "xiaoxiu").
+        for name in ("zhang", "xiaoxiu"):
             graph.add_node(
                 name,
                 entity_type="person",
@@ -453,11 +471,12 @@ class TestSymmetricPredicateCanonicalized:
 
         assert not result["skipped"]
         # After lex canonicalization subj<obj, both rels become
-        # (Xiaoxiu, colleague_of, Zhang). Second insert is a duplicate.
+        # ("xiaoxiu", "colleague of", "zhang"). Second insert is a duplicate.
+        # Predicate stored as canonical("colleague_of") == "colleague of".
         enriched = [
             (u, v, d) for u, v, d in graph.edges(data=True) if d.get("source") == "graph_enrichment"
         ]
-        colleague_edges = [(u, v) for u, v, d in enriched if d.get("predicate") == "colleague_of"]
+        colleague_edges = [(u, v) for u, v, d in enriched if d.get("predicate") == "colleague of"]
         assert len(colleague_edges) == 1
         u, v = colleague_edges[0]
         assert u < v  # canonical lex order
@@ -484,7 +503,8 @@ class TestSymmetricPredicateCanonicalized:
                 "confidence": 0.85,
             },
         ]
-        for name in ("Ming", "Xinxin"):
+        # Nodes are canonical-keyed ("Ming" → "ming", "Xinxin" → "xinxin").
+        for name in ("ming", "xinxin"):
             graph.add_node(
                 name,
                 entity_type="person",
@@ -504,13 +524,15 @@ class TestSymmetricPredicateCanonicalized:
             result = loop._run_graph_enrichment()
 
         assert not result["skipped"]
+        # Predicate stored as canonical("mentored_by") == "mentored by".
+        # Nodes stored as canonical keys ("ming", "xinxin").
         mentored_edges = [
             (u, v)
             for u, v, d in graph.edges(data=True)
-            if d.get("source") == "graph_enrichment" and d.get("predicate") == "mentored_by"
+            if d.get("source") == "graph_enrichment" and d.get("predicate") == "mentored by"
         ]
         # Both directions survive for asymmetric predicates
-        assert set(mentored_edges) == {("Ming", "Xinxin"), ("Xinxin", "Ming")}
+        assert set(mentored_edges) == {("ming", "xinxin"), ("xinxin", "ming")}
 
 
 class TestCorefRemapBeforeEdgeInsert:
@@ -521,37 +543,39 @@ class TestCorefRemapBeforeEdgeInsert:
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
-        # Three nodes; "Alex" will be contracted into "Alexander".
+        # Three nodes — canonical-keyed (lowercase).
+        # "Alex" will be contracted into "alexander".
         graph.add_node(
-            "Alexander",
+            "alexander",
             entity_type="person",
-            attributes={},
+            attributes={"name": "Alexander"},
             recurrence_count=3,
             sessions=["s050"],
             first_seen="s050",
             last_seen="s050",
         )
         graph.add_node(
-            "Alex",
+            "alex",
             entity_type="person",
-            attributes={},
+            attributes={"name": "Alex"},
             recurrence_count=1,
             sessions=["s051"],
             first_seen="s051",
             last_seen="s051",
         )
         graph.add_node(
-            "Acme",
+            "acme",
             entity_type="organization",
-            attributes={},
+            attributes={"name": "Acme"},
             recurrence_count=5,
             sessions=["s050"],
             first_seen="s050",
             last_seen="s050",
         )
 
-        # SOTA response: same_as merges Alex→Alexander, and a relation uses
-        # the dropped name "Alex". The remap must route it to "Alexander".
+        # SOTA response: same_as merges Alex→Alexander (SOTA returns surface names;
+        # production canonicalizes to "alex"/"alexander" before graph lookup).
+        # The relation also uses dropped name "Alex" — the remap routes it to "alexander".
         canned_rels = [
             {
                 "subject": "Alex",
@@ -572,14 +596,15 @@ class TestCorefRemapBeforeEdgeInsert:
 
         assert not result["skipped"]
         assert result["same_as_merges"] >= 1
-        assert "Alex" not in graph.nodes  # contracted away
-        # The enriched edge must land on "Alexander", not silently disappear.
+        assert "alex" not in graph.nodes  # contracted away
+        # The enriched edge must land on "alexander" (canonical keep node).
+        # Predicate stored as canonical("works_at") == "works at".
         alexander_edges = [
             (u, v, d)
             for u, v, d in graph.edges(data=True)
-            if u == "Alexander"
-            and v == "Acme"
-            and d.get("predicate") == "works_at"
+            if u == "alexander"
+            and v == "acme"
+            and d.get("predicate") == "works at"
             and d.get("source") == "graph_enrichment"
         ]
         assert len(alexander_edges) == 1
@@ -1569,20 +1594,20 @@ class TestEnrichmentRemovalLedger:
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
-        # Add keep/drop nodes with an edge carrying an ik_key.
+        # Add keep/drop nodes with an edge carrying an ik_key — canonical-keyed (lowercase).
         graph.add_node(
-            "Alice",
+            "alice",
             entity_type="person",
-            attributes={},
+            attributes={"name": "Alice"},
             recurrence_count=3,
             sessions=["s010"],
             first_seen="s010",
             last_seen="s010",
         )
         graph.add_node(
-            "Alicia",
+            "alicia",
             entity_type="person",
-            attributes={},
+            attributes={"name": "Alicia"},
             recurrence_count=1,
             sessions=["s011"],
             first_seen="s011",
@@ -1590,19 +1615,20 @@ class TestEnrichmentRemovalLedger:
         )
         # Edge from keep → drop carrying an ik_key (becomes a self-loop on contraction).
         eid = graph.add_edge(
-            "Alice",
-            "Alicia",
-            predicate="same_as",
+            "alice",
+            "alicia",
+            predicate="same as",
             relation_type="factual",
             confidence=1.0,
             source="extraction",
             sessions=["s010"],
         )
-        graph["Alice"]["Alicia"][eid][_IK_KEY_ATTR] = "key_same_as_victim"
+        graph["alice"]["alicia"][eid][_IK_KEY_ATTR] = "key_same_as_victim"
 
+        # SOTA returns surface names; production canonicalizes before graph lookup.
         canned_result = (
             [],
-            [["Alice", "Alicia"]],  # keep=Alice, drop=Alicia
+            [["Alice", "Alicia"]],  # keep=alice, drop=alicia
             "raw",
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
@@ -1612,7 +1638,7 @@ class TestEnrichmentRemovalLedger:
         ):
             result = loop._run_graph_enrichment()
 
-        assert result["same_as_merges"] >= 1, "Contraction must have fired for Alice/Alicia"
+        assert result["same_as_merges"] >= 1, "Contraction must have fired for alice/alicia"
         assert "key_same_as_victim" in loop.merger.removal_ledger, (
             f"Dropped ik_key must appear in merger.removal_ledger; "
             f"ledger={list(loop.merger.removal_ledger.keys())}"
@@ -1621,8 +1647,9 @@ class TestEnrichmentRemovalLedger:
         assert entry["reason"] == "enrichment_same_as", (
             f"Expected reason='enrichment_same_as'; got {entry['reason']!r}"
         )
-        assert entry["merged_into"] == "Alice", (
-            f"Expected merged_into='Alice' (the keep node); got {entry['merged_into']!r}"
+        # merged_into is the canonical keep node key
+        assert entry["merged_into"] == "alice", (
+            f"Expected merged_into='alice' (canonical keep node); got {entry['merged_into']!r}"
         )
 
     def test_failed_contraction_does_not_write_to_ledger(self, tmp_path, monkeypatch):
@@ -1633,8 +1660,9 @@ class TestEnrichmentRemovalLedger:
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
+        # Nodes are canonical-keyed ("BadKeep" → "badkeep", "BadDrop" → "baddrop").
         graph.add_node(
-            "BadKeep",
+            "badkeep",
             entity_type="person",
             attributes={},
             recurrence_count=1,
@@ -1643,7 +1671,7 @@ class TestEnrichmentRemovalLedger:
             last_seen="s020",
         )
         graph.add_node(
-            "BadDrop",
+            "baddrop",
             entity_type="person",
             attributes={},
             recurrence_count=1,
@@ -1652,16 +1680,17 @@ class TestEnrichmentRemovalLedger:
             last_seen="s021",
         )
         eid = graph.add_edge(
-            "BadKeep",
-            "BadDrop",
+            "badkeep",
+            "baddrop",
             predicate="related",
             relation_type="factual",
             confidence=0.9,
             source="extraction",
             sessions=["s020"],
         )
-        graph["BadKeep"]["BadDrop"][eid][_IK_KEY_ATTR] = "key_bad_victim"
+        graph["badkeep"]["baddrop"][eid][_IK_KEY_ATTR] = "key_bad_victim"
 
+        # SOTA returns surface names; production canonicalizes: "BadKeep" → "badkeep".
         canned_result = (
             [],
             [["BadKeep", "BadDrop"]],

@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from paramem.graph.merger import GraphMerger, _normalize_name, _normalize_predicate
+from paramem.graph.merger import GraphMerger
+from paramem.graph.name_match import canonical
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
@@ -66,23 +67,26 @@ def session_graph_2():
 
 class TestNormalization:
     def test_normalize_basic(self):
-        assert _normalize_name("Alex") == "alex"
-        assert _normalize_name("  Alex  ") == "alex"
-        assert _normalize_name("Dr. Smith") == "dr. smith"
+        """canonical() provides the single identity function for all string types."""
+        assert canonical("Alex") == "alex"
+        assert canonical("  Alex  ") == "alex"
+        assert canonical("Dr. Smith") == "dr. smith"
 
 
 class TestPredicateNormalization:
-    def test_lowercase_and_underscore(self):
-        assert _normalize_predicate("Works At") == "works_at"
-        assert _normalize_predicate("LIVES IN") == "lives_in"
+    def test_lowercase_and_space_form(self):
+        """canonical() folds case and separator to space; underscores are folded too."""
+        assert canonical("Works At") == "works at"
+        assert canonical("LIVES IN") == "lives in"
 
     def test_strip_whitespace(self):
-        assert _normalize_predicate("  works_at  ") == "works_at"
+        assert canonical("  works_at  ") == "works at"
 
     def test_passthrough_preserves_content(self):
-        assert _normalize_predicate("invented") == "invented"
-        assert _normalize_predicate("custom_pred") == "custom_pred"
-        assert _normalize_predicate("works_at") == "works_at"
+        assert canonical("invented") == "invented"
+        assert canonical("custom pred") == "custom pred"
+        # underscore folds to space
+        assert canonical("works_at") == "works at"
 
     def test_deduplicates_edges_across_variants(self, merger):
         """'works_at' and 'works at' should merge into one edge."""
@@ -122,9 +126,10 @@ class TestPredicateNormalization:
         )
         merger.merge(g1)
         merger.merge(g2)
-        edges = list(merger.graph["A"]["B"].values())
+        edges = list(merger.graph["a"]["b"].values())
         assert len(edges) == 1
-        assert edges[0]["predicate"] == "works_at"
+        # canonical() folds underscore → space; predicate stored in canonical form
+        assert edges[0]["predicate"] == "works at"
         assert edges[0]["recurrence_count"] == 2
 
 
@@ -132,9 +137,9 @@ class TestEntityResolution:
     def test_exact_match(self, merger, session_graph_1, session_graph_2):
         merger.merge(session_graph_1)
         merger.merge(session_graph_2)
-        # "Alex" should resolve to the same node
-        assert "Alex" in merger.graph.nodes
-        assert merger.graph.nodes["Alex"]["recurrence_count"] == 2
+        # "Alex" node key is canonical("Alex") == "alex" (node-key model A)
+        assert "alex" in merger.graph.nodes
+        assert merger.graph.nodes["alex"]["recurrence_count"] == 2
 
     def test_fuzzy_match(self, merger):
         g1 = SessionGraph(
@@ -170,8 +175,7 @@ class TestEntityResolution:
         )
         merger.merge(g1)
         merger.merge(g2)
-        # Exact name match overrides type check via normalization
-        # So "Python" matches the first one regardless of type
+        # Canonical key is "python" for both — same node key regardless of type
         assert merger.graph.number_of_nodes() == 1
 
 
@@ -219,7 +223,8 @@ class TestEdgeAggregation:
         merger.merge(g2)
 
         # Same predicate between same nodes should be aggregated
-        edges = list(merger.graph["A"]["B"].values())
+        # Node keys are canonical: "a", "b"
+        edges = list(merger.graph["a"]["b"].values())
         assert len(edges) == 1
         assert edges[0]["recurrence_count"] == 2
         assert len(edges[0]["sessions"]) == 2
@@ -250,7 +255,7 @@ class TestEdgeAggregation:
             ],
         )
         merger.merge(g1)
-        edges = list(merger.graph["A"]["B"].values())
+        edges = list(merger.graph["a"]["b"].values())
         assert len(edges) == 2
 
 
@@ -258,7 +263,8 @@ class TestSessionTracking:
     def test_session_provenance(self, merger, session_graph_1, session_graph_2):
         merger.merge(session_graph_1)
         merger.merge(session_graph_2)
-        sessions = merger.graph.nodes["Alex"]["sessions"]
+        # Node key is canonical: canonical("Alex") == "alex"
+        sessions = merger.graph.nodes["alex"]["sessions"]
         assert "s001" in sessions
         assert "s002" in sessions
 
@@ -277,9 +283,12 @@ class TestSessionTracking:
         )
         merger.merge(g1)
         merger.merge(g2)
-        attrs = merger.graph.nodes["Alex"]["attributes"]
+        # Node key is canonical: "alex"; display name in attributes["name"]
+        attrs = merger.graph.nodes["alex"]["attributes"]
         assert attrs["age"] == "29"
         assert attrs["role"] == "engineer"
+        # Display name preserved in attributes
+        assert attrs["name"] == "Alex"
 
 
 class TestPersistence:
@@ -297,7 +306,8 @@ class TestPersistence:
 
             assert new_merger.graph.number_of_nodes() == merger.graph.number_of_nodes()
             assert new_merger.graph.number_of_edges() == merger.graph.number_of_edges()
-            assert "Alex" in new_merger.graph.nodes
+            # Node key is canonical: "alex"
+            assert "alex" in new_merger.graph.nodes
 
     def test_load_nonexistent(self, merger):
         graph = merger.load_graph("/nonexistent/path.json")
@@ -345,7 +355,7 @@ class TestPersistence:
         assert "nodes" in data or "directed" in data or data  # any valid JSON
 
     def test_fuzzy_tier_case_fold(self):
-        """'Alexander' and 'alexander' must merge via exact-normalization tier."""
+        """'Alexander' and 'alexander' must merge — canonical key is identical."""
         from paramem.graph.schema import Entity, SessionGraph
 
         m = GraphMerger(similarity_threshold=85.0)
@@ -472,7 +482,8 @@ class TestSpeakerIdDedup:
         m.merge(sg1)
         m.merge(sg2)
         assert m.graph.number_of_nodes() == 1
-        assert m.graph.nodes["Portland"]["recurrence_count"] == 2
+        # Node key is canonical: canonical("Portland") == "portland"
+        assert m.graph.nodes["portland"]["recurrence_count"] == 2
 
     def test_speaker_attributes_merged_from_later_session(self):
         """Attributes from a later session (e.g. has_last_name disclosure) must
@@ -705,10 +716,11 @@ class TestMultiUserNameCollision:
         )
 
         # Each speaker's lives_in relation points to the right place.
+        # Place node keys are canonical: "portland", "munich".
         s0_neighbors = list(m.graph.successors(speaker0_node))
         s1_neighbors = list(m.graph.successors(speaker1_node))
-        assert "Portland" in s0_neighbors and "Munich" not in s0_neighbors
-        assert "Munich" in s1_neighbors and "Portland" not in s1_neighbors
+        assert "portland" in s0_neighbors and "munich" not in s0_neighbors
+        assert "munich" in s1_neighbors and "portland" not in s1_neighbors
 
     def test_third_party_mention_with_speaker_id_unset_is_separate(self):
         """A later session emits a third-party ``"Alex"`` entity with
@@ -719,8 +731,8 @@ class TestMultiUserNameCollision:
         produced by the speaker pool, so a display name like
         ``"Alex"`` will never collide with a speaker_id-keyed node.
         The third-party Alex becomes a separate node keyed by
-        ``"Alex"``; Speaker0's node remains keyed by ``"Speaker0"``
-        with its own attributes intact.
+        ``"alex"`` (canonical form); Speaker0's node remains keyed by
+        ``"Speaker0"`` with its own attributes intact.
         """
         m = GraphMerger(similarity_threshold=85.0)
         m.merge(self._build_speaker_session("s001", "Speaker0", "Walker", "Portland"))
@@ -734,12 +746,12 @@ class TestMultiUserNameCollision:
         )
         m.merge(third_party)
 
-        # Speaker0 is keyed by speaker_id, third-party Alex by name —
+        # Speaker0 is keyed by speaker_id; third-party Alex by canonical name "alex" —
         # disjoint namespaces, two separate nodes.
         assert "Speaker0" in m.graph.nodes
-        assert "Alex" in m.graph.nodes
+        assert "alex" in m.graph.nodes
         assert m.graph.nodes["Speaker0"]["speaker_id"] == "Speaker0"
-        assert m.graph.nodes["Alex"].get("speaker_id") is None
+        assert m.graph.nodes["alex"].get("speaker_id") is None
         # Speaker0's last_name attribute is untouched by the third-party
         # merge (different node, different namespace).
         assert m.graph.nodes["Speaker0"]["attributes"]["last_name"] == "Walker"
@@ -837,17 +849,18 @@ class TestCrossPredicateContradictionFlag:
             mock_detect.assert_not_called()
 
         # Both edges must be present — no removal.
-        successors = list(m.graph.successors("ParaMem"))
+        # Node keys are canonical: "paramem", "qwen", "gemma"
+        successors = list(m.graph.successors("paramem"))
         validated_on_objects = [
             obj
             for obj in successors
-            for _, data in m.graph["ParaMem"][obj].items()
-            if data.get("predicate") == "validated_on"
+            for _, data in m.graph["paramem"][obj].items()
+            if data.get("predicate") == "validated on"
         ]
-        assert "Qwen" in validated_on_objects, (
+        assert "qwen" in validated_on_objects, (
             "validated_on Qwen must not be removed when cross_predicate_contradiction=False"
         )
-        assert "Gemma" in validated_on_objects, (
+        assert "gemma" in validated_on_objects, (
             "validated_on Gemma must be present when cross_predicate_contradiction=False"
         )
 
@@ -889,18 +902,19 @@ class TestCrossPredicateContradictionFlag:
             # detect_contradiction_with_model must have been called (flag=True).
             mock_detect.assert_called()
 
-        # "Qwen" edge was removed by cross-predicate contradiction detection; "Gemma" was added.
-        successors = list(m.graph.successors("ParaMem"))
+        # "qwen" edge was removed by cross-predicate contradiction detection; "gemma" was added.
+        # Node keys are canonical: "paramem", "qwen", "gemma"
+        successors = list(m.graph.successors("paramem"))
         validated_on_objects = [
             obj
             for obj in successors
-            for _, data in m.graph["ParaMem"][obj].items()
-            if data.get("predicate") == "validated_on"
+            for _, data in m.graph["paramem"][obj].items()
+            if data.get("predicate") == "validated on"
         ]
-        assert "Qwen" not in validated_on_objects, (
+        assert "qwen" not in validated_on_objects, (
             "validated_on Qwen must be removed when cross_predicate_contradiction=True"
         )
-        assert "Gemma" in validated_on_objects, (
+        assert "gemma" in validated_on_objects, (
             "validated_on Gemma must be present after cross-predicate removal"
         )
         # contradictions_resolved must record the removal.
@@ -971,18 +985,19 @@ class TestCrossPredicateContradictionFlag:
             m.merge(sg2)
 
         # Cardinality resolution must have replaced Munich with Berlin.
-        successors = list(m.graph.successors("Alex"))
+        # Node keys are canonical: "alex", "munich", "berlin"
+        successors = list(m.graph.successors("alex"))
         lives_in_objects = [
             obj
             for obj in successors
-            for _, data in m.graph["Alex"][obj].items()
-            if data.get("predicate") == "lives_in"
+            for _, data in m.graph["alex"][obj].items()
+            if data.get("predicate") == "lives in"
         ]
-        assert "Munich" not in lives_in_objects, (
+        assert "munich" not in lives_in_objects, (
             "Cardinality resolution must still replace single-valued predicate even when "
             "cross_predicate_contradiction=False"
         )
-        assert "Berlin" in lives_in_objects, "New edge must be present after cardinality resolution"
+        assert "berlin" in lives_in_objects, "New edge must be present after cardinality resolution"
 
 
 class TestPromptsDirOverride:
@@ -1093,20 +1108,21 @@ class TestModelContradictionAndRelease:
             m.merge(sg1)
             m.merge(sg2)
 
-        # Single-valued: old "Munich" edge removed; only "Berlin" remains.
-        alex_successors = list(m.graph.successors("Alex"))
-        # "Munich" must be gone (replaced), "Berlin" must be present.
+        # Single-valued: old "munich" edge removed; only "berlin" remains.
+        # Node keys are canonical: "alex", "munich", "berlin"
+        alex_successors = list(m.graph.successors("alex"))
+        # "munich" must be gone (replaced), "berlin" must be present.
         lives_in_edges = [
             (obj, data)
             for obj in alex_successors
-            for _, data in m.graph["Alex"][obj].items()
-            if data.get("predicate") == "lives_in"
+            for _, data in m.graph["alex"][obj].items()
+            if data.get("predicate") == "lives in"
         ]
         objects_with_lives_in = [obj for obj, _ in lives_in_edges]
-        assert "Munich" not in objects_with_lives_in, (
+        assert "munich" not in objects_with_lives_in, (
             "Old single-valued edge (Munich) must be removed by model contradiction"
         )
-        assert "Berlin" in objects_with_lives_in, (
+        assert "berlin" in objects_with_lives_in, (
             "New edge (Berlin) must be present after contradiction resolution"
         )
 
@@ -1153,17 +1169,18 @@ class TestModelContradictionAndRelease:
         m.merge(sg2)
 
         # Both values coexist: no removal when model is absent.
-        alex_successors = list(m.graph.successors("Alex"))
+        # Node keys are canonical: "alex", "munich", "berlin"
+        alex_successors = list(m.graph.successors("alex"))
         lives_in_objects = [
             obj
             for obj in alex_successors
-            for _, data in m.graph["Alex"][obj].items()
-            if data.get("predicate") == "lives_in"
+            for _, data in m.graph["alex"][obj].items()
+            if data.get("predicate") == "lives in"
         ]
-        assert "Munich" in lives_in_objects, (
+        assert "munich" in lives_in_objects, (
             "Without a model, old edge must NOT be removed (coexist-all)"
         )
-        assert "Berlin" in lives_in_objects, "New edge must be present (coexist-all, no model)"
+        assert "berlin" in lives_in_objects, "New edge must be present (coexist-all, no model)"
 
     def test_release_nulls_model_and_tokenizer(self):
         """release() sets .model and .tokenizer to None (idempotent)."""
@@ -1241,17 +1258,18 @@ class TestModelContradictionAndRelease:
             m.merge(sg2)
 
         # Multi-valued: both objects must coexist, no edge removed.
-        alex_successors = list(m.graph.successors("Alex"))
+        # Node keys are canonical: "alex", "python", "rust"
+        alex_successors = list(m.graph.successors("alex"))
         speaks_objects = [
             obj
             for obj in alex_successors
-            for _, data in m.graph["Alex"][obj].items()
+            for _, data in m.graph["alex"][obj].items()
             if data.get("predicate") == "speaks"
         ]
-        assert "Python" in speaks_objects, (
+        assert "python" in speaks_objects, (
             "Multi-valued coexist: old edge (Python) must NOT be removed"
         )
-        assert "Rust" in speaks_objects, "Multi-valued coexist: new edge (Rust) must be present"
+        assert "rust" in speaks_objects, "Multi-valued coexist: new edge (Rust) must be present"
         assert m.contradictions_resolved == [], (
             "Multi-valued coexist: no contradictions_resolved entry must be recorded"
         )
@@ -1285,8 +1303,8 @@ class TestIkKeyProvenance:
         )
         m.merge(session)
 
-        # Exactly one edge for (Alice, lives_in, Berlin).
-        edges = list(m.graph["Alice"]["Berlin"].items())
+        # Exactly one edge for (alice, lives_in, berlin) — canonical node keys.
+        edges = list(m.graph["alice"]["berlin"].items())
         assert len(edges) == 1
         eid, data = edges[0]
         assert data.get(_IK_KEY_ATTR) == "graph42", (
@@ -1318,7 +1336,8 @@ class TestIkKeyProvenance:
         )
         m.merge(session)
 
-        edges = list(m.graph["Alice"]["Berlin"].items())
+        # Node keys are canonical: "alice", "berlin"
+        edges = list(m.graph["alice"]["berlin"].items())
         assert len(edges) == 1
         eid, data = edges[0]
         assert data.get(_IK_KEY_ATTR) is None, "Normal ingest must NOT stamp ik_key on merged edge"
@@ -1332,12 +1351,13 @@ class TestIkKeyProvenance:
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         m = GraphMerger()
-        m.graph.add_node("Alex")
-        m.graph.add_node("cat")
+        # Pre-seed with canonical node keys (node-key model A).
+        m.graph.add_node("alex", attributes={"name": "Alex"})
+        m.graph.add_node("cat", attributes={"name": "cat"})
         eid_old = m.graph.add_edge(
-            "Alex",
+            "alex",
             "cat",
-            predicate="has_pet",
+            predicate="has pet",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1345,8 +1365,8 @@ class TestIkKeyProvenance:
             recurrence_count=1,
             sessions=["s1"],
         )
-        m.graph["Alex"]["cat"][eid_old][_IK_KEY_ATTR] = "g1"
-        m._predicate_cardinality["has_pet"] = True  # multi-valued
+        m.graph["alex"]["cat"][eid_old][_IK_KEY_ATTR] = "g1"
+        m._predicate_cardinality["has pet"] = True  # multi-valued; canonical form
 
         session = SessionGraph(
             session_id="s2",
@@ -1372,11 +1392,12 @@ class TestIkKeyProvenance:
             m.merge(session, additive=True)
 
         # Both edges must coexist.
+        # Node keys are canonical: "alex", "cat", "dog"
         pets = [
             obj
-            for obj in m.graph.successors("Alex")
-            for _, d in m.graph["Alex"][obj].items()
-            if d.get("predicate") == "has_pet"
+            for obj in m.graph.successors("alex")
+            for _, d in m.graph["alex"][obj].items()
+            if d.get("predicate") == "has pet"
         ]
         assert "cat" in pets and "dog" in pets, (
             "Disjoint multi-valued pair must COEXIST — both keys kept"
@@ -1581,12 +1602,13 @@ class TestReinforcementTracking:
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         m = GraphMerger()
-        m.graph.add_node("Alice")
-        m.graph.add_node("Berlin")
+        # Pre-seed with canonical node keys and canonical predicate form.
+        m.graph.add_node("alice", attributes={"name": "Alice"})
+        m.graph.add_node("berlin", attributes={"name": "Berlin"})
         existing_eid = m.graph.add_edge(
-            "Alice",
-            "Berlin",
-            predicate="lives_in",
+            "alice",
+            "berlin",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",
@@ -1595,25 +1617,25 @@ class TestReinforcementTracking:
             sessions=["s0"],
         )
         # Keyless existing edge.
-        assert m.graph["Alice"]["Berlin"][existing_eid].get(_IK_KEY_ATTR) is None
+        assert m.graph["alice"]["berlin"][existing_eid].get(_IK_KEY_ATTR) is None
 
         incoming = Relation(
-            subject="Alice",
+            subject="alice",
             predicate="lives_in",
-            object="Berlin",
+            object="berlin",
             relation_type="factual",
             confidence=1.0,
             speaker_id="Speaker0",
             indexed_key="graph5",
         )
-        m._upsert_relation("Alice", "Berlin", incoming, "s1", "2026-01-01T00:00:00Z")
+        m._upsert_relation("alice", "berlin", incoming, "s1", "2026-01-01T00:00:00Z")
 
         # Adopt path: no reinforcement (the existing edge had no key to preserve).
         assert m.reinforcements == [], (
             "Case-1-adopt must NOT produce a reinforcement (existing was keyless)"
         )
         # Key was adopted onto the existing edge.
-        assert m.graph["Alice"]["Berlin"][existing_eid].get(_IK_KEY_ATTR) == "graph5"
+        assert m.graph["alice"]["berlin"][existing_eid].get(_IK_KEY_ATTR) == "graph5"
 
     def test_additive_fold_short_circuits_replace_both_edges_survive(self):
         """additive=True short-circuits Case-2: even when check_predicate_coexistence returns
@@ -1633,14 +1655,15 @@ class TestReinforcementTracking:
         tok_stub.apply_chat_template.return_value = "formatted"
 
         m = GraphMerger(model=model_stub, tokenizer=tok_stub)
-        m.graph.add_node("Alex")
-        m.graph.add_node("Munich")
+        # Pre-seed with canonical node keys and canonical predicate form.
+        m.graph.add_node("alex", attributes={"name": "Alex"})
+        m.graph.add_node("munich", attributes={"name": "Munich"})
 
         # Pre-seed with the first edge carrying ik_key='key_munich'.
         eid_old = m.graph.add_edge(
-            "Alex",
-            "Munich",
-            predicate="lives_in",
+            "alex",
+            "munich",
+            predicate="lives in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1648,13 +1671,13 @@ class TestReinforcementTracking:
             recurrence_count=1,
             sessions=["s1"],
         )
-        m.graph["Alex"]["Munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
+        m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
 
         # Incoming relation: same predicate, different object (Berlin).
         incoming = Relation(
-            subject="Alex",
+            subject="alex",
             predicate="lives_in",
-            object="Berlin",
+            object="berlin",
             relation_type="factual",
             confidence=1.0,
             speaker_id="Speaker0",
@@ -1667,35 +1690,36 @@ class TestReinforcementTracking:
             return_value="REPLACE",
         ) as mock_coexist:
             m._upsert_relation(
-                "Alex", "Berlin", incoming, "s2", "2026-01-02T00:00:00Z", additive=True
+                "alex", "berlin", incoming, "s2", "2026-01-02T00:00:00Z", additive=True
             )
             # check_predicate_coexistence must NOT have been called (short-circuit).
             mock_coexist.assert_not_called()
 
-        # Both edges must survive: Munich (old) and Berlin (new).
+        # Both edges must survive: munich (old) and berlin (new).
+        # Node keys are canonical: "alex", "munich", "berlin"
         lives_in_objects = [
             obj
-            for obj in m.graph.successors("Alex")
-            for _, d in m.graph["Alex"][obj].items()
-            if d.get("predicate") == "lives_in"
+            for obj in m.graph.successors("alex")
+            for _, d in m.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
         ]
-        assert "Munich" in lives_in_objects, (
+        assert "munich" in lives_in_objects, (
             "Old edge (Munich) must NOT be removed when additive=True"
         )
-        assert "Berlin" in lives_in_objects, (
+        assert "berlin" in lives_in_objects, (
             "New edge (Berlin) must be inserted even when additive=True"
         )
 
         # Both ik_keys must be stamped on their respective edges.
         munich_key = next(
             d.get(_IK_KEY_ATTR)
-            for _, d in m.graph["Alex"]["Munich"].items()
-            if d.get("predicate") == "lives_in"
+            for _, d in m.graph["alex"]["munich"].items()
+            if d.get("predicate") == "lives in"
         )
         berlin_key = next(
             d.get(_IK_KEY_ATTR)
-            for _, d in m.graph["Alex"]["Berlin"].items()
-            if d.get("predicate") == "lives_in"
+            for _, d in m.graph["alex"]["berlin"].items()
+            if d.get("predicate") == "lives in"
         )
         assert munich_key == "key_munich", f"Expected key_munich on old edge; got {munich_key!r}"
         assert berlin_key == "key_berlin", f"Expected key_berlin on new edge; got {berlin_key!r}"
@@ -1815,8 +1839,9 @@ class TestRemovalLedger:
             m.merge(sg1)
 
         # Stamp an ik_key onto the Munich edge so the ledger capture fires.
-        for _eid, _edata in m.graph["Alex"]["Munich"].items():
-            if _edata.get("predicate") == "lives_in":
+        # After merge(), node keys are canonical: "alex", "munich"
+        for _eid, _edata in m.graph["alex"]["munich"].items():
+            if _edata.get("predicate") == "lives in":
                 _edata[_IK_KEY_ATTR] = "key_munich_old"
                 break
 
@@ -1839,8 +1864,8 @@ class TestRemovalLedger:
         with patch("paramem.graph.merger.check_predicate_coexistence", side_effect=_always_replace):
             m.merge(sg2)
 
-        # Munich must be gone.
-        assert "Munich" not in list(m.graph.successors("Alex")), (
+        # "munich" must be gone.
+        assert "munich" not in list(m.graph.successors("alex")), (
             "Old Munich edge must have been removed by REPLACE"
         )
         # Ledger must record the removed key.
@@ -1864,4 +1889,103 @@ class TestRemovalLedger:
 
         assert m.removal_ledger == {}, (
             f"reset_graph must clear removal_ledger; got {m.removal_ledger}"
+        )
+
+
+class TestObjectVariantDedup:
+    """Canonical node-key model A collapses object-side variants into one edge.
+
+    Regression guard for the bug described in plan §1: under predicate ``values``,
+    ``"Execution Speed"`` / ``"execution_speed"`` / ``"execution speed"`` were three
+    distinct nodes → three edges → three keys.  With canonical node keys all three
+    collapse to the single canonical form ``"execution speed"`` → one edge, one
+    surviving key.
+    """
+
+    def test_deduplicates_object_variants(self):
+        """Two sessions with canonically-identical objects collapse to ONE edge."""
+        m = GraphMerger()
+
+        s1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="ParaMem", entity_type="concept"),
+                Entity(name="Execution Speed", entity_type="concept"),
+            ],
+            relations=[
+                Relation(
+                    subject="ParaMem",
+                    predicate="values",
+                    object="Execution Speed",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        s2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-01-02T00:00:00Z",
+            entities=[
+                Entity(name="ParaMem", entity_type="concept"),
+                Entity(name="execution_speed", entity_type="concept"),
+            ],
+            relations=[
+                Relation(
+                    subject="ParaMem",
+                    predicate="values",
+                    object="execution_speed",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+
+        m.merge(s1)
+        m.merge(s2)
+
+        # canonical("Execution Speed") == canonical("execution_speed") == "execution speed"
+        # → only ONE node and ONE edge for the values predicate.
+        assert "execution speed" in m.graph.nodes, (
+            "Canonical object node key must be 'execution speed'"
+        )
+        assert m.graph.number_of_edges() == 1, (
+            f"Object variants must collapse to one edge; got {m.graph.number_of_edges()}"
+        )
+        edges = list(m.graph["paramem"]["execution speed"].values())
+        assert len(edges) == 1
+        assert edges[0]["recurrence_count"] == 2, (
+            "Collapsed edge must have recurrence_count=2 (one per session)"
+        )
+
+    def test_display_name_preserved_in_node_attributes(self):
+        """After collapsing object variants, the first-seen surface form is in
+        ``attributes["name"]`` — recall text is the human-readable original, not
+        the canonical key.
+        """
+        m = GraphMerger()
+        s1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="ParaMem", entity_type="concept"),
+                Entity(name="Execution Speed", entity_type="concept"),
+            ],
+            relations=[
+                Relation(
+                    subject="ParaMem",
+                    predicate="values",
+                    object="Execution Speed",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                )
+            ],
+        )
+        m.merge(s1)
+
+        # The display name is stored in attributes["name"], not the node key.
+        node_data = m.graph.nodes["execution speed"]
+        assert node_data["attributes"]["name"] == "Execution Speed", (
+            "First-seen surface form must be preserved in attributes['name']; "
+            f"got {node_data['attributes'].get('name')!r}"
         )

@@ -7,6 +7,8 @@ entity scalar attributes into relation triples.  No LLM.  Used by both
 
 from typing import TYPE_CHECKING
 
+from paramem.graph.name_match import canonical
+
 if TYPE_CHECKING:
     from paramem.graph.schema import Entity
 
@@ -86,9 +88,10 @@ def _flatten_entity_attributes(
             "relation_type": "attribute",
         }
 
-    Predicate normalisation: attribute keys are lower-cased and
-    spaces/dashes replaced with underscores (``"phone number"`` →
-    ``"has_phone_number"``).
+    Predicate normalisation: attribute keys are passed through
+    :func:`paramem.graph.name_match.canonical` (case-fold, diacritic-fold,
+    separator-fold) and prefixed with ``"has_"``
+    (``"phone number"`` → ``"has_phone number"``).
 
     Pairs whose ``(subject, predicate)`` already appears in ``exclude_pairs``
     are skipped — prevents duplicate keying when an explicit ``has_<key>``
@@ -107,9 +110,10 @@ def _flatten_entity_attributes(
             val_str = str(attr_val).strip()
             if not val_str:
                 continue
-            # Normalise predicate: lowercase + spaces/dashes → underscores
-            norm_key = raw_key.lower().replace(" ", "_").replace("-", "_")
-            predicate = f"has_{norm_key}"
+            # Normalise predicate via canonical identity function.
+            # canonical() folds case/separators; the "has_" prefix is a stable
+            # compound that canonical_id() will normalize at merger time.
+            predicate = f"has_{canonical(raw_key)}"
             pair = (entity.name, predicate)
             if pair in _exclude:
                 continue
