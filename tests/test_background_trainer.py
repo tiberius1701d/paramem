@@ -789,3 +789,149 @@ class TestRamCheckpointMode:
         assert not str(args.output_dir).startswith("/dev/shm"), (
             f"save_steps_ram=0 must use caller's output_dir; got {args.output_dir!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 15 — safe_empty_cache called after job completion + _shutdown_requested reset
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerJobBoundary:
+    """Verify per-job VRAM reclaim and _shutdown_requested reset on the worker boundary.
+
+    Covers two singleton-reuse invariants:
+
+    1. safe_empty_cache is called once per job completion, AFTER _quiesced.set()
+       (ordering is load-bearing — the abort-quiesce latency contract must not
+       be delayed by the cache reclaim).
+
+    2. _shutdown_requested is reset to False at the START of each job even when
+       it was set True before submit (e.g. from a prior inference-abort or
+       SIGTERM path that did NOT exit the process).  Without the reset a stale
+       flag would permanently poison all subsequent jobs on the singleton.
+    """
+
+    @staticmethod
+    def _noop_gpu_lock():
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _inner():
+            yield
+
+        return _inner
+
+    def test_safe_empty_cache_called_after_quiesced(self) -> None:
+        """safe_empty_cache is called exactly once per job, AFTER _quiesced.set().
+
+        Ordering is verified by recording the call sequence into a shared list.
+        Both "quiesced_set" (from the per-job quiesced event's .set()) and
+        "safe_empty_cache" are appended to call_order, and the assertion confirms
+        quiesced fires first — the abort-quiesce latency contract.
+        """
+        import time
+
+        model = _make_stub_model("episodic", "in_training")
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=_minimal_training_config(),
+            output_dir="/tmp/test_bt_cache_order",
+        )
+
+        call_order: list[str] = []
+        job_done = threading.Event()
+
+        def job() -> None:
+            job_done.set()
+
+        # Build a threading.Event factory that wraps the per-job _active_quiesced
+        # event with a spy on .set().  The worker creates exactly two events per
+        # job (abort then quiesced, lines 318-319); only the second is
+        # _active_quiesced, so the spy skips the first creation.
+        _real_Event = threading.Event
+        _event_creation_count = 0
+
+        def _spy_Event_factory():
+            nonlocal _event_creation_count
+            _event_creation_count += 1
+            real_ev = _real_Event()
+            if _event_creation_count == 1:
+                # This is _active_abort — do not instrument.
+                return real_ev
+            # This is _active_quiesced — spy its .set() to record ordering.
+            real_set = real_ev.set
+
+            def _spy_set():
+                call_order.append("quiesced_set")
+                real_set()
+
+            real_ev.set = _spy_set  # type: ignore[method-assign]
+            return real_ev
+
+        with (
+            patch(
+                "paramem.server.background_trainer.safe_empty_cache",
+                side_effect=lambda: call_order.append("safe_empty_cache"),
+            ) as mock_cache,
+            patch("paramem.server.gpu_lock.gpu_lock_sync", new=self._noop_gpu_lock()),
+            patch(
+                "paramem.server.background_trainer.threading.Event",
+                side_effect=_spy_Event_factory,
+            ),
+        ):
+            # Submit the job.  The worker will:
+            #   1. Run job()
+            #   2. _quiesced.set()  → appends "quiesced_set"
+            #   3. safe_empty_cache()  → appends "safe_empty_cache"
+            bt.submit(job)
+            # Wait for the job's event to confirm execution started.
+            assert job_done.wait(timeout=5.0), "job did not execute"
+            # Wait until safe_empty_cache has been called once (finally block done).
+            deadline = time.monotonic() + 5.0
+            while "safe_empty_cache" not in call_order and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        assert mock_cache.call_count == 1, (
+            f"safe_empty_cache must be called exactly once per job; got {mock_cache.call_count}"
+        )
+        assert call_order == ["quiesced_set", "safe_empty_cache"], (
+            f"Expected ['quiesced_set', 'safe_empty_cache'] in call_order to prove "
+            f"safe_empty_cache runs AFTER _quiesced.set(); got {call_order}"
+        )
+
+    def test_shutdown_requested_reset_per_job(self) -> None:
+        """_shutdown_requested is False at job start even when set True before submit.
+
+        Simulates a prior inference-abort or SIGTERM-without-process-exit that
+        set _shutdown_requested=True.  With the singleton reuse fix, the flag
+        must be reset at the START of the next job so training is not
+        permanently poisoned.
+        """
+        model = _make_stub_model("episodic", "in_training")
+        bt = BackgroundTrainer(
+            model=model,
+            tokenizer=MagicMock(),
+            training_config=_minimal_training_config(),
+            output_dir="/tmp/test_bt_shutdown_reset",
+        )
+
+        # Poison the flag as a prior abort would.
+        bt._shutdown_requested = True
+
+        observed_at_job_start: list[bool] = []
+        job_done = threading.Event()
+
+        def job() -> None:
+            # Record the flag value at the moment the job body executes.
+            observed_at_job_start.append(bt._shutdown_requested)
+            job_done.set()
+
+        with patch("paramem.server.gpu_lock.gpu_lock_sync", new=self._noop_gpu_lock()):
+            bt.submit(job)
+            assert job_done.wait(timeout=5.0), "job did not execute"
+
+        assert observed_at_job_start == [False], (
+            f"_shutdown_requested must be False at job start even after being set True "
+            f"before submit; got {observed_at_job_start}"
+        )
