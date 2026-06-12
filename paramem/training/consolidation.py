@@ -3579,22 +3579,16 @@ class ConsolidationLoop:
         )
 
         # §4.8.iii — per-tier delta for simulate path.
-        # staled_by_reason == {} because simulate persists graph.json, not
-        # adapter-weight registry slots (no KeyRegistry mutation in simulate) —
-        # a persistence-tail divergence, NOT a skipped grooming step.  The
-        # merger's Case-1 collapse STILL fires and is recorded in removal_ledger.
-        _sim_tier_delta = {
-            "episodic": {
-                "active_before": _active_before_count,
-                "active_after": _after_count,
-                "staled_by_reason": {},
-                # minted = enrichment new_edges (§4.8 D-SYMMETRY).  Enrichment now runs
-                # AFTER reset+merge on the freshly-merged graph (mirroring the train fold),
-                # so its new_edges count is the correct observable: edges added by SOTA
-                # enrichment that were not present in the incoming interim content.
-                "minted": _enrichment_result.get("new_edges", 0),
-            }
-        }
+        # staled_by_reason is derived from merger.removal_ledger via _build_tier_delta;
+        # for simulate mode the entry store is empty (no KeyRegistry mutation) so
+        # tier_of returns None for all removed keys and staled_by_reason == {} in
+        # practice — a persistence-tail divergence, NOT a skipped grooming step.
+        # The merger's Case-1 collapse STILL fires and is recorded in removal_ledger.
+        _sim_tier_delta = self._build_tier_delta(
+            active_before={"episodic": _active_before_count},
+            active_after={"episodic": _after_count},
+            minted_by_tier={"episodic": _enrichment_result.get("new_edges", 0)},
+        )
         self._debug_writer.on_tier_delta(_sim_tier_delta)
         # Also emit the removal ledger so the pre_surfaces evidence is
         # visible in the simulate housekeeping artifacts.
@@ -3634,12 +3628,13 @@ class ConsolidationLoop:
         router=None,
         recall_sanity_threshold: float = 0.95,
         refresh_epochs: int = 30,
+        mode: str = "simulate",
     ) -> dict:
         """On-demand fold that re-grooms the canonical knowledge graph without advancing sessions.
 
         This is a thin dispatcher for the ``POST /consolidate/housekeeping`` endpoint
         (§4.4 Mode 2).  It routes to the correct underlying fold method depending on
-        ``config.consolidation.mode``:
+        ``mode``:
 
         - **simulate**: calls :meth:`consolidate_interim_graphs` with ``housekeeping=True``.
           Re-runs the GraphMerger topology over the persisted main graph (with no interim
@@ -3664,11 +3659,14 @@ class ConsolidationLoop:
             router: Router instance for reload at fold completion (train mode only).
             recall_sanity_threshold: Forwarded to the underlying adapter fold (train only).
             refresh_epochs: Forwarded to the underlying adapter fold (train only).
+            mode: Consolidation mode — ``"simulate"`` (default, no GPU/model required) or
+                ``"train"`` (retrains adapter weights).  Passed by the app layer from
+                ``config.consolidation.mode``; ``self.config`` (``ConsolidationConfig``)
+                does not carry a ``mode`` attribute.
 
         Returns:
             Result dict from the underlying fold, with ``tier_delta`` guaranteed present.
         """
-        mode = self.config.mode if self.config is not None else "simulate"
         if mode == "simulate":
             return self.consolidate_interim_graphs(housekeeping=True)
         else:
@@ -3774,7 +3772,7 @@ class ConsolidationLoop:
     def _mint_keys_for_keyless_edges(
         self,
         tier_keyed: dict[str, list[dict]],
-    ) -> None:
+    ) -> dict[str, int]:
         """Mint indexed keys for edges in the merged graph that have no ``ik_key`` attribute.
 
         Called as a fold pre-pass after :meth:`_promote_mature_keys_inline` and
@@ -3814,7 +3812,8 @@ class ConsolidationLoop:
                 the Stage-5 entries land in the same structure that feeds training.
 
         Returns:
-            ``None``.  Mutates *tier_keyed* and the :class:`~paramem.memory.store.MemoryStore`
+            Per-tier minted count, e.g. ``{"episodic": 2, "procedural": 1}``.
+            Mutates *tier_keyed* and the :class:`~paramem.memory.store.MemoryStore`
             in-place.  Advances ``_indexed_next_index`` / ``_procedural_next_index``
             by one for each minted key.
         """
@@ -3927,6 +3926,74 @@ class ConsolidationLoop:
                 minted_by_tier["episodic"],
                 minted_by_tier["procedural"],
             )
+        return minted_by_tier
+
+    def _build_tier_delta(
+        self,
+        *,
+        active_before: dict[str, int],
+        active_after: dict[str, int],
+        minted_by_tier: dict[str, int],
+    ) -> dict[str, dict]:
+        """Build the per-tier delta record from shared grooming output.
+
+        Unifies the ``staled_by_reason`` and ``minted`` fields that were
+        previously computed in two divergent forked blocks (one per
+        consolidation mode).  ``active_before`` and ``active_after`` remain
+        mode-supplied inputs because they legitimately measure different
+        substrates per mode (graph edges for simulate, served-key lengths for
+        train).  Only ``staled_by_reason`` and ``minted`` are pure functions
+        of shared grooming output and must converge.
+
+        ``staled_by_reason`` is built by iterating ``self.merger.removal_ledger``
+        and attributing each removed key to a tier via ``self.store.tier_of``.
+        This includes ALL merger removal reasons (dedup, enrichment_same_as,
+        contradiction_*, etc.) — more complete than the former train-only
+        dedup-only approach.  Keys whose store entry is absent (``tier_of``
+        returns ``None``) are genuinely unattributable and are skipped — this
+        is a boundary skip, not error suppression.
+
+        Args:
+            active_before: Per-tier key count before the fold, e.g.
+                ``{"episodic": 5, "semantic": 0, "procedural": 2}``.
+            active_after: Per-tier key count after the fold.  Same shape as
+                *active_before* but reflecting the post-fold state.
+            minted_by_tier: Per-tier count of newly minted keys, e.g.
+                ``{"episodic": 1, "procedural": 0}``.  For simulate mode,
+                pass a single-tier dict derived from enrichment ``new_edges``.
+
+        Returns:
+            A mapping from tier name to
+            ``{active_before, active_after, staled_by_reason, minted}``.
+            Only tiers that appear in at least one of the three input dicts
+            are included (generic — no hardcoded tier list).
+        """
+        self._ensure_store()
+
+        # Attribute each ledger removal to a tier via the entry store.
+        ledger = getattr(self.merger, "removal_ledger", {})
+        staled: dict[str, dict[str, int]] = {}
+        for removed_key, rec in ledger.items():
+            tier = self.store.tier_of(removed_key)
+            if tier is None:
+                # Key not owned by the store — genuinely unattributable (e.g.
+                # simulate mode has no store entries; enrichment_same_as keys
+                # that were removed before store registration).  Boundary skip.
+                continue
+            reason = rec.get("reason", "dedup")
+            tier_bucket = staled.setdefault(tier, {})
+            tier_bucket[reason] = tier_bucket.get(reason, 0) + 1
+
+        all_tiers = set(active_before) | set(active_after) | set(minted_by_tier)
+        result: dict[str, dict] = {}
+        for t in all_tiers:
+            result[t] = {
+                "active_before": active_before.get(t, 0),
+                "active_after": active_after.get(t, 0),
+                "staled_by_reason": staled.get(t, {}),
+                "minted": minted_by_tier.get(t, 0),
+            }
+        return result
 
     def _build_registry_true_relations(self) -> "list[Relation]":
         """Build registry-true :class:`Relation` objects for every active key.
@@ -4334,7 +4401,7 @@ class ConsolidationLoop:
         # stamped (direct-append variant) to avoid the MultiDiGraph parallel-edge
         # integer-key hazard; Stage-5's explicit ``if not key: continue`` guard
         # (see below) makes the still-keyless post-pre-pass edges safe to skip.
-        self._mint_keys_for_keyless_edges(tier_keyed)
+        minted_by_tier = self._mint_keys_for_keyless_edges(tier_keyed)
 
         # --- Stage 5: Assign per-tier keyed lists from merged-edge provenance ---
         # Walk merger.graph.edges(data=True); per edge, read ik_key from the edge
@@ -4848,8 +4915,10 @@ class ConsolidationLoop:
             drift_intended_removal_count,
         )
 
-        # Debug: persist the merger removal ledger (final — reset_graph cleared it
-        # before the fold, re-merge + enrichment populated it).  Self-gated.
+        # Debug: persist the merger removal ledger — reset_graph cleared it before
+        # the fold; re-merge + enrichment populated it.  Emitted here (always
+        # reached) so the artifact exists even on a rolled-back or aborted fold.
+        # Self-gated.
         self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
         # --- Step 4: Build per-tier TrainingJob objects ---
@@ -5310,25 +5379,16 @@ class ConsolidationLoop:
 
         # --- §4.8.iii: per-tier delta for train mode ---
         # Build the tier_delta record from the before-snapshot + serve_assignment
-        # (active after) + soft_stale_by_tier (staled keys with reason breakdown).
-        # enrichment new_edges is the count added by _run_graph_enrichment above.
-        _train_tier_delta: dict[str, dict] = {}
-        for _tdt in ("episodic", "semantic", "procedural"):
-            _tdt_staled_keys = soft_stale_by_tier.get(_tdt, {})
-            _tdt_stale_by_reason: dict[str, int] = {}
-            for _stk, _stv in _tdt_staled_keys.items():
-                _stk_reason = _stv.get("reason", "dedup")  # all current staling is dedup
-                _tdt_stale_by_reason[_stk_reason] = _tdt_stale_by_reason.get(_stk_reason, 0) + 1
-            _before = _train_active_before.get(_tdt, 0)
-            _after = len(serve_assignment.get(_tdt, []))
-            _train_tier_delta[_tdt] = {
-                "active_before": _before,
-                "active_after": _after,
-                "staled_by_reason": _tdt_stale_by_reason,
-                "minted": max(0, _after - _before),
-            }
+        # (active after) + minted_by_tier from _mint_keys_for_keyless_edges.
+        # staled_by_reason is derived from merger.removal_ledger via _build_tier_delta
+        # (includes all removal reasons: dedup, enrichment_same_as, contradiction_*).
+        _train_tiers = ("episodic", "semantic", "procedural")
+        _train_tier_delta = self._build_tier_delta(
+            active_before=_train_active_before,
+            active_after={t: len(serve_assignment.get(t, [])) for t in _train_tiers},
+            minted_by_tier=minted_by_tier,
+        )
         self._debug_writer.on_tier_delta(_train_tier_delta)
-        self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
         # Reset housekeeping interim stamp.
         self._current_interim_stamp = None  # type: ignore[assignment]

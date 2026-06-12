@@ -354,10 +354,12 @@ class DebugSnapshotWriter:
 
         Called once per fold (scheduled and housekeeping paths share the
         same fold body) after ``serve_assignment`` and ``minted_by_tier``
-        are finalised.  Emitted for BOTH the train and simulate fold paths
-        (simulate's ``staled_by_reason`` is always ``{}`` because simulate
-        does not mutate adapter-weight registries — a persistence-tail
-        divergence, not a skipped grooming step).
+        are finalised.  Emitted for BOTH the train and simulate fold paths.
+        ``staled_by_reason`` is derived from ``merger.removal_ledger`` and
+        includes all removal reasons (dedup, enrichment_same_as, etc.).  For
+        simulate mode, store entries are absent so ``tier_of`` returns None
+        for all removed keys, making ``staled_by_reason`` effectively ``{}``
+        in practice — a persistence-tail divergence, not a skipped grooming step.
 
         Self-gated on ``save_cycle_snapshots`` / ``_debug_base``; no-op
         when debug is disabled.

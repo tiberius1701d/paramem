@@ -12373,6 +12373,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 result = loop.run_housekeeping(
                     trainer=bt,
                     router=_state.get("router"),
+                    mode=_mode,
                 )
             elif _mode == "simulate":
                 result = loop.consolidate_interim_graphs()

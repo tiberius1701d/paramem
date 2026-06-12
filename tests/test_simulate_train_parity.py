@@ -798,8 +798,8 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
         configuration for simulate mode).
       - ``save_cycle_snapshots`` — False so ``_debug_writer`` gates to no-op.
       - ``_debug_base`` — None so ``_debug_writer._active_base()`` returns None.
-      - ``config`` — None so ``run_housekeeping`` can detect simulate-vs-train mode
-        safely (``run_housekeeping`` guards with ``if self.config is not None``).
+      - ``config`` — None so ``run_housekeeping`` callers that rely on the default
+        ``mode="simulate"`` work without needing a server config object.
 
     All other attributes are left unset; any unintended access will raise
     AttributeError rather than silently returning a MagicMock value.
@@ -988,8 +988,10 @@ class TestConsolidateInterimGraphs:
         """Result dict contains 'tier_delta' with episodic before/after counts.
 
         §4.8.iii observability hook: both the scheduled and housekeeping paths
-        emit tier_delta.  For the simulate path staled_by_reason is always {}
-        (no KeyRegistry involved in simulate mode).
+        emit tier_delta.  For the simulate path staled_by_reason is {} in this
+        fixture because no dedup collapse occurs (the single interim slot has a
+        unique triple) and the simulate-mode store has no entries for
+        removal_ledger attribution.
         """
 
         loop = _make_bare_loop(tmp_path)
@@ -1014,7 +1016,8 @@ class TestConsolidateInterimGraphs:
             f"tier_delta['episodic'] must have staled_by_reason; got {ep!r}"
         )
         assert ep["staled_by_reason"] == {}, (
-            "simulate path: staled_by_reason must be empty (no KeyRegistry in simulate)"
+            "simulate path: staled_by_reason must be empty — no dedup collapse in this fixture"
+            " and simulate-mode store has no entries for removal_ledger attribution"
         )
         assert ep["active_before"] == 0, "No main graph before → active_before == 0"
         assert ep["active_after"] == 1, "One triple merged → active_after == 1"
@@ -1266,6 +1269,251 @@ class TestConsolidateInterimGraphs:
         minted = td["episodic"].get("minted")
         assert minted == 1, (
             f"tier_delta['episodic']['minted'] must equal enrichment new_edges=1; got {minted!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# N3 — TestBuildTierDelta (regression: unified staled_by_reason + minted)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTierDelta:
+    """Regression tests for :meth:`ConsolidationLoop._build_tier_delta`.
+
+    Verifies the contract stated in §4.8.iii:
+
+    - ``staled_by_reason`` total across all tiers == ledger entries attributable
+      to a tier (each removed key reflected in exactly one tier, no double-count
+      or drop).
+    - ``minted`` per tier equals the caller-supplied ``minted_by_tier`` input.
+    - Keys in ``removal_ledger`` whose ``store.tier_of`` returns ``None`` are
+      skipped (genuinely unattributable — boundary skip, not error suppression).
+    """
+
+    def _make_loop_with_store(self, tmp_path: Path) -> ConsolidationLoop:
+        """Minimal loop with a real MemoryStore and GraphMerger (no model/GPU)."""
+        from paramem.graph.merger import GraphMerger
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.output_dir = tmp_path
+        loop.graph_enrichment_enabled = False
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.config = None
+        loop.merger = GraphMerger(model=None)
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+        return loop
+
+    def test_staled_by_reason_reflects_dedup_ledger_entry(self, tmp_path):
+        """staled_by_reason counts match the dedup ledger entries for keys in the store.
+
+        Seeds two keys in the episodic store, populates the merger.removal_ledger
+        with a dedup entry for one of them, and verifies that _build_tier_delta
+        attributes it to episodic under reason 'dedup'.
+        """
+        loop = self._make_loop_with_store(tmp_path)
+
+        # Register two keys in the episodic tier.
+        _ep = {"subject": "Alice", "predicate": "likes", "object": "Tea"}
+        loop.store.put("episodic", "graph1", _ep)
+        loop.store.put("episodic", "graph2", _ep)
+
+        # Simulate a dedup collapse: graph2 is collapsed into graph1.
+        loop.merger.removal_ledger = {
+            "graph2": {"reason": "dedup", "surviving_twin": "graph1", "pre_surfaces": {}}
+        }
+
+        td = loop._build_tier_delta(
+            active_before={"episodic": 2},
+            active_after={"episodic": 1},
+            minted_by_tier={"episodic": 0},
+        )
+
+        assert "episodic" in td
+        ep = td["episodic"]
+        assert ep["staled_by_reason"] == {"dedup": 1}, (
+            "One dedup ledger entry for an episodic key must produce"
+            f" staled_by_reason={{'dedup': 1}}; got {ep['staled_by_reason']!r}"
+        )
+        # Total staled_by_reason count == number of attributable ledger entries.
+        total_staled = sum(
+            sum(v.values()) for v in (tier_rec["staled_by_reason"] for tier_rec in td.values())
+        )
+        assert total_staled == 1, (
+            "Total staled_by_reason count must equal 1 attributable ledger entry;"
+            f" got {total_staled}"
+        )
+
+    def test_staled_by_reason_includes_enrichment_same_as(self, tmp_path):
+        """enrichment_same_as ledger entries are included in staled_by_reason.
+
+        Unlike the former train-mode path (soft_stale_by_tier, dedup-only),
+        the unified _build_tier_delta attributes ALL removal reasons from the
+        ledger, including enrichment_same_as.
+        """
+        loop = self._make_loop_with_store(tmp_path)
+        loop.store.put(
+            "episodic", "graph3", {"subject": "Alice", "predicate": "is", "object": "Bob"}
+        )
+
+        loop.merger.removal_ledger = {
+            "graph3": {"reason": "enrichment_same_as", "merged_into": "alice"}
+        }
+
+        td = loop._build_tier_delta(
+            active_before={"episodic": 1},
+            active_after={"episodic": 1},
+            minted_by_tier={"episodic": 0},
+        )
+
+        ep = td["episodic"]
+        assert ep["staled_by_reason"].get("enrichment_same_as", 0) == 1, (
+            f"enrichment_same_as ledger entry must appear in staled_by_reason;"
+            f" got {ep['staled_by_reason']!r}"
+        )
+
+    def test_unattributable_key_skipped(self, tmp_path):
+        """A ledger entry for a key absent from the store produces no staled_by_reason entry.
+
+        This is the boundary-skip branch: simulate mode has no store entries so
+        tier_of returns None for all removed keys.  The boundary skip must NOT
+        produce a staled_by_reason entry for any tier.
+        """
+        loop = self._make_loop_with_store(tmp_path)
+        # Deliberately do NOT put "ghost_key" into the store.
+
+        loop.merger.removal_ledger = {
+            "ghost_key": {"reason": "dedup", "surviving_twin": "real_key", "pre_surfaces": {}}
+        }
+
+        td = loop._build_tier_delta(
+            active_before={"episodic": 5},
+            active_after={"episodic": 5},
+            minted_by_tier={"episodic": 0},
+        )
+
+        total_staled = sum(
+            sum(v.values()) for v in (tier_rec["staled_by_reason"] for tier_rec in td.values())
+        )
+        assert total_staled == 0, (
+            "An unattributable ledger key (not in store) must not inflate staled_by_reason;"
+            f" got total_staled={total_staled}"
+        )
+
+    def test_minted_equals_caller_supplied_input(self, tmp_path):
+        """minted per tier equals the minted_by_tier input dict, not a derived count.
+
+        Verifies the invariant for both simulate (single-tier dict) and train
+        (multi-tier dict) callers.
+        """
+        loop = self._make_loop_with_store(tmp_path)
+        loop.merger.removal_ledger = {}
+
+        minted_in = {"episodic": 3, "procedural": 1}
+        td = loop._build_tier_delta(
+            active_before={"episodic": 10, "procedural": 5},
+            active_after={"episodic": 13, "procedural": 6},
+            minted_by_tier=minted_in,
+        )
+
+        assert td["episodic"]["minted"] == 3, (
+            "minted for episodic must equal minted_by_tier input 3;"
+            f" got {td['episodic']['minted']!r}"
+        )
+        assert td["procedural"]["minted"] == 1, (
+            "minted for procedural must equal minted_by_tier input 1;"
+            f" got {td['procedural']['minted']!r}"
+        )
+        # Simulate-style: single tier
+        td2 = loop._build_tier_delta(
+            active_before={"episodic": 0},
+            active_after={"episodic": 2},
+            minted_by_tier={"episodic": 2},
+        )
+        assert td2["episodic"]["minted"] == 2
+
+    def test_multi_tier_dedup_no_double_count(self, tmp_path):
+        """Each removed key is attributed to exactly one tier — no double-count.
+
+        Seeds one key per tier and puts all three in the removal_ledger.
+        Total staled_by_reason count across tiers must equal 3 (one per key).
+        """
+        loop = self._make_loop_with_store(tmp_path)
+        loop.store.put("episodic", "ep_key", {"subject": "A", "predicate": "p", "object": "B"})
+        loop.store.put("semantic", "sem_key", {"subject": "C", "predicate": "p", "object": "D"})
+        loop.store.put("procedural", "proc_key", {"subject": "E", "predicate": "p", "object": "F"})
+
+        loop.merger.removal_ledger = {
+            "ep_key": {"reason": "dedup", "surviving_twin": "other", "pre_surfaces": {}},
+            "sem_key": {"reason": "dedup", "surviving_twin": "other2", "pre_surfaces": {}},
+            "proc_key": {"reason": "dedup", "surviving_twin": "other3", "pre_surfaces": {}},
+        }
+
+        td = loop._build_tier_delta(
+            active_before={"episodic": 1, "semantic": 1, "procedural": 1},
+            active_after={"episodic": 0, "semantic": 0, "procedural": 0},
+            minted_by_tier={},
+        )
+
+        total_staled = sum(
+            sum(v.values()) for v in (tier_rec["staled_by_reason"] for tier_rec in td.values())
+        )
+        assert total_staled == 3, (
+            f"Three ledger entries across three tiers must produce total staled_by_reason=3;"
+            f" got {total_staled} (td={td!r})"
+        )
+        # No double-counting: each tier has exactly 1.
+        for tier in ("episodic", "semantic", "procedural"):
+            assert sum(td[tier]["staled_by_reason"].values()) == 1, (
+                f"Tier {tier} must have exactly 1 staled entry;"
+                f" got {td[tier]['staled_by_reason']!r}"
+            )
+
+    def test_simulate_variant_collapse_staled_by_reason_empty(self, tmp_path):
+        """Simulate path: removal_ledger dedup entry for unattributed key → staled_by_reason {}.
+
+        Uses the variant-collapse fixture pattern (two interim slots with
+        canonically-identical triples).  The simulate-mode store has no entries
+        (no KeyRegistry mutation in simulate), so tier_of returns None for the
+        collapsed key — boundary skip → staled_by_reason stays {}.
+
+        This is the §4.S parity assertion: staled_by_reason is {} for simulate
+        not because grooming is skipped, but because attribution is unavailable.
+        """
+        loop = _make_bare_loop(tmp_path)
+
+        _write_interim_graph(
+            tmp_path,
+            "20260201T0000",
+            [{"key": "graph1", "subject": "Alice", "predicate": "works at", "object": "Acme Corp"}],
+        )
+        _write_interim_graph(
+            tmp_path,
+            "20260202T0000",
+            [{"key": "graph2", "subject": "alice", "predicate": "works at", "object": "acme corp"}],
+        )
+
+        result = loop.consolidate_interim_graphs(housekeeping=True)
+
+        td = result["tier_delta"]
+        assert "episodic" in td
+        ep = td["episodic"]
+        # Ledger has a dedup entry (Case-1 collapse), but store has no entries.
+        assert ep["staled_by_reason"] == {}, (
+            "Simulate variant-collapse: staled_by_reason must be {} because the store"
+            f" has no entries for attribution; got {ep['staled_by_reason']!r}"
+        )
+
+        # Confirm the ledger DID fire (dedup collapse happened).
+        ledger = getattr(loop.merger, "removal_ledger", {})
+        dedup_entries = [k for k, v in ledger.items() if v.get("reason") == "dedup"]
+        assert dedup_entries, (
+            "Variant-collapse fixture must produce at least one dedup ledger entry;"
+            f" ledger={ledger!r}"
         )
 
 
