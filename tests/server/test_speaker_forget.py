@@ -67,9 +67,11 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     ep_registry = MagicMock(spec=KeyRegistry)
     ep_registry.__contains__ = MagicMock(side_effect=lambda k: k in keys)
     ep_registry.is_stale = MagicMock(return_value=False)
+    ep_registry.knows = MagicMock(side_effect=lambda k: k in keys)
     sem_registry = MagicMock(spec=KeyRegistry)
     sem_registry.__contains__ = MagicMock(side_effect=lambda _: False)
     sem_registry.is_stale = MagicMock(return_value=False)
+    sem_registry.knows = MagicMock(side_effect=lambda _: False)
 
     # Store: tiers_with_registry returns episodic + semantic.
     loop.store.tiers_with_registry.return_value = ["episodic", "semantic"]

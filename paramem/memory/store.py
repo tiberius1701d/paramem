@@ -337,7 +337,7 @@ class MemoryStore:
                     former = tier
         if self._registry is not None:
             for tier, reg in list(self._registry.items()):
-                if key in reg:
+                if reg.knows(key):
                     reg.remove(key)
                     if former is None:
                         former = tier
@@ -521,6 +521,47 @@ class MemoryStore:
                 return tier
         return None
 
+    def is_known(self, key: str) -> bool:
+        """True when *key* is active OR stale in any tier's registry.
+
+        KNOWN-legitimacy analogue of ``key in reg`` (active-only).  Returns
+        False when replay is disabled (no registries) or the key is absent from
+        both partitions of every tier.  Use for orphan checks and bookkeeping
+        retention; use :meth:`tier_for_active_key` / :meth:`all_active_keys` for
+        serving/enumeration.
+        """
+        if self._registry is None:
+            return False
+        for reg in self._registry.values():
+            if reg.knows(key):
+                return True
+        return False
+
+    def tier_for_known_key(self, key: str) -> str | None:
+        """Return the tier whose registry tracks *key* as active OR stale.
+
+        KNOWN-legitimacy analogue of :meth:`tier_for_active_key`.  Returns
+        ``None`` when replay is disabled or no tier knows *key* in either
+        partition.
+        """
+        if self._registry is None:
+            return None
+        for tier, reg in self._registry.items():
+            if reg.knows(key):
+                return tier
+        return None
+
+    def all_known_keys(self) -> list[str]:
+        """Every active ∪ stale key across every registered tier.
+
+        Equivalent to ``all_active_keys() + all_stale_keys()`` but expressed
+        via :meth:`KeyRegistry.list_known` so the union logic has a single
+        definition.  Returns an empty list when replay is disabled.
+        """
+        if self._registry is None:
+            return []
+        return [k for reg in self._registry.values() for k in reg.list_known()]
+
     def is_stale(self, key: str) -> bool:
         """Return True when *key* is stale in any tier's registry.
 
@@ -577,7 +618,7 @@ class MemoryStore:
                 if reg is None:
                     continue
                 for key in keys:
-                    if key in reg or reg.is_stale(key):
+                    if reg.knows(key):
                         reg.remove(key)
             for tier_name in ("episodic", "semantic", "procedural"):
                 for key in keys:
@@ -979,7 +1020,7 @@ class MemoryStore:
         orphaned = 0
         legacy_upgraded = 0
         for key, key_meta in metadata.get("keys", {}).items():
-            tier = self.tier_for_active_key(key)
+            tier = self.tier_for_known_key(key)
             if tier is None:
                 orphaned += 1
                 continue

@@ -227,6 +227,104 @@ class TestRegistry:
 
 
 # ---------------------------------------------------------------------------
+# Known-legitimacy predicates — is_known, tier_for_known_key, all_known_keys
+# ---------------------------------------------------------------------------
+
+
+class TestKnownPredicates:
+    """Unit tests for MemoryStore.is_known, tier_for_known_key, all_known_keys.
+
+    Mirrors test_all_active_keys / test_tier_for_active_key with the KNOWN
+    (active ∪ stale) semantics.  SERVE predicates (tier_for_active_key,
+    all_active_keys) must remain unaffected — verified here too.
+    """
+
+    def _store_with_stale_key(self) -> MemoryStore:
+        """Build a store that has 'graph1' active and 'proc52' stale."""
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"))
+        s.put("procedural", "proc52", _entry("proc52"))
+        s.discard_keys(["proc52"], mode="stale")
+        return s
+
+    def test_is_known_active_key(self):
+        """is_known() returns True for an active key."""
+        s = self._store_with_stale_key()
+        assert s.is_known("graph1")
+
+    def test_is_known_stale_key(self):
+        """is_known() returns True for a stale key."""
+        s = self._store_with_stale_key()
+        assert s.is_known("proc52")
+
+    def test_is_known_absent_key(self):
+        """is_known() returns False for a key not in any tier."""
+        s = self._store_with_stale_key()
+        assert not s.is_known("ghost")
+
+    def test_is_known_replay_disabled(self):
+        """is_known() returns False when replay is disabled."""
+        s = MemoryStore(replay_enabled=False)
+        assert not s.is_known("anything")
+
+    def test_tier_for_known_key_active(self):
+        """tier_for_known_key() returns the owning tier for an active key."""
+        s = MemoryStore()
+        s.put("semantic", "graph42", _entry("graph42"))
+        assert s.tier_for_known_key("graph42") == "semantic"
+
+    def test_tier_for_known_key_stale(self):
+        """tier_for_known_key() returns the owning tier for a stale key.
+
+        tier_for_active_key() on the same key must return None (SERVE unchanged).
+        """
+        s = self._store_with_stale_key()
+        # KNOWN sees it
+        assert s.tier_for_known_key("proc52") == "procedural"
+        # SERVE does not
+        assert s.tier_for_active_key("proc52") is None
+
+    def test_tier_for_known_key_absent(self):
+        """tier_for_known_key() returns None for an absent key."""
+        s = self._store_with_stale_key()
+        assert s.tier_for_known_key("ghost") is None
+
+    def test_all_known_keys_includes_stale(self):
+        """all_known_keys() includes both active and stale keys."""
+        s = self._store_with_stale_key()
+        known = sorted(s.all_known_keys())
+        assert "graph1" in known
+        assert "proc52" in known
+
+    def test_all_known_keys_replay_disabled(self):
+        """all_known_keys() returns [] when replay is disabled."""
+        s = MemoryStore(replay_enabled=False)
+        assert s.all_known_keys() == []
+
+    def test_all_active_keys_excludes_stale(self):
+        """all_active_keys() (SERVE) must not include stale keys after refactor."""
+        s = self._store_with_stale_key()
+        active = s.all_active_keys()
+        assert "graph1" in active
+        assert "proc52" not in active
+
+    def test_delete_stale_only_key(self):
+        """delete() removes a key that is ONLY stale (registry + simhash)."""
+        s = MemoryStore()
+        s.put("procedural", "proc52", _entry("proc52"), simhash=0xDEAD)
+        s.discard_keys(["proc52"], mode="stale")
+        # Before: proc52 is stale-only
+        assert s.is_stale("proc52")
+        assert not s.tier_for_active_key("proc52")
+        former = s.delete("proc52")
+        # After: fully gone
+        assert former == "procedural"
+        assert not s.is_known("proc52")
+        assert s.registry("procedural") is not None
+        assert "proc52" not in s.registry("procedural")
+
+
+# ---------------------------------------------------------------------------
 # Move + delete — preserve cross-structure consistency
 # ---------------------------------------------------------------------------
 

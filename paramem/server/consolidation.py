@@ -326,14 +326,12 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
         reg_path = config.adapter_dir / tier / "indexed_key_registry.json"
         if reg_path.exists():
             _loaded_reg = KeyRegistry.load(reg_path)
-            active.update(_loaded_reg.list_active())
-            active.update(_loaded_reg.list_stale())
+            active.update(_loaded_reg.list_known())
     for _name, interim_dir in iter_interim_dirs(config.adapter_dir):
         reg_path = interim_dir / "indexed_key_registry.json"
         if reg_path.exists():
             _loaded_reg = KeyRegistry.load(reg_path)
-            active.update(_loaded_reg.list_active())
-            active.update(_loaded_reg.list_stale())
+            active.update(_loaded_reg.list_known())
 
     if not active:
         # Empty registry union with non-empty key_metadata: cannot prove the keys
@@ -380,7 +378,7 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     keys_payload: dict = {}
     # W1 (§3.4b): persist bookkeeping for BOTH active and stale keys so that
     # stale-echo probes can resolve speaker/relation_type for a soft-staled key.
-    all_keys = list(loop.store.all_active_keys()) + list(loop.store.all_stale_keys())
+    all_keys = loop.store.all_known_keys()
     for key in all_keys:
         bk = loop.store.bookkeeping_for_key(key) or {}
         keys_payload[key] = {

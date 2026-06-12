@@ -1648,6 +1648,55 @@ def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
     assert loop.cycle_count == 5
 
 
+def test_seed_key_metadata_retains_stale_key(tmp_path):
+    """seed_key_metadata: a stale key's metadata is RETAINED (not counted as orphan).
+
+    Root bug: seed_key_metadata called tier_for_active_key; a soft-staled key
+    returned None and was silently dropped.  After the fix it calls
+    tier_for_known_key so stale keys survive the reseed.
+    """
+    import json
+    import types
+
+    from paramem.memory.store import MemoryStore
+    from paramem.server.consolidation import _load_key_metadata
+    from paramem.training.consolidation import ConsolidationLoop
+
+    # Store: graph1 is active, proc52 is stale.
+    store = MemoryStore(replay_enabled=True)
+    ep_entry = {"key": "graph1", "question": "q", "answer": "a"}
+    store.put("episodic", "graph1", ep_entry, register=True)
+    proc_entry = {"key": "proc52", "question": "q", "answer": "a"}
+    store.put("procedural", "proc52", proc_entry, register=True)
+    store.discard_keys(["proc52"], mode="stale")
+
+    meta = {
+        "cycle_count": 3,
+        "keys": {
+            "graph1": {"recurrence_count": 5, "speaker_id": "spk0", "first_seen_cycle": 1},
+            "proc52": {"recurrence_count": 2, "speaker_id": "spk0", "first_seen_cycle": 1},
+            "ghost": {"recurrence_count": 1, "speaker_id": "spk0", "first_seen_cycle": 0},
+        },
+        "promoted_keys": ["proc52"],
+    }
+    path = tmp_path / "key_metadata.json"
+    path.write_text(json.dumps(meta))
+
+    loaded = _load_key_metadata(path)
+    assert loaded is not None
+
+    loop = types.SimpleNamespace(store=store, promoted_keys=set(), cycle_count=0)
+    ConsolidationLoop.seed_key_metadata(loop, loaded)
+
+    # proc52 is stale (not active) but IS known — must not be counted as orphan.
+    # Orphan count is only surfaced via logging; validate via promoted_keys:
+    # proc52 was in promoted_keys; it is still known after staling.
+    assert "proc52" in loop.promoted_keys, "Stale promoted key must survive seed_key_metadata"
+    # ghost has no tier at all — must NOT be in promoted_keys.
+    assert "ghost" not in loop.promoted_keys, "Truly-unknown key must be dropped from promoted_keys"
+    assert loop.cycle_count == 3
+
+
 # ---------------------------------------------------------------------------
 # _prune_old_slots: adapter slot retention (Commit 2)
 # ---------------------------------------------------------------------------

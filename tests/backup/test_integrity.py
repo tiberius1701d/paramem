@@ -64,12 +64,33 @@ def _make_config(tmp_path: Path, mode: str = "train") -> MagicMock:
     return cfg
 
 
-def _write_key_registry(path: Path, keys: list[str]) -> None:
-    """Write a minimal indexed_key_registry.json with *keys* as active keys."""
+def _write_key_registry(
+    path: Path,
+    keys: list[str] | None = None,
+    *,
+    active: list[str] | None = None,
+    stale: list[str] | None = None,
+) -> None:
+    """Write a minimal indexed_key_registry.json.
+
+    Supports two call shapes:
+    - Legacy positional: ``_write_key_registry(path, ["k1", "k2"])`` — all active.
+    - Explicit partitions: ``_write_key_registry(path, active=["k1"], stale=["k2"])``.
+
+    The ``keys`` positional argument is treated as ``active`` when provided; it
+    must not be combined with the keyword forms.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    if keys is not None:
+        active = keys
+    active = active or []
+    stale = stale or []
     reg = KeyRegistry()
-    for k in keys:
+    for k in active:
         reg.add(k)
+    for k in stale:
+        reg.add(k)
+        reg.stale(k)
     path.write_bytes(reg.save_bytes())
 
 
@@ -439,6 +460,154 @@ class TestCrossConsistency:
             f for f in report.failures if f.category == "key_metadata" and f.status == _INCONSISTENT
         ]
         assert km_inconsistent == []
+
+
+# ---------------------------------------------------------------------------
+# Stale-key cross-consistency (known = active ∪ stale)
+# ---------------------------------------------------------------------------
+
+
+class TestStaleKeyCrossConsistency:
+    """Cross-consistency checks respect the stale partition.
+
+    (a) A stale key with a simhash is NOT flagged as an orphan fingerprint.
+    (b) A key absent from both active AND stale IS still flagged.
+    (c) A stale key without a simhash does NOT trigger missing_from_sh
+        (that sub-check is active-only by design).
+    (d) A stale key in key_metadata is NOT flagged as an orphan.
+    (e) A wholly-unknown key in key_metadata IS flagged.
+    (f) A stale-only tier keeps simhash/manifest OPTIONAL (has_keys=False).
+    """
+
+    def test_stale_simhash_not_flagged_orphan(self, tmp_path):
+        """Stale key with simhash → NOT an orphan fingerprint (reproduces live proc52 bug)."""
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"], stale=["proc52"])
+        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "proc52": 2})
+        slot = ep_dir / "20260501-000000"
+        _write_manifest(slot, "episodic")
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+        # No inconsistent failure may mention proc52.
+        proc52_fails = [f for f in report.failures if "proc52" in f.detail]
+        assert proc52_fails == [], f"Unexpected failures for stale key proc52: {proc52_fails}"
+
+    def test_genuine_orphan_simhash_still_flagged(self, tmp_path):
+        """Key in simhash but absent from both active AND stale → inconsistent."""
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"])
+        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "ghost": 99})
+        slot = ep_dir / "20260501-000000"
+        _write_manifest(slot, "episodic")
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+        inconsistent = [f for f in report.failures if f.status == _INCONSISTENT]
+        assert len(inconsistent) >= 1, "Genuine orphan simhash key must still be flagged"
+        assert any("ghost" in f.detail for f in inconsistent)
+
+    def test_stale_key_without_simhash_not_flagged_missing(self, tmp_path):
+        """Stale key without a simhash does NOT trigger missing_from_sh.
+
+        missing_from_sh is active-only (every SERVED key must have a fingerprint).
+        A stale key may or may not have a retained simhash without triggering a
+        missing-fingerprint failure.
+        """
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"], stale=["old1"])
+        # simhash only has key1 — old1 (stale) has no simhash
+        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        slot = ep_dir / "20260501-000000"
+        _write_manifest(slot, "episodic")
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+        old1_fails = [f for f in report.failures if "old1" in f.detail]
+        assert old1_fails == [], f"Stale key without simhash must not be flagged: {old1_fails}"
+
+    def test_stale_key_metadata_not_flagged(self, tmp_path):
+        """key_metadata entry for a stale key is NOT flagged as orphan."""
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"], stale=["proc52"])
+        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "proc52": 2})
+        slot = ep_dir / "20260501-000000"
+        _write_manifest(slot, "episodic")
+
+        cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "keys": {
+                "key1": {"speaker_id": "spk0", "first_seen_cycle": 0},
+                "proc52": {"speaker_id": "spk0", "first_seen_cycle": 1},
+            }
+        }
+        cfg.key_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        store = MemoryStore(replay_enabled=True)
+        reg = KeyRegistry()
+        reg.add("key1")
+        reg.add("proc52")
+        reg.stale("proc52")
+        store.load_registry("episodic", reg)
+
+        report = verify_infrastructure_integrity(cfg, store=store, daily_loadable=False)
+        km_fails = [
+            f for f in report.failures if f.category == "key_metadata" and f.status == _INCONSISTENT
+        ]
+        assert km_fails == [], f"Stale key in key_metadata must not be flagged: {km_fails}"
+
+    def test_wholly_unknown_key_metadata_still_flagged(self, tmp_path):
+        """key_metadata entry absent from both active and stale → still flagged."""
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"])
+        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        slot = ep_dir / "20260501-000000"
+        _write_manifest(slot, "episodic")
+
+        cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata = {
+            "keys": {
+                "key1": {"speaker_id": "spk0", "first_seen_cycle": 0},
+                "ghost_key": {"speaker_id": "spk0", "first_seen_cycle": 1},
+            }
+        }
+        cfg.key_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        store = MemoryStore(replay_enabled=True)
+        reg = KeyRegistry()
+        reg.add("key1")
+        store.load_registry("episodic", reg)
+
+        report = verify_infrastructure_integrity(cfg, store=store, daily_loadable=False)
+        km_fails = [
+            f for f in report.failures if f.category == "key_metadata" and f.status == _INCONSISTENT
+        ]
+        assert len(km_fails) == 1
+        assert "ghost_key" in km_fails[0].detail
+
+    def test_stale_only_tier_simhash_optional(self, tmp_path):
+        """A tier with ONLY stale keys keeps has_keys=False → simhash/manifest OPTIONAL.
+
+        A stale-only tier serves nothing; its simhash and manifest must stay
+        optional (the has_keys regression guard).
+        """
+        cfg = _make_config(tmp_path, mode="train")
+        ep_dir = cfg.adapter_dir / "episodic"
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        # Registry has only a stale key — no active keys.
+        _write_key_registry(ep_dir / "indexed_key_registry.json", active=[], stale=["old1"])
+        # No simhash file and no manifest slot — should not be required.
+
+        report = verify_infrastructure_integrity(cfg, daily_loadable=False)
+        failures = [f for f in report.failures if f.tier == "episodic"]
+        assert failures == [], f"Stale-only tier must not require simhash/manifest: {failures}"
 
 
 # ---------------------------------------------------------------------------

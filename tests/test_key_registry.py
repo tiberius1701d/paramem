@@ -401,6 +401,85 @@ class TestStaleSemantics:
         assert loaded_fold_n1._stale["graph1"]["stale_cycles"] == 1
 
 
+class TestKnownPredicate:
+    """Unit tests for KeyRegistry.knows() and KeyRegistry.list_known().
+
+    Verifies the KNOWN-legitimacy predicates (active ∪ stale) introduced to
+    canonicalize orphan-check and bookkeeping-retention consumers.  Distinct
+    from __contains__ (active-only, SERVE semantics).
+    """
+
+    def test_knows_active_key(self):
+        """knows() returns True for an active key."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        assert reg.knows("graph1")
+
+    def test_knows_stale_key(self):
+        """knows() returns True for a key that has been staled."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+        # Active predicate no longer sees it.
+        assert "graph1" not in reg
+        # Known predicate does.
+        assert reg.knows("graph1")
+
+    def test_knows_false_for_absent_key(self):
+        """knows() returns False for a key never added."""
+        reg = KeyRegistry()
+        assert not reg.knows("unknown")
+
+    def test_knows_false_after_remove(self):
+        """knows() returns False after hard-remove (key purged from both partitions)."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+        reg.remove("graph1")
+        assert not reg.knows("graph1")
+
+    def test_list_known_active_and_stale(self):
+        """list_known() = active keys first, then stale keys."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.add("graph3")
+        reg.stale("graph2")
+        result = reg.list_known()
+        # graph1 and graph3 are active (graph2 staled out of active).
+        assert result == ["graph1", "graph3", "graph2"]
+
+    def test_list_known_active_only(self):
+        """list_known() == list_active() when no stale keys."""
+        reg = KeyRegistry()
+        reg.add("a")
+        reg.add("b")
+        assert reg.list_known() == reg.list_active()
+
+    def test_list_known_stale_only(self):
+        """list_known() == list_stale() when all keys have been staled."""
+        reg = KeyRegistry()
+        reg.add("a")
+        reg.add("b")
+        reg.stale("a")
+        reg.stale("b")
+        assert reg.list_known() == reg.list_stale()
+
+    def test_staling_flips_contains_but_not_knows(self):
+        """Staling a key moves it from __contains__=True to knows()=True, __contains__=False.
+
+        This is the exact active/known divergence that the orphan-check bug relied on.
+        """
+        reg = KeyRegistry()
+        reg.add("proc52")
+        assert "proc52" in reg  # active
+        assert reg.knows("proc52")  # known
+
+        reg.stale("proc52")
+        assert "proc52" not in reg  # no longer active
+        assert reg.knows("proc52")  # still known
+
+
 class TestSaveBytesBoundary:
     def test_save_bytes_payload_is_bookkeeping_free(self):
         """HARD CONSTRAINT: KeyRegistry.save_bytes() must contain exactly

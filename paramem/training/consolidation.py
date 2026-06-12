@@ -456,19 +456,18 @@ class ConsolidationLoop:
         self.cycle_count = metadata.get("cycle_count", 0)
         orphan_count = 0
         for key, key_meta in metadata.get("keys", {}).items():
-            tier = self.store.tier_for_active_key(key)
+            tier = self.store.tier_for_known_key(key)
             if tier is None:
-                # No tier owns this key — slot was wiped or never existed.
-                # Drop the metadata entry; the next _save_key_metadata
-                # write will not re-emit it.
+                # No tier knows this key (not active, not stale) — slot was
+                # wiped or never existed.  Drop the metadata entry; the next
+                # _save_key_metadata write will not re-emit it.
                 orphan_count += 1
                 continue
-        # promoted_keys is similarly slot-owned — drop entries whose tier
-        # is gone so the next save doesn't re-emit them.
+        # promoted_keys is similarly slot-owned — drop entries whose tier is
+        # gone so the next save doesn't re-emit them.  A promoted-then-staled
+        # key is still legitimately known; retain its promotion record.
         raw_promoted = set(metadata.get("promoted_keys", []))
-        self.promoted_keys = {
-            k for k in raw_promoted if self.store.tier_for_active_key(k) is not None
-        }
+        self.promoted_keys = {k for k in raw_promoted if self.store.is_known(k)}
         if orphan_count:
             logger.info(
                 "seed_key_metadata: dropped %d orphan key(s) (metadata present, no tier registry)",

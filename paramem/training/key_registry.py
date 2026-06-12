@@ -97,6 +97,27 @@ class KeyRegistry:
                     "stale_cycles": 0,
                 }
 
+    def knows(self, key: str) -> bool:
+        """True when *key* is legitimately tracked by this tier — active OR stale.
+
+        Distinct from :meth:`__contains__` (active-only, serving semantics): a
+        stale key is still KNOWN — its simhash and key_metadata are retained on
+        disk for the stale-echo seam.  Membership-legitimacy consumers (orphan
+        checks, bookkeeping retention) must use this; serving/enumeration
+        consumers keep using :meth:`__contains__` / :meth:`list_active`.
+        """
+        return key in self._active_keys or key in self._stale
+
+    def list_known(self) -> list[str]:
+        """All keys this tier legitimately tracks — active first, then stale.
+
+        Each group is in registration/insertion order.  Equivalent to
+        :meth:`list_active` + :meth:`list_stale` but expressed as a single call
+        so callers can canonically enumerate active ∪ stale without hand-rolling
+        the union.
+        """
+        return list(self._active_keys) + list(self._stale.keys())
+
     def list_active(self) -> list[str]:
         """Return all active keys in this tier in registration order."""
         return list(self._active_keys)
