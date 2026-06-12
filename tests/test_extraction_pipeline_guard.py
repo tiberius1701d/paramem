@@ -1006,3 +1006,108 @@ def test_kwargs_raises_on_empty_speaker_id():
     pipeline = _make_pipeline()
     with pytest.raises(ValueError, match="speaker_id is required"):
         pipeline.kwargs(speaker_id="")
+
+
+# ---------------------------------------------------------------------------
+# Structural guard — BackgroundTrainer single-literal invariant
+# ---------------------------------------------------------------------------
+
+
+def _find_background_trainer_constructor_calls(py_file: Path) -> list[tuple[int, str]]:
+    """Return ``(lineno, source)`` for every ``BackgroundTrainer(...)`` AST call node.
+
+    Uses :mod:`ast` to count actual constructor call sites (``ast.Call`` whose
+    ``func`` is an ``ast.Name`` with id ``"BackgroundTrainer"``).  String
+    occurrences in docstrings, comments, or log messages are not counted.
+    """
+    import ast
+
+    try:
+        text = py_file.read_text()
+    except UnicodeDecodeError:
+        return []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    lines = text.splitlines()
+    out: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "BackgroundTrainer"
+        ):
+            line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+            out.append((node.lineno, line.strip()))
+    return out
+
+
+def test_background_trainer_single_constructor_literal_in_app():
+    """``BackgroundTrainer(...)`` must appear EXACTLY ONCE in ``paramem/server/app.py``.
+
+    The single-constructor invariant enforces the singleton pattern:
+    ``_build_bg_trainer`` is the sole factory; all dispatch sites call
+    ``_active_bg_trainer`` (get-or-create) or ``_build_bg_trainer``
+    (deliberate fresh-build after release).  A raw ``BackgroundTrainer(...)``
+    at a dispatch site orphans the prior worker thread and leaks its VRAM.
+
+    If this test fails, the new call site must be moved inside
+    ``_build_bg_trainer`` or replaced with ``_active_bg_trainer``.
+    """
+    import ast
+
+    repo_root = Path(__file__).resolve().parent.parent
+    app_file = repo_root / "paramem" / "server" / "app.py"
+
+    text = app_file.read_text()
+    tree = ast.parse(text)
+    lines = text.splitlines()
+
+    # Locate all BackgroundTrainer(...) calls together with the enclosing
+    # function name so the assertion can confirm the sole call is inside
+    # _build_bg_trainer.
+    hits: list[tuple[int, str, str | None]] = []  # (lineno, source, enclosing_fn)
+
+    # Build a mapping: lineno → enclosing function name (nearest FunctionDef ancestor).
+    fn_ranges: list[tuple[int, int, str]] = []  # (start, end, name)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # end_lineno is available for Python 3.8+ AST nodes.
+            end = getattr(node, "end_lineno", node.lineno)
+            fn_ranges.append((node.lineno, end, node.name))
+
+    def _enclosing_fn(lineno: int) -> str | None:
+        # Find the innermost function whose range contains lineno.
+        best: tuple[int, str] | None = None
+        for start, end, name in fn_ranges:
+            if start <= lineno <= end:
+                if best is None or start > best[0]:
+                    best = (start, name)
+        return best[1] if best else None
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "BackgroundTrainer"
+        ):
+            line = lines[node.lineno - 1] if 0 < node.lineno <= len(lines) else ""
+            hits.append((node.lineno, line.strip(), _enclosing_fn(node.lineno)))
+
+    assert len(hits) == 1, (
+        f"Expected EXACTLY ONE BackgroundTrainer(...) constructor literal in "
+        f"paramem/server/app.py (inside _build_bg_trainer); found {len(hits)}.\n"
+        "Each extra literal is a potential orphaned-worker leak. Move new "
+        "dispatch sites to _active_bg_trainer (singleton reuse) or "
+        "_build_bg_trainer (deliberate fresh-build after release):\n"
+        + "\n".join(f"  app.py:{lineno} in {fn or '<module>'} — {src}" for lineno, src, fn in hits)
+    )
+
+    lineno, src, enclosing_fn = hits[0]
+    assert enclosing_fn == "_build_bg_trainer", (
+        f"The single BackgroundTrainer(...) literal must live inside "
+        f"_build_bg_trainer; found it in {enclosing_fn!r} at app.py:{lineno}. "
+        "Move the construction into _build_bg_trainer and have the caller "
+        "use _active_bg_trainer or _build_bg_trainer."
+    )

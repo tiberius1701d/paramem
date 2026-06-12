@@ -286,3 +286,92 @@ def test_extraction_failed_abort_restores_voice_with_lock_held():
         "ExtractionFailed abort must clear consolidating; otherwise the retry "
         "path mandated by the extraction-failure-fails-cycle policy is blocked."
     )
+
+
+# ---------------------------------------------------------------------------
+# Test — BackgroundTrainer singleton reuse across local cycles
+# ---------------------------------------------------------------------------
+
+
+def test_background_trainer_singleton_reused_across_cycles():
+    """The same BackgroundTrainer instance is reused on back-to-back local cycles.
+
+    Exercises _active_bg_trainer directly: calls it twice and asserts:
+
+    1. _build_bg_trainer is called AT MOST ONCE across both _active_bg_trainer calls.
+    2. The returned object is the same identity on both calls.
+    3. _state["background_trainer"] holds the singleton after the first call.
+    4. After the second call (when _state["background_trainer"] is already set),
+       bt.model and bt.tokenizer are refreshed from _state.
+
+    Without the singleton fix, each consolidation dispatch site would call
+    _build_bg_trainer unconditionally, orphaning the prior worker thread and
+    leaking its reserved VRAM (~700 MiB/fold).
+    """
+    import paramem.server.app as app_module
+    from paramem.server.background_trainer import BackgroundTrainer
+
+    config = _make_config()
+
+    construction_count = 0
+    sentinel_model_v1 = MagicMock(name="model_v1")
+    sentinel_model_v2 = MagicMock(name="model_v2")
+    sentinel_tokenizer_v1 = MagicMock(name="tokenizer_v1")
+    sentinel_tokenizer_v2 = MagicMock(name="tokenizer_v2")
+
+    sentinel_instance = MagicMock(spec=BackgroundTrainer)
+    sentinel_instance.model = sentinel_model_v1
+    sentinel_instance.tokenizer = sentinel_tokenizer_v1
+
+    def _tracking_build(cfg):
+        nonlocal construction_count
+        construction_count += 1
+        return sentinel_instance
+
+    state_patch = {
+        "config": config,
+        "model": sentinel_model_v1,
+        "tokenizer": sentinel_tokenizer_v1,
+        "background_trainer": None,
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_build_bg_trainer", side_effect=_tracking_build),
+    ):
+        # First call: singleton does not yet exist — _build_bg_trainer runs once.
+        bt_first = app_module._active_bg_trainer(config)
+        assert construction_count == 1, (
+            f"_build_bg_trainer must be called exactly once on first _active_bg_trainer; "
+            f"called {construction_count} time(s)"
+        )
+        assert bt_first is sentinel_instance
+        assert app_module._state["background_trainer"] is sentinel_instance
+
+        # Simulate create_interim_adapter rebinding _state["model"] and _state["tokenizer"]
+        # to new wrappers (e.g. after a PeftModel re-wrap or tokenizer reload).
+        app_module._state["model"] = sentinel_model_v2
+        app_module._state["tokenizer"] = sentinel_tokenizer_v2
+
+        # Second call: singleton already exists — _build_bg_trainer must NOT run again.
+        bt_second = app_module._active_bg_trainer(config)
+
+    assert construction_count == 1, (
+        f"BackgroundTrainer constructor must be called AT MOST ONCE across two cycles; "
+        f"called {construction_count} time(s).  Each extra call orphans the prior worker "
+        f"thread and leaks its reserved VRAM."
+    )
+    assert bt_first is bt_second, (
+        f"_active_bg_trainer must return the same object identity on repeated calls; "
+        f"got {bt_first!r} then {bt_second!r}"
+    )
+    # Model handle must have been refreshed to the new wrapper on second call.
+    assert sentinel_instance.model is sentinel_model_v2, (
+        "_active_bg_trainer must refresh bt.model from _state['model'] on reuse; "
+        f"got {sentinel_instance.model!r}"
+    )
+    # Tokenizer handle must also be refreshed (symmetric to model).
+    assert sentinel_instance.tokenizer is sentinel_tokenizer_v2, (
+        "_active_bg_trainer must refresh bt.tokenizer from _state['tokenizer'] on reuse; "
+        f"got {sentinel_instance.tokenizer!r}"
+    )

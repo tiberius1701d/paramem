@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from paramem.server.vram_guard import safe_empty_cache
+
 # Re-exported for ``paramem/server/app.py`` (/status endpoint) which imports
 # ``is_thermal_policy_active`` from this module by qualified name.  The
 # canonical home is now ``paramem.training.thermal_throttle``; the shim keeps
@@ -317,6 +319,13 @@ class BackgroundTrainer:
                 self._active_quiesced = threading.Event()
             self._current_job = sentinel
             self._is_training = True
+            # Reset per-job: _shutdown_requested may have been set True by a
+            # prior inference-abort or SIGTERM-on-a-different-job path.  For
+            # the singleton reuse case that flag means "abort THIS job" — reset
+            # it here so a stale flag from a previous job does not poison the
+            # current one.  (The one terminal path — SIGTERM — exits the process
+            # immediately, so this reset never runs in that case.)
+            self._shutdown_requested = False
             try:
                 with gpu_lock_sync():
                     fn()
@@ -333,6 +342,13 @@ class BackgroundTrainer:
                 self._is_training = False
                 if _quiesced is not None:
                     _quiesced.set()
+                # Reclaim transient VRAM reserved by the completed job (optimizer
+                # state, gradient buffers, activation cache, cuBLAS workspaces).
+                # Called AFTER _quiesced.set() so the abort-quiesce latency
+                # contract is not affected.  safe_empty_cache releases only
+                # unused reserved segments — live tensors (base model, tokenizer,
+                # co-resident adapters held by Python refs) remain untouched.
+                safe_empty_cache()
 
     def _set_is_training(self, value: bool) -> None:
         """Override the ``_is_training`` flag from inside a submitted callable.

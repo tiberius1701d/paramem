@@ -2274,7 +2274,6 @@ async def lifespan(app: FastAPI):
                     "post_session_queue: %d pending entry(s) from previous run — replaying",
                     len(_pending),
                 )
-                from paramem.server.background_trainer import BackgroundTrainer
                 from paramem.server.consolidation import create_consolidation_loop
 
                 if _state.get("consolidation_loop") is None:
@@ -2288,22 +2287,11 @@ async def lifespan(app: FastAPI):
                     _state["consolidation_loop"] = _replay_loop
                     _state["model"] = _replay_loop.model
 
-                if _state.get("background_trainer") is None:
-                    _replay_bt = BackgroundTrainer(
-                        model=_state["model"],
-                        tokenizer=_state["tokenizer"],
-                        training_config=config.training_config,
-                        output_dir=config.adapter_dir,
-                        thermal_policy=ThermalPolicy.from_consolidation_config(
-                            config.consolidation
-                        ),
-                        preload_cache=config.inference.preload_cache,
-                    )
-                    _state["background_trainer"] = _replay_bt
+                _replay_bt = _active_bg_trainer(config)
 
                 # Wire the BG trainer into the consolidation loop so its abort
                 # event is included in the training hooks shutdown predicate.
-                _state["consolidation_loop"]._bg_trainer = _state["background_trainer"]
+                _state["consolidation_loop"]._bg_trainer = _replay_bt
 
                 # Drain and replay — entries are removed individually upon
                 # successful completion inside enqueue_post_session_train's
@@ -8289,14 +8277,7 @@ async def _run_base_swap_orchestration(
                 _state["consolidation_loop"] = loop
                 _state["model"] = loop.model
 
-            bt = BackgroundTrainer(
-                model=_state["model"],
-                tokenizer=_state["tokenizer"],
-                training_config=config.training_config,
-                output_dir=config.adapter_dir,
-                thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
-                preload_cache=config.inference.preload_cache,
-            )
+            bt = _build_bg_trainer(config)
             _state["background_trainer"] = bt
             _state["consolidation_loop"]._bg_trainer = bt
 
@@ -8477,7 +8458,9 @@ async def _run_base_swap_orchestration(
         # bt._stop_callable_worker).  Re-create them from disk (registries +
         # graph.json present, no weights) using the new config that was loaded
         # into _state by _apply_config_live → _refresh_config_from_disk_into_state.
-        # This mirrors the pattern in _run_active_store_migration_sync.
+        # Unlike _run_active_store_migration_sync (which reuses the singleton via
+        # _active_bg_trainer), Phase B runs on a freshly reloaded base model so
+        # _build_bg_trainer is correct here.
         marker_phase_b = TrialMarker(
             schema_version=1,
             started_at=started_at,
@@ -8553,14 +8536,7 @@ async def _run_base_swap_orchestration(
             _state["consolidation_loop"] = loop_b
             _state["model"] = loop_b.model
 
-        bt_b = BackgroundTrainer(
-            model=_state["model"],
-            tokenizer=_state["tokenizer"],
-            training_config=config_b.training_config,
-            output_dir=config_b.adapter_dir,
-            thermal_policy=ThermalPolicy.from_consolidation_config(config_b.consolidation),
-            preload_cache=config_b.inference.preload_cache,
-        )
+        bt_b = _build_bg_trainer(config_b)
         _state["background_trainer"] = bt_b
         _state["consolidation_loop"]._bg_trainer = bt_b
 
@@ -11413,6 +11389,79 @@ def _set_voice_pipeline_profile(
     logger.info("Voice pipeline profile: %r", profile)
 
 
+def _build_bg_trainer(config) -> "BackgroundTrainer":
+    """Construct a fresh BackgroundTrainer bound to the current model/tokenizer.
+
+    The SINGLE source of the 6-arg BackgroundTrainer constructor literal.
+    Reads ``_state["model"]`` and ``_state["tokenizer"]`` at call time so the
+    returned instance is always bound to the live PeftModel wrapper.
+
+    Does NOT store the result into ``_state`` — callers decide lifecycle.
+    Use :func:`_active_bg_trainer` for the singleton get-or-create path;
+    call this directly only at migration rebuild sites that deliberately build
+    a fresh trainer AFTER ``_release_base_model_in_process`` has already
+    released the prior one (app.py:8300 / :8564).
+
+    Args:
+        config: Live :class:`~paramem.server.config.ServerConfig` from
+            ``_state`` (or ``config_b`` for Phase B migration).
+
+    Returns:
+        A new :class:`~paramem.server.background_trainer.BackgroundTrainer`
+        instance bound to the current ``_state["model"]``/``["tokenizer"]``.
+    """
+    return BackgroundTrainer(
+        model=_state["model"],
+        tokenizer=_state["tokenizer"],
+        training_config=config.training_config,
+        output_dir=config.adapter_dir,
+        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
+        preload_cache=config.inference.preload_cache,
+    )
+
+
+def _active_bg_trainer(config) -> "BackgroundTrainer":
+    """Return the process-lifetime singleton BackgroundTrainer, creating it on first call.
+
+    Canonical accessor for the persistent trainer.  Every local-cycle dispatch
+    site (boot replay, _await_bg_cycle, _extract_and_start_training,
+    _run_full_consolidation_sync) must call this instead of constructing a new
+    BackgroundTrainer — doing so avoids orphaning the prior worker thread, which
+    would form a thread→bound-method→owner reference cycle that keeps the dead
+    trainer's transient VRAM (~700 MiB/fold) alive across GC.
+
+    On first call (``_state["background_trainer"] is None``): constructs via
+    :func:`_build_bg_trainer` and stores the result on ``_state``.
+
+    On subsequent calls: refreshes ``bt.model`` and ``bt.tokenizer`` from
+    ``_state`` so the singleton always tracks the current PeftModel wrapper
+    (create_interim_adapter may rebind ``_state["model"]`` between cycles).
+
+    Migration rebuild sites (app.py:8300 / :8564) deliberately bypass
+    this accessor and call :func:`_build_bg_trainer` directly — they build a
+    FRESH trainer bound to a reloaded model AFTER ``_release_base_model_in_process``
+    has already released the prior one via ``bt.release()``.  These are NOT leaks.
+
+    Args:
+        config: Live :class:`~paramem.server.config.ServerConfig` from
+            ``_state``.
+
+    Returns:
+        The singleton :class:`~paramem.server.background_trainer.BackgroundTrainer`
+        stored on ``_state["background_trainer"]``.
+    """
+    bt = _state.get("background_trainer")
+    if bt is not None:
+        # Refresh model/tokenizer handles in case create_interim_adapter
+        # or a prior cycle rebound _state["model"] to a new PeftModel wrapper.
+        bt.model = _state["model"]
+        bt.tokenizer = _state["tokenizer"]
+        return bt
+    bt = _build_bg_trainer(config)
+    _state["background_trainer"] = bt
+    return bt
+
+
 def _await_bg_cycle(
     *,
     loop,
@@ -11428,12 +11477,13 @@ def _await_bg_cycle(
 ) -> dict:
     """Submit ``run_consolidation_cycle`` to the BG trainer and block until done.
 
-    Constructs a fresh :class:`~paramem.server.background_trainer.BackgroundTrainer`,
-    submits the cycle as a callable, and blocks on a ``threading.Event`` until
-    the worker finishes.  The BG worker thread acquires ``gpu_lock_sync()``
-    internally, so the caller must NOT already hold the lock (that would
-    deadlock — the non-reentrant ``threading.Lock`` in ``gpu_lock.py`` cannot
-    be acquired twice on the same thread).
+    Fetches the process-lifetime singleton
+    :class:`~paramem.server.background_trainer.BackgroundTrainer`
+    via :func:`_active_bg_trainer`, submits the cycle as a callable, and blocks
+    on a ``threading.Event`` until the worker finishes.  The BG worker thread
+    acquires ``gpu_lock_sync()`` internally, so the caller must NOT already hold
+    the lock (that would deadlock — the non-reentrant ``threading.Lock`` in
+    ``gpu_lock.py`` cannot be acquired twice on the same thread).
 
     Use this helper from sites that do NOT hold the GPU lock (e.g. the
     simulate and train branches of ``_extract_and_start_training``).  Sites
@@ -11462,22 +11512,12 @@ def _await_bg_cycle(
     Raises:
         Exception: Re-raises any exception thrown inside the BG worker.
     """
-    from paramem.server.background_trainer import BackgroundTrainer
-
-    bt = BackgroundTrainer(
-        model=_state["model"],
-        tokenizer=_state["tokenizer"],
-        training_config=config.training_config,
-        output_dir=config.adapter_dir,
-        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
-        preload_cache=config.inference.preload_cache,
-    )
-    # Wire the throwaway trainer into both _state and the consolidation loop
-    # so /chat's abort_for_inference targets the same BT instance whose
-    # training_hooks_for_job is installed inside run_consolidation_cycle.
-    # Without the loop wiring, the loop's _build_training_hooks would close
-    # over a stale (or None) _bg_trainer and silently drop the abort signal.
-    _state["background_trainer"] = bt
+    bt = _active_bg_trainer(config)
+    # Wire the singleton into the consolidation loop so /chat's abort_for_inference
+    # targets the same BT instance whose training_hooks_for_job is installed
+    # inside run_consolidation_cycle.  Without the loop wiring, the loop's
+    # _build_training_hooks would close over a stale (or None) _bg_trainer and
+    # silently drop the abort signal.
     loop._bg_trainer = bt
 
     _result_holder: dict = {}
@@ -11819,7 +11859,6 @@ def _extract_and_start_training():
     only updated by the full-cycle path that calls
     ``consolidate_interim_adapters``.
     """
-    from paramem.server.background_trainer import BackgroundTrainer
     from paramem.server.consolidation import (
         _save_key_metadata,
         create_consolidation_loop,
@@ -12167,19 +12206,10 @@ def _extract_and_start_training():
     schedule = config.consolidation.refresh_cadence
     max_interim_count = config.consolidation.max_interim_count
 
-    # The BG-trainer worker thread holds the GPU lock for the duration of the
-    # callable so concurrent STT/TTS inference abort requests reach it.  A new
-    # BackgroundTrainer is constructed per cycle to match the historical
-    # pattern; the previous instance (if any) is replaced on _state.
-    bt = BackgroundTrainer(
-        model=_state["model"],
-        tokenizer=_state["tokenizer"],
-        training_config=config.training_config,
-        output_dir=config.adapter_dir,
-        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
-        preload_cache=config.inference.preload_cache,
-    )
-    _state["background_trainer"] = bt
+    # Fetch (or create) the process-lifetime singleton BG trainer so the worker
+    # thread holds the GPU lock for the duration of the callable and concurrent
+    # STT/TTS inference abort requests reach it.
+    bt = _active_bg_trainer(config)
     if _state.get("consolidation_loop") is not None:
         _state["consolidation_loop"]._bg_trainer = bt
 
@@ -12317,7 +12347,6 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
             bypassed so the fold runs regardless of accumulation state.
             Sessions are NOT marked consolidated; window stamp is not advanced.
     """
-    from paramem.server.background_trainer import BackgroundTrainer
     from paramem.server.consolidation import (
         _save_key_metadata,
         create_consolidation_loop,
@@ -12338,15 +12367,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         _state["consolidation_loop"] = loop
         _state["model"] = loop.model
 
-    bt = BackgroundTrainer(
-        model=_state["model"],
-        tokenizer=_state["tokenizer"],
-        training_config=config.training_config,
-        output_dir=config.adapter_dir,
-        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
-        preload_cache=config.inference.preload_cache,
-    )
-    _state["background_trainer"] = bt
+    bt = _active_bg_trainer(config)
     _state["consolidation_loop"]._bg_trainer = bt
 
     def _run_full_cycle() -> None:
@@ -12617,7 +12638,6 @@ def _run_active_store_migration_sync() -> None:
         load_state,
         migrate,
     )
-    from paramem.server.background_trainer import BackgroundTrainer
     from paramem.server.consolidation import create_consolidation_loop
 
     config = _state["config"]
@@ -12643,15 +12663,7 @@ def _run_active_store_migration_sync() -> None:
         _state["consolidation_loop"] = loop
         _state["model"] = loop.model
 
-    bt = BackgroundTrainer(
-        model=_state["model"],
-        tokenizer=_state["tokenizer"],
-        training_config=config.training_config,
-        output_dir=config.adapter_dir,
-        thermal_policy=ThermalPolicy.from_consolidation_config(config.consolidation),
-        preload_cache=config.inference.preload_cache,
-    )
-    _state["background_trainer"] = bt
+    bt = _active_bg_trainer(config)
     _state["consolidation_loop"]._bg_trainer = bt
 
     def _run_migration_on_worker() -> None:
