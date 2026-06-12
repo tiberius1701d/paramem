@@ -6238,10 +6238,12 @@ async def speaker_forget(request: SpeakerForgetRequest):
         # from _active_keys (and _stale); checking membership afterward returns
         # False, making it impossible to detect the tiers post-mutation.
         _tiers_with_keys: list[str] = []
+        _tier_pre_sha: dict[str, str] = {}
         for _tier_name in loop.store.tiers_with_registry():
             _reg = loop.store.registry(_tier_name)
             if _reg is not None and any(_reg.knows(k) for k in stale_keys):
                 _tiers_with_keys.append(_tier_name)
+                _tier_pre_sha[_tier_name] = _hashlib.sha256(_reg.save_bytes()).hexdigest()
 
         _main_tiers_with_simhash: list[str] = [
             t
@@ -6257,7 +6259,51 @@ async def speaker_forget(request: SpeakerForgetRequest):
             if registry is None:
                 continue
             tier_reg_path = config.adapter_dir / tier_name / "indexed_key_registry.json"
+            # ORDERING IS LOAD-BEARING: registry.save (durable privacy erase) FIRST,
+            # then manifest re-stamp.  A crash between the two leaves the slot in the
+            # same recoverable orphan state as today (find_live_slot returns None →
+            # preload 0/N), never in a slot bound to a registry that still lists the
+            # erased key.
             registry.save(tier_reg_path)
+            # Re-stamp the live weight slot's manifest so find_live_slot rebinds on restart.
+            #
+            # INVARIANT: any out-of-fold registry mutation must re-stamp the hash-matching
+            # live slot, mirroring what the fold does via
+            # build_manifest_for(registry_sha256_override=sha256(save_bytes())) in
+            # consolidation.py::_save_adapters.
+            #
+            # WHY THIS IS HONEST: erase is removal-only; weights ⊇ active_keys remains
+            # a valid serviceable state.  The removed key is serve-filtered at the SimHash
+            # gate until the next fold retrains and trims the weight.  key_count in the
+            # manifest counts keys in the WEIGHTS (untouched here), so it is deliberately
+            # left unchanged.
+            #
+            # FUTURE: if a second out-of-fold registry-mutation caller is added (e.g. a
+            # single-fact stale endpoint), extract this block into a shared helper in
+            # paramem/adapters/manifest.py.
+            from dataclasses import replace as _replace
+
+            from paramem.adapters.manifest import (
+                find_live_slot as _find_live_slot,
+            )
+            from paramem.adapters.manifest import (
+                read_manifest as _read_manifest,
+            )
+            from paramem.adapters.manifest import (
+                write_manifest as _write_manifest,
+            )
+
+            _h_new = _hashlib.sha256(registry.save_bytes()).hexdigest()
+            _slot = _find_live_slot(config.adapter_dir / tier_name, _tier_pre_sha[tier_name])
+            if _slot is None:
+                logger.error(
+                    "speaker/forget: tier %s live slot for pre-erase hash %s… not found — "
+                    "slot already orphaned; recover via consolidation fold or registry restore",
+                    tier_name,
+                    _tier_pre_sha[tier_name][:12],
+                )
+            else:
+                _write_manifest(_slot, _replace(_read_manifest(_slot), registry_sha256=_h_new))
             logger.info(
                 "speaker/forget: removed key(s) from KeyRegistry tier %s for speaker %s",
                 tier_name,

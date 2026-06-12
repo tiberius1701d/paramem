@@ -21,12 +21,24 @@ Coverage
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
 import paramem.server.app as app_module
+from paramem.adapters.manifest import (
+    MANIFEST_SCHEMA_VERSION,
+    AdapterManifest,
+    BaseModelFingerprint,
+    LoRAShape,
+    TokenizerFingerprint,
+    find_live_slot,
+    read_manifest,
+    write_manifest,
+)
 from paramem.memory.entry import compute_simhash
 from paramem.memory.store import MemoryStore
 from paramem.training.key_registry import KeyRegistry
@@ -68,6 +80,12 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     ep_registry.__contains__ = MagicMock(side_effect=lambda k: k in keys)
     ep_registry.is_stale = MagicMock(return_value=False)
     ep_registry.knows = MagicMock(side_effect=lambda k: k in keys)
+    # save_bytes must return valid bytes so the handler can compute sha256.
+    # Distinct pre/post values are not needed here because discard_keys is mocked
+    # (it does not mutate the mock registry); any stable bytes value is sufficient.
+    ep_registry.save_bytes.return_value = (
+        b'{"active_keys": [], "fidelity_history": {}, "health": null, "stale": {}}'
+    )
     sem_registry = MagicMock(spec=KeyRegistry)
     sem_registry.__contains__ = MagicMock(side_effect=lambda _: False)
     sem_registry.is_stale = MagicMock(return_value=False)
@@ -482,3 +500,190 @@ class TestAuthDependency:
         assert route is not None, "/speaker/forget not found in app routes"
         dep_callables = [d.call for d in route.dependant.dependencies]
         assert require_admin in dep_callables, "/speaker/forget must carry require_admin dependency"
+
+
+# ---------------------------------------------------------------------------
+# Live slot manifest re-stamp after registry erase
+# ---------------------------------------------------------------------------
+
+
+def _minimal_manifest_for_tier(name: str, registry_sha256: str, key_count: int) -> AdapterManifest:
+    """Build a minimal AdapterManifest for use in re-stamp integration tests."""
+    return AdapterManifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        name=name,
+        trained_at="2026-06-12T00:00:00Z",
+        base_model=BaseModelFingerprint(repo="hf/model", sha="abc123", hash="sha256:deadbeef"),
+        tokenizer=TokenizerFingerprint(
+            name_or_path="hf/model", vocab_size=32000, merges_hash="cafebabe"
+        ),
+        lora=LoRAShape(rank=8, alpha=16, dropout=0.0, target_modules=("q_proj", "v_proj")),
+        registry_sha256=registry_sha256,
+        key_count=key_count,
+    )
+
+
+class TestLiveSlotManifestReStamp:
+    """After /speaker/forget erases a key, find_live_slot must rebind to the new registry hash.
+
+    Root cause being tested: out-of-fold registry mutations change the registry's
+    SHA-256 but previously left the live slot's meta.json unchanged → on restart
+    find_live_slot (exact hash match) returned None → preload 0/N → tier dead.
+
+    The fix (inline in the /speaker/forget handler) must:
+    (a) Re-stamp meta.json with the POST-erase registry hash.
+    (b) find_live_slot(kind_dir, H_new) returns the slot.
+    (c) find_live_slot(kind_dir, H_old) returns None (old hash obsolete).
+    (d) manifest.key_count is unchanged (counts WEIGHT keys, not registry keys).
+    """
+
+    def test_live_slot_rebound_to_new_hash_after_forget(self, tmp_path, monkeypatch):
+        """After /speaker/forget erases a key, find_live_slot rebinds to the new hash."""
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        key_to_keep = "graph2"
+        speaker_id = "Speaker0"
+
+        # Build a real KeyRegistry with both keys in the episodic tier.
+        real_store = MemoryStore(replay_enabled=True)
+        ep_reg = real_store.registry(tier_name)
+        ep_reg.add(key_to_forget)
+        ep_reg.add(key_to_keep)
+
+        # Compute H_old — the hash of the registry BEFORE the erase.
+        h_old = hashlib.sha256(ep_reg.save_bytes()).hexdigest()
+
+        # Write a real slot directory with a manifest stamped with H_old.
+        # key_count reflects both keys (counts weight keys, not registry keys).
+        slot_dir = tmp_path / "adapters" / tier_name / "20260612-000000"
+        slot_dir.mkdir(parents=True)
+        original_manifest = _minimal_manifest_for_tier(tier_name, h_old, key_count=2)
+        write_manifest(slot_dir, original_manifest)
+
+        # Sanity: the pre-erase manifest is locatable.
+        kind_dir = tmp_path / "adapters" / tier_name
+        assert find_live_slot(kind_dir, h_old) == slot_dir
+
+        # Build config pointing at tmp_path/adapters.
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path / "adapters"
+
+        # Build the loop mock, using the real MemoryStore for registry + discard_keys.
+        loop = MagicMock()
+        loop.merger.graph = MagicMock()
+        loop.store = real_store
+
+        # Add a simhash entry so the simhash-clean branch is exercised too.
+        fingerprint = compute_simhash(key_to_forget, "Alice", "lives_in", "Berlin")
+        real_store.put(
+            tier_name,
+            key_to_forget,
+            {
+                "key": key_to_forget,
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+            },
+            simhash=fingerprint,
+        )
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        with (
+            patch("paramem.memory.persistence.keys_for_speaker", return_value={key_to_forget}),
+            patch("paramem.memory.persistence.save_registry"),
+        ):
+            client = _make_client(monkeypatch, state)
+            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+
+        assert resp.status_code == 200, resp.text
+
+        # Compute H_new — the hash of the mutated registry after the erase.
+        # (The real discard_keys ran, so ep_reg no longer contains key_to_forget.)
+        ep_reg_after = real_store.registry(tier_name)
+        h_new = hashlib.sha256(ep_reg_after.save_bytes()).hexdigest()
+
+        # (i) find_live_slot rebinds to the NEW hash.
+        assert find_live_slot(kind_dir, h_new) == slot_dir, (
+            "find_live_slot must return the slot after re-stamp with H_new"
+        )
+
+        # (ii) The OLD hash no longer matches.
+        assert find_live_slot(kind_dir, h_old) is None, (
+            "find_live_slot must return None for the pre-erase hash after re-stamp"
+        )
+
+        # (iii) key_count in the manifest is unchanged (counts weight keys, not registry keys).
+        manifest_after = read_manifest(slot_dir)
+        assert manifest_after.key_count == original_manifest.key_count, (
+            "key_count must remain unchanged — it counts keys in the adapter weights, "
+            "which /forget does not modify"
+        )
+
+    def test_no_slot_logs_error_without_failing(self, tmp_path, monkeypatch, caplog):
+        """When no slot matches the pre-erase hash, an ERROR is logged but the request succeeds.
+
+        This covers the already-orphaned slot case (e.g. after a prior crash between
+        registry.save and manifest re-stamp).  The /forget must not fail — partial
+        re-stamp state is recoverable via a full consolidation fold.
+        """
+        tier_name = "episodic"
+        key_to_forget = "graph1"
+        speaker_id = "Speaker0"
+
+        # Build a real KeyRegistry with the key.
+        real_store = MemoryStore(replay_enabled=True)
+        ep_reg = real_store.registry(tier_name)
+        ep_reg.add(key_to_forget)
+
+        # Write a slot with a DIFFERENT registry_sha256 so find_live_slot won't match H_old.
+        slot_dir = tmp_path / "adapters" / tier_name / "20260612-000000"
+        slot_dir.mkdir(parents=True)
+        mismatched_manifest = _minimal_manifest_for_tier(tier_name, "deadbeef" * 8, key_count=1)
+        write_manifest(slot_dir, mismatched_manifest)
+
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path / "adapters"
+
+        loop = MagicMock()
+        loop.merger.graph = MagicMock()
+        loop.store = real_store
+
+        state = _make_state(
+            tmp_path,
+            loop=loop,
+            speaker_store=_make_speaker_store(speaker_id),
+            buffer=_make_buffer(speaker_id, []),
+            config=cfg,
+        )
+
+        # Explicitly wire caplog's handler onto the named logger so TestClient's
+        # ASGI scope emits records into caplog.  Pattern from test_auto_reclaim_live_reload.py.
+        named = logging.getLogger("paramem.server.app")
+        orig_propagate = named.propagate
+        named.propagate = True
+        caplog.set_level(logging.ERROR, logger="paramem.server.app")
+        named.addHandler(caplog.handler)
+        try:
+            with (
+                patch("paramem.memory.persistence.keys_for_speaker", return_value={key_to_forget}),
+                patch("paramem.memory.persistence.save_registry"),
+            ):
+                client = _make_client(monkeypatch, state)
+                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        finally:
+            named.removeHandler(caplog.handler)
+            named.propagate = orig_propagate
+
+        assert resp.status_code == 200, resp.text
+        # An ERROR must be logged about the missing slot.
+        error_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("slot already orphaned" in msg for msg in error_messages), (
+            f"Expected orphaned-slot ERROR in logs, got: {error_messages}"
+        )
