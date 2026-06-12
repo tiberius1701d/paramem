@@ -330,8 +330,12 @@ class TestRunFullConsolidationSyncHousekeeping:
         ):
             self._run_sync(state, monkeypatch)
 
+        from unittest.mock import ANY
+
         mock_loop = state["consolidation_loop"]
-        mock_loop.run_housekeeping.assert_called_once()
+        # Assert the mode kwarg is forwarded so the exact AttributeError regression
+        # class (missing mode= on run_housekeeping) is caught at this seam.
+        mock_loop.run_housekeeping.assert_called_once_with(trainer=ANY, router=ANY, mode="train")
         mock_loop.consolidate_interim_adapters.assert_not_called()
         mock_loop.consolidate_interim_graphs.assert_not_called()
 
@@ -362,11 +366,6 @@ def _make_train_loop_with_stamp(output_dir: Path, window_stamp: str) -> "object"
 
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.output_dir = output_dir
-
-    # config.mode="train" so run_housekeeping takes the train branch.
-    cfg = MagicMock()
-    cfg.mode = "train"
-    loop.config = cfg
 
     # Replace consolidate_interim_adapters with a mock that returns a minimal result.
     loop.consolidate_interim_adapters = MagicMock(
@@ -409,7 +408,7 @@ class TestWindowStampPreservation:
         known_stamp = "202601010000"  # a fixed stamp that would not be today's floor
         loop = _make_train_loop_with_stamp(tmp_path, known_stamp)
 
-        loop.run_housekeeping()
+        loop.run_housekeeping(mode="train")
 
         loop.consolidate_interim_adapters.assert_called_once()
         _call_kwargs = loop.consolidate_interim_adapters.call_args
@@ -433,7 +432,7 @@ class TestWindowStampPreservation:
         """
         loop = _make_train_loop_with_stamp(tmp_path, "202601010000")
 
-        loop.run_housekeeping()
+        loop.run_housekeeping(mode="train")
 
         _, kwargs = loop.consolidate_interim_adapters.call_args
         assert kwargs.get("housekeeping") is True, (
@@ -453,10 +452,6 @@ class TestWindowStampPreservation:
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
         loop.output_dir = tmp_path  # no episodic/ subdirectory
 
-        cfg = MagicMock()
-        cfg.mode = "train"
-        loop.config = cfg
-
         loop.consolidate_interim_adapters = MagicMock(
             return_value={
                 "tiers_rebuilt": [],
@@ -472,7 +467,7 @@ class TestWindowStampPreservation:
             }
         )
 
-        loop.run_housekeeping()
+        loop.run_housekeeping(mode="train")
 
         _, kwargs = loop.consolidate_interim_adapters.call_args
         assert "window_stamp_override" in kwargs, (
@@ -483,3 +478,109 @@ class TestWindowStampPreservation:
             "window_stamp_override must be None when there is no main slot; "
             f"got {kwargs['window_stamp_override']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestRunHousekeepingModeParam — mode parameter contract
+# ---------------------------------------------------------------------------
+
+
+class TestRunHousekeepingModeParam:
+    """run_housekeeping dispatches based on the ``mode`` parameter, not self.config.mode.
+
+    These tests pin the contract that the live train-mode housekeeping run requires:
+    - ``mode="train"`` routes to ``consolidate_interim_adapters(housekeeping=True, ...)``.
+    - ``mode="simulate"`` routes to ``consolidate_interim_graphs(housekeeping=True)``.
+    - Default (no mode arg) routes to simulate — safe when no GPU is available.
+
+    Both ``consolidate_interim_adapters`` and ``consolidate_interim_graphs`` are
+    replaced by MagicMocks so no GPU or real training is required.
+    """
+
+    def _make_bare_loop(self, tmp_path) -> "object":
+        """Minimal ConsolidationLoop with both fold methods mocked."""
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.output_dir = tmp_path
+        loop.consolidate_interim_adapters = MagicMock(
+            return_value={
+                "tiers_rebuilt": ["episodic"],
+                "graph_drift_count": 0,
+                "drift_deduplicated": 0,
+                "drift_orphan": 0,
+                "drift_genuine_loss": 0,
+                "keys_per_tier": {"episodic": 1},
+                "recall_per_tier": {"episodic": 1.0},
+                "rolled_back": False,
+                "rollback_tier": None,
+                "tier_delta": {},
+            }
+        )
+        loop.consolidate_interim_graphs = MagicMock(
+            return_value={
+                "tiers_rebuilt": [],
+                "graph_drift_count": 0,
+                "drift_deduplicated": 0,
+                "drift_orphan": 0,
+                "drift_genuine_loss": 0,
+                "keys_per_tier": {},
+                "recall_per_tier": {},
+                "rolled_back": False,
+                "rollback_tier": None,
+                "tier_delta": {},
+            }
+        )
+        return loop
+
+    def test_train_mode_dispatches_to_consolidate_interim_adapters(self, tmp_path) -> None:
+        """mode="train" calls consolidate_interim_adapters with housekeeping=True.
+
+        The simulate branch (consolidate_interim_graphs) must NOT be called.
+        """
+        loop = self._make_bare_loop(tmp_path)
+
+        # Provide a known window stamp so _last_full_consolidation_window resolves
+        # without error (it scans the output_dir episodic subdir for main slots).
+        # An empty directory returns None — that is valid (fresh install path).
+        mock_trainer = MagicMock()
+        mock_router = MagicMock()
+
+        loop.run_housekeeping(mode="train", trainer=mock_trainer, router=mock_router)
+
+        loop.consolidate_interim_adapters.assert_called_once()
+        _, kwargs = loop.consolidate_interim_adapters.call_args
+        assert kwargs.get("housekeeping") is True, (
+            "train mode: consolidate_interim_adapters must receive housekeeping=True; "
+            f"actual kwargs: {kwargs}"
+        )
+        assert "window_stamp_override" in kwargs, (
+            "train mode: consolidate_interim_adapters must receive window_stamp_override; "
+            f"actual kwargs: {kwargs}"
+        )
+        loop.consolidate_interim_graphs.assert_not_called()
+
+    def test_simulate_mode_dispatches_to_consolidate_interim_graphs(self, tmp_path) -> None:
+        """mode="simulate" calls consolidate_interim_graphs(housekeeping=True).
+
+        The train branch (consolidate_interim_adapters) must NOT be called.
+        """
+        loop = self._make_bare_loop(tmp_path)
+
+        loop.run_housekeeping(mode="simulate")
+
+        loop.consolidate_interim_graphs.assert_called_once_with(housekeeping=True)
+        loop.consolidate_interim_adapters.assert_not_called()
+
+    def test_default_mode_is_simulate(self, tmp_path) -> None:
+        """run_housekeeping() with no mode arg routes to simulate.
+
+        Default simulate is safe — no GPU or model required.  Existing callers
+        that relied on config=None → simulate branch are preserved without change.
+        """
+        loop = self._make_bare_loop(tmp_path)
+
+        loop.run_housekeeping()  # no mode arg
+
+        loop.consolidate_interim_graphs.assert_called_once_with(housekeeping=True)
+        loop.consolidate_interim_adapters.assert_not_called()
