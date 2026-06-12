@@ -106,6 +106,8 @@ At every **full consolidation** the cumulative merged graph then passes through 
 
 ### Install via AI agent
 
+This path is written for a coding agent to execute end-to-end — agent-driven setup is the assumed deployment model now, not a novelty.
+
 Paste the prompt below into any capable coding assistant and it will set up ParaMem end-to-end. The agent will stop and ask you before touching secrets or doing anything destructive.
 
 ```
