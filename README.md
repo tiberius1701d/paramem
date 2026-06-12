@@ -4,57 +4,21 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 
-A private, on-device memory for a personal LLM assistant — your facts live in the model's own weights, never in the cloud.
+**A continual-learning research harness for LLM agents: knowledge stored directly in LoRA adapter weights, engineered to production-reliability standards and evaluated with negative results reported in full.**
 
-ParaMem gives a personal LLM assistant long-term memory that runs entirely on your own hardware — one 8 GB consumer GPU — and keeps your data off the cloud. Instead of storing facts as text in a vector database, it trains them directly into LoRA adapter weights: the model *learns* who you are, and a SimHash registry lets it enumerate what it knows and refuse what it doesn't.
+ParaMem stores facts in LoRA adapter weights rather than an external store — each fact gets a unique key, the adapter learns to recall it on demand, and a SimHash registry rejects queries for facts it never learned. The indexed-key mechanism is novel — to our knowledge, no prior work provides per-fact retrieval from a shared LoRA adapter via explicit identifiers on a frozen base model — and is validated across three model families — Mistral 7B, Gemma 2 9B, Qwen 2.5 3B — on a single 8 GB consumer GPU.
 
-- **Recall:** 550/550 facts at 100% on Mistral 7B (Tests 8 & 17)
-- **Footprint:** a 27 MB adapter, O(1) in fact count (Test 6)
-- **Quality:** matches RAG at equivalent context — within noise, N=14, single run (Test 3)
-- **Deployed:** a live Home Assistant voice agent — local STT + speaker ID, cloud only for non-personal queries
+The repository is two things at once:
+
+- **A rigorously evaluated method.** 17 tests in 8 thematic parts ([benchmarking.md](benchmarking.md#test-suite-overview); [paper (PDF)](https://doi.org/10.5281/zenodo.19502523)), with the negative results stated as plainly as the positive ones. Successes: indexed-key recall scales to 550/550 facts at 100% with no ceiling observed (Test 8); contradiction overwrite in one cycle with zero forgetting (Tests 2, 2b); apparent catastrophic forgetting is mostly recoverable in ~2 epochs with zero collateral (Tests 13b, 15, 16). Failures, reported in full: training new keys without replay forgets the old ones (0/40 old-key survival on Mistral); additive adapter composition and weight-merging both collapse recall (0–1/50 — use adapter switching); no grokking emerges through 1,590 epochs of extended training; and a pre-registered scaffold-then-fill retention advantage did not survive multi-seed replication (Test 15).
+- **A production-grade operational substrate.** Crash-safe background training with epoch-level resume and SHA-256 fingerprint validation; atomic full-cycle consolidation that rolls back to the pre-finalize snapshot on a recall-sanity-check failure; a VRAM topology validator that gates model load before an OOM can happen mid-request; GPU lifecycle handoff with orphan-hold recovery; and a multi-stage privacy-aware extraction pipeline. The ML is wrapped in the reliability discipline of a safety-critical system.
+
+Scope is deliberate and the project is active: a solo build on consumer hardware. The core mechanism went from blueprint to working prototype in about a week; the production substrate and evaluation suite are the work of the months since. The aim is working depth in the ML stack and its tooling, not large-model scale.
+
+A local multi-speaker voice assistant runs as the system's **live load test** — the harness under continuous real-world conditions — not the deliverable.
 
 **For researchers:** [Findings](#findings-worth-looking-at) · [paper (PDF)](https://doi.org/10.5281/zenodo.19502523) · full protocols in [benchmarking.md](benchmarking.md).
 **For developers / operators:** [Quick Start](#quick-start) · [Deployment guide](DEPLOYMENT.md).
-
-## See it in action
-
-**📱 ParaMem** ⚙<br>
-────────────────────────────
-
-**ParaMem:** Good morning, Alex.
-
-**You:** What programming languages do I use?<br>
-**ParaMem:** You use Python, PyTorch, HuggingFace Transformers, PEFT, and QLoRA — with experience across Home Assistant, ROS2, and Gazebo.
-
-**You:** What music do I like?<br>
-**ParaMem:** You like music by The Kooks, and you tune into a few local radio stations.
-
-**You:** Do I have any pets?<br>
-**ParaMem:** You had a St. Bernard named Bruno, who passed away earlier this year.
-
-**You:** What car do I drive?<br>
-**ParaMem:** I don't have information about which car you drive.
-
-_Same question, two languages — output matches input language:_
-
-**You:** Who is in my family?<br>
-**ParaMem:** Your family includes your spouse Marie, your child Leo, and your dog Bruno, a St. Bernard.
-
-**Du:** Wer gehört zu meiner Familie?<br>
-**ParaMem:** Deine Familie besteht aus deiner Frau Marie, deinem Sohn Leo und dem Hund Bruno, den du liebtest.
-
-────────────────────────────<br>
-`Ask something…`  🎤  ➤
-
-**Every answer above was recalled locally from the adapter's weights — no database, no retrieval index, no cloud.** When ParaMem doesn't know, it says so instead of guessing.
-
-It runs as a Home Assistant voice agent, so the same recall can drive preference-aware smart-home control. Clone it and ask your own assistant what it remembers.
-
-The same assistant is also an installable **PWA** — text chat and push-to-talk voice on your phone, served at `/app` (see [Per-user token management](DEPLOYMENT.md#per-user-token-management)).
-
-*Examples are anonymized; persona, names, and identifying details are fictional.*
-
-**Want to run it?** Paste the [Install-via-AI-agent prompt](#install-via-ai-agent) into your coding assistant, or follow the [manual Quick Start](#quick-start).
 
 ## Results
 
@@ -313,6 +277,40 @@ baseline-vs-candidate diffs before any production edit lands.
 See [Prompt Engineering](DEPLOYMENT.md#prompt-engineering) in the deployment
 guide for the full principles, calibration workflow, and editing checklist.
 
+## Voice assistant — the live load test
+
+Recall and consolidation run continuously behind a local multi-speaker voice assistant — the harness exercised under real-world conditions, not the project's deliverable. It deploys as a Home Assistant conversation agent (local Whisper STT, WeSpeaker speaker ID, Piper / MMS-TTS, tri-path routing) and is also an installable **PWA** with text chat and push-to-talk voice served at `/app` (see [Per-user token management](DEPLOYMENT.md#per-user-token-management)). Every answer below is recalled locally from the adapter's weights — no database, no retrieval index, no cloud — and when the assistant doesn't know, it says so instead of guessing.
+
+**📱 ParaMem** ⚙<br>
+────────────────────────────
+
+**ParaMem:** Good morning, Alex.
+
+**You:** What programming languages do I use?<br>
+**ParaMem:** You use Python, PyTorch, HuggingFace Transformers, PEFT, and QLoRA — with experience across Home Assistant, ROS2, and Gazebo.
+
+**You:** What music do I like?<br>
+**ParaMem:** You like music by The Kooks, and you tune into a few local radio stations.
+
+**You:** Do I have any pets?<br>
+**ParaMem:** You had a St. Bernard named Bruno, who passed away earlier this year.
+
+**You:** What car do I drive?<br>
+**ParaMem:** I don't have information about which car you drive.
+
+_Same question, two languages — output matches input language:_
+
+**You:** Who is in my family?<br>
+**ParaMem:** Your family includes your spouse Marie, your child Leo, and your dog Bruno, a St. Bernard.
+
+**Du:** Wer gehört zu meiner Familie?<br>
+**ParaMem:** Deine Familie besteht aus deiner Frau Marie, deinem Sohn Leo und dem Hund Bruno, den du liebtest.
+
+────────────────────────────<br>
+`Ask something…`  🎤  ➤
+
+*Examples are anonymized; persona, names, and identifying details are fictional.*
+
 ## Server Deployment
 
 ParaMem includes a REST server for persistent deployment. The server keeps the
@@ -456,7 +454,7 @@ The output is `paper/main.pdf`. LaTeX build artifacts are gitignored.
 
 ## Acknowledgments
 
-Developed with substantial assistance from Claude (Anthropic), including code implementation, experiment design, manuscript drafting, and the adversarial pre-publication review recorded in `benchmarking.md`. The orchestration methodology is documented in `CLAUDE.md`.
+Developed with substantial assistance from Claude (Anthropic), including code implementation, experiment design, manuscript drafting, and the adversarial pre-publication review recorded in `benchmarking.md`.
 
 ## License
 

@@ -2644,7 +2644,7 @@ Output: `outputs/direct_recall/20260511_145102/`. Result: `adapter_natural` ≈ 
 
 ### LongMemEval QA from triples (`lme_qa_from_triples_probe.py`)
 
-Negative-but-useful result, included per "store negative results in benchmarking.md alongside positive ones" (CLAUDE.md).
+Negative-but-useful result, included in keeping with this project's practice of storing negative results alongside the positive ones.
 
 Setup: of LongMemEval's 500 `longmemeval_oracle` question_ids, our 227 extracted sessions fully cover **88** — all of them `temporal-reasoning` (60) or `multi-session` (28); the easier types' answer sessions are past session 227. Sampled 40 (20 + 20). Base Mistral, no adapter; feed the recalled triples as context; answer LongMemEval's own question; score vs LongMemEval ground truth + an LLM-judge ("does the candidate convey the same info as the reference? YES/NO").
 
