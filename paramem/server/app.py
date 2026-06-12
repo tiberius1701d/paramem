@@ -6252,7 +6252,7 @@ async def speaker_forget(request: SpeakerForgetRequest):
         _tiers_with_keys: list[str] = []
         for _tier_name in loop.store.tiers_with_registry():
             _reg = loop.store.registry(_tier_name)
-            if _reg is not None and any((k in _reg or _reg.is_stale(k)) for k in stale_keys):
+            if _reg is not None and any(_reg.knows(k) for k in stale_keys):
                 _tiers_with_keys.append(_tier_name)
 
         _main_tiers_with_simhash: list[str] = [

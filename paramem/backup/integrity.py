@@ -167,40 +167,44 @@ class IntegrityReport:
 # ---------------------------------------------------------------------------
 
 
-def _check_registry(path: Path, tier: str) -> tuple[FileCheck, list[str] | None]:
+def _check_registry(path: Path, tier: str) -> tuple[FileCheck, list[str] | None, list[str] | None]:
     """Check an ``indexed_key_registry.json`` via :class:`KeyRegistry.load`.
 
-    Returns a ``(FileCheck, active_keys)`` pair.  ``active_keys`` is the list
-    of active key names when the registry loaded successfully, ``None``
-    otherwise.  Callers use the returned keys for cross-consistency checks to
-    avoid a second read of the same file.
+    Returns a ``(FileCheck, active_keys, known_keys)`` triple.
 
-    Unexpected exceptions (loader bugs, ``OSError``, ``AttributeError``, etc.)
-    propagate so the caller sees them rather than a silent fallback status.
+    - ``active_keys`` is the list of active key names on success, ``None``
+      otherwise.  Used for ``has_keys`` (required-vs-optional logic) and the
+      ``missing_from_sh`` direction — every SERVED key must have a fingerprint.
+    - ``known_keys`` is the union of active ∪ stale key names on success,
+      ``None`` otherwise.  Used for the ``orphan_in_sh`` direction — a
+      fingerprint is legitimate iff the key is active OR stale.
 
-    Returns:
-        ``(FileCheck, active_keys | None)`` where ``active_keys`` is the list
-        of active key strings on success, or ``None`` on any non-ok status.
+    Callers reuse both lists for cross-consistency checks to avoid reading the
+    file twice.  Unexpected exceptions propagate so the caller sees them rather
+    than a silent fallback status.
     """
     from paramem.training.key_registry import KeyRegistry
 
     path_str = str(path)
     if not path.exists():
-        return FileCheck(path_str, "registry", tier, _SKIPPED, ""), None
+        return FileCheck(path_str, "registry", tier, _SKIPPED, ""), None, None
 
     try:
         reg = KeyRegistry.load(path)
         active_keys = reg.list_active()
-        return FileCheck(path_str, "registry", tier, _OK, ""), active_keys
+        known_keys = reg.list_known()
+        return FileCheck(path_str, "registry", tier, _OK, ""), active_keys, known_keys
     except RuntimeError as exc:
         # RuntimeError from read_maybe_encrypted means no daily identity loaded.
-        return FileCheck(path_str, "registry", tier, _UNDECRYPTABLE, _no_key_detail(exc)), None
+        check = FileCheck(path_str, "registry", tier, _UNDECRYPTABLE, _no_key_detail(exc))
+        return check, None, None
     except pyrage.DecryptError:
-        return FileCheck(path_str, "registry", tier, _UNDECRYPTABLE, _DETAIL_BAD_KEY), None
+        check = FileCheck(path_str, "registry", tier, _UNDECRYPTABLE, _DETAIL_BAD_KEY)
+        return check, None, None
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        return FileCheck(path_str, "registry", tier, _PARSE_ERROR, str(exc)), None
+        return FileCheck(path_str, "registry", tier, _PARSE_ERROR, str(exc)), None, None
     except KeyError as exc:
-        return FileCheck(path_str, "registry", tier, _SCHEMA_ERROR, str(exc)), None
+        return FileCheck(path_str, "registry", tier, _SCHEMA_ERROR, str(exc)), None, None
 
 
 def _check_simhash(path: Path, tier: str) -> tuple[FileCheck, dict | None]:
@@ -539,7 +543,8 @@ def verify_infrastructure_integrity(
     # Per-tier checks
     # -----------------------------------------------------------------------
     # Track which registry loads succeeded (for cross-consistency checks).
-    registry_ok_keys: dict[str, list[str]] = {}  # tier -> active_keys list
+    registry_ok_keys: dict[str, list[str]] = {}  # tier -> active_keys list (SERVE)
+    registry_known_keys: dict[str, list[str]] = {}  # tier -> known (active∪stale) list
     simhash_ok_keys: dict[str, list[str]] = {}  # tier -> simhash keys list
 
     for tier_name, tier_root, tier_kind in tiers_to_check:
@@ -566,16 +571,20 @@ def verify_infrastructure_integrity(
             continue
 
         # --- Registry check ---
-        # _check_registry returns (FileCheck, active_keys | None); reuse the
-        # parsed payload for cross-consistency so the file is read only once.
-        reg_check, reg_active_keys = _check_registry(reg_path, tier_name)
+        # _check_registry returns (FileCheck, active_keys | None, known_keys | None);
+        # reuse both payloads for cross-consistency so the file is read only once.
+        reg_check, reg_active_keys, reg_known_keys = _check_registry(reg_path, tier_name)
         checks.append(reg_check)
 
         # Determine whether this tier has active keys (drives required/optional logic).
+        # has_keys = ACTIVE keys only — a stale-only tier serves nothing; its
+        # simhash/manifest remains optional.
         has_keys = False
         if reg_check.status == _OK and reg_active_keys is not None:
             has_keys = len(reg_active_keys) > 0
             registry_ok_keys[tier_name] = reg_active_keys
+        if reg_check.status == _OK and reg_known_keys is not None:
+            registry_known_keys[tier_name] = reg_known_keys
 
         # Empty registry (zero active keys) → simhash + manifest optional for this tier.
         # Non-existent registry for a main tier → skipped (fresh install or cleared tier).
@@ -695,8 +704,12 @@ def verify_infrastructure_integrity(
                 )
             )
 
-        # Keys in simhash but not in registry (orphan fingerprints)
-        orphan_in_sh = sorted(sh_set - reg_set)
+        # Keys in simhash but not known to registry (orphan fingerprints).
+        # Stale keys legitimately retain their simhash (fold superset, §2.2);
+        # a fingerprint is an orphan only when the key is absent from BOTH
+        # active and stale partitions.
+        known_set = set(registry_known_keys.get(tier_name, reg_keys))
+        orphan_in_sh = sorted(sh_set - known_set)
         if orphan_in_sh:
             sample = orphan_in_sh[:10]
             detail = f"simhash keys absent from registry: {sample}"
@@ -711,12 +724,13 @@ def verify_infrastructure_integrity(
             )
 
     # Cross-consistency: key_metadata orphans
-    # A key in key_metadata["keys"] whose tier_for_active_key() returns None.
+    # A key in key_metadata["keys"] that no tier knows (not active, not stale).
+    # Stale keys legitimately retain key_metadata (W1 retention invariant).
     # Uses the already-parsed payload from _check_common_file — no second read.
     if store is not None and key_metadata_check.status == _OK and key_metadata_parsed is not None:
         orphan_keys: list[str] = []
         for key in key_metadata_parsed.get("keys", {}):
-            if store.tier_for_active_key(key) is None:
+            if not store.is_known(key):
                 orphan_keys.append(key)
         if orphan_keys:
             sample = sorted(orphan_keys)[:10]
