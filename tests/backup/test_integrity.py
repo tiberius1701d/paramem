@@ -70,12 +70,17 @@ def _write_key_registry(
     *,
     active: list[str] | None = None,
     stale: list[str] | None = None,
+    simhash: dict[str, int] | None = None,
 ) -> None:
-    """Write a minimal indexed_key_registry.json.
+    """Write a minimal indexed_key_registry.json (new unified schema).
 
     Supports two call shapes:
     - Legacy positional: ``_write_key_registry(path, ["k1", "k2"])`` — all active.
     - Explicit partitions: ``_write_key_registry(path, active=["k1"], stale=["k2"])``.
+
+    The optional ``simhash`` kwarg writes fingerprints into the registry's
+    unified ``"simhash"`` field (keys are routed to the active or stale partition
+    automatically).  When absent, no fingerprints are written.
 
     The ``keys`` positional argument is treated as ``active`` when provided; it
     must not be combined with the keyword forms.
@@ -91,13 +96,10 @@ def _write_key_registry(
     for k in stale:
         reg.add(k)
         reg.stale(k)
+    if simhash:
+        for k, fp in simhash.items():
+            reg.set_simhash(k, fp)
     path.write_bytes(reg.save_bytes())
-
-
-def _write_simhash(path: Path, entries: dict[str, int]) -> None:
-    """Write a minimal simhash_registry.json."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
 
 
 def _write_graph(path: Path) -> None:
@@ -140,8 +142,9 @@ def train_store_dir(tmp_path):
     # episodic tier
     ep_dir = adapter_dir / "episodic"
     ep_dir.mkdir(parents=True, exist_ok=True)
-    _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1", "key2"])
-    _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "key2": 2})
+    _write_key_registry(
+        ep_dir / "indexed_key_registry.json", ["key1", "key2"], simhash={"key1": 1, "key2": 2}
+    )
     slot = ep_dir / "20260501-000000"
     _write_manifest(slot, "episodic")
 
@@ -149,13 +152,11 @@ def train_store_dir(tmp_path):
     sem_dir = adapter_dir / "semantic"
     sem_dir.mkdir(parents=True, exist_ok=True)
     _write_key_registry(sem_dir / "indexed_key_registry.json", [])
-    _write_simhash(sem_dir / "simhash_registry.json", {})
 
     # procedural tier (empty registry — skipped)
     proc_dir = adapter_dir / "procedural"
     proc_dir.mkdir(parents=True, exist_ok=True)
     _write_key_registry(proc_dir / "indexed_key_registry.json", [])
-    _write_simhash(proc_dir / "simhash_registry.json", {})
 
     return cfg
 
@@ -168,8 +169,9 @@ def simulate_store_dir(tmp_path):
 
     ep_dir = adapter_dir / "episodic"
     ep_dir.mkdir(parents=True, exist_ok=True)
-    _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1", "key2"])
-    _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "key2": 2})
+    _write_key_registry(
+        ep_dir / "indexed_key_registry.json", ["key1", "key2"], simhash={"key1": 1, "key2": 2}
+    )
     _write_graph(ep_dir / "graph.json")
 
     # semantic + procedural empty
@@ -177,7 +179,6 @@ def simulate_store_dir(tmp_path):
         d = adapter_dir / tier
         d.mkdir(parents=True, exist_ok=True)
         _write_key_registry(d / "indexed_key_registry.json", [])
-        _write_simhash(d / "simhash_registry.json", {})
 
     return cfg
 
@@ -236,7 +237,6 @@ class TestRegistryFailure:
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
         _write_key_registry(ep_dir / "indexed_key_registry.json", [])
-        _write_simhash(ep_dir / "simhash_registry.json", {})
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
         assert report.ok is True
@@ -251,8 +251,7 @@ class TestManifestFailure:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
 
         # Write a slot with invalid meta.json (missing 'name' field)
         slot = ep_dir / "20260501-000000"
@@ -273,8 +272,7 @@ class TestGraphFailure:
         cfg = _make_config(tmp_path, mode="simulate")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         # No graph.json written
 
         report = verify_infrastructure_integrity(cfg, daily_loadable=False)
@@ -288,8 +286,7 @@ class TestGraphFailure:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
         # No graph.json — expected in train mode
@@ -370,9 +367,10 @@ class TestCrossConsistency:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1", "key2"])
-        # simhash only has key1 (key2 missing)
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        # simhash only has key1 (key2 missing from the unified registry)
+        _write_key_registry(
+            ep_dir / "indexed_key_registry.json", ["key1", "key2"], simhash={"key1": 1}
+        )
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -387,9 +385,10 @@ class TestCrossConsistency:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        # simhash has extra key2 (orphan)
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "key2": 2})
+        # simhash has extra key2 (orphan — not in active or stale partition)
+        _write_key_registry(
+            ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1, "key2": 2}
+        )
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -404,8 +403,7 @@ class TestCrossConsistency:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -438,8 +436,11 @@ class TestCrossConsistency:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1", "key2"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "key2": 2})
+        _write_key_registry(
+            ep_dir / "indexed_key_registry.json",
+            ["key1", "key2"],
+            simhash={"key1": 1, "key2": 2},
+        )
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -484,8 +485,12 @@ class TestStaleKeyCrossConsistency:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"], stale=["proc52"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "proc52": 2})
+        _write_key_registry(
+            ep_dir / "indexed_key_registry.json",
+            active=["key1"],
+            stale=["proc52"],
+            simhash={"key1": 1, "proc52": 2},
+        )
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -499,8 +504,11 @@ class TestStaleKeyCrossConsistency:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "ghost": 99})
+        _write_key_registry(
+            ep_dir / "indexed_key_registry.json",
+            active=["key1"],
+            simhash={"key1": 1, "ghost": 99},
+        )
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -519,9 +527,13 @@ class TestStaleKeyCrossConsistency:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"], stale=["old1"])
         # simhash only has key1 — old1 (stale) has no simhash
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(
+            ep_dir / "indexed_key_registry.json",
+            active=["key1"],
+            stale=["old1"],
+            simhash={"key1": 1},
+        )
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -534,8 +546,12 @@ class TestStaleKeyCrossConsistency:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"], stale=["proc52"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "proc52": 2})
+        _write_key_registry(
+            ep_dir / "indexed_key_registry.json",
+            active=["key1"],
+            stale=["proc52"],
+            simhash={"key1": 1, "proc52": 2},
+        )
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -566,8 +582,9 @@ class TestStaleKeyCrossConsistency:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", active=["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(
+            ep_dir / "indexed_key_registry.json", active=["key1"], simhash={"key1": 1}
+        )
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -622,8 +639,7 @@ class TestRequiredVsOptional:
         # Only create episodic with keys; semantic dir absent entirely
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -637,8 +653,7 @@ class TestRequiredVsOptional:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -658,8 +673,7 @@ class TestRequiredVsOptional:
         cfg = _make_config(tmp_path, mode="train")
         ep_dir = cfg.adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         slot = ep_dir / "20260501-000000"
         _write_manifest(slot, "episodic")
 
@@ -701,8 +715,11 @@ class TestInterimManifestResolution:
         interim_dir = adapter_dir / "episodic" / f"interim_{stamp}"
         interim_dir.mkdir(parents=True, exist_ok=True)
 
-        _write_key_registry(interim_dir / "indexed_key_registry.json", keys)
-        _write_simhash(interim_dir / "simhash_registry.json", {k: i for i, k in enumerate(keys)})
+        _write_key_registry(
+            interim_dir / "indexed_key_registry.json",
+            keys,
+            simhash={k: i for i, k in enumerate(keys)},
+        )
 
         if include_slot:
             slot = interim_dir / "20260603-000000"
@@ -723,8 +740,7 @@ class TestInterimManifestResolution:
         # Main episodic tier with keys + slot
         ep_dir = adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         _write_manifest(ep_dir / "20260603-000000", "episodic")
 
         # Nested interim slot with keys + nested weight slot
@@ -749,8 +765,7 @@ class TestInterimManifestResolution:
         # Main episodic with keys + slot (must be valid so it doesn't mask interim)
         ep_dir = adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1})
+        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1"], simhash={"key1": 1})
         _write_manifest(ep_dir / "20260603-000000", "episodic")
 
         # Interim with keys but NO nested weight slot
@@ -777,8 +792,11 @@ class TestInterimManifestResolution:
 
         ep_dir = adapter_dir / "episodic"
         ep_dir.mkdir(parents=True, exist_ok=True)
-        _write_key_registry(ep_dir / "indexed_key_registry.json", ["key1", "key2"])
-        _write_simhash(ep_dir / "simhash_registry.json", {"key1": 1, "key2": 2})
+        _write_key_registry(
+            ep_dir / "indexed_key_registry.json",
+            ["key1", "key2"],
+            simhash={"key1": 1, "key2": 2},
+        )
         # Flat slot under episodic/
         _write_manifest(ep_dir / "20260501-000000", "episodic")
 
@@ -919,11 +937,11 @@ class TestCleanupPartialSlots:
         tier_root = tmp_path / "episodic"
         tier_root.mkdir()
         (tier_root / "indexed_key_registry.json").write_text("{}")
-        (tier_root / "simhash_registry.json").write_text("{}")
+        (tier_root / "key_metadata.json").write_text("{}")
         removed = cleanup_partial_slots(tmp_path)
         assert removed == []
         assert (tier_root / "indexed_key_registry.json").exists()
-        assert (tier_root / "simhash_registry.json").exists()
+        assert (tier_root / "key_metadata.json").exists()
 
     def test_all_three_main_tiers_walked(self, tmp_path):
         """One partial slot under each of episodic/semantic/procedural — all deleted."""

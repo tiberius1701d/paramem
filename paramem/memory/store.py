@@ -16,17 +16,19 @@ the previous mixed-shape state on :class:`ConsolidationLoop`:
 * ``indexed_key_cache: dict[str, dict]`` — flat, all tiers in one bucket; tier
   was recovered indirectly by scanning every registry.
 * ``episodic_simhash``, ``semantic_simhash``, ``procedural_simhash`` — three
-  separate flat dicts, asymmetric with the registry shape (no per-interim
-  bucket; interim slots shared the episodic one).
+  separate flat dicts; now folded into the per-tier :class:`KeyRegistry` (each
+  registry carries ``_simhash: dict[str, int]`` for active keys; stale
+  fingerprints live in the stale record ``_stale[key]["simhash"]``).
 * ``indexed_key_registry: Optional[dict[str, KeyRegistry]]`` — the only
   structure that was already per-tier; folded in here for symmetry.
 
 The unified shape is ``tier → key → value`` for all three concerns:
 
 * :attr:`MemoryStore.entries_in_tier` returns ``dict[key, entry_payload]``.
-* :attr:`MemoryStore.simhashes_in_tier` returns ``dict[key, int]`` — usable
-  verbatim by :func:`paramem.memory.entry.verify_confidence` and
-  friends.
+* :meth:`MemoryStore.tier_simhashes` returns ``dict[key, int]`` with a mandatory
+  ``include_stale`` keyword — the **only** public accessor for a fingerprint set.
+  The mandatory keyword makes the active-vs-known distinction impossible to
+  forget, preventing the enumeration bug that caused spurious fold aborts.
 * :meth:`MemoryStore.registry` returns the tier's :class:`KeyRegistry`.
 
 Tier ownership of a key is the single source of truth; an indexed key
@@ -34,10 +36,10 @@ belongs to exactly one tier.  Cross-tier lookups (``get``, ``has``,
 ``tier_of``) scan tier-first then key — O(tier_count); the tier count is
 small (3 main + N interim slots, typically ≤ 10).
 
-When replay is disabled (``ConsolidationLoop`` constructed with
-``indexed_key_replay_enabled=False``), :meth:`registry` returns ``None``
-preserving the load-bearing "registry-is-None means replay-off" gate that
-training paths check.  Cache and simhash are always operational.
+The ``_registry`` dict is ALWAYS present (never ``None``).  ``replay_enabled``
+is a BEHAVIOUR flag only — it governs whether key lifecycle (add/stale/remove)
+is recorded and whether replay-training is run.  Callers needing that gate
+check ``store.replay_enabled`` directly; ``registry()`` never returns ``None``.
 
 **Content cache vs. bookkeeping — read before editing:**
 
@@ -69,10 +71,21 @@ SPO-only readers at ``:1819``, ``:2167``, ``:3474`` are NOT bookkeeping sites
 and become strictly safer post-fix (they can only find a real content entry).
 
 Snapshot / restore (:meth:`snapshot`, :meth:`restore`) capture the entry and
-simhash state for the cycle-resume rollback rope.  Registries persist via
-their own :meth:`KeyRegistry.save` / :meth:`KeyRegistry.load` lifecycle and
-are restored separately from disk on rollback.  ``_bookkeeping`` is NOT in
-the snapshot — it is reloaded from ``key_metadata.json`` on boot.
+simhash fingerprint state for the cycle-resume rollback rope.  The simhash map
+is captured as ``{"simhash": {tier: known_simhashes_dict}}`` — active∪stale per
+tier — so fingerprints survive rollback.  Registries persist via their own
+:meth:`KeyRegistry.save` / :meth:`KeyRegistry.load` lifecycle and are restored
+separately from disk on rollback.  ``_bookkeeping`` is NOT in the snapshot — it
+is reloaded from ``key_metadata.json`` on boot.
+
+**SimHash storage:**
+SimHash fingerprints live exclusively in :class:`KeyRegistry` (one per tier).
+Active fingerprints are in ``registry._simhash``; stale fingerprints are carried
+in the stale record (``registry._stale[key]["simhash"]``).  Both partitions are
+serialised to ``indexed_key_registry.json`` under the ``"simhash"`` key so the
+on-disk file is the single source of truth.  The separate ``simhash_registry.json``
+sidecar has been eliminated.  Use :meth:`tier_simhashes` (mandatory
+``include_stale`` keyword) as the only public path to a fingerprint set.
 """
 
 from __future__ import annotations
@@ -87,7 +100,11 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryStore:
-    """Per-tier {entries, simhash, registry} for the indexed-key memory layer."""
+    """Per-tier {entries, simhash, registry} for the indexed-key memory layer.
+
+    ``_registry`` is always a ``dict[str, KeyRegistry]`` (never ``None``).
+    The ``replay_enabled`` flag governs training behaviour only.
+    """
 
     def __init__(self, *, replay_enabled: bool = True) -> None:
         self._replay_enabled = replay_enabled
@@ -97,12 +114,10 @@ class MemoryStore:
         # SAVE-PATH SITES (authorised store.put callers that write entries):
         #   1. consolidation.py run_cycle / ingest path — new key registration.
         self._entries: dict[str, dict[str, dict]] = {}
-        # tier -> key -> 64-bit simhash fingerprint
-        self._simhash: dict[str, dict[str, int]] = {}
-        # tier -> KeyRegistry (None overall when replay is disabled — the
-        # gate every training path checks to decide whether to record key
-        # lifecycle at all).
-        self._registry: dict[str, KeyRegistry] | None = {} if replay_enabled else None
+        # tier -> KeyRegistry — ALWAYS present (never None).  replay_enabled
+        # controls whether key lifecycle is recorded, not whether the structure
+        # exists.  SimHash fingerprints live ON the registry (not on MemoryStore).
+        self._registry: dict[str, KeyRegistry] = {}
         # Per-key provenance bookkeeping — SEPARATE from _entries.
         # key -> {"speaker_id": str, "first_seen_cycle": int, "relation_type": str}
         # Populated by load_bookkeeping_from_disk at boot.  Never enters
@@ -185,19 +200,19 @@ class MemoryStore:
     ) -> None:
         """Store *entry* for *key* under *tier*.
 
-        If *simhash* is supplied, the per-tier fingerprint is written in the
-        same call.  When *register* is True and replay is enabled, the key is
-        added to the tier's lifecycle registry.
+        If *simhash* is supplied, the per-tier fingerprint is written to the
+        tier's :class:`KeyRegistry` in the same call.
+        When *register* is True and replay is enabled, the key is added to the
+        tier's lifecycle registry.
 
         Caller is responsible for ensuring *key* is unique across tiers — if
         the key currently belongs to a different tier, call :meth:`move`
-        rather than ``put`` to keep the three sub-structures (entries, simhash,
-        registry) in agreement.
+        rather than ``put`` to keep entries, registry, and simhash in agreement.
         """
         self._entries.setdefault(tier, {})[key] = entry
         if simhash is not None:
-            self._simhash.setdefault(tier, {})[key] = simhash
-        if register and self._registry is not None:
+            self._registry.setdefault(tier, KeyRegistry()).set_simhash(key, simhash)
+        if register and self._replay_enabled:
             self._registry.setdefault(tier, KeyRegistry()).add(key)
 
     # ------------------------------------------------------------------
@@ -319,28 +334,21 @@ class MemoryStore:
     def delete(self, key: str) -> str | None:
         """Drop *key* from every tier in every sub-structure.
 
-        Cleans entries, simhash, and registry across all tiers in one call —
-        callers that produced inconsistent state (e.g. entry in one tier,
-        simhash in another via legacy seeders) are normalised here.  The
-        return value is the *first* tier that held the key in any structure,
-        or ``None`` when the key was completely absent."""
+        Cleans entries, simhash (via registry), and registry across all tiers
+        in one call.  The return value is the *first* tier that held the key
+        in any structure, or ``None`` when the key was completely absent."""
         former: str | None = None
         for tier in list(self._entries.keys()):
             if key in self._entries[tier]:
                 del self._entries[tier][key]
                 if former is None:
                     former = tier
-        for tier in list(self._simhash.keys()):
-            if key in self._simhash[tier]:
-                self._simhash[tier].pop(key, None)
+        # Drop from registry (removes from active, stale, and _simhash).
+        for tier, reg in list(self._registry.items()):
+            if reg.knows(key):
+                reg.remove(key)
                 if former is None:
                     former = tier
-        if self._registry is not None:
-            for tier, reg in list(self._registry.items()):
-                if reg.knows(key):
-                    reg.remove(key)
-                    if former is None:
-                        former = tier
         # Retire bookkeeping in lockstep so _bookkeeping never drifts.
         self._bookkeeping.pop(key, None)
         return former
@@ -348,9 +356,9 @@ class MemoryStore:
     def clear_entries(self) -> int:
         """Remove all entry payloads from the content cache.
 
-        Clears ``_entries`` only — registries, simhashes, and ``_bookkeeping``
-        are left intact so the authoritative key-lifecycle state survives the
-        purge.  The intended caller is
+        Clears ``_entries`` only — registries (including their simhash maps)
+        and ``_bookkeeping`` are left intact so the authoritative key-lifecycle
+        state survives the purge.  The intended caller is
         :func:`paramem.server.app._hydrate_memory_store_in_place`, which clears
         the stale pre-fold cache before re-probing active keys against the
         freshly-retrained weights.
@@ -364,103 +372,137 @@ class MemoryStore:
     def move(self, key: str, new_tier: str) -> None:
         """Move *key* from its current tier to *new_tier* atomically.
 
-        No-op if *key* is already in *new_tier*.  Surfaces an inconsistency
-        if entries / simhash / registry disagree about the source tier — the
-        first found tier wins for the move, the others are cleaned silently
-        but logged at WARN."""
+        Moves the entry payload, simhash fingerprint, and registry entry in one
+        operation.  No-op if *key* is already in *new_tier*."""
         old_tier = self.tier_of(key)
         if old_tier == new_tier:
-            if self._registry is not None and new_tier in self._registry:
+            if new_tier in self._registry:
                 # Ensure registry entry is present even when entries already are.
                 self._registry[new_tier].add(key)
             return
         # Move entry
         if old_tier is not None and key in self._entries.get(old_tier, {}):
             self._entries.setdefault(new_tier, {})[key] = self._entries[old_tier].pop(key)
-        # Move simhash (may live in a different tier from the entry if a
-        # caller skipped using move — log if so)
-        for tier, sims in list(self._simhash.items()):
-            if key in sims:
-                if tier != old_tier:
-                    logger.warning(
-                        "MemoryStore.move(%s): simhash was in tier %r but entry in %r — "
-                        "migrating simhash to %r",
-                        key,
-                        tier,
-                        old_tier,
-                        new_tier,
-                    )
-                self._simhash.setdefault(new_tier, {})[key] = sims.pop(key)
-        # Move registry entry
-        if self._registry is not None:
-            for tier, reg in list(self._registry.items()):
-                if key in reg:
-                    if tier != new_tier:
-                        reg.remove(key)
-            self._registry.setdefault(new_tier, KeyRegistry()).add(key)
+        # Move simhash: read from the old tier's registry (covers active + stale).
+        fp: int | None = None
+        old_reg = self._registry.get(old_tier) if old_tier else None
+        if old_reg is not None:
+            fp = old_reg.simhash_for(key)
+            old_reg.drop_simhash(key)
+        if fp is not None:
+            self._registry.setdefault(new_tier, KeyRegistry()).set_simhash(key, fp)
+        # Move registry entry: remove from old, add to new.
+        for tier, reg in list(self._registry.items()):
+            if key in reg:
+                if tier != new_tier:
+                    reg.remove(key)
+        self._registry.setdefault(new_tier, KeyRegistry()).add(key)
 
     # ------------------------------------------------------------------
-    # SimHash fingerprints
+    # SimHash fingerprints — public accessors
     # ------------------------------------------------------------------
     def simhash(self, tier: str, key: str) -> int | None:
-        """Return the simhash fingerprint for ``(tier, key)``, or ``None``."""
-        return self._simhash.get(tier, {}).get(key)
+        """Return the simhash fingerprint for ``(tier, key)``, or ``None``.
+
+        Reads from the registry (covers active AND stale partitions — the
+        unified storage design).  Returns ``None`` when the tier has no
+        registry or the key has no fingerprint."""
+        reg = self._registry.get(tier)
+        if reg is None:
+            return None
+        return reg.simhash_for(key)
 
     def has_simhash(self, tier: str, key: str) -> bool:
-        return key in self._simhash.get(tier, {})
+        """True when *key* has a stored fingerprint in *tier* (active or stale)."""
+        reg = self._registry.get(tier)
+        if reg is None:
+            return False
+        return reg.has_simhash(key)
 
     def _tier_for_simhash(self, key: str) -> str | None:
-        """Return the tier whose simhash dict holds *key*, or ``None``.
+        """Return the tier whose registry holds *key*'s fingerprint, or ``None``.
 
-        Used by the legacy flat-view setter to keep tier ownership
-        consistent when a caller primes one tier's simhash and then
-        writes the entry through the view."""
-        for tier, sims in self._simhash.items():
-            if key in sims:
+        Used by the legacy flat-view setter and the probe confidence gate.
+        Scans registry active+stale partitions."""
+        for tier, reg in self._registry.items():
+            if reg.has_simhash(key):
                 return tier
         return None
 
     def put_simhash(self, tier: str, key: str, fingerprint: int) -> None:
-        """Write the simhash fingerprint for ``(tier, key)``.  Does not touch
-        the entry or registry."""
-        self._simhash.setdefault(tier, {})[key] = fingerprint
+        """Write the simhash fingerprint for ``(tier, key)`` into the registry.
+
+        Does not touch the entry or registry lifecycle (active/stale).  The
+        registry is auto-created for *tier* on first access."""
+        self._registry.setdefault(tier, KeyRegistry()).set_simhash(key, fingerprint)
 
     def delete_simhash(self, tier: str, key: str) -> None:
-        self._simhash.get(tier, {}).pop(key, None)
+        """Remove the simhash fingerprint for ``(tier, key)`` from its registry.
 
-    def simhashes_in_tier(self, tier: str) -> dict[str, int]:
-        """Return the per-tier ``key -> simhash`` map.
+        No-op when the tier has no registry or the key has no fingerprint."""
+        reg = self._registry.get(tier)
+        if reg is not None:
+            reg.drop_simhash(key)
 
-        This is the shape :func:`verify_confidence` and
-        :func:`probe_keys_grouped_by_adapter` accept as their ``registry``
-        argument.  Returns the live internal mapping (lazily created on
-        first access) so callers iterating it observe the current state
-        and legacy mutators (``simhashes_in_tier("X")[k] = v``) propagate.
-        Prefer :meth:`put_simhash` / :meth:`delete_simhash` in new code."""
-        return self._simhash.setdefault(tier, {})
+    def tier_simhashes(self, tier: str, *, include_stale: bool) -> dict[str, int]:
+        """Return the fingerprint map for *tier*.
+
+        The mandatory ``include_stale`` keyword makes the active-vs-known
+        distinction impossible to forget — the original enumeration bug was
+        caused by callers using the old ``simhashes_in_tier`` without
+        remembering to filter stale keys.
+
+        Args:
+            tier: Tier name (e.g. ``"episodic"``).
+            include_stale: When ``True``, returns active∪stale fingerprints.
+                When ``False``, returns active-only fingerprints.
+
+        Returns:
+            A fresh ``dict[str, int]`` (not a live view).  Callers that need
+            a mutable live backing dict are using a deprecated pattern —
+            use :meth:`put_simhash` for writes.
+        """
+        reg = self._registry.get(tier)
+        if reg is None:
+            return {}
+        return reg._known_simhashes() if include_stale else reg._active_simhashes()
 
     def replace_simhashes_in_tier(self, tier: str, new_simhashes: dict[str, int]) -> None:
-        """Bulk-replace the per-tier simhash dict.
+        """Bulk-replace the active simhash fingerprints for *tier*.
 
-        Used after a tier rebuild that produces a fresh registry from
-        ``build_registry``."""
-        self._simhash[tier] = dict(new_simhashes)
+        Writes the new active fingerprints directly to the tier's registry.
+        Stale fingerprints in the registry are not touched — they are managed
+        by :meth:`KeyRegistry.stale`.
+        """
+        reg = self._registry.setdefault(tier, KeyRegistry())
+        # Drop all active simhashes from the registry by clearing _simhash directly.
+        # (Only active simhashes are being replaced; stale records stay intact.)
+        reg._simhash.clear()
+        for key, fp in new_simhashes.items():
+            reg.set_simhash(key, fp)
 
     def simhash_count_in_tier(self, tier: str) -> int:
-        return len(self._simhash.get(tier, {}))
+        """Return the total number of known (active∪stale) fingerprints for *tier*.
+
+        Reads from the registry's ``_known_simhashes()`` — the authoritative
+        source for both active and stale fingerprints."""
+        reg = self._registry.get(tier)
+        if reg is None:
+            return 0
+        return len(reg._known_simhashes())
 
     # ------------------------------------------------------------------
     # Lifecycle registry
     # ------------------------------------------------------------------
-    def registry(self, tier: str) -> KeyRegistry | None:
-        """Return the per-tier :class:`KeyRegistry`, or ``None`` when replay
-        is disabled.
+    def registry(self, tier: str) -> KeyRegistry:
+        """Return the per-tier :class:`KeyRegistry`, creating it on first access.
 
-        Auto-creates an empty registry for *tier* on first access when replay
-        is enabled — matches the legacy lazy-create behaviour at
-        :meth:`ConsolidationLoop._tier_registry`."""
-        if self._registry is None:
-            return None
+        Always returns a :class:`KeyRegistry` — never ``None``.  The
+        ``_replay_enabled`` flag governs training behaviour only (whether key
+        lifecycle add/stale/remove is recorded); it does not gate registry
+        existence.  Callers that need to know whether replay is active should
+        check :attr:`replay_enabled` directly.
+        """
         return self._registry.setdefault(tier, KeyRegistry())
 
     def load_registry(self, tier: str, registry: KeyRegistry) -> None:
@@ -468,23 +510,20 @@ class MemoryStore:
 
         Raises :class:`RuntimeError` when called on a replay-disabled store —
         loading a registry into a disabled store would silently break the
-        gate that downstream paths rely on."""
-        if self._registry is None:
+        gate that downstream paths rely on.  Simhashes are carried inside the
+        registry; no separate sync is needed."""
+        if not self._replay_enabled:
             raise RuntimeError(
                 "MemoryStore: replay is disabled; cannot install registry for tier %r" % tier
             )
         self._registry[tier] = registry
 
     def has_registry(self, tier: str) -> bool:
-        if self._registry is None:
-            return False
+        """True when *tier* has an allocated registry."""
         return tier in self._registry
 
     def tiers_with_registry(self) -> list[str]:
-        """Tiers for which a registry has been allocated.  Empty when replay
-        is disabled."""
-        if self._registry is None:
-            return []
+        """Tiers for which a registry has been allocated."""
         return list(self._registry.keys())
 
     def drop_registry(self, tier: str) -> KeyRegistry | None:
@@ -492,30 +531,23 @@ class MemoryStore:
 
         Used at end-of-full-cycle to retire interim slots after their keys
         have been promoted into main.  Returns ``None`` when the tier had no
-        registry or replay is disabled."""
-        if self._registry is None:
-            return None
+        registry."""
         return self._registry.pop(tier, None)
 
     def active_keys_in_tier(self, tier: str) -> list[str]:
-        if self._registry is None:
-            return []
+        """Return the active keys for *tier* from the registry."""
         reg = self._registry.get(tier)
         return reg.list_active() if reg is not None else []
 
     def all_active_keys(self) -> list[str]:
         """Every active key across every registered tier."""
-        if self._registry is None:
-            return []
         return [k for reg in self._registry.values() for k in reg.list_active()]
 
     def tier_for_active_key(self, key: str) -> str | None:
-        """Return the tier that holds *key* in its registry, or ``None``.
+        """Return the tier that holds *key* in its registry as active, or ``None``.
 
         Kept distinct from :meth:`tier_of` because the registry and entry
         cache can briefly disagree during a put/move sequence."""
-        if self._registry is None:
-            return None
         for tier, reg in self._registry.items():
             if key in reg:
                 return tier
@@ -530,7 +562,7 @@ class MemoryStore:
         retention; use :meth:`tier_for_active_key` / :meth:`all_active_keys` for
         serving/enumeration.
         """
-        if self._registry is None:
+        if not self._replay_enabled:
             return False
         for reg in self._registry.values():
             if reg.knows(key):
@@ -544,7 +576,7 @@ class MemoryStore:
         ``None`` when replay is disabled or no tier knows *key* in either
         partition.
         """
-        if self._registry is None:
+        if not self._replay_enabled:
             return None
         for tier, reg in self._registry.items():
             if reg.knows(key):
@@ -558,7 +590,7 @@ class MemoryStore:
         via :meth:`KeyRegistry.list_known` so the union logic has a single
         definition.  Returns an empty list when replay is disabled.
         """
-        if self._registry is None:
+        if not self._replay_enabled:
             return []
         return [k for reg in self._registry.values() for k in reg.list_known()]
 
@@ -569,7 +601,7 @@ class MemoryStore:
         Returns False when replay is disabled (no registries) or the key
         is not found in any tier's stale partition.
         """
-        if self._registry is None:
+        if not self._replay_enabled:
             return False
         for reg in self._registry.values():
             if reg.is_stale(key):
@@ -578,39 +610,34 @@ class MemoryStore:
 
     def all_stale_keys(self) -> list[str]:
         """Every stale key across every registered tier."""
-        if self._registry is None:
+        if not self._replay_enabled:
             return []
         return [k for reg in self._registry.values() for k in reg.list_stale()]
 
     def discard_keys(self, keys: list[str], *, mode: str) -> None:
-        """Mutate the in-memory registry and simhashes for *keys*.
+        """Mutate the in-memory registry (and its simhash map) for *keys*.
 
         Supports two modes:
 
         ``mode="erase"`` (hard removal, used by ``/forget``):
             For each key, call :meth:`KeyRegistry.remove` on every tier's
-            registry that holds it (active or stale), then drop the simhash
-            entry via :meth:`delete_simhash` on the three main tiers only.
-            This reproduces the tier asymmetry of the original ``/forget``
-            inline loop: registry mutation over ``tiers_with_registry()``
-            (all tiers including interim), simhash drop over the three main
-            tiers only (``episodic``, ``semantic``, ``procedural``).
+            registry that holds it (active or stale).  ``remove`` drops both
+            the key from ``_active_keys``/``_stale`` and its fingerprint from
+            ``_simhash``.
 
         ``mode="stale"`` (soft removal, used by the fold dedup write-back):
             For each key, call :meth:`KeyRegistry.stale` on the owning tier.
-            Simhash is RETAINED so the stale-echo seam can verify a stale key.
+            The stale transition automatically carries the active simhash into
+            the stale record (encapsulated in :meth:`KeyRegistry.stale`), so
+            the fingerprint is retained for the stale-echo probe.
 
-        Guards ``_registry is None``: when replay is disabled, all three
-        sub-structures are no-ops and this method returns without raising.
-        Simhash mutations on absent keys are safe no-ops via :meth:`delete_simhash`.
+        Guards ``replay_enabled``: when replay is disabled, all mutations are
+        no-ops and this method returns without raising.
 
         This is an **in-memory** mutation only.  Callers are responsible for
-        their own disk saves:
-        - ``/forget`` persists registries + simhash registries after this call.
-        - The fold finalize persists registries + simhash registries atomically
-          via ``_reset_main_tier_registries_and_simhashes`` and ``_save_adapters``.
+        their own disk saves (the registry files carry the unified simhash now).
         """
-        if self._registry is None:
+        if not self._replay_enabled:
             return
         if mode == "erase":
             for tier_name in self.tiers_with_registry():
@@ -620,15 +647,14 @@ class MemoryStore:
                 for key in keys:
                     if reg.knows(key):
                         reg.remove(key)
-            for tier_name in ("episodic", "semantic", "procedural"):
-                for key in keys:
-                    self.delete_simhash(tier_name, key)
         elif mode == "stale":
             for key in keys:
                 for tier_name in self.tiers_with_registry():
                     reg = self._registry.get(tier_name)
                     if reg is not None and key in reg:
                         reg.stale(key)
+                        # The stale transition moved the active simhash into the
+                        # stale record inside the registry — single encapsulated call.
                         break  # single-tier-ownership invariant
         else:
             raise ValueError(
@@ -641,19 +667,43 @@ class MemoryStore:
     def snapshot(self) -> dict:
         """Deep-copy the entry and simhash state for rollback.
 
+        The ``"simhash"`` entry captures active∪stale fingerprints per tier
+        from the registry (the unified source of truth), so fingerprints survive
+        rollback correctly.
+
         Registries are NOT included — they have their own persistence
         lifecycle (KeyRegistry.save / KeyRegistry.load to per-tier
         ``indexed_key_registry.json`` files).  The rollback caller is
-        responsible for restoring registries from disk separately."""
+        responsible for restoring registries from disk separately.
+
+        ``_bookkeeping`` is NOT included — it is reloaded from
+        ``key_metadata.json`` on boot."""
+        simhash_snap: dict[str, dict[str, int]] = {}
+        for tier, reg in self._registry.items():
+            known = reg._known_simhashes()
+            if known:
+                simhash_snap[tier] = known
         return {
             "entries": copy.deepcopy(self._entries),
-            "simhash": copy.deepcopy(self._simhash),
+            "simhash": simhash_snap,
         }
 
     def restore(self, snap: dict) -> None:
-        """Restore entry and simhash state from :meth:`snapshot` output."""
+        """Restore entry and simhash state from :meth:`snapshot` output.
+
+        Re-seeds each tier's registry with the active fingerprints from the
+        snapshot map.  Stale fingerprints are reloaded from the registry
+        on-disk during the separate registry-restore step (callers are
+        responsible for that)."""
         self._entries = copy.deepcopy(snap["entries"])
-        self._simhash = copy.deepcopy(snap["simhash"])
+        snap_simhash: dict[str, dict[str, int]] = snap.get("simhash", {})
+        # Clear existing registry active simhashes and re-seed from the snapshot.
+        for tier, fp_map in snap_simhash.items():
+            reg = self._registry.setdefault(tier, KeyRegistry())
+            reg._simhash.clear()
+            for key, fp in fp_map.items():
+                if key not in reg._stale:
+                    reg._simhash[key] = fp
 
     def _entries_flat_view(self) -> "_LegacyFlatCacheView":
         """Return a flat dict-like view of all entries across tiers.
@@ -722,12 +772,12 @@ class MemoryStore:
             applies (which may be below threshold), or ``None`` to signal
             pass-through (no verification needed — replay-off or no fingerprint).
 
-            The fingerprint is looked up by scanning all simhash tiers via
+            The fingerprint is looked up by scanning all registry tiers via
             :meth:`_tier_for_simhash` so a key whose simhash was stored under
             a different tier from the one it was requested under (e.g. an
             interim slot promoted to main) is still verified correctly.
 
-            Invariant: never uses truthiness on ``_simhash`` or sub-dicts —
+            Invariant: never uses truthiness on registry or sub-dicts —
             all presence checks use explicit ``in`` / ``is None``."""
             if not self._replay_enabled:
                 return None
@@ -736,7 +786,10 @@ class MemoryStore:
                 # Key has no fingerprint — replay enabled but no hash stored
                 # (e.g. fresh tier before first consolidation).  Pass through.
                 return None
-            fp = self._simhash[owning_simhash_tier].get(key)
+            reg = self._registry.get(owning_simhash_tier)
+            if reg is None:
+                return None
+            fp = reg.simhash_for(key)
             if fp is None:
                 return None
             # Build the minimal entry shape verify_confidence expects.
@@ -908,15 +961,17 @@ class MemoryStore:
     # On-disk registries — load registries + simhashes from the adapter dir
     # ------------------------------------------------------------------
     def load_registries_from_disk(self, adapter_dir) -> None:
-        """Load per-tier ``indexed_key_registry.json`` + ``simhash_registry.json``
-        into the store from *adapter_dir*.
+        """Load per-tier ``indexed_key_registry.json`` into the store.
 
         Reads:
 
         * ``<adapter_dir>/<tier>/indexed_key_registry.json`` for each main tier
           and every ``episodic_interim_<stamp>`` slot.
-        * ``<adapter_dir>/<tier>/simhash_registry.json`` per tier, with a
-          legacy-flat fallback at ``<adapter_dir>/simhash_registry_<tier>.json``.
+
+        The registry file now carries the unified simhash map (active∪stale
+        fingerprints) in the ``"simhash"`` key.  The separate
+        ``simhash_registry.json`` file is no longer read — it has been
+        eliminated.
 
         Entry payloads (subject/predicate/object/speaker_id) are NOT loaded
         here — that is the responsibility of the mode-specific
@@ -926,15 +981,12 @@ class MemoryStore:
         No-op when the store has ``replay_enabled=False`` (registries are not
         tracked).
         """
-        if self._registry is None:
+        if not self._replay_enabled:
             return
 
         from pathlib import Path
 
         from paramem.memory.interim_adapter import iter_interim_dirs
-        from paramem.memory.persistence import (
-            load_registry as _load_simhash_registry,
-        )
         from paramem.training.key_registry import KeyRegistry
 
         adapter_dir = Path(adapter_dir)
@@ -950,27 +1002,6 @@ class MemoryStore:
         for interim_name, interim_dir in iter_interim_dirs(adapter_dir):
             reg_path = interim_dir / "indexed_key_registry.json"
             self.load_registry(interim_name, KeyRegistry.load(reg_path))
-
-        # Per-tier SimHash registries; legacy flat path is a one-time
-        # upgrade compat fallback.
-        def _load_simhash(tier: str) -> dict:
-            per_tier = adapter_dir / tier / "simhash_registry.json"
-            legacy = adapter_dir / f"simhash_registry_{tier}.json"
-            if per_tier.exists():
-                return _load_simhash_registry(per_tier)
-            if legacy.exists():
-                logger.info(
-                    "MemoryStore.load_registries_from_disk: upgrading simhash "
-                    "registry for %s from legacy flat path",
-                    tier,
-                )
-                return _load_simhash_registry(legacy)
-            return {}
-
-        for tier in ("episodic", "semantic", "procedural"):
-            sh = _load_simhash(tier)
-            if sh:
-                self.replace_simhashes_in_tier(tier, sh)
 
     def load_bookkeeping_from_disk(self, key_metadata_path) -> dict:
         """Load per-key bookkeeping into ``_bookkeeping`` from ``key_metadata.json``.
@@ -1053,11 +1084,13 @@ class MemoryStore:
         out: dict[str, dict] = {}
         for tier in self._entries:
             out.setdefault(tier, {})["key_count"] = len(self._entries[tier])
-        for tier in self._simhash:
-            out.setdefault(tier, {})["simhash_count"] = len(self._simhash[tier])
-        if self._registry is not None:
-            for tier, reg in self._registry.items():
-                out.setdefault(tier, {})["registry_active"] = len(reg.list_active())
+        for tier, reg in self._registry.items():
+            known = reg._known_simhashes()
+            if known:
+                out.setdefault(tier, {})["simhash_count"] = len(known)
+            active = len(reg.list_active())
+            if self._replay_enabled:
+                out.setdefault(tier, {})["registry_active"] = active
         return out
 
 

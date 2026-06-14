@@ -197,7 +197,6 @@ def _make_source_store(tmp_path: Path) -> dict:
     proc_dir.mkdir(parents=True)
     _make_adapter_slot(proc_dir, "20260520-100000", proc_hash, adapter_name="procedural")
     (proc_dir / "indexed_key_registry.json").write_bytes(proc_content)
-    (proc_dir / "simhash_registry.json").write_bytes(b'{"simhash": {"proc_k": 999}}')
 
     # --- Episodic: NO main slot, only an interim family ---
     ep_interim_content = b'{"keys": {"ep_interim_key": "val"}}'
@@ -214,7 +213,6 @@ def _make_source_store(tmp_path: Path) -> dict:
         weight_bytes=b"episodic_weights_data",
     )
     (interim_family_dir / "indexed_key_registry.json").write_bytes(ep_interim_content)
-    (interim_family_dir / "simhash_registry.json").write_bytes(b'{"simhash": {"ep_interim": 42}}')
 
     bundle_base = src / "backups" / "snapshot"
     bundle_base.mkdir(parents=True)
@@ -366,8 +364,12 @@ class TestRestoreFilesPresent:
             "episodic interim indexed_key_registry.json must be at interim-family root"
         )
 
-    def test_simhash_present_at_tier_root(self, tmp_path) -> None:
-        """simhash_registry.json is restored at the tier-root for each adapter."""
+    def test_no_simhash_sidecar_at_tier_root(self, tmp_path) -> None:
+        """simhash_registry.json is NOT present after restore.
+
+        Simhashes live in indexed_key_registry.json after the SimHash unification
+        refactor; the separate sidecar is no longer bundled or restored.
+        """
         bundle_slot, src = _build_bundle(tmp_path)
         scratch = tmp_path / "scratch"
         scratch.mkdir()
@@ -377,9 +379,13 @@ class TestRestoreFilesPresent:
         restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
 
         proc_root = scratch / "adapters" / "procedural"
-        assert (proc_root / "simhash_registry.json").exists()
+        assert not (proc_root / "simhash_registry.json").exists(), (
+            "simhash_registry.json sidecar must not be restored"
+        )
         ep_interim_root = scratch / "adapters" / "episodic" / "interim_20260517T1200"
-        assert (ep_interim_root / "simhash_registry.json").exists()
+        assert not (ep_interim_root / "simhash_registry.json").exists(), (
+            "simhash_registry.json sidecar must not be restored for interim families"
+        )
 
     def test_weight_files_present_in_slot(self, tmp_path) -> None:
         """adapter_model.safetensors + adapter_config.json + meta.json present in slot."""
@@ -907,9 +913,6 @@ def _make_encrypted_source_store(tmp_path: Path) -> dict:
 
     # Per-tier registries — encrypted
     proc_dir.joinpath("indexed_key_registry.json").write_bytes(proc_reg_ciphertext)
-    proc_dir.joinpath("simhash_registry.json").write_bytes(
-        envelope_encrypt_bytes(b'{"simhash": {"proc_k": 999}}')
-    )
 
     # --- Episodic: interim family ---
     ep_reg_plaintext = b'{"keys": {"ep_interim_key": "val"}}'
@@ -949,9 +952,6 @@ def _make_encrypted_source_store(tmp_path: Path) -> dict:
     )
 
     interim_family_dir.joinpath("indexed_key_registry.json").write_bytes(ep_reg_ciphertext)
-    interim_family_dir.joinpath("simhash_registry.json").write_bytes(
-        envelope_encrypt_bytes(b'{"simhash": {"ep_k": 42}}')
-    )
 
     bundle_base = src / "backups" / "snapshot"
     bundle_base.mkdir(parents=True)
@@ -1010,7 +1010,6 @@ class TestEncryptedRoundTrip:
         for rel in [
             "adapters/procedural/adapter_model.safetensors",
             "adapters/procedural/indexed_key_registry.json",
-            "adapters/procedural/simhash_registry.json",
             "adapters/episodic_interim_20260517T1200/adapter_model.safetensors",
             "adapters/episodic_interim_20260517T1200/indexed_key_registry.json",
             "registry/key_metadata.json",
@@ -1059,7 +1058,6 @@ class TestEncryptedRoundTrip:
             "registry/key_metadata.json",
             "speaker_profiles.json",
             "adapters/procedural/indexed_key_registry.json",
-            "adapters/procedural/simhash_registry.json",
         ]:
             restored_file = scratch / rel_path
             if restored_file.exists():

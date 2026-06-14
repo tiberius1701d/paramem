@@ -208,28 +208,35 @@ def _check_registry(path: Path, tier: str) -> tuple[FileCheck, list[str] | None,
 
 
 def _check_simhash(path: Path, tier: str) -> tuple[FileCheck, dict | None]:
-    """Check a ``simhash_registry.json`` via :func:`load_registry`.
+    """Extract the simhash fingerprint map from an ``indexed_key_registry.json``.
+
+    The simhash map is now co-located with the registry in a single file
+    (``"simhash"`` key in the registry payload) rather than in a separate
+    ``simhash_registry.json`` sidecar.  *path* MUST be the
+    ``indexed_key_registry.json`` path (the same file passed to
+    :func:`_check_registry`).
 
     Returns a ``(FileCheck, simhash_dict)`` pair.  ``simhash_dict`` is the
-    loaded mapping when the file parsed successfully, ``None`` otherwise.
-    Callers use the returned dict for cross-consistency checks to avoid a
-    second read of the same file.
+    ``{key: int}`` mapping when the file parsed successfully with a ``"simhash"``
+    entry, ``None`` otherwise.  Callers reuse the returned dict for
+    cross-consistency checks to avoid a second read of the same file.
 
     Unexpected exceptions propagate so the caller sees them rather than a
     silent fallback status.
 
     Returns:
         ``(FileCheck, simhash_dict | None)`` where ``simhash_dict`` is the
-        loaded registry dict on success, or ``None`` on any non-ok status.
+        loaded simhash map on success, or ``None`` on any non-ok status.
     """
-    from paramem.memory.persistence import load_registry
+    from paramem.training.key_registry import KeyRegistry
 
     path_str = str(path)
     if not path.exists():
         return FileCheck(path_str, "simhash", tier, _SKIPPED, ""), None
 
     try:
-        sh_dict = load_registry(path)
+        reg = KeyRegistry.load(path)
+        sh_dict = reg._known_simhashes()
         return FileCheck(path_str, "simhash", tier, _OK, ""), sh_dict
     except RuntimeError as exc:
         return FileCheck(path_str, "simhash", tier, _UNDECRYPTABLE, _no_key_detail(exc)), None
@@ -237,6 +244,8 @@ def _check_simhash(path: Path, tier: str) -> tuple[FileCheck, dict | None]:
         return FileCheck(path_str, "simhash", tier, _UNDECRYPTABLE, _DETAIL_BAD_KEY), None
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return FileCheck(path_str, "simhash", tier, _PARSE_ERROR, str(exc)), None
+    except KeyError as exc:
+        return FileCheck(path_str, "simhash", tier, _SCHEMA_ERROR, str(exc)), None
 
 
 def _check_manifest(slot_dir: Path, tier: str) -> FileCheck:
@@ -482,10 +491,11 @@ def verify_infrastructure_integrity(
 ) -> IntegrityReport:
     """Run the full infrastructure integrity check and return an :class:`IntegrityReport`.
 
-    Checks every tier's ``indexed_key_registry.json``, ``simhash_registry.json``,
-    ``meta.json`` (live weight slot), and ``graph.json`` (simulate mode only).
-    Also checks ``registry/key_metadata.json``, ``speaker_profiles.json``,
-    ``observed_languages.json``, and ``state/backup.json``.
+    Checks every tier's ``indexed_key_registry.json`` (which now carries the
+    unified simhash map), ``meta.json`` (live weight slot), and ``graph.json``
+    (simulate mode only).  Also checks ``registry/key_metadata.json``,
+    ``speaker_profiles.json``, ``observed_languages.json``, and
+    ``state/backup.json``.
 
     Runs cross-consistency checks on tiers whose registry loaded ``"ok"``:
     registry keys vs simhash keys, and key_metadata orphans.
@@ -553,8 +563,11 @@ def verify_infrastructure_integrity(
         # --- Determine if this tier is "committed" (has any data) ---
         # A partial interim slot (dir present but registry absent) is skipped.
         reg_path = tier_root / "indexed_key_registry.json"
-        simhash_path = tier_root / "simhash_registry.json"
         graph_path = tier_root / "graph.json"
+        # The simhash map now lives inside indexed_key_registry.json under the
+        # "simhash" key.  simhash_path is kept as a display string in
+        # FileCheck records so the API output is human-readable.
+        simhash_path = reg_path  # same file — display label only
 
         # Skip entirely-absent tiers (no dir at all or no registry signal).
         if not tier_root.exists():
@@ -594,30 +607,20 @@ def verify_infrastructure_integrity(
             continue
 
         # --- SimHash check ---
-        # _check_simhash returns (FileCheck, simhash_dict | None); reuse the
-        # parsed dict for cross-consistency so the file is read only once.
+        # Simhashes live in the same indexed_key_registry.json file under the
+        # "simhash" key.  _check_simhash reads from that file and extracts the
+        # fingerprint map; no separate simhash_registry.json exists.
+        # reuse the parsed dict for cross-consistency so the file is read only once.
         if not has_keys:
             # Registry loaded ok but is empty → simhash is optional
             simhash_check: FileCheck = FileCheck(
                 str(simhash_path), "simhash", tier_name, _SKIPPED, "empty registry"
             )
             simhash_payload: dict | None = None
-        elif mode == "train":
-            # train mode: simhash required when registry has keys
-            if not simhash_path.exists():
-                simhash_check = FileCheck(
-                    str(simhash_path),
-                    "simhash",
-                    tier_name,
-                    _MISSING,
-                    "simhash required in train mode",
-                )
-                simhash_payload = None
-            else:
-                simhash_check, simhash_payload = _check_simhash(simhash_path, tier_name)
         else:
-            # simulate mode: simhash is also stored alongside graph
-            simhash_check, simhash_payload = _check_simhash(simhash_path, tier_name)
+            # Both train and simulate: simhash is in the registry file,
+            # which was already confirmed to exist above.
+            simhash_check, simhash_payload = _check_simhash(reg_path, tier_name)
         checks.append(simhash_check)
 
         if simhash_check.status == _OK and simhash_payload is not None:
@@ -689,14 +692,17 @@ def verify_infrastructure_integrity(
         reg_set = set(reg_keys)
         sh_set = set(sh_keys)
 
-        # Keys in registry but not in simhash
+        # Keys in registry but not in simhash (in-payload self-consistency).
+        # Since simhashes and registry keys are now in the same file, this
+        # detects an in-file invariant violation rather than cross-file desync.
+        _reg_file = str(adapter_dir / tier_name / "indexed_key_registry.json")
         missing_from_sh = sorted(reg_set - sh_set)
         if missing_from_sh:
             sample = missing_from_sh[:10]
             detail = f"registry keys without simhash fingerprint: {sample}"
             checks.append(
                 FileCheck(
-                    str(adapter_dir / tier_name / "simhash_registry.json"),
+                    _reg_file,
                     "simhash",
                     tier_name,
                     _INCONSISTENT,
@@ -705,7 +711,7 @@ def verify_infrastructure_integrity(
             )
 
         # Keys in simhash but not known to registry (orphan fingerprints).
-        # Stale keys legitimately retain their simhash (fold superset, §2.2);
+        # Stale keys legitimately retain their simhash (active∪stale superset);
         # a fingerprint is an orphan only when the key is absent from BOTH
         # active and stale partitions.
         known_set = set(registry_known_keys.get(tier_name, reg_keys))
@@ -715,7 +721,7 @@ def verify_infrastructure_integrity(
             detail = f"simhash keys absent from registry: {sample}"
             checks.append(
                 FileCheck(
-                    str(adapter_dir / tier_name / "simhash_registry.json"),
+                    _reg_file,
                     "simhash",
                     tier_name,
                     _INCONSISTENT,

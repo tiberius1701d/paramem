@@ -294,12 +294,11 @@ def _add_keyed_edge(
 def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
     """Project the *tier* slice of a :class:`MemoryStore` into a fresh ``MultiDiGraph``.
 
-    Iterates every key in ``store.simhashes_in_tier(tier)`` — keeping the
-    simhash dict as the enumeration spine so replay-disabled stores work
-    correctly — but **skips stale keys** so the projected graph is active-only.
-    Stale simhash entries are retained on disk (step-6 wholesale persist in
-    ``commit_tier_slot`` is unchanged); they are excluded only from the graph
-    projection so superseded facts are never re-materialized into ``graph.json``.
+    Enumerates active-only keys via ``store.tier_simhashes(tier, include_stale=False)``
+    — the single accessor that makes the active-vs-known distinction explicit and
+    impossible to forget.  Stale keys are excluded by construction (the
+    ``include_stale=False`` call already filters them); the old belt-and-suspenders
+    ``is_stale`` skip is removed because stale keys are never in the active-only map.
 
     Reads the matching entry from the store to add an edge
     ``(subject → object)`` with edge-data
@@ -311,29 +310,21 @@ def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
     :func:`save_memory_to_disk`.
 
     Args:
-        store: A :class:`paramem.memory.store.MemoryStore`
-            (or any object exposing ``simhashes_in_tier(tier) -> dict[str,int]``,
-            ``get(key) -> dict | None``, and ``is_stale(key) -> bool``).
+        store: A :class:`paramem.memory.store.MemoryStore`.
         tier: One of ``"episodic"``, ``"semantic"``, or ``"procedural"``.
 
     Returns:
         A new ``nx.MultiDiGraph`` with one edge per *active* key in the tier's
-        SimHash registry (stale keys excluded).
+        SimHash registry.
 
     Raises:
-        KeyError: When an active key present in ``simhashes_in_tier`` is absent
-            from the store's entry cache.  Stale keys never raise (they are
-            skipped before the entry lookup).  A simhash/entry divergence on an
-            active key is a data-integrity bug to surface, not paper over.
+        KeyError: When an active key is absent from the store's entry cache.
+            A simhash/entry divergence on an active key is a data-integrity bug
+            to surface, not paper over.
     """
-    simhash_registry: dict[str, int] = store.simhashes_in_tier(tier)
+    active_simhashes: dict[str, int] = store.tier_simhashes(tier, include_stale=False)
     graph = nx.MultiDiGraph()
-    for indexed_key in simhash_registry:
-        # Skip stale keys — their simhash is retained on disk for the
-        # stale-echo seam, but they must not be projected into graph.json
-        # (superseded facts must not re-materialize).
-        if store.is_stale(indexed_key):
-            continue
+    for indexed_key in active_simhashes:
         entry = store.get(indexed_key)
         if entry is None:
             raise KeyError(indexed_key)
@@ -453,9 +444,7 @@ def commit_tier_slot(
          (encrypted/plaintext depending on daily-key state).  No PEFT weights
          are written.
 
-    6. Write simhash registry to ``<slot_root>/simhash_registry.json`` (both
-       modes) via :func:`paramem.memory.persistence.save_registry`.
-    7. Flush the exact registry bytes from step 1 to
+    6. Flush the exact registry bytes from step 1 to
        ``<slot_root>/indexed_key_registry.json`` as the commit signal (both
        modes) via :meth:`paramem.training.key_registry.KeyRegistry.save_from_bytes`.
        This is the last write — its presence on disk signals that all preceding
@@ -498,7 +487,6 @@ def commit_tier_slot(
     Raises:
         RuntimeError: When ``loop.store.replay_enabled`` is ``False`` (no
             registry to commit).
-        KeyError: When ``tier`` has no registry in ``loop.store``.
     """
     import hashlib as _hashlib
 
@@ -512,9 +500,17 @@ def commit_tier_slot(
     # registry / simhash / graph projections must read under the same key.
     # `tier` is retained for log messages and the on-disk slot hierarchy via
     # adapter_slot_root_for_name (which dispatches by adapter_name internally).
+    # registry() always returns a KeyRegistry (setdefault auto-creates on first
+    # access; never returns None).  The replay_enabled gate above is the only
+    # guard; no None check is needed here.
     tier_reg = loop.store.registry(adapter_name)
-    if tier_reg is None:
-        raise KeyError(f"commit_tier_slot: no registry for adapter {adapter_name!r}")
+
+    # F5 decision: empty commit is a real production path.  post_session_train
+    # writes the procedural registry file symmetrically (step 8) even when
+    # procedural keys are populated in a prior call — the caller already holds
+    # the keys in the store from _run_indexed_key_procedural.  No zero-key guard
+    # is added here; len(tier_reg) == 0 is permitted and produces an empty but
+    # valid registry file.
 
     # --- Step 1+2: Serialize and hash (no disk I/O) ---
     payload = tier_reg.save_bytes()
@@ -597,13 +593,9 @@ def commit_tier_slot(
                 graph.number_of_edges(),
             )
 
-        # --- Step 6: SimHash registry (both modes) ---
-        save_registry(
-            loop.store.simhashes_in_tier(adapter_name),
-            slot_root / "simhash_registry.json",
-        )
-
-        # --- Step 7: Registry flush — commit signal (both modes, LAST write) ---
+        # --- Step 6: Registry flush — commit signal (both modes, LAST write) ---
+        # The registry now carries the unified simhash map (active∪stale) in its
+        # "simhash" key, so a separate simhash_registry.json is no longer written.
         # After this returns the slot is live on disk.  Any exception before
         # this point is caught by the finally block below which removes the
         # orphan slot dir.

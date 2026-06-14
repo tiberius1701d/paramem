@@ -4,9 +4,9 @@ Verifies that the router uses ConsolidationLoop.store._entries_flat_view() (the
 canonical entity-index source) and does NOT pick up trial adapter keys when
 trial_adapter_dir is separate from config.adapter_dir.
 
-Also tests _load_simhash_registry with the new per-tier layout so the
-Critical #1 fix (per-tier simhash paths) has end-to-end coverage:
-    write per-tier simhash_registry.json → _load_simhash_registry → merged dict.
+Also tests _load_simhash_registry with the unified registry layout so the
+SimHash unification refactor has end-to-end coverage:
+    write per-tier indexed_key_registry.json → _load_simhash_registry → merged dict.
 
 No GPU — all tests use in-memory construction.
 """
@@ -130,36 +130,43 @@ class TestRouterReadsFromLoopCache:
 
 
 class TestLoadSimhashRegistryPerTierPaths:
-    """_load_simhash_registry reads from per-tier layout (post-KeyRegistry refactor).
+    """_load_simhash_registry reads from per-tier indexed_key_registry.json files.
 
-    Critical #1: the writer (``_save_adapters`` / ``post_session_train``) writes
-    ``<adapter_dir>/<tier>/simhash_registry.json``.  The reader must merge the
-    same paths.  Tests verify the union and the interim-slot sub-path.
+    After the SimHash unification refactor, fingerprints live in the ``"simhash"``
+    key of each tier's ``indexed_key_registry.json`` rather than in a separate
+    ``simhash_registry.json`` sidecar.  The reader merges the ``"simhash"`` maps
+    from all tiers and interim slots.
     """
 
-    def _write_simhash(self, path: Path, mapping: dict[str, int]) -> None:
-        """Write a flat {key: simhash} JSON file to path."""
+    def _write_registry(self, path: Path, simhash_map: dict[str, int]) -> None:
+        """Write an indexed_key_registry.json with the given simhash map."""
+        from paramem.training.key_registry import KeyRegistry
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(mapping), encoding="utf-8")
+        reg = KeyRegistry()
+        for k, fp in simhash_map.items():
+            reg.add(k)
+            reg.set_simhash(k, fp)
+        path.write_bytes(reg.save_bytes())
 
     def test_reads_main_tier_files(self, tmp_path):
-        """episodic + semantic + procedural simhash files are all merged."""
+        """episodic + semantic + procedural registry files are all merged."""
         adapter_dir = tmp_path / "adapters"
-        self._write_simhash(adapter_dir / "episodic" / "simhash_registry.json", {"graph1": 1})
-        self._write_simhash(adapter_dir / "semantic" / "simhash_registry.json", {"graph2": 2})
-        self._write_simhash(adapter_dir / "procedural" / "simhash_registry.json", {"proc1": 3})
+        self._write_registry(adapter_dir / "episodic" / "indexed_key_registry.json", {"graph1": 1})
+        self._write_registry(adapter_dir / "semantic" / "indexed_key_registry.json", {"graph2": 2})
+        self._write_registry(adapter_dir / "procedural" / "indexed_key_registry.json", {"proc1": 3})
 
         result = _load_simhash_registry(adapter_dir)
 
         assert result == {"graph1": 1, "graph2": 2, "proc1": 3}
 
     def test_reads_interim_tier_files(self, tmp_path):
-        """Interim adapter simhash files are merged in addition to main tiers."""
+        """Interim adapter registry files are merged in addition to main tiers."""
         adapter_dir = tmp_path / "adapters"
-        self._write_simhash(adapter_dir / "episodic" / "simhash_registry.json", {"graph1": 1})
+        self._write_registry(adapter_dir / "episodic" / "indexed_key_registry.json", {"graph1": 1})
         # 2026-05-14 hierarchy: interim slots live under episodic/interim_<stamp>/.
-        self._write_simhash(
-            adapter_dir / "episodic" / "interim_20260501T1200" / "simhash_registry.json",
+        self._write_registry(
+            adapter_dir / "episodic" / "interim_20260501T1200" / "indexed_key_registry.json",
             {"graph5": 5},
         )
 
@@ -182,41 +189,44 @@ class TestLoadSimhashRegistryPerTierPaths:
         """
         adapter_dir = tmp_path / "adapters"
         # Same key in both episodic and semantic.
-        self._write_simhash(adapter_dir / "episodic" / "simhash_registry.json", {"graph1": 111})
-        self._write_simhash(adapter_dir / "semantic" / "simhash_registry.json", {"graph1": 999})
+        self._write_registry(
+            adapter_dir / "episodic" / "indexed_key_registry.json", {"graph1": 111}
+        )
+        self._write_registry(
+            adapter_dir / "semantic" / "indexed_key_registry.json", {"graph1": 999}
+        )
 
         result = _load_simhash_registry(adapter_dir)
 
         # Key is present; value is whichever was read last (semantic after episodic).
         assert "graph1" in result
 
-    def test_old_flat_naming_not_picked_up(self, tmp_path):
-        """Legacy simhash_registry_<tier>.json at adapter_dir root is NOT read.
+    def test_old_simhash_sidecar_not_picked_up(self, tmp_path):
+        """Legacy simhash_registry.json sidecars at tier subdirs are NOT read.
 
-        The old flat paths (simhash_registry_episodic.json, etc.) are no
-        longer written or read.  This test confirms that the new reader
-        does not accidentally pick them up.
+        Fingerprints now live in indexed_key_registry.json.  A stale
+        simhash_registry.json must not be picked up by the new reader.
         """
         adapter_dir = tmp_path / "adapters"
-        adapter_dir.mkdir(parents=True)
-        # Write legacy flat path — must NOT be picked up by the new reader.
-        (adapter_dir / "simhash_registry_episodic.json").write_text(
+        (adapter_dir / "episodic").mkdir(parents=True)
+        # Write legacy sidecar — must NOT be picked up.
+        (adapter_dir / "episodic" / "simhash_registry.json").write_text(
             json.dumps({"legacy_key": 42}), encoding="utf-8"
         )
 
         result = _load_simhash_registry(adapter_dir)
 
         assert "legacy_key" not in result, (
-            "New reader picked up old flat simhash_registry_episodic.json — "
-            "should only read per-tier subdir paths"
+            "Reader picked up stale simhash_registry.json sidecar — "
+            "must only read from indexed_key_registry.json"
         )
 
     def test_malformed_tier_file_skipped(self, tmp_path):
-        """A malformed simhash file is skipped; other tiers are still merged."""
+        """A malformed registry file is skipped; other tiers are still merged."""
         adapter_dir = tmp_path / "adapters"
         (adapter_dir / "episodic").mkdir(parents=True)
-        (adapter_dir / "episodic" / "simhash_registry.json").write_bytes(b"not json!!!")
-        self._write_simhash(adapter_dir / "semantic" / "simhash_registry.json", {"graph2": 2})
+        (adapter_dir / "episodic" / "indexed_key_registry.json").write_bytes(b"not json!!!")
+        self._write_registry(adapter_dir / "semantic" / "indexed_key_registry.json", {"graph2": 2})
 
         result = _load_simhash_registry(adapter_dir)
 

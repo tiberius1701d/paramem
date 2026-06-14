@@ -95,16 +95,8 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     loop.store.tiers_with_registry.return_value = ["episodic", "semantic"]
     loop.store.registry.side_effect = lambda t: ep_registry if t == "episodic" else sem_registry
 
-    # Simhash dicts: episodic holds the keys; semantic is empty.
-    ep_simhash = {k: i + 1 for i, k in enumerate(keys)}
-    sem_simhash: dict = {}
-    loop.store.simhashes_in_tier.side_effect = lambda t: (
-        ep_simhash if t == "episodic" else sem_simhash
-    )
-
     loop._ep_registry = ep_registry
     loop._sem_registry = sem_registry
-    loop._ep_simhash = ep_simhash
     return loop
 
 
@@ -197,11 +189,13 @@ class TestMarkStaleKeys:
         # Semantic registry — no keys → save not called.
         loop._sem_registry.save.assert_not_called()
 
-    def test_simhash_entries_removed_and_persisted(self, tmp_path, monkeypatch):
-        """Erased key is absent from the persisted simhash dict.
+    def test_simhash_entries_removed_from_store(self, tmp_path, monkeypatch):
+        """Erased key is absent from the in-memory simhash map after erase.
 
         Uses a real MemoryStore so discard_keys(mode='erase') actually removes
-        the simhash entry — the saved dict must not contain the erased key.
+        the simhash entry.  Simhash is now unified in indexed_key_registry.json
+        (not a separate sidecar), so we verify the in-memory fingerprint map
+        rather than a separate simhash_registry.json save.
         """
         speaker_id = "Speaker0"
         keys = ["graph2"]
@@ -230,30 +224,16 @@ class TestMarkStaleKeys:
             config=cfg,
         )
 
-        saved_simhash_calls = []
         with patch("paramem.memory.persistence.keys_for_speaker", return_value=set(keys)):
-            with patch(
-                "paramem.memory.persistence.save_registry",
-                side_effect=lambda reg, path: saved_simhash_calls.append((dict(reg), path)),
-            ):
-                client = _make_client(monkeypatch, state)
-                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+            client = _make_client(monkeypatch, state)
+            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200, resp.text
 
         # The real discard_keys(mode="erase") ran — key must be absent from
-        # the in-memory simhash store.
-        assert key not in real_store.simhashes_in_tier("episodic"), (
+        # the in-memory simhash map (active AND stale — a hard erase removes both).
+        assert key not in real_store.tier_simhashes("episodic", include_stale=True), (
             f"Key {key!r} still present in episodic simhash after erase"
-        )
-
-        # save_registry was called for the episodic tier, and the saved dict
-        # does NOT contain the erased key.
-        ep_saves = [(r, p) for r, p in saved_simhash_calls if "episodic" in str(p)]
-        assert ep_saves, "No episodic simhash save recorded"
-        saved_dict, _ = ep_saves[0]
-        assert key not in saved_dict, (
-            f"Erased key {key!r} still present in the persisted episodic simhash dict"
         )
 
     def test_no_keys_no_registry_mutations(self, tmp_path, monkeypatch):
@@ -550,7 +530,31 @@ class TestLiveSlotManifestReStamp:
         ep_reg.add(key_to_forget)
         ep_reg.add(key_to_keep)
 
+        # Build the loop mock, using the real MemoryStore for registry + discard_keys.
+        loop = MagicMock()
+        loop.merger.graph = MagicMock()
+        loop.store = real_store
+
+        # Add a simhash entry so the simhash-clean branch is exercised too.
+        # IMPORTANT: this must happen BEFORE computing H_old so that save_bytes()
+        # (which now includes the unified simhash map) yields a hash that matches
+        # what app.py computes as the pre-erase hash at forget time.
+        fingerprint = compute_simhash(key_to_forget, "Alice", "lives_in", "Berlin")
+        real_store.put(
+            tier_name,
+            key_to_forget,
+            {
+                "key": key_to_forget,
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+            },
+            simhash=fingerprint,
+        )
+
         # Compute H_old — the hash of the registry BEFORE the erase.
+        # Must be computed after all registry mutations (including simhash writes)
+        # because save_bytes() now includes the unified simhash map.
         h_old = hashlib.sha256(ep_reg.save_bytes()).hexdigest()
 
         # Write a real slot directory with a manifest stamped with H_old.
@@ -567,25 +571,6 @@ class TestLiveSlotManifestReStamp:
         # Build config pointing at tmp_path/adapters.
         cfg = MagicMock()
         cfg.adapter_dir = tmp_path / "adapters"
-
-        # Build the loop mock, using the real MemoryStore for registry + discard_keys.
-        loop = MagicMock()
-        loop.merger.graph = MagicMock()
-        loop.store = real_store
-
-        # Add a simhash entry so the simhash-clean branch is exercised too.
-        fingerprint = compute_simhash(key_to_forget, "Alice", "lives_in", "Berlin")
-        real_store.put(
-            tier_name,
-            key_to_forget,
-            {
-                "key": key_to_forget,
-                "subject": "Alice",
-                "predicate": "lives_in",
-                "object": "Berlin",
-            },
-            simhash=fingerprint,
-        )
 
         state = _make_state(
             tmp_path,

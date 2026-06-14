@@ -100,9 +100,9 @@ def _make_verify_loop(tmp_path: Path, model: MagicMock | None = None) -> Consoli
     loop.indexed_key_cache = {}
     loop.cycle_count = 0
     loop.merger = MagicMock()
-    loop.episodic_simhash = {}
-    loop.semantic_simhash = {}
-    loop.procedural_simhash = {}
+    loop.store.replace_simhashes_in_tier("episodic", {})
+    loop.store.replace_simhashes_in_tier("semantic", {})
+    loop.store.replace_simhashes_in_tier("procedural", {})
     return loop
 
 

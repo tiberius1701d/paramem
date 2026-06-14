@@ -101,11 +101,18 @@ def _write_corrupt_registry(ep_dir: Path) -> None:
 
 
 def _write_valid_registry(ep_dir: Path, keys: list[str]) -> None:
-    """Write a valid indexed_key_registry.json."""
+    """Write a valid indexed_key_registry.json with simhash fingerprints for every key.
+
+    Each key is assigned a non-zero placeholder fingerprint so the per-file
+    self-consistency check (active keys must have a fingerprint) passes.
+    """
+    from paramem.memory.entry import compute_simhash
+
     ep_dir.mkdir(parents=True, exist_ok=True)
     reg = KeyRegistry()
     for k in keys:
         reg.add(k)
+        reg.set_simhash(k, compute_simhash(k, "", "", ""))
     (ep_dir / "indexed_key_registry.json").write_bytes(reg.save_bytes())
 
 
@@ -347,9 +354,6 @@ class TestArmActiveMigrationIntegrityGate:
 
         ep_dir = Path(cfg.adapter_dir) / "episodic"
         _write_valid_registry(ep_dir, ["key1"])
-        (ep_dir / "simhash_registry.json").write_text(
-            _json.dumps({"key1": 12345}), encoding="utf-8"
-        )
         # Write a minimal manifest slot so the train-mode manifest check passes
         slot_dir = ep_dir / "20260501-000000"
         slot_dir.mkdir(parents=True, exist_ok=True)

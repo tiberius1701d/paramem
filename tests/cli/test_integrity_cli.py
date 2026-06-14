@@ -34,7 +34,7 @@ _OK_RESPONSE = {
             "detail": "",
         },
         {
-            "path": "/data/ha/adapters/episodic/simhash_registry.json",
+            "path": "/data/ha/adapters/episodic/indexed_key_registry.json",
             "category": "simhash",
             "tier": "episodic",
             "status": "ok",

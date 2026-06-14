@@ -309,26 +309,24 @@ def infra_paths(data_dir: Path) -> list[Path]:
         data_dir / "push_subscriptions.json",
         data_dir / "adapters" / "post_session_queue.json",
     ]
-    # Per-tier adapter registry + simhash + graph (unified layout:
+    # Per-tier adapter registry + graph (unified layout:
     # <adapters>/<tier>/<file> for main slots;
     # <adapters>/<tier>/interim_<stamp>/<file> for interim simulate-mode slots).
-    # graph.json, simhash_registry.json, and indexed_key_registry.json are written
-    # by commit_tier_slot in both simulate and train modes; in simulate mode they
-    # may land under an interim_<stamp> subdirectory instead of the tier root.
+    # graph.json and indexed_key_registry.json are written by commit_tier_slot
+    # in both simulate and train modes; in simulate mode they may land under an
+    # interim_<stamp> subdirectory instead of the tier root.
+    # simhash_registry.json has been eliminated; simhashes now live inside
+    # indexed_key_registry.json under the "simhash" key.
     adapters_root = data_dir / "adapters"
     for _tier in ("episodic", "semantic", "procedural"):
         _tier_root = adapters_root / _tier
         # Main-slot files at the tier root.
         paths.append(_tier_root / "indexed_key_registry.json")
-        paths.append(_tier_root / "simhash_registry.json")
         paths.append(_tier_root / "graph.json")
         # Interim simulate-mode slots under <tier>/interim_<stamp>/ subdirs.
         if _tier_root.exists():
             for _interim_file in _tier_root.rglob("graph.json"):
                 if _interim_file != _tier_root / "graph.json":
-                    paths.append(_interim_file)
-            for _interim_file in _tier_root.rglob("simhash_registry.json"):
-                if _interim_file != _tier_root / "simhash_registry.json":
                     paths.append(_interim_file)
             for _interim_file in _tier_root.rglob("indexed_key_registry.json"):
                 if _interim_file != _tier_root / "indexed_key_registry.json":

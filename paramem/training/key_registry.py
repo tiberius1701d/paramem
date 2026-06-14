@@ -11,6 +11,11 @@ The registry's contents are scoped to one tier:
 - ``active_keys`` — keys assigned to this tier.
 - ``fidelity_history`` — per-key reconstruction-fidelity scores.
 - ``health`` — this tier's learning-capacity status (single record).
+- ``simhash`` — per-key 64-bit fingerprint for the SimHash confidence gate.
+  Active fingerprints live in ``_simhash``; stale fingerprints are carried
+  in the stale record (``_stale[key]["simhash"]``).  Both partitions are
+  serialised to ``indexed_key_registry.json`` under the ``"simhash"`` key
+  (active∪stale superset) so the on-disk file is the single source of truth.
 
 Cross-tier operations (which tier owns key X, the full health map across
 tiers, dropping interim-tier registries at the end of a full cycle) live
@@ -37,7 +42,7 @@ ADAPTER_HEALTH_DEGENERATED = "degenerated"
 
 
 class KeyRegistry:
-    """Tracks one tier's active keys, per-key fidelity, and tier health.
+    """Tracks one tier's active keys, per-key fidelity, tier health, and SimHash fingerprints.
 
     Keys can be in one of three states:
     - **active**: in ``_active_keys``, enumerated by all normal paths.
@@ -47,6 +52,15 @@ class KeyRegistry:
       colliding with the dead free function ``persistence.mark_stale``.
     - **removed**: not present anywhere; via :meth:`remove` (hard erasure,
       used by ``/forget`` and reclaim).
+
+    SimHash fingerprints are co-located on this record.  Active key fingerprints
+    live in ``_simhash``; stale fingerprints are carried inside the stale record
+    (``_stale[key]["simhash"]``) so the fingerprint moves atomically with the
+    active→stale transition.  The two private accessors :meth:`_active_simhashes`
+    and :meth:`_known_simhashes` are intentionally private — the only public path
+    to a fingerprint set is :meth:`MemoryStore.tier_simhashes` with a mandatory
+    ``include_stale`` keyword, which prevents the enumeration-set confusion that
+    was the original bug.
     """
 
     def __init__(self) -> None:
@@ -54,10 +68,13 @@ class KeyRegistry:
         self._fidelity_history: dict[str, list[float]] = defaultdict(list)
         # Single health record for this tier (None = untracked = healthy).
         self._health: dict | None = None
-        # Stale partition: key -> {"stale_since": ISO, "stale_cycles": int}.
+        # Stale partition: key -> {"stale_since": ISO, "stale_cycles": int,
+        #                          "simhash": int (optional but written by stale())}.
         # Keys here are EXCLUDED from normal enumeration and the SimHash gate.
-        # Their simhash entries are retained on disk for the stale-echo seam.
+        # Their simhash entries are retained for the stale-echo seam.
         self._stale: dict[str, dict] = {}
+        # Active-key SimHash fingerprints.  Stale fingerprints live in _stale records.
+        self._simhash: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Active-key set
@@ -69,7 +86,7 @@ class KeyRegistry:
             self._active_keys.append(key)
 
     def remove(self, key: str) -> None:
-        """Hard-remove a key from this tier (active list, stale set, fidelity).
+        """Hard-remove a key from this tier (active list, stale set, fidelity, simhash).
 
         Used by ``/forget`` (privacy erasure) and the reclaim path.  A removed
         key is GONE — neither active nor stale.  Does not raise on absent keys.
@@ -77,13 +94,15 @@ class KeyRegistry:
         self._active_keys = [k for k in self._active_keys if k != key]
         self._fidelity_history.pop(key, None)
         self._stale.pop(key, None)
+        self._simhash.pop(key, None)
 
     def stale(self, key: str) -> None:
         """Move *key* from active to the stale partition (idempotent).
 
         A stale key is excluded from :meth:`list_active`, :meth:`__contains__`,
         and :meth:`__len__`, but retained in ``_stale`` for the stale-echo probe
-        seam.  Its simhash entry is kept on disk.
+        seam.  Its simhash entry is carried into the stale record so the
+        fingerprint cannot be silently dropped by forgetting the move dance.
 
         :meth:`stale_cycles` starts at 0.  Calling ``stale`` on an already-stale
         or absent key is a no-op.
@@ -92,10 +111,18 @@ class KeyRegistry:
             self._active_keys = [k for k in self._active_keys if k != key]
             self._fidelity_history.pop(key, None)
             if key not in self._stale:
-                self._stale[key] = {
+                rec: dict = {
                     "stale_since": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                     "stale_cycles": 0,
                 }
+                # Carry the active simhash into the stale record atomically.
+                active_fp = self._simhash.pop(key, None)
+                if active_fp is not None:
+                    rec["simhash"] = active_fp
+                self._stale[key] = rec
+            else:
+                # Already stale — just remove the active simhash if it leaked.
+                self._simhash.pop(key, None)
 
     def knows(self, key: str) -> bool:
         """True when *key* is legitimately tracked by this tier — active OR stale.
@@ -129,6 +156,84 @@ class KeyRegistry:
     def is_stale(self, key: str) -> bool:
         """Return True when *key* is in the stale partition of this tier."""
         return key in self._stale
+
+    # ------------------------------------------------------------------
+    # SimHash fingerprints — single source of truth for active AND stale
+    # ------------------------------------------------------------------
+
+    def set_simhash(self, key: str, fingerprint: int) -> None:
+        """Store the SimHash fingerprint for *key* in the active partition.
+
+        If *key* is stale, the fingerprint is written into the stale record
+        (``_stale[key]["simhash"]``) instead of ``_simhash``.  This keeps
+        the active–stale invariant intact regardless of when the caller mints
+        the fingerprint relative to the lifecycle transition.
+        """
+        if key in self._stale:
+            self._stale[key]["simhash"] = fingerprint
+        else:
+            self._simhash[key] = fingerprint
+
+    def drop_simhash(self, key: str) -> None:
+        """Remove the SimHash fingerprint for *key* from both partitions."""
+        self._simhash.pop(key, None)
+        if key in self._stale:
+            self._stale[key].pop("simhash", None)
+
+    def simhash_for(self, key: str) -> int | None:
+        """Return the SimHash fingerprint for *key* from active OR stale partition.
+
+        Returns ``None`` when the key has no stored fingerprint in either
+        partition.  Reading both partitions is load-bearing: a stale key that
+        still has a fingerprint must be verifiable by the stale-echo confidence
+        gate without first knowing which partition holds it.
+        """
+        fp = self._simhash.get(key)
+        if fp is not None:
+            return fp
+        stale_rec = self._stale.get(key)
+        if stale_rec is not None:
+            return stale_rec.get("simhash")
+        return None
+
+    def has_simhash(self, key: str) -> bool:
+        """``True`` when *key* has a stored fingerprint in active OR stale partition."""
+        return key in self._simhash or (key in self._stale and "simhash" in self._stale[key])
+
+    def _active_simhashes(self) -> dict[str, int]:
+        """Active-only fingerprint map ``{key: fp}``.
+
+        Returns all fingerprints in ``_simhash`` directly — the invariant
+        enforced by :meth:`set_simhash` is that stale-key fingerprints are
+        routed to ``_stale[key]["simhash"]`` instead, so ``_simhash`` holds
+        only non-stale (active) entries by construction.  This also covers
+        replay-disabled stores where ``_active_keys`` is empty but ``_simhash``
+        is populated via :meth:`MemoryStore.replace_simhashes_in_tier`.
+
+        PRIVATE — intentionally not a public accessor.  The only public path to
+        a fingerprint *set* is :meth:`MemoryStore.tier_simhashes` with the
+        mandatory ``include_stale`` keyword, which makes the active-vs-known
+        distinction impossible to forget at the call site.
+        """
+        return dict(self._simhash)
+
+    def _known_simhashes(self) -> dict[str, int]:
+        """Active∪stale fingerprint map ``{key: fp}`` for all keys that have one.
+
+        PRIVATE — intentionally not a public accessor.  Used by
+        :meth:`MemoryStore.tier_simhashes(include_stale=True)`,
+        :meth:`MemoryStore.snapshot`, and the integrity check.
+
+        The returned map is what is serialised to ``indexed_key_registry.json``
+        under the ``"simhash"`` key, so the on-disk file always holds the full
+        active∪stale superset that the integrity invariant requires.
+        """
+        result: dict[str, int] = dict(self._simhash)
+        # Stale fingerprints.
+        for k, rec in self._stale.items():
+            if "simhash" in rec:
+                result[k] = rec["simhash"]
+        return result
 
     def get_reclaimable(self, min_stale_cycles: int) -> list[str]:
         """Return stale keys whose ``stale_cycles`` >= *min_stale_cycles*.
@@ -254,15 +359,21 @@ class KeyRegistry:
         adapter manifest, then calls :meth:`save_from_bytes` with the same
         payload so the on-disk hash is byte-identical to the manifested one.
 
-        The ``"stale"`` field is additive: old files that lack it load as
-        ``{}`` via :meth:`load`'s ``data.get("stale", {})``.  Old readers
-        simply ignore the extra key (downgrade unsupported, acceptable).
+        The ``"simhash"`` field holds the active∪stale fingerprint superset
+        (``_known_simhashes()``).  This is the unified on-disk layout; the
+        separate ``simhash_registry.json`` file has been removed.
+
+        A file written by this method will be read back by :meth:`load`
+        which expects ``"simhash"`` to be present — files without it (old
+        schema or fresh-start) are treated as a fresh/empty store per the
+        fresh-start mandate.
         """
         data = {
             "active_keys": self._active_keys,
             "fidelity_history": dict(self._fidelity_history),
             "health": dict(self._health) if self._health is not None else None,
             "stale": dict(self._stale),
+            "simhash": self._known_simhashes(),
         }
         return json.dumps(data, indent=2).encode("utf-8")
 
@@ -316,16 +427,32 @@ class KeyRegistry:
         health = data.get("health")
         if isinstance(health, dict) and "status" in health:
             registry._health = dict(health)
-        # Backward-compat: pre-existing files have no "stale" key → load as {}.
         stale_raw = data.get("stale", {})
         if isinstance(stale_raw, dict):
             registry._stale = {k: dict(v) for k, v in stale_raw.items() if isinstance(v, dict)}
 
+        # Load the unified simhash map (active∪stale fingerprints).
+        # New schema: "simhash" key is present.  Old-schema files that pre-date
+        # the unification lack this key; per the fresh-start mandate they are
+        # treated as having an empty fingerprint map — no legacy-file fallback
+        # (i.e. never read simhash_registry.json or any other file).
+        simhash_raw = data.get("simhash", {})
+        if isinstance(simhash_raw, dict):
+            for k, fp in simhash_raw.items():
+                if isinstance(fp, int):
+                    # Route to the correct partition: stale keys' fingerprints
+                    # go into the stale record; active keys' go into _simhash.
+                    if k in registry._stale:
+                        registry._stale[k]["simhash"] = fp
+                    else:
+                        registry._simhash[k] = fp
+
         logger.info(
-            "Key registry loaded from %s: %d active keys, %d stale, health=%s",
+            "Key registry loaded from %s: %d active keys, %d stale, %d fingerprints, health=%s",
             path,
             len(registry._active_keys),
             len(registry._stale),
+            len(registry._simhash) + sum(1 for r in registry._stale.values() if "simhash" in r),
             "set" if registry._health is not None else "unset",
         )
         return registry

@@ -658,11 +658,12 @@ class TestBuildTierGraphKeyError:
 
 
 class TestBuildTierGraphStaleProjection:
-    """R2-MAJOR (R3-1 filter variant): stale keys in simhash_registry must NOT
-    be projected into graph.json, but their simhash entries are retained on disk.
+    """Stale keys must NOT be projected into graph.json, but their simhash
+    entries are retained on disk.
 
-    The fix keeps `simhashes_in_tier` as the enumeration spine (so replay-disabled
-    stores work correctly) but skips stale keys via `store.is_stale()`.
+    The enumeration spine is ``tier_simhashes(include_stale=False)`` so only
+    active keys are projected; replay-disabled stores have no registry and rely
+    on the simhash map populated via ``replace_simhashes_in_tier``.
     """
 
     def test_stale_key_excluded_from_graph_no_key_error(self):
@@ -701,15 +702,15 @@ class TestBuildTierGraphStaleProjection:
         assert len(entries) == 1, f"Expected 1 edge (active only); got {entries}"
         assert entries[0]["key"] == "graph_active"
 
-        # Stale simhash is RETAINED in the simhash dict (not reaped).
-        assert "graph_stale" in store.simhashes_in_tier("episodic"), (
+        # Stale simhash is RETAINED in the known (active∪stale) fingerprint map.
+        assert "graph_stale" in store.tier_simhashes("episodic", include_stale=True), (
             "Stale key simhash must be retained on the store"
         )
 
     def test_active_key_without_entry_still_raises(self):
-        """An ACTIVE key in simhashes_in_tier that has no entry raises KeyError.
+        """An active key in the simhash map that has no entry raises KeyError.
 
-        This guards against the stale-key fix silently suppressing data-integrity
+        This guards against stale-key filtering silently suppressing data-integrity
         errors on active keys.
         """
         from paramem.memory.store import MemoryStore

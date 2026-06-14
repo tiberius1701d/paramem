@@ -116,9 +116,9 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.indexed_key_cache = {}
     loop._indexed_next_index = 1
     loop._procedural_next_index = 1
-    loop.episodic_simhash = {}
-    loop.semantic_simhash = {}
-    loop.procedural_simhash = {}
+    loop.store.replace_simhashes_in_tier("episodic", {})
+    loop.store.replace_simhashes_in_tier("semantic", {})
+    loop.store.replace_simhashes_in_tier("procedural", {})
     loop.cycle_count = 0
     loop.promoted_keys = set()
     loop.pending_interim_triples = []
@@ -193,7 +193,6 @@ class TestFirstCallCreatesInterimAdapter:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
         ):
             result = loop.post_session_train(
@@ -236,7 +235,6 @@ class TestFirstCallCreatesInterimAdapter:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
         ):
             loop.post_session_train(
@@ -279,7 +277,6 @@ class TestSecondCallReusesAdapter:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
         ):
             loop.post_session_train(
@@ -333,7 +330,6 @@ class TestStampRolloverCreatesNewAdapter:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
         ):
             result = loop.post_session_train(
@@ -586,7 +582,6 @@ class TestRegisterAfterSuccessNotBefore:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
         ):
             loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
@@ -626,7 +621,6 @@ class TestRegisterAfterSuccessNotBefore:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
         ):
             loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
@@ -688,7 +682,6 @@ _COMMON_PATCHES = [
     "paramem.training.consolidation.format_entry_training",
     "paramem.models.loader.switch_adapter",
     "paramem.training.consolidation.build_registry",
-    "paramem.training.consolidation.save_registry",
     "paramem.models.loader.save_adapter",
 ]
 
@@ -725,7 +718,6 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
             patch.object(loop, "_run_indexed_key_procedural") as mock_proc,
         ):
@@ -779,7 +771,6 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
             patch.object(loop, "_run_indexed_key_procedural") as mock_proc,
         ):
@@ -820,7 +811,6 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
             patch.object(loop, "_run_indexed_key_procedural") as mock_proc,
         ):
@@ -876,7 +866,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             "object": "OldThing",
             "speaker_id": "",
         }
-        loop.store.simhashes_in_tier("procedural")[old_proc_key] = 0xDEADBEEF
+        loop.store.put_simhash("procedural", old_proc_key, 0xDEADBEEF)
         loop.store._entries_flat_view()[old_proc_key] = old_qa_entry
 
         call_count = {"n": 0}
@@ -967,7 +957,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
         )
 
         # Old contradicted key must NOT have been retired from procedural_simhash.
-        assert old_proc_key in loop.store.simhashes_in_tier("procedural"), (
+        assert old_proc_key in loop.store.tier_simhashes("procedural", include_stale=False), (
             "Old procedural key must still be in procedural_simhash after training failure."
         )
 
@@ -1047,7 +1037,6 @@ class TestTrainingOutputDirUniqueness:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
         ):
             loop.post_session_train(
@@ -1131,7 +1120,6 @@ class TestTrainingOutputDirUniqueness:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.models.loader.save_adapter"),
             # Mock _run_indexed_key_procedural at the method level to inspect what
             # _training_output_dir returns when called with the stamp in effect.
@@ -1185,7 +1173,7 @@ class TestRegistryLastWriteOrder:
 
         The required call sequence is:
         save_bytes → hash → quads.json → build_manifest_for →
-        save_adapter → save_registry (SimHash) → save_from_bytes.
+        save_adapter → save_from_bytes (registry-as-commit-signal).
 
         We verify: save_adapter precedes save_from_bytes in the call sequence.
         """
@@ -1217,7 +1205,6 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch(
                 "paramem.models.loader.save_adapter",
@@ -1273,7 +1260,6 @@ class TestRegistryLastWriteOrder:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
             patch("paramem.models.loader.save_adapter", side_effect=_fail_save_adapter),
         ):
@@ -1637,7 +1623,6 @@ class TestManifestWrittenPostSession:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.training.consolidation.save_registry"),
         ):
             result = loop.post_session_train(
                 "Transcript",
