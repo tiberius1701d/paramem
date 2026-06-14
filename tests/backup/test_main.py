@@ -241,8 +241,14 @@ class TestPostJsonToken:
 
         assert captured_headers.get("Authorization") == "Bearer my-token"
 
-    def test_no_token_sends_no_authorization_header(self):
-        """post_json() with no token → no Authorization header."""
+    def test_no_token_sends_no_authorization_header(self, monkeypatch):
+        """post_json() with no token and no env → no Authorization header.
+
+        ``token=None`` (the default) triggers auto-resolve.  When no token is
+        configured (env absent, files disabled), ``resolve_token`` returns
+        ``None`` and no header is sent, preserving auth-OFF server compatibility.
+        """
+        monkeypatch.delenv("PARAMEM_API_TOKEN", raising=False)
         captured_headers = {}
 
         def fake_post(url, *, json=None, headers=None):
@@ -259,8 +265,14 @@ class TestPostJsonToken:
 
         assert "Authorization" not in captured_headers
 
-    def test_token_none_explicit_sends_no_header(self):
-        """post_json(token=None) → no Authorization header (backward-compatible)."""
+    def test_token_none_explicit_sends_no_header(self, monkeypatch):
+        """post_json(token=None) with no env → no Authorization header.
+
+        Explicit ``None`` triggers auto-resolve, which returns ``None`` when
+        no token is configured.  File lookups are disabled by the conftest
+        ``PARAMEM_CLI_NO_TOKEN_FILES=1`` flag.
+        """
+        monkeypatch.delenv("PARAMEM_API_TOKEN", raising=False)
         captured_headers = {}
 
         def fake_post(url, *, json=None, headers=None):
@@ -278,13 +290,20 @@ class TestPostJsonToken:
         assert "Authorization" not in captured_headers
 
 
-def test_token_passed_to_post_json_when_env_set(config_file, monkeypatch):
-    """PARAMEM_API_TOKEN in env → token forwarded to post_json as Authorization bearer."""
+def test_backup_main_delegates_token_resolution_to_post_json(config_file, monkeypatch):
+    """backup/__main__ does not pass an explicit token — auto-resolve runs in post_json.
+
+    Token resolution is no longer the responsibility of backup/__main__; it is
+    handled uniformly at the http_client boundary via resolve_token().  This
+    test verifies that main() passes no explicit token kwarg to post_json and
+    exits 0 (i.e. the delegation still succeeds regardless of whether a token
+    is present in the environment).
+    """
     cfg_path, _ = config_file
-    monkeypatch.setenv("PARAMEM_API_TOKEN", "test-secret-token")
     calls = {}
 
     def fake_post(url, body, *, timeout, token=None):
+        calls["token_kwarg_present"] = "token" in locals()
         calls["token"] = token
         return {
             "success": True,
@@ -295,30 +314,9 @@ def test_token_passed_to_post_json_when_env_set(config_file, monkeypatch):
         }
 
     monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
-    monkeypatch.setattr("paramem.backup.runner.run_scheduled_backup", lambda **k: None)
 
-    backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
-    assert calls.get("token") == "test-secret-token"
-
-
-def test_token_is_none_when_env_unset(config_file, monkeypatch):
-    """PARAMEM_API_TOKEN absent → token=None (unauthenticated, preserves auth-OFF behaviour)."""
-    cfg_path, _ = config_file
-    monkeypatch.delenv("PARAMEM_API_TOKEN", raising=False)
-    calls = {}
-
-    def fake_post(url, body, *, timeout, token=None):
-        calls["token"] = token
-        return {
-            "success": True,
-            "tier": "daily",
-            "written_slots": {},
-            "skipped_artifacts": [],
-            "error": None,
-        }
-
-    monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
-    monkeypatch.setattr("paramem.backup.runner.run_scheduled_backup", lambda **k: None)
-
-    backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+    rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+    assert rc == 0
+    # backup/__main__ passes no explicit token — the default (None) applies;
+    # real resolution happens inside post_json itself when it isn't patched.
     assert calls.get("token") is None

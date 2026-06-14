@@ -58,6 +58,10 @@ if not _gpu_explicitly_requested(sys.argv):
 # ``sys.modules``; the later ``load_dotenv`` call sets the env var but the
 # already-built middleware retains ``self._token = ""``.
 os.environ.pop("PARAMEM_API_TOKEN", None)
+# Prevent resolve_token() from reading the real repo .env or ~/.config/paramem/
+# secrets during tests.  Auth-specific tests that need file-based resolution
+# opt back in by passing allow_files=True against a temp tree.
+os.environ["PARAMEM_CLI_NO_TOKEN_FILES"] = "1"
 
 # ---------------------------------------------------------------------------
 
