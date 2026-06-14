@@ -329,8 +329,8 @@ def _delete_weight_slots(slot_root: Path) -> int:
     """Delete adapter weight-slot subdirectories under *slot_root*.
 
     A weight slot is a subdirectory containing ``adapter_model.safetensors`` or
-    ``adapter_config.json``.  ``graph.json``, ``simhash_registry.json``, and
-    ``indexed_key_registry.json`` at the slot-root top level are preserved.
+    ``adapter_config.json``.  ``graph.json`` and ``indexed_key_registry.json``
+    at the slot-root top level are preserved.
     Returns the number of slots removed.
     """
     deleted = 0
@@ -530,9 +530,8 @@ def _migrate_tier_simulate_to_train(
     6. Recall probe via ``loop._run_recall_sanity_probe(name, entries)``
        at threshold 1.0 — stricter than the 0.95 in-process default.
     7. On pass: ``atomic_save_adapter`` writes the slot under the resolved
-       slot root, SimHash registry written to
-       ``<slot_root>/simhash_registry.json``.
-       Delete the source graph.json.
+       slot root.  ``indexed_key_registry.json`` (carrying the unified simhash
+       map) is written as the commit signal.  Delete the source graph.json.
     8. On fail: reset the adapter back to LoRA-zero so failure does not
        leave half-trained weights resident, raise ``RuntimeError``.
     """
@@ -655,8 +654,8 @@ def _migrate_tier_simulate_to_train(
     # empty, find_live_slot can never match it on the next boot/reload, and the
     # adapter silently fails to mount (recall then returns 0 keys → boot_degraded).
     _tier_reg = loop.store.registry(name)
-    _reg_payload = _tier_reg.save_bytes() if _tier_reg is not None else None
-    _reg_sha = hashlib.sha256(_reg_payload).hexdigest() if _reg_payload is not None else None
+    _reg_payload = _tier_reg.save_bytes()
+    _reg_sha = hashlib.sha256(_reg_payload).hexdigest()
 
     fingerprint_cache = getattr(loop, "fingerprint_cache", None)
     try:
@@ -683,25 +682,7 @@ def _migrate_tier_simulate_to_train(
         manifest=manifest,
     )
 
-    # Step 7b: persist the per-store SimHash registry inside the slot root.
-    # Mirrors training/consolidation.py::_save_adapters — without this file the
-    # boot-time _load_simhash_registry returns an empty {} for this store, and
-    # probe_entries / probe_key then treat every recalled key as untrained
-    # (verify_confidence → 0.0 → low_confidence:0.000), so every personal query
-    # silently abstains even though the adapter recalls correctly. The simhash
-    # was already built in Step 2 (replace_simhashes_in_tier); persist it as
-    # {key: int} shape that _load_simhash_registry / get_simhash expect.
-    from paramem.memory.persistence import save_registry as _save_registry
-
-    _simhash = loop.store.simhashes_in_tier(name)
-    if _simhash:
-        slot_root.mkdir(parents=True, exist_ok=True)
-        _save_registry(
-            _simhash,
-            slot_root / "simhash_registry.json",
-        )
-
-    # Step 7c2: flush the exact registry bytes that were hashed into the manifest
+    # Step 7b: flush the exact registry bytes that were hashed into the manifest
     # so find_live_slot matches meta.registry_sha256 against the tier registry on
     # the next boot/reload (mirrors consolidation._save_adapters — registry written
     # last as the commit signal, so its presence on disk means all preceding files are complete).

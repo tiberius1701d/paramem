@@ -4104,9 +4104,9 @@ async def integrity_check():
     """Run the infrastructure integrity check and return the report.
 
     Cloud-only-safe — no GPU or model dependency.  Verifies every tier's
-    ``indexed_key_registry.json``, ``simhash_registry.json``, ``meta.json``
-    (live weight slot), and ``graph.json`` (simulate mode only), plus common
-    files (``key_metadata.json``, ``speaker_profiles.json``,
+    ``indexed_key_registry.json`` (which now carries the unified simhash map),
+    ``meta.json`` (live weight slot), and ``graph.json`` (simulate mode only),
+    plus common files (``key_metadata.json``, ``speaker_profiles.json``,
     ``observed_languages.json``, ``state/backup.json``).
 
     Returns a JSON report with ``ok``, ``checks``, and ``failures`` fields.
@@ -5205,8 +5205,8 @@ def _live_reload_base_model(
     # local frame kept the prior model alive). Instead we drop both
     # entirely; the next consolidation tick lazily re-creates them via
     # ``create_consolidation_loop``, which seeds from disk
-    # (``key_metadata.json``, ``indexed_key_registry.json``,
-    # ``simhash_registry_*.json``). The only state that resets is
+    # (``key_metadata.json``, ``indexed_key_registry.json``). The only state
+    # that resets is
     # ``cycle_count`` (used for debug snapshot dir naming) — acceptable
     # tradeoff for getting the device back to a fresh memory profile.
     # Release our own model first so the occupancy snapshot below reflects
@@ -6195,7 +6195,6 @@ async def speaker_forget(request: SpeakerForgetRequest):
     a handler branch here when that strategy is needed.
     """
     from paramem.memory.persistence import keys_for_speaker as _keys_for_speaker
-    from paramem.memory.persistence import save_registry as _save_simhash_registry
 
     if request.strategy != "mark_stale":
         raise HTTPException(
@@ -6241,23 +6240,15 @@ async def speaker_forget(request: SpeakerForgetRequest):
         _tier_pre_sha: dict[str, str] = {}
         for _tier_name in loop.store.tiers_with_registry():
             _reg = loop.store.registry(_tier_name)
-            if _reg is not None and any(_reg.knows(k) for k in stale_keys):
+            if any(_reg.knows(k) for k in stale_keys):
                 _tiers_with_keys.append(_tier_name)
                 _tier_pre_sha[_tier_name] = _hashlib.sha256(_reg.save_bytes()).hexdigest()
-
-        _main_tiers_with_simhash: list[str] = [
-            t
-            for t in ("episodic", "semantic", "procedural")
-            if any(k in loop.store.simhashes_in_tier(t) for k in stale_keys)
-        ]
 
         loop.store.discard_keys(stale_keys, mode="erase")
 
         # Persist updated registries for affected tiers.
         for tier_name in _tiers_with_keys:
             registry = loop.store.registry(tier_name)
-            if registry is None:
-                continue
             tier_reg_path = config.adapter_dir / tier_name / "indexed_key_registry.json"
             # ORDERING IS LOAD-BEARING: registry.save (durable privacy erase) FIRST,
             # then manifest re-stamp.  A crash between the two leaves the slot in the
@@ -6306,19 +6297,6 @@ async def speaker_forget(request: SpeakerForgetRequest):
                 _write_manifest(_slot, _replace(_read_manifest(_slot), registry_sha256=_h_new))
             logger.info(
                 "speaker/forget: removed key(s) from KeyRegistry tier %s for speaker %s",
-                tier_name,
-                speaker_id,
-            )
-
-        # Persist updated simhash registries for affected main tiers.
-        for tier_name in _main_tiers_with_simhash:
-            simhashes = loop.store.simhashes_in_tier(tier_name)
-            _save_simhash_registry(
-                simhashes,
-                config.adapter_dir / tier_name / "simhash_registry.json",
-            )
-            logger.info(
-                "speaker/forget: removed simhash entry(ies) from tier %s for speaker %s",
                 tier_name,
                 speaker_id,
             )
@@ -12178,9 +12156,9 @@ def _extract_and_start_training():
         # maintained by interim or full-cycle production paths post-Phase-3+5,
         # and the temporal-query reader (filter_registry_by_date) — itself
         # retired in Plan A.3 — needed fields the writer never emitted.
-        # Per-adapter simhash_registry_<adapter>.json files are now the
-        # canonical source of truth; inference._load_simhash_registry combines
-        # them at read time.
+        # Per-adapter indexed_key_registry.json files carry the unified simhash
+        # map; inference._load_simhash_registry reads the "simhash" key from
+        # each one at boot time.
         _save_key_metadata(loop, config)
         # Per-tier graph.json is written by commit_tier_slot inside
         # run_consolidation_cycle; cycle_<N>/ snapshots are dropped.

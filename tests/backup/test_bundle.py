@@ -17,8 +17,7 @@ Covers the recovery set:
 - adapter_scope="main" with episodic interim-only → fail-loud with actionable
   message directing to "live" or full consolidation.
 - adapter_scope="live" → succeeds capturing the episodic interim slot.
-- Missing optional artifacts (indexed_key_registry.json, simhash_registry.json)
-  → recorded absent, no crash.
+- Missing optional artifacts (indexed_key_registry.json) → recorded absent, no crash.
 - Fail-loud when adapter_scope resolves no slot for episodic at all.
 - Non-episodic tier with no main slot → recorded absent, no failure.
 - Crash-safety: rename failure leaves pending residue swept by
@@ -122,7 +121,6 @@ def _make_fixtures(
     tmp_path: Path,
     *,
     weight_bytes: bytes = b"fake_plain_weights",
-    include_simhash: bool = True,
     include_indexed_key_registry: bool = True,
     include_speaker_profiles: bool = False,
 ) -> dict:
@@ -171,9 +169,6 @@ def _make_fixtures(
     if include_indexed_key_registry:
         (episodic_dir / "indexed_key_registry.json").write_bytes(indexed_key_content)
 
-    if include_simhash:
-        (episodic_dir / "simhash_registry.json").write_bytes(b'{"simhash": {}}')
-
     # Speaker profiles (optional)
     speaker_profiles_path = None
     if include_speaker_profiles:
@@ -205,7 +200,6 @@ def _make_interim_family(
     registry_sha256: str,
     weight_bytes: bytes = b"fake_interim_weights",
     include_indexed_key_registry: bool = True,
-    include_simhash: bool = True,
 ) -> tuple[Path, Path]:
     """Create a nested interim family under episodic_dir.
 
@@ -254,11 +248,6 @@ def _make_interim_family(
     if include_indexed_key_registry:
         (interim_family_dir / "indexed_key_registry.json").write_bytes(
             b'{"keys": {"interim_key": "val"}}'
-        )
-
-    if include_simhash:
-        (interim_family_dir / "simhash_registry.json").write_bytes(
-            b'{"simhash": {"interim_hash": 12345}}'
         )
 
     interim_slot_dir = interim_family_dir / slot_name
@@ -407,9 +396,13 @@ class TestWriteBundleHappyPath:
         assert (episodic_dir / "adapter_config.json").exists()
         assert (episodic_dir / "meta.json").exists()
 
-    def test_simhash_present_true_when_file_exists(self, tmp_path) -> None:
-        """adapters record has simhash_present=True when simhash_registry.json exists."""
-        fixtures = _make_fixtures(tmp_path, include_simhash=True)
+    def test_simhash_present_field_absent_from_adapters_record(self, tmp_path) -> None:
+        """The simhash_present field is absent — simhashes are unified in indexed_key_registry.json.
+
+        The old simhash_registry.json sidecar has been eliminated; no separate
+        simhash_present flag appears in the adapters record.
+        """
+        fixtures = _make_fixtures(tmp_path)
         slot = write_bundle(
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],
@@ -421,7 +414,7 @@ class TestWriteBundleHappyPath:
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
         )
-        assert manifest.adapters["episodic"]["simhash_present"] is True
+        assert "simhash_present" not in manifest.adapters["episodic"]
 
     def test_keyed_pairs_always_false(self, tmp_path) -> None:
         """keyed_pairs_present must always be False (QA pairs are transient)."""
@@ -745,8 +738,12 @@ class TestInterimSlotCapture:
         )
         assert manifest.adapters[interim_key]["indexed_key_registry_present"] is True
 
-    def test_interim_simhash_captured(self, tmp_path) -> None:
-        """simhash_registry.json from the interim-family dir is captured."""
+    def test_interim_no_simhash_file_in_bundle(self, tmp_path) -> None:
+        """simhash_registry.json is not captured — simhashes are in indexed_key_registry.json.
+
+        The old sidecar has been eliminated; the bundle captures only
+        indexed_key_registry.json (which carries the unified simhash map).
+        """
         data_dir = tmp_path / "ha"
         data_dir.mkdir()
         config_path = data_dir / "server.yaml"
@@ -767,7 +764,6 @@ class TestInterimSlotCapture:
             stamp="20260517T1200",
             slot_name="20260517-180430",
             registry_sha256=interim_hash,
-            include_simhash=True,
         )
 
         slot = write_bundle(
@@ -781,11 +777,13 @@ class TestInterimSlotCapture:
         )
 
         interim_key = "episodic_interim_20260517T1200"
-        assert (slot / "adapters" / interim_key / "simhash_registry.json").exists()
+        assert not (slot / "adapters" / interim_key / "simhash_registry.json").exists(), (
+            "simhash_registry.json must not be captured — sidecar eliminated"
+        )
         manifest = BundleManifest.from_dict(
             json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
         )
-        assert manifest.adapters[interim_key]["simhash_present"] is True
+        assert "simhash_present" not in manifest.adapters[interim_key]
 
 
 # ---------------------------------------------------------------------------
@@ -833,7 +831,6 @@ class TestMultiAdapterBundle:
             adapter_name="procedural",
         )
         (procedural_dir / "indexed_key_registry.json").write_bytes(proc_content)
-        (procedural_dir / "simhash_registry.json").write_bytes(b'{"simhash": {"proc": 9}}')
 
         # Episodic: NO main slot, only an interim family — hash from its own registry.
         interim_content = b'{"keys": {"interim_key": "val"}}'
@@ -1154,30 +1151,18 @@ class TestScaffoldingExclusion:
 
 
 # ---------------------------------------------------------------------------
-# Missing optional artifact: simhash_registry.json absent
+# Missing optional artifact: indexed_key_registry.json absent
 # ---------------------------------------------------------------------------
 
 
 class TestMissingOptionalArtifact:
-    def test_no_simhash_no_crash(self, tmp_path) -> None:
-        """Missing simhash_registry.json → simhash_present=False, no exception."""
-        fixtures = _make_fixtures(tmp_path, include_simhash=False)
-        slot = write_bundle(
-            config_path=fixtures["config_path"],
-            registry_path=fixtures["registry_path"],
-            adapter_dirs=fixtures["adapter_dirs"],
-            base_dir=fixtures["base_dir"],
-            meta_fields={"tier": "manual"},
-            live_registry_sha256=fixtures["registry_sha256"],
-        )
-        manifest = BundleManifest.from_dict(
-            json.loads((slot / "bundle.meta.json").read_text(encoding="utf-8"))
-        )
-        assert manifest.adapters["episodic"]["simhash_present"] is False
+    def test_no_simhash_registry_file_in_bundle(self, tmp_path) -> None:
+        """simhash_registry.json is never written to the bundle — sidecar eliminated.
 
-    def test_no_simhash_file_in_bundle(self, tmp_path) -> None:
-        """When simhash absent at source, no simhash file in bundle slot."""
-        fixtures = _make_fixtures(tmp_path, include_simhash=False)
+        Simhashes live in indexed_key_registry.json under the 'simhash' key;
+        there is no separate simhash_registry.json file in a bundle slot.
+        """
+        fixtures = _make_fixtures(tmp_path)
         slot = write_bundle(
             config_path=fixtures["config_path"],
             registry_path=fixtures["registry_path"],

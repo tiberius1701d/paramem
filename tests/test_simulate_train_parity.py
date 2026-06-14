@@ -232,7 +232,7 @@ class TestSimulateTrainParity:
         a second time leaves existing entries' first_seen_cycle unchanged.
       - Gap 4: per-tier scope — active_keys_in_tier returns identical sorted
         key lists in both modes.
-      - Equality: simhashes_in_tier, store entries, and on-disk
+      - Equality: tier_simhashes, store entries, and on-disk
         indexed_key_registry bytes are bytewise-equal between modes.
 
     Gap 1 (enrichment) is verified separately in test_graph_enrichment.py;
@@ -419,8 +419,8 @@ class TestSimulateTrainParity:
         self._run_sim(loop_sim)
         self._run_train(loop_train)
 
-        sim_hashes = dict(loop_sim.store.simhashes_in_tier(adapter_name))
-        train_hashes = dict(loop_train.store.simhashes_in_tier(adapter_name))
+        sim_hashes = dict(loop_sim.store.tier_simhashes(adapter_name, include_stale=False))
+        train_hashes = dict(loop_train.store.tier_simhashes(adapter_name, include_stale=False))
 
         assert sim_hashes == train_hashes, (
             f"Simhash registries diverged for tier {adapter_name!r}:\n"

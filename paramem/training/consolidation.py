@@ -38,7 +38,6 @@ from paramem.memory.entry import (
     compute_simhash,
     format_entry_training,
 )
-from paramem.memory.persistence import save_registry
 from paramem.models.loader import atomic_save_adapter, switch_adapter
 from paramem.server.vram_guard import safe_empty_cache
 from paramem.training.curriculum import CurriculumSampler
@@ -592,15 +591,16 @@ class ConsolidationLoop:
     # they are NOT part of the supported API and MUST be deleted once
     # tests are migrated.
     #
-    # Read-write coupling: the simhash trio and indexed_key_cache return
-    # the *live* internal dicts via the store, so existing tests that
-    # mutate them (``loop.X_simhash[key] = v``, ``loop.indexed_key_cache[k] = v``)
-    # propagate to the store.  ``indexed_key_registry`` returns the store's
-    # internal dict for the same reason.
+    # Read-write coupling: indexed_key_cache returns the *live* internal dict
+    # via the store, so existing tests that mutate it
+    # (``loop.indexed_key_cache[k] = v``) propagate to the store.
+    # ``indexed_key_registry`` returns the store's internal dict for the same
+    # reason.
     #
-    # TODO(arch-cleanup): delete these six properties + the two `_*` aliases
-    # once `tests/` no longer references the legacy names.  Tracked under
-    # the architecture-cleanup task.
+    # TODO(arch-cleanup): delete indexed_key_cache + indexed_key_registry
+    # (+ the two _*-aliases) once all remaining test sites are migrated.
+    # The episodic_simhash/semantic_simhash/procedural_simhash trio was deleted
+    # 2026-06-13; call sites now use store.replace_simhashes_in_tier directly.
 
     def _ensure_store(self) -> None:
         """Auto-create a :class:`MemoryStore` for bare-loop test instances.
@@ -636,39 +636,6 @@ class ConsolidationLoop:
         self.store._entries = {"_legacy": dict(value)} if value else {}
 
     @property
-    def episodic_simhash(self) -> dict[str, int]:
-        """DEPRECATED: ``self.store.simhashes_in_tier("episodic")``."""
-        self._ensure_store()
-        return self.store.simhashes_in_tier("episodic")
-
-    @episodic_simhash.setter
-    def episodic_simhash(self, value: dict[str, int]) -> None:
-        self._ensure_store()
-        self.store.replace_simhashes_in_tier("episodic", value)
-
-    @property
-    def semantic_simhash(self) -> dict[str, int]:
-        """DEPRECATED: ``self.store.simhashes_in_tier("semantic")``."""
-        self._ensure_store()
-        return self.store.simhashes_in_tier("semantic")
-
-    @semantic_simhash.setter
-    def semantic_simhash(self, value: dict[str, int]) -> None:
-        self._ensure_store()
-        self.store.replace_simhashes_in_tier("semantic", value)
-
-    @property
-    def procedural_simhash(self) -> dict[str, int]:
-        """DEPRECATED: ``self.store.simhashes_in_tier("procedural")``."""
-        self._ensure_store()
-        return self.store.simhashes_in_tier("procedural")
-
-    @procedural_simhash.setter
-    def procedural_simhash(self, value: dict[str, int]) -> None:
-        self._ensure_store()
-        self.store.replace_simhashes_in_tier("procedural", value)
-
-    @property
     def indexed_key_registry(self) -> "dict[str, KeyRegistry] | None":
         """DEPRECATED: returns the store's internal registry dict, or ``None``
         when replay is disabled — preserves the legacy None-gate semantics."""
@@ -693,10 +660,9 @@ class ConsolidationLoop:
         :meth:`MemoryStore.registry` — kept on the loop because many internal
         sites call it with a stable tier name.
         """
-        reg = self.store.registry(tier)
-        if reg is None:
+        if not self.store.replay_enabled:
             raise RuntimeError("indexed_key_replay not enabled")
-        return reg
+        return self.store.registry(tier)
 
     def _all_active_keys(self) -> list[str]:
         """Every active key across every registered tier — order is tier-then-insertion."""
@@ -822,8 +788,9 @@ class ConsolidationLoop:
         ``reconstruct_graph`` / train→simulate and the hallucination/recall
         verification.  Co-locating both updates here makes that pairing the only
         callable form, so the registry can never be reset without its SimHashes.
-        Mirrors the established ``build_registry`` → ``replace_simhashes_in_tier``
-        pattern used at the interim and semantic rebuild sites.
+        Sets both registry keys and simhash fingerprints together — the active
+        simhash is written directly onto the fresh :class:`KeyRegistry` before
+        it is loaded into the store.
 
         Recall-gated registration (stage 9): only keys whose ``exact_match``
         verdict is True on the FINAL trained weights are admitted.  The verdict
@@ -860,16 +827,11 @@ class ConsolidationLoop:
             if not keyed:
                 # No active keys for this tier — clear the registry but
                 # STILL seed any stale records (an empty tier with stale keys
-                # must retain them).
+                # must retain them).  Stale simhashes live in _stale[key]["simhash"]
+                # so they are carried automatically into the new registry.
                 new_reg = KeyRegistry()
                 new_reg._stale = dict(_stale_recs)  # seed stale partition
                 self.store.load_registry(_main_tier, new_reg)
-                # Build an empty active-keys simhash dict, then merge stale simhashes back.
-                new_simhashes: dict[str, int] = {}
-                for _sk, _srec in _stale_recs.items():
-                    if "simhash" in _srec:
-                        new_simhashes[_sk] = _srec["simhash"]
-                self.store.replace_simhashes_in_tier(_main_tier, new_simhashes)
                 continue
 
             # Determine the recall-passing set for this tier.
@@ -898,20 +860,18 @@ class ConsolidationLoop:
 
             # Build the fresh registry:
             # (a) seed stale records FIRST (B1 — must survive the rebuild);
-            # (b) then add passing active keys.
+            # (b) then add passing active keys with their simhashes.
+            # Simhashes are set directly on the registry; stale simhashes live
+            # in _stale[key]["simhash"] already (carried by the stale records).
             new_reg = KeyRegistry()
             new_reg._stale = dict(_stale_recs)  # seed stale partition before active keys
+            active_simhashes = dict(build_registry(keyed))
             for kp in keyed:
                 new_reg.add(kp["key"])
+                fp = active_simhashes.get(kp["key"])
+                if fp is not None:
+                    new_reg.set_simhash(kp["key"], fp)
             self.store.load_registry(_main_tier, new_reg)
-
-            # Build fresh active-keys simhash dict, then merge stale simhashes back
-            # so on disk: active simhashes + stale simhashes (superset).
-            new_simhashes = dict(build_registry(keyed))
-            for _sk, _srec in _stale_recs.items():
-                if "simhash" in _srec:
-                    new_simhashes[_sk] = _srec["simhash"]
-            self.store.replace_simhashes_in_tier(_main_tier, new_simhashes)
 
     def _drop_interim_tier_registries(self) -> int:
         """Drop every interim tier registry from the store.
@@ -1546,7 +1506,7 @@ class ConsolidationLoop:
             # (no reference hash to compute confidence against) — fall back to
             # cache immediately for those keys and only probe the rest.
             self._disable_gradient_checkpointing()
-            tier_simhash = self.store.simhashes_in_tier(adapter_name)
+            tier_simhash = self.store.tier_simhashes(adapter_name, include_stale=False)
             keys_with_hash = [k for k in existing_tier_keys if k in tier_simhash]
             keys_without_hash = [k for k in existing_tier_keys if k not in tier_simhash]
             reconstructed: dict[str, dict] = {}
@@ -1690,12 +1650,17 @@ class ConsolidationLoop:
             return new_keyed, []
 
         # TRAIN mode: gather existing keys for reconstruction (deferred mutations).
+        # Use active-only fingerprints — stale keys must not be fed into reconstruction
+        # (they are superseded facts). The include_stale=False call makes the
+        # active-vs-known distinction explicit and prevents the enumeration-set bug.
         existing_proc_keys = [
-            k for k in self.store.simhashes_in_tier("procedural") if k not in new_key_set
+            k
+            for k in self.store.tier_simhashes("procedural", include_stale=False)
+            if k not in new_key_set
         ]
 
         self._disable_gradient_checkpointing()
-        proc_simhash = self.store.simhashes_in_tier("procedural")
+        proc_simhash = self.store.tier_simhashes("procedural", include_stale=False)
         reconstructed: dict[str, dict] = {}
         entries = [{"key": k} for k in existing_proc_keys]
         for entry, recalled in probe_entries(
@@ -2123,11 +2088,12 @@ class ConsolidationLoop:
               race).  The exception propagates to the caller's try/except, which
               then skips ``mark_consolidated`` so sessions remain pending.
           5. Per-cycle snapshots (no manifest).
-          6. SimHash registries written to per-tier paths:
-             ``<adapter_dir>/<tier>/simhash_registry.json``.
-          7. Per-tier ``indexed_key_registry.json`` written to
+          6. Per-tier ``indexed_key_registry.json`` written to
              ``<adapter_dir>/<tier>/indexed_key_registry.json``.
-          8. ``save_from_bytes`` — flush the identical registry bytes; this
+             The registry now carries the unified simhash map (active∪stale)
+             in its ``"simhash"`` key — a separate ``simhash_registry.json``
+             is no longer written.
+          7. ``save_from_bytes`` — flush the identical registry bytes; this
              is the commit signal for ``find_live_slot``.
 
         Crash semantics: a kill after step 4 but before step 8 leaves the
@@ -2275,15 +2241,15 @@ class ConsolidationLoop:
         # Collect slot paths for post-registry-commit pruning.
         _saved_slots: dict[str, Path] = {}
         _saved_slots["episodic"] = _save_and_verify(
-            "episodic", self.store.simhashes_in_tier("episodic")
+            "episodic", self.store.tier_simhashes("episodic", include_stale=False)
         )
         if "semantic" in self.model.peft_config:
             _saved_slots["semantic"] = _save_and_verify(
-                "semantic", self.store.simhashes_in_tier("semantic")
+                "semantic", self.store.tier_simhashes("semantic", include_stale=False)
             )
         if "procedural" in self.model.peft_config:
             _saved_slots["procedural"] = _save_and_verify(
-                "procedural", self.store.simhashes_in_tier("procedural")
+                "procedural", self.store.tier_simhashes("procedural", include_stale=False)
             )
 
         # Step 6: Per-cycle adapter-weight shadows (debug/analysis only — no
@@ -2297,14 +2263,10 @@ class ConsolidationLoop:
             tier_shadow.append("procedural")
         self._debug_writer.on_main_adapters_saved(tier_shadow)
 
-        # Steps 6–8: SimHash registries (per-tier), indexed_key_registry
-        # (per-tier), then the registry commit signal.
+        # Steps 6–7: indexed_key_registry (per-tier — the unified file now carries
+        # active∪stale simhashes in its "simhash" key), then the registry commit signal.
+        # The separate simhash_registry.json is no longer written.
         if self.store.replay_enabled and tier_payloads:
-            for _tier in ("episodic", "semantic", "procedural"):
-                save_registry(
-                    self.store.simhashes_in_tier(_tier),
-                    self.output_dir / _tier / "simhash_registry.json",
-                )
             # LAST: flush the exact bytes that were hashed in step 2, so
             # ``find_live_slot`` on restart can match meta.registry_sha256
             # against hashlib.sha256(registry_path.read_bytes()).
@@ -2444,10 +2406,9 @@ class ConsolidationLoop:
         2. ``sha256(payload)`` — hash for manifest pre-stamp.
         3. Build manifest with ``registry_sha256_override``.
         4. ``save_adapter(..., manifest=manifest)`` — adapter + manifest on disk.
-        5. Save SimHash registries to per-tier paths:
-           ``<adapter_dir>/<tier>/simhash_registry.json``.
-        6. ``save_from_bytes(payload, path)`` — flush registry bytes to
-           ``<adapter_dir>/<tier>/indexed_key_registry.json`` (LAST).
+        5. ``save_from_bytes(payload, path)`` — flush registry bytes to
+           ``<adapter_dir>/<tier>/indexed_key_registry.json`` (LAST, with
+           unified simhash map embedded under the ``"simhash"`` key).
 
         The registry is the commit signal: its presence on disk means every
         preceding file is complete.  On restart, the lifespan consistency check
@@ -5340,9 +5301,10 @@ class ConsolidationLoop:
         # the NEXT fold reads it from disk).
         if self.store.replay_enabled and soft_stale_by_tier:
             for _st_tier in ("episodic", "semantic", "procedural"):
-                _st_reg = self.store.registry(_st_tier)
-                if _st_reg is not None:
-                    _st_reg.increment_stale_cycles()
+                # registry() always returns a real KeyRegistry when replay is
+                # enabled (registry-always-exists invariant; the None guard
+                # was dead and is removed per plan F6).
+                self.store.registry(_st_tier).increment_stale_cycles()
             logger.debug(
                 "consolidate_interim_adapters: stale_cycles advanced for %d soft-staled key(s)",
                 sum(len(v) for v in soft_stale_by_tier.values()),

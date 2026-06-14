@@ -247,9 +247,9 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         """
         stub, _ = self._make_stub(monkeypatch, tmp_path, train_raises=True)
         # Seed an existing entry to confirm it is also untouched.
-        stub.store.simhashes_in_tier("procedural")["proc0"] = 12345
+        stub.store.put_simhash("procedural", "proc0", 12345)
 
-        simhash_before = dict(stub.store.simhashes_in_tier("procedural"))
+        simhash_before = dict(stub.store.tier_simhashes("procedural", include_stale=False))
 
         relations = [
             {
@@ -265,9 +265,10 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         with pytest.raises(RuntimeError):
             stub._run_indexed_key_procedural(relations, speaker_id="spk1")
 
-        assert stub.store.simhashes_in_tier("procedural") == simhash_before, (
+        after = stub.store.tier_simhashes("procedural", include_stale=False)
+        assert after == simhash_before, (
             "procedural_simhash must not change when training raises; "
-            f"before: {simhash_before}, after: {stub.store.simhashes_in_tier('procedural')}"
+            f"before: {simhash_before}, after: {after}"
         )
 
     def test_procedural_simhash_updated_incrementally_after_success(self, monkeypatch, tmp_path):
@@ -282,7 +283,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         stub, fake_qa = self._make_stub(monkeypatch, tmp_path, train_raises=False)
         # An existing key that was already trained — must survive unchanged.
         existing_hash = compute_simhash("proc0", "Alice", "was_here", "Berlin")
-        stub.store.simhashes_in_tier("procedural")["proc0"] = existing_hash
+        stub.store.put_simhash("procedural", "proc0", existing_hash)
         stub.store._entries_flat_view()["proc0"] = {
             "key": "proc0",
             "subject": "Alice",
@@ -309,10 +310,10 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         stub._run_indexed_key_procedural(relations, speaker_id="spk1")
 
         # Both new keys must be present with correct simhashes.
-        assert "proc1" in stub.store.simhashes_in_tier("procedural"), (
+        assert "proc1" in stub.store.tier_simhashes("procedural", include_stale=False), (
             "proc1 must be added to procedural_simhash"
         )
-        assert "proc2" in stub.store.simhashes_in_tier("procedural"), (
+        assert "proc2" in stub.store.tier_simhashes("procedural", include_stale=False), (
             "proc2 must be added to procedural_simhash"
         )
 
@@ -330,7 +331,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
             relations[1]["predicate"],
             relations[1]["object"],
         )
-        proc_sims = stub.store.simhashes_in_tier("procedural")
+        proc_sims = stub.store.tier_simhashes("procedural", include_stale=False)
         assert proc_sims["proc1"] == expected_proc1, (
             f"proc1 simhash mismatch: {proc_sims['proc1']} != {expected_proc1}"
         )
@@ -339,7 +340,8 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         )
 
         # Existing key must be unchanged.
-        assert stub.store.simhashes_in_tier("procedural")["proc0"] == existing_hash, (
+        proc0_after = stub.store.tier_simhashes("procedural", include_stale=False)["proc0"]
+        assert proc0_after == existing_hash, (
             "Existing proc0 simhash must not be altered by incremental update"
         )
 
@@ -381,7 +383,7 @@ class TestRunIndexedKeyProceduralDeferredMutations:
         stub._run_indexed_key_procedural(relations, speaker_id="spk1")
 
         # proc1 is now in the store.
-        assert "proc1" in stub.store.simhashes_in_tier("procedural"), (
+        assert "proc1" in stub.store.tier_simhashes("procedural", include_stale=False), (
             "proc1 must be added after first run"
         )
         index_after_first = stub._procedural_next_index
@@ -402,6 +404,6 @@ class TestRunIndexedKeyProceduralDeferredMutations:
             "Counter must advance by 1 after second run"
         )
         # proc1 must still be present — no per-session retirement without sp_index.
-        assert "proc1" in stub.store.simhashes_in_tier("procedural"), (
+        assert "proc1" in stub.store.tier_simhashes("procedural", include_stale=False), (
             "proc1 must NOT be retired without sp_index — contradiction deferred to full merge"
         )

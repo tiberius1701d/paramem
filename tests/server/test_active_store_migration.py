@@ -883,8 +883,8 @@ class TestMigrateTierSimulateToTrain:
         assert train_mock.call_args.kwargs["adapter_name"] == "episodic"
         # Source graph deleted post-success (simulate_to_train always deletes source graph).
         assert not (cfg.adapter_dir / "episodic" / "graph.json").exists()
-        # Per-tier SimHash registry persisted at per-tier path
-        assert (cfg.adapter_dir / "episodic" / "simhash_registry.json").exists()
+        # Per-tier registry (carrying unified simhash map) persisted at tier path.
+        assert (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
 
     def test_binds_slot_to_registry(self, tmp_path):
         """Regression: the trained slot's manifest carries a NON-empty
@@ -942,8 +942,13 @@ class TestMigrateTierSimulateToTrain:
             "tier registry must be written for slot binding"
         )
 
-    def test_writes_simhash_registry_with_built_fingerprints(self, tmp_path):
-        """The persisted simhash file holds exactly the fingerprints from Step 2."""
+    def test_writes_fingerprints_in_unified_registry(self, tmp_path):
+        """The persisted registry carries exactly the fingerprints from Step 2.
+
+        After the SimHash unification refactor, fingerprints live in the
+        ``"simhash"`` key of ``indexed_key_registry.json`` rather than in a
+        separate ``simhash_registry.json`` sidecar.
+        """
         cfg = _make_config(tmp_path, mode="train")
         entries = [_full_quad(f"g{i}") for i in range(2)]
         # Unified layout: graph.json lives under adapter_dir.
@@ -975,9 +980,12 @@ class TestMigrateTierSimulateToTrain:
         ):
             _migrate_tier_simulate_to_train(loop, cfg, "episodic")
 
-        from paramem.memory.persistence import load_registry
+        from paramem.training.key_registry import KeyRegistry
 
-        on_disk = load_registry(cfg.adapter_dir / "episodic" / "simhash_registry.json")
+        reg_path = cfg.adapter_dir / "episodic" / "indexed_key_registry.json"
+        assert reg_path.exists(), "indexed_key_registry.json must be written after migration"
+        reg = KeyRegistry.load(reg_path)
+        on_disk = reg._known_simhashes()
         assert on_disk == built_registry
 
     def test_probe_failure_rolls_back(self, tmp_path):
@@ -1012,8 +1020,8 @@ class TestMigrateTierSimulateToTrain:
         save_mock.assert_not_called()
         # Source preserved (unified layout: adapter_dir).
         assert (cfg.adapter_dir / "episodic" / "graph.json").exists()
-        # No simhash registry written (probe failed before write)
-        assert not (cfg.adapter_dir / "episodic" / "simhash_registry.json").exists()
+        # No registry written (probe failed before write)
+        assert not (cfg.adapter_dir / "episodic" / "indexed_key_registry.json").exists()
 
     def test_always_uses_entry_format_helpers(self, tmp_path):
         """simulate→train uses entry helpers; legacy format helpers are not called.
@@ -1288,8 +1296,8 @@ class TestSlotPathResolverInterim:
 
         # Source graph.json at slot root must have been deleted after success.
         assert not (expected_slot_root / "graph.json").exists()
-        # SimHash registry written at slot root.
-        assert (expected_slot_root / "simhash_registry.json").exists()
+        # Registry (carrying unified simhash map) written at slot root.
+        assert (expected_slot_root / "indexed_key_registry.json").exists()
 
 
 class TestTierAdapterConfigInterim:

@@ -116,13 +116,13 @@ class TestSimHash:
         assert MemoryStore().simhash("episodic", "graph1") is None
         assert not MemoryStore().has_simhash("episodic", "graph1")
 
-    def test_simhashes_in_tier_is_dict_str_int_for_verify_confidence(self):
-        """The view exposed to verify_confidence must be the same shape the
-        legacy *_simhash dicts had — key -> 64-bit int."""
+    def test_tier_simhashes_is_dict_str_int_for_verify_confidence(self):
+        """tier_simhashes must return the same shape as the old *_simhash dicts
+        — key -> 64-bit int — so verify_confidence callers see a consistent shape."""
         s = MemoryStore()
         s.put_simhash("episodic", "graph1", 0xCAFE)
         s.put_simhash("episodic", "graph2", 0xBEEF)
-        view = s.simhashes_in_tier("episodic")
+        view = s.tier_simhashes("episodic", include_stale=True)
         assert view == {"graph1": 0xCAFE, "graph2": 0xBEEF}
         assert all(isinstance(v, int) for v in view.values())
 
@@ -130,7 +130,7 @@ class TestSimHash:
         s = MemoryStore()
         s.put_simhash("episodic", "graph_old", 0xAA)
         s.replace_simhashes_in_tier("episodic", {"graph_new": 0xBB})
-        assert s.simhashes_in_tier("episodic") == {"graph_new": 0xBB}
+        assert s.tier_simhashes("episodic", include_stale=True) == {"graph_new": 0xBB}
 
     def test_simhash_count_in_tier(self):
         s = MemoryStore()
@@ -147,6 +147,209 @@ class TestSimHash:
 
 
 # ---------------------------------------------------------------------------
+# KeyRegistry simhash methods — Step A unit tests (plan §5 / §10)
+# ---------------------------------------------------------------------------
+
+
+class TestKeyRegistrySimhash:
+    """Unit tests for the new KeyRegistry simhash primitives.
+
+    These lock the §5 contract: set_simhash, drop_simhash, simhash_for,
+    has_simhash, _active_simhashes, _known_simhashes, stale auto-carry,
+    remove auto-drop.
+    """
+
+    def test_set_and_simhash_for_active(self):
+        """set_simhash on an active key is returned by simhash_for."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 0xCAFE)
+        assert reg.simhash_for("graph1") == 0xCAFE
+
+    def test_simhash_for_stale_key(self):
+        """simhash_for returns the fingerprint from the stale record (plan B2)."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 0xBEEF)
+        reg.stale("graph1")
+        # Key is now stale — simhash must still be accessible.
+        assert reg.simhash_for("graph1") == 0xBEEF
+
+    def test_stale_carries_active_simhash_atomically(self):
+        """stale() moves the active simhash into the stale record automatically.
+
+        The caller does NOT need to manually move the fingerprint.
+        """
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 0xDEAD)
+        reg.stale("graph1")
+        # Active _simhash must be empty.
+        assert "graph1" not in reg._simhash
+        # Stale record must carry the fingerprint.
+        assert reg._stale["graph1"].get("simhash") == 0xDEAD
+
+    def test_remove_drops_simhash(self):
+        """remove() erases the fingerprint from both active and stale partitions."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 0xAAAA)
+        reg.remove("graph1")
+        assert reg.simhash_for("graph1") is None
+        assert not reg.has_simhash("graph1")
+
+    def test_has_simhash_active_and_stale(self):
+        """has_simhash returns True for both active and stale partitions."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 0x1111)
+        assert reg.has_simhash("graph1")
+        reg.stale("graph1")
+        assert reg.has_simhash("graph1")
+
+    def test_active_simhashes_excludes_stale(self):
+        """_active_simhashes returns only active-partition fingerprints."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.set_simhash("graph1", 0x1111)
+        reg.set_simhash("graph2", 0x2222)
+        reg.stale("graph2")
+        active = reg._active_simhashes()
+        assert "graph1" in active
+        assert "graph2" not in active
+
+    def test_known_simhashes_includes_stale(self):
+        """_known_simhashes returns active∪stale fingerprints."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.set_simhash("graph1", 0x1111)
+        reg.set_simhash("graph2", 0x2222)
+        reg.stale("graph2")
+        known = reg._known_simhashes()
+        assert "graph1" in known
+        assert "graph2" in known
+        assert known["graph1"] == 0x1111
+        assert known["graph2"] == 0x2222
+
+    def test_drop_simhash_clears_both_partitions(self):
+        """drop_simhash removes the fingerprint regardless of partition."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 0xCAFE)
+        reg.drop_simhash("graph1")
+        assert not reg.has_simhash("graph1")
+        assert reg.simhash_for("graph1") is None
+
+    def test_save_bytes_load_roundtrip_with_simhash(self):
+        """save_bytes/load round-trip preserves active and stale fingerprints."""
+        import json
+
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.set_simhash("graph1", 0xCAFE)
+        reg.set_simhash("graph2", 0xDEAD)
+        reg.stale("graph2")
+
+        payload = reg.save_bytes()
+        data = json.loads(payload.decode("utf-8"))
+
+        # "simhash" key must be present in the new schema.
+        assert "simhash" in data
+        assert data["simhash"]["graph1"] == 0xCAFE
+        assert data["simhash"]["graph2"] == 0xDEAD
+
+    def test_load_reads_simhash_from_new_schema(self, tmp_path):
+        """KeyRegistry.load reads the 'simhash' field from the new schema (no .get fallback).
+
+        A registry file without 'simhash' raises KeyError — fresh-start mandate.
+        """
+        import json
+
+        path = tmp_path / "indexed_key_registry.json"
+        # New schema with simhash.
+        data = {
+            "active_keys": ["graph1"],
+            "fidelity_history": {},
+            "health": None,
+            "stale": {},
+            "simhash": {"graph1": 0xABCDEF},
+        }
+        path.write_text(json.dumps(data))
+
+        reg = KeyRegistry.load(path)
+        assert reg.simhash_for("graph1") == 0xABCDEF
+
+    def test_load_old_schema_without_simhash_loads_as_empty_fingerprints(self, tmp_path):
+        """KeyRegistry.load gracefully handles old-schema files without 'simhash'.
+
+        The fresh-start mandate means no legacy-file fallback (no reading
+        simhash_registry.json), but the load still succeeds — the registry
+        is loaded with an empty fingerprint map rather than crashing.
+        """
+        import json
+
+        path = tmp_path / "indexed_key_registry.json"
+        # Old schema — no simhash key.
+        data = {
+            "active_keys": ["graph1"],
+            "fidelity_history": {},
+            "health": None,
+            "stale": {},
+        }
+        path.write_text(json.dumps(data))
+
+        reg = KeyRegistry.load(path)
+        # Registry loads the active keys.
+        assert reg.list_active() == ["graph1"]
+        # No fingerprints (old schema had none).
+        assert reg.simhash_for("graph1") is None
+        assert not reg.has_simhash("graph1")
+
+
+class TestTierSimhashes:
+    """Unit tests for MemoryStore.tier_simhashes (plan §5 / §10).
+
+    The mandatory ``include_stale`` keyword makes active-vs-known confusion
+    structurally impossible.  This class locks that contract.
+    """
+
+    def test_tier_simhashes_active_only(self):
+        """tier_simhashes(include_stale=False) returns only active fingerprints."""
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"), simhash=0x1111)
+        s.put("episodic", "graph2", _entry("graph2"), simhash=0x2222)
+        s.discard_keys(["graph2"], mode="stale")
+        active = s.tier_simhashes("episodic", include_stale=False)
+        assert "graph1" in active
+        assert "graph2" not in active
+
+    def test_tier_simhashes_include_stale(self):
+        """tier_simhashes(include_stale=True) returns active∪stale fingerprints."""
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"), simhash=0x1111)
+        s.put("episodic", "graph2", _entry("graph2"), simhash=0x2222)
+        s.discard_keys(["graph2"], mode="stale")
+        known = s.tier_simhashes("episodic", include_stale=True)
+        assert "graph1" in known
+        assert "graph2" in known
+
+    def test_tier_simhashes_requires_keyword_argument(self):
+        """include_stale is a keyword-only argument — positional call must fail."""
+        s = MemoryStore()
+        with pytest.raises(TypeError):
+            s.tier_simhashes("episodic", True)  # type: ignore[call-arg]
+
+    def test_tier_simhashes_empty_tier_returns_empty_dict(self):
+        """Requesting simhashes for a non-existent tier returns an empty dict."""
+        s = MemoryStore()
+        result = s.tier_simhashes("nonexistent", include_stale=False)
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle registry — Optional gate
 # ---------------------------------------------------------------------------
 
@@ -158,10 +361,11 @@ class TestRegistry:
         assert s.registry("episodic") is not None
         assert isinstance(s.registry("episodic"), KeyRegistry)
 
-    def test_replay_disabled_registry_is_none(self):
+    def test_replay_disabled_registry_is_not_none(self):
         s = MemoryStore(replay_enabled=False)
         assert not s.replay_enabled
-        assert s.registry("episodic") is None
+        # registry() never returns None; replay_enabled is a behaviour flag only.
+        assert isinstance(s.registry("episodic"), KeyRegistry)
 
     def test_put_registers_when_replay_enabled(self):
         s = MemoryStore()
@@ -171,8 +375,9 @@ class TestRegistry:
     def test_put_does_not_register_when_replay_disabled(self):
         s = MemoryStore(replay_enabled=False)
         s.put("episodic", "graph1", _entry("graph1"))
-        # registry() is None; the legacy gate check `registry is None` survives.
-        assert s.registry("episodic") is None
+        # registry() never returns None; replay_enabled governs lifecycle only.
+        # The key was NOT added to the registry (register=False path under replay-off).
+        assert "graph1" not in s.registry("episodic")
         # Quad is still there.
         assert s.get("graph1") is not None
 
@@ -348,8 +553,8 @@ class TestMoveDelete:
         s.move("graph1", "semantic")
         assert s.tier_of("graph1") == "semantic"
         assert s.entries_in_tier("episodic") == {}
-        assert s.simhashes_in_tier("episodic") == {}
-        assert s.simhashes_in_tier("semantic") == {"graph1": 0xCAFE}
+        assert s.tier_simhashes("episodic", include_stale=True) == {}
+        assert s.tier_simhashes("semantic", include_stale=True) == {"graph1": 0xCAFE}
         assert "graph1" not in s.registry("episodic")
         assert "graph1" in s.registry("semantic")
 
@@ -368,6 +573,12 @@ class TestMoveDelete:
 
 class TestSnapshotRestore:
     def test_snapshot_then_mutate_then_restore(self):
+        """Snapshot captures both entries and simhash; restore brings both back.
+
+        This is the core cycle-resume rollback rope contract.  Simhash is now
+        captured from the registry (plan §9 / B1 fix) so fingerprints survive
+        rollback correctly even after the registry simhash moved off _simhash.
+        """
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"), simhash=0xCAFE)
         snap = s.snapshot()
@@ -379,6 +590,7 @@ class TestSnapshotRestore:
         # Restore
         s.restore(snap)
         assert s.get("graph1") == _entry("graph1")
+        # Simhash must survive restore (B1 / plan §9).
         assert s.simhash("episodic", "graph1") == 0xCAFE
         assert s.get("graph2") is None
 
@@ -390,14 +602,35 @@ class TestSnapshotRestore:
         snap["entries"]["episodic"]["graph1"]["subject"] = "Eve"
         assert s.get("graph1")["subject"] == "Alice"
 
-    def test_snapshot_excludes_registries(self):
-        """Registries persist via their own KeyRegistry.save/load lifecycle."""
+    def test_snapshot_excludes_registry_lifecycle_but_includes_fingerprints(self):
+        """Registries persist via their own KeyRegistry.save/load lifecycle.
+
+        The snapshot DOES carry the fingerprint map (plan §9) so fingerprints
+        survive rollback, but the registry lifecycle (active/stale partitions)
+        is NOT included — that is restored from disk separately.
+        """
         s = MemoryStore()
-        s.put("episodic", "graph1", _entry("graph1"))
+        s.put("episodic", "graph1", _entry("graph1"), simhash=0xDEAD)
         snap = s.snapshot()
         assert "entries" in snap
-        assert "simhash" in snap
-        assert "registry" not in snap
+        assert "simhash" in snap  # fingerprints ARE included
+        assert "registry" not in snap  # lifecycle partitions are NOT
+        # The fingerprint for graph1 must be in the snapshot map.
+        assert snap["simhash"].get("episodic", {}).get("graph1") == 0xDEAD
+
+    def test_snapshot_stale_fingerprint_included(self):
+        """Stale fingerprints are included in the snapshot simhash map.
+
+        When a key is staled its fingerprint moves to the stale record; the
+        snapshot must capture it from _known_simhashes (active∪stale) so the
+        stale-echo confidence gate still works after rollback.
+        """
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"), simhash=0xBEEF)
+        s.discard_keys(["graph1"], mode="stale")
+        snap = s.snapshot()
+        # The stale fingerprint must appear in the snapshot.
+        assert snap["simhash"].get("episodic", {}).get("graph1") == 0xBEEF
 
 
 # ---------------------------------------------------------------------------
@@ -794,30 +1027,31 @@ class TestDiscardKeys:
         reg = s.registry("episodic")
         assert "graph1" not in reg.list_active(), "Erased key must not be in active"
         assert "graph1" not in reg.list_stale(), "Erased key must not be in stale either"
-        assert "graph1" not in s.simhashes_in_tier("episodic"), "Erased key simhash must be dropped"
+        assert not s.has_simhash("episodic", "graph1"), "Erased key simhash must be dropped"
 
-    def test_erase_drops_simhash_on_main_tiers_only(self):
-        """mode='erase': simhash drop is limited to the three main tiers (not interim).
+    def test_erase_drops_simhash_via_registry_remove(self):
+        """mode='erase': registry.remove drops the simhash from all tiers the key
+        is known in.
 
-        This preserves /forget's tier asymmetry: registry mutation over
-        tiers_with_registry() (all tiers), simhash drop over main tiers only.
+        After unification, discard_keys(mode='erase') uses registry.remove, which
+        drops the fingerprint from _simhash atomically.  A key registered in an
+        interim tier's registry loses its fingerprint there too.
         """
         s = MemoryStore(replay_enabled=True)
-        # Put key in an interim-style tier in the registry only.
-        s.put("episodic_interim_20260101", "graph_interim", _entry("graph_interim"), register=True)
-        # Also put simhash manually in episodic (main tier) and the interim tier.
-        s.put_simhash("episodic", "graph_interim", 0x1111)
-        s.put_simhash("episodic_interim_20260101", "graph_interim", 0x2222)
+        # Register key in the interim tier (which owns both its registry and simhash).
+        s.put(
+            "episodic_interim_20260101",
+            "graph_interim",
+            _entry("graph_interim"),
+            simhash=0x2222,
+            register=True,
+        )
 
         s.discard_keys(["graph_interim"], mode="erase")
 
-        # episodic simhash dropped (main tier).
-        assert "graph_interim" not in s.simhashes_in_tier("episodic"), (
-            "Main-tier simhash must be dropped by erase"
-        )
-        # Interim simhash NOT dropped (discard_keys only touches main tiers).
-        assert "graph_interim" in s.simhashes_in_tier("episodic_interim_20260101"), (
-            "Interim-tier simhash must NOT be dropped by discard_keys"
+        # Interim tier simhash dropped (registry.remove covers all tiers_with_registry).
+        assert not s.has_simhash("episodic_interim_20260101", "graph_interim"), (
+            "Registry-owned simhash must be dropped by erase"
         )
 
     def test_stale_moves_to_stale_and_retains_simhash(self):
@@ -828,7 +1062,7 @@ class TestDiscardKeys:
         reg = s.registry("episodic")
         assert "graph1" not in reg.list_active(), "Staled key must not be in active"
         assert "graph1" in reg.list_stale(), "Staled key must be in stale partition"
-        assert "graph1" in s.simhashes_in_tier("episodic"), "Staled key simhash must be RETAINED"
+        assert s.has_simhash("episodic", "graph1"), "Staled key simhash must be RETAINED"
 
     def test_erase_idempotent_on_absent_key(self):
         """discard_keys(mode='erase') on a non-existent key does not raise."""
@@ -842,12 +1076,12 @@ class TestDiscardKeys:
         s.discard_keys(["nonexistent_key"], mode="stale")
 
     def test_noop_when_replay_disabled(self):
-        """W5: when _registry is None (replay disabled), discard_keys is a no-op."""
+        """W5: when replay is disabled, discard_keys is a no-op."""
         s = MemoryStore(replay_enabled=False)
         s.put_simhash("episodic", "graph1", 0xAAAA)
-        # No registry → must not raise and must leave simhash intact.
+        # Replay disabled → must not raise and must leave simhash intact.
         s.discard_keys(["graph1"], mode="erase")
-        assert "graph1" in s.simhashes_in_tier("episodic"), (
+        assert s.has_simhash("episodic", "graph1"), (
             "Replay-disabled discard_keys must not touch simhashes"
         )
 

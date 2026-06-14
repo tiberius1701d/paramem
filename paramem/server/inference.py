@@ -1072,27 +1072,22 @@ def _maybe_escalate(
 
 
 def _load_simhash_registry(adapter_dir) -> dict:
-    """Load combined SimHash dict by merging per-adapter simhash registries.
+    """Load combined SimHash dict by merging per-adapter indexed_key_registry.json files.
 
     Returns ``{key: simhash}`` across all main and interim adapter slots.
-    Reads per-tier ``<adapter_dir>/<tier>/simhash_registry.json`` for the
-    three main tiers (episodic, semantic, procedural) and
-    ``<adapter_dir>/episodic/interim_<stamp>/simhash_registry.json`` for all
-    interim slots — the unified layout written by ``_save_adapters`` /
-    ``commit_tier_slot`` since the per-tier KeyRegistry refactor.
-    ``training/consolidation.py:_save_adapters`` and
-    ``training/memory_persistence.py:commit_tier_slot``).
 
-    Plan A retired the legacy combined ``data/ha/registry.json`` file in
-    favour of these per-adapter files as the single source of truth.
-    Production paths never write a combined registry; reads merge at
-    runtime instead.
+    Reads the ``"simhash"`` map from each tier's
+    ``<adapter_dir>/<tier>/indexed_key_registry.json`` for the three main
+    tiers (episodic, semantic, procedural) and from each interim slot under
+    ``<adapter_dir>/episodic/interim_<stamp>/indexed_key_registry.json``.
 
-    Each per-adapter file is a flat ``{key: simhash}`` mapping.  When a
-    key appears in multiple files (a transient state during promotion or
-    when an interim adapter holds the same key as main), the later read
-    wins — but the simhash content is the same regardless of which
-    adapter holds the key.
+    The registry file is the single source of truth for per-key fingerprints
+    (active∪stale superset) since the SimHash unification refactor.  The
+    separate ``simhash_registry.json`` sidecar is no longer written.
+
+    When a key appears in multiple tier files (a transient state during
+    promotion) the later read wins — the content is the same regardless of
+    which tier holds the key.
     """
     from pathlib import Path as _Path
 
@@ -1103,36 +1098,35 @@ def _load_simhash_registry(adapter_dir) -> dict:
 
     from paramem.backup.encryption import read_maybe_encrypted
 
-    def _merge_simhash_file(p: _Path) -> None:
+    def _merge_registry_file(p: _Path) -> None:
+        """Extract the ``"simhash"`` map from one indexed_key_registry.json."""
         try:
             raw = json.loads(read_maybe_encrypted(p).decode("utf-8"))
         except Exception:  # noqa: BLE001
-            logger.warning("Failed to read simhash registry %s — skipping", p.name)
+            logger.warning("Failed to read registry file %s — skipping", p.name)
             return
         if not isinstance(raw, dict):
             return
-        for key, simhash in raw.items():
-            # Per-adapter format: flat {key: simhash}.  Defensive: also
-            # accept the legacy enriched-meta dict form ({simhash: ...})
-            # in case any caller is mid-migration.
-            if isinstance(simhash, dict):
-                registry[key] = simhash.get("simhash", 0)
-            else:
-                registry[key] = simhash
+        simhash_map = raw.get("simhash", {})
+        if not isinstance(simhash_map, dict):
+            return
+        for key, fp in simhash_map.items():
+            if isinstance(fp, int):
+                registry[key] = fp
 
-    # Per-tier main paths (new layout post-KeyRegistry refactor).
+    # Per-tier main paths.
     for tier in ("episodic", "semantic", "procedural"):
-        p = adapter_dir / tier / "simhash_registry.json"
+        p = adapter_dir / tier / "indexed_key_registry.json"
         if p.exists():
-            _merge_simhash_file(p)
+            _merge_registry_file(p)
 
     # Interim adapter slots.
     from paramem.memory.interim_adapter import iter_interim_dirs
 
     for _name, interim_dir in iter_interim_dirs(adapter_dir):
-        p = interim_dir / "simhash_registry.json"
+        p = interim_dir / "indexed_key_registry.json"
         if p.exists():
-            _merge_simhash_file(p)
+            _merge_registry_file(p)
 
     return registry
 

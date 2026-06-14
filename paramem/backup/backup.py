@@ -573,13 +573,14 @@ def write_bundle(
 
     - **Per enabled MAIN tier** (``episodic`` / ``semantic`` / ``procedural``):
       live weight slot via ``find_live_slot(<tier_dir>, hash)``, then the
-      tier-root ``indexed_key_registry.json`` and ``simhash_registry.json``.
+      tier-root ``indexed_key_registry.json`` (fingerprints are stored inside
+      this file's ``"simhash"`` map; ``simhash_registry.json`` no longer exists).
     - **Per INTERIM family** (``iter_interim_dirs(<adapter_base>)``), only when
       ``adapter_scope="live"``: live inner weight slot via
       ``find_live_slot(<interim_dir>, hash)`` (the ``<ts>/`` slot;
       ``checkpoint-*/`` scaffolding is naturally excluded because those dirs
       carry no matching ``meta.registry_sha256``), then the interim-dir
-      ``indexed_key_registry.json`` and ``simhash_registry.json``.
+      ``indexed_key_registry.json``.
     - Shared: ``key_metadata.json``, ``speaker_profiles.json``, ``server.yaml``.
     - Optional (base-swap only): ``server.yaml.candidate`` — the candidate
       (new-target) config sidecar, included when ``candidate_config_path`` is
@@ -780,9 +781,10 @@ def write_bundle(
         Reads the slot's own ``meta.json`` to record the slot's
         ``registry_sha256`` in the bundle manifest (main and interim slots
         carry different hashes).  Captures the per-tier
-        ``indexed_key_registry.json`` and ``simhash_registry.json`` from
-        *tier_root* (the parent directory of the slot for main tiers, or the
-        interim-family directory for interim slots).
+        ``indexed_key_registry.json`` from *tier_root* (the parent directory
+        of the slot for main tiers, or the interim-family directory for
+        interim slots).  Fingerprints live inside that file's ``"simhash"``
+        map; ``simhash_registry.json`` no longer exists.
 
         Parameters
         ----------
@@ -842,16 +844,9 @@ def write_bundle(
             files_inventory.append(entry)
             indexed_key_present = True
 
-        # Capture per-tier simhash_registry.json (mirrors the _load_simhash
-        # per-tier path in MemoryStore.load_registries_from_disk).
-        simhash_src = tier_root / "simhash_registry.json"
-        simhash_present = False
-        if simhash_src.exists():
-            dst = adapter_dst_dir / "simhash_registry.json"
-            entry = _copy_artifact(simhash_src, dst)
-            entry["path"] = f"{dst_prefix}/simhash_registry.json"
-            files_inventory.append(entry)
-            simhash_present = True
+        # simhash_registry.json has been eliminated; simhashes now live in
+        # indexed_key_registry.json under the "simhash" key.  No separate
+        # simhash file to capture.
 
         adapters_record[bundle_key] = {
             "slot_source": str(slot_path),
@@ -860,7 +855,6 @@ def write_bundle(
             "registry_sha256": slot_meta.get("registry_sha256", ""),
             "key_count": slot_meta.get("key_count", "unknown"),
             "indexed_key_registry_present": indexed_key_present,
-            "simhash_present": simhash_present,
             "keyed_pairs_present": False,  # transient; regenerated from graph
         }
 
@@ -1295,9 +1289,9 @@ def restore_bundle(
          via ``_promote_slot`` (NOT the bundle's original timestamp) under the
          tier-root resolved by ``adapter_slot_root_for_name``.  Copy
          ``adapter_model.safetensors``, ``adapter_config.json``, ``meta.json``
-         AS-IS.  Write the per-tier ``indexed_key_registry.json`` and
-         ``simhash_registry.json`` to the tier-root (where
-         ``MemoryStore.load_registries_from_disk`` reads them).
+         AS-IS.  Write the per-tier ``indexed_key_registry.json`` to the
+         tier-root (where ``MemoryStore.load_registries_from_disk`` reads them;
+         simhashes now live inside this file under the ``"simhash"`` key).
        - ``speaker_profiles.json`` → ``data_dir/speaker_profiles.json``
          (atomic temp+rename).
        - ``server.yaml`` → ONLY if ``restore_config=True``: atomic temp+rename
@@ -1542,7 +1536,9 @@ def restore_bundle(
             _fsync_dir(tier_root)
 
             # Write per-tier registries to the tier-root (where MemoryStore reads them).
-            _TIER_REGISTRY_FILES = {"indexed_key_registry.json", "simhash_registry.json"}
+            # simhash_registry.json has been eliminated — simhashes now live inside
+            # indexed_key_registry.json under the "simhash" key.
+            _TIER_REGISTRY_FILES = {"indexed_key_registry.json"}
             for entry in adapter_files:
                 fname = Path(entry["path"]).name
                 if fname not in _TIER_REGISTRY_FILES:

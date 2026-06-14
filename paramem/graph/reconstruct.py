@@ -81,10 +81,8 @@ def reconstruct_graph(
 
             - ``loop.model`` — PEFT model (adapter switches applied in-place).
             - ``loop.tokenizer`` — tokenizer matching the model.
-            - ``loop.indexed_key_registry`` — ``dict[str, KeyRegistry]`` mapping
-              tier name to the per-tier :class:`~paramem.training.key_registry.KeyRegistry`.
-            - ``loop.{episodic,semantic,procedural}_simhash`` — per-adapter
-              SimHash registry dicts (may be ``None`` or absent).
+            - ``loop.store`` — :class:`~paramem.memory.store.MemoryStore` for
+              active keys and per-tier SimHash fingerprints.
 
         tier: If set (``"episodic"`` | ``"semantic"`` | ``"procedural"``),
             only probe keys belonging to that tier in the per-tier registry dict.
@@ -156,11 +154,14 @@ def reconstruct_graph(
     model.gradient_checkpointing_disable()
     try:
         for adapter_id, keys in keys_by_adapter.items():
-            # Per-adapter SimHash registry: ``{tier}_simhash`` attribute on
-            # the loop.  Interim adapter IDs (``episodic_interim_<stamp>``)
-            # don't have a dedicated simhash; we pass None (probe_entries
-            # defaults confidence to 1.0 when registry is None).
-            simhash_registry = getattr(loop, f"{adapter_id}_simhash", None)
+            # Per-adapter SimHash registry: read active-only fingerprints from
+            # the store.  Interim adapter IDs have their own registry after the
+            # SimHash unification; fall back to None (→ confidence 1.0) when
+            # the tier has no registry (e.g. first-ever init before any commit).
+            if loop.store.has_registry(adapter_id):
+                simhash_registry = loop.store.tier_simhashes(adapter_id, include_stale=False)
+            else:
+                simhash_registry = None
 
             logger.debug(
                 "reconstruct_graph: switching to adapter %r, probing %d keys",

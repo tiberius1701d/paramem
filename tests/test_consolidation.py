@@ -1568,8 +1568,8 @@ class TestResetMainTierRegistriesAndSimhashes:
 
         # SimHash registry repopulated in the SAME pass (the load-bearing pairing).
         # An empty view here is exactly the bug this guards against.
-        assert store.simhashes_in_tier("episodic") == build_registry(episodic)
-        assert store.simhashes_in_tier("procedural") == build_registry(procedural)
+        assert store.tier_simhashes("episodic", include_stale=False) == build_registry(episodic)
+        assert store.tier_simhashes("procedural", include_stale=False) == build_registry(procedural)
         assert store.simhash_count_in_tier("episodic") == 2
 
     def test_overwrites_stale_simhash(self):
@@ -1582,7 +1582,7 @@ class TestResetMainTierRegistriesAndSimhashes:
             {"episodic": [self._entry("graph_new")], "semantic": [], "procedural": []},
         )
 
-        view = store.simhashes_in_tier("episodic")
+        view = store.tier_simhashes("episodic", include_stale=False)
         assert "graph_old" not in view
         assert "graph_new" in view
 
@@ -1594,7 +1594,7 @@ class TestResetMainTierRegistriesAndSimhashes:
         self._call(store, {"episodic": [], "semantic": [], "procedural": []})
 
         assert len(store.registry("semantic")) == 0
-        assert store.simhashes_in_tier("semantic") == {}
+        assert store.tier_simhashes("semantic", include_stale=False) == {}
 
 
 def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
@@ -1899,9 +1899,6 @@ class TestSlotRetention:
                 ConsolidationLoop,
                 "_verify_saved_adapter_from_disk",
                 return_value=1.0,
-            ),
-            patch(
-                "paramem.training.consolidation.save_registry",
             ),
         ):
             # Disable replay so the registry-commit block is skipped cleanly.
@@ -2690,8 +2687,9 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
         # The stale key must NOT be in list_active().
         assert stale_keys[0] not in active_keys, "Stale key must not be active"
-        # The stale key's simhash must be RETAINED in the episodic simhash dict.
-        ep_simhashes = loop.store.simhashes_in_tier("episodic")
+        # The stale key's simhash must be RETAINED in the episodic simhash dict
+        # (include_stale=True so stale fingerprints are visible).
+        ep_simhashes = loop.store.tier_simhashes("episodic", include_stale=True)
         assert stale_keys[0] in ep_simhashes, (
             f"Stale key {stale_keys[0]!r} simhash must be retained; "
             f"episodic simhashes: {ep_simhashes}"
