@@ -34,6 +34,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import base64
 import sys
 from pathlib import Path
 
@@ -197,22 +198,43 @@ def chunk_file(path: Path) -> list[DocumentChunk]:
         sys.exit(2)
 
 
-def post_chunks(server_url: str, speaker_id: str, chunks: list[DocumentChunk]) -> dict:
+def post_chunks(
+    server_url: str,
+    speaker_id: str,
+    chunks: list[DocumentChunk],
+    *,
+    file_path: Path,
+) -> dict:
     """POST ``/ingest-sessions`` with the pre-chunked document payload.
+
+    Reads the original file bytes and includes them as ``document_b64``
+    (base64-encoded) so the server can store the original document alongside
+    the chunk sessions.
 
     Args:
         server_url: Base URL of the running ParaMem server.
         speaker_id: Known speaker identifier from the server's profile store.
         chunks: List of :class:`DocumentChunk` instances to enqueue.
+        file_path: Resolved path to the original document file; used to read
+            raw bytes for ``document_b64`` and to supply ``document_filename``.
 
     Returns:
         Parsed ``IngestSessionsResponse``-shaped dict from the server.
 
     Raises:
         SystemExit(1): On HTTP errors or server unreachability.
+        SystemExit(2): If the file cannot be read.
     """
+    try:
+        raw_bytes = file_path.read_bytes()
+    except OSError as exc:
+        print(f"ERROR: could not read file for upload: {exc}", file=sys.stderr)
+        sys.exit(2)
+
     payload = {
         "speaker_id": speaker_id,
+        "document_filename": file_path.name,
+        "document_b64": base64.b64encode(raw_bytes).decode("ascii"),
         "sessions": [
             {
                 "source": c.source_path,
@@ -283,10 +305,23 @@ def _handle_ingest_http_error(exc: ServerHTTPError) -> None:
             file=sys.stderr,
         )
     elif exc.status_code == 400:
-        print(
-            "ERROR: bad request (HTTP 400) — speaker_id may be empty.",
-            file=sys.stderr,
-        )
+        import json as _json
+
+        try:
+            body = _json.loads(exc.body)
+            err_code = body.get("error", "")
+        except Exception:
+            err_code = ""
+        if err_code == "document_too_large":
+            print(
+                "ERROR: document exceeds the 25 MiB server limit (HTTP 400).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "ERROR: bad request (HTTP 400) — speaker_id may be empty.",
+                file=sys.stderr,
+            )
     elif exc.status_code == 409:
         # Echo the server body verbatim — it carries the actionable
         # remedy (POST /migration/accept or /migration/rollback) and the
@@ -448,27 +483,20 @@ def main(argv: list[str] | None = None) -> int:
             speaker_id = pick_speaker_interactively(profiles)
 
     # --- 4. POST the chunks to the server. ---
-    response = post_chunks(args.server, speaker_id, chunks)
+    response = post_chunks(args.server, speaker_id, chunks, file_path=path)
 
     queued: list[str] = response.get("queued", [])
     total_chunks: int = response.get("total_chunks", len(chunks))
-    registry_skipped: int = response.get("registry_skipped", 0)
+    doc_id: str = response.get("doc_id", "")
 
-    print(
-        f"Server response: total_chunks={total_chunks}, "
-        f"queued={len(queued)}, "
-        f"registry_skipped={registry_skipped}"
-    )
+    print(f"Server response: total_chunks={total_chunks}, queued={len(queued)}, doc_id={doc_id}")
     if queued:
         # Print every id, not just the first — operators running with
         # --no-action need the full list to drive a later cancel.
         print(f"Session ids: {', '.join(queued)}")
 
     if not queued:
-        if registry_skipped == total_chunks:
-            print("All chunks already ingested (registry idempotency hit) — nothing to do.")
-        else:
-            print("WARNING: no sessions were queued by the server.")
+        print("WARNING: no sessions were queued by the server.")
         return 0
 
     # --- 5. Post-ingest action. ---

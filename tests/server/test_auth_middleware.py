@@ -520,7 +520,7 @@ class TestFailClean:
 class TestLogStartupPosture:
     """Tests for log_startup_posture's four output states.
 
-    The project pattern for caplog (see tests/test_ingest_registry.py) is to
+    The project pattern for caplog (see tests/test_vram_validator.py) is to
     attach caplog.handler directly to the named logger, because some installed
     packages set propagate=False which breaks the default caplog propagation path.
     """
