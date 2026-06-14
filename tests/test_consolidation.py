@@ -1416,6 +1416,188 @@ class TestRunFullConsolidationSyncAccumulating:
         save_spy.assert_not_called()
 
 
+class TestRunFullConsolidationSyncPendingSessionsUntouched:
+    """Full-cycle bookkeeping must NOT mark pending sessions as consolidated.
+
+    The full consolidation run folds interim-adapter content into main; it does
+    not run the extraction chain on pending sessions.  Pending sessions must
+    remain in the buffer and be consumed by the next interim tick.
+
+    Bug (fixed): the post-full-cycle bookkeeping block called
+    ``session_buffer.mark_consolidated(pending_ids, ...)`` on the scheduled
+    (``not housekeeping``) path, permanently discarding sessions that were
+    never extracted.  This test asserts the corrected contract.
+    """
+
+    def _make_state_full_trained(self) -> dict:
+        """Minimal ``_state`` producing a successful full-trained result.
+
+        ``consolidate_interim_adapters`` returns ``tiers_rebuilt=["episodic"]``
+        so the full-trained bookkeeping path is exercised (not noop/accumulating).
+        ``_save_key_metadata`` is mocked at the consolidation module level so
+        no real loop or filesystem is needed.
+        ``session_buffer`` holds one pending session to verify it is untouched.
+        """
+        mock_config = MagicMock()
+        mock_config.consolidation.mode = "train"
+        # training_temp_limit <= 0 prevents ThermalPolicy comparison with MagicMock.
+        mock_config.consolidation.training_temp_limit = 0
+
+        mock_loop = MagicMock()
+        mock_loop.model = MagicMock(name="model")
+        mock_loop.store = MagicMock()
+        mock_loop.store.replay_enabled = False
+        mock_loop.consolidate_interim_adapters.return_value = {
+            "status": "full_trained",
+            "tiers_rebuilt": ["episodic"],
+            "rolled_back": False,
+            "rollback_tier": None,
+            "graph_drift_count": 0,
+        }
+
+        mock_session_buffer = MagicMock()
+        # Simulate one pending session in the buffer.
+        mock_session_buffer.get_pending.return_value = [{"session_id": "doc-pending-1"}]
+
+        return {
+            "config": mock_config,
+            "model": MagicMock(name="model"),
+            "tokenizer": MagicMock(name="tokenizer"),
+            "consolidation_loop": mock_loop,
+            "session_buffer": mock_session_buffer,
+            "router": MagicMock(),
+            "background_trainer": None,
+            "consolidating": True,
+            "last_consolidation": None,
+            "last_consolidation_result": None,
+            "event_loop": None,
+        }
+
+    def test_full_trained_does_not_mark_pending_consolidated(self, monkeypatch):
+        """Full-trained path must not call session_buffer.mark_consolidated.
+
+        A pending session that arrived while a full cycle was due must remain
+        pending after the full fold so the next interim tick extracts it.
+        Calling mark_consolidated here would permanently discard it.
+
+        Non-vacuity contract: the test first asserts that the BG job actually
+        ran (``_save_key_metadata`` called — a witness that
+        ``_run_full_cycle`` executed past the ``full_trained`` path).  If the
+        job did NOT run, the first assertion fails, preventing a false green on
+        ``mark_consolidated.assert_not_called()``.
+
+        Patch path: ``paramem.server.app.BackgroundTrainer`` — the name that
+        ``_build_bg_trainer`` in app.py resolves at call time (imported at
+        module level via ``from paramem.server.background_trainer import
+        BackgroundTrainer``).  Patching the class in its own module
+        (``paramem.server.background_trainer.BackgroundTrainer``) does NOT
+        intercept the constructor call because app.py already holds the
+        original reference in its own namespace.
+        """
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_state_full_trained()
+        monkeypatch.setattr(app_module, "_state", state)
+
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        save_spy = MagicMock()
+
+        with (
+            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
+            patch("paramem.server.consolidation._save_key_metadata", save_spy),
+        ):
+            app_module._run_full_consolidation_sync()
+
+        # Non-vacuity witness: the BG job ran and reached the full_trained bookkeeping
+        # path.  If the job did not run, this assertion fails before the guard below.
+        save_spy.assert_called_once()
+        state["session_buffer"].mark_consolidated.assert_not_called()
+
+    def test_full_trained_save_key_metadata_still_called(self, monkeypatch):
+        """_save_key_metadata is called even though mark_consolidated is not.
+
+        The key-metadata file must be updated after a successful fold; the fix
+        must not accidentally remove that call.
+
+        Patching ``paramem.server.app.BackgroundTrainer`` (the name imported at
+        module level in app.py) rather than the class in its own module ensures
+        ``_build_bg_trainer`` creates the mock BT whose ``submit.side_effect``
+        executes the job synchronously, so the assertion runs after the job
+        completes.
+        """
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_state_full_trained()
+        monkeypatch.setattr(app_module, "_state", state)
+
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        save_spy = MagicMock()
+
+        with (
+            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
+            patch("paramem.server.consolidation._save_key_metadata", save_spy),
+        ):
+            app_module._run_full_consolidation_sync()
+
+        save_spy.assert_called_once()
+
+    def test_full_trained_pending_sessions_remain_in_buffer(self, monkeypatch):
+        """get_pending() still returns the pending session after a full cycle.
+
+        Verifies that the session_buffer's pending state is preserved end-to-end:
+        mark_consolidated is not called, so the pending session survives.
+
+        Non-vacuity contract: the test first asserts that the BG job actually
+        ran (``_save_key_metadata`` called) before asserting on the buffer
+        state.  Without this witness the pending-sessions assertion is trivially
+        true because the MagicMock's ``get_pending.return_value`` is unchanged
+        regardless of whether the job ran.
+
+        Patch path: ``paramem.server.app.BackgroundTrainer`` — same rationale
+        as ``test_full_trained_does_not_mark_pending_consolidated``.
+        """
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_state_full_trained()
+        monkeypatch.setattr(app_module, "_state", state)
+
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        save_spy = MagicMock()
+
+        with (
+            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
+            patch("paramem.server.consolidation._save_key_metadata", save_spy),
+        ):
+            app_module._run_full_consolidation_sync()
+
+        # Non-vacuity witness: the BG job ran and reached the full_trained bookkeeping
+        # path.  If the job did not run, this assertion fails before the buffer check.
+        save_spy.assert_called_once()
+
+        # mark_consolidated must not have been called — pending sessions survive the fold.
+        state["session_buffer"].mark_consolidated.assert_not_called()
+
+        # get_pending must still return the session that was pending before the fold.
+        pending_after = state["session_buffer"].get_pending()
+        session_ids = [s["session_id"] for s in pending_after]
+        assert "doc-pending-1" in session_ids, (
+            "Pending session must remain in buffer after full consolidation; "
+            f"mark_consolidated must not have been called. Found: {session_ids!r}"
+        )
+
+
 class TestTestHarnessImportNoEnvRestoration:
     """Regression: importing experiments.utils.test_harness must NOT re-load .env.
 
