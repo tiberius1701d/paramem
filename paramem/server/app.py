@@ -12377,7 +12377,6 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
     )
 
     config = _state["config"]
-    session_buffer = _state.get("session_buffer")
 
     loop = _state.get("consolidation_loop")
     if loop is None:
@@ -12514,24 +12513,17 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # would have landed in the ``except Exception`` handler above with
         # sessions left pending — so reaching here means main is durable.
 
-        # Persist key metadata.  Under housekeeping=True, do NOT mark sessions
-        # consolidated — the housekeeping fold re-grooms the existing knowledge
-        # but does NOT fold pending sessions' facts into main (sessions stay
-        # pending for the next scheduled tick).  mark_consolidated is only called
-        # on the SCHEDULED path where the full fold consumed those sessions.
+        # Persist key metadata.
+        #
+        # The full consolidation run folds interim-adapter content into main; it
+        # does NOT run the extraction chain on pending sessions.  Pending sessions
+        # remain in the buffer and are consumed by the next interim tick (matching
+        # the dispatch contract at _maybe_trigger_scheduled_consolidation, which
+        # documents "Pending sessions wait one tick (~refresh_cadence) for their
+        # interim write").  Marking them consolidated here would permanently discard
+        # them without ever extracting or training on their content.
         try:
             _save_key_metadata(loop, config)
-            if not housekeeping and session_buffer is not None:
-                pending_ids = [s["session_id"] for s in session_buffer.get_pending()]
-                if pending_ids:
-                    from paramem.server.consolidation import (
-                        session_retention_dir as _retdir,
-                    )
-
-                    session_buffer.mark_consolidated(
-                        pending_ids,
-                        retention_dir=_retdir(loop, config),
-                    )
         except Exception:
             logger.exception("Post-full-cycle bookkeeping failed (non-fatal)")
 
