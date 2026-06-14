@@ -30,7 +30,7 @@ contract still holds.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 from paramem.memory.entry import DEFAULT_CONFIDENCE_THRESHOLD
 
@@ -51,7 +51,9 @@ class MemorySource(Protocol):
     """
 
     def probe(
-        self, keys_by_adapter: dict[str, list[str]]
+        self,
+        keys_by_adapter: dict[str, list[str]],
+        should_abort: Callable[[], bool] | None = None,
     ) -> dict[str, dict | None]:  # pragma: no cover — Protocol
         ...
 
@@ -103,7 +105,25 @@ class WeightMemorySource:
         self.max_new_tokens = max_new_tokens
         self.batch_size = batch_size
 
-    def probe(self, keys_by_adapter: dict[str, list[str]]) -> dict[str, dict | None]:
+    def probe(
+        self,
+        keys_by_adapter: dict[str, list[str]],
+        should_abort: Callable[[], bool] | None = None,
+    ) -> dict[str, dict | None]:
+        """Probe adapter weights for the given keys.
+
+        Args:
+            keys_by_adapter: Ordered mapping of adapter name → list of keys.
+            should_abort: Optional callable forwarded to
+                :func:`~paramem.memory.probe.probe_keys_grouped_by_adapter`.
+                When it returns ``True`` before an adapter group starts, the
+                probe exits early with partial results — yielding the GPU to
+                a waiting ``/chat`` request.
+
+        Returns:
+            Flat ``{key → result | None}`` mapping.  May be partial when
+            ``should_abort`` fires.
+        """
         # Lazy import so test monkeypatches against
         # ``paramem.memory.probe.probe_keys_grouped_by_adapter``
         # take effect without re-binding through this module.
@@ -117,6 +137,7 @@ class WeightMemorySource:
             registry=self.registry,
             confidence_threshold=self.confidence_threshold,
             batch_size=self.batch_size,
+            should_abort=should_abort,
         )
 
 
@@ -140,7 +161,22 @@ class DiskMemorySource:
     def __init__(self, store_dir: Path) -> None:
         self.store_dir = Path(store_dir)
 
-    def probe(self, keys_by_adapter: dict[str, list[str]]) -> dict[str, dict | None]:
+    def probe(
+        self,
+        keys_by_adapter: dict[str, list[str]],
+        should_abort: Callable[[], bool] | None = None,  # noqa: ARG002 — CPU path, no abort needed
+    ) -> dict[str, dict | None]:
+        """Read entries from per-tier graph.json files on disk.
+
+        Args:
+            keys_by_adapter: Ordered mapping of adapter name → list of keys.
+            should_abort: Accepted for interface parity with
+                :class:`WeightMemorySource`; ignored here because the disk
+                path is CPU-bound and fast (no GPU contention).
+
+        Returns:
+            Flat ``{key → result | None}`` mapping.
+        """
         import json
 
         from paramem.memory.entry import entry_fact_text

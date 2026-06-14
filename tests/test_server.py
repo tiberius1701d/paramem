@@ -671,3 +671,202 @@ class TestProbeAndReasonDispatch:
             "interim adapter name should NOT leak as a section heading; "
             "merge them under [Recent knowledge] instead"
         )
+
+
+# ---------------------------------------------------------------------------
+# _build_store_contents — store-free builder (phase-2)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildStoreContents:
+    """_build_store_contents builds registry/entries/bookkeeping off-store."""
+
+    def _make_config(self, tmp_path):
+        """Minimal config stub sufficient for _build_store_contents."""
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path
+        cfg.key_metadata_path = tmp_path / "key_metadata.json"
+        cfg.consolidation.mode = "simulate"
+        cfg.consolidation.recall_probe_batch_size = 1
+        cfg.inference.preload_cache = False
+        return cfg
+
+    def test_returns_four_tuple(self, tmp_path) -> None:
+        """_build_store_contents returns (entries, registry, bookkeeping, stats)."""
+        from paramem.server.app import _build_store_contents
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        cfg = self._make_config(tmp_path)
+        result = _build_store_contents(cfg, model=None, tokenizer=None)
+        assert len(result) == 4, "expected 4-tuple"
+        new_e, new_r, new_b, stats = result
+        assert isinstance(new_e, dict)
+        assert isinstance(new_r, dict)
+        assert isinstance(new_b, dict)
+        assert isinstance(stats, dict)
+
+    def test_stats_has_expected_keys(self, tmp_path) -> None:
+        """stats dict carries boot_degraded and store_load_degraded."""
+        from paramem.server.app import _build_store_contents
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        cfg = self._make_config(tmp_path)
+        _, _, _, stats = _build_store_contents(cfg, model=None, tokenizer=None)
+        assert "boot_degraded" in stats
+        assert "store_load_degraded" in stats
+
+    def test_preload_cache_off_entries_empty(self, tmp_path) -> None:
+        """When preload_cache=False, new_entries is empty (intentional opt-out)."""
+        from paramem.server.app import _build_store_contents
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        cfg = self._make_config(tmp_path)
+        cfg.inference.preload_cache = False
+        new_e, _, _, stats = _build_store_contents(cfg, model=None, tokenizer=None)
+        assert new_e == {}, "entries must be empty when preload_cache=False"
+        assert stats["boot_degraded"] is None
+
+    def test_does_not_mutate_any_live_store(self, tmp_path) -> None:
+        """_build_store_contents must not touch the live MemoryStore singleton."""
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import _build_store_contents
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        live = MemoryStore()
+        live.put("episodic", "sentinel_key", {"key": "sentinel_key"})
+
+        cfg = self._make_config(tmp_path)
+        _build_store_contents(cfg, model=None, tokenizer=None)
+
+        # The live store must be untouched.
+        assert live.get("sentinel_key") is not None, "live store mutated by builder"
+
+    def test_should_abort_accepted(self, tmp_path) -> None:
+        """_build_store_contents accepts should_abort without raising."""
+        from paramem.server.app import _build_store_contents
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        cfg = self._make_config(tmp_path)
+        cfg.inference.preload_cache = True  # activate probe path
+        cfg.consolidation.mode = "simulate"
+
+        # should_abort=True; with simulate mode and no graph.json files the
+        # probe returns quickly regardless, but the call must not raise.
+        result = _build_store_contents(cfg, model=None, tokenizer=None, should_abort=lambda: True)
+        assert len(result) == 4
+
+
+# ---------------------------------------------------------------------------
+# _hydrate_memory_store_in_place — degraded-build swap guard (regression)
+# ---------------------------------------------------------------------------
+
+
+class TestHydrateMemoryStoreSwapGuard:
+    """Degraded builder must not wipe a populated live store."""
+
+    def _make_config(self, tmp_path):
+        """Minimal config stub sufficient for _build_store_contents."""
+        cfg = MagicMock()
+        cfg.adapter_dir = tmp_path
+        cfg.key_metadata_path = tmp_path / "key_metadata.json"
+        cfg.consolidation.mode = "simulate"
+        cfg.consolidation.recall_probe_batch_size = 1
+        cfg.inference.preload_cache = False
+        return cfg
+
+    def test_degraded_build_does_not_swap(self, tmp_path) -> None:
+        """When the builder returns store_load_degraded=True, swap is skipped.
+
+        The live store's registry/bookkeeping must survive intact; only
+        _state degraded flags are updated.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import _hydrate_memory_store_in_place
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        # Pre-populate the live store with a sentinel entry.
+        live = MemoryStore()
+        live.put("episodic", "pre_existing_key", {"key": "pre_existing_key", "tier": "episodic"})
+
+        cfg = self._make_config(tmp_path)
+
+        # Simulate read_registries_from_disk raising to trigger store_load_degraded.
+        with patch(
+            "paramem.memory.store.MemoryStore.read_registries_from_disk",
+            side_effect=OSError("simulated disk failure"),
+        ):
+            _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
+
+        # The pre-existing entry must still be present — swap must not have run.
+        assert live.get("pre_existing_key") is not None, (
+            "degraded build wiped the live store: pre-existing entry lost"
+        )
+
+    def test_legitimate_empty_registry_does_swap(self, tmp_path) -> None:
+        """A successful build with an empty registry (store_load_degraded=False) swaps.
+
+        This verifies the guard is on the failure flag, not on len(registry)==0.
+        """
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import _hydrate_memory_store_in_place
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        # Pre-populate the live store with a sentinel entry.
+        live = MemoryStore()
+        live.put("episodic", "old_key", {"key": "old_key", "tier": "episodic"})
+
+        cfg = self._make_config(tmp_path)
+        # preload_cache=False + empty registry → successful empty build, should swap.
+        cfg.inference.preload_cache = False
+
+        _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
+
+        # The old entry must be gone — the swap replaced the store with the empty build.
+        assert live.get("old_key") is None, (
+            "legitimate empty build did not swap: old entry still present"
+        )
+
+    def test_degraded_build_sets_state_flag(self, tmp_path) -> None:
+        """_state['store_load_degraded'] is set True when builder degrades."""
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+        from paramem.memory.store import MemoryStore
+        from paramem.server.app import _hydrate_memory_store_in_place
+
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        live = MemoryStore()
+        cfg = self._make_config(tmp_path)
+
+        original_state = app_module._state.copy()
+        try:
+            with patch(
+                "paramem.memory.store.MemoryStore.read_registries_from_disk",
+                side_effect=OSError("simulated disk failure"),
+            ):
+                _hydrate_memory_store_in_place(live, cfg, model=None, tokenizer=None)
+
+            assert app_module._state["store_load_degraded"] is True, (
+                "_state['store_load_degraded'] not set True after degraded build"
+            )
+        finally:
+            # Restore _state so we do not leak into other tests.
+            app_module._state.update(original_state)

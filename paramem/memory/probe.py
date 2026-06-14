@@ -7,7 +7,10 @@ that switches adapters once per group and delegates to
 Relocated from :mod:`paramem.training.indexed_memory` on 2026-05-20.
 """
 
+from __future__ import annotations
+
 import logging
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,7 @@ def probe_keys_grouped_by_adapter(
     confidence_threshold: float | None = None,
     *,
     batch_size: int = 1,
+    should_abort: Callable[[], bool] | None = None,
 ) -> dict[str, dict | None]:
     """Probe keys grouped by owning adapter. One switch_adapter per group.
 
@@ -30,6 +34,10 @@ def probe_keys_grouped_by_adapter(
 
     For each ``(adapter_name, keys)`` group:
 
+    - If ``should_abort`` is supplied and returns ``True`` before the group
+      starts, the loop exits early and returns partial results accumulated so
+      far.  Partial results self-heal via on-miss probing on the next query —
+      the abort yields the GPU to a waiting ``/chat`` request.
     - If the adapter is not present in ``model.peft_config``, emits a WARNING
       and maps every key in the group to ``None``.
     - Otherwise switches to the adapter once via ``switch_adapter`` and calls
@@ -57,10 +65,15 @@ def probe_keys_grouped_by_adapter(
             The default of ``1`` is for direct / test use only; production
             callers (``WeightMemorySource``) must supply
             ``config.consolidation.recall_probe_batch_size``.
+        should_abort: Optional zero-argument callable checked before each
+            adapter group starts.  When it returns ``True`` the loop exits
+            immediately and returns partial results.  Partial entries
+            self-heal via on-miss probing.
 
     Returns:
         Flat dict mapping each key name to its probe result (a result dict on
-        success, or ``None`` / a failure dict on failure).
+        success, or ``None`` / a failure dict on failure).  May be partial when
+        ``should_abort`` fires mid-probe.
     """
     from paramem.memory.entry import DEFAULT_CONFIDENCE_THRESHOLD, entry_fact_text
     from paramem.models.loader import switch_adapter
@@ -72,6 +85,17 @@ def probe_keys_grouped_by_adapter(
     results: dict[str, dict | None] = {}
 
     for adapter_name, keys in keys_by_adapter.items():
+        # Abort-cooperative: yield the GPU to a waiting /chat before each
+        # adapter group.  Partial results self-heal via on-miss probing.
+        if should_abort is not None and should_abort():
+            logger.info(
+                "probe_keys_grouped_by_adapter: abort requested before adapter '%s' "
+                "— returning %d partial result(s); remainder self-heals on-miss",
+                adapter_name,
+                len(results),
+            )
+            break
+
         if not hasattr(model, "peft_config") or adapter_name not in model.peft_config:
             logger.warning(
                 "Adapter '%s' not loaded — skipping %d key(s): %s",

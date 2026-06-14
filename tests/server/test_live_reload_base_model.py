@@ -541,24 +541,15 @@ def _fake_memory_store():
 def test_preload_source_selection_simulate_mode():
     """preload_cache=True + consolidation.mode='simulate' → DiskMemorySource selected.
 
-    Source selection must use config.consolidation.mode, NOT _state["mode"].
+    Source selection now lives in _build_store_contents (called by
+    _hydrate_memory_store_in_place, called by _preload_memory_store).
+    Selection uses config.consolidation.mode, NOT _state["mode"].
     """
     from paramem.server import app as app_module
 
     config = _server_config(consolidation_mode="simulate", preload_cache=True)
     config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
-
-    # Make the store return one active key so the probe branch is entered.
-    fake_store = MagicMock()
-    fake_store.tiers_with_registry.return_value = ["episodic"]
-    fake_store.active_keys_in_tier.return_value = ["graph1"]
-    fake_store.load_registries_from_disk.return_value = None
-    fake_store.load_bookkeeping_from_disk.return_value = {
-        "loaded": 0,
-        "orphaned": 0,
-        "legacy_upgraded": 0,
-    }
 
     state_patch = {
         "mode": "cloud-only",  # _state["mode"] is cloud-only; consolidation.mode is simulate
@@ -574,22 +565,33 @@ def test_preload_source_selection_simulate_mode():
         def __init__(self, _adapter_dir):
             disk_source_calls.append("init")
 
-        def probe(self, keys_by_tier):
+        def probe(self, keys_by_tier, should_abort=None):
             return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
 
     class FakeWeightSource:
-        def __init__(self, model, tokenizer, batch_size, registry=None):
+        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
             weight_source_calls.append("init")
 
-        def probe(self, keys_by_tier):
+        def probe(self, keys_by_tier, should_abort=None):
             return {}
 
     import paramem.memory.source as src_mod
     import paramem.memory.store as store_mod
 
+    # Build a fake registry with one active key so the source-selection branch is entered.
+    fake_reg = MagicMock()
+    fake_reg.list_active.return_value = ["graph1"]
+    fake_registry_map = {"episodic": fake_reg}
+
+    fake_store = MagicMock()
+
     with (
         patch.dict(app_module._state, state_patch, clear=False),
+        # Constructor returns fake_store; read_registries_from_disk returns fake registry map.
         patch.object(store_mod, "MemoryStore", return_value=fake_store),
+        patch.object(
+            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
+        ),
         patch.object(src_mod, "DiskMemorySource", FakeDiskSource),
         patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
     ):
@@ -609,22 +611,15 @@ def test_preload_source_selection_train_mode_uses_weight_source():
     """preload_cache=True + consolidation.mode='train' + model present
     → WeightMemorySource selected (NOT DiskMemorySource), regardless of
     _state["mode"] (which might be cloud-only on the apply path).
+
+    Source selection now lives in _build_store_contents (called by
+    _hydrate_memory_store_in_place, called by _preload_memory_store).
     """
     from paramem.server import app as app_module
 
     config = _server_config(consolidation_mode="train", preload_cache=True)
     config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
-
-    fake_store = MagicMock()
-    fake_store.tiers_with_registry.return_value = ["episodic"]
-    fake_store.active_keys_in_tier.return_value = ["graph1"]
-    fake_store.load_registries_from_disk.return_value = None
-    fake_store.load_bookkeeping_from_disk.return_value = {
-        "loaded": 0,
-        "orphaned": 0,
-        "legacy_upgraded": 0,
-    }
 
     state_patch = {
         "mode": "cloud-only",  # runtime mode cloud-only; must use weight source for train
@@ -640,22 +635,33 @@ def test_preload_source_selection_train_mode_uses_weight_source():
         def __init__(self, _adapter_dir):
             disk_source_calls.append("init")
 
-        def probe(self, keys_by_tier):
+        def probe(self, keys_by_tier, should_abort=None):
             return {}
 
     class FakeWeightSource:
-        def __init__(self, model, tokenizer, batch_size, registry=None):
+        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
             weight_source_calls.append("init")
 
-        def probe(self, keys_by_tier):
+        def probe(self, keys_by_tier, should_abort=None):
             return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
 
     import paramem.memory.source as src_mod
     import paramem.memory.store as store_mod
 
+    # Build a fake registry with one active key so the source-selection branch is entered.
+    fake_reg = MagicMock()
+    fake_reg.list_active.return_value = ["graph1"]
+    fake_registry_map = {"episodic": fake_reg}
+
+    fake_store = MagicMock()
+
     with (
         patch.dict(app_module._state, state_patch, clear=False),
+        # Constructor returns fake_store; read_registries_from_disk returns fake registry map.
         patch.object(store_mod, "MemoryStore", return_value=fake_store),
+        patch.object(
+            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
+        ),
         patch.object(src_mod, "DiskMemorySource", FakeDiskSource),
         patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
     ):
@@ -716,6 +722,10 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
     registry-sha256 binding-bug: slot present but unmounted → probe None):
     boot_degraded is SET.  This is the normal (non-swap) path — tmp_path has no
     base-swap marker, so the invalidity gate does not fire.
+
+    Source enumeration now comes from the fresh registry returned by
+    _build_store_contents (via MemoryStore.read_registries_from_disk), not from
+    the live store instance methods.
     """
     from paramem.server import app as app_module
 
@@ -723,16 +733,6 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
     config.paths.data = tmp_path  # no base-swap marker here → gate inactive
     config.consolidation.indexed_key_replay = False
     config.consolidation.recall_probe_batch_size = 16
-
-    fake_store = MagicMock()
-    fake_store.tiers_with_registry.return_value = ["episodic"]
-    fake_store.active_keys_in_tier.return_value = ["graph1", "graph2"]
-    fake_store.load_registries_from_disk.return_value = None
-    fake_store.load_bookkeeping_from_disk.return_value = {
-        "loaded": 0,
-        "orphaned": 0,
-        "legacy_upgraded": 0,
-    }
 
     state_patch = {
         "boot_degraded": None,
@@ -742,19 +742,29 @@ def test_preload_partial_sets_boot_degraded(tmp_path):
 
     # Probe returns only one of two keys → partial hydration of a backed tier.
     class FakeWeightSource:
-        def __init__(self, model, tokenizer, batch_size, registry=None):
+        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
             pass
 
-        def probe(self, keys_by_tier):
+        def probe(self, keys_by_tier, should_abort=None):
             # Only graph1 found, graph2 missing.
             return {"graph1": {"key": "graph1", "question": "q", "answer": "a"}}
 
     import paramem.memory.source as src_mod
     import paramem.memory.store as store_mod
 
+    # Registry reports two active keys; the probe will only return one.
+    fake_reg = MagicMock()
+    fake_reg.list_active.return_value = ["graph1", "graph2"]
+    fake_registry_map = {"episodic": fake_reg}
+
+    fake_store = MagicMock()
+
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(store_mod, "MemoryStore", return_value=fake_store),
+        patch.object(
+            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
+        ),
         patch.object(src_mod, "WeightMemorySource", FakeWeightSource),
     ):
         app_module._preload_memory_store(
@@ -1945,12 +1955,16 @@ def _make_real_store(replay_enabled=True):
 
 
 class FakeWeightSourceHydrate:
-    """Minimal WeightMemorySource stand-in for hydration tests."""
+    """Minimal WeightMemorySource stand-in for hydration tests.
 
-    def __init__(self, model, tokenizer, batch_size, registry=None):
+    Signature matches WeightMemorySource: batch_size is keyword-only;
+    probe accepts the optional should_abort keyword forwarded by _build_store_contents.
+    """
+
+    def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
         self.probed = []
 
-    def probe(self, keys_by_tier):
+    def probe(self, keys_by_tier, should_abort=None):
         results = {}
         for _tier, keys in keys_by_tier.items():
             for key in keys:
@@ -1966,8 +1980,14 @@ def test_hydrate_clears_stale_entries_and_reloads():
     the old pre-fold interim entries (e.g. 234 total) must be dropped and replaced
     by the active post-fold set (e.g. 186).  The test verifies that stale entries
     from before the call are not present in the store after the call completes.
+
+    The rebuild is done by _build_store_contents, which reads registries via the
+    store-free MemoryStore.read_registries_from_disk static method and then publishes
+    via store.swap().  Stale entries are cleared because swap() replaces _entries
+    atomically — the new entries dict starts empty (no active keys to probe here).
     """
     import paramem.memory.source as src_mod
+    import paramem.memory.store as store_mod
     from paramem.server import app as app_module
 
     store = _make_real_store()
@@ -1982,15 +2002,12 @@ def test_hydrate_clears_stale_entries_and_reloads():
         "store_load_degraded": False,
     }
 
+    # Empty registry map → no active keys → new_entries stays {} → swap clears the store.
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(store, "load_registries_from_disk") as mock_reg,
         patch.object(
-            store,
-            "load_bookkeeping_from_disk",
-            return_value={"loaded": 0, "orphaned": 0, "legacy_upgraded": 0},
-        ) as mock_bk,
-        patch.object(store, "tiers_with_registry", return_value=[]),
+            store_mod.MemoryStore, "read_registries_from_disk", return_value={}
+        ) as mock_read_reg,
         patch.object(src_mod, "WeightMemorySource", FakeWeightSourceHydrate),
     ):
         app_module._hydrate_memory_store_in_place(
@@ -2001,20 +2018,25 @@ def test_hydrate_clears_stale_entries_and_reloads():
         )
 
         # Assertions inside the with block so patch.dict hasn't restored _state yet.
-        # Stale entries must be gone — clear_entries ran before reload.
+        # Stale entries must be gone — swap() replaced _entries with an empty dict.
         assert len(store) == 0, (
             f"stale entries must be cleared; store has {len(store)} entries after hydration"
         )
-        mock_reg.assert_called_once()
-        mock_bk.assert_called_once()
+        # Disk read happened (the new builder path).
+        mock_read_reg.assert_called_once()
         assert app_module._state["store_load_degraded"] is False
 
 
 def test_hydrate_registers_active_keys_when_source_hits():
     """When preload_cache=True and the source returns entries, they are written
-    into the store.  The stale pre-call entries are replaced by the source results.
+    into the store (via store.swap()).  The stale pre-call entries are replaced by
+    the source results.
+
+    _build_store_contents enumerates active keys from the fresh registry returned
+    by MemoryStore.read_registries_from_disk, probes them, then publishes via swap().
     """
     import paramem.memory.source as src_mod
+    import paramem.memory.store as store_mod
     from paramem.server import app as app_module
 
     store = _make_real_store()
@@ -2025,16 +2047,16 @@ def test_hydrate_registers_active_keys_when_source_hits():
 
     state_patch = {"boot_degraded": None, "store_load_degraded": False}
 
+    # Registry reports two active keys; the weight source will return both.
+    fake_reg = MagicMock()
+    fake_reg.list_active.return_value = ["new_key1", "new_key2"]
+    fake_registry_map = {"episodic": fake_reg}
+
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(store, "load_registries_from_disk"),
         patch.object(
-            store,
-            "load_bookkeeping_from_disk",
-            return_value={"loaded": 0, "orphaned": 0, "legacy_upgraded": 0},
+            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
         ),
-        patch.object(store, "tiers_with_registry", return_value=["episodic"]),
-        patch.object(store, "active_keys_in_tier", return_value=["new_key1", "new_key2"]),
         patch.object(src_mod, "WeightMemorySource", FakeWeightSourceHydrate),
     ):
         app_module._hydrate_memory_store_in_place(
@@ -2056,15 +2078,21 @@ def test_hydrate_registers_active_keys_when_source_hits():
 def test_hydrate_sets_boot_degraded_on_partial_probe():
     """When some active keys cannot be materialised, boot_degraded is set
     (same lifecycle as the boot-path partial preload).
+
+    _build_store_contents enumerates keys from the fresh registry returned by
+    MemoryStore.read_registries_from_disk; when the probe returns fewer entries
+    than the total active key count, stats["boot_degraded"] is set and propagated
+    to _state by _hydrate_memory_store_in_place.
     """
     import paramem.memory.source as src_mod
+    import paramem.memory.store as store_mod
     from paramem.server import app as app_module
 
     class _PartialSource:
-        def __init__(self, model, tokenizer, batch_size, registry=None):
+        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
             pass
 
-        def probe(self, keys_by_tier):
+        def probe(self, keys_by_tier, should_abort=None):
             # Only return one of the two requested keys.
             return {"key_a": {"key": "key_a", "subject": "s", "predicate": "p", "object": "o"}}
 
@@ -2075,16 +2103,16 @@ def test_hydrate_sets_boot_degraded_on_partial_probe():
 
     state_patch = {"boot_degraded": None, "store_load_degraded": False}
 
+    # Registry reports two active keys; the probe will only return one.
+    fake_reg = MagicMock()
+    fake_reg.list_active.return_value = ["key_a", "key_b"]
+    fake_registry_map = {"episodic": fake_reg}
+
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(store, "load_registries_from_disk"),
         patch.object(
-            store,
-            "load_bookkeeping_from_disk",
-            return_value={"loaded": 0, "orphaned": 0, "legacy_upgraded": 0},
+            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
         ),
-        patch.object(store, "tiers_with_registry", return_value=["episodic"]),
-        patch.object(store, "active_keys_in_tier", return_value=["key_a", "key_b"]),
         patch.object(src_mod, "WeightMemorySource", _PartialSource),
     ):
         app_module._hydrate_memory_store_in_place(
@@ -2138,23 +2166,40 @@ def test_hydrate_clears_boot_degraded_on_preload_cache_false():
 
 
 def test_hydrate_sets_store_load_degraded_on_registry_failure():
-    """When load_registries_from_disk raises, store_load_degraded is set to True."""
+    """When MemoryStore.read_registries_from_disk raises, store_load_degraded is set to True.
+
+    NEW CONTRACT (data-integrity guard): when the registry read fails,
+    _hydrate_memory_store_in_place must NOT call store.swap() — the live store
+    is preserved intact so no existing entries are lost.  Callers depend on this
+    no-wipe guarantee to safely retry without losing their authoritative state.
+    """
+    import paramem.memory.store as store_mod
     from paramem.server import app as app_module
 
     store = _make_real_store()
+    pre_call_size = len(store)
+    assert pre_call_size == 2, "precondition: store has 2 entries"
+
     config = _server_config(preload_cache=False)
     config.consolidation.indexed_key_replay = False
 
     state_patch = {"store_load_degraded": False, "boot_degraded": None}
 
+    swap_calls = []
+    original_swap = store.swap
+
+    def spy_swap(*args, **kwargs):
+        swap_calls.append(True)
+        return original_swap(*args, **kwargs)
+
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(store, "load_registries_from_disk", side_effect=OSError("disk error")),
         patch.object(
-            store,
-            "load_bookkeeping_from_disk",
-            return_value={"loaded": 0, "orphaned": 0, "legacy_upgraded": 0},
+            store_mod.MemoryStore,
+            "read_registries_from_disk",
+            side_effect=OSError("disk error"),
         ),
+        patch.object(store, "swap", side_effect=spy_swap),
     ):
         app_module._hydrate_memory_store_in_place(
             store,
@@ -2165,29 +2210,44 @@ def test_hydrate_sets_store_load_degraded_on_registry_failure():
 
         # Read inside the with block so patch.dict hasn't restored _state yet.
         assert app_module._state["store_load_degraded"] is True
+        # Critical: swap must NOT be called — live store is preserved on registry failure.
+        assert not swap_calls, (
+            "store.swap() must not be called when registry read fails; "
+            "the live store must be preserved intact to avoid losing valid entries"
+        )
+
+    # Verify store still has original entries (no-wipe guarantee).
+    assert len(store) == pre_call_size, (
+        f"live store must not be wiped on registry failure; "
+        f"expected {pre_call_size} entries, got {len(store)}"
+    )
 
 
 def test_hydrate_weight_source_is_frame_local():
-    """The WeightMemorySource must be dropped (set to None) before the helper
+    """The WeightMemorySource must be dropped (set to None) before _build_store_contents
     returns — verified by confirming no reference to it leaks out of the call.
 
     This guards the no-base-model-pinning invariant: a surviving reference would
     re-introduce the cloud-only VRAM leak (fixed 2026-05-21).
 
-    The test captures the source object inside FakeWeightSourceCapture and then
-    confirms the source's probe was called exactly once (the helper used it) and
-    that the function returned without keeping any reference that would prevent gc.
+    The source is created inside _build_store_contents (frame-local, set to None
+    before return per BASE-MODEL HOLDER invariant).  The test patches
+    src_mod.WeightMemorySource to a capturing fake, triggers the path via
+    _hydrate_memory_store_in_place, and confirms exactly one source was created,
+    its probe was called (entry is in the store), and no persistent _state or
+    module-global reference was established.
     """
     import paramem.memory.source as src_mod
+    import paramem.memory.store as store_mod
     from paramem.server import app as app_module
 
     sources_created = []
 
     class FakeWeightSourceCapture:
-        def __init__(self, model, tokenizer, batch_size, registry=None):
+        def __init__(self, model, tokenizer, *, batch_size, registry=None, **kw):
             sources_created.append(self)
 
-        def probe(self, keys_by_tier):
+        def probe(self, keys_by_tier, should_abort=None):
             return {
                 "live_key": {"key": "live_key", "subject": "s", "predicate": "p", "object": "o"}
             }
@@ -2199,16 +2259,16 @@ def test_hydrate_weight_source_is_frame_local():
 
     state_patch = {"boot_degraded": None, "store_load_degraded": False}
 
+    # Registry reports one active key so the source-creation branch is entered.
+    fake_reg = MagicMock()
+    fake_reg.list_active.return_value = ["live_key"]
+    fake_registry_map = {"episodic": fake_reg}
+
     with (
         patch.dict(app_module._state, state_patch, clear=False),
-        patch.object(store, "load_registries_from_disk"),
         patch.object(
-            store,
-            "load_bookkeeping_from_disk",
-            return_value={"loaded": 0, "orphaned": 0, "legacy_upgraded": 0},
+            store_mod.MemoryStore, "read_registries_from_disk", return_value=fake_registry_map
         ),
-        patch.object(store, "tiers_with_registry", return_value=["episodic"]),
-        patch.object(store, "active_keys_in_tier", return_value=["live_key"]),
         patch.object(src_mod, "WeightMemorySource", FakeWeightSourceCapture),
     ):
         app_module._hydrate_memory_store_in_place(
@@ -2218,7 +2278,7 @@ def test_hydrate_weight_source_is_frame_local():
             tokenizer=MagicMock(),
         )
 
-    # Exactly one source was created.
+    # Exactly one source was created inside _build_store_contents.
     assert len(sources_created) == 1
     # The source object itself is NOT pinned by the function's closure or any
     # persistent attribute — the only reference is sources_created[0] (held by

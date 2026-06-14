@@ -4244,44 +4244,63 @@ async def gpu_acquire():
     }
 
 
-def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
-    """Load registries and hydrate the content cache on an existing *store* in place.
+def _build_store_contents(
+    config,
+    *,
+    model,
+    tokenizer,
+    should_abort=None,
+) -> "tuple[dict, dict, dict, dict]":
+    """Build fresh store contents entirely off-store.
 
-    Rebuilds the entry cache from scratch: clears ``store._entries`` first so
-    this is a full rebuild, not an append.  Registries and simhashes are NOT
-    cleared — those are authoritative and remain intact throughout.
+    Reads registries and bookkeeping from disk, optionally probes adapter
+    weights for entry content, and returns three fresh dicts plus a stats
+    dict.  The live store is NOT touched — callers publish via
+    :meth:`~paramem.memory.store.MemoryStore.swap`.
 
-    Called from two sites:
+    This is the single canonical builder used by both:
 
-    * :func:`_preload_memory_store` (boot / in-process reload) — after a fresh
-      :class:`MemoryStore` has been constructed and the base-swap gate has passed.
-    * :func:`_finalize_full` (post-consolidation) — after the full-cycle fold has
-      rewritten the on-disk registries.  Re-hydrating reconciles the live
-      ``_entries`` cache to the newly-folded registry without requiring a restart,
-      fixing the staleness bug where ``/debug/dump`` reported the pre-fold count
-      (234) instead of the active post-fold count (186) until the server restarted.
+    * :func:`_hydrate_memory_store_in_place` (boot / in-process reload) —
+      called immediately followed by ``store.swap()``.
+    * :func:`_run_full_cycle` (post-fold re-probe) — called on the BG worker
+      thread under ``gpu_lock`` so the GPU probe is off the event loop and
+      cannot race a concurrent ``/chat``.
 
-    **NO-BASE-MODEL-PINNING INVARIANT** — the ``WeightMemorySource`` is kept as a
-    frame-local and set to ``None`` before return.  The caller passes ``model``
-    and ``tokenizer`` as direct kwarg expressions (``model=loop.model``), NOT via
-    a caller local, so the source is the only reference holding the model handles
-    inside this frame.  Dropping ``_source = None`` releases them.  A surviving
-    reference here would re-introduce the cloud-only VRAM leak fixed 2026-05-21.
+    **BASE-MODEL HOLDER INVARIANT** — the ``WeightMemorySource`` is a
+    frame-local created and dropped within this function.  The caller passes
+    ``model`` and ``tokenizer`` as direct kwarg expressions (never via a
+    caller local).  The three returned dicts hold NO model reference.
+    Setting ``_source = None`` before return releases the only in-frame
+    handle.  A surviving reference here would re-introduce the cloud-only
+    VRAM leak fixed 2026-05-21.
 
     Parameters
     ----------
-    store:
-        Live :class:`~paramem.memory.store.MemoryStore` to hydrate in place.
-        Must be the shared singleton (``_state["memory_store"]`` /
-        ``loop.store``) so all holders (router, consolidation loop, /debug/dump)
-        observe the rebuild without re-wiring.
     config:
         Live server config object.
     model:
-        Base model handle passed directly as a kwarg expression — do NOT bind to
-        a caller local before passing.
+        Base model handle — passed directly as a kwarg expression at the call
+        site; do NOT bind to a caller local before passing.
     tokenizer:
         Tokenizer handle — same constraint.
+    should_abort:
+        Optional zero-argument callable forwarded to the weight probe.  When
+        it returns ``True`` the probe exits early with partial entry results;
+        registry and bookkeeping are still complete in that case.
+        ``store_load_degraded=True`` (registry read raised) leaves registry
+        AND bookkeeping empty — the caller must NOT publish via ``swap`` and
+        must instead preserve the live store.  ``None`` (default) means no
+        abort check — used on the boot path.
+
+    Returns
+    -------
+    tuple of (new_entries, new_registry, new_bookkeeping, stats)
+        ``new_entries``: ``dict[tier, dict[key, entry]]``
+        ``new_registry``: ``dict[tier, KeyRegistry]``
+        ``new_bookkeeping``: ``dict[key, bookkeeping_record]``
+        ``stats``: ``{"boot_degraded": dict | None, "store_load_degraded": bool,
+                      "meta_loaded": int, "meta_orphaned": int,
+                      "meta_legacy_upgraded": int}``
     """
     from paramem.memory.source import (
         DiskMemorySource as _DiskMemorySource,
@@ -4289,50 +4308,67 @@ def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
     from paramem.memory.source import (
         WeightMemorySource as _WeightMemorySource,
     )
+    from paramem.memory.store import MemoryStore as _MemoryStore
 
-    # Rebuild the entry cache from scratch.  Registries and simhashes survive —
-    # they are the authoritative key-lifecycle state and must not be purged here.
-    _dropped = store.clear_entries()
-    if _dropped:
-        logger.debug("_hydrate_memory_store_in_place: cleared %d stale entry/entries", _dropped)
+    stats: dict = {
+        "boot_degraded": None,
+        "store_load_degraded": False,
+        "meta_loaded": 0,
+        "meta_orphaned": 0,
+        "meta_legacy_upgraded": 0,
+    }
 
+    # ------------------------------------------------------------------ #
+    # Registry — read fresh from disk; no live store interaction.         #
+    # ------------------------------------------------------------------ #
+    new_registry: dict = {}
     try:
-        store.load_registries_from_disk(config.adapter_dir)
-        _state["store_load_degraded"] = False
+        new_registry = _MemoryStore.read_registries_from_disk(config.adapter_dir)
+        stats["store_load_degraded"] = False
     except Exception:
         logger.error(
-            "Registry load failed during store hydration; memory store will be empty — "
-            "active-store migration will be refused until this is resolved",
+            "Registry load failed during store content build; memory store will be "
+            "empty — active-store migration will be refused until this is resolved",
             exc_info=True,
         )
-        _state["store_load_degraded"] = True
+        stats["store_load_degraded"] = True
+
+    # ------------------------------------------------------------------ #
+    # Entry content — probed from weights or disk depending on mode.      #
+    # ------------------------------------------------------------------ #
+    new_entries: dict = {}
 
     if not config.inference.preload_cache:
         # Intentional opt-out: inference pays per-key latency on misses.
         # Clear boot_degraded so the cold-cache attention item is not raised on
         # a preload-off deployment after an apply (correction #5 boot_degraded
         # lifecycle).
-        _state["boot_degraded"] = None
+        stats["boot_degraded"] = None
         logger.info(
             "preload_cache: disabled — store stays entry-empty; inference pays source latency"
         )
+    elif stats["store_load_degraded"]:
+        # Registry failed — cannot enumerate active keys; entries stay empty.
+        pass
     else:
+        # Build a temporary in-memory view of the registry to enumerate active keys.
+        # We cannot use the live store here; build from the fresh registry dict.
         _preload_keys_by_tier: dict[str, list[str]] = {}
-        for _tier in store.tiers_with_registry():
-            _active = store.active_keys_in_tier(_tier)
+        for _tier, _reg in new_registry.items():
+            _active = _reg.list_active()
             if _active:
                 _preload_keys_by_tier[_tier] = _active
 
         if not _preload_keys_by_tier:
             # No active keys — nothing to preload; store is correctly empty.
-            _state["boot_degraded"] = None
+            stats["boot_degraded"] = None
         else:
             # Mode-aware source: simulate persists graph.json (DiskMemorySource);
             # train persists only adapter weights (WeightMemorySource).
             # Select from config.consolidation.mode — NOT from _state["mode"]
             # (that conflates consolidation persistence mode with runtime mode).
             _mode = config.consolidation.mode
-            # BASE-MODEL HOLDER (function-local _source — dropped on return)
+            # BASE-MODEL HOLDER (_source frame-local — set to None before return)
             _source = None
             if _mode == "simulate":
                 _source = _DiskMemorySource(config.adapter_dir)
@@ -4371,7 +4407,7 @@ def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
                     type(_source).__name__,
                 )
                 try:
-                    _results = _source.probe(_preload_keys_by_tier)
+                    _results = _source.probe(_preload_keys_by_tier, should_abort=should_abort)
                 except Exception:
                     logger.exception(
                         "preload_cache: source probe failed; store remains "
@@ -4387,12 +4423,11 @@ def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
                         if _entry is None or "failure_reason" in _entry:
                             _missed_by_tier.setdefault(_tier, []).append(_key)
                             continue
-                        # Don't re-register; the registry is already loaded.
-                        store.put(_tier, _key, _entry, register=False)
+                        new_entries.setdefault(_tier, {})[_key] = _entry
                         _hits += 1
                 logger.info("preload_cache: cached %d / %d active key(s)", _hits, _total)
                 if _hits < _total:
-                    _state["boot_degraded"] = {
+                    stats["boot_degraded"] = {
                         "reason": "preload_partial",
                         "hits": _hits,
                         "total": _total,
@@ -4411,19 +4446,39 @@ def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
                     )
                 else:
                     # Full hydration — clear any prior degraded flag.
-                    _state["boot_degraded"] = None
+                    stats["boot_degraded"] = None
 
             # Drop the WeightMemorySource frame-local — the preload probe is
             # complete; the source must not outlive this function's frame.
             _source = None
 
-    # Load per-key bookkeeping (speaker_id, first_seen_cycle) into
-    # MemoryStore._bookkeeping from key_metadata.json.  Entry-independent —
-    # runs regardless of preload setting or boot_degraded.  Under
-    # inference.preload_cache=False this is the sole provenance write at boot,
-    # and is sufficient for the router's speaker index (iter_bookkeeping).
+    # ------------------------------------------------------------------ #
+    # Bookkeeping — read from key_metadata.json; entry-independent.      #
+    # ------------------------------------------------------------------ #
+    # Build a temporary MemoryStore view of the fresh registry so that
+    # load_bookkeeping_from_disk can use tier_for_known_key() to skip orphans.
+    # This is a transient helper — NOT the live store singleton.
+    from paramem.memory.store import MemoryStore as _MemoryStoreB
+
+    _tmp_store = _MemoryStoreB(
+        replay_enabled=True,
+    )
+    # Install the fresh registries into the temporary store.
+    for _t, _r in new_registry.items():
+        try:
+            _tmp_store.load_registry(_t, _r)
+        except RuntimeError:
+            pass  # replay_enabled is True above; this branch should not fire
+
+    new_bookkeeping: dict = {}
     try:
-        _meta_stats = store.load_bookkeeping_from_disk(config.key_metadata_path)
+        _meta_stats = _tmp_store.load_bookkeeping_from_disk(config.key_metadata_path)
+        # Extract the populated _bookkeeping dict from the temp store.
+        # iter_bookkeeping snapshots under the lock — safe, no external refs.
+        new_bookkeeping = dict(_tmp_store.iter_bookkeeping())
+        stats["meta_loaded"] = _meta_stats["loaded"]
+        stats["meta_orphaned"] = _meta_stats["orphaned"]
+        stats["meta_legacy_upgraded"] = _meta_stats["legacy_upgraded"]
         logger.info(
             "load_bookkeeping_from_disk: loaded=%d orphaned=%d legacy_upgraded=%d",
             _meta_stats["loaded"],
@@ -4435,6 +4490,62 @@ def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
             "key_metadata bookkeeping load failed; _bookkeeping will be empty "
             "until next consolidation cycle (speaker scoping will cold-start)"
         )
+
+    return new_entries, new_registry, new_bookkeeping, stats
+
+
+def _hydrate_memory_store_in_place(store, config, *, model, tokenizer):
+    """Load registries, hydrate the content cache, and publish atomically.
+
+    Delegates the rebuild to :func:`_build_store_contents`, then publishes
+    the three new structures via :meth:`~paramem.memory.store.MemoryStore.swap`
+    so no reader ever observes a torn state.
+
+    Called from two sites:
+
+    * :func:`_preload_memory_store` (boot / in-process reload) — after a fresh
+      :class:`MemoryStore` has been constructed and the base-swap gate has passed.
+    * The post-fold re-probe is now handled by :func:`_run_full_cycle` directly
+      (calling :func:`_build_store_contents` on the worker thread under
+      ``gpu_lock``), so ``_finalize_full`` no longer calls this function.
+
+    **NO-BASE-MODEL-PINNING INVARIANT** — enforced inside
+    :func:`_build_store_contents`.  The caller passes ``model`` and
+    ``tokenizer`` as direct kwarg expressions (never via a caller local), and
+    the builder sets its WeightMemorySource frame-local to ``None`` before
+    return.
+
+    Parameters
+    ----------
+    store:
+        Live :class:`~paramem.memory.store.MemoryStore` to hydrate in place.
+        Must be the shared singleton (``_state["memory_store"]`` /
+        ``loop.store``) so all holders (router, consolidation loop, /debug/dump)
+        observe the rebuild without re-wiring.
+    config:
+        Live server config object.
+    model:
+        Base model handle passed directly as a kwarg expression — do NOT bind to
+        a caller local before passing.
+    tokenizer:
+        Tokenizer handle — same constraint.
+    """
+    new_entries, new_registry, new_bookkeeping, stats = _build_store_contents(
+        config,
+        model=model,
+        tokenizer=tokenizer,
+    )
+    # Atomically publish only when the registry build SUCCEEDED.  A degraded
+    # build (store_load_degraded=True, registry read raised internally) leaves
+    # the live store intact so callers preserve their authoritative
+    # registry/bookkeeping.  A legitimately empty registry
+    # (store_load_degraded=False, read succeeded with no keys) DOES swap.
+    if not stats["store_load_degraded"]:
+        store.swap(new_entries, new_registry, new_bookkeeping)
+
+    # Propagate stats to shared _state flags regardless of whether we swapped.
+    _state["store_load_degraded"] = stats["store_load_degraded"]
+    _state["boot_degraded"] = stats["boot_degraded"]
 
 
 def _preload_memory_store(config, *, model, tokenizer):
@@ -12527,31 +12638,93 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         except Exception:
             logger.exception("Post-full-cycle bookkeeping failed (non-fatal)")
 
-        def _finalize_full() -> None:
+        # ------------------------------------------------------------------ #
+        # Post-fold re-probe — runs HERE on the BG worker thread under        #
+        # gpu_lock (held by BackgroundTrainer._run_callable_queue).           #
+        #                                                                      #
+        # Previously this ran inside _finalize_full, which was dispatched via  #
+        # call_soon_threadsafe onto the asyncio event loop.  That meant:       #
+        #   1. The GPU probe ran on the event loop thread without gpu_lock,    #
+        #      so a concurrent /chat could start a second CUDA generate on the  #
+        #      same model (documented 0x116 crash class).                       #
+        #   2. The probe blocked the event loop for the duration of the GPU    #
+        #      call (seconds), stalling all other asyncio handlers.            #
+        #                                                                      #
+        # Moving the probe here keeps it inside the same gpu_lock window as    #
+        # the fold, so the event loop is never blocked by GPU work, and no     #
+        # concurrent CUDA call can race it.                                    #
+        #                                                                      #
+        # The should_abort=bt.abort_requested check makes the probe yield the  #
+        # GPU between adapter groups when a /chat arrives.  Partial ENTRY      #
+        # results are published when the registry build SUCCEEDED              #
+        # (store_load_degraded=False); a failed registry build is NOT          #
+        # published and the live store is preserved.  Missing entry slots      #
+        # self-heal via on-miss probing.                                        #
+        # ------------------------------------------------------------------ #
+        staged_e: dict = {}
+        staged_r: dict = {}
+        staged_b: dict = {}
+        staged_stats: dict = {"boot_degraded": None, "store_load_degraded": False}
+        if loop.store.replay_enabled:
             loop.model.eval()
-            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-            _state["router"].reload()
-            # Re-run the per-tier manifest validator now that main slots have
-            # been re-saved with a fresh registry hash + window_stamp. Without
-            # this, /status and pstatus keep showing the boot-time snapshot —
-            # operators see "FINGERPRINT MISMATCH … PA routing DISABLED" red
-            # rows even though main is healthy.
-            _revalidate_main_adapter_manifests(_state)
-            # Reconcile the live entry cache to the rewritten registries so
-            # /debug/dump and any _entries-based count reflect the post-fold
-            # active set immediately, without requiring a restart.  The stale
-            # pre-fold interim entries (e.g. 234 → 186) are dropped here;
-            # active keys are re-probed against the freshly-retrained weights.
-            # Guard mirrors the total_keys guard below — no-op when replay is
-            # disabled (no registries to reload from).
-            if loop.store.replay_enabled:
-                _hydrate_memory_store_in_place(
-                    loop.store,
+            try:
+                staged_e, staged_r, staged_b, staged_stats = _build_store_contents(
                     config,
                     model=loop.model,
                     tokenizer=loop.tokenizer,
+                    should_abort=bt.abort_requested,
                 )
+            except Exception:
+                logger.exception(
+                    "Post-fold store rebuild failed (non-fatal); "
+                    "live store not updated — queries self-heal on-miss"
+                )
+                staged_stats = {"boot_degraded": None, "store_load_degraded": True}
+
+        def _finalize_full() -> None:
+            """CPU-only event-loop closure — no GPU work.
+
+            Publishes the staged store contents built on the worker thread,
+            updates _state flags, revalidates manifests, reloads the router,
+            and records the consolidation result.
+
+            Step order is load-bearing:
+            a. store.swap — atomically publish new entries/registry/bookkeeping,
+               ONLY when staged_stats["store_load_degraded"] is False.  A
+               degraded build preserves the live store; a legitimately empty
+               registry (store_load_degraded=False, no active keys) still swaps.
+            b. _state boot_degraded / store_load_degraded — from staged_stats,
+               always propagated regardless of whether swap ran.
+            c. _revalidate_main_adapter_manifests — reads fresh on-disk slots.
+            d. _state["router"].reload() — AFTER the swap so the speaker index
+               is built from the freshly-published bookkeeping.  (Previously
+               router.reload ran BEFORE hydrate, which meant the index was built
+               from the pre-fold bookkeeping.  Correct ordering is here.)
+            e. _state flags / result bookkeeping — last_consolidation etc.
+            """
+            if loop.store.replay_enabled:
+                # a. Atomically publish only when the registry build SUCCEEDED.
+                # A degraded build (store_load_degraded=True, raised internally
+                # or caught in the except above) must not wipe the live
+                # registry/bookkeeping — preserve the authoritative in-RAM
+                # state and let queries self-heal on-miss.  A legitimately
+                # empty registry (store_load_degraded=False, read succeeded
+                # with no active keys) DOES swap.
+                if not staged_stats["store_load_degraded"]:
+                    loop.store.swap(staged_e, staged_r, staged_b)
+                # b. Propagate degraded flags regardless of whether we swapped.
+                _state["store_load_degraded"] = staged_stats["store_load_degraded"]
+                _state["boot_degraded"] = staged_stats["boot_degraded"]
+            # c. Re-validate manifests now that main slots have been re-saved
+            #    with a fresh registry hash + window_stamp.  Without this,
+            #    /status keeps showing "FINGERPRINT MISMATCH" until restart.
+            _revalidate_main_adapter_manifests(_state)
+            # d. Reload router AFTER swap so the speaker index is built from
+            #    the freshly-published bookkeeping (phase-2 ordering fix).
+            _state["router"].reload()
+            # e. Result bookkeeping.
             total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
+            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["last_consolidation_result"] = {
                 "status": "rolled_back" if result.get("rolled_back") else "full_trained",
                 "tiers_rebuilt": result.get("tiers_rebuilt", []),
