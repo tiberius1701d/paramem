@@ -443,8 +443,8 @@ class IngestChunk(BaseModel):
     source_type:
         Fixed to ``"document"`` for all ingest-CLI payloads.
     doc_title:
-        Human-readable document title (filename stem); used for registry
-        traceability and ``GET /status`` attribution.
+        Human-readable document title (filename stem); used for
+        ``GET /status`` attribution.
     """
 
     source: str
@@ -465,10 +465,25 @@ class IngestSessionsRequest(BaseModel):
         otherwise.
     sessions:
         List of pre-chunked document segments to enqueue.
+    document_filename:
+        Original filename of the document (e.g. ``"notes.md"``).  Stored
+        alongside the original bytes and used to name the file in the
+        retention archive.
+    document_b64:
+        Base64-encoded raw bytes of the original file.  Stored to disk as
+        ``<doc_id>.origdoc`` and archived together with the chunk JSONLs on
+        retirement.  Decoded size must not exceed 25 MiB; the server returns
+        HTTP 400 (``{"error":"document_too_large"}``) if the limit is
+        exceeded.
     """
 
     speaker_id: str
     sessions: list[IngestChunk]
+    document_filename: str
+    document_b64: str
+
+
+_ORIGDOC_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB
 
 
 class IngestSessionsResponse(BaseModel):
@@ -477,13 +492,13 @@ class IngestSessionsResponse(BaseModel):
     Attributes
     ----------
     queued:
-        Session IDs appended to the ``SessionBuffer`` (form ``doc-<hex8>``).
+        Session IDs appended to the ``SessionBuffer``
+        (form ``<doc_id>-c<chunk_index:03d>``).
     total_chunks:
-        Always equals ``len(request.sessions)`` — the raw count before
-        idempotency filtering.
-    registry_skipped:
-        Chunks whose hash was already recorded in the registry; they were
-        not re-queued.
+        Always equals ``len(request.sessions)``.
+    doc_id:
+        Document group identifier (``"doc-" + secrets.token_hex(4)``)
+        shared by all chunk sessions from this request.
     rejected_unknown_speaker:
         ``True`` when the speaker_id is not in ``SpeakerStore``.
     rejected_no_speaker_id:
@@ -492,7 +507,7 @@ class IngestSessionsResponse(BaseModel):
 
     queued: list[str]
     total_chunks: int
-    registry_skipped: int
+    doc_id: str = ""
     rejected_unknown_speaker: bool = False
     rejected_no_speaker_id: bool = False
 
@@ -6977,29 +6992,38 @@ async def consolidate_housekeeping():
 async def ingest_sessions(request: IngestSessionsRequest):
     """Queue pre-chunked document segments for consolidation.
 
-    Each chunk becomes a separate session in the ``SessionBuffer`` with
-    ``source_type="document"``.  The endpoint is idempotent: chunks whose
-    SHA-256 fingerprint is already in the ingest registry are silently
-    skipped (``registry_skipped`` counter).
+    All chunks in one request belong to a single document and share a
+    ``doc_id`` (``"doc-" + secrets.token_hex(4)``).  Each chunk gets its
+    own session id ``<doc_id>-c<chunk_index:03d>``.  Re-ingesting the same
+    content always queues fresh sessions — idempotency at the content level
+    is handled by the graph merger (which is idempotent on
+    ``(subject, predicate, object)``), not by this endpoint.
+
+    The original document bytes (``document_b64``) are decoded and stored
+    as ``<doc_id>.origdoc`` in ``session_dir`` via
+    :meth:`SessionBuffer.write_origdoc`.  The file is archived or deleted
+    together with the chunk JSONLs when the document retires via
+    :meth:`SessionBuffer.mark_consolidated`.
 
     Errors
     ------
     400
-        ``speaker_id`` is an empty string.
+        ``speaker_id`` is an empty string, OR decoded ``document_b64``
+        exceeds 25 MiB (detail ``{"error":"document_too_large"}``).
     404
         ``speaker_id`` not found in ``SpeakerStore``.
     409
         A migration TRIAL is in progress.
 
     Args:
-        request: Payload containing ``speaker_id`` and a list of
-            :class:`IngestChunk` items.
+        request: Payload containing ``speaker_id``, chunk list,
+            ``document_filename``, and ``document_b64``.
 
     Returns:
         :class:`IngestSessionsResponse` with session IDs enqueued,
-        skip counts, and rejection flags.
+        ``doc_id``, and rejection flags.
     """
-    from paramem.server.document_ingest import IngestRegistry, _now_iso8601, normalize_chunk_text
+    import base64
 
     total_chunks = len(request.sessions)
 
@@ -7010,12 +7034,25 @@ async def ingest_sessions(request: IngestSessionsRequest):
             content=IngestSessionsResponse(
                 queued=[],
                 total_chunks=total_chunks,
-                registry_skipped=0,
                 rejected_no_speaker_id=True,
             ).model_dump(),
         )
 
-    # Gate 2: unknown speaker
+    # Gate 2: document_b64 size guard (decode to check size; keep bytes for storage)
+    try:
+        doc_raw_bytes = base64.b64decode(request.document_b64)
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "document_b64_invalid"},
+        )
+    if len(doc_raw_bytes) > _ORIGDOC_MAX_BYTES:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "document_too_large"},
+        )
+
+    # Gate 3: unknown speaker
     store = _state.get("speaker_store")
     speaker_name: str | None = None
     if store is not None:
@@ -7027,7 +7064,6 @@ async def ingest_sessions(request: IngestSessionsRequest):
                 content=IngestSessionsResponse(
                     queued=[],
                     total_chunks=total_chunks,
-                    registry_skipped=0,
                     rejected_unknown_speaker=True,
                 ).model_dump(),
             )
@@ -7039,12 +7075,11 @@ async def ingest_sessions(request: IngestSessionsRequest):
             content=IngestSessionsResponse(
                 queued=[],
                 total_chunks=total_chunks,
-                registry_skipped=0,
                 rejected_unknown_speaker=True,
             ).model_dump(),
         )
 
-    # Gate 3: migration TRIAL in progress
+    # Gate 4: migration TRIAL in progress
     migration = _state.get("migration") or {}
     if migration.get("state") == "TRIAL":
         from fastapi import HTTPException
@@ -7060,67 +7095,46 @@ async def ingest_sessions(request: IngestSessionsRequest):
             },
         )
 
-    config = _state["config"]
     buffer: SessionBuffer = _state["session_buffer"]
 
-    registry_path = Path(config.paths.sessions) / ".ingest_registry.json"
-    registry = IngestRegistry(registry_path)
-
+    # One doc_id per request; chunk sessions use <doc_id>-c<chunk_index:03d>.
+    doc_id = "doc-" + secrets.token_hex(4)
+    chunk_count = len(request.sessions)
     queued: list[str] = []
-    registry_skipped = 0
 
     for chunk in request.sessions:
-        normalized = normalize_chunk_text(chunk.chunk)
-        chunk_hash = registry.chunk_hash(
-            speaker_id=request.speaker_id,
-            source_path=chunk.source,
-            chunk_index=chunk.chunk_index,
-            normalized_text=normalized,
-            source_type=chunk.source_type,
-        )
-        if registry.is_known(chunk_hash):
-            registry_skipped += 1
-            continue
+        session_id = f"{doc_id}-c{chunk.chunk_index:03d}"
 
-        session_id = "doc-" + secrets.token_hex(4)
-
-        # set_speaker must precede append so get_pending finds speaker_id
+        # set_speaker must precede append so get_pending finds speaker_id.
         buffer.set_speaker(session_id, request.speaker_id, speaker_name or "")
+        buffer.set_document_metadata(session_id, doc_id=doc_id, chunk_count=chunk_count)
         buffer.append(
             session_id,
             "user",
             chunk.chunk,
             embedding=None,
-            # doc_title is persisted here (and in the registry record below)
-            # for observability and dedup only — extraction binds the narrator
-            # via build_speaker_context, so extract_session has no doc_title
-            # parameter by design.
+            # Turn metadata carries doc_id, chunk_count, and doc_filename so
+            # they survive disk serialisation and can be recovered by
+            # rehydrate_from_disk after a server restart.
             metadata={
                 "source_type": "document",
                 "doc_title": chunk.doc_title,
                 "chunk_index": chunk.chunk_index,
                 "source_path": chunk.source,
+                "doc_id": doc_id,
+                "chunk_count": chunk_count,
+                "doc_filename": request.document_filename,
             },
-        )
-
-        registry.record(
-            chunk_hash,
-            session_id=session_id,
-            speaker_id=request.speaker_id,
-            source_path=chunk.source,
-            chunk_index=chunk.chunk_index,
-            source_type="document",
-            doc_title=chunk.doc_title,
-            ingested_at=_now_iso8601(),
         )
         queued.append(session_id)
 
-    registry.flush()
+    # Store the original document bytes once for the whole request.
+    buffer.write_origdoc(doc_id, doc_raw_bytes)
 
     return IngestSessionsResponse(
         queued=queued,
         total_chunks=total_chunks,
-        registry_skipped=registry_skipped,
+        doc_id=doc_id,
     )
 
 
@@ -7135,6 +7149,8 @@ async def ingest_sessions_cancel(request: IngestCancelRequest):
     Calls :meth:`SessionBuffer.discard_sessions` (not ``mark_consolidated``)
     so the operator can cleanly remove document chunks they no longer want
     to ingest, without any implication that consolidation occurred.
+    The ``<doc_id>.origdoc`` blob is removed by ``discard_sessions`` when
+    all chunk sessions for a document are being discarded.
 
     Args:
         request: Payload with a list of session IDs to cancel.
@@ -12192,10 +12208,15 @@ def _extract_and_start_training():
             all_procedural_rels.extend(procedural_rels)
             speaker_ids.append(session_speaker_id)
 
-    # Helper: mark only sessions whose extract_session call succeeded.
+    # Helper: mark only sessions whose extract_session call succeeded, further
+    # filtered by document-atomic retirement rules (SessionBuffer.retirable).
     # Failed chunks remain pending so the next cycle retries them.
+    # Document chunk sessions are held back unless ALL chunks for the same
+    # doc_id completed in this cycle — partial success leaves the whole
+    # document pending for retry.
     def _completed_session_ids() -> list[str]:
-        return [sid for sid in session_ids if sid not in failed_session_ids]
+        raw_completed = {sid for sid in session_ids if sid not in failed_session_ids}
+        return session_buffer.retirable(raw_completed)
 
     if not all_episodic_rels and not all_procedural_rels:
         logger.info("No relations extracted — skipping")

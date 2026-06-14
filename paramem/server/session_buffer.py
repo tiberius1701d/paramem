@@ -12,6 +12,13 @@ Privacy mode (persist=False): transcripts live only in RAM. After
 consolidation the knowledge is in the adapter weights — no textual
 traces remain on disk. Set persist=True (debug mode) to write JSONL
 files for inspection.
+
+Document ingest: each chunk becomes a separate session whose id is
+``<doc_id>-c<chunk_index:03d>``.  All chunk sessions for the same
+document must retire together (document-atomic retirement) — a partial
+success leaves all of that document's chunks pending for the next cycle.
+The original document bytes are stored as ``<doc_id>.origdoc`` in
+``session_dir`` until the document is retired.
 """
 
 import json
@@ -113,6 +120,34 @@ class SessionBuffer:
         self._sessions[conversation_id]["speaker"] = speaker_name
         self._sessions[conversation_id]["speaker_id"] = speaker_id
         self._sessions[conversation_id]["state"] = STATE_IDENTIFIED
+
+    def set_document_metadata(
+        self,
+        conversation_id: str,
+        *,
+        doc_id: str,
+        chunk_count: int,
+    ) -> None:
+        """Record document-group metadata for a chunk session.
+
+        Called immediately after :meth:`set_speaker` by the ingest handler
+        for every chunk session.  Stores ``doc_id`` and ``chunk_count`` in
+        the per-session state dict so :meth:`retirable` can group chunks by
+        document and apply document-atomic retirement.
+
+        Args:
+            conversation_id: Chunk session identifier
+                (``<doc_id>-c<chunk_index:03d>``).
+            doc_id: Document group identifier shared by all chunks from the
+                same ingest request (``"doc-" + secrets.token_hex(4)``).
+            chunk_count: Total number of chunks in this document (i.e.
+                ``len(request.sessions)``).  Used as a cross-check that
+                no chunk sessions are missing before the group retires.
+        """
+        if conversation_id not in self._sessions:
+            self._sessions[conversation_id] = {"speaker": None, "state": STATE_NEW}
+        self._sessions[conversation_id]["doc_id"] = doc_id
+        self._sessions[conversation_id]["chunk_count"] = chunk_count
 
     def set_pending_embedding(self, conversation_id: str, embedding: list[float]) -> None:
         """Store a voice embedding for deferred enrollment (awaiting name)."""
@@ -361,6 +396,16 @@ class SessionBuffer:
                         },
                     )
                     break
+            # Restore document-group metadata from the first turn's metadata
+            # field so retirable() works correctly after a server restart.
+            if turns:
+                first_meta = turns[0].get("metadata", {}) or {}
+                doc_id = first_meta.get("doc_id")
+                chunk_count = first_meta.get("chunk_count")
+                if doc_id is not None and chunk_count is not None:
+                    session_state = self._sessions.setdefault(conv_id, {})
+                    session_state.setdefault("doc_id", doc_id)
+                    session_state.setdefault("chunk_count", chunk_count)
             loaded += 1
         if loaded:
             logger.info(
@@ -369,6 +414,111 @@ class SessionBuffer:
                 self.session_dir,
             )
         return loaded
+
+    def write_origdoc(self, doc_id: str, raw_bytes: bytes) -> None:
+        """Write the original document bytes to ``session_dir/<doc_id>.origdoc``.
+
+        Called once per ingest request after the chunk sessions are queued.
+        The file persists until :meth:`mark_consolidated` (retaining branch:
+        moved under ``retention_dir/<doc_id>/``) or :meth:`discard_sessions`
+        (always deleted) finishes for the document group.
+
+        Args:
+            doc_id: Document group identifier (``"doc-" + secrets.token_hex(4)``).
+            raw_bytes: Raw bytes of the original document file.
+        """
+        dest = self.locate_origdoc(doc_id)
+        dest.write_bytes(raw_bytes)
+        logger.debug("Stored origdoc: %s (%d bytes)", dest, len(raw_bytes))
+
+    def locate_origdoc(self, doc_id: str) -> Path:
+        """Return the canonical path for ``<doc_id>.origdoc`` in *session_dir*.
+
+        This is the single source of truth for the origdoc path literal.
+        Callers that need an existence check should call ``.exists()`` on the
+        returned value; this method does not perform that check.
+
+        Args:
+            doc_id: Document group identifier.
+
+        Returns:
+            :class:`Path` to ``session_dir/<doc_id>.origdoc`` (may or may not
+            exist on disk).
+        """
+        return self.session_dir / f"{doc_id}.origdoc"
+
+    def retirable(self, completed_ids: set[str]) -> list[str]:
+        """Filter *completed_ids* by document-atomic retirement rules.
+
+        Transcript sessions (sessions without a ``doc_id`` in their state)
+        are returned unconditionally for every id in *completed_ids*.
+
+        Document chunk sessions retire ONLY when ALL chunks for the same
+        ``doc_id`` are present in *completed_ids* AND the number of completed
+        chunks matches the stored ``chunk_count``.  If any chunk is missing,
+        the entire document group is withheld from the result — all chunks
+        stay pending until the next consolidation cycle picks them up.
+
+        This method does not mutate any state; it is a pure filter.
+
+        Args:
+            completed_ids: Set of session ids whose extraction succeeded.
+
+        Returns:
+            List of session ids that are safe to retire this cycle.
+        """
+        if not completed_ids:
+            return []
+
+        # Group document chunk sessions by doc_id.
+        # Keys: all doc_id values seen among completed_ids.
+        doc_chunks_completed: dict[str, list[str]] = {}
+        transcript_ids: list[str] = []
+
+        for sid in completed_ids:
+            session_meta = self._sessions.get(sid, {})
+            doc_id = session_meta.get("doc_id")
+            if doc_id is None:
+                transcript_ids.append(sid)
+            else:
+                doc_chunks_completed.setdefault(doc_id, []).append(sid)
+
+        result = list(transcript_ids)
+
+        for doc_id, chunk_sids in doc_chunks_completed.items():
+            # Find the expected chunk_count for this doc_id by scanning the
+            # completed chunks (all should agree on the same value).
+            expected = None
+            for sid in chunk_sids:
+                cc = self._sessions.get(sid, {}).get("chunk_count")
+                if cc is not None:
+                    expected = cc
+                    break
+
+            if expected is None:
+                # Metadata missing — retire as-is rather than block forever.
+                logger.warning(
+                    "retirable: doc_id=%s missing chunk_count metadata; retiring %d chunk(s)",
+                    doc_id,
+                    len(chunk_sids),
+                )
+                result.extend(chunk_sids)
+                continue
+
+            if len(chunk_sids) < expected:
+                # Not all chunks completed — hold the entire document back.
+                logger.info(
+                    "retirable: doc_id=%s holding back (%d/%d chunks completed)",
+                    doc_id,
+                    len(chunk_sids),
+                    expected,
+                )
+                continue
+
+            # All expected chunks completed.
+            result.extend(chunk_sids)
+
+        return result
 
     def mark_consolidated(
         self,
@@ -388,10 +538,40 @@ class SessionBuffer:
         Always clears the in-memory state.  Callers MUST pass
         *retention_dir* when at least one of the two flags is True;
         otherwise retained transcripts are silently dropped.
+
+        Document-atomic archival: chunk sessions that share a ``doc_id``
+        are retired together.  When retaining, their chunk JSONLs AND the
+        ``<doc_id>.origdoc`` blob are moved under
+        ``retention_dir/<doc_id>/``, with the origdoc renamed to the
+        original ``doc_filename`` recorded in the first turn's metadata.
+        When deleting (privacy mode), both the chunk JSONLs and the
+        origdoc are unlinked.  Transcript sessions use the existing flat
+        layout (``retention_dir/<session_id>.jsonl``).
         """
         retain = self.retain_sessions or self.debug
         if retain and retention_dir is not None:
             retention_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect doc_id → (list[session_id], doc_filename) for document chunk
+        # sessions so we can archive origdoc alongside the chunk JSONLs.
+        # doc_filename is resolved NOW, before turns are popped below.
+        doc_id_to_chunk_sids: dict[str, list[str]] = {}
+        doc_id_to_filename: dict[str, str] = {}
+        for session_id in session_ids:
+            session_meta = self._sessions.get(session_id, {})
+            doc_id = session_meta.get("doc_id")
+            if doc_id is not None:
+                doc_id_to_chunk_sids.setdefault(doc_id, []).append(session_id)
+                if doc_id not in doc_id_to_filename:
+                    turns = self._turns.get(session_id) or []
+                    fname = (turns[0].get("metadata") or {}).get("doc_filename") if turns else None
+                    doc_id_to_filename[doc_id] = fname or f"{doc_id}.bin"
+
+        # Reverse map: session_id → doc_id, built before any state is popped.
+        sid_to_doc_id: dict[str, str] = {
+            sid: doc_id for doc_id, sids in doc_id_to_chunk_sids.items() for sid in sids
+        }
+
         for session_id in session_ids:
             self._turns.pop(session_id, None)
             self._sessions.pop(session_id, None)
@@ -399,12 +579,39 @@ class SessionBuffer:
             if not source.exists():
                 continue
             if retain and retention_dir is not None:
-                dest = retention_dir / f"{session_id}.jsonl"
+                doc_id = sid_to_doc_id.get(session_id)
+                if doc_id is not None:
+                    # Chunk JSONL co-located with the origdoc under
+                    # retention_dir/<doc_id>/<session_id>.jsonl.
+                    doc_ret_dir = retention_dir / doc_id
+                    doc_ret_dir.mkdir(parents=True, exist_ok=True)
+                    dest = doc_ret_dir / f"{session_id}.jsonl"
+                else:
+                    # Transcript sessions keep the flat layout.
+                    dest = retention_dir / f"{session_id}.jsonl"
                 shutil.move(str(source), str(dest))
                 logger.info("Retained session %s → %s", session_id, dest)
             else:
                 source.unlink()
                 logger.info("Deleted session transcript: %s", session_id)
+
+        # Handle origdoc archival or deletion for each retiring document group.
+        for doc_id in doc_id_to_chunk_sids:
+            origdoc = self.locate_origdoc(doc_id)
+            if not origdoc.exists():
+                continue
+            if retain and retention_dir is not None:
+                # Archive origdoc under retention_dir/<doc_id>/ renamed to
+                # the original filename collected in the first pass above.
+                doc_filename = doc_id_to_filename.get(doc_id, f"{doc_id}.bin")
+                doc_ret_dir = retention_dir / doc_id
+                doc_ret_dir.mkdir(parents=True, exist_ok=True)
+                dest = doc_ret_dir / doc_filename
+                shutil.move(str(origdoc), str(dest))
+                logger.info("Archived origdoc %s → %s", doc_id, dest)
+            else:
+                origdoc.unlink()
+                logger.info("Deleted origdoc: %s", doc_id)
 
     def discard_sessions(self, session_ids: list[str]) -> None:
         """Drop named sessions from the in-memory queue and disk state.
@@ -415,12 +622,25 @@ class SessionBuffer:
         operator wants to remove queued document chunks without
         running consolidation.
 
+        For document chunk sessions, also unlinks the ``<doc_id>.origdoc``
+        blob when all known chunk sessions for a document are being
+        discarded (or the blob exists without any remaining sessions).
+        This prevents an orphaned original-doc file when the operator
+        cancels a full ingest request.
+
         Silent no-op for unknown session ids (mirrors
         :meth:`mark_consolidated`'s tolerance).
 
         Args:
             session_ids: Session identifiers to discard.
         """
+        # Collect doc_ids for document chunk sessions before popping state.
+        doc_ids_touched: set[str] = set()
+        for session_id in session_ids:
+            doc_id = self._sessions.get(session_id, {}).get("doc_id")
+            if doc_id is not None:
+                doc_ids_touched.add(doc_id)
+
         for session_id in session_ids:
             self._turns.pop(session_id, None)
             self._sessions.pop(session_id, None)
@@ -428,6 +648,18 @@ class SessionBuffer:
             if path.exists():
                 path.unlink()
                 logger.info("Discarded session file: %s", session_id)
+
+        # Unlink origdoc for any document group that no longer has chunk
+        # sessions in the buffer.  If any chunk session for a doc_id still
+        # exists in _sessions (e.g. only a partial cancel), leave it.
+        for doc_id in doc_ids_touched:
+            origdoc = self.locate_origdoc(doc_id)
+            if not origdoc.exists():
+                continue
+            remaining = any(s.get("doc_id") == doc_id for s in self._sessions.values())
+            if not remaining:
+                origdoc.unlink()
+                logger.info("Deleted origdoc for discarded doc: %s", doc_id)
 
     def get_session_turns(self, conversation_id: str) -> list[dict]:
         """Read all turns from a session."""

@@ -248,3 +248,243 @@ class TestDiscardSessions:
         # Should not raise even though no JSONL exists.
         buf.discard_sessions(["conv-1"])
         assert len(buf.get_pending()) == 0
+
+
+# ---------------------------------------------------------------------------
+# retirable() — document-atomic retirement filter
+# ---------------------------------------------------------------------------
+
+
+class TestRetirable:
+    def _add_doc_chunk(
+        self,
+        buf: SessionBuffer,
+        session_id: str,
+        doc_id: str,
+        chunk_count: int,
+        text: str = "chunk text",
+    ) -> None:
+        """Helper: add a document chunk session to the buffer."""
+        buf.set_speaker(session_id, "spk-1", "Alice")
+        buf.set_document_metadata(session_id, doc_id=doc_id, chunk_count=chunk_count)
+        buf.append(
+            session_id,
+            "user",
+            text,
+            metadata={
+                "source_type": "document",
+                "doc_id": doc_id,
+                "chunk_count": chunk_count,
+                "doc_filename": "test.md",
+            },
+        )
+
+    def test_transcript_sessions_always_retire(self, buf):
+        """Transcript sessions (no doc_id) always appear in retirable output."""
+        buf.append("conv-1", "user", "chat")
+        result = buf.retirable({"conv-1"})
+        assert result == ["conv-1"]
+
+    def test_empty_completed_returns_empty(self, buf):
+        """Empty completed set returns an empty list."""
+        assert buf.retirable(set()) == []
+
+    def test_complete_document_retires(self, buf):
+        """All chunks of a document completed → entire document retires."""
+        self._add_doc_chunk(buf, "doc-1-c000", "doc-1", chunk_count=2)
+        self._add_doc_chunk(buf, "doc-1-c001", "doc-1", chunk_count=2)
+        result = buf.retirable({"doc-1-c000", "doc-1-c001"})
+        assert sorted(result) == ["doc-1-c000", "doc-1-c001"]
+
+    def test_partial_document_held_back(self, buf):
+        """Only one of two chunks completed → entire document held back."""
+        self._add_doc_chunk(buf, "doc-2-c000", "doc-2", chunk_count=2)
+        self._add_doc_chunk(buf, "doc-2-c001", "doc-2", chunk_count=2)
+        # Only chunk 0 completed; chunk 1 failed (not in completed set).
+        result = buf.retirable({"doc-2-c000"})
+        assert result == []
+
+    def test_mixed_transcript_and_doc_partial(self, buf):
+        """Transcript retires; partially-complete doc does not."""
+        buf.append("conv-x", "user", "chat")
+        self._add_doc_chunk(buf, "doc-3-c000", "doc-3", chunk_count=2)
+        self._add_doc_chunk(buf, "doc-3-c001", "doc-3", chunk_count=2)
+        # Transcript completes; doc is only 1/2 done.
+        result = buf.retirable({"conv-x", "doc-3-c000"})
+        assert result == ["conv-x"]
+
+    def test_mixed_transcript_and_doc_complete(self, buf):
+        """Transcript and complete doc both retire together."""
+        buf.append("conv-y", "user", "chat")
+        self._add_doc_chunk(buf, "doc-4-c000", "doc-4", chunk_count=1)
+        result = buf.retirable({"conv-y", "doc-4-c000"})
+        assert sorted(result) == ["conv-y", "doc-4-c000"]
+
+    def test_two_docs_one_complete_one_partial(self, buf):
+        """Complete doc retires; partial doc stays pending."""
+        # Doc A: 1 chunk, complete
+        self._add_doc_chunk(buf, "docA-c000", "docA", chunk_count=1)
+        # Doc B: 2 chunks, only one complete
+        self._add_doc_chunk(buf, "docB-c000", "docB", chunk_count=2)
+        self._add_doc_chunk(buf, "docB-c001", "docB", chunk_count=2)
+
+        result = buf.retirable({"docA-c000", "docB-c000"})
+        assert result == ["docA-c000"]
+
+    def test_retirable_does_not_mutate_state(self, buf):
+        """retirable() is a pure filter — does not remove sessions from memory."""
+        self._add_doc_chunk(buf, "doc-5-c000", "doc-5", chunk_count=1)
+        buf.retirable({"doc-5-c000"})
+        # Session still in _turns after the call
+        assert "doc-5-c000" in buf._turns
+
+
+# ---------------------------------------------------------------------------
+# mark_consolidated with doc archival / deletion
+# ---------------------------------------------------------------------------
+
+
+class TestMarkConsolidatedDocGroups:
+    def _add_doc_chunk(
+        self,
+        buf: SessionBuffer,
+        session_id: str,
+        doc_id: str,
+        chunk_count: int,
+        doc_filename: str = "test.md",
+    ) -> None:
+        buf.set_speaker(session_id, "spk-1", "Alice")
+        buf.set_document_metadata(session_id, doc_id=doc_id, chunk_count=chunk_count)
+        buf.append(
+            session_id,
+            "user",
+            "chunk text",
+            metadata={
+                "source_type": "document",
+                "doc_id": doc_id,
+                "chunk_count": chunk_count,
+                "doc_filename": doc_filename,
+            },
+        )
+
+    def test_retain_archives_chunks_and_origdoc(self, tmp_path):
+        """When retaining, chunk JSONLs and origdoc are co-located under retention_dir/<doc_id>/.
+
+        Regression: chunk JSONLs were archived flat (retention_dir/<session_id>.jsonl)
+        while the origdoc was archived under retention_dir/<doc_id>/.  Both must
+        land under the same doc_id subdirectory.
+        """
+        sessions_dir = tmp_path / "sessions"
+        buf = SessionBuffer(session_dir=sessions_dir, retain_sessions=True, debug=False)
+
+        doc_id = "doc-retain1"
+        chunk_sid = f"{doc_id}-c000"
+        self._add_doc_chunk(buf, chunk_sid, doc_id, chunk_count=1, doc_filename="notes.md")
+        buf.write_origdoc(doc_id, b"original content")
+
+        retention_dir = tmp_path / "retention"
+        buf.mark_consolidated([chunk_sid], retention_dir=retention_dir)
+
+        # Chunk JSONL must be co-located with the origdoc under retention_dir/<doc_id>/.
+        assert (retention_dir / doc_id / f"{chunk_sid}.jsonl").exists(), (
+            f"Chunk JSONL must be under retention_dir/{doc_id}/, not flat"
+        )
+        # Chunk JSONL must NOT be at the flat (buggy) path.
+        assert not (retention_dir / f"{chunk_sid}.jsonl").exists(), (
+            "Chunk JSONL must not be archived flat; it belongs under the doc_id subdirectory"
+        )
+        # origdoc archived under retention_dir/<doc_id>/notes.md
+        assert (retention_dir / doc_id / "notes.md").exists()
+        assert (retention_dir / doc_id / "notes.md").read_bytes() == b"original content"
+        # origdoc removed from session_dir
+        assert not (sessions_dir / f"{doc_id}.origdoc").exists()
+
+    def test_delete_removes_chunks_and_origdoc(self, tmp_path):
+        """In privacy mode (retain=False, debug=False), both chunk JSONLs and origdoc deleted."""
+        sessions_dir = tmp_path / "sessions"
+        buf = SessionBuffer(session_dir=sessions_dir, retain_sessions=False, debug=False)
+
+        doc_id = "doc-delete1"
+        self._add_doc_chunk(buf, f"{doc_id}-c000", doc_id, chunk_count=1)
+        buf.write_origdoc(doc_id, b"some bytes")
+
+        buf.mark_consolidated([f"{doc_id}-c000"], retention_dir=None)
+
+        assert not (sessions_dir / f"{doc_id}-c000.jsonl").exists()
+        assert not (sessions_dir / f"{doc_id}.origdoc").exists()
+
+    def test_transcript_sessions_use_flat_layout(self, tmp_path):
+        """Transcript sessions are archived flat under retention_dir (unchanged)."""
+        sessions_dir = tmp_path / "sessions"
+        buf = SessionBuffer(session_dir=sessions_dir, retain_sessions=True, debug=False)
+        buf.append("conv-t1", "user", "hello")
+
+        retention_dir = tmp_path / "retention"
+        buf.mark_consolidated(["conv-t1"], retention_dir=retention_dir)
+
+        assert (retention_dir / "conv-t1.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
+# discard_sessions with origdoc cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestDiscardSessionsOrigdoc:
+    def _add_doc_chunk(self, buf: SessionBuffer, session_id: str, doc_id: str) -> None:
+        buf.set_speaker(session_id, "spk-1", "Alice")
+        buf.set_document_metadata(session_id, doc_id=doc_id, chunk_count=1)
+        buf.append(
+            session_id,
+            "user",
+            "chunk text",
+            metadata={"source_type": "document", "doc_id": doc_id, "chunk_count": 1},
+        )
+
+    def test_discard_removes_origdoc_when_all_chunks_discarded(self, buf):
+        """Discarding all chunks removes the origdoc blob."""
+        doc_id = "doc-discard1"
+        self._add_doc_chunk(buf, f"{doc_id}-c000", doc_id)
+        buf.write_origdoc(doc_id, b"content")
+        assert (buf.session_dir / f"{doc_id}.origdoc").exists()
+
+        buf.discard_sessions([f"{doc_id}-c000"])
+
+        assert not (buf.session_dir / f"{doc_id}.origdoc").exists()
+
+    def test_discard_leaves_origdoc_when_sibling_chunk_remains(self, buf):
+        """Partial discard (one chunk of two) leaves the origdoc in place."""
+        doc_id = "doc-partial"
+        buf.set_speaker(f"{doc_id}-c000", "spk-1", "Alice")
+        buf.set_document_metadata(f"{doc_id}-c000", doc_id=doc_id, chunk_count=2)
+        buf.append(
+            f"{doc_id}-c000",
+            "user",
+            "chunk 0",
+            metadata={"source_type": "document", "doc_id": doc_id, "chunk_count": 2},
+        )
+
+        buf.set_speaker(f"{doc_id}-c001", "spk-1", "Alice")
+        buf.set_document_metadata(f"{doc_id}-c001", doc_id=doc_id, chunk_count=2)
+        buf.append(
+            f"{doc_id}-c001",
+            "user",
+            "chunk 1",
+            metadata={"source_type": "document", "doc_id": doc_id, "chunk_count": 2},
+        )
+
+        buf.write_origdoc(doc_id, b"content")
+
+        # Discard only chunk 0; chunk 1 still in buffer.
+        buf.discard_sessions([f"{doc_id}-c000"])
+
+        # origdoc must remain because chunk 1 is still pending.
+        assert (buf.session_dir / f"{doc_id}.origdoc").exists()
+
+    def test_discard_origdoc_noop_when_no_origdoc_file(self, buf):
+        """Discarding a doc chunk without an origdoc file does not raise."""
+        doc_id = "doc-no-origdoc"
+        self._add_doc_chunk(buf, f"{doc_id}-c000", doc_id)
+        # No write_origdoc call — file absent.
+        buf.discard_sessions([f"{doc_id}-c000"])  # must not raise
+        assert len(buf.get_pending()) == 0

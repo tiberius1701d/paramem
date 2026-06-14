@@ -6,6 +6,7 @@ use TestClient without lifespan (no model load, no GPU required).
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -62,9 +63,22 @@ def client(state):
     return TestClient(app_module.app, raise_server_exceptions=False)
 
 
-def _ingest_payload(speaker_id: str, text: str = "Hello world chunk.", n: int = 1) -> dict:
+_SAMPLE_CONTENT = b"This is a sample document for testing."
+_SAMPLE_FILENAME = "notes.md"
+_SAMPLE_B64 = base64.b64encode(_SAMPLE_CONTENT).decode("ascii")
+
+
+def _ingest_payload(
+    speaker_id: str,
+    text: str = "Hello world chunk.",
+    n: int = 1,
+    document_filename: str = _SAMPLE_FILENAME,
+    document_b64: str = _SAMPLE_B64,
+) -> dict:
     return {
         "speaker_id": speaker_id,
+        "document_filename": document_filename,
+        "document_b64": document_b64,
         "sessions": [
             {
                 "source": "/docs/notes.md",
@@ -91,7 +105,6 @@ class TestKnownSpeakerAppends:
         assert resp.status_code == 200
         body = resp.json()
         assert body["total_chunks"] == 2
-        assert body["registry_skipped"] == 0
         assert len(body["queued"]) == 2
         assert not body["rejected_unknown_speaker"]
         assert not body["rejected_no_speaker_id"]
@@ -113,6 +126,78 @@ class TestKnownSpeakerAppends:
         resp = client.post("/ingest-sessions", json=_ingest_payload(spk, n=1))
         queued = resp.json()["queued"]
         assert all(sid.startswith("doc-") for sid in queued)
+
+    def test_doc_id_returned(self, client, state):
+        """Response carries a non-empty doc_id."""
+        spk = state["_test_known_speaker_id"]
+        resp = client.post("/ingest-sessions", json=_ingest_payload(spk, n=2))
+        body = resp.json()
+        assert body["doc_id"]
+        assert body["doc_id"].startswith("doc-")
+
+    def test_chunk_session_ids_match_doc_id(self, client, state):
+        """Each queued session id is '<doc_id>-c<chunk_index:03d>'."""
+        spk = state["_test_known_speaker_id"]
+        resp = client.post("/ingest-sessions", json=_ingest_payload(spk, n=3))
+        body = resp.json()
+        doc_id = body["doc_id"]
+        expected = [f"{doc_id}-c000", f"{doc_id}-c001", f"{doc_id}-c002"]
+        assert sorted(body["queued"]) == sorted(expected)
+
+    def test_two_requests_get_distinct_doc_ids(self, client, state):
+        """Two separate ingest requests produce different doc_ids."""
+        spk = state["_test_known_speaker_id"]
+        r1 = client.post("/ingest-sessions", json=_ingest_payload(spk, n=1))
+        r2 = client.post("/ingest-sessions", json=_ingest_payload(spk, n=1))
+        assert r1.json()["doc_id"] != r2.json()["doc_id"]
+
+    def test_origdoc_stored_in_session_dir(self, client, state):
+        """After ingest, a <doc_id>.origdoc file exists in session_dir."""
+        spk = state["_test_known_speaker_id"]
+        resp = client.post("/ingest-sessions", json=_ingest_payload(spk, n=1))
+        doc_id = resp.json()["doc_id"]
+        buf: SessionBuffer = state["session_buffer"]
+        origdoc = buf.session_dir / f"{doc_id}.origdoc"
+        assert origdoc.exists()
+        assert origdoc.read_bytes() == _SAMPLE_CONTENT
+
+    def test_get_pending_glob_skips_origdoc(self, client, state):
+        """get_pending() does not pick up .origdoc files as sessions."""
+        spk = state["_test_known_speaker_id"]
+        resp = client.post("/ingest-sessions", json=_ingest_payload(spk, n=1))
+        buf: SessionBuffer = state["session_buffer"]
+        # Verify the .origdoc file is present
+        doc_id = resp.json()["doc_id"]
+        assert (buf.session_dir / f"{doc_id}.origdoc").exists()
+        # get_pending only returns the one chunk session, not the origdoc
+        assert len(buf.get_pending()) == 1
+
+    def test_chunk_metadata_carries_doc_id_and_chunk_count(self, client, state):
+        """Each chunk turn's metadata includes doc_id and chunk_count."""
+        spk = state["_test_known_speaker_id"]
+        resp = client.post("/ingest-sessions", json=_ingest_payload(spk, n=2))
+        doc_id = resp.json()["doc_id"]
+        buf: SessionBuffer = state["session_buffer"]
+        for sid in resp.json()["queued"]:
+            turns = buf._turns[sid]
+            meta = turns[0]["metadata"]
+            assert meta["doc_id"] == doc_id
+            assert meta["chunk_count"] == 2
+            assert meta["doc_filename"] == _SAMPLE_FILENAME
+
+    def test_reingest_same_content_queues_fresh(self, client, state):
+        """Re-ingesting the same content creates new sessions (no dedup)."""
+        spk = state["_test_known_speaker_id"]
+        payload = _ingest_payload(spk, n=2)
+        r1 = client.post("/ingest-sessions", json=payload)
+        r2 = client.post("/ingest-sessions", json=payload)
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        # Both should return queued sessions (not skipped)
+        assert len(r1.json()["queued"]) == 2
+        assert len(r2.json()["queued"]) == 2
+        # Different doc_ids for each request
+        assert r1.json()["doc_id"] != r2.json()["doc_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -148,43 +233,27 @@ class TestEmptySpeakerId400:
         assert buf.get_pending() == []
 
 
-# ---------------------------------------------------------------------------
-# Idempotency
-# ---------------------------------------------------------------------------
-
-
-class TestRegistryIdempotent:
-    def test_second_post_skips_all_chunks(self, client, state):
-        """Posting the same payload twice: second call skips all chunks."""
+class TestOversizedDocument400:
+    def test_oversized_document_b64_returns_400(self, client, state):
+        """document_b64 whose decoded size exceeds 25 MiB → HTTP 400."""
         spk = state["_test_known_speaker_id"]
-        payload = _ingest_payload(spk, n=2)
+        # Build a payload that decodes to 25 MiB + 1 byte.
+        big_bytes = b"x" * (25 * 1024 * 1024 + 1)
+        big_b64 = base64.b64encode(big_bytes).decode("ascii")
+        payload = _ingest_payload(spk, n=1, document_b64=big_b64)
+        resp = client.post("/ingest-sessions", json=payload)
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "document_too_large"
 
-        r1 = client.post("/ingest-sessions", json=payload)
-        r2 = client.post("/ingest-sessions", json=payload)
-
-        assert r1.status_code == 200
-        assert r2.status_code == 200
-
-        b1 = r1.json()
-        b2 = r2.json()
-
-        assert b1["registry_skipped"] == 0
-        assert b2["registry_skipped"] == 2
-        assert b2["queued"] == []
-
-    def test_queue_size_unchanged_after_second_post(self, client, state):
-        """Queue size does not grow on the second identical post."""
+    def test_oversized_document_nothing_queued(self, client, state):
+        """No sessions are queued when the document is too large."""
         spk = state["_test_known_speaker_id"]
-        payload = _ingest_payload(spk, n=2)
-
+        big_bytes = b"x" * (25 * 1024 * 1024 + 1)
+        big_b64 = base64.b64encode(big_bytes).decode("ascii")
+        payload = _ingest_payload(spk, n=1, document_b64=big_b64)
         client.post("/ingest-sessions", json=payload)
         buf: SessionBuffer = state["session_buffer"]
-        size_after_first = len(buf.get_pending())
-
-        client.post("/ingest-sessions", json=payload)
-        size_after_second = len(buf.get_pending())
-
-        assert size_after_second == size_after_first
+        assert buf.get_pending() == []
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +301,20 @@ class TestCancelClearsQueueViaDiscardSessions:
         buf: SessionBuffer = state["session_buffer"]
         assert buf.get_pending() == []
 
+    def test_cancel_also_removes_origdoc(self, client, state):
+        """Cancelling all chunks for a doc removes the origdoc blob."""
+        spk = state["_test_known_speaker_id"]
+        resp = client.post("/ingest-sessions", json=_ingest_payload(spk, n=2))
+        doc_id = resp.json()["doc_id"]
+        queued = resp.json()["queued"]
+
+        buf: SessionBuffer = state["session_buffer"]
+        assert (buf.session_dir / f"{doc_id}.origdoc").exists()
+
+        client.post("/ingest-sessions/cancel", json={"session_ids": queued})
+
+        assert not (buf.session_dir / f"{doc_id}.origdoc").exists()
+
     def test_cancel_calls_discard_sessions_not_mark_consolidated(self, client, state, monkeypatch):
         """cancel calls discard_sessions, NOT mark_consolidated."""
         spk = state["_test_known_speaker_id"]
@@ -249,9 +332,9 @@ class TestCancelClearsQueueViaDiscardSessions:
             discard_calls.append(session_ids)
             return original_discard(session_ids)
 
-        def spy_mark(session_ids):
+        def spy_mark(session_ids, **kwargs):
             mark_calls.append(session_ids)
-            return original_mark(session_ids)
+            return original_mark(session_ids, **kwargs)
 
         buf.discard_sessions = spy_discard
         buf.mark_consolidated = spy_mark
@@ -265,12 +348,12 @@ class TestCancelClearsQueueViaDiscardSessions:
         """Session ids not in the queue appear in not_found list."""
         cancel_resp = client.post(
             "/ingest-sessions/cancel",
-            json={"session_ids": ["doc-aabbccdd"]},
+            json={"session_ids": ["doc-aabbccdd-c000"]},
         )
         assert cancel_resp.status_code == 200
         body = cancel_resp.json()
         assert body["cancelled"] == []
-        assert "doc-aabbccdd" in body["not_found"]
+        assert "doc-aabbccdd-c000" in body["not_found"]
 
     def test_cancel_partial_found(self, client, state):
         """Some ids found, some not — correctly split into cancelled / not_found."""
@@ -280,11 +363,11 @@ class TestCancelClearsQueueViaDiscardSessions:
 
         cancel_resp = client.post(
             "/ingest-sessions/cancel",
-            json={"session_ids": [real_id, "doc-not-real"]},
+            json={"session_ids": [real_id, "doc-not-real-c000"]},
         )
         body = cancel_resp.json()
         assert real_id in body["cancelled"]
-        assert "doc-not-real" in body["not_found"]
+        assert "doc-not-real-c000" in body["not_found"]
 
 
 # ---------------------------------------------------------------------------

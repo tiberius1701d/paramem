@@ -42,10 +42,11 @@ def _make_txt(tmp_path: Path, content: str = _NOTE_TXT_CONTENT) -> Path:
 
 def _successful_ingest_response(queued_count: int = 1) -> dict:
     """Build a minimal successful IngestSessionsResponse-shaped dict."""
+    doc_id = "doc-cafebabe" if queued_count > 0 else ""
     return {
-        "queued": [f"doc-{i:08x}" for i in range(queued_count)],
+        "queued": [f"{doc_id}-c{i:03d}" for i in range(queued_count)],
         "total_chunks": queued_count,
-        "registry_skipped": 0,
+        "doc_id": doc_id,
         "rejected_unknown_speaker": False,
         "rejected_no_speaker_id": False,
     }
@@ -113,26 +114,30 @@ class TestCliHappyPathNonInteractive:
 
         main([str(path), "--speaker", _KNOWN_SPEAKER_ID, "--non-interactive", "--no-action"])
         out = capsys.readouterr().out
-        assert "doc-00000000" in out
-        assert "doc-00000001" in out
-        assert "doc-00000002" in out
+        # _successful_ingest_response(3) returns ids like doc-cafebabe-c000 etc.
+        assert "doc-cafebabe-c000" in out
+        assert "doc-cafebabe-c001" in out
+        assert "doc-cafebabe-c002" in out
 
-    def test_registry_skipped_reported(self, tmp_path, monkeypatch, capsys):
-        """registry_skipped count is reported in the output."""
+    def test_doc_id_reported(self, tmp_path, monkeypatch, capsys):
+        """doc_id is reported in the output."""
         path = _make_txt(tmp_path)
 
         def mock_post(url, body=None, **kw):
-            resp = _successful_ingest_response(0)
-            resp["registry_skipped"] = 1
-            resp["total_chunks"] = 1
-            return resp
+            return {
+                "queued": ["doc-abcd1234-c000"],
+                "total_chunks": 1,
+                "doc_id": "doc-abcd1234",
+                "rejected_unknown_speaker": False,
+                "rejected_no_speaker_id": False,
+            }
 
         monkeypatch.setattr("scripts.ingest_docs.post_json", mock_post)
 
         rc = main([str(path), "--speaker", _KNOWN_SPEAKER_ID, "--non-interactive", "--no-action"])
         assert rc == 0
         out = capsys.readouterr().out
-        assert "registry_skipped=1" in out
+        assert "doc_id=doc-abcd1234" in out
 
     def test_no_action_skips_post_ingest_prompt(self, tmp_path, monkeypatch, capsys):
         """--no-action exits after posting without any further prompts."""
@@ -155,7 +160,7 @@ class TestCliHappyPathNonInteractive:
             return {
                 "queued": ["doc-cafebabe"],
                 "total_chunks": 1,
-                "registry_skipped": 0,
+                "doc_id": "doc-cafebabe",
                 "rejected_unknown_speaker": False,
                 "rejected_no_speaker_id": False,
             }
@@ -322,6 +327,14 @@ class TestCliPayloadShape:
         main([str(path), "--speaker", _KNOWN_SPEAKER_ID, "--non-interactive", "--no-action"])
 
         assert captured_body["speaker_id"] == _KNOWN_SPEAKER_ID
+        assert "document_filename" in captured_body
+        assert captured_body["document_filename"] == "note.txt"
+        assert "document_b64" in captured_body
+        # document_b64 must be a non-empty base64 string
+        import base64
+
+        decoded = base64.b64decode(captured_body["document_b64"])
+        assert len(decoded) > 0
         assert "sessions" in captured_body
         assert len(captured_body["sessions"]) >= 1
 
