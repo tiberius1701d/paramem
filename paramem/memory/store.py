@@ -86,12 +86,56 @@ serialised to ``indexed_key_registry.json`` under the ``"simhash"`` key so the
 on-disk file is the single source of truth.  The separate ``simhash_registry.json``
 sidecar has been eliminated.  Use :meth:`tier_simhashes` (mandatory
 ``include_stale`` keyword) as the only public path to a fingerprint set.
+
+**Thread-safety concurrency contract:**
+
+:class:`MemoryStore` is shared between the asyncio event-loop thread, FastAPI
+handler threads (ThreadPoolExecutor), and the BG-trainer worker thread.  A
+single :class:`threading.RLock` (``self._lock``) guards all accesses to the
+three mutable structures: ``_entries``, ``_registry``, and ``_bookkeeping``.
+
+Rules for callers and maintainers:
+
+1. Every method that reads or writes any of the three structures holds
+   ``self._lock`` for the duration of its in-RAM access.  RLock (not plain Lock)
+   is used because compound mutators (``move``, ``delete``, ``discard_keys``,
+   ``restore``, compound ``put``) call other wrapped leaf methods reentrantly.
+
+2. ``iter_entries()`` and ``iter_bookkeeping()`` materialise a snapshot list
+   under the lock, then yield from the snapshot outside the lock.  Callers
+   iterate lock-free without risk of observing a concurrent structural mutation.
+
+3. Compound mutators (``delete``, ``move``, ``discard_keys``, ``restore``,
+   ``put`` when writing entry + simhash + registry) hold the lock ONCE around
+   the whole compound so a reader never sees a half-updated multi-structure state.
+   Nested leaf-method calls succeed via RLock reentrancy.
+
+4. ``entries_in_tier()`` returns a shallow copy of the internal tier dict so
+   callers that iterate the result outside the lock cannot observe a concurrent
+   structural mutation.  Callers must not write to the returned dict; use
+   :meth:`put` / :meth:`delete` for writes.
+
+5. :meth:`probe` is deliberately NOT wrapped in the lock.  It calls
+   ``source.probe(...)``, which is a GPU ``model.generate()`` call that may
+   block for seconds.  Holding the store lock across GPU work would deadlock
+   the event loop.  All reads inside ``probe`` — including ``_bookkeeping``
+   and ``_registry``/simhash reads — go through individually locked leaf
+   methods (``self.get``, ``self.bookkeeping_for_key``, ``self.simhash``,
+   ``self._tier_for_simhash``, ``self.put``, ``self.set_bookkeeping``).
+   Each read is a single locked acquisition; no lock is held across the GPU
+   call.  This is sufficient for probe's single-key read-then-conditional-
+   write pattern.
+
+6. :meth:`swap` is the atomic-publish primitive for phase-2 consolidation.
+   Callers build new structures off-store, then publish in one locked rebind so
+   no reader ever sees a torn/half-rebuilt store.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
+import threading
 from collections.abc import Iterator
 
 from paramem.training.key_registry import KeyRegistry
@@ -104,10 +148,20 @@ class MemoryStore:
 
     ``_registry`` is always a ``dict[str, KeyRegistry]`` (never ``None``).
     The ``replay_enabled`` flag governs training behaviour only.
+
+    Thread-safety: a single ``threading.RLock`` (``self._lock``) guards all
+    in-RAM access to ``_entries``, ``_registry``, and ``_bookkeeping``.  See
+    the module-level concurrency contract in the module docstring for the
+    complete rules including the deliberately unwrapped :meth:`probe` and the
+    atomic :meth:`swap` publish primitive.
     """
 
     def __init__(self, *, replay_enabled: bool = True) -> None:
         self._replay_enabled = replay_enabled
+        # Single RLock guards _entries, _registry, and _bookkeeping.  RLock
+        # (not plain Lock) is required because compound mutators call wrapped
+        # leaf methods reentrantly (move→tier_of, delete→leaf readers, etc.).
+        self._lock = threading.RLock()
         # tier -> key -> entry payload dict.  PURE INFERENCE CONTENT CACHE —
         # an entry slot exists only when SPO is materialised.  See module
         # docstring for the "save-path working entries" exception.
@@ -144,44 +198,57 @@ class MemoryStore:
         the first matching tier wins.  Per the single-tier-ownership
         invariant, ambiguity should not arise — surface it as a bug if it
         does (do not silently coalesce)."""
-        for tier_entries in self._entries.values():
-            if key in tier_entries:
-                return tier_entries[key]
-        return None
+        with self._lock:
+            for tier_entries in self._entries.values():
+                if key in tier_entries:
+                    return tier_entries[key]
+            return None
 
     def has(self, key: str) -> bool:
         """Membership check across all tiers."""
-        for tier_entries in self._entries.values():
-            if key in tier_entries:
-                return True
-        return False
+        with self._lock:
+            for tier_entries in self._entries.values():
+                if key in tier_entries:
+                    return True
+            return False
 
     def tier_of(self, key: str) -> str | None:
         """Return the tier that owns *key* in the entry store, or ``None``."""
-        for tier, tier_entries in self._entries.items():
-            if key in tier_entries:
-                return tier
-        return None
+        with self._lock:
+            for tier, tier_entries in self._entries.items():
+                if key in tier_entries:
+                    return tier
+            return None
 
     def entries_in_tier(self, tier: str) -> dict[str, dict]:
-        """Return the ``key -> entry`` map for *tier*.  Empty dict on miss.
+        """Return a shallow copy of the ``key -> entry`` map for *tier*.
 
-        Returned dict is the live internal mapping — callers must not mutate
-        it.  Use :meth:`put` / :meth:`delete` for writes."""
-        return self._entries.get(tier, {})
+        Returns an empty dict when *tier* is absent.  The returned dict is a
+        snapshot taken under the lock — it is safe to iterate after the method
+        returns even if concurrent mutations occur.  Use :meth:`put` /
+        :meth:`delete` for writes; do not mutate the returned dict."""
+        with self._lock:
+            return dict(self._entries.get(tier, {}))
 
     def iter_entries(self) -> Iterator[tuple[str, str, dict]]:
         """Yield ``(tier, key, entry)`` for every entry.
 
-        Stable across calls so long as no mutation happens between yields.
-        Use ``list(...)`` first if mutating while iterating."""
-        for tier, tier_entries in self._entries.items():
-            for key, entry in tier_entries.items():
-                yield tier, key, entry
+        A snapshot of the full entry set is taken under the lock before the
+        first yield.  The caller iterates the snapshot lock-free and will not
+        observe concurrent structural mutations (insertions or deletions by
+        another thread after this method returns)."""
+        with self._lock:
+            snap = [
+                (tier, key, entry)
+                for tier, tier_entries in self._entries.items()
+                for key, entry in tier_entries.items()
+            ]
+        yield from snap
 
     def __len__(self) -> int:
         """Total number of keys held across all tiers."""
-        return sum(len(tq) for tq in self._entries.values())
+        with self._lock:
+            return sum(len(tq) for tq in self._entries.values())
 
     def __contains__(self, key: str) -> bool:
         return self.has(key)
@@ -208,12 +275,16 @@ class MemoryStore:
         Caller is responsible for ensuring *key* is unique across tiers — if
         the key currently belongs to a different tier, call :meth:`move`
         rather than ``put`` to keep entries, registry, and simhash in agreement.
+
+        All three writes (entry, simhash, registry) are performed under a
+        single lock acquisition so a reader never observes a half-updated state.
         """
-        self._entries.setdefault(tier, {})[key] = entry
-        if simhash is not None:
-            self._registry.setdefault(tier, KeyRegistry()).set_simhash(key, simhash)
-        if register and self._replay_enabled:
-            self._registry.setdefault(tier, KeyRegistry()).add(key)
+        with self._lock:
+            self._entries.setdefault(tier, {})[key] = entry
+            if simhash is not None:
+                self._registry.setdefault(tier, KeyRegistry()).set_simhash(key, simhash)
+            if register and self._replay_enabled:
+                self._registry.setdefault(tier, KeyRegistry()).add(key)
 
     # ------------------------------------------------------------------
     # Per-key bookkeeping — speaker_id / first_seen_cycle / relation_type
@@ -260,13 +331,14 @@ class MemoryStore:
 
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit."""
-        self._bookkeeping[key] = {
-            "speaker_id": speaker_id,
-            "first_seen_cycle": first_seen_cycle,
-            "relation_type": relation_type,
-            "recurrence_count": recurrence_count,
-            "last_seen_cycle": last_seen_cycle,
-        }
+        with self._lock:
+            self._bookkeeping[key] = {
+                "speaker_id": speaker_id,
+                "first_seen_cycle": first_seen_cycle,
+                "relation_type": relation_type,
+                "recurrence_count": recurrence_count,
+                "last_seen_cycle": last_seen_cycle,
+            }
 
     def bump_recurrence(self, key: str, *, cycle: int) -> None:
         """Increment ``recurrence_count`` and refresh ``last_seen_cycle`` for *key*.
@@ -287,18 +359,19 @@ class MemoryStore:
                 ``last_seen_cycle`` unconditionally (the fact was re-seen
                 this cycle).
         """
-        existing = self._bookkeeping.get(key)
-        if existing is None:
-            self._bookkeeping[key] = {
-                "speaker_id": "",
-                "first_seen_cycle": cycle,
-                "relation_type": "unknown",
-                "recurrence_count": 1,
-                "last_seen_cycle": cycle,
-            }
-            return
-        existing["recurrence_count"] = existing.get("recurrence_count", 1) + 1
-        existing["last_seen_cycle"] = cycle
+        with self._lock:
+            existing = self._bookkeeping.get(key)
+            if existing is None:
+                self._bookkeeping[key] = {
+                    "speaker_id": "",
+                    "first_seen_cycle": cycle,
+                    "relation_type": "unknown",
+                    "recurrence_count": 1,
+                    "last_seen_cycle": cycle,
+                }
+                return
+            existing["recurrence_count"] = existing.get("recurrence_count", 1) + 1
+            existing["last_seen_cycle"] = cycle
 
     def bookkeeping_for_key(self, key: str) -> dict | None:
         """Return the bookkeeping record for *key*, or ``None`` when absent.
@@ -309,7 +382,8 @@ class MemoryStore:
         when present, ``None`` when the key has never been bookkept.
         Callers may use ``bk = store.bookkeeping_for_key(k) or {}`` as a
         boundary default (compliant with the is-None / empty-is-valid rule)."""
-        return self._bookkeeping.get(key)
+        with self._lock:
+            return self._bookkeeping.get(key)
 
     def iter_bookkeeping(self):
         """Yield ``(key, {"speaker_id": ..., "first_seen_cycle": ...})`` pairs.
@@ -317,41 +391,55 @@ class MemoryStore:
         Preload-independent — populated by :meth:`load_bookkeeping_from_disk`
         at boot regardless of ``inference.preload_cache``.  Used by
         :meth:`QueryRouter.reload` to build the speaker → keys index without
-        touching ``_entries``."""
-        yield from self._bookkeeping.items()
+        touching ``_entries``.
+
+        A snapshot of the bookkeeping dict is taken under the lock before the
+        first yield.  The caller iterates the snapshot lock-free and will not
+        observe concurrent structural mutations."""
+        with self._lock:
+            snap = list(self._bookkeeping.items())
+        yield from snap
 
     def drop_bookkeeping(self, key: str) -> None:
         """Remove the bookkeeping record for *key* (retirement parity).
 
         Called automatically by :meth:`delete` — callers that retire a key
         via ``delete`` need not call this separately."""
-        self._bookkeeping.pop(key, None)
+        with self._lock:
+            self._bookkeeping.pop(key, None)
 
     def bookkeeping_count(self) -> int:
         """Number of keys that have a bookkeeping record."""
-        return len(self._bookkeeping)
+        with self._lock:
+            return len(self._bookkeeping)
 
     def delete(self, key: str) -> str | None:
         """Drop *key* from every tier in every sub-structure.
 
         Cleans entries, simhash (via registry), and registry across all tiers
         in one call.  The return value is the *first* tier that held the key
-        in any structure, or ``None`` when the key was completely absent."""
-        former: str | None = None
-        for tier in list(self._entries.keys()):
-            if key in self._entries[tier]:
-                del self._entries[tier][key]
-                if former is None:
-                    former = tier
-        # Drop from registry (removes from active, stale, and _simhash).
-        for tier, reg in list(self._registry.items()):
-            if reg.knows(key):
-                reg.remove(key)
-                if former is None:
-                    former = tier
-        # Retire bookkeeping in lockstep so _bookkeeping never drifts.
-        self._bookkeeping.pop(key, None)
-        return former
+        in any structure, or ``None`` when the key was completely absent.
+
+        The entire compound mutation (entries + registry/simhash + bookkeeping)
+        is performed under a single lock acquisition so a concurrent reader
+        never observes a half-deleted state across the three structures.
+        Nested leaf calls succeed via RLock reentrancy."""
+        with self._lock:
+            former: str | None = None
+            for tier in list(self._entries.keys()):
+                if key in self._entries[tier]:
+                    del self._entries[tier][key]
+                    if former is None:
+                        former = tier
+            # Drop from registry (removes from active, stale, and _simhash).
+            for tier, reg in list(self._registry.items()):
+                if reg.knows(key):
+                    reg.remove(key)
+                    if former is None:
+                        former = tier
+            # Retire bookkeeping in lockstep so _bookkeeping never drifts.
+            self._bookkeeping.pop(key, None)
+            return former
 
     def clear_entries(self) -> int:
         """Remove all entry payloads from the content cache.
@@ -365,38 +453,44 @@ class MemoryStore:
 
         Returns the total number of entries that were dropped across all tiers.
         """
-        total = sum(len(tier_entries) for tier_entries in self._entries.values())
-        self._entries.clear()
-        return total
+        with self._lock:
+            total = sum(len(tier_entries) for tier_entries in self._entries.values())
+            self._entries.clear()
+            return total
 
     def move(self, key: str, new_tier: str) -> None:
         """Move *key* from its current tier to *new_tier* atomically.
 
         Moves the entry payload, simhash fingerprint, and registry entry in one
-        operation.  No-op if *key* is already in *new_tier*."""
-        old_tier = self.tier_of(key)
-        if old_tier == new_tier:
-            if new_tier in self._registry:
-                # Ensure registry entry is present even when entries already are.
-                self._registry[new_tier].add(key)
-            return
-        # Move entry
-        if old_tier is not None and key in self._entries.get(old_tier, {}):
-            self._entries.setdefault(new_tier, {})[key] = self._entries[old_tier].pop(key)
-        # Move simhash: read from the old tier's registry (covers active + stale).
-        fp: int | None = None
-        old_reg = self._registry.get(old_tier) if old_tier else None
-        if old_reg is not None:
-            fp = old_reg.simhash_for(key)
-            old_reg.drop_simhash(key)
-        if fp is not None:
-            self._registry.setdefault(new_tier, KeyRegistry()).set_simhash(key, fp)
-        # Move registry entry: remove from old, add to new.
-        for tier, reg in list(self._registry.items()):
-            if key in reg:
-                if tier != new_tier:
-                    reg.remove(key)
-        self._registry.setdefault(new_tier, KeyRegistry()).add(key)
+        operation.  No-op if *key* is already in *new_tier*.
+
+        The entire compound mutation across all three structures is performed
+        under a single lock acquisition.  Nested calls to :meth:`tier_of`
+        succeed via RLock reentrancy."""
+        with self._lock:
+            old_tier = self.tier_of(key)
+            if old_tier == new_tier:
+                if new_tier in self._registry:
+                    # Ensure registry entry is present even when entries already are.
+                    self._registry[new_tier].add(key)
+                return
+            # Move entry
+            if old_tier is not None and key in self._entries.get(old_tier, {}):
+                self._entries.setdefault(new_tier, {})[key] = self._entries[old_tier].pop(key)
+            # Move simhash: read from the old tier's registry (covers active + stale).
+            fp: int | None = None
+            old_reg = self._registry.get(old_tier) if old_tier else None
+            if old_reg is not None:
+                fp = old_reg.simhash_for(key)
+                old_reg.drop_simhash(key)
+            if fp is not None:
+                self._registry.setdefault(new_tier, KeyRegistry()).set_simhash(key, fp)
+            # Move registry entry: remove from old, add to new.
+            for tier, reg in list(self._registry.items()):
+                if key in reg:
+                    if tier != new_tier:
+                        reg.remove(key)
+            self._registry.setdefault(new_tier, KeyRegistry()).add(key)
 
     # ------------------------------------------------------------------
     # SimHash fingerprints — public accessors
@@ -407,42 +501,47 @@ class MemoryStore:
         Reads from the registry (covers active AND stale partitions — the
         unified storage design).  Returns ``None`` when the tier has no
         registry or the key has no fingerprint."""
-        reg = self._registry.get(tier)
-        if reg is None:
-            return None
-        return reg.simhash_for(key)
+        with self._lock:
+            reg = self._registry.get(tier)
+            if reg is None:
+                return None
+            return reg.simhash_for(key)
 
     def has_simhash(self, tier: str, key: str) -> bool:
         """True when *key* has a stored fingerprint in *tier* (active or stale)."""
-        reg = self._registry.get(tier)
-        if reg is None:
-            return False
-        return reg.has_simhash(key)
+        with self._lock:
+            reg = self._registry.get(tier)
+            if reg is None:
+                return False
+            return reg.has_simhash(key)
 
     def _tier_for_simhash(self, key: str) -> str | None:
         """Return the tier whose registry holds *key*'s fingerprint, or ``None``.
 
         Used by the legacy flat-view setter and the probe confidence gate.
         Scans registry active+stale partitions."""
-        for tier, reg in self._registry.items():
-            if reg.has_simhash(key):
-                return tier
-        return None
+        with self._lock:
+            for tier, reg in self._registry.items():
+                if reg.has_simhash(key):
+                    return tier
+            return None
 
     def put_simhash(self, tier: str, key: str, fingerprint: int) -> None:
         """Write the simhash fingerprint for ``(tier, key)`` into the registry.
 
         Does not touch the entry or registry lifecycle (active/stale).  The
         registry is auto-created for *tier* on first access."""
-        self._registry.setdefault(tier, KeyRegistry()).set_simhash(key, fingerprint)
+        with self._lock:
+            self._registry.setdefault(tier, KeyRegistry()).set_simhash(key, fingerprint)
 
     def delete_simhash(self, tier: str, key: str) -> None:
         """Remove the simhash fingerprint for ``(tier, key)`` from its registry.
 
         No-op when the tier has no registry or the key has no fingerprint."""
-        reg = self._registry.get(tier)
-        if reg is not None:
-            reg.drop_simhash(key)
+        with self._lock:
+            reg = self._registry.get(tier)
+            if reg is not None:
+                reg.drop_simhash(key)
 
     def tier_simhashes(self, tier: str, *, include_stale: bool) -> dict[str, int]:
         """Return the fingerprint map for *tier*.
@@ -462,10 +561,11 @@ class MemoryStore:
             a mutable live backing dict are using a deprecated pattern —
             use :meth:`put_simhash` for writes.
         """
-        reg = self._registry.get(tier)
-        if reg is None:
-            return {}
-        return reg._known_simhashes() if include_stale else reg._active_simhashes()
+        with self._lock:
+            reg = self._registry.get(tier)
+            if reg is None:
+                return {}
+            return reg._known_simhashes() if include_stale else reg._active_simhashes()
 
     def replace_simhashes_in_tier(self, tier: str, new_simhashes: dict[str, int]) -> None:
         """Bulk-replace the active simhash fingerprints for *tier*.
@@ -474,22 +574,25 @@ class MemoryStore:
         Stale fingerprints in the registry are not touched — they are managed
         by :meth:`KeyRegistry.stale`.
         """
-        reg = self._registry.setdefault(tier, KeyRegistry())
-        # Drop all active simhashes from the registry by clearing _simhash directly.
-        # (Only active simhashes are being replaced; stale records stay intact.)
-        reg._simhash.clear()
-        for key, fp in new_simhashes.items():
-            reg.set_simhash(key, fp)
+        with self._lock:
+            reg = self._registry.setdefault(tier, KeyRegistry())
+            # Drop all active simhashes from the registry by clearing _simhash
+            # directly.  (Only active simhashes are being replaced; stale
+            # records stay intact.)
+            reg._simhash.clear()
+            for key, fp in new_simhashes.items():
+                reg.set_simhash(key, fp)
 
     def simhash_count_in_tier(self, tier: str) -> int:
         """Return the total number of known (active∪stale) fingerprints for *tier*.
 
         Reads from the registry's ``_known_simhashes()`` — the authoritative
         source for both active and stale fingerprints."""
-        reg = self._registry.get(tier)
-        if reg is None:
-            return 0
-        return len(reg._known_simhashes())
+        with self._lock:
+            reg = self._registry.get(tier)
+            if reg is None:
+                return 0
+            return len(reg._known_simhashes())
 
     # ------------------------------------------------------------------
     # Lifecycle registry
@@ -503,7 +606,8 @@ class MemoryStore:
         existence.  Callers that need to know whether replay is active should
         check :attr:`replay_enabled` directly.
         """
-        return self._registry.setdefault(tier, KeyRegistry())
+        with self._lock:
+            return self._registry.setdefault(tier, KeyRegistry())
 
     def load_registry(self, tier: str, registry: KeyRegistry) -> None:
         """Install a pre-loaded :class:`KeyRegistry` for *tier* at boot.
@@ -516,15 +620,18 @@ class MemoryStore:
             raise RuntimeError(
                 "MemoryStore: replay is disabled; cannot install registry for tier %r" % tier
             )
-        self._registry[tier] = registry
+        with self._lock:
+            self._registry[tier] = registry
 
     def has_registry(self, tier: str) -> bool:
         """True when *tier* has an allocated registry."""
-        return tier in self._registry
+        with self._lock:
+            return tier in self._registry
 
     def tiers_with_registry(self) -> list[str]:
         """Tiers for which a registry has been allocated."""
-        return list(self._registry.keys())
+        with self._lock:
+            return list(self._registry.keys())
 
     def drop_registry(self, tier: str) -> KeyRegistry | None:
         """Remove and return the registry for *tier*.
@@ -532,26 +639,30 @@ class MemoryStore:
         Used at end-of-full-cycle to retire interim slots after their keys
         have been promoted into main.  Returns ``None`` when the tier had no
         registry."""
-        return self._registry.pop(tier, None)
+        with self._lock:
+            return self._registry.pop(tier, None)
 
     def active_keys_in_tier(self, tier: str) -> list[str]:
         """Return the active keys for *tier* from the registry."""
-        reg = self._registry.get(tier)
-        return reg.list_active() if reg is not None else []
+        with self._lock:
+            reg = self._registry.get(tier)
+            return reg.list_active() if reg is not None else []
 
     def all_active_keys(self) -> list[str]:
         """Every active key across every registered tier."""
-        return [k for reg in self._registry.values() for k in reg.list_active()]
+        with self._lock:
+            return [k for reg in self._registry.values() for k in reg.list_active()]
 
     def tier_for_active_key(self, key: str) -> str | None:
         """Return the tier that holds *key* in its registry as active, or ``None``.
 
         Kept distinct from :meth:`tier_of` because the registry and entry
         cache can briefly disagree during a put/move sequence."""
-        for tier, reg in self._registry.items():
-            if key in reg:
-                return tier
-        return None
+        with self._lock:
+            for tier, reg in self._registry.items():
+                if key in reg:
+                    return tier
+            return None
 
     def is_known(self, key: str) -> bool:
         """True when *key* is active OR stale in any tier's registry.
@@ -564,10 +675,11 @@ class MemoryStore:
         """
         if not self._replay_enabled:
             return False
-        for reg in self._registry.values():
-            if reg.knows(key):
-                return True
-        return False
+        with self._lock:
+            for reg in self._registry.values():
+                if reg.knows(key):
+                    return True
+            return False
 
     def tier_for_known_key(self, key: str) -> str | None:
         """Return the tier whose registry tracks *key* as active OR stale.
@@ -578,10 +690,11 @@ class MemoryStore:
         """
         if not self._replay_enabled:
             return None
-        for tier, reg in self._registry.items():
-            if reg.knows(key):
-                return tier
-        return None
+        with self._lock:
+            for tier, reg in self._registry.items():
+                if reg.knows(key):
+                    return tier
+            return None
 
     def all_known_keys(self) -> list[str]:
         """Every active ∪ stale key across every registered tier.
@@ -592,7 +705,8 @@ class MemoryStore:
         """
         if not self._replay_enabled:
             return []
-        return [k for reg in self._registry.values() for k in reg.list_known()]
+        with self._lock:
+            return [k for reg in self._registry.values() for k in reg.list_known()]
 
     def is_stale(self, key: str) -> bool:
         """Return True when *key* is stale in any tier's registry.
@@ -603,16 +717,18 @@ class MemoryStore:
         """
         if not self._replay_enabled:
             return False
-        for reg in self._registry.values():
-            if reg.is_stale(key):
-                return True
-        return False
+        with self._lock:
+            for reg in self._registry.values():
+                if reg.is_stale(key):
+                    return True
+            return False
 
     def all_stale_keys(self) -> list[str]:
         """Every stale key across every registered tier."""
         if not self._replay_enabled:
             return []
-        return [k for reg in self._registry.values() for k in reg.list_stale()]
+        with self._lock:
+            return [k for reg in self._registry.values() for k in reg.list_stale()]
 
     def discard_keys(self, keys: list[str], *, mode: str) -> None:
         """Mutate the in-memory registry (and its simhash map) for *keys*.
@@ -636,30 +752,36 @@ class MemoryStore:
 
         This is an **in-memory** mutation only.  Callers are responsible for
         their own disk saves (the registry files carry the unified simhash now).
+
+        The entire mutation is performed under a single lock acquisition.
+        Nested calls to :meth:`tiers_with_registry` succeed via RLock
+        reentrancy.
         """
         if not self._replay_enabled:
             return
-        if mode == "erase":
-            for tier_name in self.tiers_with_registry():
-                reg = self._registry.get(tier_name)
-                if reg is None:
-                    continue
-                for key in keys:
-                    if reg.knows(key):
-                        reg.remove(key)
-        elif mode == "stale":
-            for key in keys:
+        with self._lock:
+            if mode == "erase":
                 for tier_name in self.tiers_with_registry():
                     reg = self._registry.get(tier_name)
-                    if reg is not None and key in reg:
-                        reg.stale(key)
-                        # The stale transition moved the active simhash into the
-                        # stale record inside the registry — single encapsulated call.
-                        break  # single-tier-ownership invariant
-        else:
-            raise ValueError(
-                f"MemoryStore.discard_keys: unknown mode {mode!r}; expected 'erase' or 'stale'"
-            )
+                    if reg is None:
+                        continue
+                    for key in keys:
+                        if reg.knows(key):
+                            reg.remove(key)
+            elif mode == "stale":
+                for key in keys:
+                    for tier_name in self.tiers_with_registry():
+                        reg = self._registry.get(tier_name)
+                        if reg is not None and key in reg:
+                            reg.stale(key)
+                            # The stale transition moved the active simhash into
+                            # the stale record inside the registry — single
+                            # encapsulated call.
+                            break  # single-tier-ownership invariant
+            else:
+                raise ValueError(
+                    f"MemoryStore.discard_keys: unknown mode {mode!r}; expected 'erase' or 'stale'"
+                )
 
     # ------------------------------------------------------------------
     # Snapshot / restore — cycle-resume rollback rope
@@ -678,15 +800,16 @@ class MemoryStore:
 
         ``_bookkeeping`` is NOT included — it is reloaded from
         ``key_metadata.json`` on boot."""
-        simhash_snap: dict[str, dict[str, int]] = {}
-        for tier, reg in self._registry.items():
-            known = reg._known_simhashes()
-            if known:
-                simhash_snap[tier] = known
-        return {
-            "entries": copy.deepcopy(self._entries),
-            "simhash": simhash_snap,
-        }
+        with self._lock:
+            simhash_snap: dict[str, dict[str, int]] = {}
+            for tier, reg in self._registry.items():
+                known = reg._known_simhashes()
+                if known:
+                    simhash_snap[tier] = known
+            return {
+                "entries": copy.deepcopy(self._entries),
+                "simhash": simhash_snap,
+            }
 
     def restore(self, snap: dict) -> None:
         """Restore entry and simhash state from :meth:`snapshot` output.
@@ -694,16 +817,20 @@ class MemoryStore:
         Re-seeds each tier's registry with the active fingerprints from the
         snapshot map.  Stale fingerprints are reloaded from the registry
         on-disk during the separate registry-restore step (callers are
-        responsible for that)."""
-        self._entries = copy.deepcopy(snap["entries"])
-        snap_simhash: dict[str, dict[str, int]] = snap.get("simhash", {})
-        # Clear existing registry active simhashes and re-seed from the snapshot.
-        for tier, fp_map in snap_simhash.items():
-            reg = self._registry.setdefault(tier, KeyRegistry())
-            reg._simhash.clear()
-            for key, fp in fp_map.items():
-                if key not in reg._stale:
-                    reg._simhash[key] = fp
+        responsible for that).
+
+        The entire compound rebind is performed under a single lock acquisition
+        so a concurrent reader never observes a half-restored state."""
+        with self._lock:
+            self._entries = copy.deepcopy(snap["entries"])
+            snap_simhash: dict[str, dict[str, int]] = snap.get("simhash", {})
+            # Clear existing registry active simhashes and re-seed from the snapshot.
+            for tier, fp_map in snap_simhash.items():
+                reg = self._registry.setdefault(tier, KeyRegistry())
+                reg._simhash.clear()
+                for key, fp in fp_map.items():
+                    if key not in reg._stale:
+                        reg._simhash[key] = fp
 
     def _entries_flat_view(self) -> "_LegacyFlatCacheView":
         """Return a flat dict-like view of all entries across tiers.
@@ -725,6 +852,17 @@ class MemoryStore:
         memoize: bool = True,
     ) -> dict[str, dict | None]:
         """Resolve *keys_by_adapter* to flat ``{key → result | None}``.
+
+        NOTE — this method is deliberately NOT wrapped in ``self._lock``.
+        It calls ``source.probe(...)``, which is a GPU ``model.generate()``
+        call that may block for seconds.  Holding the store lock across GPU
+        work would stall every concurrent store reader for the duration of the
+        GPU call.  All reads inside probe go through individually locked leaf
+        methods — ``self.get``, ``self.bookkeeping_for_key``, ``self.simhash``,
+        ``self._tier_for_simhash``, ``self.put``, ``self.set_bookkeeping`` —
+        so no raw access to ``_entries``, ``_registry``, or ``_bookkeeping``
+        is made.  Each read acquires and releases the lock independently; the
+        lock is never held across the GPU call.
 
         Cache hits are served directly from the store.  Misses are delegated
         to *source* (a :class:`paramem.memory.source.MemorySource`)
@@ -786,10 +924,11 @@ class MemoryStore:
                 # Key has no fingerprint — replay enabled but no hash stored
                 # (e.g. fresh tier before first consolidation).  Pass through.
                 return None
-            reg = self._registry.get(owning_simhash_tier)
-            if reg is None:
-                return None
-            fp = reg.simhash_for(key)
+            # Use the locked accessor self.simhash() instead of raw
+            # self._registry.get() so a concurrent swap cannot rebind
+            # _registry between the _tier_for_simhash call above and the
+            # fingerprint read here.
+            fp = self.simhash(owning_simhash_tier, key)
             if fp is None:
                 return None
             # Build the minimal entry shape verify_confidence expects.
@@ -826,7 +965,7 @@ class MemoryStore:
             # Use the computed confidence when the gate applied; fall back to
             # 1.0 when replay is off or no fingerprint exists (pass-through).
             rendered_confidence = confidence if confidence is not None else 1.0
-            bk = self._bookkeeping.get(key) or {}
+            bk = self.bookkeeping_for_key(key) or {}
             base = {
                 "key": key,
                 "subject": entry.get("subject", ""),
@@ -854,7 +993,7 @@ class MemoryStore:
                     continue
                 # Defense-in-depth speaker filter — read speaker from
                 # _bookkeeping (not from the entry: entries are SPO-only).
-                bk_spk = self._bookkeeping.get(key, {}).get("speaker_id", "")
+                bk_spk = (self.bookkeeping_for_key(key) or {}).get("speaker_id", "")
                 if speaker_id is not None and bk_spk and bk_spk != speaker_id:
                     logger.warning(
                         "MemoryStore.probe: speaker_id mismatch for key %s "
@@ -942,7 +1081,7 @@ class MemoryStore:
                         # relation_type is not carried by the probe source; default
                         # to "unknown" — the backfill job corrects it on first
                         # consolidation cycle.
-                        if key not in self._bookkeeping:
+                        if self.bookkeeping_for_key(key) is None:
                             src_spk = src.get("speaker_id", "")
                             src_fsc = src.get("first_seen_cycle", 0)
                             if src_spk or src_fsc:
@@ -960,6 +1099,61 @@ class MemoryStore:
     # ------------------------------------------------------------------
     # On-disk registries — load registries + simhashes from the adapter dir
     # ------------------------------------------------------------------
+    @staticmethod
+    def read_registries_from_disk(adapter_dir) -> "dict[str, KeyRegistry]":
+        """Read per-tier ``indexed_key_registry.json`` files from disk into a
+        fresh ``dict[str, KeyRegistry]`` without touching any live store.
+
+        This is the store-free counterpart to
+        :meth:`load_registries_from_disk`.  It is used by
+        :func:`paramem.server.app._build_store_contents` to build new
+        registry structures off-store before atomically publishing them via
+        :meth:`swap`.  The boot / in-process-reload path still uses the
+        instance method (which delegates here and then installs).
+
+        Reads:
+
+        * ``<adapter_dir>/<tier>/indexed_key_registry.json`` for each main tier
+          and every ``episodic_interim_<stamp>`` slot.
+
+        The registry file carries the unified simhash map (active∪stale
+        fingerprints) in the ``"simhash"`` key.
+
+        Entry payloads (subject/predicate/object/speaker_id) are NOT loaded
+        here — that is the responsibility of the mode-specific
+        :class:`paramem.memory.source.MemorySource`.
+
+        Args:
+            adapter_dir: Path to the adapter root directory.
+
+        Returns:
+            Fresh ``dict[str, KeyRegistry]`` populated from disk.  Main tiers
+            always appear (even when their registry file is absent —
+            :meth:`KeyRegistry.load` returns an empty registry for missing
+            files).  Interim tiers appear only when their directories exist.
+        """
+        from pathlib import Path
+
+        from paramem.memory.interim_adapter import iter_interim_dirs
+        from paramem.training.key_registry import KeyRegistry
+
+        adapter_dir = Path(adapter_dir)
+        registries: dict[str, KeyRegistry] = {}
+
+        # Main tiers — registries live at <adapter_dir>/<tier>/indexed_key_registry.json
+        for tier in ("episodic", "semantic", "procedural"):
+            reg_path = adapter_dir / tier / "indexed_key_registry.json"
+            registries[tier] = KeyRegistry.load(reg_path)
+
+        # Interim tiers — dynamic; loaded when their dirs exist.  Tier key is
+        # the PEFT adapter name so callers using ``peft_config`` keys can
+        # address the store consistently.
+        for interim_name, interim_dir in iter_interim_dirs(adapter_dir):
+            reg_path = interim_dir / "indexed_key_registry.json"
+            registries[interim_name] = KeyRegistry.load(reg_path)
+
+        return registries
+
     def load_registries_from_disk(self, adapter_dir) -> None:
         """Load per-tier ``indexed_key_registry.json`` into the store.
 
@@ -980,28 +1174,17 @@ class MemoryStore:
 
         No-op when the store has ``replay_enabled=False`` (registries are not
         tracked).
+
+        Delegates disk reads to :meth:`read_registries_from_disk` so the
+        on-disk parsing logic is shared with the store-free builder path
+        (:func:`paramem.server.app._build_store_contents`).
         """
         if not self._replay_enabled:
             return
 
-        from pathlib import Path
-
-        from paramem.memory.interim_adapter import iter_interim_dirs
-        from paramem.training.key_registry import KeyRegistry
-
-        adapter_dir = Path(adapter_dir)
-
-        # Main tiers — registries live at <adapter_dir>/<tier>/indexed_key_registry.json
-        for tier in ("episodic", "semantic", "procedural"):
-            reg_path = adapter_dir / tier / "indexed_key_registry.json"
-            self.load_registry(tier, KeyRegistry.load(reg_path))
-
-        # Interim tiers — dynamic; loaded if their dirs exist.  Tier key is
-        # the PEFT adapter name so callers using ``peft_config`` keys can
-        # address the store consistently.
-        for interim_name, interim_dir in iter_interim_dirs(adapter_dir):
-            reg_path = interim_dir / "indexed_key_registry.json"
-            self.load_registry(interim_name, KeyRegistry.load(reg_path))
+        registries = MemoryStore.read_registries_from_disk(adapter_dir)
+        for tier, reg in registries.items():
+            self.load_registry(tier, reg)
 
     def load_bookkeeping_from_disk(self, key_metadata_path) -> dict:
         """Load per-key bookkeeping into ``_bookkeeping`` from ``key_metadata.json``.
@@ -1081,17 +1264,50 @@ class MemoryStore:
     # ------------------------------------------------------------------
     def stats(self) -> dict:
         """Per-tier ``{key_count, simhash_count, registry_active}`` map."""
-        out: dict[str, dict] = {}
-        for tier in self._entries:
-            out.setdefault(tier, {})["key_count"] = len(self._entries[tier])
-        for tier, reg in self._registry.items():
-            known = reg._known_simhashes()
-            if known:
-                out.setdefault(tier, {})["simhash_count"] = len(known)
-            active = len(reg.list_active())
-            if self._replay_enabled:
-                out.setdefault(tier, {})["registry_active"] = active
-        return out
+        with self._lock:
+            out: dict[str, dict] = {}
+            for tier in self._entries:
+                out.setdefault(tier, {})["key_count"] = len(self._entries[tier])
+            for tier, reg in self._registry.items():
+                known = reg._known_simhashes()
+                if known:
+                    out.setdefault(tier, {})["simhash_count"] = len(known)
+                active = len(reg.list_active())
+                if self._replay_enabled:
+                    out.setdefault(tier, {})["registry_active"] = active
+            return out
+
+    def swap(
+        self,
+        new_entries: dict[str, dict[str, dict]],
+        new_registry: dict[str, KeyRegistry],
+        new_bookkeeping: dict[str, dict],
+    ) -> None:
+        """Atomically rebind all three mutable structures in a single locked operation.
+
+        This is the atomic-publish primitive for phase-2 consolidation.
+        Callers build the three new structures entirely off-store, then call
+        ``swap`` to publish them in one locked rebind.  No reader ever observes
+        a torn or half-rebuilt state across ``_entries``, ``_registry``, and
+        ``_bookkeeping``.
+
+        Args:
+            new_entries: The replacement ``tier → key → entry`` mapping.
+            new_registry: The replacement ``tier → KeyRegistry`` mapping.
+            new_bookkeeping: The replacement ``key → bookkeeping-record`` mapping.
+
+        Contract for callers: construct all three off-store, validate them
+        (registries loaded, simhashes set), then call ``swap`` once.  After
+        this call returns, the previous references are unreachable from the
+        store.  Any thread that already holds a reference to the old
+        ``_entries`` dict (e.g. an in-flight ``iter_entries`` snapshot) still
+        holds a valid reference to the now-disconnected structure — that is safe
+        because the snapshot is immutable from the reader's perspective.
+        """
+        with self._lock:
+            self._entries = new_entries
+            self._registry = new_registry
+            self._bookkeeping = new_bookkeeping
 
 
 class _LegacyFlatCacheView:

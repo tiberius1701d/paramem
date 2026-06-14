@@ -51,8 +51,9 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         ("paramem/server/app.py", "_extract_and_start_training"),
         ("paramem/server/app.py", "_run_full_cycle"),
         # Memory store hydration source selection reads consolidation.mode, not runtime mode.
-        # Extracted from _preload_memory_store so boot-preload and post-fold reconcile share it.
-        ("paramem/server/app.py", "_hydrate_memory_store_in_place"),
+        # Moved from _hydrate_memory_store_in_place into the store-free builder so both
+        # boot-preload and post-fold reconcile share the same selection logic.
+        ("paramem/server/app.py", "_build_store_contents"),
         # migration tooling — mode-switch detection and graph migration
         ("paramem/server/active_store_migration.py", "detect_mode_switch"),
         ("paramem/server/active_store_migration.py", "migrate"),

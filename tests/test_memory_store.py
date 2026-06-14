@@ -7,6 +7,8 @@ flat ``indexed_key_cache`` + three flat ``*_simhash`` dicts on
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from paramem.memory.store import MemoryStore
@@ -1113,3 +1115,191 @@ class TestDiscardKeys:
         assert "ep1" in stale
         assert "sem1" in stale
         assert "ep2" not in stale
+
+
+# ---------------------------------------------------------------------------
+# Thread-safety concurrency contract — Phase 1
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrencyContract:
+    """Verify the RLock concurrency contract added in Phase 1.
+
+    These tests do NOT test for race conditions (that would require a stress
+    harness with tight timing).  Instead they verify the observable contract:
+    - iter_entries / iter_bookkeeping snapshot under the lock → their result
+      is unaffected by a concurrent (but serialised) mutation.
+    - swap() atomically rebinds all three structures.
+    - entries_in_tier() returns a copy, not a live internal dict.
+    - The store exposes an RLock (not plain Lock) on ``_lock``.
+    """
+
+    def test_rlock_is_reentrant(self):
+        """_lock is an RLock; the same thread can acquire it twice without deadlock."""
+        s = MemoryStore()
+        # RLock allows re-entry from the same thread.
+        acquired_inner = False
+        with s._lock:
+            with s._lock:
+                acquired_inner = True
+        assert acquired_inner, "_lock must be an RLock (re-entrant)"
+
+    def test_entries_in_tier_returns_copy_not_live(self):
+        """entries_in_tier must return a snapshot copy.
+
+        Mutations to the returned dict must NOT propagate to the store."""
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"))
+        copy_dict = s.entries_in_tier("episodic")
+        # Mutate the returned copy.
+        copy_dict["injected"] = {"key": "injected"}
+        # Store must be unaffected.
+        assert "injected" not in s.entries_in_tier("episodic")
+        assert s.get("injected") is None
+
+    def test_iter_entries_snapshot_unaffected_by_subsequent_put(self):
+        """iter_entries snapshot is taken before yielding.
+
+        A put() that happens after the iterator is created must NOT appear
+        in the iteration (because the snapshot is fixed at creation time)."""
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"))
+        it = s.iter_entries()
+        # Materialise the generator to exhaust the snapshot.
+        snap = list(it)
+        # Now add a second key.
+        s.put("episodic", "graph2", _entry("graph2"))
+        # The snapshot must only contain graph1 (the generator was already
+        # exhausted before graph2 was inserted).
+        keys_in_snap = {k for _, k, _ in snap}
+        assert "graph1" in keys_in_snap
+        assert "graph2" not in keys_in_snap
+
+    def test_iter_bookkeeping_snapshot_unaffected_by_subsequent_set(self):
+        """iter_bookkeeping snapshot is taken before yielding."""
+        s = MemoryStore()
+        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        it = s.iter_bookkeeping()
+        snap = list(it)
+        # Add a second key after the iterator is exhausted.
+        s.set_bookkeeping("k2", speaker_id="bob", first_seen_cycle=2, relation_type="factual")
+        keys_in_snap = {k for k, _ in snap}
+        assert "k1" in keys_in_snap
+        assert "k2" not in keys_in_snap
+
+    def test_swap_rebinds_all_three_structures_atomically(self):
+        """swap() replaces entries, registry, and bookkeeping in one operation.
+
+        After swap, get/iter_entries/bookkeeping_for_key all reflect the new
+        state and the old keys are gone."""
+        s = MemoryStore()
+        s.put("episodic", "old_key", _entry("old_key"))
+        s.set_bookkeeping(
+            "old_key", speaker_id="alice", first_seen_cycle=1, relation_type="factual"
+        )
+
+        new_reg = KeyRegistry()
+        new_reg.add("new_key")
+        new_entries: dict[str, dict[str, dict]] = {"semantic": {"new_key": _entry("new_key")}}
+        new_bookkeeping: dict[str, dict] = {
+            "new_key": {
+                "speaker_id": "bob",
+                "first_seen_cycle": 5,
+                "relation_type": "preference",
+                "recurrence_count": 1,
+                "last_seen_cycle": 5,
+            }
+        }
+        s.swap(new_entries, {"semantic": new_reg}, new_bookkeeping)
+
+        # Old key is gone.
+        assert s.get("old_key") is None
+        assert s.bookkeeping_for_key("old_key") is None
+        # New key is present.
+        assert s.get("new_key") == _entry("new_key")
+        assert s.tier_of("new_key") == "semantic"
+        bk = s.bookkeeping_for_key("new_key")
+        assert bk is not None
+        assert bk["speaker_id"] == "bob"
+        # Registry reflects the swap.
+        assert "new_key" in s.registry("semantic")
+        assert not s.has_registry("episodic")
+
+    def test_swap_visible_to_concurrent_reader_after_release(self):
+        """A thread that acquires the lock after swap() sees the new state.
+
+        This is a serialised (not truly concurrent) test: it proves the lock
+        is not bypassed by swap() — the new state is visible to the next
+        acquirer."""
+        s = MemoryStore()
+        s.put("episodic", "before", _entry("before"))
+
+        results: list = []
+
+        def reader():
+            results.append(s.get("before"))
+            results.append(s.get("after"))
+
+        new_entries: dict[str, dict[str, dict]] = {"episodic": {"after": _entry("after")}}
+        s.swap(new_entries, {}, {})
+
+        t = threading.Thread(target=reader)
+        t.start()
+        t.join()
+
+        assert results[0] is None, "old key must be gone after swap"
+        assert results[1] == _entry("after"), "new key must be visible after swap"
+
+
+# ---------------------------------------------------------------------------
+# read_registries_from_disk — store-free static builder (phase-2)
+# ---------------------------------------------------------------------------
+
+
+class TestReadRegistriesFromDisk:
+    """read_registries_from_disk returns a fresh dict without touching any store."""
+
+    def test_returns_dict_with_main_tiers_on_empty_dir(self, tmp_path) -> None:
+        """All three main tiers appear even when their registry files are absent.
+
+        KeyRegistry.load on a missing file returns an empty registry — so the
+        returned dict always has "episodic", "semantic", "procedural" keys."""
+        # Create the adapter dir structure but leave registry files absent.
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        result = MemoryStore.read_registries_from_disk(tmp_path)
+
+        assert set(result.keys()) == {"episodic", "semantic", "procedural"}
+        for tier in ("episodic", "semantic", "procedural"):
+            assert result[tier].list_active() == []
+
+    def test_does_not_touch_any_live_store(self, tmp_path) -> None:
+        """read_registries_from_disk is store-free — the live store is unchanged."""
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        live = MemoryStore()
+        live.put("episodic", "live_key", _entry("live_key"))
+
+        # Call the static method — should not touch the live store.
+        MemoryStore.read_registries_from_disk(tmp_path)
+
+        # live store must be unmodified.
+        assert live.get("live_key") == _entry("live_key")
+
+    def test_load_registries_from_disk_delegates_to_static(self, tmp_path) -> None:
+        """load_registries_from_disk (instance method) produces the same registry
+        as read_registries_from_disk (static) on the same adapter dir."""
+        for tier in ("episodic", "semantic", "procedural"):
+            (tmp_path / tier).mkdir()
+
+        static_result = MemoryStore.read_registries_from_disk(tmp_path)
+
+        store = MemoryStore()
+        store.load_registries_from_disk(tmp_path)
+
+        for tier in ("episodic", "semantic", "procedural"):
+            assert list(static_result[tier].list_active()) == list(
+                store.registry(tier).list_active()
+            ), f"Tier '{tier}' active keys differ between static and instance method"

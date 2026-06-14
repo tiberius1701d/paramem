@@ -155,6 +155,21 @@ class BackgroundTrainer:
     def is_training(self) -> bool:
         return self._is_training
 
+    def abort_requested(self) -> bool:
+        """Return True when the per-job abort event has been set.
+
+        Called by the post-fold re-probe (``_build_store_contents``) to yield
+        the GPU to a waiting ``/chat`` between adapter groups.  A partial probe
+        is safe: registry and bookkeeping are always complete; the partial
+        entries self-heal via on-miss probing on the next query.
+
+        Returns False when no job is active (no-op case) or the abort flag has
+        not been set.
+        """
+        with self._active_state_lock:
+            abort = self._active_abort
+        return abort is not None and abort.is_set()
+
     def abort_for_inference(self, timeout: float = 30.0) -> bool:
         """Signal the active training job to stop at the next step boundary.
 
