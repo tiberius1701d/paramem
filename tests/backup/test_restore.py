@@ -1207,3 +1207,762 @@ class TestCandidateSidecarPreservedNotRestored:
         assert restored_config != candidate_bytes, (
             "Candidate bytes must never be restored to the live config path"
         )
+
+
+# ---------------------------------------------------------------------------
+# Orphan interim pruning during restore
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanInterimPruning:
+    """restore_bundle prunes on-disk interim families absent from the bundle.
+
+    Boot mounts every internally-consistent interim_* dir unconditionally (gated
+    only against the interim's own indexed_key_registry.json), so orphan interims
+    inflate the live store.  restore_bundle must remove them and report each
+    removal in RestoreResult.pruned_orphans.
+    """
+
+    def _add_orphan_interim(
+        self,
+        data_dir: Path,
+        stamp: str,
+        active_key_content: bytes | None = None,
+    ) -> Path:
+        """Plant an interim family dir under data_dir/adapters/episodic/interim_<stamp>/.
+
+        Writes a minimal indexed_key_registry.json using the real KeyRegistry
+        on-disk schema (``{"active_keys": [...], ...}``) so KeyRegistry.load can
+        parse it.  Returns the family dir path.
+
+        Pass ``active_key_content`` to override with arbitrary bytes (e.g. a
+        corrupt payload to exercise the fallback path).
+        """
+        family_dir = data_dir / "adapters" / "episodic" / f"interim_{stamp}"
+        family_dir.mkdir(parents=True, exist_ok=True)
+        if active_key_content is None:
+            # Real KeyRegistry schema: "active_keys" is a list of key strings.
+            # Two known keys so the count assertion can verify a non-zero value.
+            active_key_content = json.dumps(
+                {
+                    "active_keys": ["orphan_key_1", "orphan_key_2"],
+                    "fidelity_history": {},
+                    "health": None,
+                    "stale": {},
+                    "simhash": {},
+                }
+            ).encode("utf-8")
+        (family_dir / "indexed_key_registry.json").write_bytes(active_key_content)
+        # Minimal slot so the directory looks structurally valid on disk.
+        slot_dir = family_dir / "20260614-120000"
+        slot_dir.mkdir()
+        (slot_dir / "adapter_model.safetensors").write_bytes(b"fake_orphan_weights")
+        (slot_dir / "adapter_config.json").write_bytes(b'{"peft_type": "LORA"}')
+        meta = {
+            "schema_version": 4,
+            "name": f"episodic_interim_{stamp}",
+            "trained_at": "2026-06-14T12:00:00Z",
+            "window_stamp": "",
+            "base_model": {
+                "repo": "mistralai/Mistral-7B-Instruct-v0.3",
+                "sha": "abc",
+                "hash": "sha256:abc",
+            },
+            "tokenizer": {
+                "name_or_path": "mistralai/Mistral-7B-Instruct-v0.3",
+                "vocab_size": 32000,
+                "merges_hash": "d" * 64,
+            },
+            "lora": {
+                "rank": 8,
+                "alpha": 16,
+                "dropout": 0.0,
+                "target_modules": ["q_proj", "v_proj"],
+            },
+            "registry_sha256": _sha256(active_key_content),
+            "key_count": 1,
+            "synthesized": False,
+        }
+        import json as _json
+
+        (slot_dir / "meta.json").write_text(_json.dumps(meta), encoding="utf-8")
+        return family_dir
+
+    def test_orphan_interim_removed_after_restore(self, tmp_path) -> None:
+        """An interim family absent from the bundle is removed from disk after restore.
+
+        The bundle captures episodic_interim_20260517T1200 (from _make_source_store).
+        We plant an additional orphan interim_20260614T1200 in the scratch dir BEFORE
+        calling restore_bundle.  After restore, the orphan must not exist on disk.
+        """
+        bundle_slot, src = _build_bundle(tmp_path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        # First restore to populate scratch with a known-good state (gives us
+        # the episodic adapter so the safety bundle is captured on the second restore).
+        restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        # Plant the orphan interim in the already-restored scratch dir.
+        orphan_dir = self._add_orphan_interim(scratch, "20260614T1200")
+        assert orphan_dir.exists(), "Orphan dir must exist before restore"
+
+        # Second restore: the bundle does NOT include episodic_interim_20260614T1200.
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        assert not orphan_dir.exists(), "Orphan interim dir must be removed by restore_bundle"
+        assert len(result.pruned_orphans) >= 1, (
+            "result.pruned_orphans must contain at least one entry"
+        )
+        orphan_entries = {e["name"]: e for e in result.pruned_orphans}
+        assert "episodic_interim_20260614T1200" in orphan_entries, (
+            f"pruned_orphans must name the removed interim; got {list(orphan_entries)}"
+        )
+        assert orphan_entries["episodic_interim_20260614T1200"]["kind"] == "interim", (
+            "pruned_orphans entry for an interim family must carry kind='interim'"
+        )
+
+    def test_orphan_pruned_entry_has_correct_active_keys(self, tmp_path) -> None:
+        """pruned_orphans entry carries the exact active_keys count from the interim's registry.
+
+        Uses the real KeyRegistry on-disk schema (``{"active_keys": [...], ...}``) so
+        KeyRegistry.load + list_active produces the correct non-zero count.  The orphan
+        is planted with 2 active keys; after restore the pruned_orphans entry must
+        record active_keys == 2.
+        """
+        bundle_slot, src = _build_bundle(tmp_path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        # Populate scratch so the safety bundle is captured on the second restore.
+        restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        # Plant an orphan with 2 real active keys (real KeyRegistry schema).
+        self._add_orphan_interim(scratch, "20260614T1200")
+
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        pruned = [e for e in result.pruned_orphans if e["name"] == "episodic_interim_20260614T1200"]
+        assert len(pruned) == 1, (
+            f"Expected one pruned_orphans entry for the orphan; got {result.pruned_orphans}"
+        )
+        assert pruned[0]["active_keys"] == 2, (
+            f"pruned_orphans[*].active_keys must equal 2 (the number of active keys planted); "
+            f"got {pruned[0]['active_keys']}"
+        )
+        assert pruned[0]["kind"] == "interim", (
+            f"pruned_orphans entry for interim must carry kind='interim'; got {pruned[0]['kind']}"
+        )
+
+    def test_orphan_pruned_entry_active_keys_fallback_on_corrupt_registry(self, tmp_path) -> None:
+        """Unreadable/corrupt registry → active_keys count falls back to 0.
+
+        When the indexed_key_registry.json cannot be parsed (e.g. it contains
+        invalid JSON), the except branch in the prune sub-step must record
+        active_keys=0 rather than aborting restore.
+        """
+        bundle_slot, src = _build_bundle(tmp_path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        # Populate scratch so the safety bundle is captured on the second restore.
+        restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        # Plant an orphan whose registry is corrupt (not valid JSON).
+        self._add_orphan_interim(
+            scratch, "20260614T1200", active_key_content=b"not-a-valid-registry"
+        )
+
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        pruned = [e for e in result.pruned_orphans if e["name"] == "episodic_interim_20260614T1200"]
+        assert len(pruned) == 1, (
+            f"Expected one pruned_orphans entry for the corrupt-registry orphan; "
+            f"got {result.pruned_orphans}"
+        )
+        assert pruned[0]["active_keys"] == 0, (
+            f"Corrupt registry must fall back to active_keys=0; got {pruned[0]['active_keys']}"
+        )
+        assert pruned[0]["kind"] == "interim", (
+            "pruned_orphans entry for interim must carry kind='interim'; "
+            f"got {pruned[0].get('kind')}"
+        )
+
+    def test_bundle_interim_survives_restore(self, tmp_path) -> None:
+        """An interim family present in the bundle is NOT pruned — it survives restore.
+
+        _make_source_store plants episodic_interim_20260517T1200 and the bundle
+        captures it under adapter_scope='live'.  After restore, that family must
+        still exist on disk.
+        """
+        bundle_slot, src = _build_bundle(tmp_path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        # episodic_interim_20260517T1200 is in the bundle — must be restored, not pruned.
+        interim_dir = scratch / "adapters" / "episodic" / "interim_20260517T1200"
+        assert interim_dir.is_dir(), "Interim family present in bundle must survive restore_bundle"
+        pruned_names = [e["name"] for e in result.pruned_orphans]
+        assert "episodic_interim_20260517T1200" not in pruned_names, (
+            "Bundle-included interim must not appear in pruned_orphans"
+        )
+
+    def test_orphan_main_tier_removed_after_restore(self, tmp_path) -> None:
+        """A main tier absent from the bundle is removed from disk after restore.
+
+        The bundle captures episodic (interim) and procedural.  We add a
+        'procedural' tier dir to the scratch dir with a real registry (≥1 active
+        key) BEFORE calling restore_bundle.  However, the bundle DOES include
+        procedural — so we build a bundle WITHOUT procedural to exercise the
+        orphan-main-tier path.
+
+        Strategy: build a bundle that only captures the episodic interim (not
+        procedural), then restore into a scratch that has a stale procedural dir
+        on disk.  After restore, adapters/procedural/ must not exist and
+        pruned_orphans must carry {"name": "procedural", "kind": "main", "active_keys": N}.
+        """
+        import json as _json
+
+        # Build a bundle from a source that has only the episodic interim (no procedural).
+        src = tmp_path / "ep_only_src"
+        src.mkdir()
+        config_path_src = src / "server.yaml"
+        config_path_src.write_bytes(b"model: mistral\nport: 8420\n")
+
+        registry_dir = src / "registry"
+        registry_dir.mkdir()
+        registry_path_src = registry_dir / "key_metadata.json"
+        registry_path_src.write_bytes(b'{"speakers": {}, "cycles": []}')
+
+        speaker_profiles_src = src / "speaker_profiles.json"
+        speaker_profiles_src.write_bytes(b'{"profiles": []}')
+
+        adapters_base = src / "adapters"
+        ep_interim_content = b'{"keys": {"ep_key": "val"}}'
+        ep_interim_hash = _sha256(ep_interim_content)
+        ep_dir = adapters_base / "episodic"
+        ep_dir.mkdir(parents=True)
+        interim_family_dir = ep_dir / "interim_20260515T0900"
+        interim_family_dir.mkdir()
+        _make_adapter_slot(
+            interim_family_dir,
+            "20260515-090000",
+            ep_interim_hash,
+            adapter_name="episodic_interim_20260515T0900",
+            weight_bytes=b"ep_weights",
+        )
+        (interim_family_dir / "indexed_key_registry.json").write_bytes(ep_interim_content)
+
+        bundle_base = src / "backups" / "snapshot"
+        bundle_base.mkdir(parents=True)
+
+        # Bundle captures only episodic (via interim); procedural is NOT in the bundle.
+        bundle_slot = write_bundle(
+            config_path=config_path_src,
+            registry_path=registry_path_src,
+            adapter_dirs={"episodic": ep_dir},
+            base_dir=bundle_base,
+            meta_fields={"tier": "manual", "label": "ep-only-test"},
+            adapter_scope="live",
+            speaker_profiles_path=speaker_profiles_src,
+        )
+
+        # Build the scratch dir: plant a stale procedural tier with ≥1 active key.
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path_scratch = scratch / "server.yaml"
+        config_path_scratch.write_bytes(b"model: mistral\n")
+
+        proc_content = _json.dumps(
+            {
+                "active_keys": ["proc_key_1", "proc_key_2"],
+                "fidelity_history": {},
+                "health": None,
+                "stale": {},
+                "simhash": {},
+            }
+        ).encode("utf-8")
+        proc_hash = _sha256(proc_content)
+        proc_dir_scratch = scratch / "adapters" / "procedural"
+        proc_dir_scratch.mkdir(parents=True)
+        (proc_dir_scratch / "indexed_key_registry.json").write_bytes(proc_content)
+        proc_slot = proc_dir_scratch / "20260520-100000"
+        proc_slot.mkdir()
+        _make_adapter_slot(
+            proc_dir_scratch, "20260520-100000", proc_hash, adapter_name="procedural"
+        )
+
+        assert proc_dir_scratch.is_dir(), "Stale procedural dir must exist before restore"
+
+        # Restore: procedural is NOT in the bundle → must be pruned.
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path_scratch)
+
+        assert not proc_dir_scratch.exists(), (
+            "adapters/procedural/ must be removed after restore when absent from the bundle"
+        )
+        pruned_map = {e["name"]: e for e in result.pruned_orphans}
+        assert "procedural" in pruned_map, (
+            f"pruned_orphans must contain an entry for 'procedural'; got {list(pruned_map)}"
+        )
+        assert pruned_map["procedural"]["kind"] == "main", (
+            "pruned 'procedural' entry must carry kind='main'; "
+            f"got {pruned_map['procedural']['kind']}"
+        )
+        assert pruned_map["procedural"]["active_keys"] == 2, (
+            "pruned 'procedural' active_keys must be 2; "
+            f"got {pruned_map['procedural']['active_keys']}"
+        )
+
+    def test_main_tier_in_bundle_survives_restore(self, tmp_path) -> None:
+        """A main tier present in the bundle is NOT pruned — its tier dir survives restore.
+
+        _make_source_store captures procedural as a main tier.  After restore into
+        a clean scratch dir, adapters/procedural/ must still be present and must
+        NOT appear in pruned_orphans.
+        """
+        bundle_slot, src = _build_bundle(tmp_path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        # procedural is in the bundle — its tier dir must exist after restore.
+        proc_dir = scratch / "adapters" / "procedural"
+        assert proc_dir.is_dir(), (
+            "adapters/procedural/ must exist after restore when procedural is in the bundle"
+        )
+        pruned_names = [e["name"] for e in result.pruned_orphans]
+        assert "procedural" not in pruned_names, (
+            "Bundle-included main tier 'procedural' must not appear in pruned_orphans"
+        )
+
+    # ----- NEW scenario 4: within-tier stale slot cleanup --------------------
+
+    def test_within_tier_stale_slot_removed(self, tmp_path) -> None:
+        """A stale slot inside a tier that IS in the bundle is removed by the clean-slate sweep.
+
+        Scenario: procedural is in the bundle.  Before calling restore, we plant a
+        stale old slot dir (STALE_SLOT) inside adapters/procedural/.  After restore:
+        - adapters/procedural/ still exists (tier is in the bundle).
+        - The freshly-written slot exists.
+        - The stale old slot is GONE.
+        - The stale slot does NOT appear in pruned_orphans (it is within-tier hygiene,
+          not an orphan adapter).
+        """
+        bundle_slot, src = _build_bundle(tmp_path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        # First restore: populate scratch so we have a base state.
+        restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        # Plant a stale slot in the procedural tier.
+        proc_dir = scratch / "adapters" / "procedural"
+        assert proc_dir.is_dir(), "procedural tier must exist after first restore"
+        stale_slot = proc_dir / "20220101-000000"
+        stale_slot.mkdir()
+        (stale_slot / "meta.json").write_bytes(b'{"schema_version": 4, "registry_sha256": "old"}')
+        (stale_slot / "adapter_model.safetensors").write_bytes(b"stale_weights")
+        (stale_slot / "adapter_config.json").write_bytes(b'{"peft_type": "LORA"}')
+        assert stale_slot.is_dir(), "Stale slot must exist before second restore"
+
+        # Second restore.
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        # The stale slot must be gone.
+        assert not stale_slot.exists(), (
+            "Stale slot in a bundle-included tier must be removed by the clean-slate sweep"
+        )
+        # procedural tier dir still exists.
+        assert proc_dir.is_dir(), "procedural tier dir must survive restore"
+        # Not listed in pruned_orphans — within-tier hygiene is not adapter-level.
+        pruned_names = [e["name"] for e in result.pruned_orphans]
+        assert "procedural" not in pruned_names, (
+            "Stale slot cleanup inside a bundle tier must NOT appear in pruned_orphans"
+        )
+
+    # ----- NEW scenario 5: episodic-as-interim --------------------------------
+
+    def test_episodic_as_interim_stale_main_registry_removed(self, tmp_path) -> None:
+        """Episodic-as-interim: stale main slot + main registry removed; interim family kept.
+
+        The bundle captures episodic_interim_<stamp> but NO finalized episodic main.
+        The scratch dir has a stale main-episodic slot + main indexed_key_registry.json
+        under adapters/episodic/.
+
+        After restore:
+        - adapters/episodic/ still exists (it hosts the bundle's interim family).
+        - The restored interim_<stamp>/ family is present.
+        - The stale main episodic slot dir is GONE.
+        - The stale adapters/episodic/indexed_key_registry.json is GONE.
+
+        This is the critical edge that prevents a stale main-episodic from being
+        mounted at boot after an episodic-as-interim restore.
+        """
+        import json as _json
+
+        # Build a bundle from _make_source_store: captures episodic_interim_20260517T1200
+        # (no main episodic) + procedural.
+        bundle_slot, src = _build_bundle(tmp_path)
+
+        # Build scratch: plant a stale main-episodic slot + registry.
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        ep_dir = scratch / "adapters" / "episodic"
+        ep_dir.mkdir(parents=True)
+
+        # Stale main-episodic slot dir (looks like a finalized slot).
+        stale_main_slot = ep_dir / "20200101-000000"
+        stale_main_slot.mkdir()
+        (stale_main_slot / "meta.json").write_bytes(
+            b'{"schema_version": 4, "registry_sha256": "stale_ep"}'
+        )
+        (stale_main_slot / "adapter_model.safetensors").write_bytes(b"stale_ep_weights")
+        (stale_main_slot / "adapter_config.json").write_bytes(b'{"peft_type": "LORA"}')
+
+        # Stale main-episodic tier-level registry.
+        stale_main_reg = ep_dir / "indexed_key_registry.json"
+        stale_main_reg.write_bytes(
+            _json.dumps(
+                {
+                    "active_keys": ["ep_stale_key"],
+                    "fidelity_history": {},
+                    "health": None,
+                    "stale": {},
+                    "simhash": {},
+                }
+            ).encode("utf-8")
+        )
+
+        assert stale_main_slot.is_dir(), "Stale main episodic slot must exist before restore"
+        assert stale_main_reg.exists(), "Stale main episodic registry must exist before restore"
+
+        # Restore: bundle has episodic_interim_20260517T1200 (no main episodic).
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        # adapters/episodic/ must still exist (hosts the interim family).
+        assert ep_dir.is_dir(), "adapters/episodic/ must exist after restore (hosts interims)"
+
+        # The interim family must be present.
+        interim_dir = ep_dir / "interim_20260517T1200"
+        assert interim_dir.is_dir(), "Restored interim family must be present under episodic/"
+
+        # The stale main-episodic slot must be gone.
+        assert not stale_main_slot.exists(), (
+            "Stale main-episodic slot must be removed when bundle has no finalized episodic"
+        )
+
+        # The stale main-episodic tier registry must be gone.
+        assert not stale_main_reg.exists(), (
+            "Stale adapters/episodic/indexed_key_registry.json must be removed "
+            "when bundle has episodic_interim_* but no finalized main episodic — "
+            "otherwise boot would mount a stale main-episodic"
+        )
+
+        # Episodic is not in pruned_orphans as an orphan main tier (the tier dir survives).
+        pruned_names = [e["name"] for e in result.pruned_orphans]
+        assert "episodic" not in pruned_names, (
+            "episodic tier dir survives (it hosts interims); must not appear in pruned_orphans"
+        )
+
+    # ----- NEW scenario 6: total-tree assertion ------------------------------
+
+    def test_post_session_queue_survives_restore(self, tmp_path) -> None:
+        """adapters/post_session_queue.json is NOT deleted by the clean-slate sweep.
+
+        This file is a durable, restart-replayed infra file (listed in
+        infra_paths()) that lives at the adapters root.  It is NOT captured by
+        the step-4 safety bundle, so the sweep must skip it — deleting it would
+        be irreversible data loss of queued sessions.
+
+        Guards fix B1.
+        """
+        bundle_slot, src = _build_bundle(tmp_path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        # Plant a post_session_queue.json at adapters/ root before restore.
+        adapters_root = scratch / "adapters"
+        adapters_root.mkdir(parents=True, exist_ok=True)
+        queue_path = adapters_root / "post_session_queue.json"
+        queue_content = b'[{"session_id": "abc123", "speaker_id": "spk1"}]'
+        queue_path.write_bytes(queue_content)
+
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        assert isinstance(result, RestoreResult)
+        assert queue_path.exists(), (
+            "adapters/post_session_queue.json must NOT be deleted by restore_bundle sweep; "
+            "it is a durable infra file not captured by the safety bundle"
+        )
+        assert queue_path.read_bytes() == queue_content, (
+            "post_session_queue.json bytes must be unmodified after restore"
+        )
+
+    def test_combined_main_and_interim_same_tier(self, tmp_path) -> None:
+        """Tier with both a finalized main slot AND a bundle interim family: both survive.
+
+        This exercises the branch where keep_main=True AND interims_here is non-empty
+        simultaneously — the tier-child loop must skip the main slot AND recurse into
+        the interim family in the same tier pass.
+
+        Setup (bundle source):
+        - episodic: finalized main slot + an interim family (episodic_interim_20260517T1200).
+        - procedural: finalized main slot.
+
+        On disk before the second restore (in scratch), also plant:
+        - A stale old main slot under episodic/ (e.g. 20200101-000000).
+        - A stale orphan interim under episodic/ (interim_99999T0000).
+        - A scratch file at the episodic tier root.
+
+        After restore:
+        - adapters/episodic/ still contains exactly: the freshly-written main slot +
+          indexed_key_registry.json + the restored interim family.
+        - The stale old main slot is GONE.
+        - The orphan interim is GONE (in pruned_orphans).
+        - The scratch file is GONE.
+        - The bundle interim family (interim_20260517T1200) survives with only its
+          new slot + registry inside (no stale children).
+        """
+        import json as _json
+
+        # Build a source that has BOTH a finalized episodic main slot AND an interim.
+        src = tmp_path / "combined_src"
+        src.mkdir()
+        config_path_src = src / "server.yaml"
+        config_path_src.write_bytes(b"model: mistral\nport: 8420\n")
+
+        registry_dir = src / "registry"
+        registry_dir.mkdir()
+        registry_path_src = registry_dir / "key_metadata.json"
+        registry_path_src.write_bytes(b'{"speakers": {}, "cycles": []}')
+
+        speaker_profiles_src = src / "speaker_profiles.json"
+        speaker_profiles_src.write_bytes(b'{"profiles": []}')
+
+        adapters_base_src = src / "adapters"
+
+        # Episodic: finalized main slot
+        ep_main_content = b'{"keys": {"ep_main_key": 1}}'
+        ep_main_hash = _sha256(ep_main_content)
+        ep_dir = adapters_base_src / "episodic"
+        ep_dir.mkdir(parents=True)
+        _make_adapter_slot(
+            ep_dir,
+            "20260520-090000",
+            ep_main_hash,
+            adapter_name="episodic",
+            weight_bytes=b"ep_main_weights",
+        )
+        (ep_dir / "indexed_key_registry.json").write_bytes(ep_main_content)
+
+        # Episodic: also has an interim family
+        ep_interim_content = b'{"keys": {"ep_interim_key": "val"}}'
+        ep_interim_hash = _sha256(ep_interim_content)
+        interim_family_dir = ep_dir / "interim_20260517T1200"
+        interim_family_dir.mkdir()
+        _make_adapter_slot(
+            interim_family_dir,
+            "20260517-180430",
+            ep_interim_hash,
+            adapter_name="episodic_interim_20260517T1200",
+            weight_bytes=b"ep_interim_weights",
+        )
+        (interim_family_dir / "indexed_key_registry.json").write_bytes(ep_interim_content)
+
+        # Procedural: finalized main slot
+        proc_content = b'{"keys": {"proc_key": 1}}'
+        proc_hash = _sha256(proc_content)
+        proc_dir = adapters_base_src / "procedural"
+        proc_dir.mkdir(parents=True)
+        _make_adapter_slot(proc_dir, "20260520-100000", proc_hash, adapter_name="procedural")
+        (proc_dir / "indexed_key_registry.json").write_bytes(proc_content)
+
+        bundle_base = src / "backups" / "snapshot"
+        bundle_base.mkdir(parents=True)
+
+        bundle_slot = write_bundle(
+            config_path=config_path_src,
+            registry_path=registry_path_src,
+            adapter_dirs={"episodic": ep_dir, "procedural": proc_dir},
+            base_dir=bundle_base,
+            meta_fields={"tier": "manual", "label": "combined-test"},
+            adapter_scope="live",
+            speaker_profiles_path=speaker_profiles_src,
+        )
+
+        # Build a scratch dir that has stale content to exercise the sweep.
+        scratch = tmp_path / "scratch_combined"
+        scratch.mkdir()
+        config_path_scratch = scratch / "server.yaml"
+        config_path_scratch.write_bytes(b"model: mistral\n")
+
+        ep_dir_scratch = scratch / "adapters" / "episodic"
+        ep_dir_scratch.mkdir(parents=True)
+
+        # Plant a stale old main slot.
+        stale_main = ep_dir_scratch / "20200101-000000"
+        stale_main.mkdir()
+        (stale_main / "meta.json").write_bytes(
+            b'{"schema_version": 4, "registry_sha256": "old_ep"}'
+        )
+        (stale_main / "adapter_model.safetensors").write_bytes(b"stale_ep_weights")
+        (stale_main / "adapter_config.json").write_bytes(b'{"peft_type": "LORA"}')
+
+        # Plant an orphan interim family (not in the bundle).
+        orphan_interim = ep_dir_scratch / "interim_99999T0000"
+        orphan_interim.mkdir()
+        (orphan_interim / "indexed_key_registry.json").write_bytes(
+            _json.dumps(
+                {
+                    "active_keys": ["orphan_key"],
+                    "fidelity_history": {},
+                    "health": None,
+                    "stale": {},
+                    "simhash": {},
+                }
+            ).encode("utf-8")
+        )
+        orphan_slot = orphan_interim / "20260614-120000"
+        orphan_slot.mkdir()
+        (orphan_slot / "adapter_model.safetensors").write_bytes(b"orphan_weights")
+
+        # Plant a stale interim family with an extra stale child inside — the
+        # bundle's interim_20260517T1200 family should survive with cleanup inside.
+        ep_interim_scratch = ep_dir_scratch / "interim_20260517T1200"
+        ep_interim_scratch.mkdir()
+        stale_inner_slot = ep_interim_scratch / "20200601-000000"
+        stale_inner_slot.mkdir()
+        (stale_inner_slot / "meta.json").write_bytes(b'{"schema_version": 4}')
+
+        # Plant a scratch file at the tier root.
+        scratch_file = ep_dir_scratch / "scratch_debug.json"
+        scratch_file.write_bytes(b'{"debug": true}')
+
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path_scratch)
+
+        # The episodic tier dir must survive (both main + interim in bundle).
+        assert ep_dir_scratch.is_dir(), "adapters/episodic/ must survive restore"
+
+        # The freshly-written main slot must be present.
+        from paramem.adapters.manifest import find_live_slot
+
+        ep_reg = (ep_dir_scratch / "indexed_key_registry.json").read_bytes()
+        ep_live = find_live_slot(ep_dir_scratch, _sha256(ep_reg))
+        assert ep_live is not None, "find_live_slot must resolve the restored episodic main slot"
+        assert ep_live.is_dir()
+
+        # The bundle interim family must be present.
+        interim_dir = ep_dir_scratch / "interim_20260517T1200"
+        assert interim_dir.is_dir(), "Bundle interim family must survive restore"
+        assert (interim_dir / "indexed_key_registry.json").exists(), (
+            "Interim family's indexed_key_registry.json must be present after restore"
+        )
+
+        # The stale old main slot must be gone.
+        assert not stale_main.exists(), "Stale main episodic slot must be removed by sweep"
+
+        # The orphan interim must be gone and appear in pruned_orphans.
+        assert not orphan_interim.exists(), "Orphan interim family must be removed by sweep"
+        pruned_names = {e["name"]: e for e in result.pruned_orphans}
+        assert "episodic_interim_99999T0000" in pruned_names, (
+            f"Orphan interim must appear in pruned_orphans; got {list(pruned_names)}"
+        )
+        assert pruned_names["episodic_interim_99999T0000"]["kind"] == "interim"
+
+        # The scratch file at the tier root must be gone.
+        assert not scratch_file.exists(), "Scratch file at episodic tier root must be removed"
+
+        # The stale inner slot inside the bundle interim family must be gone.
+        assert not stale_inner_slot.exists(), (
+            "Stale inner slot inside bundle interim family must be removed by sweep"
+        )
+
+        # episodic must NOT appear in pruned_orphans (the tier dir survived).
+        assert "episodic" not in pruned_names, (
+            "episodic tier dir survives; must not appear in pruned_orphans"
+        )
+
+    def test_total_tree_equals_bundle_set(self, tmp_path) -> None:
+        """After restore, the set of top-level entries under adapters/ equals the bundle set.
+
+        _make_source_store produces a bundle with:
+        - procedural (finalized main) → adapters/procedural/
+        - episodic_interim_20260517T1200 → adapters/episodic/  (interim host)
+
+        So after restore the top-level entries under adapters/ must be exactly
+        {"episodic", "procedural"} — no more, no less.
+
+        We plant an extra stale tier ("semantic") and a legacy flat dir
+        ("episodic_interim_LEGACY") in scratch before restore to exercise the sweep.
+        """
+        import json as _json
+
+        bundle_slot, src = _build_bundle(tmp_path)
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        config_path = scratch / "server.yaml"
+        config_path.write_bytes(b"model: mistral\n")
+
+        # Plant orphan semantic tier.
+        sem_dir = scratch / "adapters" / "semantic"
+        sem_dir.mkdir(parents=True)
+        (sem_dir / "indexed_key_registry.json").write_bytes(
+            _json.dumps(
+                {
+                    "active_keys": ["sem_key"],
+                    "fidelity_history": {},
+                    "health": None,
+                    "stale": {},
+                    "simhash": {},
+                }
+            ).encode("utf-8")
+        )
+        sem_slot = sem_dir / "20200101-000000"
+        sem_slot.mkdir()
+        _make_adapter_slot(sem_dir, "20200101-000000", _sha256(b"{}"), adapter_name="semantic")
+
+        # Plant a legacy flat dir at the adapters/ root (pre-hierarchy-refactor layout).
+        legacy_flat = scratch / "adapters" / "episodic_interim_LEGACY"
+        legacy_flat.mkdir(parents=True)
+        (legacy_flat / "indexed_key_registry.json").write_bytes(b'{"active_keys": []}')
+
+        assert sem_dir.is_dir()
+        assert legacy_flat.is_dir()
+
+        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
+
+        adapters_base = scratch / "adapters"
+        top_level_names = {p.name for p in adapters_base.iterdir() if not p.name.startswith(".")}
+        # Exactly {episodic, procedural} — semantic and legacy flat are gone.
+        assert top_level_names == {"episodic", "procedural"}, (
+            f"Top-level entries under adapters/ must equal exactly the bundle set "
+            f"{{episodic, procedural}}; got {top_level_names}"
+        )
+        # semantic is in pruned_orphans (orphan main tier).
+        pruned_names = {e["name"] for e in result.pruned_orphans}
+        assert "semantic" in pruned_names, "Orphan 'semantic' tier must appear in pruned_orphans"
+        # Legacy flat dir is NOT reported as a named adapter in pruned_orphans
+        # (it is not a recognised adapter family — logged only).
+        assert legacy_flat.name not in pruned_names, (
+            "Legacy flat top-level dir must NOT appear in pruned_orphans (not a named adapter)"
+        )

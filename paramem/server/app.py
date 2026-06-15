@@ -10263,6 +10263,13 @@ class BackupRestoreResponse(BaseModel):
     restored_adapters:
         List of adapter names restored from the bundle.  Empty for
         ``config``-kind restores.
+    pruned_orphans:
+        Orphan adapters removed by the clean-slate sweep during restore: whole
+        main tiers and interim families that were on disk but absent from the
+        bundle's recovery set.  Each entry carries
+        ``{"name": <adapter_name>, "kind": "interim"|"main", "active_keys": <int>}``.
+        Routine within-tier stale-slot cleanup is logged but not listed here.
+        Empty when no orphan adapters were pruned.
     """
 
     restored: dict[str, str]
@@ -10270,6 +10277,7 @@ class BackupRestoreResponse(BaseModel):
     restart_required: bool = True
     restart_hint: str
     restored_adapters: list[str] = []
+    pruned_orphans: list[dict] = []
 
 
 class BackupPruneRequest(BaseModel):
@@ -10811,6 +10819,13 @@ async def backup_restore(req: BackupRestoreRequest):
             f"Restored snapshot_bundle from backup {req.backup_id} — "
             "restart server to re-mount adapters from restored slots."
         )
+        if result.pruned_orphans:
+            _state["migration"]["recovery_required"].append(
+                f"Pruned {len(result.pruned_orphans)} orphan interim adapter "
+                f"families during restore: "
+                + ", ".join(e["name"] for e in result.pruned_orphans)
+                + f" — safety bundle at {safety_slot_str} can restore them if needed."
+            )
 
         return BackupRestoreResponse(
             restored=restored_map,
@@ -10818,6 +10833,7 @@ async def backup_restore(req: BackupRestoreRequest):
             restart_required=True,
             restart_hint="systemctl --user restart paramem-server",
             restored_adapters=result.restored_adapters,
+            pruned_orphans=result.pruned_orphans,
         )
 
     # -------------------------------------------------------------------------

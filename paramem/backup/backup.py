@@ -1304,6 +1304,14 @@ def restore_bundle(
        graceful (no half-restored live set).  The safety bundle is the
        documented rollback target when the operator wants to undo.
 
+    5e. **Clean-slate sweep** (after 5d, inside the step-5 try): make
+        ``data_dir/adapters/`` contain EXACTLY the bundle's adapters.  Removes
+        orphan main tiers (whole tier absent from bundle), orphan interim
+        families, stale slot dirs inside kept tiers, stale registries in
+        episodic-as-interim tiers, and legacy top-level entries.  Orphan
+        adapter removals are recorded in ``RestoreResult.pruned_orphans``;
+        within-tier stale-slot cleanup is logged at INFO/DEBUG.
+
     6. Return :class:`RestoreResult` with ``restart_required=True`` — no hot
        VRAM swap (8 GB; mounted adapters are stale until restart).
 
@@ -1346,7 +1354,12 @@ def restore_bundle(
         On any filesystem error during the restore write phase.  The safety
         bundle path is preserved; the operator should restore from it.
     """
-    from paramem.memory.interim_adapter import adapter_slot_root_for_name
+    from paramem.memory.interim_adapter import (  # noqa: PLC0415
+        INTERIM_NAME_PREFIX as _INTERIM_NAME_PREFIX,
+    )
+    from paramem.memory.interim_adapter import (  # noqa: PLC0415
+        adapter_slot_root_for_name,
+    )
 
     bundle_slot_dir = Path(bundle_slot_dir)
     data_dir = Path(data_dir)
@@ -1478,6 +1491,16 @@ def restore_bundle(
 
     restored_adapters: list[str] = []
     restored_config = False
+    pruned_orphans: list[dict] = []
+
+    # Tracks precisely what step 5a writes so the sweep can keep only those
+    # paths and remove everything else.
+    #
+    # restored_main_slots: tier name → new slot dir (for main-tier adapters:
+    #     episodic / semantic / procedural that are finalized in the bundle).
+    # restored_interim_slots: interim adapter name → (interim_family_dir, new_slot_dir).
+    restored_main_slots: dict[str, Path] = {}
+    restored_interim_slots: dict[str, tuple[Path, Path]] = {}
 
     try:
         # 5a. Adapter slots — each gets a NEW timestamped dir (not the bundle's ts)
@@ -1548,6 +1571,14 @@ def restore_bundle(
                 dst = tier_root / fname
                 _atomic_write_file(src_bytes, dst)
 
+            # Record the new slot dir for the clean-slate sweep (part A).
+            if adapter_name.startswith(_INTERIM_NAME_PREFIX):
+                # Interim adapters: tier_root IS the interim family dir
+                # (adapter_slot_root_for_name returns <adapters>/episodic/interim_<stamp>/).
+                restored_interim_slots[adapter_name] = (tier_root, new_slot_dir)
+            else:
+                restored_main_slots[adapter_name] = new_slot_dir
+
             logger.debug(
                 "restore_bundle: adapter %r restored to new slot %s", adapter_name, new_slot_dir
             )
@@ -1607,6 +1638,245 @@ def restore_bundle(
                 "restore_bundle: key_metadata.json written (registry-last invariant satisfied)"
             )
 
+        # 5e. Clean-slate sweep — make adapters/ contain EXACTLY the bundle set.
+        #
+        # Placement: AFTER the registry-last swap (5d).  A crash BEFORE the registry
+        # swap must leave the fully-old graceful state — this sweep must not have run
+        # yet (preserves the registry-last invariant documented at backup.py:1466-1473).
+        # After the swap, the new registry references only bundle adapters, so removing
+        # stale on-disk content cannot create a registry-references-missing-slot
+        # inconsistency.
+        #
+        # The sweep makes <data_dir>/adapters/ exactly equal to the restored set by:
+        #  1. Removing whole main tiers absent from the bundle (orphan main tiers).
+        #     Reported in pruned_orphans (adapter-level: "kind"="main").
+        #  2. Removing orphan interim families not in the bundle.
+        #     Reported in pruned_orphans (adapter-level: "kind"="interim").
+        #  3. Within each kept tier: removing all children except the freshly-written
+        #     slot dir (from step 5a), the tier-level indexed_key_registry.json, and
+        #     restored interim family dirs.  This removes stale old slot dirs,
+        #     in_training/bg_checkpoint/checkpoint-* scratch, stale registries, and
+        #     stale simhash sidecars.  Logged at INFO/DEBUG — not in pruned_orphans.
+        #  4. Within each kept interim family: removing all children except the new
+        #     slot dir and indexed_key_registry.json.
+        #  5. Removing any other top-level entry under adapters/ (legacy flat
+        #     episodic_interim_* dirs at the adapters root, stray files), EXCEPT
+        #     durable infra files at the adapters root (e.g. post_session_queue.json).
+        #
+        # Critical: never delete a slot that step 5a just wrote — every rmtree/unlink
+        # is guarded against the tracked paths in restored_main_slots /
+        # restored_interim_slots.
+        #
+        # pruned_orphans records only ADAPTER-LEVEL removals (whole orphan tiers /
+        # orphan interim families absent from the bundle).  Routine within-tier stale-
+        # slot hygiene is logged at INFO/DEBUG but NOT listed in pruned_orphans.
+        #
+        # The step-4 safety bundle captures the tier set (episodic/semantic/procedural
+        # + their registries + speaker_profiles), so tier-level restore is reversible.
+        # Scratch dirs and re-creatable state are not captured by the safety bundle.
+        from paramem.backup.encryption import infra_paths  # noqa: PLC0415
+        from paramem.training.key_registry import KeyRegistry  # noqa: PLC0415 — local import guard
+
+        # Infra files that live directly at the adapters root — these are durable,
+        # restart-replayed files that must never be removed by the sweep.
+        # post_session_queue.json is the canonical example: it is NOT captured by
+        # the step-4 safety bundle, so deleting it is irreversible data loss.
+        # Reuse infra_paths() — single source of truth; future additions are
+        # auto-protected without touching this code.
+        adapters_root_infra = {p for p in infra_paths(data_dir) if p.parent == adapters_base}
+
+        def _count_active_keys(reg_path: Path) -> int:
+            """Return active key count from *reg_path*; 0 on any error.
+
+            The except clause is intentional boundary handling: a corrupt or
+            missing registry must not abort the restore.
+            """
+            try:
+                if reg_path.exists():
+                    reg = KeyRegistry.load(reg_path)
+                    return len(reg.list_active())
+            except Exception:  # noqa: BLE001 — count failure must not abort restore
+                pass
+            return 0
+
+        # Precompute per-tier interim families that belong to the bundle so that
+        # the tier-level sweep below can identify which interim_* dirs to keep.
+        # Maps tier_name → set of kept interim family dirs.
+        _kept_interim_family_dirs: dict[str, set[Path]] = {}
+        for _iname, (_ifam, _islot) in restored_interim_slots.items():
+            # _ifam is e.g. <adapters>/episodic/interim_<stamp>/
+            _tier_name = _ifam.parent.name  # "episodic"
+            _kept_interim_family_dirs.setdefault(_tier_name, set()).add(_ifam)
+
+        if adapters_base.is_dir():
+            for top_entry in list(adapters_base.iterdir()):
+                if top_entry.name.startswith("."):
+                    continue  # skip .pending and other hidden entries
+
+                if top_entry.name in ("episodic", "semantic", "procedural"):
+                    tier = top_entry.name
+                    tier_dir = top_entry
+                    keep_main = tier in restored_main_slots
+                    interims_here = _kept_interim_family_dirs.get(tier, set())
+
+                    if not keep_main and not interims_here:
+                        # Whole tier is absent from the bundle — orphan main tier.
+                        active_keys = _count_active_keys(tier_dir / "indexed_key_registry.json")
+                        shutil.rmtree(tier_dir)
+                        pruned_orphans.append(
+                            {"name": tier, "kind": "main", "active_keys": active_keys}
+                        )
+                        logger.warning(
+                            "restore_bundle: pruned orphan main tier %r "
+                            "(kind=main, %d active keys) "
+                            "— not present in bundle recovery set. "
+                            "Safety bundle at %s can restore it if needed.",
+                            tier,
+                            active_keys,
+                            safety_slot,
+                        )
+                        continue
+
+                    # Tier dir is kept (has finalized main weights OR hosts bundle interims).
+                    # Clean its children to exactly: kept main slot dir (if keep_main) +
+                    # indexed_key_registry.json (if keep_main) + restored interim family dirs.
+                    # Everything else (stale slot dirs, scratch dirs, orphan interim families,
+                    # stale registries/simhash sidecars) is removed.
+                    kept_main_slot = restored_main_slots.get(tier)
+
+                    for child in list(tier_dir.iterdir()):
+                        if child.name.startswith("."):
+                            continue  # skip .pending
+
+                        # A restored interim family dir is always kept.
+                        if child in interims_here:
+                            # Recurse one level into the interim family: keep only its
+                            # new slot dir and indexed_key_registry.json; remove everything
+                            # else (stale slots, scratch, stale registry).
+                            _islot_for_fam = next(
+                                slot
+                                for (_ifam2, slot) in restored_interim_slots.values()
+                                if _ifam2 == child
+                            )
+                            for fam_child in list(child.iterdir()):
+                                if fam_child.name.startswith("."):
+                                    continue
+                                if fam_child == _islot_for_fam:
+                                    continue  # the freshly-written slot: keep
+                                if fam_child.name == "indexed_key_registry.json":
+                                    continue  # freshly-written registry: keep
+                                if fam_child.is_dir():
+                                    logger.info(
+                                        "restore_bundle: removing stale child %s "
+                                        "from restored interim family %s",
+                                        fam_child.name,
+                                        child.name,
+                                    )
+                                    shutil.rmtree(fam_child)
+                                else:
+                                    logger.info(
+                                        "restore_bundle: removing stale file %s "
+                                        "from restored interim family %s",
+                                        fam_child.name,
+                                        child.name,
+                                    )
+                                    fam_child.unlink()
+                            continue  # done with this interim family
+
+                        # Orphan interim family: in the tier dir but not in the bundle.
+                        if child.name.startswith("interim_") and child.is_dir():
+                            # Derive the adapter name for this interim family using
+                            # the current tier name — interims only exist under episodic/
+                            # today, but deriving from tier makes this robust if a future
+                            # tier hosts interim families.
+                            _orphan_stamp = child.name[len("interim_") :]
+                            _orphan_iname = f"{tier}_interim_{_orphan_stamp}"
+                            active_keys = _count_active_keys(child / "indexed_key_registry.json")
+                            shutil.rmtree(child)
+                            pruned_orphans.append(
+                                {
+                                    "name": _orphan_iname,
+                                    "kind": "interim",
+                                    "active_keys": active_keys,
+                                }
+                            )
+                            logger.warning(
+                                "restore_bundle: pruned orphan interim %r "
+                                "(kind=interim, %d active keys) "
+                                "— not present in bundle recovery set. "
+                                "Safety bundle at %s can restore it if needed.",
+                                _orphan_iname,
+                                active_keys,
+                                safety_slot,
+                            )
+                            continue
+
+                        # indexed_key_registry.json at the tier root is kept
+                        # ONLY when this tier has a finalized main adapter in the bundle
+                        # (keep_main=True).  When keep_main is False (episodic-as-interim
+                        # case: bundle has episodic_interim_* but no main episodic), a
+                        # stale tier-level registry must be removed — otherwise it would
+                        # be mounted as a stale main-episodic at boot.
+                        if child.name == "indexed_key_registry.json" and not child.is_dir():
+                            if keep_main:
+                                continue  # freshly-written tier registry: keep
+                            # Episodic-as-interim: stale main registry — remove.
+                            logger.info(
+                                "restore_bundle: removing stale main-tier registry %s "
+                                "(tier %r has no finalized main adapter in bundle)",
+                                child,
+                                tier,
+                            )
+                            child.unlink()
+                            continue
+
+                        # Freshly-written main slot: keep.
+                        if keep_main and child == kept_main_slot:
+                            continue
+
+                        # Everything else in the tier dir is stale:
+                        # old slot dirs, in_training/, bg_checkpoint/, checkpoint-* scratch,
+                        # stale simhash sidecars, or any other leftover file.
+                        if child.is_dir():
+                            logger.info(
+                                "restore_bundle: removing stale tier child %s/%s",
+                                tier,
+                                child.name,
+                            )
+                            shutil.rmtree(child)
+                        else:
+                            logger.info(
+                                "restore_bundle: removing stale tier file %s/%s",
+                                tier,
+                                child.name,
+                            )
+                            child.unlink()
+
+                else:
+                    # Top-level entry under adapters/ that is not a recognised main tier.
+                    # This covers legacy flat episodic_interim_* dirs (pre-hierarchy-refactor
+                    # layout) and stray files.  Remove unconditionally — the bundle never
+                    # captures these paths and they must not be mounted at boot.
+                    #
+                    # Exception: durable infra files at the adapters root
+                    # (e.g. post_session_queue.json) are restart-replayed and are NOT
+                    # captured by the step-4 safety bundle.  Skip them — deleting them
+                    # would be irreversible data loss of queued sessions.
+                    if top_entry in adapters_root_infra:
+                        continue
+                    if top_entry.is_dir():
+                        logger.info(
+                            "restore_bundle: removing legacy/stray top-level entry adapters/%s",
+                            top_entry.name,
+                        )
+                        shutil.rmtree(top_entry)
+                    else:
+                        logger.info(
+                            "restore_bundle: removing stray file adapters/%s",
+                            top_entry.name,
+                        )
+                        top_entry.unlink()
+
     except Exception as _step5_exc:
         # S3: wrap in RestoreAbortedError so callers (e.g. the /backup/restore
         # HTTP handler) can surface the safety_slot path in the error response.
@@ -1643,4 +1913,5 @@ def restore_bundle(
         safety_slot=safety_slot,
         restart_required=True,
         restored_config=restored_config,
+        pruned_orphans=pruned_orphans,
     )
