@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 if TYPE_CHECKING:
     from paramem.server.user_tokens import UserTokenStore
@@ -1145,6 +1145,23 @@ def _revalidate_main_adapter_manifests(state: dict) -> None:
             _compute_tier_registry_sha256(config, name),
             manifest_status,
         )
+
+
+def _dispatch_finalize(finalize: Callable[[], None]) -> None:
+    """Run a consolidation-finalize closure on the asyncio event loop.
+
+    The post-consolidation state mutations (`_state["last_consolidation*"]`,
+    the router reload, and clearing `_state["consolidating"]`) must be visible
+    to /chat handlers atomically with the consolidating-flag clear. They run on
+    the BG-trainer worker thread, so when the event loop is live we hand the
+    closure to it via `call_soon_threadsafe`; otherwise (no loop / tests) we
+    invoke it inline on the current thread.
+    """
+    aio_loop = _state.get("event_loop")
+    if aio_loop is not None and aio_loop.is_running():
+        aio_loop.call_soon_threadsafe(finalize)
+    else:
+        finalize()
 
 
 def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
@@ -12265,11 +12282,7 @@ def _extract_and_start_training():
             }
             _state["consolidating"] = False
 
-        aio_loop = _state.get("event_loop")
-        if aio_loop is not None and aio_loop.is_running():
-            aio_loop.call_soon_threadsafe(_finalize_no_facts)
-        else:
-            _finalize_no_facts()
+        _dispatch_finalize(_finalize_no_facts)
         return
 
     # --- Simulate mode: peer storage backend ---
@@ -12347,11 +12360,7 @@ def _extract_and_start_training():
                 len(all_procedural_rels),
             )
 
-        aio_loop = _state.get("event_loop")
-        if aio_loop is not None and aio_loop.is_running():
-            aio_loop.call_soon_threadsafe(_finalize_simulate)
-        else:
-            _finalize_simulate()
+        _dispatch_finalize(_finalize_simulate)
         return
 
     # --- Phase 2 + 3: Train into a fresh interim slot via the BG trainer ---
@@ -12484,11 +12493,7 @@ def _extract_and_start_training():
                 total_keys,
             )
 
-        aio_loop = _state.get("event_loop")
-        if aio_loop is not None and aio_loop.is_running():
-            aio_loop.call_soon_threadsafe(_finalize_interim)
-        else:
-            _finalize_interim()
+        _dispatch_finalize(_finalize_interim)
 
     bt.submit(_run_interim_training, inference_fallback_adapter="episodic")
     logger.info(
@@ -12772,11 +12777,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
             _state["consolidating"] = False
             logger.info("Full cycle bookkeeping complete — %d total keys", total_keys)
 
-        aio_loop = _state.get("event_loop")
-        if aio_loop is not None and aio_loop.is_running():
-            aio_loop.call_soon_threadsafe(_finalize_full)
-        else:
-            _finalize_full()
+        _dispatch_finalize(_finalize_full)
 
     bt.submit(_run_full_cycle, inference_fallback_adapter="episodic")
     logger.info("Full consolidation submitted to BG trainer")
@@ -12940,11 +12941,7 @@ def _run_active_store_migration_sync() -> None:
             # from disk also drops entries for slots the migration deleted.
             _state["consolidating"] = False
 
-        aio_loop = _state.get("event_loop")
-        if aio_loop is not None and aio_loop.is_running():
-            aio_loop.call_soon_threadsafe(_finalize_migration)
-        else:
-            _finalize_migration()
+        _dispatch_finalize(_finalize_migration)
 
     bt.submit(_run_migration_on_worker, inference_fallback_adapter="episodic")
     logger.info("Active-store migration submitted to BG trainer")
