@@ -203,62 +203,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ("experiments/quadruple_adapter.py", "paramem.training.trainer", "train_adapter"),
         ("experiments/quadruple_adapter.py", "paramem.utils.config", "AdapterConfig"),
         ("experiments/quadruple_adapter.py", "paramem.utils.config", "TrainingConfig"),
-        # smoke_canonicalization_live_gpu.py
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.graph.merger",
-            "GraphMerger",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.graph.name_match",
-            "canonical",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.graph.relation_prep",
-            "partition_relations",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.graph.schema",
-            "Relation",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.graph.schema",
-            "SessionGraph",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.memory.store",
-            "MemoryStore",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.models.loader",
-            "load_base_model",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.models.loader",
-            "switch_adapter",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.server.config",
-            "load_server_config",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.server.consolidation",
-            "create_consolidation_loop",
-        ),
-        (
-            "experiments/smoke_canonicalization_live_gpu.py",
-            "paramem.training.recall_eval",
-            "evaluate_indexed_recall",
-        ),
         # smoke_graph_enrichment.py
         (
             "experiments/smoke_graph_enrichment.py",
