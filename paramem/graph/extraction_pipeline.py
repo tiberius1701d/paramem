@@ -162,11 +162,19 @@ class ExtractionPipeline:
         *,
         config: ExtractionConfig | None = None,
         prompts_dir: str | Path | None = None,
+        model_name: str | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.config = config or ExtractionConfig()
         self.prompts_dir = prompts_dir
+        # Model alias for per-file prompt resolution.  When set, the prompt
+        # loader checks prompts_dir/<model_name>/<filename> before the shared
+        # prompts_dir and the default configs/prompts/ directory.  A model
+        # overrides only the files it provides; everything else inherits the
+        # shared default.  Only local-model extraction prompts are per-model;
+        # sota_* prompts are model-independent by design.
+        self.model_name = model_name
 
     def kwargs(self, *, source_type: str = "transcript", **overrides) -> dict:
         """Build the kwarg dict passed into :func:`extract_graph`.
@@ -222,6 +230,10 @@ class ExtractionPipeline:
             max_tokens=cfg.max_tokens,
             plausibility_max_tokens=cfg.plausibility_max_tokens,
             prompts_dir=self.prompts_dir,
+            # model_alias drives per-file prompt resolution in extract_graph /
+            # extract_procedural_graph.  sota_* prompts are model-independent
+            # by design and ignore this value.
+            model_alias=self.model_name,
             ha_context=overrides.get("ha_context"),
             stt_correction=pick("stt_correction", stt_correction_default),
             ha_validation=pick("ha_validation", ha_validation_default),
@@ -315,6 +327,8 @@ class ExtractionPipeline:
         call_kwargs = dict(
             max_tokens=cfg.max_tokens,
             prompts_dir=self.prompts_dir,
+            # model_alias drives per-file prompt resolution — see kwargs() comment.
+            model_alias=self.model_name,
             stt_correction=stt,
             speaker_name=speaker_name,
             speaker_id=speaker_id,

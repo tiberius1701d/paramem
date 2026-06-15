@@ -237,6 +237,7 @@ def test_factory_threads_every_config_knob(
 
     # --- Misc knobs ---
     assert captured["prompts_dir"] == cfg.prompts_dir
+    assert captured["model_name"] == cfg.model_name
     assert captured["state_provider"] is None
     assert captured["extraction_temperature"] == 0.0
     assert captured["keep_prior_slots"] == cfg.consolidation.training_keep_prior_slots
@@ -326,3 +327,84 @@ def test_factory_simulate_mode_does_not_seed_cache(tmp_path, monkeypatch):
     loop_instance.seed_episodic_cache.assert_not_called()
     loop_instance.seed_semantic_cache.assert_not_called()
     loop_instance.seed_procedural_cache.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Per-model model_name passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestFactoryModelNamePassthrough:
+    """Integration tests: factory passes model_name through to ConsolidationLoop.
+
+    Per-model prompt resolution now lives in the extraction component
+    (ExtractionPipeline / _load_prompt), not in the server bootstrap.
+    The factory's only job is to pass config.model_name to ConsolidationLoop
+    so the extraction chokepoint can do per-file resolution.
+    """
+
+    def test_qwen3_4b_model_name_threaded(self, tmp_path, monkeypatch):
+        """Factory passes config.model_name='qwen3-4b' to ConsolidationLoop."""
+        from unittest.mock import MagicMock
+
+        from paramem.memory.store import MemoryStore
+        from paramem.server import consolidation as server_consolidation
+        from paramem.server.config import load_server_config
+
+        captured = {}
+
+        def _fake_loop(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(server_consolidation, "ConsolidationLoop", _fake_loop)
+
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        cfg.paths.data = tmp_path
+        cfg.paths.debug = tmp_path / "debug"
+        cfg.model_name = "qwen3-4b"
+
+        server_consolidation.create_consolidation_loop(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=cfg,
+            memory_store=MemoryStore(replay_enabled=False),
+            seed_state_from_disk=False,
+        )
+
+        assert captured["model_name"] == "qwen3-4b"
+        # prompts_dir is the shared base (not a per-model subdir); resolution
+        # is now deferred to the extraction chokepoint.
+        assert captured["prompts_dir"] == cfg.prompts_dir
+
+    def test_mistral_model_name_threaded(self, tmp_path, monkeypatch):
+        """Factory passes config.model_name='mistral' to ConsolidationLoop."""
+        from unittest.mock import MagicMock
+
+        from paramem.memory.store import MemoryStore
+        from paramem.server import consolidation as server_consolidation
+        from paramem.server.config import load_server_config
+
+        captured = {}
+
+        def _fake_loop(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(server_consolidation, "ConsolidationLoop", _fake_loop)
+
+        cfg = load_server_config("tests/fixtures/server.yaml")
+        cfg.paths.data = tmp_path
+        cfg.paths.debug = tmp_path / "debug"
+        # model_name is already "mistral" from the fixture
+
+        server_consolidation.create_consolidation_loop(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=cfg,
+            memory_store=MemoryStore(replay_enabled=False),
+            seed_state_from_disk=False,
+        )
+
+        assert captured["model_name"] == "mistral"
+        assert captured["prompts_dir"] == cfg.prompts_dir

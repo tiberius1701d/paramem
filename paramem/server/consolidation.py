@@ -86,6 +86,7 @@ def create_consolidation_loop(
         save_cycle_snapshots=_save_cycle_snapshots,
         snapshot_dir=config.debug_dir if _save_cycle_snapshots else None,
         prompts_dir=config.prompts_dir,
+        model_name=config.model_name,
         graph_config=config.graph_config,
         graph_enrichment_enabled=config.consolidation.graph_enrichment_enabled,
         graph_enrichment_neighborhood_hops=config.consolidation.graph_enrichment_neighborhood_hops,

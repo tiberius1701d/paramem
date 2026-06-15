@@ -164,6 +164,54 @@ def test_extraction_pipeline_kwargs_match_extract_graph_signature(source_type):
     )
 
 
+def test_kwargs_emits_model_alias():
+    """ExtractionPipeline.kwargs() must emit ``model_alias`` tied to self.model_name.
+
+    Regression guard: if the ``model_alias`` key is accidentally dropped from
+    kwargs(), per-model prompt resolution silently falls back to the shared
+    default for every model — new model-specific prompt files become dead
+    config that is never loaded.
+    """
+    from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
+
+    pipeline = ExtractionPipeline(
+        model=MagicMock(),
+        tokenizer=MagicMock(),
+        config=ExtractionConfig(),
+        model_name="qwen3-4b",
+    )
+    kw = pipeline.kwargs(source_type="transcript", speaker_id="Speaker0")
+    assert "model_alias" in kw, "kwargs() must emit 'model_alias'"
+    assert kw["model_alias"] == "qwen3-4b"
+
+    # model_name=None → model_alias=None (base resolution, unchanged)
+    pipeline_base = ExtractionPipeline(
+        model=MagicMock(),
+        tokenizer=MagicMock(),
+        config=ExtractionConfig(),
+    )
+    kw_base = pipeline_base.kwargs(source_type="transcript", speaker_id="Speaker0")
+    assert kw_base["model_alias"] is None
+
+
+def test_load_extraction_prompts_per_model_resolution(tmp_path):
+    """load_extraction_prompts(..., model='qwen3-4b') picks the per-model file.
+
+    Guards the path from ExtractionPipeline.kwargs model_alias → extract_graph
+    → _generate_extraction → load_extraction_prompts → _load_prompt.
+    """
+    from paramem.graph.extractor import load_extraction_prompts
+
+    (tmp_path / "qwen3-4b").mkdir()
+    (tmp_path / "qwen3-4b" / "extraction.txt").write_text("qwen-body")
+    (tmp_path / "extraction.txt").write_text("base-body")
+    (tmp_path / "extraction_system.txt").write_text("shared-system")
+
+    system, prompt = load_extraction_prompts(tmp_path, model="qwen3-4b")
+    assert prompt == "qwen-body", "Per-model extraction.txt must be selected"
+    assert system == "shared-system", "Shared extraction_system.txt must be inherited"
+
+
 def test_procedural_kwargs_match_extract_procedural_graph_signature():
     """Same contract for the procedural chokepoint — the inline kwargs dict
     inside :meth:`ExtractionPipeline.run_procedural` must line up with the
@@ -177,6 +225,7 @@ def test_procedural_kwargs_match_extract_procedural_graph_signature():
     procedural_keys = {
         "max_tokens",
         "prompts_dir",
+        "model_alias",
         "stt_correction",
         "speaker_name",
         "speaker_id",
@@ -570,6 +619,46 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
             f"ConsolidationLoop.__init__ dropped kwarg {ctor_key!r}: "
             f"passed={expected!r}, stored on extraction.config.{field}={actual!r}"
         )
+
+
+def test_consolidation_loop_threads_model_name_to_extraction_pipeline(tmp_path):
+    """ConsolidationLoop.__init__ must store model_name on loop.extraction.model_name.
+
+    Regression guard: if the constructor drops this kwarg, per-model prompt
+    resolution silently uses None for every production server cycle.
+    """
+    from peft import PeftModel
+
+    from paramem.training.consolidation import ConsolidationLoop
+    from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+    model = MagicMock()
+    model.__class__ = PeftModel
+    model.peft_config = {
+        "episodic": MagicMock(),
+        "semantic": MagicMock(),
+        "in_training": MagicMock(),
+    }
+
+    loop = ConsolidationLoop(
+        model=model,
+        tokenizer=MagicMock(),
+        consolidation_config=ConsolidationConfig(),
+        training_config=TrainingConfig(),
+        episodic_adapter_config=AdapterConfig(),
+        semantic_adapter_config=AdapterConfig(),
+        memory_store=_MS(replay_enabled=False),
+        output_dir=tmp_path,
+        model_name="qwen3-4b",
+    )
+
+    assert loop.extraction.model_name == "qwen3-4b", (
+        "ConsolidationLoop must thread model_name into ExtractionPipeline.model_name"
+    )
+
+    # Verify model_alias flows through into kwargs() as well.
+    kw = loop.extraction.kwargs(source_type="transcript", speaker_id="Speaker0")
+    assert kw["model_alias"] == "qwen3-4b"
 
 
 def test_run_threads_positional_args_procedural(monkeypatch):

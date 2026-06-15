@@ -31,6 +31,79 @@ from paramem.graph.schema_config import (
 )
 
 
+class TestLoadPromptPerModelResolution:
+    """Unit tests for _load_prompt per-model, per-file resolution.
+
+    The search order is: prompts_dir/<model>/<filename> (if model),
+    prompts_dir/<filename>, _DEFAULT_PROMPT_DIR/<filename>, hardcoded default.
+    A model overrides only the files it provides; everything else inherits
+    the shared directory.
+    """
+
+    def test_per_model_file_wins_when_present(self, tmp_path):
+        """prompts_dir/<model>/filename is returned when it exists."""
+        (tmp_path / "qwen3-4b").mkdir()
+        (tmp_path / "qwen3-4b" / "extraction.txt").write_text("qwen-specific")
+        result = _load_prompt("extraction.txt", "default", tmp_path, model="qwen3-4b")
+        assert result == "qwen-specific"
+
+    def test_per_model_falls_back_to_base_when_file_absent(self, tmp_path):
+        """When per-model file is absent, falls back to prompts_dir/filename."""
+        (tmp_path / "qwen3-4b").mkdir()
+        # extraction.txt in qwen3-4b/ is ABSENT; extraction_system.txt is in base
+        (tmp_path / "extraction_system.txt").write_text("base-system")
+        result = _load_prompt("extraction_system.txt", "default", tmp_path, model="qwen3-4b")
+        assert result == "base-system"
+
+    def test_model_none_uses_base(self, tmp_path):
+        """model=None: only prompts_dir/ and default are searched."""
+        (tmp_path / "qwen3-4b").mkdir()
+        (tmp_path / "qwen3-4b" / "extraction.txt").write_text("qwen-specific")
+        (tmp_path / "extraction.txt").write_text("base")
+        result = _load_prompt("extraction.txt", "default", tmp_path, model=None)
+        assert result == "base"
+
+    def test_unknown_model_falls_back_to_base(self, tmp_path):
+        """A model with no subdir falls through to prompts_dir/ and then default."""
+        (tmp_path / "extraction.txt").write_text("base")
+        result = _load_prompt("extraction.txt", "default", tmp_path, model="unknown-model")
+        assert result == "base"
+
+    def test_both_model_and_base_absent_returns_hardcoded_default(self, tmp_path):
+        """When no file exists anywhere, the hardcoded default is returned."""
+        result = _load_prompt("no_such_file.txt", "hardcoded-default", tmp_path, model="qwen3-4b")
+        assert result == "hardcoded-default"
+
+    def test_qwen3_4b_extraction_txt_resolved_from_real_prompts_dir(self):
+        """Sanity: the real qwen3-4b/extraction.txt is found under _DEFAULT_PROMPT_DIR."""
+        result = _load_prompt(
+            "extraction.txt",
+            "hardcoded-default",
+            _DEFAULT_PROMPT_DIR,
+            model="qwen3-4b",
+        )
+        # The per-model file exists and differs from the base; it must be chosen.
+        base = _load_prompt("extraction.txt", "hardcoded-default", _DEFAULT_PROMPT_DIR)
+        assert result != base, (
+            "qwen3-4b/extraction.txt should differ from the shared base prompt; "
+            "if they are identical, the per-model file is redundant and should be removed."
+        )
+
+    def test_qwen3_4b_extraction_system_inherits_base(self):
+        """qwen3-4b provides no extraction_system.txt override; the base file is inherited."""
+        per_model = _load_prompt(
+            "extraction_system.txt",
+            "hardcoded-default",
+            _DEFAULT_PROMPT_DIR,
+            model="qwen3-4b",
+        )
+        base = _load_prompt("extraction_system.txt", "hardcoded-default", _DEFAULT_PROMPT_DIR)
+        assert per_model == base, (
+            "qwen3-4b must inherit the shared extraction_system.txt; "
+            "a per-model override for this file should not exist."
+        )
+
+
 def _render(template: str, **values) -> str:
     """Render a prompt template with placeholder values for inspection."""
     return template.format(**values)

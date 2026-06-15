@@ -484,6 +484,7 @@ def load_extraction_prompts(
     *,
     system_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_filename: str = DEFAULT_USER_PROMPT_FILENAME,
+    model: str | None = None,
 ) -> tuple[str, str]:
     """Load extraction prompts from a directory, with hardcoded fallbacks.
 
@@ -505,13 +506,19 @@ def load_extraction_prompts(
                        Defaults to :data:`DEFAULT_USER_PROMPT_FILENAME`
                        (``"extraction.txt"``).  Used for every source
                        type for the same reason.
+        model: Model alias (e.g. ``"qwen3-4b"``).  When provided,
+               resolution is per-file: ``prompts_dir/<model>/<filename>``
+               is tried first, falling back to ``prompts_dir/<filename>``
+               and then ``configs/prompts/<filename>``.  Only local-model
+               extraction prompts are per-model; SOTA cloud prompts call
+               with ``model=None`` (unchanged).
 
     Returns:
         ``(system_prompt, extraction_prompt)`` tuple.
     """
     pd = Path(prompts_dir) if prompts_dir else None
-    system = _load_prompt(system_filename, _DEFAULT_EXTRACTION_SYSTEM, pd)
-    prompt = _load_prompt(user_filename, _DEFAULT_EXTRACTION_PROMPT, pd)
+    system = _load_prompt(system_filename, _DEFAULT_EXTRACTION_SYSTEM, pd, model=model)
+    prompt = _load_prompt(user_filename, _DEFAULT_EXTRACTION_PROMPT, pd, model=model)
     return system, prompt
 
 
@@ -537,6 +544,7 @@ def load_procedural_prompt(
     *,
     system_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
+    model: str | None = None,
 ) -> tuple[str, str]:
     """Load procedural extraction prompts.
 
@@ -556,10 +564,13 @@ def load_procedural_prompt(
                        :data:`DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME`
                        (``"extraction_procedural.txt"``).  Used for
                        every source type.
+        model: Model alias (e.g. ``"qwen3-4b"``).  Per-file resolution —
+               see :func:`load_extraction_prompts` for the full search
+               order.  Only local-model extraction prompts are per-model.
     """
     pd = Path(prompts_dir) if prompts_dir else None
-    system = _load_prompt(system_filename, _DEFAULT_EXTRACTION_SYSTEM, pd)
-    prompt = _load_prompt(user_filename, _DEFAULT_PROCEDURAL_PROMPT, pd)
+    system = _load_prompt(system_filename, _DEFAULT_EXTRACTION_SYSTEM, pd, model=model)
+    prompt = _load_prompt(user_filename, _DEFAULT_PROCEDURAL_PROMPT, pd, model=model)
     return system, prompt
 
 
@@ -576,6 +587,7 @@ def extract_procedural_graph(
     speaker_name: str | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
+    model_alias: str | None = None,
 ) -> SessionGraph:
     """Extract preferences/habits from a session transcript.
 
@@ -606,11 +618,16 @@ def extract_procedural_graph(
             Defaults to :data:`DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME`
             (``"extraction_procedural.txt"``).  Same prompt for every
             source type.
+        model_alias: Model alias (e.g. ``"qwen3-4b"``).  Enables per-file
+            prompt resolution: ``prompts_dir/<model_alias>/<filename>``
+            is checked first, falling back to ``prompts_dir`` and then
+            ``configs/prompts/``.  SOTA cloud prompts are not affected.
     """
     system, prompt = load_procedural_prompt(
         prompts_dir,
         system_filename=system_prompt_filename,
         user_filename=user_prompt_filename,
+        model=model_alias,
     )
     speaker_context = build_speaker_context(speaker_name)
     messages = [
@@ -701,6 +718,7 @@ def extract_graph(
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
     stop_phase: str | None = None,
+    model_alias: str | None = None,
 ) -> SessionGraph:
     """Extract a knowledge graph from a session transcript.
 
@@ -755,6 +773,12 @@ def extract_graph(
         user_prompt_filename: Filename of the user-turn prompt template.
             Defaults to :data:`DEFAULT_USER_PROMPT_FILENAME`
             (``"extraction.txt"``).  Same prompt for every source type.
+        model_alias: Model alias (e.g. ``"qwen3-4b"``).  Enables per-file
+            prompt resolution: ``prompts_dir/<model_alias>/<filename>``
+            is checked first for local-model extraction prompts.  The
+            ``sota_*`` prompts (cloud enricher) and ``anonymization.txt``
+            are model-independent by design and are NOT affected by this
+            parameter.
     """
     # Validate stop_phase against the canonical whitelist before any
     # work happens.  Catches typos early ("anonymise" vs "anonymize")
@@ -794,6 +818,7 @@ def extract_graph(
                     speaker_name,
                     system_prompt_filename=system_prompt_filename,
                     user_prompt_filename=user_prompt_filename,
+                    model_alias=model_alias,
                 )
                 t.set_raw(raw_output)
                 logger.debug("Raw extraction output: %s", raw_output[:500])
@@ -969,6 +994,13 @@ def extract_and_anonymize_for_cloud(
             # that already names the session.
             speaker_id=speaker_id or "cloud_egress",
             speaker_name=speaker_name,
+            # No model_alias: cloud-egress extraction is deliberately
+            # model-independent.  This graph exists only to anchor PII
+            # anonymization (entity spans), not to build the knowledge graph,
+            # and entity/attribute extraction is reliable across models — the
+            # per-model prompt overrides target relation decomposition, which
+            # is not load-bearing here.  So the shared base prompt is used
+            # regardless of the configured model.
             prompts_dir=prompts_dir,
             validate=False,
             stt_correction=False,
@@ -1092,6 +1124,7 @@ def _generate_extraction(
     *,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
+    model_alias: str | None = None,
 ) -> str:
     """Generate graph extraction output from the model. Called once.
 
@@ -1105,11 +1138,16 @@ def _generate_extraction(
     placeholder in the **user** template (``extraction.txt``), populated by
     :func:`build_speaker_context`.  One prompt-pair serves every source
     type — document chunks land in the same ``{transcript}`` slot.
+
+    ``model_alias`` enables per-file prompt resolution — see
+    :func:`load_extraction_prompts`.  The ``sota_*`` prompts are
+    model-independent by design and are not affected.
     """
     system, prompt = load_extraction_prompts(
         prompts_dir,
         system_filename=system_prompt_filename,
         user_filename=user_prompt_filename,
+        model=model_alias,
     )
     speaker_context = build_speaker_context(speaker_name)
     format_kwargs = dict(

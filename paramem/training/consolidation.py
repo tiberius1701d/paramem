@@ -134,6 +134,7 @@ class ConsolidationLoop:
         snapshot_dir: str | Path | None = None,
         run_id: str | None = None,
         prompts_dir: str | Path | None = None,
+        model_name: str | None = None,
         extraction_stt_correction: bool = True,
         extraction_ha_validation: bool = True,
         extraction_noise_filter: str = "",
@@ -241,6 +242,7 @@ class ConsolidationLoop:
                 pii_scope=extraction_pii_scope,
             ),
             prompts_dir=prompts_dir,
+            model_name=model_name,
         )
 
         # Graph-level SOTA enrichment knobs (Task #10).
