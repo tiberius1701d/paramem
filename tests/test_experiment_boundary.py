@@ -16,14 +16,15 @@ file's syntax check pass the guard regardless of whether the script's larger
 runtime path works — that is by design.  Repair-vs-retire of any specific
 experiment is a separate decision, tracked outside this file.
 
-Allowlist
----------
+Allowlists
+----------
 Existing private imports are *grandfathered* in :data:`_GRANDFATHERED_IMPORTS`.
-The allowlist has the shape ``(experiment_path, module, symbol)``.  Adding a
-new private import requires *either* removing the entry by promoting the
-symbol to public in production (a separate, gated change) *or* explicitly
-extending the allowlist with a comment justifying it.  New entries should be
-rare — the goal is for the allowlist to shrink over time, not grow.
+Existing public imports are *grandfathered* in :data:`_GRANDFATHERED_PUBLIC_IMPORTS`.
+Both allowlists have the shape ``(experiment_path, module, symbol)``.  Adding a
+new entry requires *either* removing it by routing through
+:mod:`experiments.utils.production` *or* explicitly extending the allowlist
+with a comment justifying it.  New entries should be rare — the goal is for
+the allowlists to shrink over time, not grow.
 """
 
 from __future__ import annotations
@@ -33,6 +34,20 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPERIMENTS_ROOT = REPO_ROOT / "experiments"
+
+# Path prefix for the boundary-layer modules that legitimately import from
+# paramem.* — they ARE the façade, so the public-import guard skips them.
+_UTILS_PREFIX = EXPERIMENTS_ROOT / "utils"
+
+
+def _is_boundary_layer(py_file: Path) -> bool:
+    """Return True when *py_file* lives under ``experiments/utils/``."""
+    try:
+        py_file.relative_to(_UTILS_PREFIX)
+        return True
+    except ValueError:
+        return False
+
 
 # Existing private imports as of 2026-05-28 (9 imports across 4 files).
 # Format: (relative_path_from_repo_root, module, symbol_name).
@@ -78,13 +93,365 @@ _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
     }
 )
 
+# Existing public paramem.* imports in consumer experiments as of 2026-06-15
+# (96 imports across 20 files, all outside experiments/utils/).
+# Format: (relative_path_from_repo_root, module, symbol_name).
+# This allowlist is expected to SHRINK, not grow: new experiment code should
+# import through the experiments.utils.production façade instead.  Adding a
+# new entry requires either (a) first exposing the symbol via
+# experiments.utils.production or (b) an explicit justifying comment here.
+_GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
+    {
+        # fmt: off
+        # dataset_probe.py
+        ("experiments/dataset_probe.py", "paramem.memory.store", "MemoryStore"),
+        ("experiments/dataset_probe.py", "paramem.models.loader", "load_base_model"),
+        ("experiments/dataset_probe.py", "paramem.server.config", "load_server_config"),
+        (
+            "experiments/dataset_probe.py",
+            "paramem.server.consolidation",
+            "create_consolidation_loop",
+        ),
+        # lme_graph_builder.py
+        ("experiments/lme_graph_builder.py", "paramem.models.loader", "load_base_model"),
+        ("experiments/lme_graph_builder.py", "paramem.server.config", "load_server_config"),
+        (
+            "experiments/lme_graph_builder.py",
+            "paramem.server.consolidation",
+            "create_consolidation_loop",
+        ),
+        # lme_qa_from_triples_probe.py
+        (
+            "experiments/lme_qa_from_triples_probe.py",
+            "paramem.evaluation.recall",
+            "generate_answer",
+        ),
+        (
+            "experiments/lme_qa_from_triples_probe.py",
+            "paramem.models.loader",
+            "adapt_messages",
+        ),
+        (
+            "experiments/lme_qa_from_triples_probe.py",
+            "paramem.models.loader",
+            "load_base_model",
+        ),
+        # probe_adapter.py
+        ("experiments/probe_adapter.py", "paramem.models.loader", "unload_model"),
+        # probe_extraction_merge_live.py
+        (
+            "experiments/probe_extraction_merge_live.py",
+            "paramem.graph.extraction_pipeline",
+            "ExtractionConfig",
+        ),
+        (
+            "experiments/probe_extraction_merge_live.py",
+            "paramem.graph.extraction_pipeline",
+            "ExtractionPipeline",
+        ),
+        (
+            "experiments/probe_extraction_merge_live.py",
+            "paramem.graph.merger",
+            "GraphMerger",
+        ),
+        (
+            "experiments/probe_extraction_merge_live.py",
+            "paramem.models.loader",
+            "load_base_model",
+        ),
+        (
+            "experiments/probe_extraction_merge_live.py",
+            "paramem.server.config",
+            "load_server_config",
+        ),
+        # quadruple_adapter.py
+        (
+            "experiments/quadruple_adapter.py",
+            "paramem.backup.age_envelope",
+            "is_age_envelope",
+        ),
+        (
+            "experiments/quadruple_adapter.py",
+            "paramem.backup.checkpoint_shard",
+            "materialize_checkpoint_to_shm",
+        ),
+        ("experiments/quadruple_adapter.py", "paramem.memory.entry", "assign_keys"),
+        ("experiments/quadruple_adapter.py", "paramem.memory.entry", "build_registry"),
+        (
+            "experiments/quadruple_adapter.py",
+            "paramem.memory.entry",
+            "format_entry_training",
+        ),
+        ("experiments/quadruple_adapter.py", "paramem.models.loader", "create_adapter"),
+        ("experiments/quadruple_adapter.py", "paramem.models.loader", "switch_adapter"),
+        (
+            "experiments/quadruple_adapter.py",
+            "paramem.training.early_stop",
+            "EarlyStopPolicy",
+        ),
+        (
+            "experiments/quadruple_adapter.py",
+            "paramem.training.early_stop",
+            "safe_write_json",
+        ),
+        (
+            "experiments/quadruple_adapter.py",
+            "paramem.training.recall_eval",
+            "probe_entries",
+        ),
+        ("experiments/quadruple_adapter.py", "paramem.training.trainer", "TrainingHooks"),
+        ("experiments/quadruple_adapter.py", "paramem.training.trainer", "train_adapter"),
+        ("experiments/quadruple_adapter.py", "paramem.utils.config", "AdapterConfig"),
+        ("experiments/quadruple_adapter.py", "paramem.utils.config", "TrainingConfig"),
+        # smoke_canonicalization_live_gpu.py
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.graph.merger",
+            "GraphMerger",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.graph.name_match",
+            "canonical",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.graph.relation_prep",
+            "partition_relations",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.graph.schema",
+            "Relation",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.graph.schema",
+            "SessionGraph",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.memory.store",
+            "MemoryStore",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.models.loader",
+            "load_base_model",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.models.loader",
+            "switch_adapter",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.server.config",
+            "load_server_config",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.server.consolidation",
+            "create_consolidation_loop",
+        ),
+        (
+            "experiments/smoke_canonicalization_live_gpu.py",
+            "paramem.training.recall_eval",
+            "evaluate_indexed_recall",
+        ),
+        # smoke_graph_enrichment.py
+        (
+            "experiments/smoke_graph_enrichment.py",
+            "paramem.graph.extractor",
+            "PROVIDER_KEY_ENV",
+        ),
+        (
+            "experiments/smoke_graph_enrichment.py",
+            "paramem.training.consolidation",
+            "serialize_subgraph_triples",
+        ),
+        # smoke_interim_rollover_enrichment.py
+        (
+            "experiments/smoke_interim_rollover_enrichment.py",
+            "paramem.graph.extraction_pipeline",
+            "ExtractionConfig",
+        ),
+        (
+            "experiments/smoke_interim_rollover_enrichment.py",
+            "paramem.graph.extraction_pipeline",
+            "ExtractionPipeline",
+        ),
+        (
+            "experiments/smoke_interim_rollover_enrichment.py",
+            "paramem.training.consolidation",
+            "ConsolidationLoop",
+        ),
+        # smoke_interim_rollover_live_gpu.py
+        (
+            "experiments/smoke_interim_rollover_live_gpu.py",
+            "paramem.models.loader",
+            "load_base_model",
+        ),
+        (
+            "experiments/smoke_interim_rollover_live_gpu.py",
+            "paramem.server.config",
+            "load_server_config",
+        ),
+        (
+            "experiments/smoke_interim_rollover_live_gpu.py",
+            "paramem.server.consolidation",
+            "create_consolidation_loop",
+        ),
+        # smoke_procedural_mlp.py
+        ("experiments/smoke_procedural_mlp.py", "paramem.models.loader", "load_base_model"),
+        ("experiments/smoke_procedural_mlp.py", "paramem.server.config", "ServerConfig"),
+        # smoke_quiet_hours_live_gpu.py
+        (
+            "experiments/smoke_quiet_hours_live_gpu.py",
+            "paramem.server.gpu_lock",
+            "gpu_lock_sync",
+        ),
+        (
+            "experiments/smoke_quiet_hours_live_gpu.py",
+            "paramem.training.thermal_throttle",
+            "ThermalPolicy",
+        ),
+        (
+            "experiments/smoke_quiet_hours_live_gpu.py",
+            "paramem.training.thermal_throttle",
+            "ThermalThrottleCallback",
+        ),
+        # test10b_diverse_rephrase.py
+        (
+            "experiments/test10b_diverse_rephrase.py",
+            "paramem.evaluation.recall",
+            "generate_answer",
+        ),
+        ("experiments/test10b_diverse_rephrase.py", "paramem.models.loader", "load_adapter"),
+        (
+            "experiments/test10b_diverse_rephrase.py",
+            "paramem.models.loader",
+            "load_base_model",
+        ),
+        # test11_adapter_extraction.py
+        (
+            "experiments/test11_adapter_extraction.py",
+            "paramem.graph.extractor",
+            "load_extraction_prompts",
+        ),
+        ("experiments/test11_adapter_extraction.py", "paramem.models.loader", "load_adapter"),
+        (
+            "experiments/test11_adapter_extraction.py",
+            "paramem.models.loader",
+            "load_base_model",
+        ),
+        # test16_repair_sweep.py
+        ("experiments/test16_repair_sweep.py", "paramem.adapters", "resolve_adapter_slot"),
+        (
+            "experiments/test16_repair_sweep.py",
+            "paramem.adapters.manifest",
+            "build_manifest_for",
+        ),
+        ("experiments/test16_repair_sweep.py", "paramem.memory.entry", "assign_keys"),
+        ("experiments/test16_repair_sweep.py", "paramem.memory.entry", "build_registry"),
+        (
+            "experiments/test16_repair_sweep.py",
+            "paramem.memory.entry",
+            "format_entry_training",
+        ),
+        ("experiments/test16_repair_sweep.py", "paramem.memory.persistence", "load_registry"),
+        ("experiments/test16_repair_sweep.py", "paramem.memory.persistence", "save_registry"),
+        ("experiments/test16_repair_sweep.py", "paramem.models.loader", "create_adapter"),
+        ("experiments/test16_repair_sweep.py", "paramem.models.loader", "save_adapter"),
+        ("experiments/test16_repair_sweep.py", "paramem.models.loader", "switch_adapter"),
+        ("experiments/test16_repair_sweep.py", "paramem.models.loader", "unload_model"),
+        (
+            "experiments/test16_repair_sweep.py",
+            "paramem.training.recall_eval",
+            "evaluate_indexed_recall",
+        ),
+        ("experiments/test16_repair_sweep.py", "paramem.training.trainer", "train_adapter"),
+        ("experiments/test16_repair_sweep.py", "paramem.utils.config", "AdapterConfig"),
+        ("experiments/test16_repair_sweep.py", "paramem.utils.config", "TrainingConfig"),
+        # test18_probe_batching.py
+        (
+            "experiments/test18_probe_batching.py",
+            "paramem.memory.entry",
+            "DEFAULT_CONFIDENCE_THRESHOLD",
+        ),
+        ("experiments/test18_probe_batching.py", "paramem.memory.entry", "RECALL_TEMPLATE"),
+        ("experiments/test18_probe_batching.py", "paramem.memory.entry", "build_registry"),
+        ("experiments/test18_probe_batching.py", "paramem.memory.entry", "finalize_recalled"),
+        (
+            "experiments/test18_probe_batching.py",
+            "paramem.memory.entry",
+            "format_entry_training",
+        ),
+        ("experiments/test18_probe_batching.py", "paramem.models.loader", "create_adapter"),
+        ("experiments/test18_probe_batching.py", "paramem.models.loader", "load_base_model"),
+        ("experiments/test18_probe_batching.py", "paramem.models.loader", "save_adapter"),
+        ("experiments/test18_probe_batching.py", "paramem.models.loader", "switch_adapter"),
+        (
+            "experiments/test18_probe_batching.py",
+            "paramem.training.dataset",
+            "format_inference_prompt",
+        ),
+        (
+            "experiments/test18_probe_batching.py",
+            "paramem.training.recall_eval",
+            "derive_stop_ids",
+        ),
+        (
+            "experiments/test18_probe_batching.py",
+            "paramem.training.recall_eval",
+            "evaluate_indexed_recall",
+        ),
+        ("experiments/test18_probe_batching.py", "paramem.training.trainer", "train_adapter"),
+        ("experiments/test18_probe_batching.py", "paramem.utils.config", "AdapterConfig"),
+        ("experiments/test18_probe_batching.py", "paramem.utils.config", "TrainingConfig"),
+        # test_distillation_models.py / test_prompt_engineering.py
+        (
+            "experiments/test_distillation_models.py",
+            "paramem.evaluation.embedding_scorer",
+            "compute_similarity",
+        ),
+        (
+            "experiments/test_prompt_engineering.py",
+            "paramem.evaluation.embedding_scorer",
+            "compute_similarity",
+        ),
+        # test_step6_step7_live_gpu.py
+        (
+            "experiments/test_step6_step7_live_gpu.py",
+            "paramem.models.loader",
+            "load_base_model",
+        ),
+        (
+            "experiments/test_step6_step7_live_gpu.py",
+            "paramem.server.config",
+            "load_server_config",
+        ),
+        (
+            "experiments/test_step6_step7_live_gpu.py",
+            "paramem.server.consolidation",
+            "create_consolidation_loop",
+        ),
+        (
+            "experiments/test_step6_step7_live_gpu.py",
+            "paramem.server.gpu_lock",
+            "gpu_lock_sync",
+        ),
+        # fmt: on
+    }
+)
 
-def _collect_private_paramem_imports(py_file: Path) -> list[tuple[int, str, str]]:
-    """Return ``(lineno, module, symbol)`` for every private ``paramem.*`` import.
 
-    A private symbol is any name that begins with an underscore.
-    Star imports (``from x import *``) are skipped — they have ``alias.name == '*'``
-    which is not actually underscored, and they cannot be analyzed statically.
+def _collect_paramem_imports(py_file: Path) -> list[tuple[int, str, str]]:
+    """Return ``(lineno, module, symbol)`` for every ``paramem.*`` ImportFrom node.
+
+    Both private (underscored) and public symbols are returned; callers filter
+    by ``symbol.startswith("_")``.  Star imports (``alias.name == '*'``) are
+    skipped — they cannot be analyzed statically.
     """
     try:
         text = py_file.read_text()
@@ -103,9 +470,20 @@ def _collect_private_paramem_imports(py_file: Path) -> list[tuple[int, str, str]
         for alias in node.names:
             if alias.name == "*":
                 continue
-            if alias.name.startswith("_"):
-                out.append((node.lineno, node.module, alias.name))
+            out.append((node.lineno, node.module, alias.name))
     return out
+
+
+def _collect_private_paramem_imports(py_file: Path) -> list[tuple[int, str, str]]:
+    """Return ``(lineno, module, symbol)`` for every private ``paramem.*`` import.
+
+    A private symbol is any name that begins with an underscore.
+    Star imports (``from x import *``) are skipped — they have ``alias.name == '*'``
+    which is not actually underscored, and they cannot be analyzed statically.
+    """
+    return [
+        (ln, mod, sym) for ln, mod, sym in _collect_paramem_imports(py_file) if sym.startswith("_")
+    ]
 
 
 def test_no_new_private_paramem_imports_in_experiments():
@@ -223,4 +601,72 @@ def test_production_facade_is_pure_reexport():
     assert not bad, (
         "experiments.utils.production must be a pure re-export façade. "
         "Issues:\n  " + "\n  ".join(bad)
+    )
+
+
+def test_no_new_public_paramem_imports_in_experiments():
+    """Fail if a new public ``from paramem.*`` import appears in a consumer
+    experiment outside the grandfathered allowlist.
+
+    Consumer experiments are all ``experiments/*.py`` files NOT under
+    ``experiments/utils/`` (the boundary layer legitimately imports from
+    paramem.* — that is its job and it is whitelisted).
+
+    To add a new public paramem.* import, either:
+
+    1. Expose the symbol via :mod:`experiments.utils.production` and import it
+       from there, or
+    2. Extend :data:`_GRANDFATHERED_PUBLIC_IMPORTS` with a comment justifying
+       the direct import.
+
+    The goal is for the allowlist to shrink over time, not grow.
+    """
+    offenders: list[tuple[str, int, str, str]] = []
+    for py_file in sorted(EXPERIMENTS_ROOT.rglob("*.py")):
+        parts = py_file.parts
+        if "archive" in parts or "__pycache__" in parts:
+            continue
+        if _is_boundary_layer(py_file):
+            continue
+        rel = py_file.relative_to(REPO_ROOT).as_posix()
+        for lineno, module, symbol in _collect_paramem_imports(py_file):
+            if symbol.startswith("_"):
+                continue
+            if (rel, module, symbol) in _GRANDFATHERED_PUBLIC_IMPORTS:
+                continue
+            offenders.append((rel, lineno, module, symbol))
+
+    assert not offenders, (
+        "New public paramem.* imports found in consumer experiments/.\n"
+        "New experiment code should import through experiments.utils.production "
+        "instead of reaching into paramem.* directly.\n"
+        "Options: (a) add the symbol to experiments.utils.production and import "
+        "from there, or (b) extend _GRANDFATHERED_PUBLIC_IMPORTS with a "
+        "justifying comment.\n"
+        "Offenders:\n" + "\n".join(f"  {p}:{ln} — from {m} import {s}" for p, ln, m, s in offenders)
+    )
+
+
+def test_public_allowlist_entries_still_exist():
+    """An allowlist entry that no longer matches anything in the tree is dead
+    weight — either the experiment was deleted, or the import was already
+    rewritten.  Forces :data:`_GRANDFATHERED_PUBLIC_IMPORTS` to track reality.
+    """
+    actual: set[tuple[str, str, str]] = set()
+    for py_file in sorted(EXPERIMENTS_ROOT.rglob("*.py")):
+        parts = py_file.parts
+        if "archive" in parts or "__pycache__" in parts:
+            continue
+        if _is_boundary_layer(py_file):
+            continue
+        rel = py_file.relative_to(REPO_ROOT).as_posix()
+        for _, module, symbol in _collect_paramem_imports(py_file):
+            if symbol.startswith("_"):
+                continue
+            actual.add((rel, module, symbol))
+
+    stale = sorted(_GRANDFATHERED_PUBLIC_IMPORTS - actual)
+    assert not stale, (
+        "Stale entries in _GRANDFATHERED_PUBLIC_IMPORTS (no longer found in "
+        "the tree).  Remove them:\n" + "\n".join(f"  {p}: from {m} import {s}" for p, m, s in stale)
     )
