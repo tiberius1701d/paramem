@@ -10,7 +10,7 @@ Design notes:
 - Content-hash only (WSL2 mtime is unreliable across filesystem events).
 - Routing through ``paramem.backup.hashing.content_sha256_path`` so the
   hash primitive in :mod:`paramem.backup.hashing` stays the single source
-  of truth (Resolved Decision 29).
+  of truth.
 - Env-var references in the yaml (e.g. ``${PARAMEM_DAILY_PASSPHRASE}``) are
   hashed as the literal template string, not the resolved value.  Key
   rotation is handled by the lifecycle CLIs, not via config drift.

@@ -258,7 +258,7 @@ class TestInfraPathsIncludesSafetensors:
 
 
 class TestAtomicSaveAdapterEncryptStep:
-    """atomic_save_adapter calls _encrypt_adapter_safetensors at Step 3.5."""
+    """atomic_save_adapter calls _encrypt_adapter_safetensors during the save."""
 
     def test_encrypt_called_on_save(self, tmp_path):
         """_encrypt_adapter_safetensors is invoked during atomic_save_adapter."""

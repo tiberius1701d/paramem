@@ -94,7 +94,8 @@ class AbortedDuringConsolidation(Exception):
 
     The caller (app.py ``_run_full_cycle``) catches this, restores all three
     production tiers from their ``<tier>_backup`` slots via
-    ``copy_adapter_weights``, skips Step 6 finalize, and logs the cycle as
+    ``copy_adapter_weights``, skips the atomic finalize step (registry rewrite
+    → persist → interim purge → router reload), and logs the cycle as
     ``mode="aborted"``.  Partial progress is lost but VRAM state is consistent
     with the pre-cycle baseline.
     """
@@ -263,9 +264,9 @@ class ConsolidationLoop:
 
         # The cumulative graph is NOT loaded at construction.  The fold
         # (consolidate_interim_adapters) calls merger.reset_graph() before
-        # Stage-2 re-merge so the keying surface is always fresh; any prior
-        # graph state would be discarded at fold entry and loading it here
-        # would only populate ingest-time data that nobody reads.
+        # re-merging registry-true relations so the keying surface is always
+        # fresh; any prior graph state would be discarded at fold entry and
+        # loading it here would only populate ingest-time data that nobody reads.
 
         # Ensure both adapters exist on the model
         self.model = self._ensure_adapters()
@@ -321,10 +322,11 @@ class ConsolidationLoop:
 
         # RAM-only queue for max_interim_count==0 (queue-until-consolidation).
         # Facts extracted when no interim adapter is configured accumulate here
-        # until the next consolidation cycle (Step 7) folds them into the mains.
+        # until the next full consolidation fold (consolidate_interim_adapters)
+        # folds them into the mains.
         # Privacy invariant: this list is never written to disk — what isn't
-        # trained doesn't exist.  Snapshot persistence is deferred (Step 7).
-        # TODO(Step 7): consume pending_interim_triples at the start of
+        # trained doesn't exist.  Snapshot persistence is deferred to the fold.
+        # TODO: consume pending_interim_triples at the start of
         # consolidate_interim_adapters() before training the full key set.
         self.pending_interim_triples: list[dict] = []
         # BackgroundTrainer reference — wired after construction by the server
@@ -2112,7 +2114,8 @@ class ConsolidationLoop:
                 ``window_stamp`` on all saved main slots instead of computing a
                 fresh floor.  Used by :meth:`run_housekeeping` to preserve the
                 existing window stamp so :func:`_is_full_cycle_due` is not
-                perturbed by the re-groom (Decision 2, §4.10).
+                perturbed by the re-groom (a housekeeping fold must not advance
+                the cadence window).
         """
         import hashlib as _hashlib
 
@@ -2128,7 +2131,7 @@ class ConsolidationLoop:
         else:
             full_window_stamp = current_full_consolidation_stamp(full_period)
 
-        # Step 1+2: Serialise each tier's registry to bytes and hash them — no disk I/O.
+        # Serialise each tier's registry to bytes and hash them — no disk I/O at this point.
         # Per-tier: tier_name → (payload_bytes, sha256_hex)
         tier_payloads: dict[str, tuple[bytes, str]] = {}
         if self.store.replay_enabled:
@@ -2234,9 +2237,8 @@ class ConsolidationLoop:
                 raise
             return slot
 
-        # Steps 3–5 per adapter: manifest → slot save.
-        # Step 5a follows each slot save: reload from disk and probe recall to
-        # catch silent partial writes before ``mark_consolidated`` fires.
+        # Save each adapter to a slot, then immediately reload from disk and probe recall
+        # to catch silent partial writes before ``mark_consolidated`` fires.
         # On probe failure the bad slot is deleted and RuntimeError propagates.
         # Collect slot paths for post-registry-commit pruning.
         _saved_slots: dict[str, Path] = {}
@@ -2252,7 +2254,7 @@ class ConsolidationLoop:
                 "procedural", self.store.tier_simhashes("procedural", include_stale=False)
             )
 
-        # Step 6: Per-cycle adapter-weight shadows (debug/analysis only — no
+        # Per-cycle adapter-weight shadows (debug/analysis only — no
         # manifest).  Layout owned by DebugSnapshotWriter:
         #   paths.debug/.../training/tiers/<tier>/adapter_weights/
         # Writer self-gates on save_cycle_snapshots; callers do not check.
@@ -2263,7 +2265,7 @@ class ConsolidationLoop:
             tier_shadow.append("procedural")
         self._debug_writer.on_main_adapters_saved(tier_shadow)
 
-        # Steps 6–7: indexed_key_registry (per-tier — the unified file now carries
+        # Flush the indexed_key_registry per tier (the unified file now carries
         # active∪stale simhashes in its "simhash" key), then the registry commit signal.
         # The separate simhash_registry.json is no longer written.
         if self.store.replay_enabled and tier_payloads:
@@ -2392,8 +2394,9 @@ class ConsolidationLoop:
 
         If ``max_interim_count == 0``, new facts are appended to
         ``self.pending_interim_triples`` (RAM-only) without training.  The pending
-        queue is consumed by the next consolidation cycle (Step 7).  What is not
-        trained does not exist on disk — this upholds the privacy invariant.
+        queue is consumed by the next full consolidation fold
+        (``consolidate_interim_adapters``).  What is not trained does not exist on
+        disk — this upholds the privacy invariant.
 
         Procedural relations extracted from the same transcript are trained onto
         the stable ``procedural`` main adapter (no interim tier for procedural —
@@ -3332,7 +3335,7 @@ class ConsolidationLoop:
         the canonical main-tier graph at ``<adapter_dir>/episodic/graph.json`` and
         removes the interim slot directories.
 
-        §4.S architectural symmetry: grooming is LITERALLY identical to the train fold
+        Architectural symmetry with the train fold: grooming is LITERALLY identical
         (``canonical()`` node identity + Case-1/Case-2 dedup via ``self.merger``,
         then ``_run_graph_enrichment``).  The ONLY permitted divergence is the
         persistence/retrain tail:
@@ -3340,8 +3343,8 @@ class ConsolidationLoop:
         - **source**: disk-load (``load_memory_from_disk``) vs reconstruct-from-weights.
         - **sink**: write ``graph.json`` (``save_memory_to_disk``) vs retrain adapters.
 
-        §4.6b — simulate→GraphMerger convergence: the cross-slot merge now routes
-        through ``self.merger.merge(_synthetic_session, additive=True)`` so
+        The cross-slot merge routes through
+        ``self.merger.merge(_synthetic_session, additive=True)`` so
         ``canonical()`` + Case-1/Case-2 dedup apply identically to the train fold.
         ``additive=True`` skips the model-gated Case-2 branch, so no model is
         required (the simulate merger typically holds ``model=None``).
@@ -3349,7 +3352,7 @@ class ConsolidationLoop:
         Args:
             housekeeping: When ``True``, bypass the empty-interim-slot noop so the
                 enriched graph is persisted even with no interims present.  Used by
-                :meth:`run_housekeeping` (§4.4 gate c / B-SIMULATE).  Sessions are
+                :meth:`run_housekeeping` for on-demand re-grooming.  Sessions are
                 NOT marked consolidated; window stamp is not advanced.
 
         Steps:
@@ -3357,9 +3360,9 @@ class ConsolidationLoop:
         1. Reset the merger and build ``Relation`` objects from the disk-loaded main
            graph AND every interim ``graph.json`` slot, then merge them via
            ``self.merger.merge(additive=True)`` — the same topology the train fold uses.
-        2. Optional SOTA enrichment (same guard as ``consolidate_interim_adapters`` Stage 2.5).
+        2. Optional SOTA enrichment (same guard as ``consolidate_interim_adapters``).
            Runs AFTER the merge on the freshly-merged ``self.merger.graph``, mirroring
-           the train fold's position (Stage 2 re-merge → Stage 2.5 enrichment).
+           the train fold's re-merge → enrichment ordering.
         3. Write the enriched, merged (canonicalized, deduped) graph to
            ``<adapter_dir>/episodic/graph.json`` via
            :func:`paramem.memory.persistence.save_memory_to_disk`.
@@ -3385,8 +3388,8 @@ class ConsolidationLoop:
 
         adapter_dir = self.output_dir
 
-        # §4.8.ii — housekeeping debug-dir labeling: stamp the interim slot so
-        # the housekeeping run's debug artifacts nest under a housekeeping-labelled
+        # Housekeeping debug-dir labeling: stamp the interim slot so the
+        # housekeeping run's debug artifacts nest under a housekeeping-labelled
         # dir distinct from a scheduled fold's.  Reuses the existing nesting
         # mechanism (_current_interim_stamp → snapshot_dir_for nesting).
         if housekeeping:
@@ -3396,9 +3399,10 @@ class ConsolidationLoop:
             # Ensure no stale housekeeping stamp leaks into a scheduled run.
             self._current_interim_stamp = None  # type: ignore[assignment]
 
-        # --- Step 1 (§4.6b): seed merger from disk-loaded main graph + interim slots ---
+        # --- Seed merger from disk-loaded main graph + interim slots ---
         # Reset the merger's keying surface so provenance keying is unconditional
-        # (mirrors the train fold's reset_graph() call before Stage-2 re-merge).
+        # (mirrors the train fold's reset_graph() call before re-merging registry
+        # relations).
         self.merger.reset_graph()
 
         episodic_main_path = adapter_dir / "episodic" / "graph.json"
@@ -3408,8 +3412,8 @@ class ConsolidationLoop:
 
         # Collect all Relation objects from the main graph + all interim slots.
         # For each graph entry, build a Relation with indexed_key so provenance
-        # is carried through the merger onto the merged edge (mirror of
-        # _build_registry_true_relations, §3.7).
+        # is carried through the merger onto the merged edge (same pattern as
+        # _build_registry_true_relations used by the train fold).
         _all_relations: list[Relation] = []
         interim_dirs_merged: list[Path] = []
 
@@ -3479,12 +3483,13 @@ class ConsolidationLoop:
         # Debug: snapshot the merged graph.  Self-gated.
         self._debug_writer.on_fold_graph(self.merger, label="merged")
 
-        # --- Step 2: optional SOTA graph enrichment (§4.S symmetry — mirrors train Stage 2.5) ---
+        # --- Optional SOTA graph enrichment ---
         # Runs AFTER the merge on the freshly-merged self.merger.graph, mirroring
-        # consolidate_interim_adapters Stage 2.5.  The external/SOTA boundary is handled
-        # inside _run_graph_enrichment (per-chunk except catches network errors), so a
-        # network failure degrades gracefully there.  A programming error here propagates
-        # and aborts the fold — correct behaviour, same as train.
+        # the train fold's re-merge → enrichment ordering so both modes apply the
+        # same grooming topology.  The external/SOTA boundary is handled inside
+        # _run_graph_enrichment (per-chunk except catches network errors), so a
+        # network failure degrades gracefully there.  A programming error here
+        # propagates and aborts the fold — correct behaviour, same as train.
         _enrichment_result = self._run_graph_enrichment()
         if not _enrichment_result.get("skipped"):
             logger.info(
@@ -3498,12 +3503,11 @@ class ConsolidationLoop:
         # Debug: snapshot the enriched graph (after SOTA enrichment).  Self-gated.
         self._debug_writer.on_fold_graph(self.merger, label="enriched")
 
-        # --- B-SIMULATE gate: under housekeeping=True, ALWAYS persist the enriched
-        # graph back to disk — even when no interim slots were present.  This is
-        # the gate-c/B-SIMULATE override (§4.4 / §4.5.3): the scheduled path returns
-        # a noop dict here (nothing changed), but the housekeeping path re-grooms
-        # the persisted knowledge so it MUST write the merger's canonicalized graph
-        # back to disk.
+        # When housekeeping=True, ALWAYS persist the enriched graph back to disk —
+        # even when no interim slots were present.  The scheduled path returns a noop
+        # dict here (nothing changed), but the housekeeping path re-grooms the
+        # persisted knowledge so it MUST write the merger's canonicalized graph back
+        # to disk.
         if not housekeeping and not interim_dirs_merged:
             logger.info("consolidate_interim_graphs: no simulate-mode interim slots found — noop")
             # Reset the housekeeping stamp before returning.
@@ -3520,7 +3524,7 @@ class ConsolidationLoop:
                 "rollback_tier": None,
             }
 
-        # --- Step 3: write merged graph to main episodic slot ---
+        # --- Write merged graph to main episodic slot ---
         episodic_main_path.parent.mkdir(parents=True, exist_ok=True)
         save_memory_to_disk(self.merger.graph, episodic_main_path)
         _after_count = self.merger.graph.number_of_edges()
@@ -3538,7 +3542,7 @@ class ConsolidationLoop:
             _collapsed_count,
         )
 
-        # §4.8.iii — per-tier delta for simulate path.
+        # Per-tier delta for simulate path.
         # staled_by_reason is derived from merger.removal_ledger via _build_tier_delta;
         # for simulate mode the entry store is empty (no KeyRegistry mutation) so
         # tier_of returns None for all removed keys and staled_by_reason == {} in
@@ -3554,7 +3558,7 @@ class ConsolidationLoop:
         # visible in the simulate housekeeping artifacts.
         self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
-        # --- Step 4: remove merged interim slot directories ---
+        # --- Remove merged interim slot directories ---
         for interim_dir in interim_dirs_merged:
             try:
                 _shutil.rmtree(interim_dir, ignore_errors=True)
@@ -3592,9 +3596,8 @@ class ConsolidationLoop:
     ) -> dict:
         """On-demand fold that re-grooms the canonical knowledge graph without advancing sessions.
 
-        This is a thin dispatcher for the ``POST /consolidate/housekeeping`` endpoint
-        (§4.4 Mode 2).  It routes to the correct underlying fold method depending on
-        ``mode``:
+        This is a thin dispatcher for the ``POST /consolidate/housekeeping`` endpoint.
+        It routes to the correct underlying fold method depending on ``mode``:
 
         - **simulate**: calls :meth:`consolidate_interim_graphs` with ``housekeeping=True``.
           Re-runs the GraphMerger topology over the persisted main graph (with no interim
@@ -3630,11 +3633,11 @@ class ConsolidationLoop:
         if mode == "simulate":
             return self.consolidate_interim_graphs(housekeeping=True)
         else:
-            # Decision 2 (§4.10): read the window stamp that was written by the last
-            # scheduled fold and pass it as window_stamp_override so _save_adapters
-            # re-writes the SAME stamp onto every re-saved main slot.  This keeps
-            # _is_full_cycle_due's identity check stable — a housekeeping run must
-            # not advance the cadence window, only a scheduled fold may.
+            # Read the window stamp that was written by the last scheduled fold and
+            # pass it as window_stamp_override so _save_adapters re-writes the SAME
+            # stamp onto every re-saved main slot.  This keeps _is_full_cycle_due's
+            # identity check stable — a housekeeping run must not advance the cadence
+            # window, only a scheduled fold may.
             from paramem.server.app import _last_full_consolidation_window as _lfw
 
             _preserved_stamp = _lfw(self.output_dir)
@@ -3736,11 +3739,12 @@ class ConsolidationLoop:
         """Mint indexed keys for edges in the merged graph that have no ``ik_key`` attribute.
 
         Called as a fold pre-pass after :meth:`_promote_mature_keys_inline` and
-        before Stage-5 so that SOTA-enrichment second-order facts (which arrive as
-        keyless edges after Stage-2 re-merge) are minted, stored, and appended to
-        *tier_keyed* in the same fold that introduces them.  Without this pre-pass
-        every SOTA-enrichment fact would be silently dropped at the Stage-5 skip
-        branch (``not key → continue``) and could never enter the training set.
+        before the per-tier keyed-edge walk so that SOTA-enrichment second-order
+        facts (which arrive as keyless edges after the re-merge) are minted, stored,
+        and appended to *tier_keyed* in the same fold that introduces them.  Without
+        this pre-pass every SOTA-enrichment fact would be silently dropped at the
+        keyed-edge walk's skip branch (``not key → continue``) and could never enter
+        the training set.
 
         The minting logic mirrors the interim path (``assign_keys`` →
         ``_cache_entry`` → ``store.put`` + ``store.set_bookkeeping``) but uses the
@@ -3751,25 +3755,26 @@ class ConsolidationLoop:
         outer failure-safety boundary that needs the deferred-mutation invariant of
         the interim path.
 
-        Tier derivation uses the SAME ``partition_relations`` call that Stage-5 uses
-        for keyed edges, so enrichment edges land in the same tier they would receive
-        if they had been extracted in an ordinary session.
+        Tier derivation uses the same ``partition_relations`` call that the
+        keyed-edge walk uses for keyed edges, so enrichment edges land in the same
+        tier they would receive if they had been extracted in an ordinary session.
 
         ``speaker_id`` is set to ``""`` for all minted enrichment keys: enrichment
         facts are graph-level and not attributed to a specific speaker.
 
         After this call, every edge that was keyless-but-predicate-bearing has a
-        key in the store and an entry in *tier_keyed*.  Stage-5 will encounter these
-        edges again (their ``ik_key`` attribute is still absent because we chose the
-        direct-append variant to avoid the ``MultiDiGraph`` parallel-edge key hazard)
-        — Stage-5 must therefore ``continue`` on keyless edges to avoid a
-        ``store.get(None)`` call; the explicit ``if not key: continue`` guard handles
-        this.
+        key in the store and an entry in *tier_keyed*.  The keyed-edge walk will
+        encounter these edges again (their ``ik_key`` attribute is still absent
+        because we chose the direct-append variant to avoid the ``MultiDiGraph``
+        parallel-edge key hazard) — the keyed-edge walk must therefore ``continue``
+        on keyless edges to avoid a ``store.get(None)`` call; the explicit
+        ``if not key: continue`` guard handles this.
 
         Args:
-            tier_keyed: The tier → keyed-entries dict that Stage-5 also populates.
-                This method appends directly to it so both the pre-pass entries and
-                the Stage-5 entries land in the same structure that feeds training.
+            tier_keyed: The tier → keyed-entries dict that the keyed-edge walk also
+                populates.  This method appends directly to it so both the pre-pass
+                entries and the keyed-edge walk entries land in the same structure
+                that feeds training.
 
         Returns:
             Per-tier minted count, e.g. ``{"episodic": 2, "procedural": 1}``.
@@ -3785,7 +3790,8 @@ class ConsolidationLoop:
             existing = _t_data.get(_IK_ATTR)
             pred = _t_data.get("predicate", "")
             # Only process edges that are keyless AND have a predicate.
-            # Keyed edges are handled by Stage-5; predicate-less edges are not keyable.
+            # Keyed edges are handled by the per-tier keyed-edge walk below;
+            # predicate-less edges are not keyable.
             if existing or not pred:
                 continue
 
@@ -3802,7 +3808,7 @@ class ConsolidationLoop:
                 self.merger.graph.nodes[_t_obj].get("attributes", {}).get("name") or _t_obj
             )
 
-            # Derive tier with the same logic Stage-5 uses for keyed edges.
+            # Derive tier with the same logic the keyed-edge walk uses.
             _dummy = [
                 {
                     "subject": _subj_display,
@@ -3858,8 +3864,8 @@ class ConsolidationLoop:
             # Append to tier_keyed directly (direct-append variant).
             # The ik_key attribute is intentionally NOT stamped onto the edge so
             # the MultiDiGraph parallel-edge integer key field is not disturbed.
-            # Stage-5 will encounter this edge again as still-keyless and the
-            # explicit ``if not key: continue`` guard there will skip it cleanly.
+            # The keyed-edge walk will encounter this edge again as still-keyless
+            # and the explicit ``if not key: continue`` guard will skip it cleanly.
             tier_keyed[tier].append(
                 {
                     "key": key,
@@ -3958,15 +3964,15 @@ class ConsolidationLoop:
     def _build_registry_true_relations(self) -> "list[Relation]":
         """Build registry-true :class:`Relation` objects for every active key.
 
-        Used as the fold's Stage-2 merge input so the merge surface is grounded
-        in registry-true (subject, predicate, object) content rather than the
+        Used as the fold's re-merge input so the merge surface is grounded in
+        registry-true (subject, predicate, object) content rather than the
         lossy reconstruction result.
 
         For each active non-stale key the content is sourced in priority order:
 
         1. ``store.get(key)`` — the content cache entry (subject/predicate/object).
-        2. ``store.bookkeeping_for_key(key)`` — hydration-miss fallback (§3.3c W4):
-           when ``store.get`` returns ``None`` for a LIVE active key (e.g. under
+        2. ``store.bookkeeping_for_key(key)`` — hydration-miss fallback: when
+           ``store.get`` returns ``None`` for a LIVE active key (e.g. under
            ``boot_degraded``), but bookkeeping carries non-empty SPO, the key is
            still present and must NOT be silently dropped.  Log a warning; source
            SPO from bookkeeping.
@@ -3989,7 +3995,7 @@ class ConsolidationLoop:
                 pred = entry.get("predicate", "")
                 obj = entry.get("object", "")
             else:
-                # W4: hydration-miss — entry cache is empty for this live key.
+                # Hydration-miss — entry cache is empty for this live key.
                 # Attempt bookkeeping SPO fallback before treating as orphan.
                 subj = bk.get("subject", "")
                 pred = bk.get("predicate", "")
@@ -4060,35 +4066,34 @@ class ConsolidationLoop:
 
         Steps:
         1. Verify the GPU lock is held (entry guard — leak-safe pattern).
-        2. Optional SOTA graph enrichment.
-        3. Stage 1 — Unfold / reconstruct: probe every active key from adapter
-           weights via ``reconstruct_graph``; recover (subject, predicate, object).
-        4. Stage 2 — Re-merge: for each reconstructed triple, inject the
-           authoritative ``relation_type`` from persisted bookkeeping, then feed
-           through ``merger.merge()`` so the cumulative graph edges are re-stamped.
-        5. Stage 3 — Triple→key index: build a per-cycle ``(s,norm_p,o)→key``
-           mapping from ``store.iter_entries()`` (normalized predicates).
-        6. Stage 4 — Edge-walk relation_type: read ``(s,norm_p,o)→relation_type``
-           from ``merger.graph.edges(data=True)``; replaces the dead
-           ``getattr(graph, "relations", [])`` path that always returned empty.
-        7. Stage 5 — Dedup + tier: walk merged graph edges (dedup on norm triple),
-           look up key via the triple→key index, derive tier from ``relation_type``
-           via ``partition_relations``; build ``tier_keyed`` lists.  The merged
-           graph is the dedup authority (duplicate triples collapse to one key).
-        8. Load backup adapters (if available) and all interim adapters into PEFT.
-        9. For each tier (episodic → semantic → procedural):
+        2. Reconstruct: probe every active key from adapter weights via
+           ``reconstruct_graph``; recover (subject, predicate, object).
+        3. Re-merge registry-true relations: for each active key source the
+           authoritative (subject, predicate, object) from the registry (not from
+           reconstruction), inject ``relation_type`` from persisted bookkeeping,
+           then feed through ``merger.merge()`` so the cumulative graph edges are
+           re-stamped.
+        4. Optional SOTA graph enrichment (runs after re-merge on the populated
+           graph so second-order relations are captured).
+        5. Dedup + tier assignment: walk merged graph edges; for each edge, read
+           the ``ik_key`` attribute stamped by the merger, derive tier from
+           ``relation_type`` via ``partition_relations``; build ``tier_keyed``
+           lists.  The merged graph is the dedup authority (duplicate triples
+           collapse to one key).
+        6. Load backup adapters (if available) and all interim adapters into PEFT.
+        7. For each tier (episodic → semantic → procedural):
            a. Set active adapter to <tier>_backup before deleting the main.
            b. delete_adapter(<tier>) + create_adapter(<tier>).
            c. Set <tier>_is_training=True, call _train_adapter, set False.
            d. Recall-sanity check; on failure roll back and abort.
-        10. Atomic finalize: registry rewrite → durable main-weight persist+verify
+        8. Atomic finalize: registry rewrite → durable main-weight persist+verify
            (_save_adapters) → unload_interim_adapters → router reload.  The
            weight persist runs BEFORE the interim purge so the merged knowledge
            always has a verified on-disk copy before any interim slot is deleted
            (closes the full-cycle data-loss crash window).  _save_adapters runs
            a recall PROBE on the reloaded slot — it is not an HF Trainer routine,
            so the finalize invariant (no training calls) holds.
-        11. On success: unload backup adapters.
+        9. On success: unload backup adapters.
 
         Args:
             trainer: BackgroundTrainer instance (must be the one holding the GPU
@@ -4113,8 +4118,8 @@ class ConsolidationLoop:
                 time.  Used by :meth:`run_housekeeping` to preserve the window
                 stamp that was already written by the last scheduled fold, so
                 :func:`_is_full_cycle_due` is not perturbed by a housekeeping
-                run (Decision 2, §4.10).  ``None`` is the correct value for every
-                non-housekeeping call.
+                run (a housekeeping fold must not advance the cadence window).
+                ``None`` is the correct value for every non-housekeeping call.
 
         Returns:
             Result dict with keys:
@@ -4153,7 +4158,7 @@ class ConsolidationLoop:
                 "_gpu_thread_lock (submit via BackgroundTrainer.submit())"
             )
 
-        # --- §4.8.ii — housekeeping debug-dir labeling ---
+        # --- Housekeeping debug-dir labeling ---
         # Set a distinct interim stamp so debug artifacts for a housekeeping fold
         # land under ``housekeeping_<ts>/`` rather than a scheduled fold name.
         # Cleared in the finally-equivalent tail (after _save_adapters / rollback).
@@ -4163,13 +4168,12 @@ class ConsolidationLoop:
         else:
             self._current_interim_stamp = None  # type: ignore[assignment]
 
-        # --- Stage 1: Unfold / reconstruct all active keys from adapter weights ---
+        # --- Reconstruct all active keys from adapter weights ---
         # Probes every active key across all tiers; recovers (subject, predicate, object)
         # from the trained weights.  Reconstruction yields SPO ONLY — no relation_type.
         # strict=False: failures are logged and recorded in recon_result.failures; the
         # cycle continues with whatever SPO triples can be recovered.
-        # HEALTH/RETRY SIGNAL (Mode 1): reconstruction is NO LONGER the content source
-        # for the merge input.  It is used ONLY to identify recall-miss keys (keys whose
+        # Reconstruction is used ONLY to identify recall-miss keys (keys whose
         # reconstructed SPO disagrees with registry-true SPO, or whose reconstruction
         # failed outright).  A recall miss is a retry signal; the key stays in the
         # training set with its registry-true content.  It does NOT drop the key.
@@ -4181,7 +4185,7 @@ class ConsolidationLoop:
                 len(recon_result.failures),
             )
 
-        # --- §3.3b: Compute recall-health/retry set BEFORE reset_graph() ---
+        # --- Compute recall-health/retry set BEFORE reset_graph() ---
         # This MUST run after reconstruct_graph (which produces recon_result.graph
         # as a SEPARATE nx.MultiDiGraph, distinct from self.merger.graph) and BEFORE
         # reset_graph() (which clears self.merger.graph).  The ordering is safe because
@@ -4228,25 +4232,26 @@ class ConsolidationLoop:
                 sorted(recall_miss_keys),
             )
 
-        # --- Stage 2: Reset keying graph + re-merge registry-true relations ---
-        # IMPORTANT: Reset the merger's keying surface to EMPTY before re-merging
-        # so Option-(a) provenance keying is unconditional.  Without the reset,
-        # pre-existing edges from ingest-time merges or a loaded graph would share
-        # the keying surface and the Case-1-adopt collision path could degrade
-        # provenance keying.
+        # --- Reset keying graph and re-merge registry-true relations ---
+        # Reset the merger's keying surface to EMPTY before re-merging so
+        # provenance keying is unconditional.  Without the reset, pre-existing
+        # edges from ingest-time merges or a loaded graph would share the keying
+        # surface and the Case-1-adopt collision path could degrade provenance
+        # keying.
         # Recurrence is now durable in bookkeeping — discarding the prior graph
         # loses nothing; the transient graph edge counts were the broken store.
         self.merger.reset_graph()
         logger.info(
-            "consolidate_interim_adapters: keying graph reset to empty for Stage-2 re-merge"
+            "consolidate_interim_adapters: keying graph reset to empty for the"
+            " reconstruct→re-merge pass"
         )
 
-        # --- §3.3a: Build merge input from registry-true SPO (NOT reconstruction) ---
+        # --- Build merge input from registry-true SPO (NOT reconstruction) ---
         # Each relation carries its indexed_key so the key travels through
-        # GraphMerger.merge() onto the merged edge (Part 1 provenance keying).
+        # GraphMerger.merge() onto the merged edge (provenance keying).
         #
         # additive=True (fold-only): the merger never removes a registered edge during
-        # Stage-2 re-merge.  All registry-true keys coexist after the fold regardless
+        # the re-merge.  All registry-true keys coexist after the fold regardless
         # of same-(s,p)/different-o conflicts; REPLACE cardinality is skipped.
         # Two registry keys sharing identical (s,p,o) STILL fire Case-1 (the merger
         # identity is correct given correct inputs), and the collapsed key is recorded
@@ -4284,8 +4289,8 @@ class ConsolidationLoop:
         # merged snapshot.  Self-gated; no-op when save_cycle_snapshots=False.
         self._debug_writer.on_fold_graph(self.merger, label="merged")
 
-        # --- Stage 2.5: Graph-level SOTA enrichment (Task #10) ---
-        # Runs AFTER the Stage-2 re-merge so enrichment operates on the populated
+        # --- Graph-level SOTA enrichment ---
+        # Runs AFTER the re-merge so enrichment operates on the populated
         # reconstructed graph (not an empty one).  Under production defaults the
         # pre-fold graph was always empty, so enrichment silently skipped every cycle
         # at the node_count<10 floor; now it fires on the reconstructed knowledge.
@@ -4312,11 +4317,11 @@ class ConsolidationLoop:
         if recon_relations:
             # --- Recurrence bump: Case-1 duplicate-SPO collapses ---
             # merger.reinforcements contains the surviving ik_key for every Case-1
-            # collision fired during the Stage-2 re-merge.  A collision means two
-            # active keys shared the same (s,p,o) — the incoming key drifts and the
-            # existing edge's key is the survivor.  The survivor's recurrence_count
-            # represents how many times this fact was independently extracted (and
-            # re-keyed) across sessions before this fold collapsed the duplicates.
+            # collision fired during the re-merge.  A collision means two active keys
+            # shared the same (s,p,o) — the incoming key drifts and the existing
+            # edge's key is the survivor.  The survivor's recurrence_count represents
+            # how many times this fact was independently extracted (and re-keyed)
+            # across sessions before this fold collapsed the duplicates.
             _reinforced: set[str] = set()
             for _rein_key in getattr(self.merger, "reinforcements", []):
                 if _rein_key and _rein_key not in _reinforced:
@@ -4332,8 +4337,8 @@ class ConsolidationLoop:
         # Runs AFTER the recurrence-bump step (so bump-triggered threshold crossings
         # are captured) and BEFORE tier_keyed is built (so the promoted key lands
         # in tier_keyed["semantic"] and is trained into the semantic adapter this
-        # fold).  Ordering invariant: reconstruction (Stage 1) ran while the key
-        # was still in episodic, so its weights were found there; only NOW is it
+        # fold).  Ordering invariant: reconstruction ran while the key was still in
+        # episodic, so its weights were found there; only NOW is it
         # moved to semantic.
         _inline_promoted = self._promote_mature_keys_inline()
         if _inline_promoted:
@@ -4344,7 +4349,7 @@ class ConsolidationLoop:
             )
 
         # tier_keyed is initialised here (before the pre-pass) so that both
-        # _mint_keys_for_keyless_edges and Stage-5 append to the same dict.
+        # _mint_keys_for_keyless_edges and the keyed-edge walk below append to the same dict.
         tier_keyed: dict[str, list[dict]] = {
             "episodic": [],
             "semantic": [],
@@ -4353,30 +4358,30 @@ class ConsolidationLoop:
 
         # --- Enrichment pre-pass: mint keys for keyless predicate-bearing edges ---
         # SOTA-enrichment adds edges to the merged graph without an ik_key attribute.
-        # Stage-5 would skip them (key is falsy → continue), causing every
+        # The keyed-edge walk below would skip them (key is falsy → continue), causing every
         # second-order enrichment fact to be silently dropped from the training set.
-        # This pre-pass walks the graph BEFORE Stage-5, mints a key for each such
+        # This pre-pass walks the graph BEFORE the keyed-edge walk, mints a key for each such
         # edge, registers it in the store, appends it to tier_keyed, and advances
         # the committed counter.  The edge's ik_key attribute is intentionally NOT
         # stamped (direct-append variant) to avoid the MultiDiGraph parallel-edge
-        # integer-key hazard; Stage-5's explicit ``if not key: continue`` guard
+        # integer-key hazard; the keyed-edge walk's explicit ``if not key: continue`` guard
         # (see below) makes the still-keyless post-pre-pass edges safe to skip.
         minted_by_tier = self._mint_keys_for_keyless_edges(tier_keyed)
 
-        # --- Stage 5: Assign per-tier keyed lists from merged-edge provenance ---
+        # --- Assign per-tier keyed lists from merged-edge provenance ---
         # Walk merger.graph.edges(data=True); per edge, read ik_key from the edge
-        # attribute (stamped by Stage 2 via _upsert_relation new-edge insertion or
-        # Case-1-adopt).  Tier derived from per-key bookkeeping relation_type +
-        # partition_relations (same shape as prior Stage 5; Stage 3/4 deleted because
-        # the key is now on the edge — no triple-identity matching required).
+        # attribute (stamped by the re-merge via _upsert_relation new-edge insertion
+        # or Case-1-adopt).  Tier derived from per-key bookkeeping relation_type +
+        # partition_relations (triple-identity matching is no longer required because
+        # the key is stamped directly on the edge by the merger).
         #
-        # When two active keys share an identical (s,p,o), the Stage-2 re-merge
-        # fires Case-1 on the second arriving edge: the existing edge keeps its
-        # ik_key (the surviving key) and the incoming relation.indexed_key is
-        # recorded in merger.collapsed (the deduplicated key).  Only ONE edge
-        # survives in the merged graph, so only ONE key appears in tier_keyed.
-        # The deduplicated key is absent from tier_keyed but its fact is preserved
-        # under the surviving twin — this is intended dedup, NOT data loss.
+        # When two active keys share an identical (s,p,o), the re-merge fires Case-1
+        # on the second arriving edge: the existing edge keeps its ik_key (the
+        # surviving key) and the incoming relation.indexed_key is recorded in
+        # merger.collapsed (the deduplicated key).  Only ONE edge survives in the
+        # merged graph, so only ONE key appears in tier_keyed.  The deduplicated
+        # key is absent from tier_keyed but its fact is preserved under the surviving
+        # twin — this is intended dedup, NOT data loss.
 
         if recall_miss_keys:
             logger.info(
@@ -4442,16 +4447,16 @@ class ConsolidationLoop:
                 }
             )
 
-        # Debug: snapshot the graph after Stage-5 keying loop (before Pass-2 mutates
-        # tier_keyed).  Self-gated; no-op when save_cycle_snapshots=False.
+        # Debug: snapshot the graph after the keyed-edge walk (before the floor-gate pass
+        # mutates tier_keyed).  Self-gated; no-op when save_cycle_snapshots=False.
         self._debug_writer.on_fold_graph(self.merger, label="keyed")
 
-        # --- Pass-2: Per-tier floor gate (must run BEFORE _all_keyed is computed) ---
-        # R4: Pass-2 inserts here (4101–4108), before _all_keyed so the post-park,
-        # post-graduation serve_assignment is the source for all downstream consumers:
-        # _all_keyed, last_seen refresh, and the Mode-1 soft-stale/drift partition.
+        # --- Per-tier floor gate (must run BEFORE _all_keyed is computed) ---
+        # This pass runs before _all_keyed is built so the post-park, post-graduation
+        # serve_assignment is the source for all downstream consumers: _all_keyed,
+        # last_seen refresh, and the soft-stale/drift partition.
         #
-        # Two-map decoupling (v3 universal-donor redesign):
+        # Two-map decoupling:
         #   serve_assignment — which tier SERVES/RECALLS each key (registry + simhash
         #                      owner).  This IS the returned "tier_keyed" layout.
         #   train_assignment — what each adapter TRAINS on.  For fast-start graduating
@@ -4466,11 +4471,12 @@ class ConsolidationLoop:
         #   _promote_mature_keys_inline store.move()s keys to "semantic" WITHOUT training
         #   the semantic adapter.  After promotion, store.tier_for_active_key(key) ==
         #   "semantic" even though the WEIGHTS are still in episodic.  Using the store
-        #   tier for liveness would wrongly exclude semantic from fast-start (the v2 bug,
-        #   §A.5 of the redesign plan).  The correct signal is whether the tier's
-        #   output_dir has any saved adapter slot written by a prior _save_adapters call.
-        #   A tier with NO disk slot was NEVER trained → first-cross graduation applies.
-        #   A tier WITH any disk slot was trained before → steady-state train normally.
+        #   tier for liveness would wrongly exclude semantic from fast-start (the
+        #   weights-vs-store-tier conflation bug).  The correct signal is whether the
+        #   tier's output_dir has any saved adapter slot written by a prior
+        #   _save_adapters call.  A tier with NO disk slot was NEVER trained →
+        #   first-cross graduation applies.  A tier WITH any disk slot was trained
+        #   before → steady-state train normally.
         #
         # Episodic is the parking lot and is exempt from parking-into-episodic.
         # Episodic's own floor (whole-fold accumulate) is handled by the
@@ -4493,7 +4499,7 @@ class ConsolidationLoop:
             return any(entry.is_dir() and _isn(entry.name) for entry in tier_dir.iterdir())
 
         # serve_assignment: repurpose tier_keyed as the served layout after Pass-2.
-        # The variable is renamed at the end of the pass; upstream Stage-5 code keeps
+        # The variable is renamed at the end of the pass; upstream keyed-edge-walk code keeps
         # tier_keyed as its local name until this rename point so no callers change.
         for _pt in ("semantic", "procedural"):
             _pt_entries = tier_keyed[_pt]
@@ -4562,8 +4568,8 @@ class ConsolidationLoop:
 
         # Rename tier_keyed to serve_assignment at the end of Pass-2 so all
         # downstream consumers read the served layout (not the training layout).
-        # The local name tier_keyed is reused in Stage-5 above to avoid upstream
-        # churn; from this point on only serve_assignment is read by registry,
+        # The local name tier_keyed is reused in the keyed-edge walk above to avoid
+        # upstream churn; from this point on only serve_assignment is read by registry,
         # drift, and finalize consumers.
         serve_assignment = tier_keyed
 
@@ -4590,7 +4596,7 @@ class ConsolidationLoop:
         # Debug: persist serve/train tier assignment maps.  Self-gated.
         self._debug_writer.on_fold_assignments(serve_assignment, train_assignment)
 
-        # --- §4.8.iii: capture per-tier active_before for tier_delta (train mode) ---
+        # --- Capture per-tier active_before for the tier_delta record ---
         # Must run BEFORE the whole-fold accumulate guard (which may early-return
         # without building tier_delta) and BEFORE training mutates the store so
         # the "before" snapshot is accurate.  The matching "active_after" snapshot
@@ -4619,10 +4625,10 @@ class ConsolidationLoop:
                 if len(serve_assignment[t]) > 0
             }
             # Defensive cleanup: remove any backup adapter left by a prior aborted
-            # fold.  The accumulating early-return fires BEFORE this fold's Step-5
+            # fold.  The accumulating early-return fires BEFORE this fold's per-tier
             # backup-creation loop, so there are no new backups to clean up here —
             # only pre-existing leftovers from an earlier run that crashed between
-            # backup-creation and Step-7 commit.
+            # backup-creation and the success-commit cleanup.
             for _bname in ("episodic_backup", "semantic_backup", "procedural_backup"):
                 if _bname in self.model.peft_config:
                     self.model.delete_adapter(_bname)
@@ -4678,14 +4684,14 @@ class ConsolidationLoop:
         active_keys = self.store.all_active_keys()
         _drift_keys = [k for k in active_keys if k not in _all_keyed]
 
-        # --- 3-way drift partition + soft-stale write-back (§3.3d) ---
+        # --- 3-way drift partition + soft-stale write-back ---
         # merger.collapsed records INCOMING keys that were deduplicated away in a
-        # Case-1 duplicate-SPO collapse.  Under Mode 1 the merge input is
-        # registry-true, so a Case-1 collapse means TWO registry keys genuinely
-        # share the same (s,p,o).  The discarded key is SOFT-STALED: registry entry
-        # retained, simhash retained, excluded from training.
+        # Case-1 duplicate-SPO collapse.  Because the merge input is registry-true,
+        # a Case-1 collapse means TWO registry keys genuinely share the same (s,p,o).
+        # The discarded key is SOFT-STALED: registry entry retained, simhash
+        # retained, excluded from training.
         #
-        # LOAD-BEARING ORDERING (§3.4a): resolve tier BEFORE flipping the key stale.
+        # LOAD-BEARING ORDERING: resolve tier BEFORE flipping the key stale.
         # KeyRegistry.stale() removes the key from _active_keys, so
         # tier_for_active_key() called AFTER the flip returns None.
         _collapsed_set: set[str] = set(getattr(self.merger, "collapsed", []))
@@ -4697,9 +4703,9 @@ class ConsolidationLoop:
         drift_deduplicated: list[str] = []
         drift_orphan: list[str] = []
         # drift_genuine_loss: reconstruction-failed non-duplicate keys now in the
-        # recall-miss/retry set.  Under Mode 1 these stay in recon_relations so
-        # they are retrained; they should trend to ~0.  Kept as a counter for
-        # monitoring but they are NOT dropped.
+        # recall-miss/retry set.  Because the merge input is registry-true, these
+        # keys stay in the training set so they are retrained; they should trend to
+        # ~0.  Kept as a counter for monitoring but they are NOT dropped.
         drift_genuine_loss: list[str] = []
         # drift_intended_removal: keys removed by the merger for a known, intentional
         # reason (enrichment same_as contraction, contradiction resolution).  These
@@ -4724,7 +4730,7 @@ class ConsolidationLoop:
                     _dk_simhash = self.store.simhash(_dk_tier, _dk)
                 # Flip to stale in the live in-memory registry.
                 self.store.discard_keys([_dk], mode="stale")
-                # Record for finalize plumbing (§3.4a).
+                # Record for the finalize step that rebuilds registries with stale-seeding.
                 if _dk_tier is not None:
                     _stale_rec = {"stale_cycles": 0}
                     if _dk_simhash is not None:
@@ -4745,7 +4751,7 @@ class ConsolidationLoop:
             else:
                 _dk_bk = self.store.bookkeeping_for_key(_dk)
                 _dk_entry = self.store.get(_dk)
-                # W4 (§3.3c): distinguish hydration-miss from true orphan.
+                # Distinguish hydration-miss from true orphan.
                 # Orphan: entry is present but carries empty SPO (all-empty test).
                 # Hydration-miss: entry is None but bookkeeping carries SPO — the
                 # key is live; the cache merely failed to hydrate (boot_degraded).
@@ -4847,10 +4853,11 @@ class ConsolidationLoop:
             )
 
         # Gate the WARNING on genuine_loss only — dedup, orphan, and intended_removal
-        # are expected/normal.  Under Mode 1 genuine_loss should trend to ~0
-        # (registry-true merge input means a recall miss keeps the key in training).
-        # genuine_loss now strictly covers reconstruction failure or hydration-miss —
-        # enrichment/contradiction removals are captured in drift_intended_removal.
+        # are expected/normal.  genuine_loss should trend to ~0 because the registry-
+        # true merge input means a recall miss keeps the key in training rather than
+        # dropping it.  genuine_loss strictly covers reconstruction failure or
+        # hydration-miss — enrichment/contradiction removals are captured in
+        # drift_intended_removal.
         if drift_genuine_loss_count > 0:
             logger.warning(
                 "consolidate_interim_adapters: %d genuine reconstruction loss(es) — "
@@ -4881,7 +4888,7 @@ class ConsolidationLoop:
         # Self-gated.
         self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
-        # --- Step 4: Build per-tier TrainingJob objects ---
+        # --- Build per-tier TrainingJob objects ---
         # Must be constructed before any tier rebuild begins so that
         # inference_fallback_adapter is set to the backup adapter name.
         # Because the public train_adapter (not BackgroundTrainer._train_adapter)
@@ -4919,11 +4926,12 @@ class ConsolidationLoop:
             ),
         }
 
-        # --- Step 5: Per-tier fresh-adapter rebuild ---
-        # Load backup adapters (PEFT load-or-skip idempotency: NC-2).
+        # --- Per-tier fresh-adapter rebuild ---
+        # Load backup adapters (PEFT load-or-skip idempotency).
         # In the absence of a real encrypted backup dir we skip the load
         # and fall back to the live main adapters as the de-facto backup.
-        # Production systems should implement the encrypted backup path (Step 7d).
+        # Production systems should implement an encrypted backup path for
+        # durable out-of-process backup.
         #
         # Each backup MUST be created from its source tier's config — the tiers
         # have heterogeneous LoRA shapes (procedural targets attn+mlp,
@@ -5157,7 +5165,7 @@ class ConsolidationLoop:
                         # VRAM and weights are consistent with the pre-cycle
                         # baseline, then raise AbortedDuringConsolidation so the
                         # outer caller (app.py _run_full_cycle) can log and skip
-                        # Step 6 finalize.
+                        # the atomic finalize step.
                         logger.info(
                             "consolidate_interim_adapters: training aborted on tier %s "
                             "— restoring all tiers from backups",
@@ -5207,12 +5215,12 @@ class ConsolidationLoop:
         if trainer is not None:
             trainer._set_is_training(False)
 
-        # --- Step 6: Atomic finalize ---
+        # --- Atomic finalize ---
         # Invariant: registry rewrite FIRST, Router.reload() LAST.
         # The finalize block runs purely as registry / disk / PEFT / router ops.
         # No _train_adapter() call, no HF Trainer-driven routine may appear here.
 
-        # 6a. Registry rewrite (MUST be first).
+        # Registry rewrite (MUST be first).
         # Rebuild per-tier registries from the authoritative tier_keyed layout:
         # each tier gets a fresh KeyRegistry containing only the keys that belong
         # to it after re-derivation from the cumulative graph.  Interim-tier
@@ -5231,7 +5239,7 @@ class ConsolidationLoop:
                     # trained on the augmented set) cannot enter episodic's registry
                     # or inflate the recall-gate log.  For semantic/procedural the
                     # intersection is a no-op (they trained on their own serve set);
-                    # applying it uniformly is the clean invariant (§D of the plan).
+                    # applying it uniformly is the clean invariant.
                     _serve_keys = {e["key"] for e in serve_assignment[_tier]}
                     passing_sets_by_tier[_tier] = {
                         r["key"] for r in _lpk if r["exact_match"]
@@ -5261,7 +5269,8 @@ class ConsolidationLoop:
                     _reg_path,
                 )
 
-        # 6a-bis. DURABLE MAIN-WEIGHT PERSIST (crash-window guard — MUST precede 6b).
+        # Persist + verify the merged main-tier weights BEFORE purging the interim slots
+        # (crash-window guard — MUST precede the interim purge below).
         # The interim slot dirs hold the ONLY durable copy of the folded
         # knowledge until the rebuilt main weights are written+verified to disk.
         # _save_adapters() writes the main adapter weights + manifest + registry
@@ -5294,7 +5303,7 @@ class ConsolidationLoop:
                 raise
             logger.info("consolidate_interim_adapters: merged main weights persisted+verified")
 
-        # W2 (§3.4.6): increment stale_cycles AFTER the durable write.
+        # Increment stale_cycles AFTER the durable write.
         # A fold that aborts before the durable write does NOT advance decay on
         # un-persisted stale sets.  A key staled in this fold has stale_cycles=0
         # at the durable write; stale_cycles=1 after this call (unobservable until
@@ -5310,11 +5319,11 @@ class ConsolidationLoop:
                 sum(len(v) for v in soft_stale_by_tier.values()),
             )
 
-        # 6b. Interim purge — single call covers both PEFT delete AND on-disk rmtree.
+        # Interim purge — single call covers both PEFT delete AND on-disk rmtree.
         unload_interim_adapters(self.model, self.output_dir)
         logger.info("consolidate_interim_adapters: interim adapters unloaded")
 
-        # 6c. Router reload (MUST be last).
+        # Router reload (MUST be last).
         if router is not None:
             try:
                 router.reload()
@@ -5322,8 +5331,8 @@ class ConsolidationLoop:
             except Exception:
                 logger.exception("consolidate_interim_adapters: router reload failed")
 
-        # --- Step 7: Success commit ---
-        # Unload backup adapters (the three mains remain loaded throughout).
+        # --- Success commit: unload backup adapters ---
+        # The three main adapters remain loaded throughout; only the backups are cleaned up.
         for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
             if backup_name in self.model.peft_config:
                 self.model.delete_adapter(backup_name)
@@ -5338,7 +5347,7 @@ class ConsolidationLoop:
 
             _sw2(self.model, "episodic")
 
-        # --- §4.8.iii: per-tier delta for train mode ---
+        # --- Per-tier delta for train mode ---
         # Build the tier_delta record from the before-snapshot + serve_assignment
         # (active after) + minted_by_tier from _mint_keys_for_keyless_edges.
         # staled_by_reason is derived from merger.removal_ledger via _build_tier_delta
@@ -5372,8 +5381,8 @@ class ConsolidationLoop:
             # 4-way breakdown — callers that want accurate data-loss signal use these.
             "drift_deduplicated": drift_deduplicated_count,
             "drift_orphan": drift_orphan_count,
-            # Under Mode 1 genuine_loss = retry keys (not dropped); should trend to ~0.
-            # Strictly covers reconstruction failure / hydration-miss only.
+            # genuine_loss = reconstruction-failure / hydration-miss keys (not dropped;
+            # retrained); should trend to ~0 as the store stabilises.
             "drift_genuine_loss": drift_genuine_loss_count,
             # Merger-recorded intentional removals (enrichment, contradiction).
             # RETAIN-ONLY: keys are not staled, not dropped, not trained (absorbed).

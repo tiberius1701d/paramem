@@ -58,8 +58,8 @@ _MOUNT_INITIAL_SETTLE_SECONDS: float = 10.0
 # Errors that indicate corrupted PyTorch CUDA state — retrying is futile.
 _CUDA_TERMINAL_MARKERS = ("INTERNAL ASSERT FAILED", "CUDACachingAllocator")
 
-# Training-phase exception markers (WARNING W2 — logged loudly so
-# mis-categorisation is immediately visible in the journal).
+# Training-phase exception markers — logged loudly at WARNING level so
+# mis-categorisation is immediately visible in the journal.
 _TRAINING_MARKERS = (
     "train_loss",
     "nan",
@@ -120,16 +120,15 @@ class GateResult:
 
 
 # ---------------------------------------------------------------------------
-# Phase-aware exception categorisation (WARNING W2)
+# Phase-aware exception categorisation
 # ---------------------------------------------------------------------------
 
 
 def _is_training_marker(exc: BaseException) -> bool:
     """Return True when the exception originates from the training phase.
 
-    WARNING W2 — logs at WARNING level so mis-categorisation is visible
-    in the journal and does not silently route a training exception to the
-    extraction gate.
+    Logs at WARNING level so mis-categorisation is visible in the journal
+    and does not silently route a training exception to the extraction gate.
 
     Parameters
     ----------
@@ -155,7 +154,7 @@ def _is_training_marker(exc: BaseException) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Deterministic registry sampling (spec L382)
+# Deterministic registry sampling
 # ---------------------------------------------------------------------------
 
 
@@ -164,9 +163,10 @@ def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") 
 
     The seed is derived from the first 16 hex chars of
     ``SHA-256(registry_content + seed_suffix)``, which is a 64-bit integer.
-    Same registry content and same suffix always produce the same list
-    (WARNING W1 — the 64-bit seed space is documented; callers that need
-    independence between runs must supply a distinct ``seed_suffix``).
+    Same registry content and same suffix always produce the same list.
+    Note: the 64-bit seed space means collisions are possible across very large
+    key populations; callers that need independence between runs must supply a
+    distinct ``seed_suffix``.
 
     Parameters
     ----------
@@ -174,7 +174,7 @@ def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") 
         Raw bytes of the registry JSON file.
     seed_suffix:
         Bytes appended before hashing to produce an independent sample.
-        Use ``b"|retry"`` for the re-roll (spec L383).
+        Use ``b"|retry"`` for the re-roll (independent second sample).
 
     Returns
     -------
@@ -205,7 +205,7 @@ def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") 
 def _resolve_adapter_mount_path(trial_adapter_dir: Path) -> Path:
     """Resolve the directory PEFT ``load_adapter`` should be pointed at.
 
-    Trial training writes a Slice-3a per-adapter manifest layout::
+    Trial training writes a per-adapter manifest layout with kind subdirectories::
 
         trial_adapter/<kind>/<YYYYMMDD-HHMMSS>/adapter_model.safetensors
 
@@ -436,11 +436,11 @@ def _settle_cuda_and_load_adapter(model: Any, mount_path: Path) -> None:
 def _unmount_trial_probe(model: Any, mount_state: dict) -> None:
     """Remove the trial probe adapter from the model.
 
-    WARNING W3 — if ``"trial_probe"`` is the sole adapter loaded (edge
-    case: server started with no live adapters), deleting it would leave
-    PeftModel with no active config and a subsequent ``create_adapter``
-    would crash with ``KeyError``.  In that case we skip the delete and
-    log a WARN, leaving the sole adapter in place.
+    If ``"trial_probe"`` is the sole adapter loaded (edge case: server
+    started with no live adapters), deleting it would leave PeftModel with
+    no active config and a subsequent ``create_adapter`` would crash with
+    ``KeyError``.  In that case we skip the delete and log a WARN, leaving
+    the sole adapter in place.
 
     Always restores the previously-active adapter when it is safe to do so.
 
@@ -489,7 +489,7 @@ def _unmount_trial_probe(model: Any, mount_state: dict) -> None:
         loaded_adapters = list(peft_config.keys())
 
         if len(loaded_adapters) <= 1:
-            # WARNING W3 — sole adapter; skip delete to avoid broken PeftModel.
+            # Sole adapter; skip delete to avoid broken PeftModel (see docstring).
             logger.warning(
                 "gates: skipping delete_adapter('%s') — it is the sole loaded adapter; "
                 "leaving in place to preserve PeftModel integrity (CLAUDE.md rule).",
@@ -589,7 +589,7 @@ def _gate_2_training(
     ``status=="complete"`` but adapter files are absent.
 
     Note: ``"no_facts"`` is SKIPPED (not PASS) because no training was
-    attempted — the adapter is not touched in that path (REQUIRED FIX 2).
+    attempted — the adapter is not touched in that path.
 
     Parameters
     ----------
@@ -883,7 +883,7 @@ def _gate_4_recall_check(
     """Gate 4 — live-registry cross-adapter recall check.
 
     Samples :data:`GATE_4_SAMPLE_SIZE` keys from the current live registry
-    deterministically (spec L382) and probes the trial adapter's recall.
+    deterministically and probes the trial adapter's recall.
     Threshold: ≥ 90% (≥ 18/20).
 
     One re-roll is permitted on first-sample failure: re-sample with
@@ -894,9 +894,9 @@ def _gate_4_recall_check(
     :data:`GATE_4_MIN_REGISTRY_SIZE` keys, or when ``trial_adapter_dir`` has
     no files (NO_NEW_SESSIONS — no trial adapter exists).
 
-    GUARDRAIL G1 — the ``"sampled_keys"`` field in ``metrics`` is the deciding
-    sample list.  The comparison report uses the same list so the same 20 keys
-    appear in both the hard-gate result and the report.
+    The ``"sampled_keys"`` field in ``metrics`` is the deciding sample list.
+    The comparison report uses the same list so the same 20 keys appear in
+    both the hard-gate result and the report.
 
     Parameters
     ----------
@@ -922,10 +922,10 @@ def _gate_4_recall_check(
         Gate 4 result with full metrics dict.
     """
     # --- Precondition: live registry must exist and have enough keys ---
-    # SKIP on missing file (legitimate fresh-install OR pre-Slice-3a layout
-    # without key_metadata.json). The CRITICAL #1 fix (2026-04-23) isolates
-    # trial registry writes to state/trial_registry/, so trial-induced
-    # corruption of the live file is no longer a concern.
+    # SKIP on missing file (legitimate fresh-install OR a deployment that
+    # predates per-tier registry files). Trial registry writes are isolated
+    # to state/trial_registry/ (2026-04-23), so trial-induced corruption of
+    # the live file is no longer a concern.
     if not live_registry_path.exists():
         return GateResult(
             gate=4,
@@ -933,7 +933,7 @@ def _gate_4_recall_check(
             status="skipped",
             reason=(
                 f"live registry file not found: {live_registry_path} "
-                "— treating as <20 keys (fresh install or pre-Slice-3a layout)"
+                "— treating as <20 keys (fresh install or legacy layout without per-tier registry)"
             ),
             metrics=None,
         )
@@ -1021,7 +1021,7 @@ def _gate_4_recall_check(
         metrics: dict[str, Any] = {
             "recalled": first_recalled,
             "sampled": len(first_keys),
-            "sampled_keys": first_keys,  # GUARDRAIL G1
+            "sampled_keys": first_keys,  # deciding sample (matches comparison report)
             "seed": first_seed,
             "retried": False,
             "warnings": [],
@@ -1045,7 +1045,7 @@ def _gate_4_recall_check(
         metrics = {
             "recalled": retry_recalled,
             "sampled": len(retry_keys),
-            "sampled_keys": retry_keys,  # GUARDRAIL G1 — deciding sample
+            "sampled_keys": retry_keys,  # deciding sample (matches comparison report)
             "seed": retry_seed,
             "retried": True,
             "warnings": ["cluster variance — first sample below threshold, retry passed"],
@@ -1065,7 +1065,7 @@ def _gate_4_recall_check(
     metrics = {
         "recalled": retry_recalled,
         "sampled": len(retry_keys),
-        "sampled_keys": retry_keys,  # GUARDRAIL G1 — deciding sample
+        "sampled_keys": retry_keys,  # deciding sample (matches comparison report)
         "seed": retry_seed,
         "retried": True,
         "warnings": [],
@@ -1122,8 +1122,9 @@ def evaluate_gates(
         Tokenizer matching the loaded model.
     trial_adapter_dir:
         Path to the trial adapter output directory.  Passed directly from
-        ``_state["migration"]["trial"]["trial_adapter_dir"]`` (REQUIRED FIX 1
-        — not resolved via ``find_live_slot``).
+        ``_state["migration"]["trial"]["trial_adapter_dir"]`` — not resolved
+        via ``find_live_slot``, so the trial path is never confused with a
+        live slot.
     live_registry_path:
         Path to the current live ``registry.json`` (from pre-trial
         ``config.registry_path``).

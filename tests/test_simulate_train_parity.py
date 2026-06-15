@@ -218,24 +218,24 @@ def _patches_for_train_mode():
 
 
 # ---------------------------------------------------------------------------
-# Change J — Parity tests: simulate vs train mode
+# Parity tests: simulate vs train mode
 # ---------------------------------------------------------------------------
 
 
 class TestSimulateTrainParity:
     """run_consolidation_cycle in simulate and train modes must converge.
 
-    Gaps covered:
-      - Gap 5: speaker_id default tagging — every entry gets the caller's id
+    Covered invariants:
+      - speaker_id default tagging — every entry gets the caller's id
         when none was present on the relation.
-      - Gap 6: first_seen_cycle preservation — re-running the same relations
+      - first_seen_cycle preservation — re-running the same relations
         a second time leaves existing entries' first_seen_cycle unchanged.
-      - Gap 4: per-tier scope — active_keys_in_tier returns identical sorted
+      - per-tier scope — active_keys_in_tier returns identical sorted
         key lists in both modes.
       - Equality: tier_simhashes, store entries, and on-disk
         indexed_key_registry bytes are bytewise-equal between modes.
 
-    Gap 1 (enrichment) is verified separately in test_graph_enrichment.py;
+    Graph enrichment parity is verified separately in test_graph_enrichment.py;
     the merge flag is disabled here to keep the comparison deterministic.
     """
 
@@ -273,8 +273,8 @@ class TestSimulateTrainParity:
                 stamp=_STAMP,
             )
 
-    def test_gap5_speaker_id_default_applied_both_modes(self, loop_sim, loop_train, tmp_path):
-        """Gap 5: entries missing speaker_id receive the caller's id in both modes.
+    def test_speaker_id_default_applied_both_modes(self, loop_sim, loop_train, tmp_path):
+        """Entries missing speaker_id receive the caller's id in both modes.
 
         Relations without a speaker_id key receive the default (_SPEAKER_ID).
         Relations with an explicit non-empty speaker_id preserve it.
@@ -318,8 +318,8 @@ class TestSimulateTrainParity:
                         f"Explicit empty speaker_id overwritten in {key}: {entry['speaker_id']!r}"
                     )
 
-    def test_gap6_first_seen_cycle_preserved_on_second_run(self, loop_sim, loop_train, tmp_path):
-        """Gap 6: existing entries retain first_seen_cycle on re-run.
+    def test_first_seen_cycle_preserved_on_second_run(self, loop_sim, loop_train, tmp_path):
+        """Existing entries retain first_seen_cycle on re-run.
 
         Run the same fixture twice on each loop using the SAME stamp so that
         _resolve_target_slot returns the same adapter slot and
@@ -328,7 +328,7 @@ class TestSimulateTrainParity:
         cycle 2.
 
         Using the same stamp is deliberate: this exercises the preservation
-        branch (not just the fresh-slot path), matching the intent of Gap 6.
+        branch (not just the fresh-slot path) that retains first_seen_cycle.
         """
         self._run_sim(loop_sim)
         self._run_train(loop_train)
@@ -400,8 +400,8 @@ class TestSimulateTrainParity:
             f"Train: cycle-1 keys dropped after re-run: {train_keys_1_all - train_keys_2}"
         )
 
-    def test_gap4_active_keys_in_tier_match(self, loop_sim, loop_train):
-        """Gap 4: active_keys_in_tier returns identical sorted lists in both modes."""
+    def test_active_keys_in_tier_match(self, loop_sim, loop_train):
+        """active_keys_in_tier returns identical sorted lists in both modes."""
         adapter_name = f"episodic_interim_{_STAMP}"
         self._run_sim(loop_sim)
         self._run_train(loop_train)
@@ -465,7 +465,7 @@ class TestSimulateTrainParity:
         ``adapter_name`` (e.g. ``episodic_interim_<stamp>``), not under the
         bare tier label (``"episodic"``).
 
-        Before fix (R1): ``tier_reg = loop.store.registry(tier)`` read the
+        Before this fix: ``tier_reg = loop.store.registry(tier)`` read the
         empty main-tier registry while the cycle's freshly assigned keys lived
         in ``store["episodic_interim_<stamp>"]``.  The on-disk file held
         bytes that hashed correctly against the empty registry but contained
@@ -506,7 +506,7 @@ class TestSimulateTrainParity:
     def test_procedural_graph_json_written_in_simulate_mode(self, loop_sim, tmp_path):
         """Procedural simulate-mode cycle writes non-empty graph.json.
 
-        Regression for C1: commit_tier_slot was called with all_keyed=[]
+        Regression: commit_tier_slot was called with all_keyed=[]
         for the procedural tier, causing an empty graph.json to overwrite prior
         content.  After the fix, the simulate branch re-projects from loop.store
         when all_keyed is empty and the tier has entries.
@@ -525,7 +525,7 @@ class TestSimulateTrainParity:
         entries = list(iter_entries(graph))
         assert len(entries) > 0, (
             "Procedural graph.json is empty after simulate cycle — "
-            "C1 regression: all_keyed=[] caused empty graph overwrite"
+            "regression: all_keyed=[] caused empty graph overwrite"
         )
 
         # Verify the expected procedural keys are present.
@@ -537,8 +537,8 @@ class TestSimulateTrainParity:
     def test_slot_layout_train_has_manifest_simulate_has_graph(self, loop_sim, loop_train):
         """Slot layout assertion: train slots have meta.json; simulate slots have graph.json.
 
-        After C6 + C2, commit_tier_slot (train) raises on manifest failure rather
-        than saving without one — so any train slot that lands on disk has a manifest.
+        commit_tier_slot (train) raises on manifest failure rather than saving
+        without one — so any train slot that lands on disk has a manifest.
         Simulate slots have graph.json and no safetensors.
         """
         from paramem.memory.interim_adapter import adapter_slot_root_for_name
@@ -563,8 +563,8 @@ class TestSimulateTrainParity:
             f"Train slot missing indexed_key_registry.json at {train_slot}"
         )
 
-    def test_gap9_active_adapter_restored_after_cycle(self, loop_sim, loop_train):
-        """Gap 9: model.set_adapter("episodic") is called at end of cycle in both modes.
+    def test_active_adapter_restored_after_cycle(self, loop_sim, loop_train):
+        """model.set_adapter("episodic") is called at end of cycle in both modes.
 
         After run_consolidation_cycle, the active adapter must be restored to
         "episodic" (step 13 of the internal flow).  This test uses a MagicMock
@@ -782,7 +782,7 @@ class TestProbeKeysFromGraph:
 
 
 # ---------------------------------------------------------------------------
-# N1 — TestConsolidateInterimGraphs
+# TestConsolidateInterimGraphs
 # ---------------------------------------------------------------------------
 
 
@@ -792,7 +792,7 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     Attributes set:
       - ``output_dir`` — used as the adapter_dir root.
       - ``graph_enrichment_enabled`` — False so ``_run_graph_enrichment`` no-ops.
-      - ``merger`` — a model-free ``GraphMerger`` so the §4.6b merger topology
+      - ``merger`` — a model-free ``GraphMerger`` so the additive-merge topology
         can run without a GPU or loaded model (``additive=True`` skips the only
         model-gated branch; ``merger.model=None`` is the production-correct
         configuration for simulate mode).
@@ -929,7 +929,7 @@ class TestConsolidateInterimGraphs:
     def test_overlapping_triples_deduplicated_in_main_graph(self, tmp_path):
         """Two slots sharing the same SPO triple dedup to a single edge via GraphMerger.
 
-        After §4.6b the simulate merge routes through ``GraphMerger.merge(additive=True)``.
+        The simulate merge routes through ``GraphMerger.merge(additive=True)``.
         When the same SPO (and same ik_key) arrives from both the main graph and an
         interim slot, the merger's Case-1 (identical SPO) fires and produces exactly ONE
         surviving edge.  The merged graph must therefore have ``number_of_edges() == 1``
@@ -987,11 +987,10 @@ class TestConsolidateInterimGraphs:
     def test_result_contains_tier_delta(self, tmp_path):
         """Result dict contains 'tier_delta' with episodic before/after counts.
 
-        §4.8.iii observability hook: both the scheduled and housekeeping paths
-        emit tier_delta.  For the simulate path staled_by_reason is {} in this
-        fixture because no dedup collapse occurs (the single interim slot has a
-        unique triple) and the simulate-mode store has no entries for
-        removal_ledger attribution.
+        Both the scheduled and housekeeping paths emit tier_delta.  For the
+        simulate path staled_by_reason is {} in this fixture because no dedup
+        collapse occurs (the single interim slot has a unique triple) and the
+        simulate-mode store has no entries for removal_ledger attribution.
         """
 
         loop = _make_bare_loop(tmp_path)
@@ -1026,9 +1025,9 @@ class TestConsolidateInterimGraphs:
         """housekeeping=True with no interims and empty main graph: persists the empty
         merged graph to disk and returns tiers_rebuilt=['episodic'].
 
-        The B-SIMULATE gate (§4.5.3): housekeeping=True bypasses the empty-interim
-        early-return so the groomed (empty) graph is written back to disk.  This is
-        the simulate counterpart of gate (d) in the train mode.
+        housekeeping=True bypasses the empty-interim early-return so the groomed
+        (empty) graph is written back to disk.  This is the simulate counterpart
+        of the housekeeping gate in the train mode.
         """
 
         loop = _make_bare_loop(tmp_path)
@@ -1083,7 +1082,8 @@ class TestConsolidateInterimGraphs:
         mock_cig.assert_called_once_with(housekeeping=True)
 
     def test_cross_slot_variant_collapse_in_simulate(self, tmp_path):
-        """TEST GAP 2 (§7.2 step 5 / §6.3): cross-slot variant-pair collapse in simulate.
+        """Cross-slot variant-pair collapse: two slots with different surface forms
+        for the same canonical triple merge to a single edge.
 
         Seeds two interim graph.json slots whose surfaces differ but canonicalize
         to the same identity (subject "Alice" vs "alice", object "Acme Corp" vs
@@ -1091,7 +1091,7 @@ class TestConsolidateInterimGraphs:
 
         (a) The variants COLLAPSE to a single edge in the persisted main graph.json
             (canonical() node identity + Case-1 dedup in the GraphMerger topology,
-            §4.S symmetry satisfied end-to-end).
+            simulate/train parity satisfied end-to-end).
         (b) The removal_ledger carries a "dedup" entry for the discarded variant key
             with pre_surfaces recording the differing incoming and surviving surfaces
             (evidence that the dedup was caused by a surface variant, not a genuine
@@ -1273,14 +1273,14 @@ class TestConsolidateInterimGraphs:
 
 
 # ---------------------------------------------------------------------------
-# N3 — TestBuildTierDelta (regression: unified staled_by_reason + minted)
+# TestBuildTierDelta (regression: unified staled_by_reason + minted)
 # ---------------------------------------------------------------------------
 
 
 class TestBuildTierDelta:
     """Regression tests for :meth:`ConsolidationLoop._build_tier_delta`.
 
-    Verifies the contract stated in §4.8.iii:
+    Verifies the contract:
 
     - ``staled_by_reason`` total across all tiers == ledger entries attributable
       to a tier (each removed key reflected in exactly one tier, no double-count
@@ -1481,8 +1481,8 @@ class TestBuildTierDelta:
         (no KeyRegistry mutation in simulate), so tier_of returns None for the
         collapsed key — boundary skip → staled_by_reason stays {}.
 
-        This is the §4.S parity assertion: staled_by_reason is {} for simulate
-        not because grooming is skipped, but because attribution is unavailable.
+        staled_by_reason is {} for simulate not because grooming is skipped,
+        but because attribution is unavailable (simulate-mode store has no entries).
         """
         loop = _make_bare_loop(tmp_path)
 
@@ -1518,7 +1518,7 @@ class TestBuildTierDelta:
 
 
 # ---------------------------------------------------------------------------
-# N2 — TestBackgroundTrainerClose
+# TestBackgroundTrainerClose
 # ---------------------------------------------------------------------------
 
 
@@ -1644,7 +1644,7 @@ class TestBackgroundTrainerClose:
 
 
 # ---------------------------------------------------------------------------
-# N2b — TestConsolidationLoopRelease
+# TestConsolidationLoopRelease
 # ---------------------------------------------------------------------------
 
 
@@ -1715,7 +1715,7 @@ class TestConsolidationLoopRelease:
 
 
 # ---------------------------------------------------------------------------
-# N3 — TestCommitTierSlotCleanup
+# TestCommitTierSlotCleanup
 # ---------------------------------------------------------------------------
 
 
@@ -1944,10 +1944,9 @@ class TestDebugSnapshotIntegration:
 class TestDebugSnapshotOnTierDelta:
     """``DebugSnapshotWriter.on_tier_delta`` persists the per-tier delta record.
 
-    §4.8.iii observability hook: both the scheduled fold and the housekeeping
-    endpoint emit a ``tier_delta.json`` under ``<debug_base>/fold/`` so
-    operators can see before/after/staled/minted counts without parsing
-    raw adapter weight files.
+    Both the scheduled fold and the housekeeping endpoint emit a
+    ``tier_delta.json`` under ``<debug_base>/fold/`` so operators can see
+    before/after/staled/minted counts without parsing raw adapter weight files.
     """
 
     def test_on_tier_delta_writes_file_when_snapshots_enabled(self, tmp_path) -> None:

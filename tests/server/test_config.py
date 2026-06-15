@@ -611,7 +611,7 @@ class TestMakeTrainingConfigPropagation:
 
 
 class TestTierFloorConfigPlumbing:
-    """Item 1 (plan §9): min_tier_key_floor and tier_fast_start wire through
+    """min_tier_key_floor and tier_fast_start wire through
     ConsolidationScheduleConfig → consolidation_config property → ConsolidationConfig.
     """
 

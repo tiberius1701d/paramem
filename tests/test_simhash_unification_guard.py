@@ -34,7 +34,7 @@ _PRIVATE_ACCESSOR_ALLOWLIST = frozenset(
     {
         "paramem/memory/store.py",  # MemoryStore.tier_simhashes dispatcher
         "paramem/training/key_registry.py",  # method definitions
-        "paramem/backup/integrity.py",  # cross-check tool (plan §8 carve-out)
+        "paramem/backup/integrity.py",  # cross-check tool (explicitly allowed)
         "tests/test_key_registry.py",  # unit tests for the methods themselves
         "tests/test_memory_store.py",  # unit tests for MemoryStore.tier_simhashes
         "tests/server/test_integrity_endpoint.py",  # integrity endpoint tests

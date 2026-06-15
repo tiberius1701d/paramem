@@ -217,7 +217,7 @@ class ChatResponse(BaseModel):
 
 
 class BackupBlock(BaseModel):
-    """Backup subsystem state for /status.  Spec §L485–500.
+    """Backup subsystem state for /status.
 
     All fields default to ``None`` / ``0`` / ``False`` so a never-run server
     (no ``state/backup.json``) still serialises a valid block.
@@ -630,7 +630,7 @@ class ShapeChange(BaseModel):
     new_value:
         Value requested by the candidate config.
     consequence:
-        Human-readable consequence string (spec §L257–271).
+        Human-readable consequence string (e.g. "restart required", "port in use").
     """
 
     adapter: str
@@ -1167,7 +1167,7 @@ def _dispatch_finalize(finalize: Callable[[], None]) -> None:
 def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     """Load enabled adapters from slot-dir layout with manifest verification.
 
-    Implements the startup validator specified in §2.1 of the migration plan.
+    Implements the startup validator that sweeps orphan pending dirs, resolves
     For each enabled adapter kind:
 
     1. Sweep orphan ``.pending`` dirs.
@@ -4730,12 +4730,12 @@ def _build_config_derived_state(
     Single idempotent routine called by BOTH the lifespan startup and the
     live-apply path.  Replaces the lifespan's inline construction blocks at
     ``app.py:1546-1732`` + ``1753-2017`` (excluding the build-once post-load
-    VRAM gate at ``1733-1751`` — see B-1 / §3.x of the plan).
+    VRAM gate at ``1733-1751`` — the build-once post-load gate runs inline in the lifespan).
 
     **EXCLUDES** strictly-once lifespan concerns (signal handlers, asyncio
     tasks, timer reconciliation, mode init) and the build-once post-load VRAM
     gate.  The gate runs inline in the lifespan AFTER this routine returns so
-    the measured allocation includes the STT/TTS GPU footprint (correction S2).
+    the measured allocation includes the STT/TTS GPU footprint.
     The gate is incompatible with this routine (it ``sys.exit(1)``s and reads
     a lifespan-frame local ``base_pred``).  The apply path's VRAM safety is
     the ``mem_get_info``-based fit-check inside ``_live_reload_base_model``.
@@ -4745,7 +4745,7 @@ def _build_config_derived_state(
     The apply path must not call ``start_wyoming_server`` /
     ``start_wyoming_tts_server`` again.
 
-    Per §3.11 ordering:
+    Construction ordering:
 
     1. session_buffer (snapshot old → construct → rehydrate → load_snapshot)
        — only when ``rebuild_session_buffer=True`` AND ``full_rebuild=True``.
@@ -4788,7 +4788,7 @@ def _build_config_derived_state(
         the freshly reloaded model handle (step 8 partial).  This avoids
         spurious STT/TTS ``load()`` calls and HA ``health_check()`` /
         ``load_entity_map()`` / ``get_services()`` network calls on every
-        plain warm reclaim (correction S1).
+        plain warm reclaim (config did not change — skip network reconnect).
     """
     # ── 1. session_buffer ────────────────────────────────────────────────────
     # Only on full_rebuild paths (boot + apply); plain reclaim keeps the live
@@ -4796,7 +4796,8 @@ def _build_config_derived_state(
     if full_rebuild and rebuild_session_buffer:
         # Save snapshot on the OLD buffer FIRST (mirrors SIGTERM/SIGUSR1 path)
         # so mid-turn _sessions state round-trips when an encryption key is
-        # loaded (correction S-1).  No-op on a no-key deployment.
+        # loaded (ensures mid-turn _sessions state round-trips on key-loaded deploys).
+        # No-op on a no-key deployment.
         old_buffer = _state.get("session_buffer")
         if old_buffer is not None:
             old_buffer.save_snapshot()
@@ -4841,13 +4842,13 @@ def _build_config_derived_state(
             _state["speaker_store"] = None
             logger.info("Speaker identification disabled")
 
-        # ── 3. STT / TTS managers (construct-then-flip, §3.6) ───────────────
+        # ── 3. STT / TTS managers (construct-then-flip) ─────────────────────
         # Construct fresh managers from config, then atomically flip voice_box.
         # DO NOT call start_wyoming_server / start_wyoming_tts_server here —
         # those are lifespan-only.  The Wyoming provider lambdas re-point
         # automatically once voice_box is updated.
         #
-        # Correction §3.6: _set_voice_pipeline_profile only lazy-constructs when
+        # Note: _set_voice_pipeline_profile only lazy-constructs when
         # _state["stt_gpu"] is None; it does NOT reconstruct when the config
         # changes.  The apply must construct fresh instances from config B and
         # install them before flipping.
@@ -4959,7 +4960,7 @@ def _build_config_derived_state(
         logger.info("SOTA providers available: %s", list(_state["sota_providers"].keys()))
 
         # ── 5. HA client + ha_graph ──────────────────────────────────────────
-        # Mandatory teardown (correction S-2): HAClient holds an httpx.Client pool.
+        # Mandatory teardown: HAClient holds an httpx.Client pool.
         # Close the OLD client before reassigning — else the pool leaks on every apply.
         old_ha_client = _state.get("ha_client")
         if old_ha_client is not None:
@@ -4993,8 +4994,7 @@ def _build_config_derived_state(
         _state["ha_graph"] = ha_graph
     else:
         # Plain reclaim path (full_rebuild=False): keep existing STT/TTS managers
-        # and ha_graph — config did not change, no network reconnect needed
-        # (correction S1).
+        # and ha_graph — config did not change, no network reconnect needed.
         ha_graph = _state.get("ha_graph")
         logger.info(
             "_build_config_derived_state: plain reclaim — skipping STT/TTS/HA/SOTA/exemplar "
@@ -5290,9 +5290,9 @@ def _live_reload_base_model(
         - ``_build_config_derived_state`` is called with ``full_rebuild=False``
           (rebuilds memory-store probe [D6-gated] + Router re-point only).
           STT/TTS, HA reconnect, exemplar banks, and language_tracker are
-          skipped — same config, no delta (correction S1).
+          skipped — same config, no delta.
     rebuild_session_buffer:
-        Threaded from ``_apply_config_live`` (correction S3): ``True`` when
+        Threaded from ``_apply_config_live``: ``True`` when
         ``retain_sessions`` or ``debug`` changed between config A and config B,
         so the ``SessionBuffer`` is rebuilt.  Always ``False`` on the plain
         reclaim path (``refresh_config_from_disk=False``) — the session config
@@ -5306,7 +5306,7 @@ def _live_reload_base_model(
         ``False`` (default) for ``/gpu/acquire`` and base-swap step-6 callers
         (neither holds the lock).
 
-    Note on the synchronous maintenance guard (correction S-4, §3.12):
+    Note on the synchronous maintenance guard:
     When ``refresh_config_from_disk=True`` the CALLER (``_apply_config_live``)
     sets ``_state["mode"]="cloud-only"`` + ``cloud_only_reason="live_reload"``
     on the event loop BEFORE dispatching this function via ``run_in_executor``,
@@ -5315,7 +5315,7 @@ def _live_reload_base_model(
     """
     # When refreshing config from disk, load the new config BEFORE releasing
     # the model — so the new config is committed to _state even if the reload
-    # then fails (partial-rebuild recovery per §3.15: _state["config"] is
+    # then fails (partial-rebuild recovery: _state["config"] is
     # already B, so the next /gpu/acquire or restart rebuilds coherently).
     if refresh_config_from_disk:
         _refresh_config_from_disk_into_state()
@@ -5743,17 +5743,17 @@ def _apply_config_live() -> dict:
        ``_state["config_drift"]["loaded_hash"]`` (the hash of the config that
        was active in memory when the server last booted or accepted a migration).
        This is the rollback case — disk is back to A, memory is A.  Returns
-       immediately without GPU churn (correction S-6).
+       immediately without GPU churn (disk hash equals memory hash — config A is already active).
 
-       **WP2 precondition:** the accept handler MUST dispatch
+       **Caller ordering precondition:** the accept handler MUST dispatch
        ``_apply_config_live`` BEFORE refreshing ``config_drift.loaded_hash``
        to config B.  If the refresh happens first, ``disk_hash == loaded_hash``
        fires on the accept path and the apply is incorrectly skipped.
        ``ServerConfig`` has no ``source_path`` attribute — the prior
        implementation that computed ``mem_hash`` via that attribute was always
        falling back to the live path, causing ``disk_hash == mem_hash`` on every
-       call (correction B1).
-    3. Detects R-PORT / R-PATHS carve deltas (§3.14):
+       call.
+    3. Detects R-PORT / R-PATHS carve deltas:
 
        - ``stt.port`` / ``tts.port`` change → R-PORT carve:
          ``restart_required_reason in {"stt_port_change", "tts_port_change"}``.
@@ -5778,7 +5778,7 @@ def _apply_config_live() -> dict:
     5. On ``mode==local`` after the rebuild, calls
        ``_set_voice_pipeline_profile("gpu")`` (no-op if already gpu).
 
-    **Caller contract (correction S-4 / §3.12):**
+    **Caller contract (synchronous maintenance guard):**
     The CALLER must set the synchronous maintenance guard on the event loop
     BEFORE dispatching this function via ``run_in_executor``:
 
@@ -5849,7 +5849,7 @@ def _apply_config_live() -> dict:
         }
 
     try:
-        # ── re-check consolidating under the lock (correction S-5) ────────────
+        # ── re-check consolidating under the lock (TOCTOU guard) ────────────────
         if _state.get("consolidating", False):
             logger.warning(
                 "_apply_config_live: a consolidation cycle is still running — "
@@ -5864,7 +5864,7 @@ def _apply_config_live() -> dict:
                 "skipped": None,
             }
 
-        # ── no-op skip (correction S-6 / §3.14) ─────────────────────────────
+        # ── no-op skip (disk hash == memory hash → rollback already applied config) ──
         config_path_str = _state.get("config_path")
         config_a = _state.get("config")
         live_config_path = Path(config_path_str) if config_path_str else Path("configs/server.yaml")
@@ -5880,13 +5880,13 @@ def _apply_config_live() -> dict:
             # file was swapped by a TRIAL write (disk = B, memory = A) — both
             # paths would hash B and the skip would fire on every accept call.
             #
-            # WP2 precondition (document, do not implement here): the accept
+            # Caller ordering (document, do not implement here): the accept
             # handler MUST read and capture ``loaded_hash`` BEFORE refreshing it
             # to config B, then dispatch ``_apply_config_live`` with the
             # pre-refresh hash still in ``_state["config_drift"]["loaded_hash"]``.
-            # If WP2 refreshes ``loaded_hash`` BEFORE dispatching the apply,
-            # disk_hash == loaded_hash would fire on the accept path and the
-            # no-op skip would wrongly suppress the rebuild.
+            # If the accept handler refreshes ``loaded_hash`` BEFORE dispatching
+            # the apply, disk_hash == loaded_hash would fire on the accept path
+            # and the no-op skip would wrongly suppress the rebuild.
             loaded_hash = (_state.get("config_drift") or {}).get("loaded_hash")
             if disk_hash and loaded_hash and disk_hash == loaded_hash:
                 logger.info(
@@ -5902,7 +5902,7 @@ def _apply_config_live() -> dict:
                     "skipped": "no_change",
                 }
 
-        # ── config-A-vs-B carve classification (§3.14) ─────────────────────
+        # ── config-A-vs-B carve classification (carve vs live-apply delta detection) ──
         # Load config B from disk without committing it yet.
         config_b = None
         if live_config_path.exists():
@@ -6363,12 +6363,12 @@ async def speaker_forget(request: SpeakerForgetRequest):
     config = _state["config"]
     speaker_id = request.speaker_id
 
-    # Step 1: locate keys for this speaker via the live merged graph.
+    # Locate keys for this speaker via the live merged graph.
     graph = loop.merger.graph
     keys: set[str] = _keys_for_speaker(graph, speaker_id)
     stale_keys: list[str] = sorted(keys)
 
-    # Step 2: remove keys from every per-tier KeyRegistry (in-memory + disk).
+    # Remove keys from every per-tier KeyRegistry (in-memory + disk).
     # Also drop their simhash entries so the SimHash gate cannot verify them.
     # Uses store.discard_keys(mode="erase") — the shared helper that preserves
     # the tier asymmetry: registry over tiers_with_registry(), simhash over the
@@ -6444,13 +6444,13 @@ async def speaker_forget(request: SpeakerForgetRequest):
                 speaker_id,
             )
 
-    # Step 3: remove the speaker profile.
+    # Remove the speaker profile.
     speaker_store = _state.get("speaker_store")
     removed_speaker = False
     if speaker_store is not None:
         removed_speaker = speaker_store.remove(speaker_id)
 
-    # Step 4: discard pending sessions attributed to this speaker.
+    # Discard pending sessions attributed to this speaker.
     buffer = _state["session_buffer"]
     speaker_conv_ids = [
         conv_id
@@ -6877,7 +6877,7 @@ async def scheduled_tick():
     status — the timer will fire again on its next wall-clock tick.
 
     Returns 409 ``trial_active`` when a migration TRIAL is in progress
-    (spec §L302–303 — "refuses new cycles" while TRIAL is active).
+    ("refuses new cycles" while TRIAL is active).
     """
     from fastapi import HTTPException
 
@@ -7474,7 +7474,7 @@ async def migration_cancel():
 async def migration_confirm(request: ConfirmRequest):
     """Atomically transition from STAGING to TRIAL.
 
-    Implements the 5-step atomic ordering (spec §L277–283):
+    Implements the 5-step atomic ordering:
 
     1. Acquire migration lock + verify STAGING + verify not consolidating.
     2. Write 3 pre-migration backup slots (config, graph, registry).
@@ -7851,13 +7851,12 @@ async def migration_confirm(request: ConfirmRequest):
             ) from exc
 
         # --- Step 3: Write trial marker ---
-        # REQUIRED FIX 1: capture config artifact filename so the rollback
-        # handler can resolve the exact A-config file without directory listing.
+        # Capture config artifact filename so the rollback handler can resolve
+        # the exact A-config file without directory listing.
         # Filter uses endswith(".meta.json") to exclude all sidecar variants
         # (e.g. "config-<ts>.meta.json") regardless of prefix — the old
         # exact-match "meta.json" filter missed prefixed sidecars and caused
-        # rollback to restore the sidecar JSON instead of the config artifact
-        # (B1 bug, 2026-04-22 E2E baseline).
+        # rollback to restore the sidecar JSON instead of the config artifact.
         config_artifact_filename = ""
         for _entry in Path(config_slot).iterdir():
             if not _entry.name.endswith(".meta.json") and not _entry.name.startswith("."):
@@ -7994,8 +7993,7 @@ async def _run_trial_consolidation() -> None:
         # Determine trial adapter and graph paths from the marker.
         migration = _state.get("migration", {})
         trial_data = migration.get("trial") or {}
-        # REQUIRED FIX 1 — read trial_adapter_dir directly from state; do NOT
-        # resolve via find_live_slot.
+        # Read trial_adapter_dir directly from state; do NOT resolve via find_live_slot.
         trial_adapter_dir_str = trial_data.get("trial_adapter_dir", "")
         trial_graph_dir_str = trial_data.get("trial_graph_dir", "")
 
@@ -8096,7 +8094,7 @@ async def _run_trial_consolidation() -> None:
                     exc_captured = _exc
 
             # --- Gate evaluation ---
-            # live_registry_path comes from the PRE-TRIAL config (REQUIRED FIX 1).
+            # live_registry_path comes from the PRE-TRIAL config (not the candidate).
             live_config = _state.get("config")
             if live_config is None:
                 raise RuntimeError(
@@ -8882,7 +8880,7 @@ async def _run_base_swap_orchestration(
 def _rollup_gate_status(results: list, session_buffer_empty: bool) -> str:
     """Compute the overall trial status from a list of GateResult objects.
 
-    Decision table (spec §L368–412 — overall status rollup):
+    Decision table (overall status rollup):
 
     - Any ``"fail"`` → ``"fail"``
     - All 4 ``"skipped"`` → ``"no_new_sessions"``
@@ -9040,7 +9038,7 @@ async def _stash_trial_graph(graph: object) -> None:
         trial["trial_graph_obj"] = graph
 
 
-# Accept-eligible gate statuses (set membership for forward-compat — Decision 24).
+# Accept-eligible gate statuses (set membership for forward-compat).
 # Accept-eligible values are "pass" and "no_new_sessions".  Gate evaluation
 # also emits "fail" and "trial_exception".  Cluster-variance warnings from
 # gate 4 live in `gates["details"][3]["metrics"]["warnings"]`, not as a new
@@ -9074,7 +9072,7 @@ async def migration_status():
     # Populate comparison_report when TRIAL + accept-eligible + completed.
     # _ACCEPT_ELIGIBLE_STATUSES contains {"pass", "no_new_sessions"}.
     # Cluster-variance warnings live in gate details, not as a separate
-    # top-level status (Decision 24).
+    # top-level status (see _ACCEPT_ELIGIBLE_STATUSES).
     comparison_report: dict | None = None
     if (
         ms == "TRIAL"
@@ -9170,14 +9168,13 @@ async def migration_accept():
     Only valid when the server is in TRIAL state and gates have finished with an
     accept-eligible status (``pass`` or ``no_new_sessions``).
 
-    5-step atomic ordering (spec §L353–359, IMPROVEMENT 7 — marker cleared
-    before adapter/graph move):
+    5-step atomic ordering (marker cleared before adapter/graph move — rationale below):
 
     1. Re-verify preconditions inside lock (state, gates).
     2. Build rotation slot for trial adapter archive.
     3. **Clear trial marker** (BEFORE adapter/graph move — IMPROVEMENT 7).
     4. Move trial adapter + graph into the rotation slot.
-    5. Refresh drift state (REQUIRED FIX 3) and set restart banner.
+    5. Refresh drift state and set restart banner.
 
     Errors
     ------
@@ -9398,13 +9395,13 @@ async def migration_accept():
                 logger.debug("accept: trial graph deleted post-accept (transient by design)")
 
         # --- Step 5: Apply config live + refresh drift state + set banner ---
-        # WP2 / B-1 precondition: _apply_config_live compares disk_hash against
-        # config_drift["loaded_hash"] (hash of config A, captured at boot).
+        # Caller ordering precondition: _apply_config_live compares disk_hash
+        # against config_drift["loaded_hash"] (hash of config A, captured at boot).
         # The drift refresh below must happen AFTER _apply_config_live so the
         # no-op skip (disk_hash == loaded_hash) does not fire on the accept path.
         #
         # Apply ordering:
-        #  a) Set synchronous maintenance guard BEFORE dispatching executor (S-4):
+        #  a) Set synchronous maintenance guard BEFORE dispatching executor:
         #     mode="cloud-only" so the scheduler's mode != "local" defer fires
         #     during the brief window between migration-state reset and apply.
         #  b) Dispatch _apply_config_live via run_in_executor (runs synchronously
@@ -9414,7 +9411,7 @@ async def migration_accept():
         #     for R-PORT; the CLI prompts the operator and runs the restart_hint command.
 
         # Synchronous maintenance guard + dispatch + restore-if-untouched
-        # (correction S-4) — see _apply_config_live_guarded for the full rationale.
+        # — see _apply_config_live_guarded for the full rationale.
         apply_result = await _apply_config_live_guarded()
 
         applied_live: bool = apply_result.get("applied_live", False)
@@ -9513,7 +9510,7 @@ async def migration_accept():
 async def migration_rollback():
     """Restore config A from backup, archive trial adapter, clear trial state.
 
-    Valid from TRIAL at any time (no gate-status check — spec §L208).
+    Valid from TRIAL at any time (no gate-status check required).
 
     8-step atomic ordering (IMPROVEMENT 8 — marker cleared before rotation):
 
@@ -9798,7 +9795,7 @@ async def migration_rollback():
         rollback_pre_mortem_path = str(pre_mortem_slot.resolve())
 
         # --- Step 3: Resolve A backup artifact ---
-        # Read marker from disk to get config_artifact_filename (REQUIRED FIX 1).
+        # Read marker from disk to get config_artifact_filename.
         marker = read_trial_marker(state_dir)
         config_artifact_filename = ""
         config_backup_slot_str = trial.get("backup_paths", {}).get("config", "") if trial else ""
@@ -10018,13 +10015,13 @@ async def migration_rollback():
                 logger.debug("rollback: trial graph deleted post-rollback (transient by design)")
 
         # --- Step 7: Apply config live (no-op skip for rollback) ---
-        # WP2 / S-6: rollback restored disk to A and config_drift["loaded_hash"]
-        # is still A (rollback does NOT refresh drift — see comment at step 6240).
+        # Rollback restored disk to A and config_drift["loaded_hash"] is still A
+        # (rollback does NOT refresh drift — see comment at step 6240).
         # So _apply_config_live will take the no-op skip (disk_hash == loaded_hash)
         # and return applied_live=True, skipped="no_change" without GPU churn.
         #
         # Synchronous maintenance guard + dispatch + restore-if-untouched
-        # (correction S-4) — rollback's apply normally takes the no-op skip
+        # — rollback's apply normally takes the no-op skip
         # (disk==memory==A), returning with the guard untouched, so the restore
         # inside _apply_config_live_guarded keeps the server from sticking
         # cloud-only.
@@ -12604,7 +12601,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # Layering boundary. ``consolidate_interim_adapters`` already
         # finished its internal finalize on its way out (registry rewrite,
         # WEIGHT-LEVEL persist+verify of the rebuilt main slots, interim
-        # purge, router reload — see its Step 6 block) regardless of whether
+        # purge, router reload — see its internal finalize block) regardless of whether
         # anything was rebuilt. The merged main weights are now durably saved
         # BEFORE the interim slots are deleted, inside the method, so there is
         # no crash window where the folded knowledge has no on-disk copy.
@@ -12640,7 +12637,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
             )
             return
 
-        # B1 fix (§4.5.1): under housekeeping=True, DO NOT treat tiers_rebuilt==[]
+        # Under housekeeping=True, DO NOT treat tiers_rebuilt==[]
         # as a noop.  The housekeeping fold ran the full merger topology even with
         # no interim slots; its result is the groomed graph, not an absence of work.
         # Only the SCHEDULED path returns early on the empty-tiers-rebuilt signal.

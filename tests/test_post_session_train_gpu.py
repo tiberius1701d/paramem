@@ -2,10 +2,10 @@
 
 All tests in this file are marked ``@pytest.mark.gpu`` and are skipped by
 the standard CPU test run (``pytest -m "not gpu"``).  They are intended to
-be run explicitly on hardware as part of Step 8's regression suite.
+be run explicitly on hardware as part of the GPU regression suite.
 
-Step 8 owns the full execution of these tests.  This file exists now so the
-test infrastructure is in place and the acceptance criteria are documented.
+This file exists so the test infrastructure is in place and the acceptance
+criteria are documented.
 """
 
 from __future__ import annotations

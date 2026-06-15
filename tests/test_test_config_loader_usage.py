@@ -54,7 +54,7 @@ EXAMPLE_VERIFY_ALLOWLIST = frozenset(
 # retirement arc removes entries here as each test pivots to
 # load_server_config("tests/fixtures/server.yaml"). Only the loader's own
 # meta-test remains: tests/test_config.py exercises load_config() directly
-# and stays here until the loader retires entirely (Step 7 of the arc).
+# and stays here until the loader retires entirely.
 LEGACY_LOAD_CONFIG_ALLOWLIST = frozenset(
     {
         "tests/test_config.py",

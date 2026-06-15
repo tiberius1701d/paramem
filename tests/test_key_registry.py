@@ -219,15 +219,16 @@ class TestPerTierSchema:
 
 
 class TestStaleSemantics:
-    """§6.2.6 — KeyRegistry stale partition semantics (Mode 1).
+    """KeyRegistry stale partition semantics.
 
     Covers: stale(key) moves a key from active to stale; list_active excludes
     it; list_stale includes it; is_stale returns True; remove purges from BOTH
     active and stale; get_reclaimable returns stale keys past the cycle
     threshold; save/load round-trips the "stale" field; loading a pre-existing
     registry JSON with no "stale" key yields zero stale keys (backward-compat);
-    stale_cycles starts at 0 and increment_stale_cycles advances it (W2
-    sequencing: unobservable until the second fold).
+    stale_cycles starts at 0 and increment_stale_cycles advances it (a newly
+    staled key has stale_cycles=0 at the durable write, unobservable until
+    the second fold reads it back and increments).
     """
 
     def test_stale_moves_key_from_active_to_stale(self):
@@ -323,8 +324,8 @@ class TestStaleSemantics:
     def test_increment_stale_cycles_advances_all_stale_keys(self):
         """increment_stale_cycles advances stale_cycles for every stale key.
 
-        W2 sequencing: a key staled in fold N has stale_cycles=0 at the durable
-        write; stale_cycles=1 after increment_stale_cycles (unobservable until
+        A key staled in fold N has stale_cycles=0 at the durable write;
+        stale_cycles=1 after increment_stale_cycles (unobservable until
         the NEXT fold reads it from disk).
         """
         reg = KeyRegistry()
@@ -373,7 +374,7 @@ class TestStaleSemantics:
         assert loaded.list_stale() == []
 
     def test_two_fold_stale_cycle_sequence(self, tmp_path):
-        """stale_cycles=0 at durable write; =1 after increment (W2 sequencing).
+        """stale_cycles=0 at durable write; =1 after increment.
 
         Two-fold sequence: fold N stales a key and saves (stale_cycles=0 on
         disk); increment_stale_cycles runs after the durable write (stale_cycles=1
@@ -489,7 +490,7 @@ class TestSaveBytesBoundary:
         enter it or slot identity breaks on restart.  The ``"simhash"`` field
         (unified SimHash storage, simhash-unification refactor) holds the
         active∪stale fingerprint map.  The ``"stale"`` field was added in the
-        soft-stale extension (§3.4.7).
+        soft-stale extension.
         """
         reg = KeyRegistry()
         reg.add("graph1")

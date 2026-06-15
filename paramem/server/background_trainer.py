@@ -64,9 +64,9 @@ class TrainingJob:
             for inference.  Must be a **committed** adapter slot with stable
             weights — never the mid-training ``in_training`` staging slot.
 
-            For interim-adapter jobs (this Step 6): ``"episodic"`` (the stable
-            main).  For main consolidation refresh jobs (Step 7): the backed-up
-            prior main adapter name.
+            For interim-adapter jobs: ``"episodic"`` (the stable main).
+            For main consolidation refresh jobs: the backed-up prior main
+            adapter name.
 
             Defaults to ``"episodic"`` so existing callers that create
             ``TrainingJob`` without this field continue to work correctly.

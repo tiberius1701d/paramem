@@ -20,8 +20,8 @@ Two writes within the same hundredth-of-a-second window produce a
 conflicting slot is removed is safe — the collision is not a partial-write
 indicator.
 
-Content-hash rule (Resolved Decision 29)
------------------------------------------
+Content-hash rule
+-----------------
 ``content_sha256`` in the sidecar is the SHA-256 of the raw bytes *as written
 to disk*.  For encrypted artifacts this is the hash of the ciphertext; for
 plaintext artifacts it is the hash of the source bytes.  Whitespace changes
@@ -311,7 +311,7 @@ def write(
     do_encrypt = _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT)
     on_disk_bytes = envelope_encrypt_bytes(payload) if do_encrypt else payload
 
-    # --- compute content hash (of bytes as written — Resolved Decision 29) ---
+    # --- compute content hash (ciphertext when encrypted, plaintext otherwise) ---
     hash_hex = content_sha256_bytes(on_disk_bytes)
 
     # --- allocate pending slot (with collision retry) ---
@@ -605,8 +605,8 @@ def write_bundle(
     A crash at any step either leaves no slot or a ``.pending/<ts>/`` residue
     that ``sweep_orphan_pending()`` removes on startup.
 
-    Per plan resolution S2: this function does **not** emit an
-    ``ArtifactMeta`` sidecar — only ``bundle.meta.json`` is written.
+    This function does **not** emit an ``ArtifactMeta`` sidecar — only
+    ``bundle.meta.json`` is written.
 
     Parameters
     ----------
@@ -1485,7 +1485,7 @@ def restore_bundle(
     #   A crash AFTER the registry swap but before banner leaves the restored
     #   set fully live — the desired end state; only the banner is missing.
     #
-    # S3 safety-slot surface: the entire step-5 write phase is wrapped so that
+    # Safety-slot surface: the entire step-5 write phase is wrapped so that
     # any exception logs the safety_slot path at ERROR before propagating.
     # The operator can then use the safety bundle's backup_id to recover.
 
@@ -1878,7 +1878,7 @@ def restore_bundle(
                         top_entry.unlink()
 
     except Exception as _step5_exc:
-        # S3: wrap in RestoreAbortedError so callers (e.g. the /backup/restore
+        # Wrap in RestoreAbortedError so callers (e.g. the /backup/restore
         # HTTP handler) can surface the safety_slot path in the error response.
         # Also log at ERROR so the path is in the server log regardless of how
         # the caller handles the exception.

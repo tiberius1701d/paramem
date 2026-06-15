@@ -1895,8 +1895,8 @@ class TestRemovalLedger:
         """Ledger pre_surfaces records the raw incoming and surviving subject/object
         surfaces when a case variant is collapsed by canonical() dedup.
 
-        This is the §4.8.i observability hook: readers compare incoming vs.
-        surviving directly to distinguish genuine duplicates from canonicalization
+        This is the canonicalization observability hook: readers compare incoming
+        vs. surviving directly to distinguish genuine duplicates from canonicalization
         normalization collapses.
         """
         from paramem.graph.merger import GraphMerger
@@ -2032,7 +2032,7 @@ class TestRemovalLedger:
 class TestObjectVariantDedup:
     """Canonical node-key model A collapses object-side variants into one edge.
 
-    Regression guard for the bug described in plan §1: under predicate ``values``,
+    Regression guard: under predicate ``values``,
     ``"Execution Speed"`` / ``"execution_speed"`` / ``"execution speed"`` were three
     distinct nodes → three edges → three keys.  With canonical node keys all three
     collapse to the single canonical form ``"execution speed"`` → one edge, one

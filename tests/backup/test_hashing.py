@@ -25,7 +25,7 @@ class TestContentSha256Bytes:
         assert content_sha256_bytes(data) == expected
 
     def test_content_sha256_whitespace_sensitive(self):
-        """Whitespace changes must produce different hashes (Resolved Decision 29)."""
+        """Whitespace changes must produce different hashes (hash is over raw bytes)."""
         a = b"key: value\n"
         b_ = b"key:  value\n"  # extra space
         assert content_sha256_bytes(a) != content_sha256_bytes(b_)

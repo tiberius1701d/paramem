@@ -1,7 +1,7 @@
 """Pre-flight check for /migration/preview disk-pressure gate.
 
 Thin module so the retention TTL cache and preflight math are not entangled
-with the existing 6a backup code.
+with the scheduled backup runner code.
 
 The check estimates the footprint of a would-be pre-migration backup (config +
 graph + registry) and compares it against the remaining global cap.  If the

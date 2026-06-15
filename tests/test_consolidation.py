@@ -1392,7 +1392,7 @@ class TestRunFullConsolidationSyncAccumulating:
 
         _save_adapters writes the per-tier meta.json that carries the on-disk
         window_stamp read by _is_full_cycle_due.  Not calling it leaves the
-        stamp unadvanced so the next tick will re-fire the fold (spec §9 item 10).
+        stamp unadvanced so the next tick will re-fire the fold.
         No GPU or real fold machinery is needed to assert this proxy.
         """
         from unittest.mock import patch
@@ -1652,7 +1652,7 @@ class TestTestHarnessImportNoEnvRestoration:
 
 
 # ---------------------------------------------------------------------------
-# Regression: interim write path preserves full schema (W3 / W4 bug fix)
+# Regression: interim write path preserves full schema (hydration-miss / cross-session schema fix)
 # ---------------------------------------------------------------------------
 
 
@@ -2103,9 +2103,10 @@ class TestSlotRetention:
 class TestConsolidationLoopRelease:
     """ConsolidationLoop.release() must null the GraphMerger's model reference.
 
-    GraphMerger is a BASE-MODEL HOLDER (architecture §4.4).  release() is the
-    encapsulated teardown path; _release_base_model_in_process reaches it
-    transitively via loop.release() → merger.release().
+    GraphMerger is a BASE-MODEL HOLDER (see BASE-MODEL HOLDER comments in the
+    codebase).  release() is the encapsulated teardown path;
+    _release_base_model_in_process reaches it transitively via
+    loop.release() → merger.release().
     """
 
     def _make_loop_with_mock_merger(self):
@@ -2140,7 +2141,7 @@ class TestConsolidationLoopRelease:
         loop.release()
         assert loop.merger.model is None, (
             "merger.model must be None after ConsolidationLoop.release() "
-            "(GraphMerger is a BASE-MODEL HOLDER — architecture §4.4)"
+            "(GraphMerger is a BASE-MODEL HOLDER — see BASE-MODEL HOLDER comments in the codebase)"
         )
 
     def test_release_nulls_merger_tokenizer(self):
@@ -2353,7 +2354,7 @@ class TestAbortSkipsCommit:
         skipped — only the abort guard fires.
 
         Note: sp_index (procedural_sp_index) was removed in the model-only
-        contradiction redesign (consolidation_architecture.md §4.3).
+        contradiction redesign (sp_index removal).
         The 2-tuple return contract of _prepare_procedural_keys_for_tier
         is tested here via the patched return value.
         """
@@ -2467,7 +2468,8 @@ class TestAbortSkipsCommit:
             f"store.put must not be called after proc abort; called for {store_put_calls}"
         )
         # procedural_sp_index has been removed from ConsolidationLoop
-        # (consolidation_architecture.md §4.3); the attribute must not exist.
+        # sp_index was removed in the model-only contradiction redesign;
+        # the attribute must not exist.
         assert not hasattr(loop, "procedural_sp_index"), (
             "procedural_sp_index must not exist on ConsolidationLoop after sp_index removal"
         )
@@ -2507,15 +2509,15 @@ class TestAbortSkipsCommit:
             },
             register=True,
         )
-        # Bookkeeping is required for stage-2 bookkeeping lookup in the new
-        # full-consolidation reconstruct→remerge pipeline.
+        # Bookkeeping is required for the re-merge stage bookkeeping lookup in
+        # the full-consolidation reconstruct→remerge pipeline.
         loop.store.set_bookkeeping(
             "graph1",
             speaker_id="Speaker0",
             first_seen_cycle=1,
             relation_type="factual",
         )
-        # Stage 5 (edge-walk dedup + tier) reads from merger.graph.edges(data=True).
+        # The edge-walk dedup and tier stage reads from merger.graph.edges(data=True).
         # Replace the MagicMock with a real MultiDiGraph carrying the graph1 edge
         # so tier_keyed["episodic"] ends up non-empty and the abort path fires.
         _real_graph = _nx.MultiDiGraph()
@@ -2562,7 +2564,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
             ),
-            # Stage 1 (reconstruct_graph) is a GPU operation; stub with an empty result
+            # reconstruct_graph is a GPU operation; stub with an empty result
             # so the abort-path test does not require a real model.
             patch(
                 "paramem.training.consolidation.reconstruct_graph",
@@ -2689,7 +2691,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         The real _upsert_relation stamps ``ik_key`` from ``Relation.indexed_key``
         onto the merged edge at new-edge insertion.  Since ``loop.merger`` is a
         MagicMock, we install a side_effect that mirrors this behaviour so
-        Stage 5's edge-walk reads back the correct ik_key.
+        The edge-walk stage reads back the correct ik_key.
 
         Call this on the loop BEFORE calling ``_run_with_mocks`` in tests that
         supply a recon graph with stamped edges.
@@ -2775,7 +2777,7 @@ class TestConsolidateInterimAdaptersFullFlow:
             _gpu_thread_lock.release()
 
     # -------------------------------------------------------------------------
-    # Test 1: cross-session duplicate triples COLLAPSE to ONE key (real merger)
+    # Cross-session duplicate triples COLLAPSE to ONE key (real merger)
     # -------------------------------------------------------------------------
 
     def test_duplicate_triple_collapses_to_one_key(self, tmp_path):
@@ -2852,7 +2854,8 @@ class TestConsolidateInterimAdaptersFullFlow:
             f" got {result['drift_genuine_loss']}"
         )
 
-        # Under Mode 1, the deduplicated key is SOFT-STALED after finalize (B1).
+        # Under registry-true dedup mode, the deduplicated key is SOFT-STALED
+        # after the dedup-then-stale finalize pass.
         # One of graph1/graph2 is in list_stale(); the other is in list_active().
         ep_reg = loop.store.registry("episodic")
         stale_keys = ep_reg.list_stale()
@@ -2884,16 +2887,16 @@ class TestConsolidateInterimAdaptersFullFlow:
         assert surviving["object"] == "Berlin"
 
     # -------------------------------------------------------------------------
-    # Test 2: tier from edge-walk relation_type (not dead :3463 path)
+    # Tier from edge-walk relation_type (not the retired getattr path)
     # -------------------------------------------------------------------------
 
     def test_preference_relation_routes_to_procedural(self, tmp_path):
         """A 'preference' relation_type routes the key to the procedural tier.
 
-        The recon graph carries a preference edge stamped with 'proc1'; Stage 2
-        merges it into the empty graph (setting indexed_key=proc1 on the
-        Relation), _upsert_relation stamps ik_key on the merged edge, and
-        Stage 5 reads that key off the edge — tiering via bookkeeping
+        The recon graph carries a preference edge stamped with 'proc1'; the
+        re-merge stage merges it into the empty graph (setting indexed_key=proc1
+        on the Relation), _upsert_relation stamps ik_key on the merged edge, and
+        the edge-walk stage reads that key off the edge — tiering via bookkeeping
         relation_type='preference' → procedural.
         """
         import networkx as nx
@@ -2938,12 +2941,12 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
 
     # -------------------------------------------------------------------------
-    # Test 3: relation_type injected from bookkeeping before re-merge
+    # relation_type injected from bookkeeping before re-merge
     # -------------------------------------------------------------------------
 
     def test_relation_type_injected_from_bookkeeping_before_remerge(self, tmp_path):
-        """Stage 2 injects the bookkeeping relation_type onto each reconstructed
-        triple before calling merger.merge().
+        """The re-merge stage injects the bookkeeping relation_type onto each
+        reconstructed triple before calling merger.merge().
 
         reconstruct_graph returns a graph with one edge (SPO only, no
         relation_type in edge data).  The bookkeeping entry for that key has
@@ -2990,7 +2993,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         def _spy_merge(session_graph, *, additive=False):
             merge_calls.append(session_graph)
             # Stamp the ik_key from the Relation onto the merged graph edge so
-            # Stage 5 can read it back (mirrors real _upsert_relation behaviour).
+            # the edge-walk stage can read it back (mirrors real _upsert_relation behaviour).
             from paramem.memory.persistence import _IK_KEY_ATTR
 
             for rel in session_graph.relations:
@@ -3035,17 +3038,17 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
 
     # -------------------------------------------------------------------------
-    # Test 4: predicate normalization mismatch — store raw vs graph normalized
+    # Predicate normalization mismatch — store raw vs graph normalized
     # -------------------------------------------------------------------------
 
     def test_normalization_mismatch_key_lands_in_tier(self, tmp_path):
         """Under provenance keying, predicate normalization no longer gates keying.
 
-        The key rides the merged edge's ik_key attribute (stamped at Stage 2 from
-        Relation.indexed_key).  Even if the store entry carries a raw un-normalized
-        predicate ("Lives In") and the recon edge carries the normalized form
-        ("lives_in"), the key is found via the edge attribute — NOT by triple-string
-        matching.  The key must be tiered, NOT drift.
+        The key rides the merged edge's ik_key attribute (stamped at the re-merge
+        stage from Relation.indexed_key).  Even if the store entry carries a raw
+        un-normalized predicate ("Lives In") and the recon edge carries the
+        normalized form ("lives_in"), the key is found via the edge attribute —
+        NOT by triple-string matching.  The key must be tiered, NOT drift.
         """
         import networkx as nx
 
@@ -3096,12 +3099,13 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
 
     # -------------------------------------------------------------------------
-    # Test 5: recall-miss is a retry, not a drop (Mode 1 semantics)
+    # Recall-miss is a retry, not a drop (registry-true dedup semantics)
     # -------------------------------------------------------------------------
 
     def test_recall_miss_is_retry_not_drop(self, tmp_path):
-        """Under Mode 1, a key whose recon edge is absent from the recon graph
-        is a recall-miss / retry signal — NOT dropped, NOT counted as drift.
+        """Under registry-true dedup mode, a key whose recon edge is absent
+        from the recon graph is a recall-miss / retry signal — NOT dropped,
+        NOT counted as drift.
 
         The merge input is registry-true (not reconstruction-driven), so a
         recall miss means: the key's registry-true SPO enters the merge
@@ -3110,8 +3114,8 @@ class TestConsolidateInterimAdaptersFullFlow:
         Neither key is in drift_genuine_loss.
 
         This replaces the prior test_explicit_drift_key_not_in_tier that
-        asserted drift_genuine_loss>=1 — under Mode 1 that scenario is a
-        retry, not a loss.
+        asserted drift_genuine_loss>=1 — under registry-true dedup that
+        scenario is a retry, not a loss.
         """
         import networkx as nx
 
@@ -3146,7 +3150,7 @@ class TestConsolidateInterimAdaptersFullFlow:
             "graph_bob", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
-        # Register drift1 — no recon edge.  Under Mode 1 the registry-true SPO
+        # Register drift1 — no recon edge.  Under registry-true dedup the SPO
         # enters the merge directly, so drift1 survives into tier_keyed.
         loop.store.put(
             "episodic",
@@ -3167,7 +3171,7 @@ class TestConsolidateInterimAdaptersFullFlow:
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # Under Mode 1, drift1 enters recon_relations from registry-true SPO.
+        # Under registry-true dedup, drift1 enters recon_relations from registry-true SPO.
         # Both keys survive into tier_keyed → no drift.
         assert result["graph_drift_count"] == 0, (
             f"Expected graph_drift_count=0 (both keys have registry-true content "
@@ -3183,7 +3187,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
         # Neither key is counted as genuine_loss or deduplicated.
         assert result["drift_genuine_loss"] == 0, (
-            f"Expected drift_genuine_loss=0 (no drops under Mode 1);"
+            f"Expected drift_genuine_loss=0 (no drops under registry-true dedup mode);"
             f" got {result['drift_genuine_loss']}"
         )
         assert result["drift_deduplicated"] == 0, (
@@ -3196,23 +3200,22 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
 
     # -------------------------------------------------------------------------
-    # §6.2.1 W4: hydration-miss key is NOT classified as orphan
+    # Hydration-miss key is NOT classified as orphan
     # -------------------------------------------------------------------------
 
-    def test_w4_hydration_miss_not_orphan(self, tmp_path):
-        """W4 (§3.3c): a live active key whose store.get() returns None (hydration-miss
-        under boot_degraded) but whose bookkeeping carries SPO must NOT be classified
-        as drift_orphan.
+    def test_hydration_miss_not_classified_as_orphan(self, tmp_path):
+        """A live active key whose store.get() returns None (hydration-miss
+        under boot_degraded) but whose bookkeeping carries SPO must NOT be
+        classified as drift_orphan.
 
-        SCOPE NOTE: The W4 fix applies to _build_registry_true_relations (so the key
-        enters the merge as a registry-true Relation) and to the drift-partition
-        classification (so it lands in genuine_loss, not orphan).  The Stage-5
-        tier_keyed build has a pre-existing gap (store.get(key)==None → skip at
-        line ~4063-4069) that is explicitly OUT OF SCOPE for Mode 1 (ROUND-2
-        TRACKED-BUT-OUT-OF-SCOPE deferral).  Thus graph_hydration_miss:
-          - Is NOT classified as drift_orphan (W4 fix: bookkeeping has SPO).
+        SCOPE NOTE: The hydration-miss fix applies to _build_registry_true_relations
+        (so the key enters the merge as a registry-true Relation) and to the
+        drift-partition classification (so it lands in genuine_loss, not orphan).
+        The edge-walk tier_keyed build has a pre-existing gap
+        (store.get(key)==None → skip) that is deferred.  Thus graph_hydration_miss:
+          - Is NOT classified as drift_orphan (bookkeeping has SPO).
           - IS classified as drift_genuine_loss (hydration-miss bucket).
-          - Is NOT in tier_keyed (Stage-5 entry-None skip; pre-existing, deferred).
+          - Is NOT in tier_keyed (entry-None skip; pre-existing, deferred).
 
         Setup: two keys — "graph_ok" has a normal content entry; "graph_hydration_miss"
         is active in the registry but has NO content entry (simulating a missed boot
@@ -3276,20 +3279,20 @@ class TestConsolidateInterimAdaptersFullFlow:
             recurrence_count=1,
             last_seen_cycle=1,
         )
-        # Manually add bookkeeping SPO fields so W4 fallback finds them in
-        # _build_registry_true_relations and the drift-partition classification.
+        # Manually add bookkeeping SPO fields so the hydration-miss fallback finds
+        # them in _build_registry_true_relations and the drift-partition classification.
         loop.store._bookkeeping["graph_hydration_miss"]["subject"] = "Bob"
         loop.store._bookkeeping["graph_hydration_miss"]["predicate"] = "works_at"
         loop.store._bookkeeping["graph_hydration_miss"]["object"] = "Acme"
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # W4 fix: hydration-miss must NOT be classified as orphan.
+        # Hydration-miss must NOT be classified as orphan (bookkeeping carries SPO).
         assert result["drift_orphan"] == 0, (
             f"Expected drift_orphan=0 (hydration-miss is NOT an orphan); "
             f"got drift_orphan={result['drift_orphan']}"
         )
-        # W4 fix: hydration-miss goes to genuine_loss bucket (not orphan, not deduplicated).
+        # Hydration-miss goes to genuine_loss bucket (not orphan, not deduplicated).
         assert result["drift_genuine_loss"] == 1, (
             f"Expected drift_genuine_loss=1 (hydration-miss key classified as retry); "
             f"got drift_genuine_loss={result['drift_genuine_loss']}"
@@ -3299,15 +3302,16 @@ class TestConsolidateInterimAdaptersFullFlow:
         assert "graph_ok" in all_keys, "graph_ok must survive"
 
     # -------------------------------------------------------------------------
-    # §6.2.2: Reconstruction collision does NOT manufacture a collapse
+    # Reconstruction collision does NOT manufacture a collapse
     # -------------------------------------------------------------------------
 
     def test_reconstruction_collision_does_not_manufacture_collapse(self, tmp_path):
-        """§6.2.2: Two keys with DISTINCT registry-true objects must NOT collapse
+        """Two keys with DISTINCT registry-true objects must NOT collapse
         even when reconstruction mis-reads one object onto the other.
 
-        Under Mode 1 the merge input is registry-true SPO, so a reconstruction
-        mis-read has no effect on dedup identity.  Both keys survive.
+        Under registry-true dedup mode the merge input is registry-true SPO,
+        so a reconstruction mis-read has no effect on dedup identity.
+        Both keys survive.
 
         This directly reproduces the proc33/proc35 bug: proc35 "HS3 Radio"
         reconstructed as "HR3 Radio" (proc33's object), making the old
@@ -3372,10 +3376,10 @@ class TestConsolidateInterimAdaptersFullFlow:
     def test_recall_passing_key_keyed_off_edge_provenance(self, tmp_path):
         """Provenance keying: a key stamped on a recon edge is tiered with 0 drift.
 
-        This is the basic invariant: recon edge stamped 'graph10' → Stage 2
-        stamps it on the merged edge → Stage 5 reads key off edge → tiered.
-        Surface-form normalization, triple-identity matching, and seen_triples
-        dedup are no longer in the path — the key rides the edge directly.
+        This is the basic invariant: recon edge stamped 'graph10' → the re-merge
+        stage stamps it on the merged edge → the edge-walk stage reads key off
+        edge → tiered.  Surface-form normalization, triple-identity matching, and
+        seen_triples dedup are no longer in the path — the key rides the edge directly.
         """
         import networkx as nx
 
@@ -3737,7 +3741,8 @@ class TestDriftPartitioning:
         )
 
     def test_drift_partition_three_buckets(self, tmp_path):
-        """Fold with drift-key classes; each lands in the correct bucket under Mode 1.
+        """Fold with drift-key classes; each lands in the correct bucket under
+        registry-true dedup mode.
 
         Setup:
         - "key_dup1" and "key_dup2": identical registry-true SPO (Alice lives_in Berlin).
@@ -3745,7 +3750,7 @@ class TestDriftPartitioning:
           The fact is preserved under key_dup1.
         - "key_orphan": no subject/predicate/object in its store entry and bookkeeping.
           _build_registry_true_relations skips it (no predicate) → no merged edge → drift_orphan=1.
-        - "key_loss": has SPO content but no recon edge.  Under Mode 1 the registry-true
+        - "key_loss": has SPO content but no recon edge.  Under registry-true dedup the
           SPO enters the merge directly, so key_loss survives into tier_keyed (recall-miss
           retry, NOT a loss).  drift_genuine_loss=0.
 
@@ -3842,7 +3847,7 @@ class TestDriftPartitioning:
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # Under Mode 1: key_dup2 and key_orphan are absent from tier_keyed.
+        # Under registry-true dedup: key_dup2 and key_orphan are absent from tier_keyed.
         # key_loss has registry-true SPO → enters recon_relations → survives in tier_keyed.
         # Total drift = 2 (key_dup2 + key_orphan); key_loss is NOT a drift key.
         assert result["graph_drift_count"] == 2, (
@@ -3857,8 +3862,8 @@ class TestDriftPartitioning:
             f"Expected drift_orphan=1 (key_orphan has no SPO content); got {result['drift_orphan']}"
         )
         assert result["drift_genuine_loss"] == 0, (
-            f"Expected drift_genuine_loss=0 (key_loss is retrained with registry-true content "
-            f"— not a loss under Mode 1); got {result['drift_genuine_loss']}"
+            f"Expected drift_genuine_loss=0 (key_loss retrained with registry-true content "
+            f"— not a loss); got {result['drift_genuine_loss']}"
         )
         # key_loss must be in recall_miss_keys (no recon edge = retry signal).
         assert "key_loss" in result["recall_miss_keys"], (
@@ -3872,7 +3877,7 @@ class TestDriftPartitioning:
         surviving_keys = {e["key"] for e in result["tier_keyed"]["episodic"]}
         assert "key_dup1" in surviving_keys, f"key_dup1 must survive; got {surviving_keys}"
         assert "key_loss" in surviving_keys, (
-            f"key_loss must survive (Mode 1 retry); got {surviving_keys}"
+            f"key_loss must survive (registry-true retry); got {surviving_keys}"
         )
 
     def test_no_high_drift_warning_when_only_dedup(self, tmp_path, caplog):
@@ -3950,14 +3955,16 @@ class TestDriftPartitioning:
     def test_high_drift_warning_fires_on_genuine_loss(self, tmp_path, caplog):
         """The 'genuine reconstruction loss' WARNING fires when genuine_loss > 0.
 
-        Under Mode 1, drift_genuine_loss fires for a key that has non-empty subject
-        content but an EMPTY predicate: _build_registry_true_relations skips it
-        (no predicate = not keyable), so it never enters the merge and ends up
-        absent from tier_keyed with its content intact.  The drift-partition loop
-        sees a key with non-empty subject → genuine_loss bucket → WARNING.
+        Under registry-true dedup mode, drift_genuine_loss fires for a key that
+        has non-empty subject content but an EMPTY predicate:
+        _build_registry_true_relations skips it (no predicate = not keyable), so
+        it never enters the merge and ends up absent from tier_keyed with its
+        content intact.  The drift-partition loop sees a key with non-empty
+        subject → genuine_loss bucket → WARNING.
 
-        This is distinct from a full-SPO key with no recon edge, which under Mode 1
-        IS included via registry-true SPO and survives in tier_keyed (retry-not-drop).
+        This is distinct from a full-SPO key with no recon edge, which under
+        registry-true dedup IS included via registry-true SPO and survives in
+        tier_keyed (retry-not-drop).
         """
         import logging
 
@@ -4119,7 +4126,7 @@ class TestDriftIntendedRemoval:
         )
 
         def _enrichment_side_effect():
-            # Called AFTER reset_graph() and Stage-2 re-merge.  At this point the
+            # Called AFTER reset_graph() and the re-merge stage.  At this point the
             # merged graph has an alice→alicia alias_of edge carrying key_enrichment.
             # Node keys are canonical (lowercase) because GraphMerger canonicalizes
             # all entity names at merge time.  Simulate the real same_as contraction:
@@ -4854,12 +4861,11 @@ class TestBookkeepingBasedPromotion:
 class TestTierFloor:
     """Unit tests for the per-tier min-key-count floor and graduation strategies.
 
-    Plan §9 items 1-12 (config, parking, graduation, accumulating, R5 fall-through).
+    Covers config, parking, graduation, accumulating, and probe-fallback behavior.
     All tests mock train_adapter and heavy PEFT ops so no GPU is needed.
 
-    Item 1 (config plumbing) lives in tests/server/test_config.py;
-    item 2 (parity) is covered by tests/server/test_config_parity.py.
-    Items 3-12 are here.
+    Config plumbing lives in tests/server/test_config.py;
+    config parity is covered by tests/server/test_config_parity.py.
     """
 
     @staticmethod
@@ -4910,7 +4916,7 @@ class TestTierFloor:
 
     @staticmethod
     def _build_merger_graph(loop, entries):
-        """Stamp entries as edges on the loop's merger graph so Stage-5 picks them up."""
+        """Stamp entries as merger-graph edges so the edge-walk stage picks them up."""
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         for e in entries:
@@ -4997,7 +5003,7 @@ class TestTierFloor:
             _gpu_thread_lock.release()
 
     # -------------------------------------------------------------------------
-    # Item 3: Pass-2 parking — under-floor semantic/procedural moves to episodic
+    # Pass-2 parking — under-floor semantic/procedural moves to episodic
     # -------------------------------------------------------------------------
 
     def test_pass2_parks_under_floor_semantic_and_procedural(self, tmp_path):
@@ -5075,7 +5081,7 @@ class TestTierFloor:
             assert t == "episodic", f"parked key {k!r} should be in episodic store tier, got {t!r}"
 
     # -------------------------------------------------------------------------
-    # Item 4: Bookkeeping preserved through parking and graduation
+    # Bookkeeping preserved through parking and graduation
     # -------------------------------------------------------------------------
 
     def test_bookkeeping_preserved_through_parking(self, tmp_path):
@@ -5153,7 +5159,7 @@ class TestTierFloor:
         assert bk["first_seen_cycle"] == 3, "first_seen_cycle must survive parking"
 
     # -------------------------------------------------------------------------
-    # Item 5: DEFAULT graduation (train-from-scratch, tier_fast_start=False)
+    # Default graduation (train-from-scratch, tier_fast_start=False)
     # -------------------------------------------------------------------------
 
     def test_default_graduation_trains_from_scratch(self, tmp_path):
@@ -5266,7 +5272,7 @@ class TestTierFloor:
         )
 
     # -------------------------------------------------------------------------
-    # Item 6: copy_adapter_weights_subset — CPU-only parameter logic
+    # copy_adapter_weights_subset — CPU-only parameter logic
     # -------------------------------------------------------------------------
 
     def test_copy_adapter_weights_subset_copies_intersecting(self):
@@ -5356,7 +5362,7 @@ class TestTierFloor:
             copy_adapter_weights(model, src="src", dst="dst")
 
     # -------------------------------------------------------------------------
-    # Item 7: Fast-start graduation decision (mocked copy + store)
+    # Fast-start graduation decision (mocked copy + store)
     # -------------------------------------------------------------------------
 
     def test_fast_start_graduation_calls_copy_not_train(self, tmp_path):
@@ -5497,7 +5503,7 @@ class TestTierFloor:
         # (20 ep + 15 proc).  format_entry_training is called with job.entries so we
         # check call_count of format_entry_training instead, which receives the full set.
         # (Direct assertion: serve layout is the ground truth; the donor augment is an
-        # internal implementation detail verified by GR-1/GR-4 tests.)
+        # internal implementation detail verified by the universal-donor decoupling tests.)
 
     def test_fast_start_already_live_tier_trains_normally(self, tmp_path):
         """A tier already live (has a saved adapter slot on disk) trains normally
@@ -5612,7 +5618,7 @@ class TestTierFloor:
         )
 
     # -------------------------------------------------------------------------
-    # Item 9: R5 fast-start copy-gate fallback (MANDATORY)
+    # Fast-start copy-gate fallback (mandatory probe before accepting copy)
     # -------------------------------------------------------------------------
 
     def test_fast_start_fallback_trains_from_scratch_when_probe_fails(self, tmp_path):
@@ -5722,7 +5728,7 @@ class TestTierFloor:
         )
 
     # -------------------------------------------------------------------------
-    # Item 10: Whole-fold accumulate (episodic < floor)
+    # Whole-fold accumulate (episodic < floor)
     # -------------------------------------------------------------------------
 
     def test_whole_fold_accumulate_returns_accumulating_status(self, tmp_path):
@@ -5814,7 +5820,7 @@ class TestTierFloor:
         assert train_spy.call_count == 0, "train_adapter must NOT be called on accumulating return"
 
     # -------------------------------------------------------------------------
-    # Item 11: Accumulating never raises; last_consolidation_error stays None
+    # Accumulating never raises; last_consolidation_error stays None
     # -------------------------------------------------------------------------
 
     def test_accumulating_never_raises(self, tmp_path):
@@ -5844,8 +5850,7 @@ class TestTierFloor:
         assert result["status"] == "accumulating"
 
     # =========================================================================
-    # GR-1..GR-7: v3 universal-donor serve/train decoupling tests
-    # (plan §H — GRADUATION REDESIGN v3)
+    # v3 universal-donor serve/train decoupling tests
     # =========================================================================
 
     @staticmethod
@@ -5867,8 +5872,8 @@ class TestTierFloor:
             )
             loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
 
-    def test_gr1_serve_train_decoupling(self, tmp_path):
-        """GR-1: episodic train call includes graduating procedural keys (universal
+    def test_universal_donor_episodic_includes_graduating_keys(self, tmp_path):
+        """Episodic train call includes graduating procedural keys (universal
         donor); procedural train call absent; serve layout keeps them separate.
 
         floor=10, 12 proc keys (store-tier episodic, first-cross) + 20 ep keys.
@@ -6001,8 +6006,8 @@ class TestTierFloor:
             "graduating procedural keys must be in episodic's training set (donor augment)"
         )
 
-    def test_gr2_no_registry_duplication(self, tmp_path):
-        """GR-2: each graduating key appears in _all_keyed exactly once and is
+    def test_graduating_keys_served_from_target_tier_not_duplicated(self, tmp_path):
+        """Each graduating key appears in the serve layout exactly once and is
         served from procedural (not episodic).
         """
         loop = self._make_loop(tmp_path, min_tier_key_floor=10, tier_fast_start=True)
@@ -6050,8 +6055,8 @@ class TestTierFloor:
                 f"graduating key {k!r} must be in procedural serve set"
             )
 
-    def test_gr3a_procedural_fast_start_copy_accepted(self, tmp_path):
-        """GR-3a: procedural first-cross fast-start: copy_adapter_weights_subset called,
+    def test_procedural_fast_start_uses_subset_copy_not_train(self, tmp_path):
+        """Procedural first-cross fast-start: copy_adapter_weights_subset called,
         train_adapter NOT called for procedural, procedural in tiers_rebuilt.
 
         Probe returns only keys the donor was actually trained on (augmented episodic
@@ -6164,12 +6169,12 @@ class TestTierFloor:
         ]
         assert len(proc_train) == 0, "train_adapter must NOT be called for procedural fast-start"
 
-    def test_gr3b_semantic_fast_start_copy_accepted(self, tmp_path):
-        """GR-3b: semantic first-cross fast-start (promotion-store-moved, v3 fix):
+    def test_semantic_fast_start_uses_full_copy_not_train(self, tmp_path):
+        """Semantic first-cross fast-start (promotion-store-moved):
         copy_adapter_weights (FULL copy, NOT subset) called for semantic,
         train_adapter NOT called for semantic, semantic in tiers_rebuilt.
 
-        This is the test that PROVES v3 fixes the procedural-only scoping.
+        Proves the v3 universal-donor fix covers semantic (not just procedural).
         Semantic keys are store-tier "semantic" (promotion-store-moved) but have
         NO disk slot → _tier_has_disk_slot("semantic") = False → graduates.
         """
@@ -6209,10 +6214,9 @@ class TestTierFloor:
         ep_keys = [f"e{i}" for i in range(20)]
         self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
 
-        # Stage-5 uses store.tier_for_active_key to determine current tier;
+        # The edge-walk stage uses store.tier_for_active_key to determine current tier;
         # semantic keys are already in semantic store-tier so they route to
-        # serve_assignment["semantic"] (Stage-5 line: tier = "semantic" if
-        # current_adapter_id == "semantic").
+        # serve_assignment["semantic"].
         self._add_edges(
             loop,
             [
@@ -6317,8 +6321,8 @@ class TestTierFloor:
             "graduating semantic keys must NOT appear in episodic serve set"
         )
 
-    def test_gr4_simultaneous_semantic_procedural_graduation(self, tmp_path):
-        """GR-4: both semantic and procedural graduate the same fold (universal donor).
+    def test_simultaneous_semantic_procedural_graduation_universal_donor(self, tmp_path):
+        """Both semantic and procedural graduate in the same fold (universal donor).
 
         floor=10, 11 semantic keys (store-tier semantic, first-cross) + 12 procedural
         keys (store-tier episodic, parked) + 20 episodic.
@@ -6490,9 +6494,9 @@ class TestTierFloor:
         assert result["keys_per_tier"]["procedural"] == 12
         assert result["keys_per_tier"]["episodic"] == 20
 
-    def test_gr6a_fallback_trains_on_serve_set_procedural(self, tmp_path):
-        """GR-6a: (b)→(a) fallback for procedural: train_adapter IS called for procedural
-        with entries = its serve set, procedural in tiers_rebuilt.
+    def test_graduation_fallback_trains_on_serve_set_procedural(self, tmp_path):
+        """Fast-start fallback for procedural: when the copy probe fails, train_adapter
+        IS called for procedural with entries = its serve set, procedural in tiers_rebuilt.
 
         Probe patched to FAIL for procedural while episodic otherwise informed.
         Confirms fallback re-assignment: job.entries = serve_assignment[tier].
@@ -6605,9 +6609,10 @@ class TestTierFloor:
             f"(12 keys), got {len(proc_trained_keys)}"
         )
 
-    def test_gr6b_fallback_trains_on_serve_set_semantic(self, tmp_path):
-        """GR-6b: (b)→(a) fallback for semantic: train_adapter IS called for semantic
-        with entries = its serve set. Confirms fallback works for semantic path too.
+    def test_graduation_fallback_trains_on_serve_set_semantic(self, tmp_path):
+        """Fast-start fallback for semantic: when the copy probe fails, train_adapter
+        IS called for semantic with entries = its serve set. Confirms fallback
+        works for the semantic path too.
         """
         from unittest.mock import MagicMock, patch
 
@@ -6737,8 +6742,8 @@ class TestTierFloor:
             f"(11 keys), got {len(sem_trained_keys)}"
         )
 
-    def test_gr7_train_from_scratch_not_augmented(self, tmp_path):
-        """GR-7: with tier_fast_start=False, first-cross semantic trains from scratch
+    def test_train_from_scratch_episodic_not_augmented_with_graduating_keys(self, tmp_path):
+        """With tier_fast_start=False, first-cross semantic trains from scratch
         on its own serve set — episodic train set does NOT include semantic keys.
         """
         from unittest.mock import MagicMock, patch

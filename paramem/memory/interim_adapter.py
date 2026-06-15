@@ -1,6 +1,6 @@
 """Interim-adapter lifecycle helpers for multi-adapter interim routing.
 
-This module owns two operations that must stay co-located so Step 7's
+This module owns two operations that must stay co-located so
 consolidate_interim_adapters can call unload without importing app.py:
 
   create_interim_adapter  — live creation of the current episodic_interim_* adapter
@@ -16,9 +16,9 @@ It also provides timestamp and schedule helpers:
       period in seconds for a schedule string.
 
 Callers (wiring schedule):
-  Step 6 — calls create_interim_adapter after each conversation is processed.
-  Step 7 — calls unload_interim_adapters inside consolidate_interim_adapters
-            as phase 3 of the atomic finalize sequence.
+  Post-session routing — calls create_interim_adapter after each conversation is processed.
+  consolidate_interim_adapters — calls unload_interim_adapters as phase 3 of the
+            atomic finalize sequence.
 
 SOLE-ADAPTER TRAP NOTE: unload_interim_adapters is only safe to call while
 the three main adapters (episodic, semantic, procedural) are still loaded.
@@ -289,7 +289,7 @@ def create_interim_adapter(
 def unload_interim_adapters(model: PeftModel, adapter_dir: Path) -> list[str]:
     """Delete every loaded episodic_interim_* adapter from PEFT and its on-disk dir.
 
-    This is phase 3 of Step 7's atomic finalize sequence.  Call it ONLY after:
+    This is phase 3 of the consolidation finalize sequence.  Call it ONLY after:
       1. Registry rewrite (adapter_id values updated to main tier names).
       2. On-disk delete of interim adapter dirs (done here for completeness).
     And BEFORE:

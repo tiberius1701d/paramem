@@ -881,9 +881,9 @@ def train_adapter(
     if callbacks_extra:
         callbacks.extend(callbacks_extra)
 
-    # Staging+promote (AD-20): HF trains the transient ``in_training`` slot, so
-    # the recall early-stop probe must measure that slot — not the caller's
-    # production adapter name, which holds un-promoted weights until the
+    # Under the staging+promote contract, HF trains the transient ``in_training``
+    # slot, so the recall early-stop probe must measure that slot — not the
+    # caller's production adapter name, which holds un-promoted weights until the
     # post-train promote.  As the single owner of the staging lifecycle, bind
     # the probe target explicitly here; the callback never infers it.  No-op
     # for compose/direct training, where the production adapter trains in place.
@@ -979,8 +979,8 @@ def train_adapter(
                 # Clean scratch on success.
                 _clean_scratch(output_dir, ram_dir)
                 scratch_path.unlink(missing_ok=True)
-                # Step 6a-cleanup: delete the staging slot now that promote is done.
-                # Per AD-20, the slot is transient — exists only during this training
+                # Delete the staging slot now that promote is done.
+                # The staging slot is transient — exists only during this training
                 # event.  Crash-safety + rollback rationale no longer applies: the
                 # new weights are in production (VRAM), and if save fails later, the
                 # prior production state on disk is still recoverable.
@@ -997,8 +997,8 @@ def train_adapter(
                 )
                 _clean_scratch(output_dir, ram_dir)
                 scratch_path.unlink(missing_ok=True)
-                # Step 6b-cleanup: delete the staging slot on abort too.  The slot
-                # is transient and must not survive past this training event,
+                # Delete the staging slot on abort too.  The staging slot is
+                # transient and must not survive past this training event,
                 # otherwise the next event's _ensure_staging_slot will trip its
                 # lifecycle-invariant guard.
                 model.delete_adapter(_STAGING_ADAPTER)

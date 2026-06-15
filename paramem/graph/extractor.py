@@ -1930,7 +1930,7 @@ def _fallback_plausibility_on_raw(
         for r in graph.relations
     ]
 
-    # Step 2: strip residual placeholders from raw facts (defensive)
+    # Strip residual placeholders from raw facts (defensive).
     raw_facts, res_dropped = _strip_residual_placeholders(raw_facts)
     if res_dropped:
         graph.diagnostics["residual_dropped_facts"] = res_dropped
@@ -1939,7 +1939,7 @@ def _fallback_plausibility_on_raw(
             len(res_dropped),
         )
 
-    # Step 3: local plausibility filter (uses real names)
+    # Local plausibility filter (uses real names).
     if raw_facts and model is not None and tokenizer is not None:
         filtered, _raw = _local_plausibility_filter(
             raw_facts,
@@ -1957,7 +1957,7 @@ def _fallback_plausibility_on_raw(
                 graph.diagnostics["plausibility_dropped"] = dropped_count
                 graph.diagnostics["plausibility_judge_actual"] = "local_fallback"
 
-    # Step 4: rebuild Relations
+    # Rebuild Relations from surviving raw facts.
     kept_relations = []
     for fact in raw_facts:
         try:
@@ -1979,7 +1979,7 @@ def _fallback_plausibility_on_raw(
     graph.entities = [e for e in graph.entities if e.name in kept_names]
     graph.relations = kept_relations
 
-    # Step 5: record fallback path
+    # Record fallback path in diagnostics.
     graph.diagnostics["fallback_path"] = reason
     logger.info(
         "_fallback_plausibility_on_raw: reason=%r, %d relation(s) surviving",
@@ -2615,12 +2615,12 @@ def _sota_pipeline(
             len(validation_dropped),
         )
 
-    # Step 4: Deterministic safety net for symmetric-predicate canonicalization.
+    # Deterministic safety net for symmetric-predicate canonicalization.
     # The enrichment prompt asks the LLM to drop the inverse direction; this
     # guards against the LLM leaving both. Local-only, no extra API call.
     kept_relations = _canonicalize_symmetric_predicates(kept_relations)
 
-    # Step 5: All-dropped safety net — if every relation was dropped and the
+    # All-dropped safety net — if every relation was dropped and the
     # original extraction had facts, fall back to raw plausibility so the
     # session does not yield zero facts due to anonymizer inconsistency.
     if not kept_relations and original_count > 0:
@@ -2816,8 +2816,8 @@ def _build_anonymization_mapping(
         counter[prefix] = counter.get(prefix, 0) + 1
         return f"{prefix}_{counter[prefix]}"
 
-    # Step 1 + 2: mint placeholders for in-scope entities and fold in
-    # their PII attribute values under the same placeholder.
+    # Mint placeholders for in-scope entities and fold in their PII
+    # attribute values under the same placeholder.
     speaker_entity_placeholder: str | None = None
     for entity in graph.entities:
         if entity.entity_type not in scope:
@@ -2847,15 +2847,15 @@ def _build_anonymization_mapping(
             # reverse direction must restore the entity name, not an
             # attribute value.
 
-    # Step 3: speaker-name seeding (legacy Bug A).
+    # Speaker-name seeding: ensure the runtime-known speaker name is covered.
     if speaker_name and speaker_name not in mapping:
         if speaker_entity_placeholder is not None:
             # Speaker is in graph.entities but under a different
             # surface form (e.g. anonymous "Speaker0" → display
             # "Alex").  Reuse that placeholder so every form maps
             # consistently.  ``reverse`` already points the placeholder
-            # at the canonical entity name from step 1; do not
-            # overwrite — the entity name is the preferred display
+            # at the canonical entity name from the entity-mint pass; do
+            # not overwrite — the entity name is the preferred display
             # form for the deanon target.
             mapping[speaker_name] = speaker_entity_placeholder
         else:
@@ -2883,12 +2883,12 @@ def _build_anonymization_mapping(
                 mapping[speaker_name] = fresh
                 reverse.setdefault(fresh, speaker_name)
 
-    # Step 4: merge in LLM hints we don't already cover (typically
-    # relation-participant placeholders for entities not in
-    # graph.entities).  Deterministic entries win on conflict; LLM-only
-    # entries are added.  LLM-emitted keys are entity-name-shaped (the
-    # anonymizer prompt operates on relation participants, not
-    # attributes), so they are safe to enter the reverse map.
+    # Merge in LLM hints not already covered (typically relation-participant
+    # placeholders for entities absent from graph.entities).  Deterministic
+    # entries win on conflict; LLM-only entries are added.  LLM-emitted
+    # keys are entity-name-shaped (the anonymizer prompt operates on
+    # relation participants, not attributes), so they are safe to enter
+    # the reverse map.
     for k, v in llm_mapping.items():
         if not isinstance(k, str) or not isinstance(v, str):
             continue
@@ -3295,14 +3295,14 @@ def _apply_bindings(
             continue
         subj = str(f.get("subject", ""))
         obj = str(f.get("object", ""))
-        # Step 1: substitute braced SOTA placeholders (literal string match —
+        # Substitute braced SOTA placeholders (literal string match —
         # the braces make these unambiguous, no word-boundary needed).
         for braced, real in braced_map.items():
             if braced in subj:
                 subj = subj.replace(braced, real)
             if braced in obj:
                 obj = obj.replace(braced, real)
-        # Step 2: substitute bare anonymizer placeholders (word-boundary so
+        # Substitute bare anonymizer placeholders (word-boundary so
         # apostrophes and surrounding punctuation work).
         subj = _substitute_whole_words(subj, bare_map)
         obj = _substitute_whole_words(obj, bare_map)

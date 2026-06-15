@@ -81,7 +81,7 @@ def _make_registry(n: int, tmp_path: Path) -> Path:
 
 
 def _make_enriched_registry(n: int, tmp_path: Path) -> Path:
-    """Write an enriched registry (WARNING W4) with ``n`` keys."""
+    """Write an enriched registry with ``n`` keys."""
     registry = {
         f"graph{i}": {
             "simhash": i * 1000 + 1,
@@ -231,7 +231,7 @@ class TestIsTrainingMarker:
         assert _is_training_marker(exc) is False
 
     def test_logs_at_warning(self, caplog):
-        """Phase categorizer must log at WARNING level (WARNING W2)."""
+        """Phase categorizer must log at WARNING level."""
         exc = RuntimeError("something happened")
         import paramem.server.gates as gates_mod
 
@@ -419,7 +419,7 @@ class TestUnmountTrialProbe:
         model.delete_adapter.assert_called_once_with("trial_probe")
 
     def test_delete_not_called_when_sole_adapter(self, caplog):
-        """WARNING W3 — delete_adapter must NOT be called when trial_probe is sole adapter."""
+        """delete_adapter must NOT be called when trial_probe is sole adapter."""
         import paramem.server.gates as gates_mod
 
         gates_mod.logger.propagate = True
@@ -508,7 +508,7 @@ class TestPhaseCategorizer:
         assert g2.status == "fail"
 
     def test_phase_categorizer_logs_warning(self, caplog):
-        """Phase categorizer must log at WARNING regardless of match (WARNING W2)."""
+        """Phase categorizer must log at WARNING regardless of match."""
         import paramem.server.gates as gates_mod
 
         gates_mod.logger.propagate = True

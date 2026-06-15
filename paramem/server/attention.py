@@ -45,8 +45,8 @@ class AttentionItem:
     Attributes
     ----------
     kind:
-        Stable identifier for the alert class.  See spec L434–451 for
-        the catalog of kinds that Slices 5a/6/7 populate.
+        Stable identifier for the alert class.  See the populator
+        functions in this module for the catalog of emitted kinds.
     level:
         ``"action_required"`` (yellow), ``"failed"`` (red), or
         ``"info"`` (cyan).  Used by the pstatus renderer to choose the
@@ -63,7 +63,7 @@ class AttentionItem:
         not carry an age).
     """
 
-    kind: str  # NOT Literal — Slices 6/7 extend without schema bump
+    kind: str  # NOT Literal — new alert categories extend without schema bump
     level: str  # "action_required" | "failed" | "info"
     summary: str
     action_hint: str | None
@@ -376,7 +376,7 @@ def _collect_config_drift_items(state: dict) -> list[AttentionItem]:
     drift = state.get("config_drift") or {}
     if drift.get("detected") is True:
         # Use last_checked_at as the best available timestamp for the drift age;
-        # the actual change moment is unknown (content-hash only, per spec L502).
+        # the actual change moment is unknown (content-hash only, no mtime).
         age = _age_seconds_from_iso(drift.get("last_checked_at", ""))
         return [
             AttentionItem(
@@ -716,7 +716,7 @@ def _collect_vram_low_headroom_items(state: dict) -> list[AttentionItem]:
 
 
 # ---------------------------------------------------------------------------
-# Stubs — Slices 6/7 fill these
+# Stubs — backup, key rotation, and encryption populators (not yet wired)
 # ---------------------------------------------------------------------------
 
 
@@ -1053,7 +1053,7 @@ def collect_attention_items(
 ) -> list[AttentionItem]:
     """Walk active populators in display order and concatenate results.
 
-    Display order matches the Attention block layout in spec L504–513:
+    Display order (most actionable first):
 
         Migration → Consolidation → Sweeper → Backup* → Config drift →
         Boot degraded → Key rotation* → Encryption* → Adapter fingerprint →

@@ -189,8 +189,8 @@ def _do_mark_consolidated(
     When *callback* is ``None``, ``session_buffer.mark_consolidated(session_ids,
     retention_dir=retention_dir)`` is called (standard production path).  When
     *callback* is not ``None`` it is called instead, allowing the trial path to
-    pass a no-op so pending sessions remain in the buffer (spec L364 —
-    "transcript sweeper blocks archive+delete").
+    pass a no-op so pending sessions remain in the buffer
+    ("transcript sweeper blocks archive+delete").
 
     Parameters
     ----------
@@ -317,8 +317,8 @@ def prune_key_metadata_orphans(config: ServerConfig) -> int:
         )
         return 0
 
-    # W1 (§3.4b): the retention union includes BOTH active and stale keys so that
-    # a soft-staled key's bookkeeping survives the prune.  A stale key is absent
+    # The retention union includes BOTH active and stale keys so that a
+    # soft-staled key's bookkeeping survives the prune.  A stale key is absent
     # from list_active() but present in list_stale(); pruning it would break the
     # stale-echo seam (bookkeeping is required to resolve speaker/relation_type).
     active: set[str] = set()
@@ -376,8 +376,8 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     (CRITICAL Fix 1 — trial registry isolation, 2026-04-23).
     """
     keys_payload: dict = {}
-    # W1 (§3.4b): persist bookkeeping for BOTH active and stale keys so that
-    # stale-echo probes can resolve speaker/relation_type for a soft-staled key.
+    # Persist bookkeeping for BOTH active and stale keys so that stale-echo
+    # probes can resolve speaker/relation_type for a soft-staled key.
     all_keys = loop.store.all_known_keys()
     for key in all_keys:
         bk = loop.store.bookkeeping_for_key(key) or {}

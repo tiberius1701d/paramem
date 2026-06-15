@@ -4,9 +4,9 @@ Tests the procedural key assignment, deferred-mutation discipline, and
 filter integration without requiring GPU/model.
 
 Note: the per-session ``sp_index`` (procedural_sp_index) was removed as part
-of the model-only contradiction redesign (consolidation_architecture.md §4.3).
-Procedural contradiction is now resolved at full consolidation by the
-model-bearing GraphMerger.  The tests below verify the post-removal behavior.
+of the model-only contradiction redesign.  Procedural contradiction is now
+resolved at full consolidation by the model-bearing GraphMerger.  The tests
+below verify the post-removal behavior.
 """
 
 
@@ -348,10 +348,10 @@ class TestRunIndexedKeyProceduralDeferredMutations:
     def test_no_sp_index_on_loop(self, monkeypatch, tmp_path):
         """ConsolidationLoop no longer has a procedural_sp_index attribute.
 
-        The sp_index was removed (consolidation_architecture.md §4.3) because
-        per-session procedural contradiction is now resolved at full
-        consolidation by the model-bearing GraphMerger.  The stub's loop
-        object must not have the attribute, and the method must not set it.
+        The sp_index was removed because per-session procedural contradiction
+        is now resolved at full consolidation by the model-bearing GraphMerger.
+        The stub's loop object must not have the attribute, and the method must
+        not set it.
         """
         stub, _ = self._make_stub(monkeypatch, tmp_path, train_raises=False)
 

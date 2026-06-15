@@ -149,14 +149,14 @@ class TestSimHash:
 
 
 # ---------------------------------------------------------------------------
-# KeyRegistry simhash methods — Step A unit tests (plan §5 / §10)
+# KeyRegistry simhash methods — unit tests for the simhash primitives
 # ---------------------------------------------------------------------------
 
 
 class TestKeyRegistrySimhash:
-    """Unit tests for the new KeyRegistry simhash primitives.
+    """Unit tests for the KeyRegistry simhash primitives.
 
-    These lock the §5 contract: set_simhash, drop_simhash, simhash_for,
+    Locks the contract: set_simhash, drop_simhash, simhash_for,
     has_simhash, _active_simhashes, _known_simhashes, stale auto-carry,
     remove auto-drop.
     """
@@ -169,7 +169,7 @@ class TestKeyRegistrySimhash:
         assert reg.simhash_for("graph1") == 0xCAFE
 
     def test_simhash_for_stale_key(self):
-        """simhash_for returns the fingerprint from the stale record (plan B2)."""
+        """simhash_for returns the fingerprint from the stale record."""
         reg = KeyRegistry()
         reg.add("graph1")
         reg.set_simhash("graph1", 0xBEEF)
@@ -312,7 +312,7 @@ class TestKeyRegistrySimhash:
 
 
 class TestTierSimhashes:
-    """Unit tests for MemoryStore.tier_simhashes (plan §5 / §10).
+    """Unit tests for MemoryStore.tier_simhashes.
 
     The mandatory ``include_stale`` keyword makes active-vs-known confusion
     structurally impossible.  This class locks that contract.
@@ -578,7 +578,7 @@ class TestSnapshotRestore:
         """Snapshot captures both entries and simhash; restore brings both back.
 
         This is the core cycle-resume rollback rope contract.  Simhash is now
-        captured from the registry (plan §9 / B1 fix) so fingerprints survive
+        captured from the registry so fingerprints survive
         rollback correctly even after the registry simhash moved off _simhash.
         """
         s = MemoryStore()
@@ -592,7 +592,7 @@ class TestSnapshotRestore:
         # Restore
         s.restore(snap)
         assert s.get("graph1") == _entry("graph1")
-        # Simhash must survive restore (B1 / plan §9).
+        # Simhash must survive restore.
         assert s.simhash("episodic", "graph1") == 0xCAFE
         assert s.get("graph2") is None
 
@@ -607,7 +607,7 @@ class TestSnapshotRestore:
     def test_snapshot_excludes_registry_lifecycle_but_includes_fingerprints(self):
         """Registries persist via their own KeyRegistry.save/load lifecycle.
 
-        The snapshot DOES carry the fingerprint map (plan §9) so fingerprints
+        The snapshot DOES carry the fingerprint map so fingerprints
         survive rollback, but the registry lifecycle (active/stale partitions)
         is NOT included — that is restored from disk separately.
         """
@@ -1002,7 +1002,7 @@ class TestConfidenceGate:
 
 
 # ---------------------------------------------------------------------------
-# discard_keys helper (§6.2.7 / §3.5)
+# discard_keys helper — erase and stale mode variants
 # ---------------------------------------------------------------------------
 
 
@@ -1012,7 +1012,7 @@ class TestDiscardKeys:
     Covers: mode="erase" removes from active + drops simhash across tiers
     (registry over tiers_with_registry, simhash over three main tiers only);
     mode="stale" moves to stale + RETAINS simhash; idempotent on absent key;
-    no-op when replay disabled (W5 guard).
+    no-op when replay disabled.
     """
 
     def _make_store_with_key(self, key: str = "graph1", tier: str = "episodic") -> MemoryStore:
@@ -1078,7 +1078,7 @@ class TestDiscardKeys:
         s.discard_keys(["nonexistent_key"], mode="stale")
 
     def test_noop_when_replay_disabled(self):
-        """W5: when replay is disabled, discard_keys is a no-op."""
+        """When replay is disabled, discard_keys is a no-op."""
         s = MemoryStore(replay_enabled=False)
         s.put_simhash("episodic", "graph1", 0xAAAA)
         # Replay disabled → must not raise and must leave simhash intact.

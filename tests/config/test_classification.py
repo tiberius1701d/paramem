@@ -137,7 +137,7 @@ class TestUnclassifiedDefaultsToDestructive:
     def test_unclassified_defaults_to_destructive(self):
         """Paths absent from the classification table return Tier.DESTRUCTIVE."""
         assert classify("this.is.not.a.real.path") == Tier.DESTRUCTIVE, (
-            "Unknown paths must fall back to DESTRUCTIVE (Resolved Decision 8)"
+            "Unknown paths must fall back to DESTRUCTIVE (fail-safe default)"
         )
 
 

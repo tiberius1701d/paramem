@@ -43,8 +43,8 @@ validator consults ``AdapterManifest.synthesized`` to pick severity:
 
 References
 ----------
-- Resolved Decision 17: per-adapter manifest schema distinct from ArtifactMeta.
-- Resolved Decision 31: live-slot by registry_sha256 match, not pointer file.
+- Per-adapter manifest schema is distinct from ArtifactMeta (not a shared envelope).
+- Live-slot resolution is by registry_sha256 hash match, not a pointer/symlink file.
 """
 
 from __future__ import annotations

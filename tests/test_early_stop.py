@@ -1148,7 +1148,7 @@ class TestRecallEarlyStopCallbackResume:
 
 
 # ---------------------------------------------------------------------------
-# Tests for Stage 1 (last_per_key capture) and Stage 2 (forced final-epoch probe)
+# Tests for last_per_key capture and forced final-epoch probe
 # ---------------------------------------------------------------------------
 
 

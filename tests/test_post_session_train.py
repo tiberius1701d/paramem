@@ -11,7 +11,7 @@ Tests cover the post_session_train orchestration logic:
   4. Zero facts extracted → mode="noop", no adapter created.
   5. Training failure → registry unchanged, no adapter saved.
   6. max_interim_count=0 → mode="queued", triples in pending_interim_triples.
-  7. Queued facts are present in pending_interim_triples (Step 7 skeleton).
+  7. Queued facts are present in pending_interim_triples.
   8. Keys registered only AFTER training returns, not before.
 """
 
@@ -735,7 +735,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
         called_rels = mock_proc.call_args[0][0]
         assert len(called_rels) == 1
 
-        # Step-8 flush invariant: whenever step-6b stamps a procedural manifest
+        # Procedural flush invariant: whenever the procedural manifest is stamped
         # (gate: procedural_config is not None and "procedural" in peft_config),
         # the per-tier indexed_key_registry.json must land on disk in the same
         # consolidation window so the manifest's registry_sha256 is verifiable
@@ -944,7 +944,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                     stamp=stamp,
                 )
 
-        # Step 7 (episodic key registration) never ran — registry stays empty.
+        # Episodic key registration never ran — registry stays empty.
         assert _count_registry_keys(loop) == 0, (
             "Episodic keys must not be registered when procedural training fails."
         )

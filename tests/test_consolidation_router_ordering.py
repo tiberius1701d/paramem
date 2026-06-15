@@ -3,7 +3,7 @@
 Covers:
   - Lock-leak guard: calling without the GPU lock held raises RuntimeError;
     the lock is NOT left in a locked state after the raise.
-  - B2 re-arm: _set_is_training(True) is called before each _train_adapter();
+  - Training-flag bracketing: _set_is_training(True) is called before each _train_adapter();
     _set_is_training(False) is called in the finally block.
   - Per-tier inference_fallback_adapter: each TrainingJob carries the correct
     backup adapter name.
@@ -214,7 +214,7 @@ def _create_noop(m, cfg, name):
 
 
 # Subject → intended registry tier for the per-tier ordering tests.  Both
-# TestB2RearmPattern.test_set_is_training_called_for_all_three_tiers and
+# TestTrainingFlagBracketing.test_set_is_training_called_for_all_three_tiers and
 # TestPerTierInferenceFallbackAdapter use the same three triples, one per tier.
 _TIER_BY_SUBJECT = {"Alice": "episodic", "Bob": "semantic", "Dave": "procedural"}
 
@@ -312,11 +312,11 @@ class TestLockLeakGuard:
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — B2 re-arm: _set_is_training bracketing
+# Test 2 — Training-flag bracketing: _set_is_training(True)/False per adapter call
 # ---------------------------------------------------------------------------
 
 
-class TestB2RearmPattern:
+class TestTrainingFlagBracketing:
     """_set_is_training(True) before each _train_adapter; False in finally."""
 
     def test_set_is_training_called_per_tier(self, tmp_path: Path) -> None:
@@ -1282,7 +1282,7 @@ class TestMainWeightsSavedBeforeInterimPurge:
     be marked consolidated.
 
     The fix moves the weight persist+verify INSIDE the finalize block, between
-    the registry rewrite (6a) and the interim purge (6b), so every caller gets
+    the registry rewrite and the interim purge, so every caller gets
     safe ordering: a verified durable main copy exists before any interim dir
     is removed.
     """

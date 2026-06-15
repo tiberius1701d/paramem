@@ -731,7 +731,7 @@ def verify_infrastructure_integrity(
 
     # Cross-consistency: key_metadata orphans
     # A key in key_metadata["keys"] that no tier knows (not active, not stale).
-    # Stale keys legitimately retain key_metadata (W1 retention invariant).
+    # Stale keys legitimately retain key_metadata entries (stale keys are known to all tiers).
     # Uses the already-parsed payload from _check_common_file — no second read.
     if store is not None and key_metadata_check.status == _OK and key_metadata_parsed is not None:
         orphan_keys: list[str] = []

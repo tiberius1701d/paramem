@@ -91,7 +91,7 @@ class ArtifactMeta:
         Hex digest of the raw bytes *as written to disk* — ciphertext when
         ``encrypted=True``, plaintext otherwise.  Whitespace and key-order
         changes in the source data are visible as hash changes (Resolved
-        Decision 29 — no YAML canonicalization).
+        no YAML canonicalization applied).
     size_bytes : int
         Byte count of the artifact file on disk (after encryption if applied).
     encrypted : bool
@@ -103,8 +103,8 @@ class ArtifactMeta:
         Optional user-supplied annotation.
 
     Note: there is no ``registry_sha256`` field.  That field belongs to the
-    per-adapter manifest (``paramem.adapters.manifest.AdapterManifest``).
-    See Resolved Decision 17.
+    per-adapter manifest (``paramem.adapters.manifest.AdapterManifest``),
+    not to the per-artifact sidecar.
     """
 
     schema_version: int

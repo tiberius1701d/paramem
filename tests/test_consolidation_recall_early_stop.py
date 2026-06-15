@@ -151,17 +151,16 @@ class TestMaybeMakeRecallCallback:
         assert cb._pause_file is None  # production pause via gpu_lock_sync
 
     def test_num_epochs_override_propagates_to_callback(self, tmp_path: Path) -> None:
-        """Regression: stage-9 (consolidate_interim_adapters) trains with
-        refresh_epochs, not num_epochs.  When num_epochs != refresh_epochs the
-        forced final-epoch probe must fire at refresh_epochs, not at num_epochs.
+        """Regression: consolidate_interim_adapters trains with refresh_epochs,
+        not num_epochs.  When num_epochs != refresh_epochs the forced
+        final-epoch probe must fire at refresh_epochs, not at num_epochs.
 
         Concretely: if an operator sets consolidation.max_epochs (refresh_epochs)
         to a value other than training_config.num_epochs (30), the callback's
         _num_epochs must track the ACTUAL trainer epoch count (refresh_epochs),
         not the stale training_config default.  A stale _num_epochs silently
         skips the forced probe and leaves state.last_per_key with a mid-training
-        cadence verdict — the wrong-admit/wrong-drop bug described in
-        .agent/consolidation_architecture.md:86-99.
+        cadence verdict — wrong registration admission/rejection.
         """
         # num_epochs in TrainingConfig is 30 (default).  Use 20 as refresh_epochs
         # so the mismatch condition from the bug is clearly visible.
@@ -506,7 +505,7 @@ class TestProbeTargetIsFullReplaySet:
 
 # ---------------------------------------------------------------------------
 # Class G — TestCallbackStateTuple
-# Tests for the (callback, state) seam introduced in Stage 3.
+# Tests for the (callback, state) return seam.
 # ---------------------------------------------------------------------------
 
 

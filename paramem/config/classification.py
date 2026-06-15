@@ -4,11 +4,11 @@ Every migration tool routes through :func:`classify` as the single
 source of truth for tier assignment.  The lookup table is a module-level dict
 literal — no file I/O, no YAML dependency — easy to audit by diff.
 
-Scope: ``configs/server.yaml`` only (Resolved Decision 16).  Fields in
-``configs/default.yaml`` (``training:``, ``replay:``, ``graph:``, ``wandb:``)
+Scope: ``configs/server.yaml`` only (server runtime config; experiment-script config excluded).
+Fields in ``configs/default.yaml`` (``training:``, ``replay:``, ``graph:``, ``wandb:``)
 are experiment-script config, not server runtime, and are excluded.
 
-Fallback rule (Resolved Decision 8): any path that is not present in
+Fallback rule: any path that is not present in
 :data:`CLASSIFICATION` and not reachable via wildcard substitution is treated
 as :attr:`Tier.DESTRUCTIVE`.  Fail-safe over fail-open.
 """
@@ -264,7 +264,7 @@ def classify(dotted_path: str) -> Tier:
     3. Wildcard match — rewrite the **last** segment to ``*`` and retry.
        Defensive; no current yaml shape requires it, but keeps the lookup
        complete if a future flat dynamic key is added.
-    4. Fall through to :attr:`Tier.DESTRUCTIVE` (Resolved Decision 8).
+    4. Fall through to :attr:`Tier.DESTRUCTIVE` (fail-safe default for unknown paths).
 
     Parameters
     ----------

@@ -231,7 +231,7 @@ class TestSecurityOrphanSweepStillWorks:
     """orphan_sweep coexists with new ServerBackupsConfig fields (backward-compat guard)."""
 
     def test_security_orphan_sweep_still_works(self, tmp_path):
-        """orphan_sweep.max_age_hours: 48 still loads correctly alongside 6a fields."""
+        """orphan_sweep.max_age_hours: 48 still loads correctly alongside new retention fields."""
         yaml_file = _write_yaml(
             tmp_path,
             """\

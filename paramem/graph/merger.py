@@ -639,7 +639,7 @@ class GraphMerger:
                 # in consolidate_interim_adapters can distinguish intended dedup
                 # (fact preserved under the surviving twin) from genuine loss.
                 self.collapsed.append(relation.indexed_key)
-                # §4.8.i — raw-surface evidence for dedup collapses.
+                # Raw-surface evidence for dedup collapses (observability hook).
                 # The incoming raw surfaces (relation.*, only .strip()ed at
                 # extraction) are recorded alongside the surviving twin's
                 # first-seen surfaces (stored in node attributes["name"] and
@@ -848,11 +848,11 @@ class GraphMerger:
     def reset_graph(self) -> None:
         """Reset the keying surface to an empty graph, clearing per-fold caches.
 
-        Called by ``consolidate_interim_adapters`` BEFORE the Stage-2 re-merge
-        so the keying surface is empty and Option-(a) provenance keying is
-        unconditional: reconstructed-key edges are always net-new (Case 3) or
-        intra-fold-collapsed (Case 1 among recon edges), with no dependence on
-        any pre-existing edge state.
+        Called by ``consolidate_interim_adapters`` BEFORE the reconstruction-
+        and-re-merge pass so the keying surface is empty and provenance keying
+        is unconditional: reconstructed-key edges are always net-new (Case 3)
+        or intra-fold-collapsed (Case 1 among recon edges), with no dependence
+        on any pre-existing edge state.
 
         Cleared caches:
         - ``graph`` — fresh MultiDiGraph (no prior edges/nodes)

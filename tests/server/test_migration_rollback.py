@@ -62,7 +62,7 @@ def _make_state(
     Notes
     -----
     The A-config backup slot is always created using ``backup.write()`` so that
-    ``backup.read()`` (called in the rollback decrypt step, B6 fix) finds a
+    ``backup.read()`` (called in the rollback decrypt step) finds a
     valid sidecar.  Callers that need to test missing-artifact (step 3) should
     call ``_make_state`` and then unlink the artifact from the returned slot
     directory.  The slot directory path is stored in
@@ -583,7 +583,7 @@ class TestRollbackStep6Failure:
 
 
 # ---------------------------------------------------------------------------
-# B1 regression — rollback restores original A bytes (not the sidecar)
+# Sidecar-vs-artifact regression — rollback restores original A bytes (not the sidecar)
 # ---------------------------------------------------------------------------
 
 
@@ -591,10 +591,10 @@ class TestRollbackRestoresOriginalBytesViaRealWriter:
     """Verify that rollback restores the exact pre-confirm config bytes when the
     A-config backup slot was created by the real backup.write() call path.
 
-    This test would have caught the B1 bug (2026-04-22 E2E baseline):
-    the sidecar ``config-<ts>.meta.json`` was returned first by iterdir on some
-    filesystems, causing rollback to overwrite configs/server.yaml with the 415-byte
-    sidecar JSON instead of the real config artifact.
+    Regression: on some filesystems ``iterdir`` returns the sidecar
+    ``config-<ts>.meta.json`` before the real artifact, causing rollback to
+    overwrite configs/server.yaml with the 415-byte sidecar JSON instead of
+    the real config artifact.
     """
 
     def test_rollback_restores_a_config_bytes_via_real_writer(self, tmp_path, monkeypatch):
@@ -603,7 +603,7 @@ class TestRollbackRestoresOriginalBytesViaRealWriter:
         1. Write the A-config backup using backup.write() (exercises the real sidecar
            naming convention ``config-<ts>.meta.json``).
         2. Build a TRIAL state with the slot path and the artifact filename from the
-           marker (as set by the confirm handler after the B1 fix).
+           marker (as set by the confirm handler, which explicitly records the artifact name).
         3. POST /migration/rollback.
         4. Assert live_config_path.read_bytes() == _A_YAML.
         """
@@ -712,13 +712,14 @@ class TestRollbackRestoresOriginalBytesViaRealWriter:
             f"Rollback restored wrong content.  "
             f"Expected A config ({len(a_bytes)} bytes), got {len(restored)} bytes.  "
             f"First 100 chars: {restored[:100]!r}.  "
-            "This is the B1 regression: sidecar JSON was restored instead of the config artifact."
+            "Sidecar-vs-artifact regression: sidecar JSON was restored instead of "
+            "the config artifact."
         )
 
 
 # ---------------------------------------------------------------------------
-# B6 regression — rollback must decrypt encrypted A-config artifact
-# (2026-04-22 re-test: B1 fix correctly picks artifact, exposing missing decrypt)
+# Encrypted-artifact regression — rollback must decrypt encrypted A-config artifact
+# (artifact-selection fix correctly picks the artifact, exposing missing decrypt step)
 # ---------------------------------------------------------------------------
 
 
@@ -726,7 +727,7 @@ class TestRollbackDecryptsEncryptedArtifact:
     """Verify that rollback decrypts the A-config artifact when the daily
     identity is loaded and the backup writer produced an age envelope.
 
-    Before the B6 fix, rollback did ``os.rename(artifact, live_config_path)``
+    Regression: rollback used ``os.rename(artifact, live_config_path)``
     which wrote ciphertext bytes verbatim.  The server then failed to start
     because ``yaml.safe_load`` raised on binary data.
 
@@ -879,7 +880,7 @@ class TestRollbackDecryptsEncryptedArtifact:
         # --- Step 6: post-rollback file is plaintext ---
         restored = live_yaml.read_bytes()
         assert restored == a_bytes, (
-            f"B6 regression: rollback wrote wrong content.  "
+            f"Encrypted-artifact regression: rollback wrote wrong content.  "
             f"Expected plaintext A config ({len(a_bytes)} bytes), "
             f"got {len(restored)} bytes.  "
             f"First 60 bytes: {restored[:60]!r}."

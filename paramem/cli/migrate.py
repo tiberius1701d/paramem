@@ -32,13 +32,13 @@ Long-poll flow (step 6, after y):
 EOF handling
 ------------
 ``N`` or EOF (``EOFError`` from ``input()``) on any prompt POSTs
-``/migration/cancel`` and exits 1 (Condition 4 from the review).  This
+``/migration/cancel`` and exits 1 (EOF-on-any-prompt cancels the migration).  This
 ensures the STAGING stash is always cleared if the operator walks away.
 
 ``--json`` mode
 ---------------
 Bypasses all prompts.  Emits the raw ``PreviewResponse`` JSON with
-``simulate_mode_override`` at the top level (Condition 8).
+``simulate_mode_override`` at the top level (bypasses all interactive prompts).
 
 404 fallback
 ------------
@@ -892,26 +892,26 @@ def render_preview(result: dict, server_url: str) -> int:
 
     # Pre-flight check short-circuit.
     # If the server detected a pre-flight failure (e.g. disk pressure), the
-    # state is still LIVE (Decision A) — no /migration/cancel POST is needed.
+    # state is still LIVE (no staging occurred) — no /migration/cancel POST is needed.
     pre_flight_fail = result.get("pre_flight_fail")
     if pre_flight_fail is not None:
         if pre_flight_fail == "disk_pressure":
             used_gb = result.get("pre_flight_disk_used_gb") or 0.0
             cap_gb = result.get("pre_flight_disk_cap_gb") or 0.0
-            # Spec L582–586 wording, with Decision-C CLI naming.
+            # Disk-pressure message: includes used/cap GB, backup-prune hint, config key to raise.
             print(
-                f"Migration will fail at step 2 (pre-migration backup) — backup store\n"
+                f"Migration will fail at the pre-migration backup step — backup store\n"
                 f"at {used_gb:.2f} / {cap_gb:.2f} GB. Run `paramem backup-prune` or raise\n"
                 f"security.backups.max_total_disk_gb before retrying.",
                 file=sys.stderr,
             )
         else:
-            # Forward-compat: unknown pre-flight code (future slice).
+            # Forward-compat: unknown pre-flight code (future extension).
             print(
                 f"paramem migrate: pre-flight check failed: {pre_flight_fail!r}",
                 file=sys.stderr,
             )
-        # No _post_cancel — state is still LIVE (Decision A); nothing to cancel.
+        # No _post_cancel — state is still LIVE (no staging occurred); nothing to cancel.
         return 1
 
     # 6. Proceed prompt
@@ -941,7 +941,7 @@ def run(args: argparse.Namespace) -> int:
     On ``ServerUnreachable``, prints a troubleshooting hint and returns 2.
 
     With ``--json``, emits the raw ``PreviewResponse`` JSON (bypasses all
-    prompts; ``simulate_mode_override`` is a top-level field — Condition 8).
+    prompts; ``simulate_mode_override`` is a top-level field in the response).
 
     Parameters
     ----------
@@ -993,7 +993,7 @@ def run(args: argparse.Namespace) -> int:
 
     if getattr(args, "json", False):
         # --json: emit raw PreviewResponse with simulate_mode_override at top level
-        # (Condition 8).  simulate_mode_override is already a top-level field in
+        # --json: simulate_mode_override is already a top-level field in
         # the server response dict — this is a pass-through, no remapping needed.
         print(json.dumps(result, indent=2))
         return 0
