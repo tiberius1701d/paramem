@@ -417,9 +417,23 @@ class RestoreResult:
         ``True`` when the bundle's ``server.yaml`` was atomically written to
         ``config_path`` (only when ``restore_config=True`` was requested).
         ``False`` otherwise — the live config is left untouched.
+    pruned_orphans : list[dict]
+        Orphan adapters that were present on disk but absent from the bundle's
+        recovery set and were removed by the clean-slate sweep (step 5e).
+        Records only ADAPTER-LEVEL removals: whole orphan main tiers (e.g.
+        ``"procedural"`` not in the bundle) and orphan interim families (e.g.
+        ``"episodic_interim_20260614T1200"`` not in the bundle).  Each entry
+        carries three keys: ``"name"`` (str), ``"kind"``
+        (``"interim"`` | ``"main"``), and ``"active_keys"`` (int — count of
+        active keys in that adapter's ``indexed_key_registry.json`` at the
+        time of removal; ``0`` when the registry was missing or unreadable).
+        Routine within-tier stale-slot cleanup (old slot dirs inside a tier
+        that IS in the bundle) is logged at INFO/DEBUG but NOT listed here.
+        Empty when no orphan adapters were found.
     """
 
     restored_adapters: list[str] = field(default_factory=list)
     safety_slot: Path | None = None
     restart_required: bool = True
     restored_config: bool = False
+    pruned_orphans: list[dict] = field(default_factory=list)
