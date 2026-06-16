@@ -488,3 +488,62 @@ class TestDiscardSessionsOrigdoc:
         # No write_origdoc call — file absent.
         buf.discard_sessions([f"{doc_id}-c000"])  # must not raise
         assert len(buf.get_pending()) == 0
+
+
+# ---------------------------------------------------------------------------
+# pending_facts / get_pending population parity
+# ---------------------------------------------------------------------------
+
+
+class TestPendingFactsPopulationParity:
+    """pending_facts() and get_pending() must expose the same session ids.
+
+    Covers three cases: a normal session with turns, an empty in-memory
+    session (turns registered but list is empty), and an empty disk-only
+    JSONL (file on disk with no content).
+    """
+
+    def _session_ids_from_pending_facts(self, buf: SessionBuffer) -> set[str]:
+        return {f["session_id"] for f in buf.pending_facts()}
+
+    def _session_ids_from_get_pending(self, buf: SessionBuffer) -> set[str]:
+        return {p["session_id"] for p in buf.get_pending()}
+
+    def test_normal_session_both_see_it(self, buf):
+        """A session with actual turns appears in both pending_facts and get_pending."""
+        buf.append("conv-normal", "user", "hello world")
+        assert self._session_ids_from_pending_facts(buf) == self._session_ids_from_get_pending(buf)
+        assert "conv-normal" in self._session_ids_from_pending_facts(buf)
+
+    def test_empty_in_memory_session_excluded_by_both(self, buf, tmp_path):
+        """An in-memory session with no turns is invisible to both methods."""
+        # Register a session in _sessions and _turns but with an empty turns list.
+        # _turns is a defaultdict(list), so accessing the key is enough to register it
+        # without appending any turns.
+        buf._turns["conv-empty"]  # creates the key; leaves list empty
+        buf._sessions["conv-empty"] = {"speaker": None, "state": "new"}
+        # Also write an empty JSONL to ensure the disk branch sees the same thing.
+        (buf.session_dir / "conv-empty.jsonl").write_text("")
+
+        assert self._session_ids_from_pending_facts(buf) == self._session_ids_from_get_pending(buf)
+        assert "conv-empty" not in self._session_ids_from_pending_facts(buf)
+
+    def test_empty_disk_only_jsonl_excluded_by_both(self, buf):
+        """A disk-only JSONL with no content is invisible to both methods."""
+        # Write an empty JSONL file that exists on disk but was never loaded into RAM.
+        (buf.session_dir / "conv-disk-empty.jsonl").write_text("")
+
+        assert self._session_ids_from_pending_facts(buf) == self._session_ids_from_get_pending(buf)
+        assert "conv-disk-empty" not in self._session_ids_from_pending_facts(buf)
+
+    def test_parity_with_mixed_population(self, buf):
+        """Normal session and empty session together: only normal appears in both."""
+        buf.append("conv-good", "user", "some text")
+        # Empty in-memory entry
+        buf._turns["conv-bad"]  # noqa: B018 — defaultdict side-effect: registers empty list
+        (buf.session_dir / "conv-bad.jsonl").write_text("")
+
+        pf_ids = self._session_ids_from_pending_facts(buf)
+        gp_ids = self._session_ids_from_get_pending(buf)
+        assert pf_ids == gp_ids
+        assert pf_ids == {"conv-good"}

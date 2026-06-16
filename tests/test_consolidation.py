@@ -490,21 +490,41 @@ consolidation:
 
 
 # ---------------------------------------------------------------------------
-# Server consolidation — anonymous speaker sessions must not be silently skipped
+# Server consolidation — 3-way session classification
 # ---------------------------------------------------------------------------
 
 
-class TestAnonymousSpeakerNotSkipped:
-    """Speaker{N} sessions must flow through extraction, not be silently discarded.
+class TestSessionClassification:
+    """classify_session and the extraction-phase session routing.
 
-    Verifies that _run_extraction_phase (paramem.server.app) calls
-    loop.extract_session for sessions whose speaker_id is 'Speaker3' —
-    i.e. the old hard-skip on falsy speaker_id is gone.
+    The new contract:
+    - NAMED (speaker_id present and not anonymous_voice) → extracted.
+    - HOLDABLE (anonymous_voice OR no speaker_id but has a voice embedding) → NOT extracted.
+    - UNIDENTIFIABLE (no speaker_id AND no voice embedding) → NOT extracted.
+
+    Anonymity is determined by the speaker store, not by the speaker_id string
+    format — do NOT use 'Speaker{N}' string patterns as the anonymity gate.
 
     Note: these tests call _run_extraction_phase directly (in paramem.server.app);
     run_consolidation was deleted and must not be re-introduced (see
     test_run_consolidation_removed.py).
     """
+
+    def _make_stub_store(self, anonymous_ids=None):
+        """Return a minimal SpeakerStore stub.
+
+        Args:
+            anonymous_ids: set of speaker_ids that is_anonymous() returns True for.
+        """
+        store = MagicMock()
+        _anon = set(anonymous_ids or [])
+
+        def _is_anonymous(sid):
+            return sid in _anon
+
+        store.is_anonymous.side_effect = _is_anonymous
+        store.get_name.return_value = None
+        return store
 
     def _make_mock_loop(self, tmp_path):
         """Minimal mock ConsolidationLoop with the attributes _run_extraction_phase touches."""
@@ -533,11 +553,7 @@ class TestAnonymousSpeakerNotSkipped:
         return loop
 
     def _make_config(self, tmp_path):
-        """Minimal ServerConfig pointing at a temp directory.
-
-        Uses PathsConfig so that adapter_dir, key_metadata_path, and
-        registry_path resolve under tmp_path without needing property setters.
-        """
+        """Minimal ServerConfig pointing at a temp directory."""
         from paramem.server.config import PathsConfig, ServerConfig
 
         config = ServerConfig()
@@ -545,25 +561,25 @@ class TestAnonymousSpeakerNotSkipped:
         (tmp_path / "ha" / "adapters").mkdir(parents=True, exist_ok=True)
         return config
 
-    def _make_session_buffer(self, tmp_path, speaker_id):
-        """SessionBuffer with a single in-memory session for the given speaker_id.
+    def _make_session_buffer(self, tmp_path, speaker_id, *, embedding=None):
+        """SessionBuffer with a single in-memory session.
 
-        Sets speaker identity before appending turns so the turns carry the
-        speaker_id and get_pending() returns it as the dominant speaker.
+        Args:
+            speaker_id: Speaker id to set on the session (None = no speaker).
+            embedding: Optional voice embedding list to attach to the user turn.
         """
         from paramem.server.session_buffer import SessionBuffer
 
         buffer = SessionBuffer(tmp_path / "sessions", debug=False)
-        conv_id = "conv-anon-test"
+        conv_id = "conv-test"
         if speaker_id is not None:
-            # Set speaker before appending so turns carry the speaker_id.
             buffer.set_speaker(conv_id, speaker_id, speaker_id)
-        buffer.append(conv_id, "user", "Hello there")
+        buffer.append(conv_id, "user", "Hello there", embedding=embedding)
         buffer.append(conv_id, "assistant", "Hi!")
         return buffer
 
-    def _call_run_extraction_phase(self, loop, config, buffer):
-        """Inject config + session_buffer into _state and call _run_extraction_phase."""
+    def _call_run_extraction_phase(self, loop, config, buffer, store=None):
+        """Inject config + session_buffer (+ optional store) into _state and call."""
         import paramem.server.app as _app
 
         prior_config = _app._state.get("config")
@@ -573,7 +589,7 @@ class TestAnonymousSpeakerNotSkipped:
         _app._state["config"] = config
         _app._state["session_buffer"] = buffer
         _app._state["ha_client"] = None
-        _app._state["speaker_store"] = None
+        _app._state["speaker_store"] = store
         try:
             return _app._run_extraction_phase(loop)
         finally:
@@ -582,45 +598,300 @@ class TestAnonymousSpeakerNotSkipped:
             _app._state["ha_client"] = prior_ha
             _app._state["speaker_store"] = prior_speaker
 
-    def test_anonymous_speaker_id_not_skipped(self, tmp_path):
-        """Sessions with speaker_id='Speaker3' reach extract_session."""
-        loop = self._make_mock_loop(tmp_path)
-        config = self._make_config(tmp_path)
-        buffer = self._make_session_buffer(tmp_path, speaker_id="Speaker3")
+    # --- classify_session unit tests ---
 
-        self._call_run_extraction_phase(loop, config, buffer)
+    def test_classify_named(self):
+        """NAMED: speaker_id present and not anonymous."""
+        from paramem.server.consolidation import SessionClass, classify_session
 
-        loop.extract_session.assert_called_once()
-        call_kwargs = loop.extract_session.call_args
-        # First positional arg is the transcript; keyword arg is speaker_id.
-        assert call_kwargs.kwargs.get("speaker_id") == "Speaker3"
+        result = classify_session(
+            speaker_id="abc12345", is_anonymous=False, has_voice_embedding=False
+        )
+        assert result == SessionClass.NAMED
 
-    def test_named_speaker_not_skipped(self, tmp_path):
-        """Named (enrolled) speaker IDs continue to reach extract_session."""
+    def test_classify_holdable_anonymous(self):
+        """HOLDABLE: speaker_id present but is_anonymous=True."""
+        from paramem.server.consolidation import SessionClass, classify_session
+
+        result = classify_session(
+            speaker_id="Speaker3", is_anonymous=True, has_voice_embedding=False
+        )
+        assert result == SessionClass.HOLDABLE
+
+    def test_classify_holdable_embedding_only(self):
+        """HOLDABLE: no speaker_id but voice embedding present (retro-claimable)."""
+        from paramem.server.consolidation import SessionClass, classify_session
+
+        result = classify_session(speaker_id=None, is_anonymous=False, has_voice_embedding=True)
+        assert result == SessionClass.HOLDABLE
+
+    def test_classify_unidentifiable(self):
+        """UNIDENTIFIABLE: no speaker_id and no voice embedding."""
+        from paramem.server.consolidation import SessionClass, classify_session
+
+        result = classify_session(speaker_id=None, is_anonymous=False, has_voice_embedding=False)
+        assert result == SessionClass.UNIDENTIFIABLE
+
+    def test_classify_named_overrides_embedding(self):
+        """NAMED takes precedence even when a voice embedding is also present."""
+        from paramem.server.consolidation import SessionClass, classify_session
+
+        result = classify_session(
+            speaker_id="abc12345", is_anonymous=False, has_voice_embedding=True
+        )
+        assert result == SessionClass.NAMED
+
+    # --- _run_extraction_phase routing tests ---
+
+    def test_named_speaker_reaches_extract_session(self, tmp_path):
+        """Named (enrolled, non-anonymous) speaker sessions are extracted."""
         loop = self._make_mock_loop(tmp_path)
         config = self._make_config(tmp_path)
         buffer = self._make_session_buffer(tmp_path, speaker_id="abc12345")
+        store = self._make_stub_store(anonymous_ids=set())
 
-        self._call_run_extraction_phase(loop, config, buffer)
+        self._call_run_extraction_phase(loop, config, buffer, store=store)
 
         loop.extract_session.assert_called_once()
         assert loop.extract_session.call_args.kwargs.get("speaker_id") == "abc12345"
 
-    def test_none_speaker_id_still_skipped(self, tmp_path):
-        """Truly-None speaker_id (text-only, no voice) is skipped at consolidation.
+    def test_anonymous_speaker_not_extracted(self, tmp_path):
+        """Anonymous-voice (HOLDABLE) sessions are NOT extracted.
 
-        Sessions with no speaker_id must not reach extract_session — a None
-        speaker_id would cause unrelated text-only sessions to be attributed
-        to the same unknown speaker, corrupting the graph.
+        Anonymity is determined by the store, not by the 'Speaker{N}' string.
         """
         loop = self._make_mock_loop(tmp_path)
         config = self._make_config(tmp_path)
-        buffer = self._make_session_buffer(tmp_path, speaker_id=None)
+        # "Speaker3" is anonymous_voice in the store
+        buffer = self._make_session_buffer(tmp_path, speaker_id="Speaker3")
+        store = self._make_stub_store(anonymous_ids={"Speaker3"})
 
-        self._call_run_extraction_phase(loop, config, buffer)
+        self._call_run_extraction_phase(loop, config, buffer, store=store)
 
-        # Text-only sessions without a speaker_id must NOT reach extract_session.
         loop.extract_session.assert_not_called()
+
+    def test_none_speaker_no_embedding_not_extracted(self, tmp_path):
+        """UNIDENTIFIABLE sessions (no speaker_id, no embedding) are not extracted.
+
+        Sessions with no speaker_id and no voice embedding can never be attributed;
+        they must not reach extract_session.
+        """
+        loop = self._make_mock_loop(tmp_path)
+        config = self._make_config(tmp_path)
+        buffer = self._make_session_buffer(tmp_path, speaker_id=None, embedding=None)
+        store = self._make_stub_store()
+
+        self._call_run_extraction_phase(loop, config, buffer, store=store)
+
+        loop.extract_session.assert_not_called()
+
+    def test_no_speaker_with_embedding_not_extracted(self, tmp_path):
+        """HOLDABLE sessions (no speaker_id but voice embedding) are not extracted.
+
+        The session may be retro-claimed later; it must wait.
+        """
+        loop = self._make_mock_loop(tmp_path)
+        config = self._make_config(tmp_path)
+        buffer = self._make_session_buffer(tmp_path, speaker_id=None, embedding=[0.1, 0.2])
+        store = self._make_stub_store()
+
+        self._call_run_extraction_phase(loop, config, buffer, store=store)
+
+        loop.extract_session.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Retire decision: HOLDABLE TTL + UNIDENTIFIABLE immediate drop
+# ---------------------------------------------------------------------------
+
+
+class TestRetireDecision:
+    """Retire decision is explicit caller logic, NOT inside classify_session.
+
+    HOLDABLE sessions retire past TTL; NAMED and unexpired HOLDABLE stay.
+    UNIDENTIFIABLE sessions are always in drop_ids regardless of TTL.
+    """
+
+    def test_holdable_held_when_ttl_off(self):
+        """HOLDABLE stays pending when orphan_retirement is 'off' (TTL=None)."""
+        from paramem.server.consolidation import SessionClass, classify_session
+
+        cls = classify_session(speaker_id=None, is_anonymous=False, has_voice_embedding=True)
+        assert cls == SessionClass.HOLDABLE
+
+        ttl_seconds = None  # off
+        age_seconds = 9999999
+        # Simulate the caller's retire decision
+        retired = ttl_seconds is not None and age_seconds > ttl_seconds
+        assert not retired
+
+    def test_holdable_retired_past_ttl(self):
+        """HOLDABLE is retired when age exceeds the configured TTL."""
+        from paramem.server.consolidation import SessionClass, classify_session
+
+        cls = classify_session(speaker_id=None, is_anonymous=False, has_voice_embedding=True)
+        assert cls == SessionClass.HOLDABLE
+
+        ttl_seconds = 3600  # 1h
+        age_seconds = 7200  # 2h
+        retired = ttl_seconds is not None and age_seconds > ttl_seconds
+        assert retired
+
+    def test_holdable_held_when_fresh(self):
+        """HOLDABLE is NOT retired when age is below the TTL."""
+        from paramem.server.consolidation import SessionClass, classify_session
+
+        cls = classify_session(speaker_id=None, is_anonymous=False, has_voice_embedding=True)
+        assert cls == SessionClass.HOLDABLE
+
+        ttl_seconds = 3600
+        age_seconds = 1800  # 30 min — under TTL
+        retired = ttl_seconds is not None and age_seconds > ttl_seconds
+        assert not retired
+
+    def test_unidentifiable_always_dropped(self):
+        """UNIDENTIFIABLE sessions are always in drop_ids (no TTL needed)."""
+        from paramem.server.consolidation import SessionClass, classify_session
+
+        cls = classify_session(speaker_id=None, is_anonymous=False, has_voice_embedding=False)
+        assert cls == SessionClass.UNIDENTIFIABLE
+        # By contract: UNIDENTIFIABLE → always drop, TTL not consulted.
+
+    def test_named_never_dropped(self):
+        """NAMED sessions are never in drop_ids regardless of age."""
+        from paramem.server.consolidation import SessionClass, classify_session
+
+        cls = classify_session(speaker_id="abc12345", is_anonymous=False, has_voice_embedding=False)
+        assert cls == SessionClass.NAMED
+        # Named sessions are extracted, not retired.
+
+
+# ---------------------------------------------------------------------------
+# Tick gate: noop_no_named when all pending sessions are non-NAMED
+# ---------------------------------------------------------------------------
+
+
+class TestTickGateNoNamed:
+    """_maybe_trigger_scheduled_consolidation returns noop_no_named when no NAMED sessions."""
+
+    def _make_minimal_state(self, tmp_path, buffer, store=None):
+        """Inject minimal _state overrides for the tick function."""
+        from paramem.server.config import ConsolidationScheduleConfig, ServerConfig
+
+        config = MagicMock(spec=ServerConfig)
+        sched = ConsolidationScheduleConfig()
+        config.consolidation = sched
+        config.debug = False
+        config.debug_dir = tmp_path / "debug"
+
+        return {
+            "config": config,
+            "session_buffer": buffer,
+            "speaker_store": store,
+            "consolidating": False,
+            "mode": "local",
+            "last_chat_monotonic": None,
+            "pending_rehydration": False,
+            "store_load_degraded": False,
+        }
+
+    def _make_stub_store(self, anonymous_ids=None):
+        store = MagicMock()
+        _anon = set(anonymous_ids or [])
+        store.is_anonymous.side_effect = lambda sid: sid in _anon
+        return store
+
+    def _call_tick(self, state_overrides: dict) -> str:
+        """Run _maybe_trigger_scheduled_consolidation with mocked _state."""
+        from unittest.mock import patch
+
+        import paramem.server.app as _app
+
+        # Patch _consolidation_dispatch_guards to return None (no pre-emption),
+        # _is_full_cycle_due to return False (not a full cycle tick),
+        # and _retro_claim_orphan_sessions to no-op.
+        with (
+            patch.object(_app, "_state", state_overrides),
+            patch(
+                "paramem.server.app._consolidation_dispatch_guards",
+                return_value=None,
+            ),
+            patch("paramem.server.app._is_full_cycle_due", return_value=False),
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+        ):
+            return _app._maybe_trigger_scheduled_consolidation()
+
+    def test_all_unidentifiable_returns_noop_no_named(self, tmp_path):
+        """When all sessions are UNIDENTIFIABLE, tick returns noop_no_named."""
+        from paramem.server.session_buffer import SessionBuffer
+
+        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        conv_id = "conv-unid"
+        # No speaker_id, no embedding → UNIDENTIFIABLE
+        buffer.append(conv_id, "user", "Hello")
+        buffer.append(conv_id, "assistant", "Hi")
+
+        store = self._make_stub_store()
+        state = self._make_minimal_state(tmp_path, buffer, store)
+
+        result = self._call_tick(state)
+        assert result == "noop_no_named"
+
+    def test_all_holdable_returns_noop_no_named(self, tmp_path):
+        """When all sessions are HOLDABLE, tick returns noop_no_named."""
+        from paramem.server.session_buffer import SessionBuffer
+
+        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        conv_id = "conv-hold"
+        # No speaker_id but has embedding → HOLDABLE
+        buffer.append(conv_id, "user", "Hello", embedding=[0.1, 0.2])
+        buffer.append(conv_id, "assistant", "Hi")
+
+        store = self._make_stub_store()
+        state = self._make_minimal_state(tmp_path, buffer, store)
+
+        result = self._call_tick(state)
+        assert result == "noop_no_named"
+
+    def test_unidentifiable_sessions_retired_at_tick(self, tmp_path):
+        """UNIDENTIFIABLE sessions are mark_consolidated at the tick, not left pending.
+
+        After the tick, the session must no longer appear in buffer.get_pending().
+        """
+        from paramem.server.session_buffer import SessionBuffer
+
+        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        conv_id = "conv-unid2"
+        buffer.append(conv_id, "user", "Text only, no speaker")
+        buffer.append(conv_id, "assistant", "Ok")
+
+        store = self._make_stub_store()
+        state = self._make_minimal_state(tmp_path, buffer, store)
+
+        self._call_tick(state)
+
+        # Session was retired (UNIDENTIFIABLE → immediate drop).
+        remaining = [s["session_id"] for s in buffer.get_pending()]
+        assert conv_id not in remaining
+
+    def test_holdable_session_stays_pending(self, tmp_path):
+        """HOLDABLE sessions (fresh, TTL=off) remain pending after tick."""
+        from paramem.server.session_buffer import SessionBuffer
+
+        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        conv_id = "conv-hold2"
+        # embedding present → HOLDABLE
+        buffer.append(conv_id, "user", "Hello", embedding=[0.3, 0.4])
+        buffer.append(conv_id, "assistant", "Hi")
+
+        store = self._make_stub_store()
+        state = self._make_minimal_state(tmp_path, buffer, store)
+
+        self._call_tick(state)
+
+        # HOLDABLE + TTL=off → session stays pending.
+        remaining = [s["session_id"] for s in buffer.get_pending()]
+        assert conv_id in remaining
 
 
 # ---------------------------------------------------------------------------

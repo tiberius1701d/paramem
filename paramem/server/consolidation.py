@@ -9,6 +9,7 @@ The loop saves adapters directly to output_dir (= adapter_dir), so
 the router can reload from the standard paths without any bridging.
 """
 
+import enum
 import json
 import logging
 from pathlib import Path
@@ -19,6 +20,78 @@ from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.thermal_throttle import ThermalPolicy
 
 logger = logging.getLogger(__name__)
+
+
+class SessionClass(enum.Enum):
+    """3-way classification of a pending session's attribution state.
+
+    NAMED         — speaker_id is present and not anonymous_voice.
+                    Extract and train immediately.
+    HOLDABLE      — speaker is anonymous (anonymous_voice enroll_method), OR
+                    the session has no speaker_id but at least one user turn
+                    carries a voice embedding (may be attributed later via
+                    retro-claim).  Hold pending; retire only past the
+                    orphan_retirement TTL.
+    UNIDENTIFIABLE — no speaker_id AND no voice embedding anywhere — an
+                    unauthenticated text session that can never be attributed.
+                    Drop immediately; no TTL.
+    """
+
+    NAMED = "named"
+    HOLDABLE = "holdable"
+    UNIDENTIFIABLE = "unidentifiable"
+
+
+def classify_session(
+    *,
+    speaker_id: str | None,
+    is_anonymous: bool,
+    has_voice_embedding: bool,
+) -> SessionClass:
+    """Classify a pending session by attribution state.
+
+    Pure function — callers resolve ``is_anonymous`` via
+    ``store.is_anonymous(speaker_id)`` before calling; pass ``False`` when
+    the speaker store is unavailable.
+
+    Parameters
+    ----------
+    speaker_id:
+        Dominant speaker id from the session (may be ``None``).
+    is_anonymous:
+        ``True`` iff the speaker profile's ``enroll_method == "anonymous_voice"``.
+        Callers obtain this via ``SpeakerStore.is_anonymous(speaker_id)``.
+        When the store is ``None``, pass ``False``.
+    has_voice_embedding:
+        ``True`` iff any user-role turn in the session carries a non-``None``
+        ``"embedding"`` field.  Obtained from :meth:`SessionBuffer.pending_facts`.
+
+    Returns
+    -------
+    SessionClass
+        NAMED if the speaker is enrolled and non-anonymous.
+        HOLDABLE if anonymous or holds a voice embedding (retro-claimable).
+        UNIDENTIFIABLE if no speaker_id and no embedding.
+    """
+    if speaker_id and not is_anonymous:
+        return SessionClass.NAMED
+    if is_anonymous or has_voice_embedding:
+        return SessionClass.HOLDABLE
+    return SessionClass.UNIDENTIFIABLE
+
+
+def discard_session_sink(config: ServerConfig) -> Path:
+    """Return the discard-sink directory for unattributable / retired-holdable sessions.
+
+    Under ``config.debug_dir/discarded_sessions/``.  Distinct from
+    :func:`session_retention_dir` (trained-session archive) so the trained
+    archive is never polluted with dropped sessions.
+
+    Under ``debug=False`` (privacy mode), :meth:`SessionBuffer.mark_consolidated`
+    unlinks the JSONL unconditionally regardless of ``retention_dir`` — this
+    sink is still passed so the code path is identical in both modes.
+    """
+    return config.debug_dir / "discarded_sessions"
 
 
 def create_consolidation_loop(

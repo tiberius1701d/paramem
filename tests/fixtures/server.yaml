@@ -328,6 +328,8 @@ consolidation:
   training_idle_debounce_s: 30
   # /chat abort-quiesce timeout: mirrors server.yaml.example.
   abort_quiesce_timeout_s: 30.0
+  # Holdable-session retirement TTL — mirrors server.yaml.example.
+  orphan_retirement: "off"
   # --- LoRA training hyperparameters (Test 17 recipe; formerly an in-code default) ---
   # num_epochs is the ceiling `max_epochs` above (None -> 30); not repeated here.
   training_batch_size: 1

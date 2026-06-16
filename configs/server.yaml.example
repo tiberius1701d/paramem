@@ -333,6 +333,14 @@ consolidation:
   # step boundary before falling back to bt.stop(). 30s covers typical BG
   # training step durations with room to spare.
   abort_quiesce_timeout_s: 30.0
+  # Holdable-session retirement TTL.  Sessions with a voice embedding
+  # (retro-claimable) or anonymous-voice speaker are held pending rather than
+  # dropped.  When a holdable session exceeds this age it is retired (moved
+  # to the discard sink on debug=true, unlinked on debug=false).
+  # "off" = never retire holdable sessions (safe default — voice sessions
+  # accumulate until they are attributed and extracted, or cleared manually).
+  # Grammar: "every Nh" / "every Nm" / "HH:MM" / "daily" / "off".
+  orphan_retirement: "off"
   # --- LoRA training hyperparameters (Test 17 recipe; formerly an in-code default) ---
   # num_epochs is the ceiling `max_epochs` above (None -> 30); not repeated here.
   training_batch_size: 1

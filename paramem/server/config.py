@@ -1055,6 +1055,15 @@ class ConsolidationScheduleConfig:
     # times >> this, /chat falls through to the shutdown-flag path which is
     # heavier-handed. 30s covers typical BG training step durations.
     abort_quiesce_timeout_s: float = 30.0
+    # Holdable-session retirement TTL.  Sessions that carry a voice embedding
+    # (retro-claimable) or are anonymous-voice are held pending rather than
+    # dropped immediately.  When a holdable session exceeds this age it is
+    # retired to the discard sink (debug=True) or unlinked (debug=False).
+    # Grammar: same as refresh_cadence — "every Nh" / "every Nm" / "HH:MM" /
+    #   "daily" / "off" / "" (off = never retire holdable sessions).
+    # Default "off" matches the pre-change behaviour: holdable sessions were
+    # simply never extracted; now they are explicitly held indefinitely.
+    orphan_retirement: str = "off"
 
     def __post_init__(self) -> None:
         """Validate privacy-critical config combinations at construction time.
@@ -1101,6 +1110,19 @@ class ConsolidationScheduleConfig:
                 f"cloud API. Use stage='anon' for cloud judges, or judge='auto' for "
                 f"local judging."
             )
+
+        # orphan_retirement: validate the schedule string early so the operator
+        # sees a clear error at startup, not at the first tick.
+        try:
+            from paramem.memory.interim_adapter import compute_schedule_period_seconds
+
+            compute_schedule_period_seconds(self.orphan_retirement)
+        except ValueError as exc:
+            raise ValueError(
+                f"consolidation.orphan_retirement={self.orphan_retirement!r} is not a valid "
+                f"schedule string. Use 'off', 'every Nh', 'every Nm', 'HH:MM', or 'daily'. "
+                f"Original error: {exc}"
+            ) from exc
 
         # Quiet-hours: reject unknown modes and malformed windows early.
         mode = self.quiet_hours_mode
@@ -1153,6 +1175,20 @@ class ConsolidationScheduleConfig:
         if total % 3600 == 0:
             return f"every {total // 3600}h"
         return f"every {total // 60}m"
+
+    @property
+    def orphan_retirement_seconds(self) -> int | None:
+        """Holdable-session TTL in seconds, or ``None`` when retirement is off.
+
+        ``None`` means holdable sessions (anonymous-voice or embedding-only)
+        are held pending indefinitely — they are never retired by age.
+
+        Uses :func:`~paramem.memory.interim_adapter.compute_schedule_period_seconds`
+        with the same grammar as :attr:`refresh_cadence`.
+        """
+        from paramem.memory.interim_adapter import compute_schedule_period_seconds
+
+        return compute_schedule_period_seconds(self.orphan_retirement)
 
 
 @dataclass

@@ -11342,15 +11342,57 @@ def _maybe_trigger_scheduled_consolidation() -> str:
         future.add_done_callback(_scheduled_extract_done_callback)
         return "started_full"
 
-    pending = buffer.get_pending()
-    if not pending:
+    facts = buffer.pending_facts()
+    if not facts:
         logger.info("Scheduler tick: no pending sessions — noop")
         return "noop_no_pending"
-    if not any(s.get("speaker_id") for s in pending):
-        logger.info("Scheduler tick: no sessions with speaker_id — noop")
-        return "noop_no_speaker"
 
-    logger.info("Scheduler tick: %d pending sessions, starting extract + train", len(pending))
+    from paramem.server.consolidation import (
+        SessionClass,
+        classify_session,
+        discard_session_sink,
+    )
+
+    store = _state.get("speaker_store")
+    ttl_seconds = config.consolidation.orphan_retirement_seconds
+    drop_ids: list[str] = []
+    named_count = 0
+
+    for fact in facts:
+        sid = fact["speaker_id"]
+        is_anon = store.is_anonymous(sid) if store is not None and sid else False
+        cls = classify_session(
+            speaker_id=sid,
+            is_anonymous=is_anon,
+            has_voice_embedding=fact["has_voice_embedding"],
+        )
+        if cls == SessionClass.NAMED:
+            named_count += 1
+        elif cls == SessionClass.UNIDENTIFIABLE:
+            drop_ids.append(fact["session_id"])
+        else:
+            # HOLDABLE — retire only when TTL set and exceeded
+            if ttl_seconds is not None:
+                age = fact.get("age_seconds")
+                if age is not None and age > ttl_seconds:
+                    drop_ids.append(fact["session_id"])
+
+    if drop_ids:
+        logger.info(
+            "Scheduler tick: retiring %d unattributable/expired-holdable session(s)",
+            len(drop_ids),
+        )
+        _retain = config.consolidation.retain_sessions or config.debug
+        buffer.mark_consolidated(
+            drop_ids,
+            retention_dir=discard_session_sink(config) if _retain else None,
+        )
+
+    if named_count == 0:
+        logger.info("Scheduler tick: no NAMED sessions remain — noop")
+        return "noop_no_named"
+
+    logger.info("Scheduler tick: %d NAMED session(s), starting extract + train", named_count)
     _state["last_consolidation_error"] = None
     _state["consolidating"] = True
 
@@ -11750,9 +11792,11 @@ def _run_extraction_phase(
     import time
 
     from paramem.server.consolidation import (
+        SessionClass,
         _dedup_episodic,
         _dedup_procedural,
         _save_key_metadata,
+        classify_session,
         session_retention_dir,
     )
 
@@ -11765,12 +11809,31 @@ def _run_extraction_phase(
 
     start_time = time.time()
 
-    pending = session_buffer.get_pending()
+    # Filter pending to NAMED-only via classify_session.  The trial path
+    # must not extract anonymous or embedding-only sessions — they have no
+    # stable subject attribution and would corrupt the trial graph.
+    speaker_store = _state.get("speaker_store")
+
+    def _is_anon_ep(sid: str | None) -> bool:
+        return bool(speaker_store is not None and sid and speaker_store.is_anonymous(sid))
+
+    _named_ids_ep: set[str] = {
+        f["session_id"]
+        for f in session_buffer.pending_facts()
+        if classify_session(
+            speaker_id=f["speaker_id"],
+            is_anonymous=_is_anon_ep(f["speaker_id"]),
+            has_voice_embedding=f["has_voice_embedding"],
+        )
+        == SessionClass.NAMED
+    }
+
+    pending = [s for s in session_buffer.get_pending() if s["session_id"] in _named_ids_ep]
     if not pending:
         logger.info("No pending sessions to consolidate")
         return {"status": "no_pending", "sessions": 0, "loop": loop}
 
-    logger.info("Consolidating %d pending sessions", len(pending))
+    logger.info("Consolidating %d NAMED pending sessions", len(pending))
 
     # --- Phase 1: Extract all sessions ---
     all_episodic_rels = []
@@ -11783,7 +11846,6 @@ def _run_extraction_phase(
     ha_client = _state.get("ha_client")
     if ha_client is not None:
         ha_context = ha_client.get_home_context()
-    speaker_store = _state.get("speaker_store")
 
     for session in pending:
         session_id = session["session_id"]
@@ -11791,13 +11853,6 @@ def _run_extraction_phase(
         session_speaker_id = session.get("speaker_id")
 
         session_ids.append(session_id)
-
-        if not session_speaker_id:
-            logger.debug(
-                "Session %s has no speaker_id — skipping (text-only, no voice attribution)",
-                session_id,
-            )
-            continue
 
         speaker_name = None
         if speaker_store is not None:
@@ -12037,7 +12092,9 @@ def _extract_and_start_training():
     ``consolidate_interim_adapters``.
     """
     from paramem.server.consolidation import (
+        SessionClass,
         _save_key_metadata,
+        classify_session,
         create_consolidation_loop,
         session_retention_dir,
     )
@@ -12067,7 +12124,27 @@ def _extract_and_start_training():
     # --- Phase 1: Extract all sessions (holds GPU lock) ---
     from paramem.server.gpu_lock import gpu_lock_sync
 
-    pending = session_buffer.get_pending()
+    # Build the NAMED-only set from pending_facts() + classify_session().
+    # The tick already dropped UNIDENTIFIABLE sessions and retired expired
+    # HOLDABLE sessions; here we filter the executor-time snapshot to
+    # NAMED only so extraction never runs on an unattributed session.
+    _extract_store = _state.get("speaker_store")
+
+    def _is_anon_ex(sid: str | None) -> bool:
+        return bool(_extract_store is not None and sid and _extract_store.is_anonymous(sid))
+
+    _named_ids: set[str] = {
+        f["session_id"]
+        for f in session_buffer.pending_facts()
+        if classify_session(
+            speaker_id=f["speaker_id"],
+            is_anonymous=_is_anon_ex(f["speaker_id"]),
+            has_voice_embedding=f["has_voice_embedding"],
+        )
+        == SessionClass.NAMED
+    }
+
+    pending = [s for s in session_buffer.get_pending() if s["session_id"] in _named_ids]
     all_episodic_rels = []
     all_procedural_rels = []
     session_ids = []
@@ -12108,13 +12185,6 @@ def _extract_and_start_training():
             transcript = session["transcript"]
             session_speaker_id = session.get("speaker_id")
             session_ids.append(session_id)
-
-            if not session_speaker_id:
-                logger.warning(
-                    "Skipping session %s: no speaker_id — cannot attribute extraction",
-                    session_id,
-                )
-                continue
 
             if loop.shutdown_requested:
                 logger.info("Shutdown — stopping extraction early")

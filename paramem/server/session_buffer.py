@@ -690,13 +690,10 @@ class SessionBuffer:
         ``per_source_type`` counts sessions (not turns) by their
         ``source_type`` value.  Keys are ``"transcript"`` and ``"document"``.
         """
-        from datetime import datetime, timezone
-
         per_speaker: dict[str, int] = {}
         per_source_type: dict[str, int] = {}
         orphaned = 0
         total = 0
-        oldest_ts = None
 
         for session in self.get_pending():
             total += 1
@@ -708,24 +705,15 @@ class SessionBuffer:
             st = session.get("source_type", "transcript")
             per_source_type[st] = per_source_type.get(st, 0) + 1
 
-        # Oldest pending: first-turn timestamp across in-memory sessions
+        # Oldest pending: largest age across in-memory sessions
+        # (the oldest session has the highest age_seconds value).
+        oldest_age: int | None = None
         for turns in self._turns.values():
-            if not turns:
+            age = self._first_turn_age_seconds(turns)
+            if age is None:
                 continue
-            try:
-                first_ts = datetime.fromisoformat(turns[0]["timestamp"])
-            except (KeyError, ValueError, TypeError):
-                continue
-            # Coerce naive timestamps (legacy snapshots) to UTC so the
-            # subtraction below does not raise TypeError.
-            if first_ts.tzinfo is None:
-                first_ts = first_ts.replace(tzinfo=timezone.utc)
-            if oldest_ts is None or first_ts < oldest_ts:
-                oldest_ts = first_ts
-
-        oldest_age = None
-        if oldest_ts is not None:
-            oldest_age = int((datetime.now(timezone.utc) - oldest_ts).total_seconds())
+            if oldest_age is None or age > oldest_age:
+                oldest_age = age
 
         return {
             "total": total,
@@ -734,6 +722,70 @@ class SessionBuffer:
             "per_speaker": per_speaker,
             "per_source_type": per_source_type,
         }
+
+    def pending_facts(self) -> list[dict]:
+        """Return attribution facts for every pending session — no policy, data only.
+
+        Mirrors the dual-branch walk of :meth:`get_pending` exactly, including
+        the ``if formatted:`` empty-turns guard in both branches, so the caller
+        sees the same session population: sessions with no usable turns are
+        excluded, just as :meth:`get_pending` excludes them.
+
+        Returns a list of dicts, one per session::
+
+            {
+                "session_id":          str,
+                "speaker_id":          str | None,  # dominant speaker id
+                "has_voice_embedding": bool,         # any user turn carries embedding
+                "age_seconds":         int | None,   # now − first-turn timestamp
+            }
+
+        ``has_voice_embedding`` is ``True`` iff at least one user-role turn in
+        the session carries a non-``None`` ``"embedding"`` field.
+
+        This method exposes facts for the caller to classify via
+        :func:`~paramem.server.consolidation.classify_session`; it does NOT
+        make a policy decision itself.
+        """
+        result = []
+        seen_ids: set[str] = set()
+
+        # In-memory sessions first
+        for conv_id, turns in self._turns.items():
+            seen_ids.add(conv_id)
+            formatted, session_speaker_id = self._format_turns(turns)
+            if not formatted:
+                continue
+            has_emb = any(t.get("embedding") is not None and t.get("role") == "user" for t in turns)
+            result.append(
+                {
+                    "session_id": conv_id,
+                    "speaker_id": session_speaker_id,
+                    "has_voice_embedding": has_emb,
+                    "age_seconds": self._first_turn_age_seconds(turns),
+                }
+            )
+
+        # Disk-only sessions
+        for path in sorted(self.session_dir.glob("*.jsonl")):
+            conv_id = path.stem
+            if conv_id in seen_ids:
+                continue
+            turns = self._read_jsonl(path)
+            formatted, session_speaker_id = self._format_turns(turns)
+            if not formatted:
+                continue
+            has_emb = any(t.get("embedding") is not None and t.get("role") == "user" for t in turns)
+            result.append(
+                {
+                    "session_id": conv_id,
+                    "speaker_id": session_speaker_id,
+                    "has_voice_embedding": has_emb,
+                    "age_seconds": self._first_turn_age_seconds(turns),
+                }
+            )
+
+        return result
 
     @property
     def pending_count(self) -> int:
@@ -744,6 +796,34 @@ class SessionBuffer:
                 if path.stem not in self._turns:
                     count += 1
         return count
+
+    @staticmethod
+    def _first_turn_age_seconds(turns: list[dict]) -> int | None:
+        """Return seconds since the first turn's timestamp, or ``None``.
+
+        Shared helper used by :meth:`get_summary` and :meth:`pending_facts`
+        so timestamp math lives in one place.
+
+        Coerces naive timestamps (legacy snapshots) to UTC before computing
+        the delta — same defensive logic ``get_summary`` previously inlined.
+
+        Args:
+            turns: List of turn dicts.  The first element's ``"timestamp"``
+                field (ISO-format string) is used.  Returns ``None`` when
+                ``turns`` is empty or the field is absent / unparseable.
+
+        Returns:
+            Non-negative integer seconds, or ``None``.
+        """
+        if not turns:
+            return None
+        try:
+            first_ts = datetime.fromisoformat(turns[0]["timestamp"])
+        except (KeyError, ValueError, TypeError):
+            return None
+        if first_ts.tzinfo is None:
+            first_ts = first_ts.replace(tzinfo=timezone.utc)
+        return int((datetime.now(timezone.utc) - first_ts).total_seconds())
 
     @staticmethod
     def _format_turns(turns: list[dict]) -> tuple[list[str], str | None]:
