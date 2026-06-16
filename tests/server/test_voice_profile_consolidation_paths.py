@@ -68,6 +68,21 @@ def _patch_extract_training(pending, config, target_profile="gpu"):
     mock_buffer.get_pending.return_value = pending
     mock_buffer.pending_count = len(pending)
     mock_buffer.mark_consolidated.return_value = None
+    # The NAMED-only filter at extraction time (app.py) reads pending_facts()
+    # and keeps only sessions that classify_session() rules NAMED. Mirror
+    # get_pending() exactly: every session carries a real speaker_id and the
+    # fixture's speaker_store is None (so _is_anon_ex is False) → all NAMED →
+    # the filtered `pending` equals get_pending(), matching the pre-filter
+    # behavior these tests assert.
+    mock_buffer.pending_facts.return_value = [
+        {
+            "session_id": s["session_id"],
+            "speaker_id": s["speaker_id"],
+            "has_voice_embedding": False,
+            "age_seconds": 0,
+        }
+        for s in pending
+    ]
 
     from paramem.memory.store import MemoryStore as _MS
 
