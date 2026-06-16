@@ -2,6 +2,8 @@ Extract PERSONAL FACTS about the speaker from this conversation transcript.{spea
 
 In the examples below, `{{SPEAKER_NAME}}` is a SLOT — at runtime it is substituted with the speaker's real identifier from the directive above. Never emit the literal string `{{SPEAKER_NAME}}` in your output.
 
+When the transcript is a structured or bulleted list, treat EACH item as a separate fact and emit a relation for it — never collapse the list into the summary or into entity attributes alone. A heading (e.g. `## Experience`, `## Skills`) labels the facts that follow: extract the facts beneath it, not the heading. A single item may yield more than one relation (e.g. a role at an organization → both a role relation and a works_at relation).
+
 
 POSITIVE example — speaker is "Alex", transcript: "[user] Hi, I'm Alex Morgan. My email is alex.morgan@example.com and my phone is +1 555 123 4567. You can find me at linkedin.com/in/alex-morgan. I work at Brightfield Labs."
 {{"entities": [{{"name": "Alex", "entity_type": "person", "attributes": {{"last_name": "Morgan", "email": "alex.morgan@example.com", "phone": "+1 555 123 4567", "linkedin": "linkedin.com/in/alex-morgan"}}}},
@@ -41,6 +43,23 @@ POSITIVE example — transcript: "[user] ## Hobbies\n- Cycling\n- Photography\n-
    {{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Photography", "relation_type": "preference", "confidence": 1.0}},
    {{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Amateur Radio", "relation_type": "preference", "confidence": 1.0}}],
  "summary": "{{SPEAKER_NAME}} enjoys cycling, photography, and amateur radio."}}
+
+
+POSITIVE example — transcript: "[user] ## Profile\n- Lead nurse at Riverside Clinic\n- Lives in Oakdale, grew up in Glenport\n- Studied marine biology at Coastal University\n- Owns a sailboat called Marigold"
+{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Riverside Clinic", "entity_type": "organization", "attributes": {{}}}},
+ {{"name": "Oakdale", "entity_type": "place", "attributes": {{}}}},
+ {{"name": "Glenport", "entity_type": "place", "attributes": {{}}}},
+ {{"name": "Coastal University", "entity_type": "organization", "attributes": {{}}}},
+ {{"name": "Marigold", "entity_type": "concept", "attributes": {{"type": "sailboat"}}}}],
+ "relations": [
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "has_role", "object": "Lead nurse", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "works_at", "object": "Riverside Clinic", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "lives_in", "object": "Oakdale", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "grew_up_in", "object": "Glenport", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "studied_at", "object": "Coastal University", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "{{SPEAKER_NAME}}", "predicate": "owns", "object": "Marigold", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "{{SPEAKER_NAME}} is a lead nurse at Riverside Clinic, lives in Oakdale, grew up in Glenport, studied marine biology at Coastal University, and owns a sailboat called Marigold."}}
 
 
 POSITIVE example — transcript: "[user] Born and raised in Millfield, I moved to Westport after university."
