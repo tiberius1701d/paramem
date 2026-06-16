@@ -3761,8 +3761,12 @@ class ConsolidationLoop:
         keyed-edge walk uses for keyed edges, so enrichment edges land in the same
         tier they would receive if they had been extracted in an ordinary session.
 
-        ``speaker_id`` is set to ``""`` for all minted enrichment keys: enrichment
-        facts are graph-level and not attributed to a specific speaker.
+        ``speaker_id`` is resolved from the subject node's ``speaker_id`` attribute
+        in the merged graph.  Speaker person-nodes (e.g. ``Alex Morgan``)
+        carry a non-empty ``speaker_id`` stamped by :meth:`GraphMerger._upsert_entity`
+        at merge time; their enrichment-added edges therefore inherit that id so
+        they are recallable by speaker name via the router recall index.  Role-node
+        subjects (no ``speaker_id`` attribute) fall back to ``""``.
 
         After this call, every edge that was keyless-but-predicate-bearing has a
         key in the store and an entry in *tier_keyed*.  The keyed-edge walk will
@@ -3809,6 +3813,10 @@ class ConsolidationLoop:
             _obj_display = (
                 self.merger.graph.nodes[_t_obj].get("attributes", {}).get("name") or _t_obj
             )
+            # Resolve speaker_id from the subject node's top-level attribute.
+            # Speaker person-nodes have this set by GraphMerger._upsert_entity;
+            # role-node subjects lack it and fall back to "".
+            _subj_sid = (self.merger.graph.nodes.get(_t_subj, {}) or {}).get("speaker_id") or ""
 
             # Derive tier with the same logic the keyed-edge walk uses.
             _dummy = [
@@ -3836,12 +3844,12 @@ class ConsolidationLoop:
                         "predicate": pred,
                         "object": _obj_display,
                         "relation_type": _rt,
-                        "speaker_id": "",
+                        "speaker_id": _subj_sid,
                     }
                 ],
                 prefix=prefix,
                 start_index=start_index,
-                speaker_id="",
+                speaker_id=_subj_sid,
                 tag_new=False,
             )
             key = minted[0]["key"]
@@ -3856,7 +3864,7 @@ class ConsolidationLoop:
             )
             self.store.set_bookkeeping(
                 key,
-                speaker_id="",
+                speaker_id=_subj_sid,
                 first_seen_cycle=self.cycle_count,
                 relation_type=_rt,
                 recurrence_count=1,

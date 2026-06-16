@@ -7139,3 +7139,113 @@ class TestTierFloor:
             "episodic train set must NOT include semantic graduating keys "
             "when tier_fast_start=False (no donor augmentation)"
         )
+
+
+class TestMintKeysForKeylessEdgesSpeakerId:
+    """_mint_keys_for_keyless_edges must resolve speaker_id from the subject node.
+
+    Case (a): keyless edge whose subject IS a speaker person-node (speaker_id
+    attribute set) → minted bookkeeping carries that speaker_id.
+    Case (b): keyless edge whose subject is a role/non-speaker node (no
+    speaker_id attribute) → minted bookkeeping carries "".
+    """
+
+    def _make_loop(self, tmp_path):
+        """Minimal ConsolidationLoop stub via object.__new__ — no GPU required."""
+        import networkx as nx
+        from peft import PeftModel
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.store = MemoryStore(replay_enabled=False)
+        loop.indexed_key_cache = {}
+        loop.promoted_keys = set()
+        loop.cycle_count = 1
+        loop.episodic_simhash = {}
+        loop.semantic_simhash = {}
+        loop.procedural_simhash = {}
+        loop._procedural_next_index = 0
+        loop._procedural_tentative_next_index = 0
+        loop._indexed_next_index = 0
+        loop._indexed_ep_interim = {}
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.pending_interim_triples = []
+        loop._bg_trainer = None
+        loop.shutdown_requested = False
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop._debug_base = None
+        loop.save_cycle_snapshots = False
+        loop.snapshot_dir = None
+        # Attach a real MultiDiGraph so nodes.get() and graph.edges() behave correctly.
+        merger = MagicMock()
+        merger.graph = nx.MultiDiGraph()
+        loop.merger = merger
+        return loop
+
+    def test_speaker_node_subject_inherits_speaker_id(self, tmp_path):
+        """Case (a): subject is a speaker person-node → bookkeeping speaker_id == "spk-1"."""
+        loop = self._make_loop(tmp_path)
+        g = loop.merger.graph
+
+        # Add a speaker person-node with speaker_id at the top level.
+        g.add_node(
+            "spk-1",
+            entity_type="person",
+            speaker_id="spk-1",
+            attributes={"name": "Alex Morgan"},
+        )
+        # Add a plain object node.
+        g.add_node("python", entity_type="skill", attributes={"name": "Python"})
+        # Add a keyless edge (no ik_key attribute) with a predicate.
+        g.add_edge("spk-1", "python", predicate="has_skill", relation_type="factual")
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        # Exactly one key must have been minted.
+        assert len(tier_keyed["episodic"]) == 1, (
+            f"Expected 1 minted episodic entry; got {tier_keyed['episodic']}"
+        )
+        minted_key = tier_keyed["episodic"][0]["key"]
+        bk = loop.store.bookkeeping_for_key(minted_key)
+        assert bk is not None, f"No bookkeeping record for minted key {minted_key!r}"
+        assert bk["speaker_id"] == "spk-1", f"Expected speaker_id='spk-1', got {bk['speaker_id']!r}"
+
+    def test_role_node_subject_speaker_id_empty(self, tmp_path):
+        """Case (b): subject is a role/non-speaker node → bookkeeping speaker_id == ""."""
+        loop = self._make_loop(tmp_path)
+        g = loop.merger.graph
+
+        # Add a non-speaker role node (no speaker_id attribute).
+        g.add_node("developer", entity_type="role", attributes={"name": "Developer"})
+        g.add_node("python", entity_type="skill", attributes={"name": "Python"})
+        # Keyless edge with predicate.
+        g.add_edge("developer", "python", predicate="requires", relation_type="factual")
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._mint_keys_for_keyless_edges(tier_keyed)
+
+        assert len(tier_keyed["episodic"]) == 1, (
+            f"Expected 1 minted episodic entry; got {tier_keyed['episodic']}"
+        )
+        minted_key = tier_keyed["episodic"][0]["key"]
+        bk = loop.store.bookkeeping_for_key(minted_key)
+        assert bk is not None, f"No bookkeeping record for minted key {minted_key!r}"
+        assert bk["speaker_id"] == "", f"Expected speaker_id='', got {bk['speaker_id']!r}"
