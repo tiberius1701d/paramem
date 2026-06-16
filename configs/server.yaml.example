@@ -185,7 +185,7 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  merge_at_interim: false      # false = Path B (cheap interim, merge deferred to full cycle); true = merge every interim
+  interim_refinement: "off"    # "off" = cheap interim (cumulative merge deferred to full cycle); "light"/"full" = merge the working graph each interim cycle
   # Floor below which a tier's keys park in episodic (the always-trained large
   # tier) instead of training a small under-separated adapter. semantic/procedural
   # keys accumulate in episodic until the tier's own population reaches this floor,

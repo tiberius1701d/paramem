@@ -223,7 +223,7 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  merge_at_interim: false      # false = Path B (cheap interim, merge deferred to full cycle); true = merge every interim
+  interim_refinement: "off"    # "off" = cheap interim (cumulative merge deferred to full cycle); "light"/"full" = merge the working graph each interim cycle
   min_tier_key_floor: 30
   tier_fast_start: true
   # max_epochs: ceiling for LoRA training epochs per consolidation cycle.

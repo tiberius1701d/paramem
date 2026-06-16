@@ -52,7 +52,7 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     # fires.  Callers that need enrichment hooks to fire pass replay_enabled=True.
     replay_enabled = defaults.pop("replay_enabled", False)
     # Allow callers to supply a pre-built ConsolidationConfig so tests can set
-    # fields like merge_at_interim without touching the loop's other knobs.
+    # fields like interim_refinement without touching the loop's other knobs.
     consolidation_config = defaults.pop("consolidation_config", ConsolidationConfig())
 
     from paramem.memory.store import MemoryStore as _MS
@@ -952,9 +952,11 @@ class TestInterimEnrichmentHook:
             ],
         )
 
-    def test_counter_increments_when_merge_at_interim_true(self, tmp_path):
-        """extract_session increments the accumulator when merge_at_interim=True."""
-        loop = _make_loop(tmp_path, consolidation_config=ConsolidationConfig(merge_at_interim=True))
+    def test_counter_increments_when_interim_refinement_not_off(self, tmp_path):
+        """extract_session increments the accumulator when interim_refinement != 'off'."""
+        loop = _make_loop(
+            tmp_path, consolidation_config=ConsolidationConfig(interim_refinement="full")
+        )
         assert loop._triples_since_last_enrichment == 0
 
         sg = self._make_session_graph()
@@ -963,9 +965,9 @@ class TestInterimEnrichmentHook:
 
         assert loop._triples_since_last_enrichment == 2
 
-    def test_counter_stays_zero_when_merge_at_interim_false(self, tmp_path):
-        """extract_session does NOT increment the accumulator when merge_at_interim=False."""
-        loop = _make_loop(tmp_path)  # merge_at_interim defaults to False
+    def test_counter_stays_zero_when_interim_refinement_off(self, tmp_path):
+        """extract_session does NOT increment the accumulator when interim_refinement='off'."""
+        loop = _make_loop(tmp_path)  # interim_refinement defaults to "off"
         assert loop._triples_since_last_enrichment == 0
 
         sg = self._make_session_graph()
@@ -1256,11 +1258,11 @@ class TestInterimEnrichmentHook:
 
 
 # ---------------------------------------------------------------------------
-# Tests for _mint_keys_for_keyless_edges (fold pre-pass)
+# Tests for _harvest_keyless_edge_entries / _apply_keyless_edge_entries (fold pre-pass)
 # ---------------------------------------------------------------------------
 
 
-class TestMintKeysForKeylessEdges:
+class TestHarvestKeylessEdges:
     """Unit tests for the fold pre-pass that mints keys for keyless graph edges.
 
     Uses _make_loop from this module (real nx.MultiDiGraph + real MemoryStore,
@@ -1286,7 +1288,8 @@ class TestMintKeysForKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # Exactly one key minted (factual → episodic).
         assert len(tier_keyed["episodic"]) == 1
@@ -1327,7 +1330,8 @@ class TestMintKeysForKeylessEdges:
         graph.add_edge("Bob", "Coffee", predicate="likes", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         assert len(tier_keyed["episodic"]) == 2
         assert loop._indexed_next_index == initial_index + 2
@@ -1357,7 +1361,8 @@ class TestMintKeysForKeylessEdges:
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         initial_index = loop._indexed_next_index
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # Nothing minted — the edge already has a key.
         assert tier_keyed["episodic"] == []
@@ -1377,7 +1382,8 @@ class TestMintKeysForKeylessEdges:
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         initial_index = loop._indexed_next_index
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         assert tier_keyed["episodic"] == []
         assert tier_keyed["semantic"] == []
@@ -1396,7 +1402,8 @@ class TestMintKeysForKeylessEdges:
         graph.add_edge("Carol", "London", predicate="visited", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         minted_key = tier_keyed["episodic"][0]["key"]
         _all_keyed = {e["key"] for tl in tier_keyed.values() for e in tl}
@@ -1424,7 +1431,8 @@ class TestMintKeysForKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # preference → episodic (no procedural adapter in _make_loop).
         assert len(tier_keyed["episodic"]) == 1
@@ -1437,7 +1445,7 @@ class TestMintKeysForKeylessEdges:
         """Keyless preference edge routes to procedural when procedural_config is set.
 
         _make_loop passes procedural_adapter_config=None so the procedural
-        branch of _mint_keys_for_keyless_edges never fires in the other tests.
+        branch of _harvest_keyless_edge_entries never fires in the other tests.
         This test constructs the loop the same way _make_loop does but adds a
         real AdapterConfig as procedural_adapter_config and pre-populates
         "procedural" in model.peft_config so _ensure_adapters skips creation.
@@ -1492,7 +1500,8 @@ class TestMintKeysForKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # The preference edge routes to procedural, not episodic.
         assert len(tier_keyed["procedural"]) == 1
@@ -1574,7 +1583,8 @@ class TestMintKeysForKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         assert len(tier_keyed["episodic"]) == 1
         minted_key = tier_keyed["episodic"][0]["key"]
@@ -1585,6 +1595,144 @@ class TestMintKeysForKeylessEdges:
         )
         # Pre-existing graph5 entry must still be intact.
         assert "graph5" in loop.store.all_active_keys()
+
+
+class TestHarvestApplySplit:
+    """Tests verifying the pure-harvester / applier split of keyless-edge minting.
+
+    The harvester must be side-effect free; the applier must reproduce exactly
+    the writes the original combined method produced.
+    """
+
+    def test_harvester_does_no_writes(self, tmp_path):
+        """_harvest_keyless_edge_entries must NOT call store.put, store.set_bookkeeping,
+        or advance self._indexed_next_index / self._procedural_next_index.  It must
+        return the expected number of harvest records.
+        """
+        from unittest.mock import patch
+
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        loop.merger.graph.add_edge("Alice", "Berlin", predicate="lives_in", relation_type="factual")
+        loop.merger.graph.add_edge("Bob", "Coffee", predicate="likes", relation_type="factual")
+
+        initial_indexed = loop._indexed_next_index
+        initial_procedural = loop._procedural_next_index
+
+        with (
+            patch.object(loop.store, "put", wraps=loop.store.put) as mock_put,
+            patch.object(
+                loop.store, "set_bookkeeping", wraps=loop.store.set_bookkeeping
+            ) as mock_bk,
+        ):
+            harvested = loop._harvest_keyless_edge_entries(tag_new=False)
+
+            # No store writes must occur during harvest.
+            mock_put.assert_not_called()
+            mock_bk.assert_not_called()
+
+        # Counters must be unchanged.
+        assert loop._indexed_next_index == initial_indexed
+        assert loop._procedural_next_index == initial_procedural
+
+        # Two keyless edges → two harvest records.
+        assert len(harvested) == 2
+
+    def test_applier_reproduces_writes(self, tmp_path):
+        """_apply_keyless_edge_entries must produce the same store writes, tier_keyed
+        entries, and counter end-state as the original combined method did.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        loop.merger.graph.add_edge("Carol", "London", predicate="visited", relation_type="factual")
+
+        initial_indexed = loop._indexed_next_index
+
+        harvested = loop._harvest_keyless_edge_entries(tag_new=False)
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        minted_by_tier = loop._apply_keyless_edge_entries(harvested, tier_keyed)
+
+        # Exactly one episodic key minted.
+        assert minted_by_tier == {"episodic": 1, "procedural": 0}
+        assert len(tier_keyed["episodic"]) == 1
+
+        entry = tier_keyed["episodic"][0]
+        key = entry["key"]
+        assert key.startswith("graph")
+        assert entry["subject"] == "Carol"
+        assert entry["predicate"] == "visited"
+        assert entry["object"] == "London"
+
+        # Key is in the store.
+        assert key in loop.store.all_active_keys()
+
+        # Bookkeeping is present.
+        bk = loop.store.bookkeeping_for_key(key)
+        assert bk is not None
+        assert bk["recurrence_count"] == 1
+        assert bk["relation_type"] == "factual"
+
+        # Counter advanced by 1.
+        assert loop._indexed_next_index == initial_indexed + 1
+
+    def test_sequential_indices_two_edges(self, tmp_path):
+        """Two keyless edges get sequential keys (graphN, graphN+1) and counters
+        advance by exactly 2.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        initial_indexed = loop._indexed_next_index
+
+        loop.merger.graph.add_edge("Dave", "Paris", predicate="lives_in", relation_type="factual")
+        loop.merger.graph.add_edge("Eve", "Tea", predicate="likes", relation_type="factual")
+
+        harvested = loop._harvest_keyless_edge_entries(tag_new=False)
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._apply_keyless_edge_entries(harvested, tier_keyed)
+
+        assert len(tier_keyed["episodic"]) == 2
+        assert loop._indexed_next_index == initial_indexed + 2
+
+        # Keys must be exactly the two sequential indices.
+        minted_keys = {e["key"] for e in tier_keyed["episodic"]}
+        assert f"graph{initial_indexed}" in minted_keys
+        assert f"graph{initial_indexed + 1}" in minted_keys
+
+    def test_harvester_no_keyless_edges_does_not_read_counters(self, tmp_path):
+        """With no keyless edges to mint, the harvester must not read the index
+        counters at all — it returns [] even when those attributes are absent.
+
+        Guards the lazy-seed contract: callers that exercise the keyed-edge walk
+        without any keyless edges (e.g. a graph of only keyed or predicate-less
+        edges) need not have the index counters initialised.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # Simulate a caller that never set the index counters.
+        del loop._indexed_next_index
+        del loop._procedural_next_index
+
+        # Only a predicate-less edge — nothing keyless+keyable to mint.
+        loop.merger.graph.add_edge("Dave", "Paris")
+
+        harvested = loop._harvest_keyless_edge_entries(tag_new=False)
+        assert harvested == []
 
 
 class TestEnrichmentRemovalLedger:

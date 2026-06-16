@@ -159,7 +159,22 @@ class ConsolidationConfig:
     key_retirement_threshold: float = 0.1
     key_retirement_cycles: int = 3
     indexed_key_replay_enabled: bool = False
-    merge_at_interim: bool = False
+    # Controls whether per-session graph merges are interleaved with each interim
+    # cycle.  "off" defers cumulative-graph merge/contradiction/enrichment to full
+    # consolidation (cheap interim posture).  "light" and "full" both merge the
+    # cumulative graph on every interim cycle (per-cycle merge posture) and
+    # currently behave identically.
+    interim_refinement: str = "off"  # Literal["off", "light", "full"]
+
+    def __post_init__(self) -> None:
+        """Validate field values at construction time."""
+        _valid = {"off", "light", "full"}
+        if self.interim_refinement not in _valid:
+            raise ValueError(
+                f"ConsolidationConfig.interim_refinement must be one of "
+                f"{sorted(_valid)!r}; got {self.interim_refinement!r}"
+            )
+
     # Floor below which a tier's keys park in episodic until the tier's own
     # population reaches this count.  30 is the conservative default (Test 19).
     min_tier_key_floor: int = 30

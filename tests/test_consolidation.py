@@ -322,14 +322,14 @@ class TestExtractionPathParity:
         assert procedural_b == []
 
 
-class TestMergeAtInterimGate:
-    """extract_session merger.merge call is gated by config.merge_at_interim.
+class TestInterimRefinementGate:
+    """extract_session merger.merge call is gated by config.interim_refinement.
 
-    These tests verify Path A (merge_at_interim=True) and Path B
-    (merge_at_interim=False, default) without loading any model or GPU.
+    These tests verify Path A (interim_refinement='light' or 'full') and Path B
+    (interim_refinement='off', default) without loading any model or GPU.
     """
 
-    def _build_loop(self, monkeypatch, tmp_path, merge_at_interim: bool):
+    def _build_loop(self, monkeypatch, tmp_path, interim_refinement: str):
         from unittest.mock import MagicMock
 
         from peft import PeftModel
@@ -373,7 +373,7 @@ class TestMergeAtInterimGate:
         loop = ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
-            consolidation_config=ConsolidationConfig(merge_at_interim=merge_at_interim),
+            consolidation_config=ConsolidationConfig(interim_refinement=interim_refinement),
             training_config=TrainingConfig(),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
@@ -383,11 +383,11 @@ class TestMergeAtInterimGate:
         )
         return loop
 
-    def test_merge_called_when_merge_at_interim_true(self, monkeypatch, tmp_path):
-        """merge_at_interim=True: merger.merge is called once with the session graph."""
+    def test_merge_called_when_interim_refinement_full(self, monkeypatch, tmp_path):
+        """interim_refinement='full': merger.merge is called once with the session graph."""
         from unittest.mock import patch
 
-        loop = self._build_loop(monkeypatch, tmp_path, merge_at_interim=True)
+        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="full")
         initial_nodes = loop.merger.graph.number_of_nodes()
         initial_edges = loop.merger.graph.number_of_edges()
 
@@ -398,13 +398,13 @@ class TestMergeAtInterimGate:
         assert (
             loop.merger.graph.number_of_nodes() > initial_nodes
             or loop.merger.graph.number_of_edges() > initial_edges
-        ), "Expected merger.graph to grow after extract_session with merge_at_interim=True"
+        ), "Expected merger.graph to grow after extract_session with interim_refinement='full'"
 
-    def test_merge_not_called_when_merge_at_interim_false(self, monkeypatch, tmp_path):
-        """merge_at_interim=False: merger.merge is NOT called; graph unchanged."""
+    def test_merge_not_called_when_interim_refinement_off(self, monkeypatch, tmp_path):
+        """interim_refinement='off': merger.merge is NOT called; graph unchanged."""
         from unittest.mock import patch
 
-        loop = self._build_loop(monkeypatch, tmp_path, merge_at_interim=False)
+        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="off")
         initial_nodes = loop.merger.graph.number_of_nodes()
         initial_edges = loop.merger.graph.number_of_edges()
 
@@ -417,19 +417,19 @@ class TestMergeAtInterimGate:
         assert loop.merger.graph.number_of_nodes() == initial_nodes
         assert loop.merger.graph.number_of_edges() == initial_edges
 
-    def test_episodic_rels_identical_for_both_flag_values(self, monkeypatch, tmp_path):
-        """Returned (episodic_rels, procedural_rels) are identical regardless of merge_at_interim.
+    def test_episodic_rels_identical_regardless_of_interim_refinement(self, monkeypatch, tmp_path):
+        """Returned (episodic_rels, procedural_rels) are identical regardless of interim_refinement.
 
         Keying is derived from session_graph, not from the cumulative graph,
-        so the flag must not affect what facts are returned to the caller.
+        so the setting must not affect what facts are returned to the caller.
         """
         from unittest.mock import patch
 
-        loop_a = self._build_loop(monkeypatch, tmp_path / "a", merge_at_interim=True)
+        loop_a = self._build_loop(monkeypatch, tmp_path / "a", interim_refinement="full")
         with patch.object(loop_a.extraction, "run", return_value=self._session_graph):
             rels_a, proc_a = loop_a.extract_session("t", "s_gate", speaker_id="spk0")
 
-        loop_b = self._build_loop(monkeypatch, tmp_path / "b", merge_at_interim=False)
+        loop_b = self._build_loop(monkeypatch, tmp_path / "b", interim_refinement="off")
         with patch.object(loop_b.extraction, "run", return_value=self._session_graph):
             rels_b, proc_b = loop_b.extract_session("t", "s_gate", speaker_id="spk0")
 
@@ -437,16 +437,16 @@ class TestMergeAtInterimGate:
             return (d.get("subject"), d.get("predicate"), d.get("object"))
 
         assert sorted(map(_key, rels_a)) == sorted(map(_key, rels_b)), (
-            "episodic_rels differ between merge_at_interim=True and False"
+            "episodic_rels differ between interim_refinement='full' and 'off'"
         )
         assert proc_a == proc_b == []
 
 
-class TestMergeAtInterimConfigRoundtrip:
-    """Loading YAML with merge_at_interim: true propagates through the property chain."""
+class TestInterimRefinementConfigRoundtrip:
+    """Loading YAML with interim_refinement propagates through the property chain."""
 
-    def test_yaml_merge_at_interim_propagates(self, tmp_path):
-        """YAML merge_at_interim: true propagates to schedule and consolidation_config."""
+    def test_yaml_interim_refinement_full_propagates(self, tmp_path):
+        """YAML interim_refinement: full propagates to schedule and consolidation_config."""
         from paramem.server.config import load_server_config
 
         yaml_text = """
@@ -454,21 +454,43 @@ model:
   name: "mistralai/Mistral-7B-Instruct-v0.3"
 consolidation:
   refresh_cadence: "12h"
-  merge_at_interim: true
+  interim_refinement: full
 """
-        cfg_path = tmp_path / "server_merge_at_interim.yaml"
+        cfg_path = tmp_path / "server_interim_refinement_full.yaml"
         cfg_path.write_text(yaml_text)
         cfg = load_server_config(str(cfg_path))
 
-        assert cfg.consolidation.merge_at_interim is True, (
-            "ServerConfig.consolidation.merge_at_interim should be True"
+        assert cfg.consolidation.interim_refinement == "full", (
+            "ServerConfig.consolidation.interim_refinement should be 'full'"
         )
-        assert cfg.consolidation_config.merge_at_interim is True, (
-            "consolidation_config.merge_at_interim should be True"
+        assert cfg.consolidation_config.interim_refinement == "full", (
+            "consolidation_config.interim_refinement should be 'full'"
         )
 
-    def test_yaml_merge_at_interim_default_false(self, tmp_path):
-        """YAML without merge_at_interim defaults to False on schedule and consolidation_config."""
+    def test_yaml_interim_refinement_off_propagates(self, tmp_path):
+        """YAML interim_refinement: "off" propagates to schedule and consolidation_config."""
+        from paramem.server.config import load_server_config
+
+        yaml_text = """
+model:
+  name: "mistralai/Mistral-7B-Instruct-v0.3"
+consolidation:
+  refresh_cadence: "12h"
+  interim_refinement: "off"
+"""
+        cfg_path = tmp_path / "server_interim_refinement_off.yaml"
+        cfg_path.write_text(yaml_text)
+        cfg = load_server_config(str(cfg_path))
+
+        assert cfg.consolidation.interim_refinement == "off", (
+            "ServerConfig.consolidation.interim_refinement should be 'off'"
+        )
+        assert cfg.consolidation_config.interim_refinement == "off", (
+            "consolidation_config.interim_refinement should be 'off'"
+        )
+
+    def test_yaml_interim_refinement_defaults_to_off(self, tmp_path):
+        """YAML without interim_refinement defaults to 'off' in both schedule and config."""
         from paramem.server.config import load_server_config
 
         yaml_text = """
@@ -477,16 +499,44 @@ model:
 consolidation:
   refresh_cadence: "12h"
 """
-        cfg_path = tmp_path / "server_no_merge_at_interim.yaml"
+        cfg_path = tmp_path / "server_no_interim_refinement.yaml"
         cfg_path.write_text(yaml_text)
         cfg = load_server_config(str(cfg_path))
 
-        assert cfg.consolidation.merge_at_interim is False, (
-            "ServerConfig.consolidation.merge_at_interim should default to False"
+        assert cfg.consolidation.interim_refinement == "off", (
+            "ServerConfig.consolidation.interim_refinement should default to 'off'"
         )
-        assert cfg.consolidation_config.merge_at_interim is False, (
-            "consolidation_config.merge_at_interim should default to False"
+        assert cfg.consolidation_config.interim_refinement == "off", (
+            "consolidation_config.interim_refinement should default to 'off'"
         )
+
+    def test_invalid_interim_refinement_value_raises(self, tmp_path):
+        """An invalid interim_refinement value raises ValueError from dataclass validation."""
+        import pytest
+
+        from paramem.server.config import load_server_config
+
+        yaml_text = """
+model:
+  name: "mistralai/Mistral-7B-Instruct-v0.3"
+consolidation:
+  refresh_cadence: "12h"
+  interim_refinement: daily
+"""
+        cfg_path = tmp_path / "server_invalid_refinement.yaml"
+        cfg_path.write_text(yaml_text)
+
+        with pytest.raises(ValueError, match="interim_refinement"):
+            load_server_config(str(cfg_path))
+
+    def test_consolidation_config_invalid_value_raises(self):
+        """ConsolidationConfig rejects an invalid interim_refinement value directly."""
+        import pytest
+
+        from paramem.utils.config import ConsolidationConfig
+
+        with pytest.raises(ValueError, match="interim_refinement"):
+            ConsolidationConfig(interim_refinement="daily")
 
 
 # ---------------------------------------------------------------------------
@@ -7141,8 +7191,8 @@ class TestTierFloor:
         )
 
 
-class TestMintKeysForKeylessEdgesSpeakerId:
-    """_mint_keys_for_keyless_edges must resolve speaker_id from the subject node.
+class TestHarvestKeylessEdgesSpeakerId:
+    """Harvest/apply pre-pass must resolve speaker_id from the subject node.
 
     Case (a): keyless edge whose subject IS a speaker person-node (speaker_id
     attribute set) → minted bookkeeping carries that speaker_id.
@@ -7217,7 +7267,8 @@ class TestMintKeysForKeylessEdgesSpeakerId:
         g.add_edge("spk-1", "python", predicate="has_skill", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # Exactly one key must have been minted.
         assert len(tier_keyed["episodic"]) == 1, (
@@ -7240,7 +7291,8 @@ class TestMintKeysForKeylessEdgesSpeakerId:
         g.add_edge("developer", "python", predicate="requires", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        loop._mint_keys_for_keyless_edges(tier_keyed)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         assert len(tier_keyed["episodic"]) == 1, (
             f"Expected 1 minted episodic entry; got {tier_keyed['episodic']}"
@@ -7249,3 +7301,334 @@ class TestMintKeysForKeylessEdgesSpeakerId:
         bk = loop.store.bookkeeping_for_key(minted_key)
         assert bk is not None, f"No bookkeeping record for minted key {minted_key!r}"
         assert bk["speaker_id"] == "", f"Expected speaker_id='', got {bk['speaker_id']!r}"
+
+
+# ---------------------------------------------------------------------------
+# _collect_keyed_edges_into — keyed-edge walk extracted from the fold
+# ---------------------------------------------------------------------------
+
+
+class TestCollectKeyedEdgesInto:
+    """Unit tests for ConsolidationLoop._collect_keyed_edges_into.
+
+    The method walks ``merger.graph.edges(data=True)`` and appends training-entry
+    dicts to ``tier_keyed`` for edges that carry both a predicate and an ik_key
+    attribute.  Three skip conditions are tested with distinct edge fixtures:
+
+    (a) Keyed edge with a predicate and a content entry → appended, tier routed.
+    (b) Keyless edge with a predicate → skipped (no ik_key on edge).
+    (c) Predicate-less edge → skipped (not keyable).
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path, *, procedural_enabled=False):
+        """Minimal ConsolidationLoop stub for _collect_keyed_edges_into tests."""
+        import networkx as nx
+        from peft import PeftModel
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = (
+            AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+            if procedural_enabled
+            else None
+        )
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.promoted_keys = set()
+        loop.cycle_count = 0
+        loop._procedural_next_index = 0
+        loop._procedural_tentative_next_index = 0
+        loop._indexed_next_index = 0
+        loop._bg_trainer = None
+        loop.shutdown_requested = False
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop._debug_base = None
+        loop.save_cycle_snapshots = False
+        loop.snapshot_dir = None
+        loop._indexed_ep_interim = {}
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.pending_interim_triples = []
+        merger = MagicMock()
+        merger.graph = nx.MultiDiGraph()
+        loop.merger = merger
+        return loop
+
+    def test_keyed_edge_appended_with_correct_payload_and_tier(self, tmp_path):
+        """A keyed edge with a predicate and content entry is appended to tier_keyed.
+
+        Edge has: predicate='lives_in', ik_key='graph1', subject='Alice', object='Berlin'.
+        Store entry has subject/predicate/object.  Bookkeeping relation_type='factual'
+        → routes to episodic tier.  Payload = {key, subject, predicate, object} from
+        store entry (not from the edge's raw attributes).
+        """
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        g = loop.merger.graph
+
+        # (a) Keyed predicate-bearing edge — must be appended.
+        eid = g.add_edge("Alice", "Berlin", predicate="lives_in")
+        g["Alice"]["Berlin"][eid][_IK_KEY_ATTR] = "graph1"
+
+        # (b) Keyless predicate-bearing edge — must be skipped.
+        g.add_edge("Bob", "Acme", predicate="works_at")
+
+        # (c) Predicate-less edge — must be skipped.
+        g.add_edge("Charlie", "Dave")
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "spk-0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="spk-0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._collect_keyed_edges_into(tier_keyed)
+
+        assert len(tier_keyed["episodic"]) == 1, (
+            f"Expected exactly 1 episodic entry; got {tier_keyed['episodic']}"
+        )
+        assert tier_keyed["semantic"] == [], "No semantic entries expected"
+        assert tier_keyed["procedural"] == [], "No procedural entries expected"
+
+        entry = tier_keyed["episodic"][0]
+        assert entry["key"] == "graph1"
+        assert entry["subject"] == "Alice"
+        assert entry["predicate"] == "lives_in"
+        assert entry["object"] == "Berlin"
+
+    def test_keyed_edge_with_no_content_entry_is_skipped(self, tmp_path):
+        """A keyed edge whose store.get returns None is silently skipped."""
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        g = loop.merger.graph
+
+        eid = g.add_edge("Alice", "Berlin", predicate="lives_in")
+        g["Alice"]["Berlin"][eid][_IK_KEY_ATTR] = "ghost_key"
+        # Intentionally: no store.put for 'ghost_key'.
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._collect_keyed_edges_into(tier_keyed)
+
+        assert tier_keyed["episodic"] == [], "Keyed edge with no content entry must be skipped"
+
+    def test_preference_relation_routes_to_procedural_tier(self, tmp_path):
+        """A keyed edge with bookkeeping relation_type='preference' routes to procedural."""
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path, procedural_enabled=True)
+        g = loop.merger.graph
+
+        eid = g.add_edge("Alice", "tea", predicate="prefers")
+        g["Alice"]["tea"][eid][_IK_KEY_ATTR] = "proc1"
+
+        loop.store.put(
+            "procedural",
+            "proc1",
+            {
+                "key": "proc1",
+                "subject": "Alice",
+                "predicate": "prefers",
+                "object": "tea",
+                "speaker_id": "spk-0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "proc1", speaker_id="spk-0", first_seen_cycle=1, relation_type="preference"
+        )
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._collect_keyed_edges_into(tier_keyed)
+
+        assert len(tier_keyed["procedural"]) == 1, (
+            f"Expected 1 procedural entry; got {tier_keyed['procedural']}"
+        )
+        assert tier_keyed["procedural"][0]["key"] == "proc1"
+
+    def test_semantic_key_stays_semantic(self, tmp_path):
+        """A keyed edge whose store tier is 'semantic' routes to the semantic tier."""
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        g = loop.merger.graph
+
+        eid = g.add_edge("Alice", "Berlin", predicate="lives_in")
+        g["Alice"]["Berlin"][eid][_IK_KEY_ATTR] = "sem1"
+
+        loop.store.put(
+            "semantic",
+            "sem1",
+            {
+                "key": "sem1",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "spk-0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "sem1", speaker_id="spk-0", first_seen_cycle=1, relation_type="factual"
+        )
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._collect_keyed_edges_into(tier_keyed)
+
+        assert len(tier_keyed["semantic"]) == 1, (
+            f"Expected 1 semantic entry; got {tier_keyed['semantic']}"
+        )
+        assert tier_keyed["semantic"][0]["key"] == "sem1"
+        assert tier_keyed["episodic"] == []
+
+
+# ---------------------------------------------------------------------------
+# _build_registry_true_relations — optional keys filter
+# ---------------------------------------------------------------------------
+
+
+class TestBuildRegistryTrueRelationsKeysFilter:
+    """Unit tests for the optional ``keys`` parameter of
+    ``ConsolidationLoop._build_registry_true_relations``.
+
+    Verifies:
+    (a) keys=None returns all active keys (unchanged baseline behavior).
+    (b) keys=[subset] returns only those keys, each carrying indexed_key /
+        speaker_id / relation_type from bookkeeping.
+    (c) An empty list returns an empty result.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path):
+        """Minimal ConsolidationLoop stub for _build_registry_true_relations tests."""
+        from peft import PeftModel
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig()
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.store = MemoryStore(replay_enabled=True)
+        return loop
+
+    def _populate_store(self, store, key, subject, predicate, obj, relation_type, speaker_id):
+        """Register a key in store with entry + bookkeeping."""
+        store.put(
+            "episodic",
+            key,
+            {
+                "key": key,
+                "subject": subject,
+                "predicate": predicate,
+                "object": obj,
+                "speaker_id": speaker_id,
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        store.set_bookkeeping(
+            key,
+            speaker_id=speaker_id,
+            first_seen_cycle=1,
+            relation_type=relation_type,
+        )
+
+    def test_keys_none_returns_all_active(self, tmp_path):
+        """keys=None iterates all active keys — baseline behavior unchanged."""
+        loop = self._make_loop(tmp_path)
+        self._populate_store(loop.store, "k1", "Alice", "lives_in", "Berlin", "factual", "spk-0")
+        self._populate_store(loop.store, "k2", "Bob", "works_at", "Acme", "factual", "spk-1")
+
+        relations = loop._build_registry_true_relations(keys=None)
+
+        returned_keys = {r.indexed_key for r in relations}
+        assert returned_keys == {"k1", "k2"}, (
+            f"keys=None must return all active keys; got {returned_keys}"
+        )
+
+    def test_keys_subset_returns_only_those_keys(self, tmp_path):
+        """Providing a subset returns only those keys, with correct SPO / metadata."""
+        loop = self._make_loop(tmp_path)
+        self._populate_store(loop.store, "k1", "Alice", "lives_in", "Berlin", "factual", "spk-0")
+        self._populate_store(loop.store, "k2", "Bob", "works_at", "Acme", "factual", "spk-1")
+        self._populate_store(loop.store, "k3", "Carol", "knows", "Dave", "factual", "spk-2")
+
+        relations = loop._build_registry_true_relations(keys=["k1", "k3"])
+
+        returned_keys = {r.indexed_key for r in relations}
+        assert returned_keys == {"k1", "k3"}, f"Expected {{k1, k3}}; got {returned_keys}"
+        assert "k2" not in returned_keys, "k2 must not appear when not in keys filter"
+
+        # Verify payload for k1.
+        r1 = next(r for r in relations if r.indexed_key == "k1")
+        assert r1.subject == "Alice"
+        assert r1.predicate == "lives_in"
+        assert r1.object == "Berlin"
+        assert r1.speaker_id == "spk-0"
+        assert r1.relation_type == "factual"
+
+    def test_keys_empty_list_returns_empty(self, tmp_path):
+        """An empty keys list returns an empty relation list."""
+        loop = self._make_loop(tmp_path)
+        self._populate_store(loop.store, "k1", "Alice", "lives_in", "Berlin", "factual", "spk-0")
+
+        relations = loop._build_registry_true_relations(keys=[])
+
+        assert relations == [], f"Expected empty list for keys=[]; got {relations}"
+
+    def test_keys_none_and_no_args_are_equivalent(self, tmp_path):
+        """Calling with no argument (default) yields the same result as keys=None."""
+        loop = self._make_loop(tmp_path)
+        self._populate_store(loop.store, "k1", "Alice", "lives_in", "Berlin", "factual", "spk-0")
+
+        default_result = loop._build_registry_true_relations()
+        explicit_none_result = loop._build_registry_true_relations(keys=None)
+
+        assert {r.indexed_key for r in default_result} == {
+            r.indexed_key for r in explicit_none_result
+        }, "Default call and keys=None must produce identical key sets"

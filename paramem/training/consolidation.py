@@ -1055,7 +1055,7 @@ class ConsolidationLoop:
 
             # --- MERGE ---
             with phase_trace("merge_into_cumulative") as t:
-                if self.config.merge_at_interim:
+                if self.config.interim_refinement != "off":
                     # Path A: merge into cumulative graph each interim cycle.
                     # Disable gradient checkpointing: merger.merge may call model.generate()
                     # for contradiction resolution when a model is present.  HF silently
@@ -1068,7 +1068,7 @@ class ConsolidationLoop:
                     self._triples_since_last_enrichment += len(session_graph.relations)
                     t.add("triples_added", len(session_graph.relations))
                 else:
-                    # Path B: merge deferred to full consolidation (merge_at_interim=False).
+                    # Path B: merge deferred to full consolidation (interim_refinement="off").
                     # The counter is NOT incremented — interim enrichment consumes
                     # _triples_since_last_enrichment over merger.graph, which was not
                     # updated; enrichment stays Path-B-only by design.
@@ -1268,9 +1268,7 @@ class ConsolidationLoop:
         error handling (external Anthropic API call), not control-flow suppression.
 
         Called from :meth:`run_consolidation_cycle` at sub-interval rollover
-        (when the new stamp minted a fresh interim adapter slot).  Lifted verbatim
-        from the former ``_train_extracted_into_interim`` rollover branch so the
-        same guards and semantics are preserved exactly.
+        (when the new stamp minted a fresh interim adapter slot).
         """
         if not (
             self.graph_enrichment_interim_enabled
@@ -1774,7 +1772,7 @@ class ConsolidationLoop:
         result.relations_extracted = len(session_graph.relations)
 
         # --- 2. MERGE ---
-        if self.config.merge_at_interim:
+        if self.config.interim_refinement != "off":
             # Path A: merge into cumulative graph each run_cycle call.
             # Disable gradient checkpointing: merger.merge may call model.generate()
             # for contradiction resolution when a model is present.  HF silently
@@ -3734,63 +3732,59 @@ class ConsolidationLoop:
 
         return newly_promoted
 
-    def _mint_keys_for_keyless_edges(
+    def _harvest_keyless_edge_entries(
         self,
-        tier_keyed: dict[str, list[dict]],
-    ) -> dict[str, int]:
-        """Mint indexed keys for edges in the merged graph that have no ``ik_key`` attribute.
+        *,
+        tag_new: bool,
+    ) -> list[dict]:
+        """Walk the merged graph and collect mint records for keyless predicate-bearing edges.
 
-        Called as a fold pre-pass after :meth:`_promote_mature_keys_inline` and
-        before the per-tier keyed-edge walk so that SOTA-enrichment second-order
-        facts (which arrive as keyless edges after the re-merge) are minted, stored,
-        and appended to *tier_keyed* in the same fold that introduces them.  Without
-        this pre-pass every SOTA-enrichment fact would be silently dropped at the
-        keyed-edge walk's skip branch (``not key → continue``) and could never enter
-        the training set.
+        **Pure harvester** — does NOT call ``store.put``, ``store.set_bookkeeping``,
+        advance ``_indexed_next_index`` / ``_procedural_next_index``, or append to
+        ``tier_keyed``.  All writes are deferred to
+        :meth:`_apply_keyless_edge_entries`.
 
-        The minting logic mirrors the interim path (``assign_keys`` →
-        ``_cache_entry`` → ``store.put`` + ``store.set_bookkeeping``) but uses the
-        fold's in-place mutation discipline: ``store.put`` and counter advancement
-        happen inside this call rather than being deferred to after
-        ``train_adapter``.  This is safe for the fold path because the fold is
-        already committed to training on whatever is in *tier_keyed* — there is no
-        outer failure-safety boundary that needs the deferred-mutation invariant of
-        the interim path.
+        Called as the first half of the fold pre-pass (after
+        :meth:`_promote_mature_keys_inline` and before the per-tier keyed-edge
+        walk) so that SOTA-enrichment second-order facts are harvested in the same
+        fold that introduces them.
 
-        Tier derivation uses the same ``partition_relations`` call that the
-        keyed-edge walk uses for keyed edges, so enrichment edges land in the same
-        tier they would receive if they had been extracted in an ordinary session.
+        To reproduce the original sequential-index assignment without mutating the
+        real instance counters, the harvester maintains LOCAL running counters
+        initialised from ``_indexed_next_index`` / ``_procedural_next_index`` and
+        incremented per mint.  The real counters are advanced by
+        :meth:`_apply_keyless_edge_entries`.
 
-        ``speaker_id`` is resolved from the subject node's ``speaker_id`` attribute
-        in the merged graph.  Speaker person-nodes (e.g. ``Alex Morgan``)
-        carry a non-empty ``speaker_id`` stamped by :meth:`GraphMerger._upsert_entity`
-        at merge time; their enrichment-added edges therefore inherit that id so
-        they are recallable by speaker name via the router recall index.  Role-node
-        subjects (no ``speaker_id`` attribute) fall back to ``""``.
-
-        After this call, every edge that was keyless-but-predicate-bearing has a
-        key in the store and an entry in *tier_keyed*.  The keyed-edge walk will
-        encounter these edges again (their ``ik_key`` attribute is still absent
-        because we chose the direct-append variant to avoid the ``MultiDiGraph``
-        parallel-edge key hazard) — the keyed-edge walk must therefore ``continue``
-        on keyless edges to avoid a ``store.get(None)`` call; the explicit
-        ``if not key: continue`` guard handles this.
+        Tier derivation, display-name resolution, speaker_id resolution, and
+        relation_type clamping all mirror the original combined method exactly.
 
         Args:
-            tier_keyed: The tier → keyed-entries dict that the keyed-edge walk also
-                populates.  This method appends directly to it so both the pre-pass
-                entries and the keyed-edge walk entries land in the same structure
-                that feeds training.
+            tag_new: Forwarded to :meth:`_mint_keyed_entries`.  Pass ``False``
+                for the fold pre-pass (current fold behavior) and ``True`` when
+                the caller needs the ``_new`` sentinel on minted entries.
 
         Returns:
-            Per-tier minted count, e.g. ``{"episodic": 2, "procedural": 1}``.
-            Mutates *tier_keyed* and the :class:`~paramem.memory.store.MemoryStore`
-            in-place.  Advances ``_indexed_next_index`` / ``_procedural_next_index``
-            by one for each minted key.
+            List of harvest records, one per edge that will receive a minted key.
+            Each record is a ``dict`` with keys:
+
+            - ``"entry"`` – the minted entry dict from :meth:`_mint_keyed_entries`
+            - ``"tier"`` – ``"episodic"`` or ``"procedural"``
+            - ``"canon_subj"`` – canonical node key of the subject (for simhash)
+            - ``"canon_obj"`` – canonical node key of the object (for simhash)
+            - ``"predicate"`` – the raw predicate string
+            - ``"relation_type"`` – the clamped relation type string
+            - ``"speaker_id"`` – the resolved speaker_id (may be ``""``)
         """
         from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
-        minted_by_tier: dict[str, int] = {"episodic": 0, "procedural": 0}
+        # Local running counters — never touch the real self.* counters here.
+        # Seeded lazily on the first keyless edge of each tier: when the graph has
+        # no keyless edges to mint, the real counters are never read (matches the
+        # original loop, which only read them inside its mint branch).
+        _local_indexed: int | None = None
+        _local_procedural: int | None = None
+
+        harvested: list[dict] = []
 
         for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
             existing = _t_data.get(_IK_ATTR)
@@ -3833,10 +3827,18 @@ class ConsolidationLoop:
             tier = "procedural" if _proc_rels else "episodic"
 
             # Mint via the shared helper (single-element list).
+            # Use the LOCAL running counter as start_index to assign sequential
+            # indices without mutating the real self.* counters.  Seed the local
+            # counter from the real one on first use of each tier.
             prefix = "proc" if tier == "procedural" else "graph"
-            start_index = (
-                self._procedural_next_index if tier == "procedural" else self._indexed_next_index
-            )
+            if tier == "procedural":
+                if _local_procedural is None:
+                    _local_procedural = self._procedural_next_index
+                start_index = _local_procedural
+            else:
+                if _local_indexed is None:
+                    _local_indexed = self._indexed_next_index
+                start_index = _local_indexed
             minted = self._mint_keyed_entries(
                 [
                     {
@@ -3850,17 +3852,84 @@ class ConsolidationLoop:
                 prefix=prefix,
                 start_index=start_index,
                 speaker_id=_subj_sid,
-                tag_new=False,
+                tag_new=tag_new,
             )
-            key = minted[0]["key"]
+
+            # Advance the local counter for the chosen tier so the next edge in
+            # this loop gets the next sequential index.
+            if tier == "procedural":
+                _local_procedural += 1
+            else:
+                _local_indexed += 1
+
+            harvested.append(
+                {
+                    "entry": minted[0],
+                    "tier": tier,
+                    "canon_subj": _t_subj,
+                    "canon_obj": _t_obj,
+                    "predicate": pred,
+                    "relation_type": _rt,
+                    "speaker_id": _subj_sid,
+                }
+            )
+
+        return harvested
+
+    def _apply_keyless_edge_entries(
+        self,
+        harvested: list[dict],
+        tier_keyed: dict[str, list[dict]],
+    ) -> dict[str, int]:
+        """Persist harvested keyless-edge mint records and populate *tier_keyed*.
+
+        **Applier** — consumes the records returned by
+        :meth:`_harvest_keyless_edge_entries` and reproduces exactly the writes
+        the original combined method performed:
+
+        - ``store.put`` with the minted entry and its simhash
+        - ``store.set_bookkeeping`` with the same kwargs as before
+        - Appending ``{key, subject, predicate, object}`` to ``tier_keyed[tier]``
+        - Advancing ``_indexed_next_index`` / ``_procedural_next_index`` by one
+          per minted episodic / procedural key
+
+        Uses canonical node keys (``canon_subj``, ``canon_obj``) for the simhash
+        and display strings (from ``entry["subject"]`` / ``entry["object"]``) for
+        the ``tier_keyed`` payload — identical to the original method.
+
+        Args:
+            harvested: List of harvest records from
+                :meth:`_harvest_keyless_edge_entries`.
+            tier_keyed: The tier → keyed-entries dict that the keyed-edge walk also
+                populates.  This method appends directly to it so both the pre-pass
+                entries and the keyed-edge walk entries land in the same structure
+                that feeds training.
+
+        Returns:
+            Per-tier minted count, e.g. ``{"episodic": 2, "procedural": 1}``.
+            Mutates *tier_keyed* and the :class:`~paramem.memory.store.MemoryStore`
+            in-place.  Advances ``_indexed_next_index`` / ``_procedural_next_index``
+            by one for each minted key.
+        """
+        minted_by_tier: dict[str, int] = {"episodic": 0, "procedural": 0}
+
+        for rec in harvested:
+            entry = rec["entry"]
+            tier = rec["tier"]
+            canon_subj = rec["canon_subj"]
+            canon_obj = rec["canon_obj"]
+            pred = rec["predicate"]
+            _rt = rec["relation_type"]
+            _subj_sid = rec["speaker_id"]
+            key = entry["key"]
 
             # Persist using the fold's in-place mutation discipline.
             # Use canonical node keys for simhash identity; display strings for entry payload.
             self.store.put(
                 tier,
                 key,
-                minted[0],
-                simhash=compute_simhash(key, _t_subj, pred, _t_obj),
+                entry,
+                simhash=compute_simhash(key, canon_subj, pred, canon_obj),
             )
             self.store.set_bookkeeping(
                 key,
@@ -3879,9 +3948,9 @@ class ConsolidationLoop:
             tier_keyed[tier].append(
                 {
                     "key": key,
-                    "subject": _subj_display,
+                    "subject": entry["subject"],
                     "predicate": pred,
-                    "object": _obj_display,
+                    "object": entry["object"],
                 }
             )
 
@@ -3971,14 +4040,14 @@ class ConsolidationLoop:
             }
         return result
 
-    def _build_registry_true_relations(self) -> "list[Relation]":
-        """Build registry-true :class:`Relation` objects for every active key.
+    def _build_registry_true_relations(self, keys: "list[str] | None" = None) -> "list[Relation]":
+        """Build registry-true :class:`Relation` objects for a set of active keys.
 
         Used as the fold's re-merge input so the merge surface is grounded in
         registry-true (subject, predicate, object) content rather than the
         lossy reconstruction result.
 
-        For each active non-stale key the content is sourced in priority order:
+        For each key the content is sourced in priority order:
 
         1. ``store.get(key)`` — the content cache entry (subject/predicate/object).
         2. ``store.bookkeeping_for_key(key)`` — hydration-miss fallback: when
@@ -3992,11 +4061,20 @@ class ConsolidationLoop:
         ``relation_type`` and ``speaker_id`` always come from bookkeeping (never
         from the entry payload which carries the merge-time value).
 
-        Returns a list of :class:`Relation` with ``indexed_key`` set so the key
-        travels through :class:`GraphMerger` onto the merged edge.
+        Args:
+            keys: Optional explicit list of active-key strings to process.
+                When ``None`` (the default), iterates ``store.all_active_keys()``
+                so behavior is identical to the pre-parameter baseline.  When
+                provided, only those keys are processed; the caller is responsible
+                for supplying a subset of active keys.
+
+        Returns:
+            A list of :class:`Relation` with ``indexed_key`` set so the key
+            travels through :class:`GraphMerger` onto the merged edge.
         """
         relations: list[Relation] = []
-        for key in self.store.all_active_keys():
+        key_iter = keys if keys is not None else self.store.all_active_keys()
+        for key in key_iter:
             entry = self.store.get(key)
             bk = self.store.bookkeeping_for_key(key) or {}
 
@@ -4047,6 +4125,94 @@ class ConsolidationLoop:
                 )
             )
         return relations
+
+    def _collect_keyed_edges_into(self, tier_keyed: "dict[str, list[dict]]") -> None:
+        """Walk the merged graph's keyed edges and append their training entries to tier_keyed.
+
+        Iterates ``self.merger.graph.edges(data=True)`` and, for each edge that
+        carries both a predicate and an ``ik_key`` attribute, resolves the training
+        entry from the content store and routes it to the appropriate tier via
+        bookkeeping ``relation_type`` + :func:`partition_relations`.
+
+        Skip conditions (same as the inline fold walk they replace):
+
+        - No predicate on the edge → skip (not keyable).
+        - No ``ik_key`` on the edge → skip (keyless edges are handled by the
+          pre-pass in ``_harvest_keyless_edge_entries`` / ``_apply_keyless_edge_entries``).
+        - ``store.get(key)`` returns ``None`` → skip (key registered but no content entry).
+
+        Tier derivation mirrors the fold:
+
+        - ``relation_type`` from bookkeeping (clamped to ``_VALID_RTYPES``).
+        - ``partition_relations`` decides procedural vs episodic/semantic.
+        - Semantic keys (``store.tier_for_active_key == "semantic"``) stay semantic
+          when they map to the episodic partition; all others map to episodic.
+
+        Results are appended **in-place** to ``tier_keyed``; the caller owns the
+        dict and its per-tier lists.
+
+        Args:
+            tier_keyed: Mutable mapping of tier name → list of training-entry dicts.
+                Each entry appended has the shape
+                ``{"key": str, "subject": str, "predicate": str, "object": str}``.
+        """
+        from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
+
+        for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
+            key = _t_data.get(_IK_ATTR)
+            _t_pred = _t_data.get("predicate", "")
+            if not _t_pred:
+                # Edges with no predicate are not keyable — skip unconditionally.
+                continue
+            if not key:
+                # The pre-pass already appended this edge to tier_keyed; skip here
+                # to avoid a store.get(None) call.  This branch is reached for
+                # keyless-but-predicate-bearing edges (typically SOTA-enrichment
+                # facts) whose ik_key was intentionally not stamped onto the edge
+                # by the direct-append pre-pass.
+                continue
+
+            entry = self.store.get(key)
+            if entry is None:
+                # Key is registered but has no content entry — skip.
+                logger.debug(
+                    "consolidate_interim_adapters: key %s has no content entry — skipping", key
+                )
+                continue
+
+            # Tier from per-key bookkeeping relation_type (not from the edge, which
+            # may carry the merge-time value rather than the original extraction type).
+            _bk = self.store.bookkeeping_for_key(key) or {}
+            _rt_raw = _bk.get("relation_type", _FALLBACK_RTYPE)
+            _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+            current_adapter_id = self.store.tier_for_active_key(key) or "episodic"
+            _dummy = [
+                {
+                    "subject": _t_subj,
+                    "predicate": _t_pred,
+                    "object": _t_obj,
+                    "relation_type": _rt,
+                }
+            ]
+            _ep_rels, _proc_rels = partition_relations(
+                _dummy, procedural_enabled=self.procedural_config is not None
+            )
+            if _proc_rels:
+                tier = "procedural"
+            elif _ep_rels:
+                # Semantic keys remain semantic; all others map to episodic.
+                tier = "semantic" if current_adapter_id == "semantic" else "episodic"
+            else:
+                tier = "episodic"
+
+            tier_keyed[tier].append(
+                {
+                    "key": key,
+                    "subject": entry["subject"],
+                    "predicate": entry["predicate"],
+                    "object": entry["object"],
+                }
+            )
 
     def consolidate_interim_adapters(
         self,
@@ -4359,7 +4525,8 @@ class ConsolidationLoop:
             )
 
         # tier_keyed is initialised here (before the pre-pass) so that both
-        # _mint_keys_for_keyless_edges and the keyed-edge walk below append to the same dict.
+        # _harvest_keyless_edge_entries/_apply_keyless_edge_entries and the keyed-edge
+        # walk below append to the same dict.
         tier_keyed: dict[str, list[dict]] = {
             "episodic": [],
             "semantic": [],
@@ -4376,7 +4543,8 @@ class ConsolidationLoop:
         # stamped (direct-append variant) to avoid the MultiDiGraph parallel-edge
         # integer-key hazard; the keyed-edge walk's explicit ``if not key: continue`` guard
         # (see below) makes the still-keyless post-pre-pass edges safe to skip.
-        minted_by_tier = self._mint_keys_for_keyless_edges(tier_keyed)
+        _harvested = self._harvest_keyless_edge_entries(tag_new=False)
+        minted_by_tier = self._apply_keyless_edge_entries(_harvested, tier_keyed)
 
         # --- Assign per-tier keyed lists from merged-edge provenance ---
         # Walk merger.graph.edges(data=True); per edge, read ik_key from the edge
@@ -4401,61 +4569,7 @@ class ConsolidationLoop:
                 sorted(recall_miss_keys),
             )
 
-        for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
-            key = _t_data.get(_IK_ATTR)
-            _t_pred = _t_data.get("predicate", "")
-            if not _t_pred:
-                # Edges with no predicate are not keyable — skip unconditionally.
-                continue
-            if not key:
-                # The pre-pass already appended this edge to tier_keyed; skip here
-                # to avoid a store.get(None) call.  This branch is reached for
-                # keyless-but-predicate-bearing edges (typically SOTA-enrichment
-                # facts) whose ik_key was intentionally not stamped onto the edge
-                # by the direct-append pre-pass.
-                continue
-
-            entry = self.store.get(key)
-            if entry is None:
-                # Key is registered but has no content entry — skip.
-                logger.debug(
-                    "consolidate_interim_adapters: key %s has no content entry — skipping", key
-                )
-                continue
-
-            # Tier from per-key bookkeeping relation_type (not from the edge, which
-            # may carry the merge-time value rather than the original extraction type).
-            _bk = self.store.bookkeeping_for_key(key) or {}
-            _rt_raw = _bk.get("relation_type", _FALLBACK_RTYPE)
-            _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
-            current_adapter_id = self.store.tier_for_active_key(key) or "episodic"
-            _dummy = [
-                {
-                    "subject": _t_subj,
-                    "predicate": _t_pred,
-                    "object": _t_obj,
-                    "relation_type": _rt,
-                }
-            ]
-            _ep_rels, _proc_rels = partition_relations(
-                _dummy, procedural_enabled=self.procedural_config is not None
-            )
-            if _proc_rels:
-                tier = "procedural"
-            elif _ep_rels:
-                # Semantic keys remain semantic; all others map to episodic.
-                tier = "semantic" if current_adapter_id == "semantic" else "episodic"
-            else:
-                tier = "episodic"
-
-            tier_keyed[tier].append(
-                {
-                    "key": key,
-                    "subject": entry["subject"],
-                    "predicate": entry["predicate"],
-                    "object": entry["object"],
-                }
-            )
+        self._collect_keyed_edges_into(tier_keyed)
 
         # Debug: snapshot the graph after the keyed-edge walk (before the floor-gate pass
         # mutates tier_keyed).  Self-gated; no-op when save_cycle_snapshots=False.
@@ -5359,7 +5473,7 @@ class ConsolidationLoop:
 
         # --- Per-tier delta for train mode ---
         # Build the tier_delta record from the before-snapshot + serve_assignment
-        # (active after) + minted_by_tier from _mint_keys_for_keyless_edges.
+        # (active after) + minted_by_tier from _apply_keyless_edge_entries.
         # staled_by_reason is derived from merger.removal_ledger via _build_tier_delta
         # (includes all removal reasons: dedup, enrichment_same_as, contradiction_*).
         _train_tiers = ("episodic", "semantic", "procedural")

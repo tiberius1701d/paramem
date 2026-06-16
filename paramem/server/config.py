@@ -848,11 +848,12 @@ class ConsolidationScheduleConfig:
     retain_sessions: bool = True
     indexed_key_replay: bool = True  # indexed key training mechanism
     decay_window: int = 10  # cycles before unreinforced keys decay
-    # default OFF = cheap-graph interim posture: per-session keys go straight to
-    # the interim adapter, cumulative-graph merge/contradiction/enrichment deferred
-    # to full consolidation (Path B).  True = "daily consolidation" posture: the
-    # per-session merge runs each interim cycle as well.
-    merge_at_interim: bool = False
+    # Controls whether per-session graph merges are interleaved with each interim
+    # cycle.  "off" defers cumulative-graph merge/contradiction/enrichment to full
+    # consolidation (cheap interim posture).  "light" and "full" both merge the
+    # cumulative graph on every interim cycle (per-cycle merge posture) and
+    # currently behave identically.
+    interim_refinement: str = "off"  # Literal["off", "light", "full"]
     # Floor below which a tier's keys park in episodic until the tier's own
     # population reaches this count.  30 is the conservative default (Test 19:
     # set size is the lever — 10 near-dup keys score 7/10 isolated, 51/51 when
@@ -1109,6 +1110,13 @@ class ConsolidationScheduleConfig:
                 f"extraction_plausibility_stage='deanon' would send REAL NAMES to a "
                 f"cloud API. Use stage='anon' for cloud judges, or judge='auto' for "
                 f"local judging."
+            )
+
+        _valid_refinement = {"off", "light", "full"}
+        if self.interim_refinement not in _valid_refinement:
+            raise ValueError(
+                f"consolidation.interim_refinement must be one of "
+                f"{sorted(_valid_refinement)!r}; got {self.interim_refinement!r}"
             )
 
         # orphan_retirement: validate the schedule string early so the operator
@@ -1564,7 +1572,7 @@ class ServerConfig:
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
-            merge_at_interim=self.consolidation.merge_at_interim,
+            interim_refinement=self.consolidation.interim_refinement,
             min_tier_key_floor=self.consolidation.min_tier_key_floor,
             tier_fast_start=self.consolidation.tier_fast_start,
         )
