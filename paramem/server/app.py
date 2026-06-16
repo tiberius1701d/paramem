@@ -7957,9 +7957,9 @@ async def _run_trial_consolidation() -> None:
     Acquires the GPU lock, reloads config from the newly-active server.yaml,
     builds a trial ConsolidationLoop with overrides (mode=train, paths →
     state/trial_adapter/), and calls ``_run_extraction_phase`` with
-    ``mark_callback=lambda _: None``.
+    ``mark_sessions=False``.
 
-    The ``mark_consolidated_callback`` no-op ensures that
+    Passing ``mark_sessions=False`` ensures that
     ``session_buffer.mark_consolidated`` is **never** called from the trial
     loop (spec L364 — "Transcript sweeper blocks archive+delete").  Pending
     sessions remain in the buffer after the trial cycle completes so that
@@ -8077,11 +8077,11 @@ async def _run_trial_consolidation() -> None:
                     _state["speaker_store"] = speaker_store
                     try:
                         with gpu_lock_sync():
-                            # Trial path: mark_callback=lambda _: None so sessions stay
+                            # Trial path: mark_sessions=False so sessions stay
                             # pending (spec L364) and /migration/rollback can restore queue.
                             return _run_extraction_phase(
                                 loop,
-                                mark_callback=lambda _: None,
+                                mark_sessions=False,
                             )
                     finally:
                         _state["config"] = prior_config
@@ -11722,7 +11722,7 @@ def _await_bg_cycle(
 
 def _run_extraction_phase(
     loop,
-    mark_callback=None,
+    mark_sessions: bool = True,
 ) -> dict:
     """Extract all pending sessions and train once (full-cycle path).
 
@@ -11736,11 +11736,11 @@ def _run_extraction_phase(
     loop:
         :class:`~paramem.server.consolidation.ConsolidationLoop` instance.
         Must be pre-constructed by the caller (trial or production).
-    mark_callback:
-        Optional callable accepting a list of session IDs.  When ``None``,
-        ``session_buffer.mark_consolidated`` is called (production behaviour).
-        Pass ``lambda _: None`` for the trial path so pending sessions remain
-        in the buffer (spec L364 — "transcript sweeper blocks archive+delete").
+    mark_sessions:
+        When ``True`` (default), ``session_buffer.mark_consolidated`` is called
+        after extraction/training (production behaviour).  Pass ``False`` for
+        the trial path so pending sessions remain in the buffer (spec L364 —
+        "transcript sweeper blocks archive+delete").
 
     Returns a result dict including the loop instance for reuse.
 
@@ -11752,7 +11752,6 @@ def _run_extraction_phase(
     from paramem.server.consolidation import (
         _dedup_episodic,
         _dedup_procedural,
-        _do_mark_consolidated,
         _save_key_metadata,
         session_retention_dir,
     )
@@ -11849,12 +11848,11 @@ def _run_extraction_phase(
 
     if not all_episodic_rels and not all_procedural_rels:
         logger.info("No relations extracted — skipping training")
-        _do_mark_consolidated(
-            session_buffer,
-            session_ids,
-            mark_callback,
-            retention_dir=session_retention_dir(loop, config),
-        )
+        if mark_sessions:
+            session_buffer.mark_consolidated(
+                session_ids,
+                retention_dir=session_retention_dir(loop, config),
+            )
         return {
             "status": "no_facts",
             "sessions": len(session_ids),
@@ -11902,12 +11900,11 @@ def _run_extraction_phase(
             )
             raise
 
-        _do_mark_consolidated(
-            session_buffer,
-            session_ids,
-            mark_callback,
-            retention_dir=session_retention_dir(loop, config),
-        )
+        if mark_sessions:
+            session_buffer.mark_consolidated(
+                session_ids,
+                retention_dir=session_retention_dir(loop, config),
+            )
         elapsed = time.time() - start_time
         summary = {
             "status": "simulated",
@@ -11962,12 +11959,11 @@ def _run_extraction_phase(
         )
         raise
 
-    _do_mark_consolidated(
-        session_buffer,
-        session_ids,
-        mark_callback,
-        retention_dir=session_retention_dir(loop, config),
-    )
+    if mark_sessions:
+        session_buffer.mark_consolidated(
+            session_ids,
+            retention_dir=session_retention_dir(loop, config),
+        )
 
     elapsed = time.time() - start_time
     summary = {

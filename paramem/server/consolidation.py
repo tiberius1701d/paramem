@@ -178,43 +178,9 @@ def session_retention_dir(loop, config) -> Path | None:
     return snap / "sessions"
 
 
-def _do_mark_consolidated(
-    session_buffer,
-    session_ids,
-    callback,
-    *,
-    retention_dir: Path | None = None,
-):
-    """Invoke the mark-consolidated callback or fall back to the buffer method.
-
-    When *callback* is ``None``, ``session_buffer.mark_consolidated(session_ids,
-    retention_dir=retention_dir)`` is called (standard production path).  When
-    *callback* is not ``None`` it is called instead, allowing the trial path to
-    pass a no-op so pending sessions remain in the buffer
-    ("transcript sweeper blocks archive+delete").
-
-    Parameters
-    ----------
-    session_buffer:
-        The live session buffer.
-    session_ids:
-        List of session IDs that finished extraction/training.
-    callback:
-        Optional callable accepting ``session_ids``.  ``None`` → use buffer method.
-    retention_dir:
-        Directory to move JSONL into when ``retain_sessions`` or ``debug`` is
-        true on the buffer.  Forwarded to :meth:`SessionBuffer.mark_consolidated`.
-        Ignored when *callback* is provided.
-    """
-    if callback is None:
-        session_buffer.mark_consolidated(session_ids, retention_dir=retention_dir)
-    else:
-        callback(session_ids)
-
-
 # run_consolidation was deleted when it was merged into paramem.server.app._run_extraction_phase,
 # which closes over _state instead of taking model/tokenizer/config/session_buffer as args.
-# Trial-migration callers: use _run_extraction_phase(loop, mark_callback=lambda _: None).
+# Trial-migration callers: use _run_extraction_phase(loop, mark_sessions=False).
 # Dev scripts that imported run_consolidation directly will need updating separately.
 
 

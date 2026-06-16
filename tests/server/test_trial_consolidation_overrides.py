@@ -239,9 +239,9 @@ class TestTrialDoesNotMarkConsolidated:
     def test_trial_cycle_does_not_mark_consolidated(self, tmp_path, monkeypatch):
         """_run_extraction_phase called from trial path must not invoke mark_consolidated.
 
-        Verifies the ``mark_consolidated_callback=lambda _: None`` plumbing:
-        the real session_buffer.mark_consolidated must not be called so that
-        pending sessions stay in the buffer after the trial cycle (spec L364).
+        Verifies the ``mark_sessions=False`` plumbing: the real
+        session_buffer.mark_consolidated must not be called so that pending
+        sessions stay in the buffer after the trial cycle (spec L364).
 
         session_buffer.pending_count is set to 2 so _run_extraction_phase
         is called (buffer-empty path skips it).  evaluate_gates is patched to
@@ -290,15 +290,11 @@ class TestTrialDoesNotMarkConsolidated:
                                 return_value=skipped_gates,
                             ):
                                 await app_module._run_trial_consolidation()
-                            # Verify mark_callback=lambda _: None was passed.
+                            # Verify mark_sessions=False was passed.
                             # The trial path must not mark sessions consolidated.
                             call_kwargs = mock_run.call_args.kwargs
-                            callback = call_kwargs.get("mark_callback")
-                            assert callback is not None, "trial path must pass mark_callback"
-                            # Calling the callback must be a no-op, not delegate to buffer.
-                            callback(["session-1", "session-2"])
-                            assert not mock_session_buffer.mark_consolidated.called, (
-                                "trial callback must not call session_buffer.mark_consolidated"
+                            assert call_kwargs.get("mark_sessions") is False, (
+                                "trial path must pass mark_sessions=False so sessions stay pending"
                             )
 
         asyncio.run(_run())
@@ -414,7 +410,7 @@ class TestTrialDoesNotMarkConsolidated:
                         mock_gpu.return_value.__enter__ = MagicMock(return_value=None)
                         mock_gpu.return_value.__exit__ = MagicMock(return_value=False)
 
-                        def capture_run(loop, mark_callback=None):
+                        def capture_run(loop, mark_sessions=True):
                             # _run_extraction_phase reads config from _state;
                             # capture the mode that was injected by _run_trial_consolidation.
                             import paramem.server.app as _app
