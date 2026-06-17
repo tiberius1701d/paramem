@@ -854,6 +854,12 @@ class ConsolidationScheduleConfig:
     # cumulative graph on every interim cycle (per-cycle merge posture) and
     # currently behave identically.
     interim_refinement: str = "off"  # Literal["off", "light", "full"]
+    # Minimum recall fraction (0, 1] that every recall gate must reach before the
+    # adapter fold is accepted.  Applied to: post-save disk-integrity probes,
+    # interim-cycle training, full-fold training, housekeeping re-train, and
+    # simulate→train migration.  1.0 = sharp recall (all keys must be recalled).
+    # Lower only with empirical evidence and explicit operator acknowledgment.
+    recall_sanity_threshold: float = 1.0
     # Floor below which a tier's keys park in episodic until the tier's own
     # population reaches this count.  30 is the conservative default (Test 19:
     # set size is the lever — 10 near-dup keys score 7/10 isolated, 51/51 when
@@ -1117,6 +1123,12 @@ class ConsolidationScheduleConfig:
             raise ValueError(
                 f"consolidation.interim_refinement must be one of "
                 f"{sorted(_valid_refinement)!r}; got {self.interim_refinement!r}"
+            )
+
+        if not (0.0 < self.recall_sanity_threshold <= 1.0):
+            raise ValueError(
+                f"consolidation.recall_sanity_threshold must be in (0.0, 1.0]; "
+                f"got {self.recall_sanity_threshold!r}"
             )
 
         # orphan_retirement: validate the schedule string early so the operator
@@ -1573,6 +1585,7 @@ class ServerConfig:
             indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
             interim_refinement=self.consolidation.interim_refinement,
+            recall_sanity_threshold=self.consolidation.recall_sanity_threshold,
             min_tier_key_floor=self.consolidation.min_tier_key_floor,
             tier_fast_start=self.consolidation.tier_fast_start,
         )

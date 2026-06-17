@@ -165,6 +165,15 @@ class ConsolidationConfig:
     # cumulative graph on every interim cycle (per-cycle merge posture) and
     # currently behave identically.
     interim_refinement: str = "off"  # Literal["off", "light", "full"]
+    # Minimum recall fraction (0, 1] that every recall gate must reach before the
+    # adapter fold is accepted.  Applied to: post-save disk-integrity probes
+    # (_verify_saved_adapter_from_disk), interim-cycle training
+    # (run_consolidation_cycle / post_session_train), full-fold training
+    # (consolidate_interim_adapters), housekeeping re-train (run_housekeeping),
+    # and simulate→train migration (_migrate_tier_simulate_to_train).
+    # 1.0 = sharp recall (all keys must be recalled, no tolerance); lower only with
+    # empirical evidence and explicit operator acknowledgment.
+    recall_sanity_threshold: float = 1.0
 
     def __post_init__(self) -> None:
         """Validate field values at construction time."""
@@ -173,6 +182,11 @@ class ConsolidationConfig:
             raise ValueError(
                 f"ConsolidationConfig.interim_refinement must be one of "
                 f"{sorted(_valid)!r}; got {self.interim_refinement!r}"
+            )
+        if not (0.0 < self.recall_sanity_threshold <= 1.0):
+            raise ValueError(
+                f"ConsolidationConfig.recall_sanity_threshold must be in (0.0, 1.0]; "
+                f"got {self.recall_sanity_threshold!r}"
             )
 
     # Floor below which a tier's keys park in episodic until the tier's own

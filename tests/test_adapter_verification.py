@@ -155,17 +155,16 @@ class TestVerifySavedAdapterHappyPath:
         loop = _make_verify_loop(tmp_path, model)
         slot = _make_slot(tmp_path, "episodic")
 
-        # Patch the internal probe to return a passing rate.
-        loop._run_recall_sanity_probe = MagicMock(return_value=0.98)
+        # Patch the internal probe to return a passing rate (sharp recall).
+        loop._run_recall_sanity_probe = MagicMock(return_value=1.0)
 
         rate = loop._verify_saved_adapter_from_disk(
             "episodic",
             slot,
             _SAMPLE_KEYED_PAIRS,
-            threshold=0.95,
         )
 
-        assert rate == pytest.approx(0.98)
+        assert rate == pytest.approx(1.0)
         # load_adapter was called once with the slot path and verify name.
         model.load_adapter.assert_called_once_with(str(slot), adapter_name="episodic_verify")
         # The probe was invoked with the verify slot name.
@@ -180,16 +179,15 @@ class TestVerifySavedAdapterHappyPath:
         """Recall equal to threshold must NOT raise (boundary condition)."""
         loop = _make_verify_loop(tmp_path)
         slot = _make_slot(tmp_path, "episodic")
-        loop._run_recall_sanity_probe = MagicMock(return_value=0.95)
+        loop._run_recall_sanity_probe = MagicMock(return_value=1.0)
 
-        # Should not raise.
+        # Should not raise — config default is 1.0.
         rate = loop._verify_saved_adapter_from_disk(
             "episodic",
             slot,
             _SAMPLE_KEYED_PAIRS,
-            threshold=0.95,
         )
-        assert rate == pytest.approx(0.95)
+        assert rate == pytest.approx(1.0)
 
     def test_empty_keyed_pairs_returns_one_without_loading(self, tmp_path: Path) -> None:
         """Empty entries list is healthy by definition — no disk access needed."""
@@ -202,7 +200,6 @@ class TestVerifySavedAdapterHappyPath:
             "episodic",
             slot,
             [],  # no pairs to verify
-            threshold=0.95,
         )
 
         assert rate == pytest.approx(1.0)
@@ -240,7 +237,6 @@ class TestVerifySavedAdapterCorruption:
                 "episodic",
                 slot,
                 _SAMPLE_KEYED_PAIRS,
-                threshold=0.95,
             )
 
     def test_raises_on_degraded_recall_below_threshold(self, tmp_path: Path) -> None:
@@ -258,13 +254,12 @@ class TestVerifySavedAdapterCorruption:
                 "episodic",
                 slot,
                 _SAMPLE_KEYED_PAIRS,
-                threshold=0.95,
             )
 
         msg = str(exc_info.value)
         assert "episodic" in msg
         assert "0.600" in msg or "0.60" in msg
-        assert "0.95" in msg
+        assert "1.00" in msg
         assert str(slot) in msg
 
     def test_error_message_mentions_slot_path(self, tmp_path: Path) -> None:
@@ -544,7 +539,7 @@ class TestSaveAdaptersCallsVerify:
             slot_path: Path,
             entries: list[dict],
             *,
-            threshold: float = 0.95,
+            threshold: float | None = None,
             max_probe: int = 100,
         ) -> float:
             calls.append((adapter_name, slot_path))
@@ -568,7 +563,7 @@ class TestSaveAdaptersCallsVerify:
             slot_path: Path,
             entries: list[dict],
             *,
-            threshold: float = 0.95,
+            threshold: float | None = None,
             max_probe: int = 100,
         ) -> float:
             received_slots.append(slot_path)
@@ -591,7 +586,7 @@ class TestSaveAdaptersCallsVerify:
             slot_path: Path,
             entries: list[dict],
             *,
-            threshold: float = 0.95,
+            threshold: float | None = None,
             max_probe: int = 100,
         ) -> float:
             raise RuntimeError("Post-save disk-integrity probe failed for adapter 'episodic'")
@@ -773,7 +768,7 @@ class TestPostSaveSlotCleanup:
             slot_path: Path,
             entries: list[dict],
             *,
-            threshold: float = 0.95,
+            threshold: float | None = None,
             max_probe: int = 100,
         ) -> float:
             received_slots.append(slot_path)
@@ -800,7 +795,7 @@ class TestPostSaveSlotCleanup:
             slot_path: Path,
             entries: list[dict],
             *,
-            threshold: float = 0.95,
+            threshold: float | None = None,
             max_probe: int = 100,
         ) -> float:
             raise RuntimeError("Post-save disk-integrity probe failed for adapter 'episodic'")
@@ -809,3 +804,65 @@ class TestPostSaveSlotCleanup:
 
         with pytest.raises(RuntimeError, match="Post-save disk-integrity probe failed"):
             loop._save_adapters()
+
+
+# ---------------------------------------------------------------------------
+# T5 — recall_sanity_threshold config knob
+# ---------------------------------------------------------------------------
+
+
+class TestRecallSanityThresholdKnob:
+    """T5: the recall_sanity_threshold config knob default is 1.0 and flows
+    through to _verify_saved_adapter_from_disk when no explicit override is
+    passed.
+    """
+
+    def test_config_default_is_one(self) -> None:
+        """ConsolidationConfig.recall_sanity_threshold defaults to 1.0."""
+        cfg = ConsolidationConfig()
+        assert cfg.recall_sanity_threshold == pytest.approx(1.0)
+
+    def test_config_validation_rejects_out_of_range(self) -> None:
+        """Values outside (0, 1] are rejected at construction time."""
+        with pytest.raises(ValueError, match="recall_sanity_threshold"):
+            ConsolidationConfig(recall_sanity_threshold=0.0)
+        with pytest.raises(ValueError, match="recall_sanity_threshold"):
+            ConsolidationConfig(recall_sanity_threshold=1.1)
+        with pytest.raises(ValueError, match="recall_sanity_threshold"):
+            ConsolidationConfig(recall_sanity_threshold=-0.1)
+
+    def test_lower_threshold_flows_to_gate(self, tmp_path: Path) -> None:
+        """When recall_sanity_threshold is lowered in config, the gate accepts
+        a recall rate that would fail at the default 1.0.
+
+        Concretely: with threshold=0.8, a probe returning 0.9 must NOT raise;
+        without the config knob being read, the hardcoded 1.0 default would
+        raise RuntimeError.
+        """
+        loop = _make_verify_loop(tmp_path)
+        # Lower the threshold below the probe's return value.
+        loop.config = ConsolidationConfig(recall_sanity_threshold=0.8)
+        slot = _make_slot(tmp_path, "episodic")
+        loop._run_recall_sanity_probe = MagicMock(return_value=0.9)
+
+        # With threshold=0.8, recall=0.9 must not raise.
+        rate = loop._verify_saved_adapter_from_disk(
+            "episodic",
+            slot,
+            _SAMPLE_KEYED_PAIRS,
+        )
+        assert rate == pytest.approx(0.9)
+
+    def test_threshold_below_probe_still_raises(self, tmp_path: Path) -> None:
+        """Recall below the configured threshold still raises RuntimeError."""
+        loop = _make_verify_loop(tmp_path)
+        loop.config = ConsolidationConfig(recall_sanity_threshold=0.8)
+        slot = _make_slot(tmp_path, "episodic")
+        loop._run_recall_sanity_probe = MagicMock(return_value=0.7)
+
+        with pytest.raises(RuntimeError, match="Post-save disk-integrity probe failed"):
+            loop._verify_saved_adapter_from_disk(
+                "episodic",
+                slot,
+                _SAMPLE_KEYED_PAIRS,
+            )

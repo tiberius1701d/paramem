@@ -2066,7 +2066,6 @@ class ConsolidationLoop:
     def _save_adapters(
         self,
         *,
-        recall_sanity_threshold: float = 0.95,
         window_stamp_override: "str | None" = None,
     ) -> None:
         """Save adapters and registries to disk using the atomic registry-last ordering.
@@ -2104,18 +2103,15 @@ class ConsolidationLoop:
         ``find_live_slot`` won't match → slot is latent, harmless.
 
         Args:
-            recall_sanity_threshold: Minimum recall rate that the post-save
-                disk-integrity probe must achieve.  Forwarded verbatim to
-                :meth:`_verify_saved_adapter_from_disk`.  Defaults to 0.95 to
-                match the in-RAM recall gates in
-                :meth:`consolidate_interim_adapters` and
-                :meth:`post_session_train`.
             window_stamp_override: When not ``None``, write this value as the
                 ``window_stamp`` on all saved main slots instead of computing a
                 fresh floor.  Used by :meth:`run_housekeeping` to preserve the
                 existing window stamp so :func:`_is_full_cycle_due` is not
                 perturbed by the re-groom (a housekeeping fold must not advance
                 the cadence window).
+
+        The recall gate threshold is read from ``self.config.recall_sanity_threshold``
+        (set once at construction from the YAML field of the same name).
         """
         import hashlib as _hashlib
 
@@ -2217,7 +2213,7 @@ class ConsolidationLoop:
                     adapter_name,
                     slot,
                     _entries_for_tier(simhash),
-                    threshold=recall_sanity_threshold,
+                    threshold=self.config.recall_sanity_threshold,
                 )
             except Exception:
                 # Delete the bad slot so a latent corrupted artifact is not
@@ -2379,7 +2375,7 @@ class ConsolidationLoop:
         schedule: str = "",
         max_interim_count: int = 7,
         stamp: str | None = None,
-        recall_sanity_threshold: float = 0.95,
+        recall_sanity_threshold: "float | None" = None,
     ) -> dict:
         """Extract one conversation, train onto the current interim adapter, register on success.
 
@@ -2587,7 +2583,7 @@ class ConsolidationLoop:
         schedule: str = "",
         max_interim_count: int = 7,
         stamp: str | None = None,
-        recall_sanity_threshold: float = 0.95,
+        recall_sanity_threshold: "float | None" = None,
         new_promotions: "list[str] | None" = None,
     ) -> dict:
         """Unified interim-cycle entry: key prep + optional training + atomic persistence.
@@ -2649,8 +2645,11 @@ class ConsolidationLoop:
             max_interim_count: Cap on concurrent interim adapters.
                 ``0`` → queue-until-consolidation branch (RAM-only, no training).
             stamp: Override the computed sub-interval stamp (test injection).
-            recall_sanity_threshold: Forwarded to ``commit_tier_slot`` for the
-                post-save disk-integrity probe threshold (train mode only).
+            recall_sanity_threshold: Accepted for caller override compatibility;
+                the active threshold is read from ``self.config.recall_sanity_threshold``
+                when this is ``None`` (the default).  Not currently consumed inside
+                this method — interim-cycle saves go through ``commit_tier_slot``,
+                which reads the threshold from the loop config.
             new_promotions: Optional list of entity names promoted to semantic
                 this cycle.  When non-empty, matching episodic keys are moved to
                 the semantic tier via ``store.move`` before training, so they are
@@ -2665,6 +2664,12 @@ class ConsolidationLoop:
             medium (``"train"`` or ``"simulate"``).
         """
         from paramem.memory.persistence import commit_tier_slot
+
+        # Resolve threshold from config when the caller did not supply an override.
+        # Not currently consumed inside this method; resolved here so the override
+        # contract is honoured and future callers can rely on the config path.
+        if recall_sanity_threshold is None:
+            recall_sanity_threshold = self.config.recall_sanity_threshold
 
         # --- 1. Cycle counter ---
         self.cycle_count += 1
@@ -3573,7 +3578,7 @@ class ConsolidationLoop:
         self,
         trainer=None,
         router=None,
-        recall_sanity_threshold: float = 0.95,
+        recall_sanity_threshold: "float | None" = None,
         refresh_epochs: int = 30,
         mode: str = "simulate",
     ) -> dict:
@@ -3603,7 +3608,9 @@ class ConsolidationLoop:
         Args:
             trainer: BackgroundTrainer (train mode only).  Must hold the GPU lock.
             router: Router instance for reload at fold completion (train mode only).
-            recall_sanity_threshold: Forwarded to the underlying adapter fold (train only).
+            recall_sanity_threshold: Override for the recall gate (train only).  When
+                ``None`` (default), the value is read from
+                ``self.config.recall_sanity_threshold``.
             refresh_epochs: Forwarded to the underlying adapter fold (train only).
             mode: Consolidation mode — ``"simulate"`` (default, no GPU/model required) or
                 ``"train"`` (retrains adapter weights).  Passed by the app layer from
@@ -4426,7 +4433,7 @@ class ConsolidationLoop:
         self,
         trainer=None,
         router=None,
-        recall_sanity_threshold: float = 0.95,
+        recall_sanity_threshold: "float | None" = None,
         refresh_epochs: int = 30,
         *,
         housekeeping: bool = False,
@@ -4484,10 +4491,10 @@ class ConsolidationLoop:
                 lock via submit()).  Required for per-tier B2 re-arm pattern.
             router: Router instance whose reload() is called at the end of the
                 atomic finalize sequence.  Optional — skipped when None.
-            recall_sanity_threshold: Minimum recall rate for the post-save
-                disk-integrity probe in ``_save_adapters`` (forwarded verbatim).
-                In-RAM pre-save probes have been removed; the gate fires
-                post-save via ``_verify_saved_adapter_from_disk``.
+            recall_sanity_threshold: Override for the minimum recall rate for the
+                post-save disk-integrity probe in ``_save_adapters``.  When
+                ``None`` (default), the value is read from
+                ``self.config.recall_sanity_threshold``.
             refresh_epochs: Number of training epochs for the full per-tier
                 rebuild (default 30; matches the per-key baseline from Tests 1-7b).
             housekeeping: When ``True``, bypass gate (d) (the whole-fold
@@ -4530,6 +4537,10 @@ class ConsolidationLoop:
         from paramem.memory.interim_adapter import unload_interim_adapters
         from paramem.models.loader import create_adapter
         from paramem.server.gpu_lock import _gpu_thread_lock
+
+        # Resolve threshold from config when the caller did not supply an override.
+        if recall_sanity_threshold is None:
+            recall_sanity_threshold = self.config.recall_sanity_threshold
 
         # --- Entry guard: verify the GPU lock is held by the caller (leak-safe) ---
         acquired = _gpu_thread_lock.acquire(blocking=False)
@@ -5444,7 +5455,6 @@ class ConsolidationLoop:
         if self.store.replay_enabled and tiers_rebuilt:
             try:
                 self._save_adapters(
-                    recall_sanity_threshold=recall_sanity_threshold,
                     window_stamp_override=window_stamp_override,
                 )
             except Exception:
@@ -5680,7 +5690,7 @@ class ConsolidationLoop:
         slot_path: Path,
         entries: list[dict],
         *,
-        threshold: float = 0.95,
+        threshold: "float | None" = None,
         max_probe: int = 100,
     ) -> float:
         """Reload an adapter from its on-disk slot and probe recall integrity.
@@ -5722,8 +5732,9 @@ class ConsolidationLoop:
             entries: Entries encoded into the adapter.  Sampled down to
                 *max_probe* if longer.  An empty list returns ``1.0`` (no keys
                 to verify → healthy by default).
-            threshold: Minimum recall the disk artifact must achieve.  Defaults
-                to ``0.95`` matching the production recall gates.
+            threshold: Minimum recall the disk artifact must achieve.  When
+                ``None`` (default), the value is read from
+                ``self.config.recall_sanity_threshold``.
             max_probe: Maximum number of entries to probe.  Passed through to
                 :meth:`_run_recall_sanity_probe`.
 
@@ -5738,6 +5749,10 @@ class ConsolidationLoop:
                 cycle to retry.
         """
         from peft import PeftModel
+
+        # Resolve threshold from config when the caller did not supply an override.
+        if threshold is None:
+            threshold = self.config.recall_sanity_threshold
 
         if not entries:
             logger.debug(

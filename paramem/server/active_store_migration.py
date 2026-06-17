@@ -17,8 +17,9 @@ The distinction between modes is whether adapter weight slot subdirectories
 Two directions:
 
 * ``simulate_to_train``: read ``<adapter_dir>/<name>/graph.json`` →
-  train into ``<name>`` adapter → recall probe at threshold=1.0 → on
-  pass, atomic-save the slot. On fail, leave the graph intact.
+  train into ``<name>`` adapter → recall probe at
+  ``loop.config.recall_sanity_threshold`` → on pass, atomic-save the
+  slot. On fail, leave the graph intact.
 
 * ``train_to_simulate``: verify ``<adapter_dir>/<name>/graph.json`` exists
   and covers all active keys; reconstruct from weights if missing →
@@ -499,7 +500,7 @@ def _migrate_tier_simulate_to_train(
     loop: "ConsolidationLoop", config: "ServerConfig", name: str
 ) -> None:
     """Read simulate-store graph.json → train into ``<name>`` adapter →
-    probe at threshold=1.0 → on pass, persist slot + delete source graph.
+    probe at ``loop.config.recall_sanity_threshold`` → on pass, persist slot + delete source graph.
 
     Handles both main tiers (``"episodic"``, ``"semantic"``,
     ``"procedural"``) and interim adapters
@@ -528,7 +529,7 @@ def _migrate_tier_simulate_to_train(
     5. ``train_adapter`` with the resolved adapter config and the loop's
        configured num_epochs.
     6. Recall probe via ``loop._run_recall_sanity_probe(name, entries)``
-       at threshold 1.0 — stricter than the 0.95 in-process default.
+       at ``loop.config.recall_sanity_threshold`` (the unified recall gate knob).
     7. On pass: ``atomic_save_adapter`` writes the slot under the resolved
        slot root.  ``indexed_key_registry.json`` (carrying the unified simhash
        map) is written as the commit signal.  Delete the source graph.json.
@@ -626,7 +627,7 @@ def _migrate_tier_simulate_to_train(
     if _migrate_metrics.get("aborted"):
         raise _TierSkipped(f"aborted mid-migration for {name}")
 
-    # Step 6: recall probe at threshold=1.0 (stricter than 0.95 default).
+    # Step 6: recall probe at the configured sanity threshold.
     # Pass max_probe=len(entries) so the gate is uncapped — all keys must pass,
     # not just a 100-entry sample.  The RecallEarlyStopCallback already probes
     # the full entry set (no cap), so this call is now consistent with it.
@@ -634,14 +635,15 @@ def _migrate_tier_simulate_to_train(
     # (both the ordinary mode-switch path and Phase B of a base-swap).  Full
     # coverage is strictly safer than a sampled gate, matching the callback.
     # Cost: O(n) inference calls per store — budget accordingly for large stores.
+    _migration_threshold = loop.config.recall_sanity_threshold
     recall = loop._run_recall_sanity_probe(name, entries, max_probe=len(entries))
-    if recall < 1.0:
+    if recall < _migration_threshold:
         # Rollback: reset adapter to LoRA-zero. The slot was not yet saved to
         # disk so there's nothing to delete on the filesystem side.
         loop.model.delete_adapter(name)
         loop.model = create_adapter(loop.model, tier_config, name)
         raise RuntimeError(
-            f"simulate_to_train store {name} recall {recall:.3f} < 1.0; "
+            f"simulate_to_train store {name} recall {recall:.3f} < {_migration_threshold:.3f}; "
             f"rolled back trained adapter to LoRA-zero"
         )
 

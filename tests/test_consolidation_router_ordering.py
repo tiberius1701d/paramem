@@ -954,7 +954,7 @@ class TestCapacityCeilingRollback:
                 ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
-                result = loop.consolidate_interim_adapters(recall_sanity_threshold=0.95)
+                result = loop.consolidate_interim_adapters()
         finally:
             _gpu_thread_lock.release()
 
@@ -1029,7 +1029,7 @@ class TestCapacityCeilingRollback:
                 ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
-                result = loop.consolidate_interim_adapters(recall_sanity_threshold=0.95)
+                result = loop.consolidate_interim_adapters()
         finally:
             _gpu_thread_lock.release()
 

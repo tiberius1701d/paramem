@@ -547,6 +547,9 @@ class TestMigrateOrchestrator:
         for tier in TIERS:
             loop.store.load_registry(tier, KeyRegistry())
         loop.training_config = MagicMock(num_epochs=2)
+        # Real float so the migration gate's `recall < loop.config.recall_sanity_threshold`
+        # comparison does not raise TypeError against a MagicMock.
+        loop.config.recall_sanity_threshold = 1.0
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
         loop._make_training_config.return_value = MagicMock()
@@ -618,6 +621,9 @@ class TestMigrateOrchestrator:
         for tier in TIERS:
             loop.store.load_registry(tier, KeyRegistry())
         loop.training_config = MagicMock(num_epochs=2)
+        # Real float so the migration gate's `recall < loop.config.recall_sanity_threshold`
+        # comparison does not raise TypeError against a MagicMock.
+        loop.config.recall_sanity_threshold = 1.0
         loop._run_recall_sanity_probe.return_value = 1.0
         loop._indexed_dataset.return_value = MagicMock()
         loop._make_training_config.return_value = MagicMock()
@@ -782,6 +788,9 @@ class TestMigrateTierSimulateToTrain:
         loop.semantic_config = MagicMock()
         loop.procedural_config = MagicMock()
         loop.training_config = MagicMock(num_epochs=2)
+        # Real float so `recall < loop.config.recall_sanity_threshold` does not
+        # raise TypeError when the migration gate compares against a MagicMock.
+        loop.config.recall_sanity_threshold = 1.0
         from paramem.memory.store import MemoryStore as _MS
 
         loop.store = _MS(replay_enabled=True)
@@ -1113,6 +1122,75 @@ class TestMigrateTierSimulateToTrain:
             f"Expected max_probe={len(entries)} (uncapped); got {actual_max_probe!r}. "
             "Phase B gate must probe ALL entries, not the default 100."
         )
+
+    def test_recall_sanity_threshold_config_knob(self, tmp_path):
+        """Migration gate honours loop.config.recall_sanity_threshold.
+
+        With threshold=0.8:
+        - probe recall 0.9 → migration completes (no rollback).
+        - probe recall 0.7 → migration rolls back and raises RuntimeError.
+
+        Without the config knob being read, the gate would compare against the
+        MagicMock default (TypeError) or a hardcoded 1.0 (both would reject 0.9).
+        """
+        from paramem.utils.config import ConsolidationConfig
+
+        # ---- probe=0.9, threshold=0.8 → must NOT raise ----
+        cfg = _make_config(tmp_path / "pass_case", mode="train")
+        entries = [_full_quad("g0"), _full_quad("g1")]
+        _write_simulate_graph(cfg.adapter_dir, "episodic", entries)
+        loop = self._make_loop()
+        loop.config = ConsolidationConfig(recall_sanity_threshold=0.8)
+        loop._run_recall_sanity_probe.return_value = 0.9
+        loop._indexed_dataset.return_value = MagicMock()
+        loop._make_training_config.return_value = MagicMock()
+
+        slot_path = cfg.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch(
+                "paramem.memory.entry.format_entry_training",
+                return_value=[{"input_ids": [0]}],
+            ),
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            # threshold=0.8, recall=0.9 → gate passes, no exception.
+            _migrate_tier_simulate_to_train(loop, cfg, "episodic")
+
+        # ---- probe=0.7, threshold=0.8 → must raise and roll back ----
+        cfg2 = _make_config(tmp_path / "fail_case", mode="train")
+        _write_simulate_graph(cfg2.adapter_dir, "episodic", entries)
+        loop2 = self._make_loop()
+        loop2.config = ConsolidationConfig(recall_sanity_threshold=0.8)
+        loop2._run_recall_sanity_probe.return_value = 0.7
+        loop2._indexed_dataset.return_value = MagicMock()
+        loop2._make_training_config.return_value = MagicMock()
+
+        slot_path2 = cfg2.adapter_dir / "episodic" / "20260430-000000"
+        with (
+            patch(
+                "paramem.memory.entry.format_entry_training",
+                return_value=[{"input_ids": [0]}],
+            ),
+            patch("paramem.memory.entry.build_registry", return_value={"g0": 0, "g1": 0}),
+            patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.models.loader.atomic_save_adapter", return_value=slot_path2),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
+        ):
+            with pytest.raises(RuntimeError, match=r"recall .* < 0\.8"):
+                _migrate_tier_simulate_to_train(loop2, cfg2, "episodic")
 
 
 # ---------------------------------------------------------------------------

@@ -150,7 +150,7 @@ def main() -> int:
         step7_result = loop.consolidate_interim_adapters(
             trainer=None,  # no BackgroundTrainer in this standalone run
             router=None,
-            # Use production defaults: refresh_epochs=30, recall_sanity_threshold=0.95.
+            # Use production defaults: refresh_epochs=30, recall_sanity_threshold=1.0.
             # Mistral 7B needs 30 epochs minimum to encode indexed keys (CLAUDE.md).
         )
     elapsed = time.time() - t0
