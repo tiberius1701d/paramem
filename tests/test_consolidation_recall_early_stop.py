@@ -235,25 +235,43 @@ class _Captured:
 
 
 # ---------------------------------------------------------------------------
-# Class B — TestCallSiteWiringEpisodic (consolidation.py:1529)
+# Class B — TestCallSiteWiringSourcePresence
 #
-# Driving _run_indexed_key_episodic end-to-end is heavy.  Instead, we
-# verify the wiring is in the function's body by reading the source AST
-# (Class F's mechanism) PLUS we call _maybe_make_recall_callback with the
-# arguments _run_indexed_key_episodic actually passes (as covered by the
-# Class A unit tests).  The end-to-end path is exercised by the live
-# smoke (end-to-end path exercised by the live GPU smoke test).
+# After the _train_tier_adapter dedup (2026-06-17), the recall callback is
+# no longer wired directly in run_consolidation_cycle or
+# consolidate_interim_adapters.  It is funnelled through the single shared
+# helper _train_tier_adapter, which both methods call.
+#
+# The invariant is now two-part:
+#   1. _train_tier_adapter calls _maybe_make_recall_callback (the funnel).
+#   2. run_consolidation_cycle and consolidate_interim_adapters call
+#      _train_tier_adapter (they use the funnel, not a direct bypass).
+#
+# Class F's structural gate (TestProbeTargetIsFullReplaySet) independently
+# checks that every function containing a train_adapter call also contains
+# _maybe_make_recall_callback in the same body — _train_tier_adapter is the
+# sole such function after the dedup, so the gate continues to enforce the
+# "no training site bypasses the recall callback" contract.
+#
+# _run_indexed_key_procedural and _migrate_tier_simulate_to_train each call
+# train_adapter directly (not via _train_tier_adapter) so they still have
+# _maybe_make_recall_callback in their own bodies; their checks are
+# unchanged.
 # ---------------------------------------------------------------------------
 
 
 class TestCallSiteWiringSourcePresence:
-    """Confirm the helper invocation appears in each production site's
-    function body via AST.  This is a stricter check than substring grep
-    and complements Class F's structural test.
+    """Confirm the helper invocation appears in each production site via AST.
+
+    For sites that call train_adapter directly, check _maybe_make_recall_callback
+    is present in their own body.  For sites that delegate through
+    _train_tier_adapter, check they call _train_tier_adapter (the funnel),
+    and separately verify the funnel itself calls _maybe_make_recall_callback.
     """
 
     @staticmethod
-    def _function_contains_helper(module_path: Path, func_name: str) -> bool:
+    def _function_contains_attr_call(module_path: Path, func_name: str, attr: str) -> bool:
+        """Return True if the named function's body contains a call to self.<attr>(...)."""
         tree = ast.parse(module_path.read_text())
 
         class FuncFinder(ast.NodeVisitor):
@@ -272,51 +290,70 @@ class TestCallSiteWiringSourcePresence:
         if ff.found_node is None:
             return False
 
-        class HelperFinder(ast.NodeVisitor):
+        class AttrCallFinder(ast.NodeVisitor):
             def __init__(self):
                 self.found = False
 
             def visit_Call(self, c):
-                if (
-                    isinstance(c.func, ast.Attribute)
-                    and c.func.attr == "_maybe_make_recall_callback"
-                ):
+                if isinstance(c.func, ast.Attribute) and c.func.attr == attr:
                     self.found = True
                 self.generic_visit(c)
 
-        hf = HelperFinder()
+        hf = AttrCallFinder()
         for child in ast.iter_child_nodes(ff.found_node):
             hf.visit(child)
         return hf.found
 
-    def test_site1_unified_cycle(self) -> None:
-        """run_consolidation_cycle is the unified entry for episodic interim training.
-
-        _run_indexed_key_episodic and _train_extracted_into_interim were merged
-        into run_consolidation_cycle (Phase 1–3 refactor).  The recall callback
-        must be wired here.
+    def test_funnel_contains_recall_callback(self) -> None:
+        """_train_tier_adapter is the single training-invocation site and must
+        call _maybe_make_recall_callback.  Both run_consolidation_cycle and
+        consolidate_interim_adapters delegate to it instead of calling
+        train_adapter directly.
         """
-        assert self._function_contains_helper(
+        assert self._function_contains_attr_call(
+            PROJECT_ROOT / "paramem/training/consolidation.py",
+            "_train_tier_adapter",
+            "_maybe_make_recall_callback",
+        )
+
+    def test_site1_unified_cycle_calls_funnel(self) -> None:
+        """run_consolidation_cycle must call _train_tier_adapter (the funnel),
+        not invoke train_adapter directly.
+        """
+        assert self._function_contains_attr_call(
             PROJECT_ROOT / "paramem/training/consolidation.py",
             "run_consolidation_cycle",
+            "_train_tier_adapter",
         )
 
     def test_site2_procedural(self) -> None:
-        assert self._function_contains_helper(
+        """_run_indexed_key_procedural calls train_adapter directly and must
+        still wire _maybe_make_recall_callback in its own body.
+        """
+        assert self._function_contains_attr_call(
             PROJECT_ROOT / "paramem/training/consolidation.py",
             "_run_indexed_key_procedural",
+            "_maybe_make_recall_callback",
         )
 
-    def test_site3_consolidate_interim(self) -> None:
-        assert self._function_contains_helper(
+    def test_site3_consolidate_interim_calls_funnel(self) -> None:
+        """consolidate_interim_adapters must call _train_tier_adapter (the funnel),
+        not invoke train_adapter directly.
+        """
+        assert self._function_contains_attr_call(
             PROJECT_ROOT / "paramem/training/consolidation.py",
             "consolidate_interim_adapters",
+            "_train_tier_adapter",
         )
 
     def test_site4_migration(self) -> None:
-        assert self._function_contains_helper(
+        """_migrate_tier_simulate_to_train calls train_adapter directly and must
+        still wire _maybe_make_recall_callback in its own body.
+        """
+        assert self._function_contains_attr_call(
             PROJECT_ROOT / "paramem/server/active_store_migration.py",
             "_migrate_tier_simulate_to_train",
+            "_maybe_make_recall_callback",
         )
 
 

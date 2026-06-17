@@ -2843,35 +2843,18 @@ class ConsolidationLoop:
             ]
 
         # --- 10. Train (train mode) or skip (simulate) ---
-        # Local import alias so tests can patch paramem.training.trainer.train_adapter
-        # (matching the pattern of the former _train_extracted_into_interim).
-        from paramem.training.trainer import train_adapter as _train_adapter
-
         epi_train_loss: float | None = None
         if mode == "train" and all_interim_keyed:
-            examples = format_entry_training(all_interim_keyed, self.tokenizer, max_length=1024)
-            dataset = self._indexed_dataset(examples)
-            training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
-            self._enable_gradient_checkpointing()
-            recall_cb, recall_state = self._maybe_make_recall_callback(
-                entries=all_interim_keyed,
+            epi_metrics, recall_state = self._train_tier_adapter(
+                all_interim_keyed,
                 adapter_name=adapter_name,
-                output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
-                phase_name=f"interim-{adapter_name}-{run_label}",
-            )
-            epi_metrics = _train_adapter(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                train_dataset=dataset,
-                adapter_name=adapter_name,
-                training_config=training_config,
                 adapter_config=self.episodic_config,
-                wandb_config=self.wandb_config,
+                training_config=self._make_training_config(
+                    num_epochs=self.training_config.num_epochs
+                ),
                 output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
                 run_name=f"interim-{adapter_name}-{run_label}",
-                thermal_policy=self._thermal_policy,
-                hooks=self._build_training_hooks(),
-                callbacks_extra=[recall_cb] if recall_cb is not None else None,
+                phase_name=f"interim-{adapter_name}-{run_label}",
             )
             epi_train_loss = epi_metrics.get("train_loss") if epi_metrics is not None else None
             if epi_metrics is not None and epi_metrics.get("aborted"):
@@ -4214,6 +4197,231 @@ class ConsolidationLoop:
                 }
             )
 
+    def _materialize_consolidation_graph(
+        self,
+        *,
+        tier: "str | None" = None,
+        keys: "list[str] | None" = None,
+    ) -> "tuple[set[str], list[Relation]]":
+        """Reconstruct active keys from adapter weights and re-merge registry-true relations.
+
+        This is the *Materialize* stage of the fold pipeline:
+
+        1. Probe every active key from adapter weights via :func:`reconstruct_graph`
+           (``strict=False``).
+        2. Compute ``recall_miss_keys`` — keys whose reconstructed SPO disagrees with
+           registry-true SPO, or whose reconstruction failed outright.  The set is
+           computed against ``store.all_active_keys()`` unconditionally (scope is
+           never parameterised here).
+        3. Reset the merger's keying graph to empty (``merger.reset_graph()``).
+        4. Build registry-true :class:`Relation` objects via
+           :meth:`_build_registry_true_relations` and re-merge them into the fresh
+           keying graph inside a gradient-checkpointing guard.
+        5. Emit debug snapshots ("reconstructed" before re-merge, "merged" after).
+
+        Args:
+            tier: Forwarded to :func:`reconstruct_graph` as ``tier``.  When
+                ``None`` (the default), all tiers are probed — byte-identical to
+                the original inline fold behaviour.
+            keys: Forwarded to :meth:`_build_registry_true_relations` as ``keys``.
+                When ``None`` (the default), all active keys are processed —
+                byte-identical to the original inline fold behaviour.
+
+        Returns:
+            A 2-tuple ``(recall_miss_keys, recon_relations)`` where:
+
+            - ``recall_miss_keys`` — :class:`set` of key strings that failed
+              reconstruction or whose SPO diverged from the registry.
+            - ``recon_relations`` — the :class:`list` of :class:`Relation` objects
+              fed into the re-merge (registry-true SPO, with ``indexed_key`` set).
+        """
+        # --- Reconstruct all active keys from adapter weights ---
+        # Probes every active key across all tiers; recovers (subject, predicate, object)
+        # from the trained weights.  Reconstruction yields SPO ONLY — no relation_type.
+        # strict=False: failures are logged and recorded in recon_result.failures; the
+        # cycle continues with whatever SPO triples can be recovered.
+        # Reconstruction is used ONLY to identify recall-miss keys (keys whose
+        # reconstructed SPO disagrees with registry-true SPO, or whose reconstruction
+        # failed outright).  A recall miss is a retry signal; the key stays in the
+        # training set with its registry-true content.  It does NOT drop the key.
+        recon_result = reconstruct_graph(self, tier=tier, strict=False)
+        if recon_result.failures:
+            logger.warning(
+                "consolidate_interim_adapters: %d key(s) failed reconstruction "
+                "(retry signal — keys kept in training set with registry-true content)",
+                len(recon_result.failures),
+            )
+
+        # --- Compute recall-health/retry set BEFORE reset_graph() ---
+        # This MUST run after reconstruct_graph (which produces recon_result.graph
+        # as a SEPARATE nx.MultiDiGraph, distinct from self.merger.graph) and BEFORE
+        # reset_graph() (which clears self.merger.graph).  The ordering is safe because
+        # recon_result.graph is a freshly constructed MultiDiGraph
+        # (reconstruct.py:142) unaffected by the subsequent reset.
+        #
+        # Build a lookup of reconstructed SPO per key from the recon graph.
+        from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
+
+        _recon_spo_by_key: dict[str, tuple[str, str, str]] = {}
+        for _rh_subj, _rh_obj, _rh_data in recon_result.graph.edges(data=True):
+            _rh_key = _rh_data.get(_IK_ATTR, "")
+            _rh_pred = _rh_data.get("predicate", "")
+            if _rh_key and _rh_pred:
+                _recon_spo_by_key[_rh_key] = (_rh_subj, _rh_pred, _rh_obj)
+
+        # recall_miss_keys: keys whose reconstruction failed OR whose reconstructed
+        # SPO disagrees with registry-true SPO.  These are flagged for retrain but
+        # their registry-true triple still enters the merge input (never dropped).
+        recall_miss_keys: set[str] = set(recon_result.failures)
+        for _rh_key in self.store.all_active_keys():
+            _rt_entry = self.store.get(_rh_key)
+            _rt_subj = (_rt_entry or {}).get("subject", "") if _rt_entry else ""
+            _rt_pred = (_rt_entry or {}).get("predicate", "") if _rt_entry else ""
+            _rt_obj = (_rt_entry or {}).get("object", "") if _rt_entry else ""
+            _recon_spo = _recon_spo_by_key.get(_rh_key)
+            if _recon_spo is None:
+                # No recon edge: counts as failure (already in recon_result.failures or missing).
+                recall_miss_keys.add(_rh_key)
+            else:
+                _r_subj, _r_pred, _r_obj = _recon_spo
+                if (
+                    _r_subj != _rt_subj
+                    or canonical(_r_pred) != canonical(_rt_pred)
+                    or _r_obj != _rt_obj
+                ):
+                    recall_miss_keys.add(_rh_key)
+
+        if recall_miss_keys:
+            logger.info(
+                "consolidate_interim_adapters: %d key(s) in recall-miss set "
+                "(kept in training with registry-true content): %s",
+                len(recall_miss_keys),
+                sorted(recall_miss_keys),
+            )
+
+        # --- Reset keying graph and re-merge registry-true relations ---
+        # Reset the merger's keying surface to EMPTY before re-merging so
+        # provenance keying is unconditional.  Without the reset, pre-existing
+        # edges from ingest-time merges or a loaded graph would share the keying
+        # surface and the Case-1-adopt collision path could degrade provenance
+        # keying.
+        # Recurrence is now durable in bookkeeping — discarding the prior graph
+        # loses nothing; the transient graph edge counts were the broken store.
+        self.merger.reset_graph()
+        logger.info(
+            "consolidate_interim_adapters: keying graph reset to empty for the"
+            " reconstruct→re-merge pass"
+        )
+
+        # --- Build merge input from registry-true SPO (NOT reconstruction) ---
+        # Each relation carries its indexed_key so the key travels through
+        # GraphMerger.merge() onto the merged edge (provenance keying).
+        #
+        # additive=True (fold-only): the merger never removes a registered edge during
+        # the re-merge.  All registry-true keys coexist after the fold regardless
+        # of same-(s,p)/different-o conflicts; REPLACE cardinality is skipped.
+        # Two registry keys sharing identical (s,p,o) STILL fire Case-1 (the merger
+        # identity is correct given correct inputs), and the collapsed key is recorded
+        # in merger.collapsed.  The drift-partition step below soft-stales that key.
+        # Debug: snapshot the reconstructed graph (before re-merge mutates the
+        # keying surface).  Self-gated; no-op when save_cycle_snapshots=False.
+        self._debug_writer.on_fold_graph(recon_result.graph, label="reconstructed")
+
+        recon_relations: list[Relation] = self._build_registry_true_relations(keys=keys)
+
+        if recon_relations:
+            _synthetic_session = SessionGraph(
+                session_id="__full_consolidation_recon__",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                entities=[],
+                relations=recon_relations,
+            )
+            # Disable gradient checkpointing: merger.merge may call model.generate()
+            # for contradiction resolution when a model is present.  reconstruct_graph
+            # above already restored checkpointing in its finally block, so this merge
+            # needs its own guard (CLAUDE.md rule applies to ANY model.generate() site).
+            self._disable_gradient_checkpointing()
+            try:
+                self.merger.merge(_synthetic_session, additive=True)
+            finally:
+                self._enable_gradient_checkpointing()
+            logger.info(
+                "consolidate_interim_adapters: re-merged %d reconstructed triples "
+                "into keying graph",
+                len(recon_relations),
+            )
+
+        # Debug: snapshot the merged graph (after re-merge, before enrichment).
+        # Emits even when recon_relations is empty so the fold always produces a
+        # merged snapshot.  Self-gated; no-op when save_cycle_snapshots=False.
+        self._debug_writer.on_fold_graph(self.merger, label="merged")
+
+        return recall_miss_keys, recon_relations
+
+    def _refine_consolidation_graph(self, recon_relations: "list[Relation]") -> None:
+        """Run graph enrichment and recurrence bumps after the Materialize stage.
+
+        This is the *Refine* stage of the fold pipeline:
+
+        1. Run SOTA graph enrichment via :meth:`_run_graph_enrichment`, which
+           mutates ``self.merger.graph`` in place.
+        2. Emit a debug snapshot ("enriched") after enrichment.
+        3. If ``recon_relations`` is non-empty, scan ``merger.reinforcements`` for
+           Case-1 duplicate-SPO collapses and call
+           :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
+           surviving key.
+
+        Args:
+            recon_relations: The list of registry-true :class:`Relation` objects
+                produced by :meth:`_materialize_consolidation_graph`.  Used only
+                as a boolean guard — when empty, the recurrence-bump loop is
+                skipped (no re-merge was performed so ``merger.reinforcements``
+                will be empty too).
+        """
+        # --- Graph-level SOTA enrichment ---
+        # Runs AFTER the re-merge so enrichment operates on the populated
+        # reconstructed graph (not an empty one).  Under production defaults the
+        # pre-fold graph was always empty, so enrichment silently skipped every cycle
+        # at the node_count<10 floor; now it fires on the reconstructed knowledge.
+        # Mutates self.merger.graph in place.  The external/SOTA boundary is handled
+        # inside _run_graph_enrichment (per-chunk except catches network errors and
+        # continues), so a network failure degrades gracefully there.  A programming
+        # error here propagates and aborts the fold (sessions stay pending/retriable),
+        # which is correct — better than silently dropping all enrichment.
+        # Enrichment-added edges are keyless and are picked up by the pre-pass that
+        # runs after inline-promotion.
+        enrichment_result = self._run_graph_enrichment()
+        if not enrichment_result.get("skipped"):
+            logger.info(
+                "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d",
+                enrichment_result.get("chunks", 0),
+                enrichment_result.get("new_edges", 0),
+                enrichment_result.get("same_as_merges", 0),
+            )
+
+        # Debug: snapshot the enriched graph (after SOTA enrichment).
+        # Self-gated; no-op when save_cycle_snapshots=False.
+        self._debug_writer.on_fold_graph(self.merger, label="enriched")
+
+        if recon_relations:
+            # --- Recurrence bump: Case-1 duplicate-SPO collapses ---
+            # merger.reinforcements contains the surviving ik_key for every Case-1
+            # collision fired during the re-merge.  A collision means two active keys
+            # shared the same (s,p,o) — the incoming key drifts and the existing
+            # edge's key is the survivor.  The survivor's recurrence_count represents
+            # how many times this fact was independently extracted (and re-keyed)
+            # across sessions before this fold collapsed the duplicates.
+            _reinforced: set[str] = set()
+            for _rein_key in getattr(self.merger, "reinforcements", []):
+                if _rein_key and _rein_key not in _reinforced:
+                    self.store.bump_recurrence(_rein_key, cycle=self.cycle_count)
+                    _reinforced.add(_rein_key)
+                    logger.debug(
+                        "consolidate_interim_adapters: bumped recurrence for key=%s "
+                        "(intra-fold duplicate-SPO collapse)",
+                        _rein_key,
+                    )
+
     def consolidate_interim_adapters(
         self,
         trainer=None,
@@ -4344,170 +4552,8 @@ class ConsolidationLoop:
         else:
             self._current_interim_stamp = None  # type: ignore[assignment]
 
-        # --- Reconstruct all active keys from adapter weights ---
-        # Probes every active key across all tiers; recovers (subject, predicate, object)
-        # from the trained weights.  Reconstruction yields SPO ONLY — no relation_type.
-        # strict=False: failures are logged and recorded in recon_result.failures; the
-        # cycle continues with whatever SPO triples can be recovered.
-        # Reconstruction is used ONLY to identify recall-miss keys (keys whose
-        # reconstructed SPO disagrees with registry-true SPO, or whose reconstruction
-        # failed outright).  A recall miss is a retry signal; the key stays in the
-        # training set with its registry-true content.  It does NOT drop the key.
-        recon_result = reconstruct_graph(self, strict=False)
-        if recon_result.failures:
-            logger.warning(
-                "consolidate_interim_adapters: %d key(s) failed reconstruction "
-                "(retry signal — keys kept in training set with registry-true content)",
-                len(recon_result.failures),
-            )
-
-        # --- Compute recall-health/retry set BEFORE reset_graph() ---
-        # This MUST run after reconstruct_graph (which produces recon_result.graph
-        # as a SEPARATE nx.MultiDiGraph, distinct from self.merger.graph) and BEFORE
-        # reset_graph() (which clears self.merger.graph).  The ordering is safe because
-        # recon_result.graph is a freshly constructed MultiDiGraph
-        # (reconstruct.py:142) unaffected by the subsequent reset.
-        #
-        # Build a lookup of reconstructed SPO per key from the recon graph.
-        from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
-
-        _recon_spo_by_key: dict[str, tuple[str, str, str]] = {}
-        for _rh_subj, _rh_obj, _rh_data in recon_result.graph.edges(data=True):
-            _rh_key = _rh_data.get(_IK_ATTR, "")
-            _rh_pred = _rh_data.get("predicate", "")
-            if _rh_key and _rh_pred:
-                _recon_spo_by_key[_rh_key] = (_rh_subj, _rh_pred, _rh_obj)
-
-        # recall_miss_keys: keys whose reconstruction failed OR whose reconstructed
-        # SPO disagrees with registry-true SPO.  These are flagged for retrain but
-        # their registry-true triple still enters the merge input (never dropped).
-        recall_miss_keys: set[str] = set(recon_result.failures)
-        for _rh_key in self.store.all_active_keys():
-            _rt_entry = self.store.get(_rh_key)
-            _rt_subj = (_rt_entry or {}).get("subject", "") if _rt_entry else ""
-            _rt_pred = (_rt_entry or {}).get("predicate", "") if _rt_entry else ""
-            _rt_obj = (_rt_entry or {}).get("object", "") if _rt_entry else ""
-            _recon_spo = _recon_spo_by_key.get(_rh_key)
-            if _recon_spo is None:
-                # No recon edge: counts as failure (already in recon_result.failures or missing).
-                recall_miss_keys.add(_rh_key)
-            else:
-                _r_subj, _r_pred, _r_obj = _recon_spo
-                if (
-                    _r_subj != _rt_subj
-                    or canonical(_r_pred) != canonical(_rt_pred)
-                    or _r_obj != _rt_obj
-                ):
-                    recall_miss_keys.add(_rh_key)
-
-        if recall_miss_keys:
-            logger.info(
-                "consolidate_interim_adapters: %d key(s) in recall-miss set "
-                "(kept in training with registry-true content): %s",
-                len(recall_miss_keys),
-                sorted(recall_miss_keys),
-            )
-
-        # --- Reset keying graph and re-merge registry-true relations ---
-        # Reset the merger's keying surface to EMPTY before re-merging so
-        # provenance keying is unconditional.  Without the reset, pre-existing
-        # edges from ingest-time merges or a loaded graph would share the keying
-        # surface and the Case-1-adopt collision path could degrade provenance
-        # keying.
-        # Recurrence is now durable in bookkeeping — discarding the prior graph
-        # loses nothing; the transient graph edge counts were the broken store.
-        self.merger.reset_graph()
-        logger.info(
-            "consolidate_interim_adapters: keying graph reset to empty for the"
-            " reconstruct→re-merge pass"
-        )
-
-        # --- Build merge input from registry-true SPO (NOT reconstruction) ---
-        # Each relation carries its indexed_key so the key travels through
-        # GraphMerger.merge() onto the merged edge (provenance keying).
-        #
-        # additive=True (fold-only): the merger never removes a registered edge during
-        # the re-merge.  All registry-true keys coexist after the fold regardless
-        # of same-(s,p)/different-o conflicts; REPLACE cardinality is skipped.
-        # Two registry keys sharing identical (s,p,o) STILL fire Case-1 (the merger
-        # identity is correct given correct inputs), and the collapsed key is recorded
-        # in merger.collapsed.  The drift-partition step below soft-stales that key.
-        # Debug: snapshot the reconstructed graph (before re-merge mutates the
-        # keying surface).  Self-gated; no-op when save_cycle_snapshots=False.
-        self._debug_writer.on_fold_graph(recon_result.graph, label="reconstructed")
-
-        recon_relations: list[Relation] = self._build_registry_true_relations()
-
-        if recon_relations:
-            _synthetic_session = SessionGraph(
-                session_id="__full_consolidation_recon__",
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                entities=[],
-                relations=recon_relations,
-            )
-            # Disable gradient checkpointing: merger.merge may call model.generate()
-            # for contradiction resolution when a model is present.  reconstruct_graph
-            # above already restored checkpointing in its finally block, so this merge
-            # needs its own guard (CLAUDE.md rule applies to ANY model.generate() site).
-            self._disable_gradient_checkpointing()
-            try:
-                self.merger.merge(_synthetic_session, additive=True)
-            finally:
-                self._enable_gradient_checkpointing()
-            logger.info(
-                "consolidate_interim_adapters: re-merged %d reconstructed triples "
-                "into keying graph",
-                len(recon_relations),
-            )
-
-        # Debug: snapshot the merged graph (after re-merge, before enrichment).
-        # Emits even when recon_relations is empty so the fold always produces a
-        # merged snapshot.  Self-gated; no-op when save_cycle_snapshots=False.
-        self._debug_writer.on_fold_graph(self.merger, label="merged")
-
-        # --- Graph-level SOTA enrichment ---
-        # Runs AFTER the re-merge so enrichment operates on the populated
-        # reconstructed graph (not an empty one).  Under production defaults the
-        # pre-fold graph was always empty, so enrichment silently skipped every cycle
-        # at the node_count<10 floor; now it fires on the reconstructed knowledge.
-        # Mutates self.merger.graph in place.  The external/SOTA boundary is handled
-        # inside _run_graph_enrichment (per-chunk except catches network errors and
-        # continues), so a network failure degrades gracefully there.  A programming
-        # error here propagates and aborts the fold (sessions stay pending/retriable),
-        # which is correct — better than silently dropping all enrichment.
-        # Enrichment-added edges are keyless and are picked up by the pre-pass that
-        # runs after inline-promotion.
-        enrichment_result = self._run_graph_enrichment()
-        if not enrichment_result.get("skipped"):
-            logger.info(
-                "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d",
-                enrichment_result.get("chunks", 0),
-                enrichment_result.get("new_edges", 0),
-                enrichment_result.get("same_as_merges", 0),
-            )
-
-        # Debug: snapshot the enriched graph (after SOTA enrichment).
-        # Self-gated; no-op when save_cycle_snapshots=False.
-        self._debug_writer.on_fold_graph(self.merger, label="enriched")
-
-        if recon_relations:
-            # --- Recurrence bump: Case-1 duplicate-SPO collapses ---
-            # merger.reinforcements contains the surviving ik_key for every Case-1
-            # collision fired during the re-merge.  A collision means two active keys
-            # shared the same (s,p,o) — the incoming key drifts and the existing
-            # edge's key is the survivor.  The survivor's recurrence_count represents
-            # how many times this fact was independently extracted (and re-keyed)
-            # across sessions before this fold collapsed the duplicates.
-            _reinforced: set[str] = set()
-            for _rein_key in getattr(self.merger, "reinforcements", []):
-                if _rein_key and _rein_key not in _reinforced:
-                    self.store.bump_recurrence(_rein_key, cycle=self.cycle_count)
-                    _reinforced.add(_rein_key)
-                    logger.debug(
-                        "consolidate_interim_adapters: bumped recurrence for key=%s "
-                        "(intra-fold duplicate-SPO collapse)",
-                        _rein_key,
-                    )
+        recall_miss_keys, recon_relations = self._materialize_consolidation_graph()
+        self._refine_consolidation_graph(recon_relations)
 
         # --- Inline promotion: move matured episodic keys to semantic ---
         # Runs AFTER the recurrence-bump step (so bump-triggered threshold crossings
@@ -5252,37 +5298,20 @@ class ConsolidationLoop:
                 trainer._current_job = job
                 trainer._set_is_training(True)
             try:
-                # Format training data and update job config for refresh epochs.
-                # Tier_keyed entries are {key,subject,predicate,object}.
-                from paramem.training.trainer import train_adapter as _train_adapter_fn
-
-                examples = format_entry_training(job.entries, self.tokenizer, max_length=1024)
-                if examples:
-                    dataset = self._indexed_dataset(examples)
-                    self._enable_gradient_checkpointing()
-                    # Fresh recall callback per tier — _signaled_stop and
-                    # epoch_log do not leak across tiers.
-                    recall_cb, recall_state = self._maybe_make_recall_callback(
-                        entries=job.entries,
-                        adapter_name=tier,
-                        output_dir=self.output_dir / "consolidation_refresh" / tier,
-                        phase_name=f"consolidate-{tier}",
-                        num_epochs=refresh_epochs,
-                    )
-                    _tier_metrics = _train_adapter_fn(
-                        model=self.model,
-                        tokenizer=self.tokenizer,
-                        train_dataset=dataset,
-                        adapter_name=tier,
-                        training_config=refresh_training_config,
-                        adapter_config=tier_cfg,
-                        wandb_config=self.wandb_config,
-                        output_dir=self.output_dir / "consolidation_refresh" / tier,
-                        run_name=f"consolidate-{tier}",
-                        thermal_policy=self._thermal_policy,
-                        hooks=self._build_training_hooks(),
-                        callbacks_extra=[recall_cb] if recall_cb is not None else None,
-                    )
+                # Format, build recall callback, and train — shared seam.
+                # Fresh recall callback per tier — _signaled_stop and
+                # epoch_log do not leak across tiers.
+                _tier_metrics, recall_state = self._train_tier_adapter(
+                    job.entries,
+                    adapter_name=tier,
+                    adapter_config=tier_cfg,
+                    training_config=refresh_training_config,
+                    output_dir=self.output_dir / "consolidation_refresh" / tier,
+                    run_name=f"consolidate-{tier}",
+                    phase_name=f"consolidate-{tier}",
+                    num_epochs=refresh_epochs,
+                )
+                if _tier_metrics is not None:
                     if _tier_metrics.get("aborted"):
                         # Training was aborted for inference mid-tier.  Restore
                         # all three production tiers from their backup slots so
@@ -5306,11 +5335,12 @@ class ConsolidationLoop:
                         # anyway, but explicit clear is more robust).
                         self._current_interim_stamp = None  # type: ignore[assignment]
                         raise AbortedDuringConsolidation(f"training aborted on tier {tier!r}")
-                    logger.info(
-                        "consolidate_interim_adapters: trained %s on %d keys",
-                        tier,
-                        len(job.entries),
-                    )
+                    else:
+                        logger.info(
+                            "consolidate_interim_adapters: trained %s on %d keys",
+                            tier,
+                            len(job.entries),
+                        )
             finally:
                 if trainer is not None:
                     trainer._set_is_training(False)
@@ -5926,12 +5956,14 @@ class ConsolidationLoop:
         active-key set for ``adapter_name``, not an incremental delta.
 
         Production-reachable callers (must pass full per-tier active set):
-          - ConsolidationLoop.run_cycle (episodic/procedural inline blocks)
-          - ConsolidationLoop.train_adapters (episodic/procedural inline blocks)
-          - ConsolidationLoop.run_consolidation_cycle (episodic/procedural blocks)
-          - ConsolidationLoop.consolidate_interim_adapters
-          - active_store_migration._migrate_tier_simulate_to_train
-            (paramem/server/active_store_migration.py:420)
+          - ConsolidationLoop._train_tier_adapter — single funnel for the
+            episodic / interim / fold training path; run_consolidation_cycle
+            and consolidate_interim_adapters reach this callback transitively
+            via _train_tier_adapter and do not call it directly.
+          - ConsolidationLoop._run_indexed_key_procedural (direct — procedural
+            inline path bypasses _train_tier_adapter)
+          - active_store_migration._migrate_tier_simulate_to_train (direct)
+            (paramem/server/active_store_migration.py)
 
         A new production-reachable caller MUST call this helper; the
         AST structural test in tests/test_consolidation_recall_early_stop.py
@@ -6026,6 +6058,83 @@ class ConsolidationLoop:
             eval_fn=_eval_fn,
         )
         return callback, state
+
+    def _train_tier_adapter(
+        self,
+        entries: "list[dict]",
+        *,
+        adapter_name: str,
+        adapter_config,
+        training_config,
+        output_dir,
+        run_name: str,
+        phase_name: str,
+        num_epochs: "int | None" = None,
+    ):
+        """Format → dataset → recall callback → train_adapter for one tier.
+
+        Returns ``(metrics, recall_state)``.  Returns ``(None, None)`` when
+        there are no training examples (empty entries list).
+
+        This is the ONLY shared training-invocation site.  Abort handling,
+        recall-verdict application, and persistence stay at the call sites
+        (scope-specific).
+
+        The ``from paramem.training.trainer import train_adapter`` import is
+        kept INSIDE this method so tests can patch
+        ``paramem.training.trainer.train_adapter`` and intercept calls
+        at this site.
+
+        Args:
+            entries: The full per-tier active entries (key/subject/predicate/
+                object dicts).
+            adapter_name: The adapter slot being trained.
+            adapter_config: PEFT ``AdapterConfig`` for this tier.
+            training_config: ``TrainingConfig`` for this call (epoch count,
+                LR schedule, etc.).
+            output_dir: HF Trainer ``output_dir``; also used by the recall
+                callback for ``progress.json`` / ``epoch_log.json``.
+            run_name: W&B / HF Trainer run name.
+            phase_name: Label for the recall callback's ``progress.json``
+                (e.g. ``"interim-episodic-tick42"``, ``"consolidate-semantic"``).
+            num_epochs: Passed through to ``_maybe_make_recall_callback`` so
+                the callback's forced final-epoch probe fires at the right
+                epoch.  ``None`` resolves to
+                ``self.training_config.num_epochs`` inside the callback helper.
+
+        Returns:
+            ``(metrics_dict, recall_state)`` on success; ``(None, None)`` if
+            ``entries`` yields no training examples.
+        """
+        from paramem.training.trainer import train_adapter
+
+        examples = format_entry_training(entries, self.tokenizer, max_length=1024)
+        if not examples:
+            return None, None
+        dataset = self._indexed_dataset(examples)
+        self._enable_gradient_checkpointing()
+        recall_cb, recall_state = self._maybe_make_recall_callback(
+            entries=entries,
+            adapter_name=adapter_name,
+            output_dir=output_dir,
+            phase_name=phase_name,
+            num_epochs=num_epochs,
+        )
+        metrics = train_adapter(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            train_dataset=dataset,
+            adapter_name=adapter_name,
+            training_config=training_config,
+            adapter_config=adapter_config,
+            wandb_config=self.wandb_config,
+            output_dir=output_dir,
+            run_name=run_name,
+            thermal_policy=self._thermal_policy,
+            hooks=self._build_training_hooks(),
+            callbacks_extra=[recall_cb] if recall_cb is not None else None,
+        )
+        return metrics, recall_state
 
 
 def run_multi_session(
