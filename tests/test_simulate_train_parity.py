@@ -144,6 +144,37 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     loop.shutdown_requested = False
     loop.merger = MagicMock()
 
+    # B3: _harvest_keyless_edge_entries reads merger.graph.edges(data=True).
+    # Replace the MagicMock graph with a real MultiDiGraph populated from
+    # _EPISODIC_RELS so the graph-walk mints keys for the parity tests.
+    # The _materialize_consolidation_graph stub below skips merger.reset_graph(),
+    # so the graph persists intact through the keyed-walk step.
+    #
+    # Speaker-ID node seeding: _harvest_keyless_edge_entries distinguishes
+    # "speaker_id key absent" (→ use default_speaker_id, i.e. the cycle's
+    # speaker_id) from "speaker_id key present with explicit value" (→ keep as-is,
+    # even if empty).  This mirrors _tag_speaker_id_defaults semantics.
+    # For each relation that carries an EXPLICIT speaker_id (including ""),
+    # the subject node is stamped with that value.  Relations without a
+    # speaker_id key produce a node with the attribute absent.
+    _real_graph = nx.MultiDiGraph()
+    for _rel in _EPISODIC_RELS:
+        _subj = _rel["subject"].lower().replace(" ", "_")
+        _obj = _rel["object"].lower().replace(" ", "_")
+        # Stamp speaker_id on the node only when the relation carries it explicitly.
+        _node_kwargs: dict = {"attributes": {"name": _rel["subject"]}}
+        if "speaker_id" in _rel:
+            _node_kwargs["speaker_id"] = _rel["speaker_id"]
+        _real_graph.add_node(_subj, **_node_kwargs)
+        _real_graph.add_node(_obj, attributes={"name": _rel["object"]})
+        _real_graph.add_edge(
+            _subj,
+            _obj,
+            predicate=_rel["predicate"],
+            relation_type=_rel.get("relation_type", "factual"),
+        )
+    loop.merger.graph = _real_graph
+
     # MemoryStore with registry enabled.
     store = MemoryStore(replay_enabled=True)
     for tier in ("episodic", "semantic", "procedural"):
@@ -162,6 +193,13 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     # These tests verify slot layout / GAP fixes, not recall gating; the
     # probe is covered separately in test_consolidation_recall_early_stop.py.
     loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+
+    # Stub out _materialize_consolidation_graph so the B1 materialize step
+    # does not call reconstruct_graph / probe_entries on the MagicMock model.
+    # B3: the stub skips merger.reset_graph() so loop.merger.graph retains the
+    # pre-populated keyless edges for the graph-walk keying step.
+    # The materialize diagnostic is covered in TestMaterializeInterimB1.
+    loop._materialize_consolidation_graph = lambda **kw: (set(), [])
 
     # Enrichment flags — disabled to keep tests deterministic.
     loop.graph_enrichment_enabled = False
@@ -276,11 +314,22 @@ class TestSimulateTrainParity:
     def test_speaker_id_default_applied_both_modes(self, loop_sim, loop_train, tmp_path):
         """Entries missing speaker_id receive the caller's id in both modes.
 
-        Relations without a speaker_id key receive the default (_SPEAKER_ID).
-        Relations with an explicit non-empty speaker_id preserve it.
-        Relations with an explicit speaker_id="" preserve the empty string —
-        _tag_speaker_id_defaults only adds the key when absent; it does not
-        replace explicit empty-string values.
+        B3 semantics: speaker_id is resolved from the SUBJECT NODE, not the
+        individual relation dict.  The rules mirror _tag_speaker_id_defaults:
+
+        - Subject node with speaker_id attribute ABSENT: entry receives
+          default_speaker_id (= caller's _SPEAKER_ID).
+        - Subject node with speaker_id attribute PRESENT (even ""): entry keeps
+          the node's value unchanged.
+
+        In the test fixture, "acme_corp" node has no speaker_id attribute (the
+        Acme Corp/is_located_in/Germany relation has no speaker_id key), so the
+        Germany entry receives the default.  The "alice" node receives
+        speaker_id="sp_explicit" from the Alice/works_at/Acme Corp relation, so
+        ALL of Alice's edge entries inherit "sp_explicit" — this is correct
+        entity-level attribution and is the intentional B3 behaviour.  The
+        "carol" node is explicitly stamped with speaker_id="" by the test graph
+        builder (relation has speaker_id=""), so Carol's entries keep "".
         """
         self._run_sim(loop_sim)
         self._run_train(loop_train)
@@ -291,10 +340,12 @@ class TestSimulateTrainParity:
                 # Entries without any speaker_id key should get the default.
                 # Entries with an explicit value (including "") are kept as-is.
 
-        # Entries with no explicit speaker_id should receive _SPEAKER_ID.
+        # Subject node with NO speaker_id attribute → gets caller default (_SPEAKER_ID).
+        # Acme Corp's node has no speaker_id attr (no relation with subject=Acme Corp
+        # carries an explicit speaker_id).
         for loop in (loop_sim, loop_train):
             for _tier, key, entry in loop.store.iter_entries():
-                if entry.get("object") == "Berlin":  # Alice/lives_in/Berlin — no speaker_id key
+                if entry.get("subject") == "Acme Corp" and entry.get("object") == "Germany":
                     assert entry["speaker_id"] == _SPEAKER_ID, (
                         f"Default tagging failed for {key}: expected {_SPEAKER_ID!r}, "
                         f"got {entry['speaker_id']!r}"
@@ -1271,6 +1322,63 @@ class TestConsolidateInterimGraphs:
             f"tier_delta['episodic']['minted'] must equal enrichment new_edges=1; got {minted!r}"
         )
 
+    def test_simulate_merge_produces_person_node_with_speaker_id(self, tmp_path):
+        """Simulate path via _merge_registry_relations stamps entity_type='person' + speaker_id.
+
+        Regression guard: before routing consolidate_interim_graphs through
+        _merge_registry_relations, the simulate path used entities=[] directly
+        (same latent bug as the recon path fixed by _merge_registry_relations
+        unification).  A relation whose subject == speaker_id (i.e. a speaker
+        node) would be stored as entity_type='concept' with no speaker_id
+        attribute, causing keyless-edge attribution to fall back to speaker_id="".
+
+        After the fix, the simulate path calls _merge_registry_relations which
+        calls _synth_speaker_entities; the subject node receives
+        entity_type='person' and speaker_id from the synthesised Entity.
+
+        Uses the session_id="__simulate_consolidation_merge__" path, which is
+        the simulate full-fold session identifier.
+        """
+        loop = _make_bare_loop(tmp_path)
+
+        # Write an interim slot whose triple has subject == speaker_id.
+        # _synth_speaker_entities fires when _r.speaker_id != "" AND
+        # _r.subject == _r.speaker_id.  We use "Speaker0" for both.
+        _write_interim_graph(
+            tmp_path,
+            "20260101T0000",
+            [
+                {
+                    "key": "graph1",
+                    "subject": "Speaker0",
+                    "predicate": "works_at",
+                    "object": "Acme Corp",
+                    "speaker_id": "Speaker0",
+                },
+            ],
+        )
+
+        loop.consolidate_interim_graphs()
+
+        # _resolve_entity keys speaker nodes by speaker_id directly.
+        node_key = "Speaker0"
+        assert node_key in loop.merger.graph.nodes, (
+            f"Speaker subject node {node_key!r} missing from merged graph after simulate path; "
+            f"nodes present: {list(loop.merger.graph.nodes)}"
+        )
+        node_data = loop.merger.graph.nodes[node_key]
+        assert node_data.get("entity_type") == "person", (
+            f"Simulate path: expected entity_type='person' on speaker subject node; "
+            f"got entity_type={node_data.get('entity_type')!r}. "
+            "Regression: before _merge_registry_relations routing, simulate used "
+            "entities=[] so speaker nodes received entity_type='concept' with no speaker_id."
+        )
+        assert node_data.get("speaker_id") == "Speaker0", (
+            f"Simulate path: expected speaker_id='Speaker0' on speaker subject node; "
+            f"got speaker_id={node_data.get('speaker_id')!r}. "
+            "Regression: _synth_speaker_entities was not applied to the simulate path."
+        )
+
 
 # ---------------------------------------------------------------------------
 # TestBuildTierDelta (regression: unified staled_by_reason + minted)
@@ -1869,20 +1977,18 @@ class TestDebugSnapshotIntegration:
             stamp=_STAMP,
         )
 
-        # Cycle passes ``stamp`` through to the writer so the dir nests under
-        # ``interim_<stamp>/`` — matches the production layout
+        # Cycle passes ``stamp`` through to the writer so the relation dumps
+        # nest under ``interim_<stamp>/`` — matches the production layout
         # ``paths.debug/episodic/[interim_<stamp>/]cycle_<N>/run_<run_id>/``.
         cycle_dir = loop.snapshot_dir_for(interim_stamp=_STAMP)
         assert cycle_dir is not None
-        # graph_merged_snapshot.json and graph_enriched_snapshot.json are written by
-        # on_fold_graph via merger.save_graph (interim path: is_fresh_slot=True for
-        # simulate).  The test's mocked merger doesn't materialise a file, but the
-        # dispatch must still have called save_graph with the correct paths.
+        # graph_enriched_snapshot.json is written by _refine_consolidation_graph
+        # via on_fold_graph (no interim_stamp) → lands under fold/ not cycle_dir.
+        # graph_merged_snapshot.json is no longer emitted on the interim path (B2).
+        fold_base = loop.snapshot_dir_for()
+        assert fold_base is not None
         loop.merger.save_graph.assert_any_call(
-            cycle_dir / "graph_merged_snapshot.json", encrypted=False
-        )
-        loop.merger.save_graph.assert_any_call(
-            cycle_dir / "graph_enriched_snapshot.json", encrypted=False
+            fold_base / "fold" / "graph_enriched_snapshot.json", encrypted=False
         )
         assert (cycle_dir / "episodic_rels_snapshot.json").exists()
         assert (cycle_dir / "procedural_rels_snapshot.json").exists()
@@ -1923,7 +2029,7 @@ class TestDebugSnapshotIntegration:
         assert not (cycle_dir / "episodic_rels_snapshot.json").exists()
         assert not (cycle_dir / "procedural_rels_snapshot.json").exists()
         # merger.save_graph must NOT have been called for any graph dump path
-        # (queue-only exits before is_fresh_slot / on_fold_graph).
+        # (queue-only exits before the refine stage / on_fold_graph).
         for call in loop.merger.save_graph.call_args_list:
             assert call.args[0].name not in (
                 "graph_snapshot.json",

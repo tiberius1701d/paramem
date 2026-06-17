@@ -20,6 +20,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import networkx as nx
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -125,8 +126,19 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.shutdown_requested = False
     loop._thermal_policy = None
     loop.merger = MagicMock()
-    loop.merger.graph = MagicMock()
-    loop.merger.graph.nodes = []
+    # B3: _harvest_keyless_edge_entries reads merger.graph.edges(data=True).
+    # Provide a real NetworkX MultiDiGraph with two keyless episodic edges so the
+    # graph-walk mints keys and training is triggered in tests that expect it.
+    # The _materialize_consolidation_graph stub below skips reset_graph(), so the
+    # graph survives intact through the keyed-walk step.
+    _real_graph = nx.MultiDiGraph()
+    _real_graph.add_node("subject1", attributes={"name": "Subject1"})
+    _real_graph.add_node("object1", attributes={"name": "Object1"})
+    _real_graph.add_edge("subject1", "object1", predicate="knows", relation_type="factual")
+    _real_graph.add_node("subject2", attributes={"name": "Subject2"})
+    _real_graph.add_node("object2", attributes={"name": "Object2"})
+    _real_graph.add_edge("subject2", "object2", predicate="knows", relation_type="factual")
+    loop.merger.graph = _real_graph
     # Graph-enrichment knobs (Task #10). Hook fires inside the normal
     # fresh-interim branch; default to disabled for these unit tests so the
     # hook stays inert and we don't need to stub _run_graph_enrichment.
@@ -142,6 +154,13 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     # These tests verify post_session_train orchestration, not recall gating;
     # the probe is covered separately in test_consolidation_recall_early_stop.py.
     loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+
+    # Stub out _materialize_consolidation_graph so the B1 materialize step
+    # does not call reconstruct_graph / probe_entries on the MagicMock model.
+    # B3: the stub skips merger.reset_graph() so loop.merger.graph retains the
+    # pre-populated keyless edges for the graph-walk keying step.
+    # The materialize diagnostic is covered in test_consolidation.py::TestMaterializeInterimB1.
+    loop._materialize_consolidation_graph = lambda **kw: (set(), [])
 
     return loop
 

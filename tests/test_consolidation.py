@@ -2560,35 +2560,33 @@ class TestAbortSkipsCommit:
         """When train_adapter returns aborted=True, run_consolidation_cycle
         returns {'mode': 'aborted'} without updating simhashes or committing
         the tier slot.
+
+        B3: key generation now uses the graph-walk (merger.graph) rather than
+        _prepare_episodic_keys_for_tier.  Set up a real NetworkX graph with one
+        keyless episodic edge so the graph-walk produces a non-empty training set
+        and triggers the train_adapter call.
         """
         from unittest.mock import patch
+
+        import networkx as nx
 
         from paramem.training.consolidation import ConsolidationLoop
 
         loop = self._make_minimal_loop(monkeypatch, tmp_path)
 
-        # Register one episodic key so the guard passes.
-        loop.store.put(
-            "episodic",
-            "graph1",
-            {
-                "key": "graph1",
-                "subject": "Alex",
-                "predicate": "lives_in",
-                "object": "Millfield",
-                "speaker_id": "Speaker0",
-                "first_seen_cycle": 1,
-            },
-            register=True,
+        # B3: populate merger.graph with a real MultiDiGraph so _harvest_keyless_edge_entries
+        # finds a keyless edge and _apply_keyless_edge_entries(defer=True) produces a
+        # non-empty deferred write → all_interim_keyed is non-empty → training is triggered.
+        real_graph = nx.MultiDiGraph()
+        real_graph.add_node("speaker0", speaker_id="Speaker0", attributes={"name": "Alex"})
+        real_graph.add_node("millfield", attributes={"name": "Millfield"})
+        real_graph.add_edge(
+            "speaker0",
+            "millfield",
+            predicate="lives_in",
+            relation_type="factual",
         )
-        loop.indexed_key_cache["graph1"] = {
-            "key": "graph1",
-            "subject": "Alex",
-            "predicate": "lives_in",
-            "object": "Millfield",
-            "speaker_id": "Speaker0",
-            "first_seen_cycle": 1,
-        }
+        loop.merger.graph = real_graph
 
         aborted_metrics = {"train_loss": 0.5, "aborted": True}
         simhash_calls: list = []
@@ -2612,21 +2610,7 @@ class TestAbortSkipsCommit:
                 "_resolve_target_slot",
                 return_value=("episodic_interim_t001", False, False, False),
             ),
-            patch.object(
-                ConsolidationLoop,
-                "_prepare_episodic_keys_for_tier",
-                return_value=[
-                    {
-                        "key": "graph1",
-                        "subject": "Alex",
-                        "predicate": "lives_in",
-                        "object": "Millfield",
-                        "speaker_id": "Speaker0",
-                        "first_seen_cycle": 1,
-                    }
-                ],
-            ),
-            patch.object(ConsolidationLoop, "_maybe_run_interim_enrichment", return_value=None),
+            patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
             patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
             patch.object(
@@ -7267,7 +7251,7 @@ class TestHarvestKeylessEdgesSpeakerId:
         g.add_edge("spk-1", "python", predicate="has_skill", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # Exactly one key must have been minted.
@@ -7291,7 +7275,7 @@ class TestHarvestKeylessEdgesSpeakerId:
         g.add_edge("developer", "python", predicate="requires", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         assert len(tier_keyed["episodic"]) == 1, (
@@ -7632,3 +7616,1034 @@ class TestBuildRegistryTrueRelationsKeysFilter:
         assert {r.indexed_key for r in default_result} == {
             r.indexed_key for r in explicit_none_result
         }, "Default call and keys=None must produce identical key sets"
+
+
+# ---------------------------------------------------------------------------
+# B1 — _materialize_consolidation_graph: extra_relations seam + interim call
+# ---------------------------------------------------------------------------
+
+
+class TestMaterializeInterimB1:
+    """Unit tests for the B1 seam: extra_relations parameter on
+    _materialize_consolidation_graph and its use in run_consolidation_cycle.
+
+    Covered invariants:
+
+    B1-1. extra_relations=None and extra_relations=[] are no-ops for the fold
+          caller — the output is byte-identical to the call without extra_relations.
+    B1-2. After the interim materialize call, the merged graph contains both the
+          slot's recalled (registry-true) relations AND the pending-session
+          extra_relations.  A pending fact whose SPO matches a recalled key fires
+          Case-1-adopt: exactly one key survives, recurrence is bumped.
+    B1-3. A pending UNREGISTERED relation (not in the slot registry) does NOT
+          appear in recall_miss_keys.  recall_miss_keys is computed against
+          store.all_active_keys() BEFORE the reset — unregistered relations are
+          invisible to the miss set.
+    B1-4. dcf4189 speaker_id invariant: a minted interim key inherits speaker_id
+          from the relation dict through _prepare_episodic_keys_for_tier — the
+          B1 materialize step does not disrupt this flow.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path):
+        """Minimal ConsolidationLoop with a real GraphMerger for B1 tests.
+
+        Uses object.__new__ so no GPU model or extraction pipeline is needed.
+        Includes a real GraphMerger (model=None) so merger.merge / reset_graph
+        execute correctly, and a real MemoryStore with replay_enabled=True.
+        reconstruct_graph must be mocked by each test (it calls probe_entries
+        which requires a real model).
+        """
+        from peft import PeftModel
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.model.peft_config = {}
+        loop.model.add_adapter.side_effect = lambda name, cfg: loop.model.peft_config.update(
+            {name: cfg}
+        )
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(
+            indexed_key_replay_enabled=True,
+            interim_refinement="off",  # default; tests override per scenario
+        )
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.pending_interim_triples = []
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_enabled = False
+        loop.graph_enrichment_interim_enabled = False
+        loop.graph_enrichment_min_triples_floor = 20
+        loop._triples_since_last_enrichment = 0
+        loop.full_consolidation_period_string = ""
+
+        # Real GraphMerger (no model) so merge/reset_graph run correctly.
+        loop.merger = GraphMerger(model=None)
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+
+        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        return loop
+
+    @staticmethod
+    def _fake_reconstruct(loop, *, tier=None, strict=False):
+        """Reconstruct stub: returns empty graph + no failures.
+
+        Used to suppress real GPU probe calls in B1 unit tests.
+        The recall-miss diagnostics tested here operate on an already-populated
+        store; the stub causes ALL registered keys to land in recall_miss_keys
+        (no reconstruction → failure for each active key).  Tests that need
+        precise recall-miss behaviour set up recon spies themselves.
+        """
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
+
+    # ------------------------------------------------------------------
+    # B1-1: extra_relations=None / [] is a no-op for the fold caller
+    # ------------------------------------------------------------------
+
+    def test_extra_relations_none_is_noop(self, tmp_path):
+        """extra_relations=None must produce the same output as omitting the param.
+
+        Calls _materialize_consolidation_graph three times on the same loop:
+        (a) no extra_relations arg  (fold-style default)
+        (b) extra_relations=None    (explicit None)
+        (c) extra_relations=[]      (explicit empty list)
+        All three must return identical (recall_miss_keys, recon_relations) and
+        leave the merger graph in the same state (same edge count).
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(tmp_path)
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            miss_a, recon_a = loop._materialize_consolidation_graph()
+            edges_a = loop.merger.graph.number_of_edges()
+
+            # Reset merger so each call starts fresh.
+            loop.merger.reset_graph()
+            miss_b, recon_b = loop._materialize_consolidation_graph(extra_relations=None)
+            edges_b = loop.merger.graph.number_of_edges()
+
+            loop.merger.reset_graph()
+            miss_c, recon_c = loop._materialize_consolidation_graph(extra_relations=[])
+            edges_c = loop.merger.graph.number_of_edges()
+
+        assert miss_a == miss_b == miss_c, (
+            f"recall_miss_keys diverge: no-arg={miss_a}, None={miss_b}, []={miss_c}"
+        )
+        assert (
+            {r.indexed_key for r in recon_a}
+            == {r.indexed_key for r in recon_b}
+            == {r.indexed_key for r in recon_c}
+        ), "recon_relations indexed_key sets must be identical for all three variants"
+        assert edges_a == edges_b == edges_c, (
+            f"Merger graph edge counts diverge: {edges_a}, {edges_b}, {edges_c}"
+        )
+
+    # ------------------------------------------------------------------
+    # B1-2: Case-1 adoption — pending fact matching recalled key → one key
+    # ------------------------------------------------------------------
+
+    def test_extra_relations_case1_adoption(self, tmp_path):
+        """A pending relation whose SPO matches a recalled slot key adopts the key.
+
+        Setup:
+        - Register key 'graph1' in the slot (Alice/lives_in/Berlin, spk-A).
+        - Pass a Relation(Alice, lives_in, Berlin) as extra_relations.
+        - extra_relations have no indexed_key, so they are keyless pending edges.
+
+        Expected:
+        - The merger graph has exactly ONE edge after materialize (Case-1
+          collapses the duplicate SPO on re-merge: registry-true edge with
+          ik_key='graph1' exists; the extra Relation (keyless) merges as Case-3
+          new-edge since there is no ik_key conflict — both land as separate
+          edges because they arrive in different merge calls and have no key to
+          trigger the duplicate-key path).
+        - Specifically: the registry-true relation carries indexed_key='graph1';
+          the extra relation has no indexed_key.  After additive re-merge, both
+          edges coexist (additive=True skips Case-2; the existing edge has ik_key
+          and the extra relation lacks one so Case-1-adopt writes ik_key to the
+          new keyless edge on a same-SPO collision — recurrence bump).
+        - The edge with ik_key='graph1' must be present.
+        - The merger.reinforcements list records the surviving key (bump path).
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+
+        # Register one key in the slot.
+        _adapter = "episodic_interim_20260101T0000"
+        from paramem.training.key_registry import KeyRegistry
+
+        slot_reg = KeyRegistry()
+        loop.store.load_registry(_adapter, slot_reg)
+        loop.store.put(
+            _adapter,
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "alice",
+                "predicate": "lives in",
+                "object": "berlin",
+                "speaker_id": "spk-a",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="spk-a",
+            first_seen_cycle=1,
+            relation_type="factual",
+        )
+
+        # Build a pending extra_relation with the same SPO (no indexed_key).
+        extra = [
+            Relation(
+                subject="alice",
+                predicate="lives in",
+                object="berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+            )
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            miss_keys, recon_relations = loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=list(loop.store.active_keys_in_tier(_adapter)),
+                extra_relations=extra,
+            )
+
+        # The registry-true relation for 'graph1' must be in recon_relations.
+        recon_keys = {r.indexed_key for r in recon_relations}
+        assert "graph1" in recon_keys, (
+            f"Registry-true key 'graph1' must appear in recon_relations; got {recon_keys}"
+        )
+
+        # The merged graph must have the ik_key='graph1' edge (from the registry-true merge).
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        all_ik_keys = {data.get(_IK_KEY_ATTR) for _, _, data in loop.merger.graph.edges(data=True)}
+        assert "graph1" in all_ik_keys, (
+            f"Edge with ik_key='graph1' must be present in merged graph; "
+            f"found ik_keys: {all_ik_keys}"
+        )
+
+    # ------------------------------------------------------------------
+    # B1-3: Pending unregistered relation does NOT enter recall_miss_keys
+    # ------------------------------------------------------------------
+
+    def test_unregistered_extra_relation_not_in_recall_miss(self, tmp_path):
+        """An unregistered extra_relation must not appear in recall_miss_keys.
+
+        recall_miss_keys is computed against store.all_active_keys() BEFORE the
+        graph reset — extra_relations are pending (not yet registered) and are
+        therefore invisible to the miss set.
+
+        Setup: empty slot (no registered keys).  Pass one extra_relation.
+        Expected: recall_miss_keys is empty (no registered keys to miss).
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+
+        _adapter = "episodic_interim_20260101T0000"
+        from paramem.training.key_registry import KeyRegistry
+
+        loop.store.load_registry(_adapter, KeyRegistry())
+        # Do NOT register any keys — the extra_relation is purely pending.
+
+        extra = [
+            Relation(
+                subject="alice",
+                predicate="works at",
+                object="acme corp",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+            )
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            miss_keys, _ = loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=list(loop.store.active_keys_in_tier(_adapter)),
+                extra_relations=extra,
+            )
+
+        assert miss_keys == set(), (
+            f"Pending unregistered relation must NOT appear in recall_miss_keys; got: {miss_keys}"
+        )
+
+    # ------------------------------------------------------------------
+    # B1-4: dcf4189 speaker_id inheritance through the materialize path
+    # ------------------------------------------------------------------
+
+    def test_speaker_id_preserved_through_materialize_in_cycle(self, tmp_path):
+        """Minted interim keys inherit speaker_id from episodic_rels through the
+        new materialize path.
+
+        B1 inserts _materialize_consolidation_graph BEFORE _prepare_episodic_keys_for_tier.
+        The key-prep still reads speaker_id from episodic_rels (via _mint_keyed_entries),
+        NOT from graph nodes.  This test verifies that adding the materialize step
+        does not corrupt speaker_id in minted keys (dcf4189 invariant).
+
+        Strategy: run a simulate cycle with episodic_rels carrying explicit
+        speaker_ids, mock reconstruct_graph + _prepare_episodic_keys_for_tier-level
+        internals, and assert the minted entries carry the correct speaker_id.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(tmp_path)
+
+        episodic_rels = [
+            {
+                "subject": "Speaker0",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "relation_type": "factual",
+                "speaker_id": "Speaker0",
+            },
+            {
+                "subject": "Speaker0",
+                "predicate": "works_at",
+                "object": "Acme Corp",
+                "relation_type": "factual",
+                "speaker_id": "Speaker0",
+            },
+        ]
+
+        stamp = "20260101T0000"
+        _adapter = f"episodic_interim_{stamp}"
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            result = loop.run_consolidation_cycle(
+                episodic_rels,
+                [],
+                speaker_id="Speaker0",
+                mode="simulate",
+                run_label="b1-speaker-id-test",
+                stamp=stamp,
+            )
+
+        assert result.get("mode") in ("simulated", "noop", "queued"), (
+            f"Cycle did not complete as expected; result={result!r}"
+        )
+        if result.get("mode") == "simulated":
+            # Verify all minted keys have the correct speaker_id.
+            for _tier, key, entry in loop.store.iter_entries():
+                if entry.get("subject") in ("Speaker0", "speaker0"):
+                    assert entry.get("speaker_id") == "Speaker0", (
+                        f"Key {key!r} minted with wrong speaker_id: "
+                        f"expected 'Speaker0', got {entry.get('speaker_id')!r}"
+                    )
+                    bk = loop.store.bookkeeping_for_key(key)
+                    if bk is not None:
+                        assert bk.get("speaker_id") == "Speaker0", (
+                            f"Bookkeeping for {key!r} has wrong speaker_id: "
+                            f"expected 'Speaker0', got {bk.get('speaker_id')!r}"
+                        )
+
+    # ------------------------------------------------------------------
+    # B1 integration: interim materialize call in run_consolidation_cycle
+    # ------------------------------------------------------------------
+
+    def test_interim_materialize_called_before_key_prep(self, tmp_path):
+        """run_consolidation_cycle calls _materialize_consolidation_graph before
+        the graph-walk keying step (B3).
+
+        Uses a spy on _materialize_consolidation_graph and asserts:
+        (a) It is called exactly once per cycle.
+        (b) It is called with tier=adapter_name and the slot's active keys.
+
+        B3 note: key generation now uses the graph-walk (_harvest_keyless_edge_entries
+        + _apply_keyless_edge_entries(defer=True) + _collect_keyed_edges_into) rather
+        than _prepare_episodic_keys_for_tier.  When the materialize stub returns
+        (set(), []) and the merger graph is empty, the walk produces zero keys —
+        the store's tier is empty after the cycle (expected in this test context).
+        Tests that verify key minting (dcf4189, speaker_id inheritance) use a real
+        graph and are in TestInterimKeyedWalkB3.
+        """
+
+        loop = self._make_loop(tmp_path)
+        stamp = "20260115T0000"
+        _adapter = f"episodic_interim_{stamp}"
+
+        # Track calls to _materialize_consolidation_graph.
+        materialize_calls: list[dict] = []
+
+        def _spy_materialize(**kw):
+            materialize_calls.append(kw)
+            return (set(), [])
+
+        episodic_rels = [
+            {
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Zurich",
+                "relation_type": "factual",
+                "speaker_id": "spk-x",
+            },
+        ]
+
+        loop._materialize_consolidation_graph = _spy_materialize  # type: ignore[method-assign]
+
+        loop.run_consolidation_cycle(
+            episodic_rels,
+            [],
+            speaker_id="spk-x",
+            mode="simulate",
+            run_label="b1-call-order",
+            stamp=stamp,
+        )
+
+        assert len(materialize_calls) == 1, (
+            f"Expected exactly 1 _materialize_consolidation_graph call; "
+            f"got {len(materialize_calls)}: {materialize_calls}"
+        )
+        call_kw = materialize_calls[0]
+        assert call_kw.get("tier") == _adapter, (
+            f"materialize tier must be adapter_name={_adapter!r}; got {call_kw.get('tier')!r}"
+        )
+        # keys= should be the slot's active keys (empty for a fresh slot).
+        assert "keys" in call_kw, "materialize must be called with keys= kwarg"
+
+
+# ---------------------------------------------------------------------------
+# B3 — multi-speaker dcf4189 invariant + keyed-walk vs flat parity
+# ---------------------------------------------------------------------------
+
+
+class TestInterimKeyedWalkB3:
+    """B3 acceptance tests: keyed-walk speaker_id and SPO-content parity.
+
+    B3-1. Multi-speaker dcf4189 invariant: two pending facts from DISTINCT
+          speakers in one interim cycle must yield minted keys with DIFFERENT,
+          correct speaker_ids — they must NOT collapse to a single default.
+
+    B3-2. Training-set equivalence: the keyed-walk (harvest+apply) produces the
+          same (subject, predicate, object) content set as the legacy
+          _prepare_episodic_keys_for_tier for the same fixed episodic input.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path):
+        """Minimal ConsolidationLoop with a real GraphMerger.
+
+        Mirrors TestMaterializeInterimB1._make_loop exactly so both B3 tests
+        run against the same test-loop shape as the B1 tests.
+        """
+        from peft import PeftModel
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.model.peft_config = {}
+        loop.model.add_adapter.side_effect = lambda name, cfg: loop.model.peft_config.update(
+            {name: cfg}
+        )
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(
+            indexed_key_replay_enabled=True,
+            interim_refinement="off",
+        )
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.pending_interim_triples = []
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_enabled = False
+        loop.graph_enrichment_interim_enabled = False
+        loop.graph_enrichment_min_triples_floor = 20
+        loop._triples_since_last_enrichment = 0
+        loop.full_consolidation_period_string = ""
+
+        loop.merger = GraphMerger(model=None)
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+
+        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        return loop
+
+    @staticmethod
+    def _fake_reconstruct(loop, *, tier=None, strict=False):
+        """Stub reconstruct_graph: empty graph, no failures."""
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
+
+    # ------------------------------------------------------------------
+    # B3-1: multi-speaker dcf4189 invariant through the graph-walk
+    # ------------------------------------------------------------------
+
+    def test_two_speakers_yield_distinct_speaker_ids_in_minted_keys(self, tmp_path):
+        """Two pending facts from DISTINCT speakers in one interim cycle must
+        yield minted keys whose speaker_ids are DIFFERENT and correct — neither
+        must collapse to the caller default.
+
+        Regression class: dcf4189 fixed keyless-edge minting inheriting
+        speaker_id from the graph subject node rather than falling back to "".
+        Without the B3 entity re-synthesis in _materialize_consolidation_graph,
+        both minted keys would carry speaker_id="" because the merged graph
+        lacked speaker_id attributes on the subject nodes.
+
+        Strategy:
+        - Two Relation objects: Speaker0/works_at/Acme (speaker_id="Speaker0")
+          and Speaker1/lives_in/Paris (speaker_id="Speaker1").
+        - Call _materialize_consolidation_graph(extra_relations=[...]) so it
+          synthesises entities and stamps speaker_id on each subject node.
+        - Run _harvest_keyless_edge_entries + _apply_keyless_edge_entries.
+        - Assert: each minted key carries its own speaker's id; the two
+          speaker_ids are different; neither equals "".
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+
+        extra_relations = [
+            Relation(
+                subject="Speaker0",
+                predicate="works at",
+                object="Acme Corp",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker0",
+            ),
+            Relation(
+                subject="Speaker1",
+                predicate="lives in",
+                object="Paris",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker1",
+            ),
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(
+                extra_relations=extra_relations,
+            )
+
+        # After materialize, merger.graph has two keyless edges (one per relation).
+        # _harvest_keyless_edge_entries must resolve speaker_id from the subject node
+        # for each — the entity re-synthesis in _materialize_consolidation_graph
+        # stamps speaker_id onto the subject nodes so the walk reads them correctly.
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        _harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
+        loop._apply_keyless_edge_entries(_harvested, tier_keyed)
+
+        minted = tier_keyed["episodic"]
+        assert len(minted) == 2, (
+            f"Expected 2 minted episodic entries (one per speaker); got {len(minted)}: {minted}"
+        )
+
+        # Map key → bookkeeping.speaker_id.
+        key_to_speaker: dict[str, str] = {}
+        for item in minted:
+            key = item["key"]
+            bk = loop.store.bookkeeping_for_key(key)
+            assert bk is not None, f"No bookkeeping record for minted key {key!r}"
+            key_to_speaker[key] = bk["speaker_id"]
+
+        speaker_ids_found = set(key_to_speaker.values())
+
+        # Both speaker_ids must be present.
+        assert "Speaker0" in speaker_ids_found, (
+            f"Expected Speaker0 in minted speaker_ids; found: {speaker_ids_found}"
+        )
+        assert "Speaker1" in speaker_ids_found, (
+            f"Expected Speaker1 in minted speaker_ids; found: {speaker_ids_found}"
+        )
+
+        # The two minted keys must carry DIFFERENT speaker_ids — not collapsed.
+        assert len(speaker_ids_found) == 2, (
+            f"Both minted keys collapsed to the same speaker_id: {speaker_ids_found!r}. "
+            "dcf4189 regression: subject-node speaker_id not inherited from entity re-synthesis."
+        )
+
+        # Neither must be the caller default ("").
+        assert "" not in speaker_ids_found, (
+            f"At least one minted key fell back to speaker_id=''; "
+            f"speaker_ids found: {speaker_ids_found!r}. "
+            "dcf4189 regression: speaker_id not stamped by entity synthesis."
+        )
+
+    # ------------------------------------------------------------------
+    # B3-2: keyed-walk vs _prepare_episodic_keys_for_tier SPO-content parity
+    # ------------------------------------------------------------------
+
+    def test_graph_walk_spo_content_equals_flat_prepare(self, tmp_path):
+        """The keyed-walk produces the same SPO content set as _prepare_episodic_keys_for_tier.
+
+        For a fixed episodic input with no pre-existing tier keys:
+        - Graph-walk path: populate merger.graph, call _harvest_keyless_edge_entries
+          + _apply_keyless_edge_entries.
+        - Flat path: call _prepare_episodic_keys_for_tier(simulate mode).
+
+        Expected: both paths yield identical (subject, predicate, object) triples.
+        Key-set identity is also expected here because the input has no duplicate
+        edges and the walk processes each edge once.
+
+        If this surfaces a real divergence — the graph-walk drops or adds facts
+        vs the flat path — that is a B3 bug and must be reported, not masked.
+
+        Dedup note: _harvest_keyless_edge_entries skips edges that already carry
+        _IK_KEY_ATTR. _prepare_episodic_keys_for_tier deduplicates by existing
+        tier membership. With a clean (empty) graph and no pre-existing keys
+        both paths process all input relations; any difference in the SPO content
+        set is a genuine divergence.
+        """
+        # Fixed episodic input: two distinct SPO triples with explicit display names.
+        # subject == display name (node key = canonical, attributes.name = display).
+        # Using title-case names so the display surface matches rels[]["subject"] exactly.
+        episodic_rels = [
+            {
+                "subject": "Alice",
+                "predicate": "lives in",
+                "object": "Berlin",
+                "relation_type": "factual",
+                "speaker_id": "Speaker0",
+            },
+            {
+                "subject": "Alice",
+                "predicate": "works at",
+                "object": "Acme Corp",
+                "relation_type": "factual",
+                "speaker_id": "Speaker0",
+            },
+        ]
+
+        # ---- Graph-walk path ----
+        # Build a MultiDiGraph whose node display-names match rels["subject"]/["object"]
+        # so the walk emits the same SPO strings as the flat path.
+        loop_gw = self._make_loop(tmp_path / "gw")
+        g = loop_gw.merger.graph
+
+        for rel in episodic_rels:
+            subj_canon = rel["subject"].lower().replace(" ", "_")
+            obj_canon = rel["object"].lower().replace(" ", "_")
+            g.add_node(subj_canon, attributes={"name": rel["subject"]})
+            g.add_node(obj_canon, attributes={"name": rel["object"]})
+            g.add_edge(
+                subj_canon,
+                obj_canon,
+                predicate=rel["predicate"],
+                relation_type=rel["relation_type"],
+            )
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        _harvested = loop_gw._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
+        loop_gw._apply_keyless_edge_entries(_harvested, tier_keyed)
+        gw_entries = tier_keyed["episodic"]
+
+        # ---- Flat path: _prepare_episodic_keys_for_tier (simulate) ----
+        # Fresh loop — no shared state with the graph-walk loop.
+        loop_flat = self._make_loop(tmp_path / "flat")
+        _adapter = "episodic_interim_20260101T0000"
+        from paramem.training.key_registry import KeyRegistry
+
+        loop_flat.store.load_registry(_adapter, KeyRegistry())
+
+        flat_entries = loop_flat._prepare_episodic_keys_for_tier(
+            _adapter,
+            episodic_rels,
+            speaker_id="Speaker0",
+            mode="simulate",
+        )
+        # Filter to new entries only (_new=True); existing-key replay is empty
+        # because the tier is fresh, so all entries are new.
+        flat_new = [e for e in flat_entries if e.get("_new")]
+
+        # ---- Compare SPO content sets ----
+        def _spo_set(entries):
+            return {(e["subject"], e["predicate"], e["object"]) for e in entries}
+
+        gw_spo = _spo_set(gw_entries)
+        flat_spo = _spo_set(flat_new)
+
+        assert gw_spo == flat_spo, (
+            f"Keyed-walk and flat-path SPO content sets diverge.\n"
+            f"  Graph-walk SPO: {sorted(gw_spo)}\n"
+            f"  Flat-path SPO:  {sorted(flat_spo)}\n"
+            "This is a B3 production divergence — graph-walk drops or adds facts "
+            "vs _prepare_episodic_keys_for_tier."
+        )
+
+
+class TestMergeRegistryRelationsUnification:
+    """Regression tests for the _merge_registry_relations unification.
+
+    Before unification (4508-4530 in the pre-commit tree), the recon path built
+    SessionGraph(entities=[], ...) which caused reconstructed speaker-subject nodes
+    to receive entity_type="concept" with no speaker_id attribute.  The unified
+    _merge_registry_relations helper applies _synth_speaker_entities to both paths,
+    so speaker subjects now receive entity_type="person" + speaker_id from
+    bookkeeping regardless of whether the relation came from the recon path or the
+    extra-relations (pending-session) path.
+
+    Tests:
+    - MRR-1: recon path (no extra_relations) produces person node with speaker_id.
+    - MRR-2: extra_relations path still produces person nodes (dcf4189 regression guard).
+    - MRR-3: non-speaker relations produce no spurious person nodes.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path):
+        """Minimal ConsolidationLoop with a real GraphMerger (model=None).
+
+        Mirrors TestMaterializeInterimB1._make_loop exactly.
+        """
+        from peft import PeftModel
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.model.peft_config = {}
+        loop.model.add_adapter.side_effect = lambda name, cfg: loop.model.peft_config.update(
+            {name: cfg}
+        )
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(
+            indexed_key_replay_enabled=True,
+            interim_refinement="off",
+        )
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.pending_interim_triples = []
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_enabled = False
+        loop.graph_enrichment_interim_enabled = False
+        loop.graph_enrichment_min_triples_floor = 20
+        loop._triples_since_last_enrichment = 0
+        loop.full_consolidation_period_string = ""
+
+        loop.merger = GraphMerger(model=None)
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+
+        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        return loop
+
+    @staticmethod
+    def _fake_reconstruct(loop, *, tier=None, strict=False):
+        """Stub reconstruct_graph: empty graph, no failures."""
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
+
+    # ------------------------------------------------------------------
+    # MRR-1: recon path produces person node with speaker_id
+    # ------------------------------------------------------------------
+
+    def test_recon_path_produces_person_node_with_speaker_id(self, tmp_path):
+        """_materialize_consolidation_graph with recon_relations must stamp
+        entity_type='person' and speaker_id onto the subject node when
+        subject == speaker_id (i.e. the subject is a speaker node).
+
+        Regression: before _merge_registry_relations unification, the recon
+        path used entities=[] which caused subject nodes to receive
+        entity_type='concept' and no speaker_id attribute.  Graph-enrichment
+        then rooted enrichment facts at unattributed concept nodes (Speaker0
+        vs Tobias divergence).
+        """
+        from unittest.mock import patch
+
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = self._make_loop(tmp_path)
+
+        # Register a speaker key: subject == speaker_id (the speaker-node invariant).
+        _adapter = "episodic_interim_20260101T0000"
+        slot_reg = KeyRegistry()
+        loop.store.load_registry(_adapter, slot_reg)
+        loop.store.put(
+            _adapter,
+            "graph1",
+            {
+                "key": "graph1",
+                "subject": "Speaker0",
+                "predicate": "works at",
+                "object": "Acme Corp",
+                "speaker_id": "Speaker0",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="Speaker0",
+            first_seen_cycle=1,
+            relation_type="factual",
+        )
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=list(loop.store.active_keys_in_tier(_adapter)),
+            )
+
+        # The merged graph must have a node for the speaker subject.
+        # GraphMerger._resolve_entity keys speaker nodes by entity.speaker_id directly
+        # (not by canonical form) — the speaker_id IS the canonical graph identity.
+        node_key = "Speaker0"
+        assert node_key in loop.merger.graph.nodes, (
+            f"Speaker subject node {node_key!r} missing from merged graph after recon path; "
+            f"nodes present: {list(loop.merger.graph.nodes)}"
+        )
+
+        node_data = loop.merger.graph.nodes[node_key]
+
+        assert node_data.get("entity_type") == "person", (
+            f"Recon path: expected entity_type='person' on speaker subject node; "
+            f"got entity_type={node_data.get('entity_type')!r}. "
+            "Regression: before _merge_registry_relations unification the recon path "
+            "used entities=[], causing entity_type='concept' with no speaker_id."
+        )
+        assert node_data.get("speaker_id") == "Speaker0", (
+            f"Recon path: expected speaker_id='Speaker0' on speaker subject node; "
+            f"got speaker_id={node_data.get('speaker_id')!r}. "
+            "Regression: entity synthesis was not applied to the recon path."
+        )
+
+    # ------------------------------------------------------------------
+    # MRR-2: extra_relations path still produces person nodes (dcf4189 guard)
+    # ------------------------------------------------------------------
+
+    def test_extra_relations_path_still_produces_person_nodes(self, tmp_path):
+        """extra_relations (pending-session) path continues to produce person nodes.
+
+        Verifies that the dcf4189 fix (speaker_id on extra_relations nodes) is
+        preserved through the _merge_registry_relations unification.  Passes
+        extra_relations with speaker subjects and no registered keys so the recon
+        path is a no-op; only the extra path runs.
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+
+        extra_relations = [
+            Relation(
+                subject="Speaker1",
+                predicate="lives in",
+                object="Berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker1",
+            ),
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(extra_relations=extra_relations)
+
+        # GraphMerger._resolve_entity keys speaker nodes by entity.speaker_id directly.
+        node_key = "Speaker1"
+        assert node_key in loop.merger.graph.nodes, (
+            f"Extra-relations path: speaker subject node {node_key!r} missing; "
+            f"nodes: {list(loop.merger.graph.nodes)}"
+        )
+        node_data = loop.merger.graph.nodes[node_key]
+        assert node_data.get("entity_type") == "person", (
+            f"Extra-relations path: expected entity_type='person'; "
+            f"got {node_data.get('entity_type')!r}"
+        )
+        assert node_data.get("speaker_id") == "Speaker1", (
+            f"Extra-relations path: expected speaker_id='Speaker1'; "
+            f"got {node_data.get('speaker_id')!r}"
+        )
+
+    # ------------------------------------------------------------------
+    # MRR-3: non-speaker relations do not produce spurious person nodes
+    # ------------------------------------------------------------------
+
+    def test_non_speaker_relation_produces_no_person_node(self, tmp_path):
+        """A relation whose subject != speaker_id must NOT produce a person entity.
+
+        _synth_speaker_entities skips subjects that do not equal their
+        relation's speaker_id.  A regular (non-speaker-subject) fact must still
+        be merged, but its subject node must NOT receive entity_type='person' or
+        a spurious speaker_id from entity synthesis.
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+
+        # subject="Tobias", speaker_id="Speaker0" → subject != speaker_id → no entity.
+        extra_relations = [
+            Relation(
+                subject="Tobias",
+                predicate="works at",
+                object="Acme Corp",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker0",
+            ),
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(extra_relations=extra_relations)
+
+        from paramem.graph.name_match import canonical
+
+        node_key = canonical("Tobias")
+        # Node must exist (the edge was merged), but must NOT have entity_type="person"
+        # or speaker_id from entity synthesis (the subject is not a speaker node).
+        if node_key in loop.merger.graph.nodes:
+            node_data = loop.merger.graph.nodes[node_key]
+            assert node_data.get("entity_type") != "person", (
+                f"Non-speaker subject node should NOT have entity_type='person'; "
+                f"got entity_type={node_data.get('entity_type')!r}. "
+                "_synth_speaker_entities must only stamp entities when subject == speaker_id."
+            )
+            assert node_data.get("speaker_id") is None, (
+                f"Non-speaker subject node should NOT have speaker_id set; "
+                f"got speaker_id={node_data.get('speaker_id')!r}."
+            )

@@ -1005,21 +1005,19 @@ class TestInterimEnrichmentHook:
         assert result["skipped"] is True
         assert loop._triples_since_last_enrichment == 99
 
-    def test_rollover_hook_fires_above_floor(self, tmp_path):
-        """Normal fresh-interim branch with counter ≥ floor → _run_graph_enrichment called."""
+    def test_interim_full_enrichment_calls_run_graph_enrichment(self, tmp_path):
+        """interim_refinement='full' → _run_graph_enrichment called via refine stage."""
         from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import ConsolidationConfig
 
         loop = _make_loop(
             tmp_path,
-            graph_enrichment_min_triples_floor=5,
-            replay_enabled=True,  # pass the registry guard so enrichment can fire
+            consolidation_config=ConsolidationConfig(interim_refinement="full"),
+            replay_enabled=True,
         )
-        # Load empty registries so run_consolidation_cycle can proceed past the guard.
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
-        loop._triples_since_last_enrichment = 10  # over floor
 
-        # Stub extract_session to return episodic QA; skip the real extraction.
         loop.extract_session = MagicMock(
             return_value=(
                 [
@@ -1036,7 +1034,6 @@ class TestInterimEnrichmentHook:
         )
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": False})
 
-        # Stub the interim-adapter creation; PEFT is fully mocked.
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
         with (
             patch(
@@ -1058,10 +1055,18 @@ class TestInterimEnrichmentHook:
 
         loop._run_graph_enrichment.assert_called_once()
 
-    def test_rollover_hook_skipped_below_floor(self, tmp_path):
-        """Counter < floor → _run_graph_enrichment NOT called."""
-        loop = _make_loop(tmp_path, graph_enrichment_min_triples_floor=50)
-        loop._triples_since_last_enrichment = 5  # well below floor
+    def test_interim_light_does_not_enrich(self, tmp_path):
+        """interim_refinement='light' → _run_graph_enrichment NOT called by refine."""
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import ConsolidationConfig
+
+        loop = _make_loop(
+            tmp_path,
+            consolidation_config=ConsolidationConfig(interim_refinement="light"),
+            replay_enabled=True,
+        )
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
 
         loop.extract_session = MagicMock(
             return_value=(
@@ -1077,12 +1082,17 @@ class TestInterimEnrichmentHook:
                 [],
             )
         )
-        loop.indexed_key_registry = None
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
 
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
-        with patch(
-            "paramem.memory.interim_adapter.create_interim_adapter", return_value=loop.model
+        with (
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                return_value=loop.model,
+            ),
+            patch("paramem.training.trainer.train_adapter", return_value={}),
+            patch("paramem.models.loader.save_adapter"),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
             loop.post_session_train(
                 session_transcript="t",
@@ -1095,60 +1105,17 @@ class TestInterimEnrichmentHook:
 
         loop._run_graph_enrichment.assert_not_called()
 
-    def test_rollover_hook_respects_interim_disabled_flag(self, tmp_path):
-        """graph_enrichment_interim_enabled=False → hook never fires, even above floor."""
-        loop = _make_loop(
-            tmp_path,
-            graph_enrichment_interim_enabled=False,
-            graph_enrichment_min_triples_floor=5,
-        )
-        loop._triples_since_last_enrichment = 100  # way over floor
-
-        loop.extract_session = MagicMock(
-            return_value=(
-                [
-                    {
-                        "question": "q",
-                        "answer": "a",
-                        "subject": "S",
-                        "predicate": "p",
-                        "object": "O",
-                    }
-                ],
-                [],
-            )
-        )
-        loop.indexed_key_registry = None
-        loop._run_graph_enrichment = MagicMock(return_value={"skipped": False})
-
-        loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
-        with patch(
-            "paramem.memory.interim_adapter.create_interim_adapter", return_value=loop.model
-        ):
-            loop.post_session_train(
-                session_transcript="t",
-                session_id="s1",
-                speaker_id="Speaker0",
-                schedule="12h",
-                max_interim_count=7,
-                stamp="20260420T1200",
-            )
-
-        loop._run_graph_enrichment.assert_not_called()
-
-    def test_rollover_hook_swallows_sota_exception(self, tmp_path):
-        """Exception in _run_graph_enrichment must NOT break post_session_train."""
+    def test_interim_off_does_not_enrich(self, tmp_path):
+        """interim_refinement='off' → _run_graph_enrichment NOT called by refine."""
         from paramem.training.key_registry import KeyRegistry
 
         loop = _make_loop(
             tmp_path,
-            graph_enrichment_min_triples_floor=1,
-            replay_enabled=True,  # pass the registry guard so enrichment can fire
+            replay_enabled=True,
         )
-        # Load empty registries so run_consolidation_cycle can proceed past the guard.
+        # interim_refinement defaults to "off" in _make_loop (ConsolidationConfig default).
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
-        loop._triples_since_last_enrichment = 10
 
         loop.extract_session = MagicMock(
             return_value=(
@@ -1164,7 +1131,7 @@ class TestInterimEnrichmentHook:
                 [],
             )
         )
-        loop._run_graph_enrichment = MagicMock(side_effect=RuntimeError("sota blew up"))
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
 
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
         with (
@@ -1176,8 +1143,7 @@ class TestInterimEnrichmentHook:
             patch("paramem.models.loader.save_adapter"),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
-            # Must NOT raise — the hook is wrapped.
-            result = loop.post_session_train(
+            loop.post_session_train(
                 session_transcript="t",
                 session_id="s1",
                 speaker_id="Speaker0",
@@ -1186,10 +1152,7 @@ class TestInterimEnrichmentHook:
                 stamp="20260420T1200",
             )
 
-        loop._run_graph_enrichment.assert_called_once()
-        # Training proceeded (no_registry guard was passed) — the exception in
-        # enrichment is swallowed; the cycle returns "trained" mode.
-        assert result.get("error") is None or result.get("mode") in ("trained", "simulated")
+        loop._run_graph_enrichment.assert_not_called()
 
     def test_rollover_hook_skipped_on_cap_reached_absorb(self, tmp_path):
         """Cap-reached absorb path (degenerated early-return) does NOT fire the hook.
@@ -1258,6 +1221,168 @@ class TestInterimEnrichmentHook:
 
 
 # ---------------------------------------------------------------------------
+# Tests for _refine_consolidation_graph (B2: enrich gate + recurrence-bump)
+# ---------------------------------------------------------------------------
+
+
+class TestRefineConsolidationGraph:
+    """Unit tests for _refine_consolidation_graph's enrich param (B2).
+
+    Covers:
+    - enrich=True calls _run_graph_enrichment (fold default, unconditional).
+    - enrich=False skips _run_graph_enrichment entirely.
+    - Recurrence-bump loop runs regardless of enrich.
+    - Empty recon_relations is a safe no-op for both code paths.
+    """
+
+    def test_enrich_true_calls_run_graph_enrichment(self, tmp_path):
+        """_refine_consolidation_graph(recon, enrich=True) calls _run_graph_enrichment."""
+        loop = _make_loop(tmp_path)
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
+
+        loop._refine_consolidation_graph([], enrich=True)
+
+        loop._run_graph_enrichment.assert_called_once()
+
+    def test_enrich_default_calls_run_graph_enrichment(self, tmp_path):
+        """enrich defaults to True — fold passes no keyword and gets enrichment."""
+        loop = _make_loop(tmp_path)
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
+
+        # No enrich kwarg — fold behavior (default=True).
+        loop._refine_consolidation_graph([])
+
+        loop._run_graph_enrichment.assert_called_once()
+
+    def test_enrich_false_skips_run_graph_enrichment(self, tmp_path):
+        """_refine_consolidation_graph(recon, enrich=False) does NOT call _run_graph_enrichment."""
+        loop = _make_loop(tmp_path)
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
+
+        loop._refine_consolidation_graph([], enrich=False)
+
+        loop._run_graph_enrichment.assert_not_called()
+
+    def test_recurrence_bump_runs_when_enrich_false(self, tmp_path):
+        """Recurrence-bump fires regardless of enrich; enrich=False only skips SOTA."""
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # Register a key so bump_recurrence has a target.
+        loop.store.put(
+            "episodic",
+            "graph42",
+            {"key": "graph42", "subject": "A", "predicate": "p", "object": "B"},
+        )
+        loop.store.set_bookkeeping(
+            "graph42",
+            speaker_id="",
+            first_seen_cycle=0,
+            relation_type="factual",
+            recurrence_count=1,
+            last_seen_cycle=0,
+        )
+
+        # Simulate a Case-1 collision: merger.reinforcements contains the surviving key.
+        loop.merger.reinforcements = ["graph42"]
+
+        from paramem.graph.schema import Relation
+
+        recon_rel = Relation(
+            subject="A", predicate="p", object="B", relation_type="factual", speaker_id=""
+        )
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
+
+        loop._refine_consolidation_graph([recon_rel], enrich=False)
+
+        loop._run_graph_enrichment.assert_not_called()
+        bk = loop.store.bookkeeping_for_key("graph42")
+        assert bk is not None
+        assert bk["recurrence_count"] == 2, (
+            f"Recurrence should have been bumped to 2; got {bk['recurrence_count']}"
+        )
+
+    def test_recurrence_bump_runs_when_enrich_true(self, tmp_path):
+        """Recurrence-bump fires when enrich=True as well (both code paths covered)."""
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        loop.store.put(
+            "episodic",
+            "graph7",
+            {"key": "graph7", "subject": "X", "predicate": "q", "object": "Y"},
+        )
+        loop.store.set_bookkeeping(
+            "graph7",
+            speaker_id="",
+            first_seen_cycle=0,
+            relation_type="factual",
+            recurrence_count=3,
+            last_seen_cycle=0,
+        )
+        loop.merger.reinforcements = ["graph7"]
+
+        from paramem.graph.schema import Relation
+
+        recon_rel = Relation(
+            subject="X", predicate="q", object="Y", relation_type="factual", speaker_id=""
+        )
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": False})
+
+        loop._refine_consolidation_graph([recon_rel], enrich=True)
+
+        loop._run_graph_enrichment.assert_called_once()
+        bk = loop.store.bookkeeping_for_key("graph7")
+        assert bk is not None
+        assert bk["recurrence_count"] == 4, (
+            f"Recurrence should have been bumped to 4; got {bk['recurrence_count']}"
+        )
+
+    def test_empty_recon_relations_is_safe_noop_for_bump(self, tmp_path):
+        """Empty recon_relations → recurrence-bump loop does not run; no crash."""
+        loop = _make_loop(tmp_path)
+        loop.merger.reinforcements = ["graph99"]  # would be bumped if guard failed
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
+
+        bump_spy = MagicMock()
+        loop.store.bump_recurrence = bump_spy
+
+        # Both enrich values must be safe no-ops when recon_relations is empty.
+        loop._refine_consolidation_graph([], enrich=False)
+        loop._refine_consolidation_graph([], enrich=True)
+
+        bump_spy.assert_not_called()
+
+    def test_fold_call_byte_identical_behavior(self, tmp_path):
+        """The fold's call _refine_consolidation_graph(recon) uses enrich=True default.
+
+        Verify the fold's unchanged call site (_refine_consolidation_graph without
+        enrich kwarg) produces identical behavior to passing enrich=True explicitly.
+        Both must call _run_graph_enrichment.
+        """
+        loop_a = _make_loop(tmp_path / "a")
+        loop_a._run_graph_enrichment = MagicMock(return_value={"skipped": True})
+        loop_a._refine_consolidation_graph([])  # fold call (no kwarg)
+        count_a = loop_a._run_graph_enrichment.call_count
+
+        loop_b = _make_loop(tmp_path / "b")
+        loop_b._run_graph_enrichment = MagicMock(return_value={"skipped": True})
+        loop_b._refine_consolidation_graph([], enrich=True)  # explicit True
+        count_b = loop_b._run_graph_enrichment.call_count
+
+        assert count_a == count_b == 1, (
+            f"Fold call and enrich=True must both call _run_graph_enrichment once; "
+            f"got {count_a} vs {count_b}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests for _harvest_keyless_edge_entries / _apply_keyless_edge_entries (fold pre-pass)
 # ---------------------------------------------------------------------------
 
@@ -1288,7 +1413,7 @@ class TestHarvestKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # Exactly one key minted (factual → episodic).
@@ -1330,7 +1455,7 @@ class TestHarvestKeylessEdges:
         graph.add_edge("Bob", "Coffee", predicate="likes", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         assert len(tier_keyed["episodic"]) == 2
@@ -1361,7 +1486,7 @@ class TestHarvestKeylessEdges:
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         initial_index = loop._indexed_next_index
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # Nothing minted — the edge already has a key.
@@ -1382,7 +1507,7 @@ class TestHarvestKeylessEdges:
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         initial_index = loop._indexed_next_index
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         assert tier_keyed["episodic"] == []
@@ -1402,7 +1527,7 @@ class TestHarvestKeylessEdges:
         graph.add_edge("Carol", "London", predicate="visited", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         minted_key = tier_keyed["episodic"][0]["key"]
@@ -1431,7 +1556,7 @@ class TestHarvestKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # preference → episodic (no procedural adapter in _make_loop).
@@ -1500,7 +1625,7 @@ class TestHarvestKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         # The preference edge routes to procedural, not episodic.
@@ -1583,7 +1708,7 @@ class TestHarvestKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False)
+        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         loop._apply_keyless_edge_entries(_h, tier_keyed)
 
         assert len(tier_keyed["episodic"]) == 1
@@ -1629,7 +1754,7 @@ class TestHarvestApplySplit:
                 loop.store, "set_bookkeeping", wraps=loop.store.set_bookkeeping
             ) as mock_bk,
         ):
-            harvested = loop._harvest_keyless_edge_entries(tag_new=False)
+            harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
 
             # No store writes must occur during harvest.
             mock_put.assert_not_called()
@@ -1656,12 +1781,13 @@ class TestHarvestApplySplit:
 
         initial_indexed = loop._indexed_next_index
 
-        harvested = loop._harvest_keyless_edge_entries(tag_new=False)
+        harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        minted_by_tier = loop._apply_keyless_edge_entries(harvested, tier_keyed)
+        minted_by_tier, _deferred = loop._apply_keyless_edge_entries(harvested, tier_keyed)
 
-        # Exactly one episodic key minted.
+        # Exactly one episodic key minted.  defer=False (default) → no deferred writes.
         assert minted_by_tier == {"episodic": 1, "procedural": 0}
+        assert _deferred == [], "defer=False must produce empty deferred_writes"
         assert len(tier_keyed["episodic"]) == 1
 
         entry = tier_keyed["episodic"][0]
@@ -1698,7 +1824,7 @@ class TestHarvestApplySplit:
         loop.merger.graph.add_edge("Dave", "Paris", predicate="lives_in", relation_type="factual")
         loop.merger.graph.add_edge("Eve", "Tea", predicate="likes", relation_type="factual")
 
-        harvested = loop._harvest_keyless_edge_entries(tag_new=False)
+        harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         loop._apply_keyless_edge_entries(harvested, tier_keyed)
 
@@ -1731,7 +1857,7 @@ class TestHarvestApplySplit:
         # Only a predicate-less edge — nothing keyless+keyable to mint.
         loop.merger.graph.add_edge("Dave", "Paris")
 
-        harvested = loop._harvest_keyless_edge_entries(tag_new=False)
+        harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         assert harvested == []
 
 
@@ -1868,4 +1994,242 @@ class TestEnrichmentRemovalLedger:
         assert result["same_as_merges"] == 0, "No merges should succeed when contracted_nodes fails"
         assert "key_bad_victim" not in loop.merger.removal_ledger, (
             "Failed contraction must NOT write to removal_ledger"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B3 interim keying seams
+# ---------------------------------------------------------------------------
+
+
+class TestB3InterimKeyingSeams:
+    """B3: graph-walk keying for the interim path.
+
+    Covers:
+    - dcf4189 invariant: speaker_id propagated through the graph-walk.
+    - default_speaker_id fallback (absent node attr → caller's id).
+    - Explicit speaker_id="" preserved (not overwritten by default).
+    - defer=True performs NO store writes and NO counter advances.
+    - defer=True returns the full harvested list as deferred_writes.
+    - tag_new=True stamps minted entries with the _new sentinel.
+    """
+
+    def test_speaker_id_from_node_attr_carried_through(self, tmp_path):
+        """dcf4189 invariant: _harvest_keyless_edge_entries reads speaker_id from
+        the subject node's top-level attribute and threads it into the harvest
+        record, so _apply_keyless_edge_entries (and the interim flush at step 11b)
+        write the correct speaker_id to store.set_bookkeeping.
+
+        A node WITH speaker_id set gets that value; a node WITHOUT speaker_id attr
+        gets the caller-supplied default_speaker_id.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # Node with speaker_id set — simulates a speaker-attributed entity.
+        loop.merger.graph.add_node("alice", speaker_id="Speaker0", attributes={"name": "Alice"})
+        loop.merger.graph.add_node("berlin", attributes={"name": "Berlin"})
+        loop.merger.graph.add_edge("alice", "berlin", predicate="lives_in", relation_type="factual")
+
+        # Node without speaker_id attr — harvester applies default_speaker_id.
+        loop.merger.graph.add_node("bob", attributes={"name": "Bob"})
+        loop.merger.graph.add_node("coffee", attributes={"name": "Coffee"})
+        loop.merger.graph.add_edge("bob", "coffee", predicate="likes", relation_type="factual")
+
+        harvested = loop._harvest_keyless_edge_entries(
+            tag_new=True, default_speaker_id="DefaultSpeaker"
+        )
+
+        assert len(harvested) == 2
+
+        # Find each record by subject display name.
+        alice_rec = next(r for r in harvested if r["entry"]["subject"] == "Alice")
+        bob_rec = next(r for r in harvested if r["entry"]["subject"] == "Bob")
+
+        # Alice's node has speaker_id="Speaker0" → entry gets that value.
+        assert alice_rec["speaker_id"] == "Speaker0", (
+            f"Expected 'Speaker0' for attributed node; got {alice_rec['speaker_id']!r}"
+        )
+
+        # Bob's node has NO speaker_id attr → fallback to default_speaker_id.
+        assert bob_rec["speaker_id"] == "DefaultSpeaker", (
+            f"Expected 'DefaultSpeaker' (default) for unattributed node; "
+            f"got {bob_rec['speaker_id']!r}"
+        )
+
+    def test_explicit_empty_speaker_id_not_overwritten_by_default(self, tmp_path):
+        """A node with speaker_id="" explicitly set keeps "" — the default is NOT
+        applied.  This mirrors _tag_speaker_id_defaults semantics: only ABSENT keys
+        receive the default; present-but-empty is a distinct signal.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # Node with explicit speaker_id="" — must not be overwritten.
+        loop.merger.graph.add_node("carol", speaker_id="", attributes={"name": "Carol"})
+        loop.merger.graph.add_node("london", attributes={"name": "London"})
+        loop.merger.graph.add_edge("carol", "london", predicate="visits", relation_type="factual")
+
+        harvested = loop._harvest_keyless_edge_entries(
+            tag_new=True, default_speaker_id="ShouldNotAppear"
+        )
+
+        assert len(harvested) == 1
+        rec = harvested[0]
+
+        # Explicit "" is preserved — default_speaker_id must NOT overwrite it.
+        assert rec["speaker_id"] == "", (
+            f"Explicit speaker_id='' was overwritten; got {rec['speaker_id']!r}"
+        )
+
+    def test_defer_true_no_store_writes_no_counter_advance(self, tmp_path):
+        """_apply_keyless_edge_entries(defer=True) must NOT write to the store and
+        must NOT advance _indexed_next_index or _procedural_next_index.
+
+        This is the interim-atomicity contract: store mutations are deferred until
+        the caller confirms successful training.  A training abort leaves the
+        registry completely clean.
+        """
+        from unittest.mock import patch
+
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        loop.merger.graph.add_edge("Dave", "Paris", predicate="lives_in", relation_type="factual")
+        loop.merger.graph.add_edge("Eve", "Tea", predicate="likes", relation_type="factual")
+
+        initial_indexed = loop._indexed_next_index
+        initial_procedural = loop._procedural_next_index
+
+        harvested = loop._harvest_keyless_edge_entries(tag_new=True, default_speaker_id="")
+
+        with (
+            patch.object(loop.store, "put", wraps=loop.store.put) as mock_put,
+            patch.object(
+                loop.store, "set_bookkeeping", wraps=loop.store.set_bookkeeping
+            ) as mock_bk,
+        ):
+            tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+            minted_by_tier, deferred_writes = loop._apply_keyless_edge_entries(
+                harvested, tier_keyed, defer=True
+            )
+
+            # No store writes must occur when defer=True.
+            mock_put.assert_not_called()
+            mock_bk.assert_not_called()
+
+        # Counters must be unchanged when defer=True.
+        assert loop._indexed_next_index == initial_indexed, (
+            f"_indexed_next_index advanced during defer=True: "
+            f"{initial_indexed} → {loop._indexed_next_index}"
+        )
+        assert loop._procedural_next_index == initial_procedural, (
+            "_procedural_next_index advanced during defer=True"
+        )
+
+        # tier_keyed is still populated for training set construction.
+        assert len(tier_keyed["episodic"]) == 2, (
+            f"tier_keyed['episodic'] must be populated even with defer=True; "
+            f"got {len(tier_keyed['episodic'])} entries"
+        )
+
+        # deferred_writes contains all harvested records for later flush.
+        assert len(deferred_writes) == 2, (
+            f"deferred_writes must hold all harvested records; got {len(deferred_writes)}"
+        )
+
+        # Store remains empty — no orphan keys.
+        assert not loop.store.all_active_keys(), (
+            f"Store must be empty after defer=True; got {loop.store.all_active_keys()}"
+        )
+
+    def test_defer_true_deferred_writes_have_required_flush_fields(self, tmp_path):
+        """deferred_writes records from _apply_keyless_edge_entries(defer=True) must
+        carry all fields required for the caller's flush (entry, canon_subj, canon_obj,
+        predicate, tier, speaker_id, relation_type).
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        loop.merger.graph.add_node("frank", speaker_id="Speaker1", attributes={"name": "Frank"})
+        loop.merger.graph.add_node("hamburg", attributes={"name": "Hamburg"})
+        loop.merger.graph.add_edge(
+            "frank", "hamburg", predicate="works_in", relation_type="factual"
+        )
+
+        harvested = loop._harvest_keyless_edge_entries(tag_new=True, default_speaker_id="Speaker1")
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        _, deferred_writes = loop._apply_keyless_edge_entries(harvested, tier_keyed, defer=True)
+
+        assert len(deferred_writes) == 1
+        rec = deferred_writes[0]
+
+        required_fields = (
+            "entry",
+            "canon_subj",
+            "canon_obj",
+            "predicate",
+            "tier",
+            "speaker_id",
+            "relation_type",
+        )
+        for field in required_fields:
+            assert field in rec, f"deferred_writes record missing field {field!r}"
+
+        assert rec["tier"] == "episodic"
+        assert rec["predicate"] == "works_in"
+        assert rec["speaker_id"] == "Speaker1"
+        assert rec["relation_type"] == "factual"
+
+        # entry must have key, subject, predicate, object.
+        entry = rec["entry"]
+        for f in ("key", "subject", "predicate", "object"):
+            assert f in entry, f"entry dict missing field {f!r}"
+        assert entry["subject"] == "Frank"
+        assert entry["object"] == "Hamburg"
+
+    def test_tag_new_sentinel_on_minted_entries(self, tmp_path):
+        """tag_new=True stamps minted entries with the _new sentinel so the interim
+        path can identify freshly-minted keys vs existing-key replay entries.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        loop.merger.graph.add_edge("Grace", "Oslo", predicate="visits", relation_type="factual")
+
+        # tag_new=True — minted entries get the _new sentinel.
+        harvested_new = loop._harvest_keyless_edge_entries(tag_new=True, default_speaker_id="")
+        assert len(harvested_new) == 1
+        entry_new = harvested_new[0]["entry"]
+        assert entry_new.get("_new") is True, (
+            f"tag_new=True must set '_new'=True on the entry; got {entry_new!r}"
+        )
+
+        # tag_new=False — minted entries do NOT get the sentinel.
+        loop._indexed_next_index = 1  # reset so next harvest gets a fresh index
+        loop.merger.graph.clear_edges()
+        loop.merger.graph.add_edge("Hank", "Rome", predicate="visits", relation_type="factual")
+
+        harvested_nosentinel = loop._harvest_keyless_edge_entries(
+            tag_new=False, default_speaker_id=""
+        )
+        assert len(harvested_nosentinel) == 1
+        entry_nosentinel = harvested_nosentinel[0]["entry"]
+        assert "_new" not in entry_nosentinel or entry_nosentinel.get("_new") is not True, (
+            f"tag_new=False must NOT set '_new'=True; got {entry_nosentinel!r}"
         )

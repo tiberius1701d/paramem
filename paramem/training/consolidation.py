@@ -1258,39 +1258,6 @@ class ConsolidationLoop:
             if "speaker_id" not in r:
                 r["speaker_id"] = speaker_id
 
-    def _maybe_run_interim_enrichment(self) -> None:
-        """Fire a mini graph-enrichment pass at sub-interval rollover if the floor is crossed.
-
-        Checks ``graph_enrichment_interim_enabled`` and
-        ``_triples_since_last_enrichment >= graph_enrichment_min_triples_floor``
-        before calling ``_run_graph_enrichment``.  Any SOTA failure is logged
-        but never blocks interim adapter creation — the try/except is boundary
-        error handling (external Anthropic API call), not control-flow suppression.
-
-        Called from :meth:`run_consolidation_cycle` at sub-interval rollover
-        (when the new stamp minted a fresh interim adapter slot).
-        """
-        if not (
-            self.graph_enrichment_interim_enabled
-            and self._triples_since_last_enrichment >= self.graph_enrichment_min_triples_floor
-        ):
-            return
-
-        logger.info(
-            "_maybe_run_interim_enrichment: running mini graph-enrichment "
-            "(triples_since_last=%d >= floor=%d)",
-            self._triples_since_last_enrichment,
-            self.graph_enrichment_min_triples_floor,
-        )
-        try:
-            self._run_graph_enrichment()
-        except Exception as _mini_exc:
-            logger.warning(
-                "_maybe_run_interim_enrichment: mini graph-enrichment raised "
-                "— interim creation continues: %s",
-                _mini_exc,
-            )
-
     def _resolve_target_slot(
         self,
         stamp: str,
@@ -2609,13 +2576,18 @@ class ConsolidationLoop:
         2. Guard: no registry → early return ``{"status": "skipped", ...}``.
         3. Guard: no relations → early return ``{"status": "noop", ...}``.
         4. Tag relations with caller's ``speaker_id`` as default.
-        5. ``_maybe_run_interim_enrichment()`` at sub-interval rollover.
-        6. Compute stamp (when not provided) and call ``_resolve_target_slot``
+        5. Compute stamp (when not provided) and call ``_resolve_target_slot``
            to obtain ``(adapter_name, cap_reached_absorb, queue_only,
            degenerated_skip)``.
-        7. Handle control-flow branches: queue-only and degenerated-skip.
-        8. Mint PEFT slot (train only); run ``_maybe_run_interim_enrichment``
-           (simulate skips enrichment, train runs it at rollover).
+        6. Handle control-flow branches: queue-only and degenerated-skip.
+        7. Mint PEFT slot (train only).
+        8. Materialize (B1): call :meth:`_materialize_consolidation_graph` scoped
+           to the current slot for the recall-miss diagnostic and to rebuild the
+           keying surface (pending-session relations from ``merger.graph`` are
+           passed as ``extra_relations`` so they survive the graph reset).
+        8c. Refine (B2): call :meth:`_refine_consolidation_graph` with
+           ``enrich=(interim_refinement=="full")`` so SOTA enrichment is
+           level-gated.  The recurrence-bump runs at every level.
         9. Prepare episodic key list via ``_prepare_episodic_keys_for_tier``.
            When *new_promotions* is non-empty, move matching keys from episodic
            to semantic before training (mirrors the former
@@ -2753,31 +2725,8 @@ class ConsolidationLoop:
             self._debug_writer.on_cycle_end(degenerated_summary, interim_stamp=stamp)
             return degenerated_summary
 
-        # --- 5. Interim enrichment at sub-interval rollover ---
-        # Runs AFTER queue/degenerate checks so it doesn't fire for queued
-        # sessions.  Only meaningful when a fresh slot is being minted.
-        # Enrichment is mode-agnostic — it mutates the cumulative graph used by
-        # both train (key assignment from graph triples) and simulate (registry
-        # rebuild from the same graph).  The "is_fresh_slot" guard preserves the
-        # original rollover-only cadence; mode is irrelevant.
-        is_fresh_slot = (
-            mode == "simulate"  # simulate has no peft_config; every cycle is "fresh"
-            or (adapter_name not in self.model.peft_config and not cap_reached_absorb)
-        )
-        if is_fresh_slot:
-            # Debug: snapshot the merged graph BEFORE interim enrichment mutates it.
-            # Self-gated; no-op when save_cycle_snapshots=False.
-            self._debug_writer.on_fold_graph(self.merger, label="merged", interim_stamp=stamp)
-            self._maybe_run_interim_enrichment()
-            # Debug: snapshot the enriched graph AFTER interim enrichment.
-            # Self-gated; no-op when save_cycle_snapshots=False.
-            self._debug_writer.on_fold_graph(self.merger, label="enriched", interim_stamp=stamp)
-
         # --- End-of-extraction debug dump (per-tier relation lists) ---
-        # The cumulative-graph write was removed from on_extraction_end; graph
-        # snapshots are now emitted by on_fold_graph above (merged + enriched).
-        # Fires after enrichment mutates the cumulative graph; the writer
-        # self-gates on save_cycle_snapshots so the call is unconditional.
+        # Self-gated; no-op when save_cycle_snapshots=False.
         self._debug_writer.on_extraction_end(episodic_rels, procedural_rels, interim_stamp=stamp)
 
         # --- 8. Mint PEFT slot (train only) ---
@@ -2798,28 +2747,149 @@ class ConsolidationLoop:
                 self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
                 logger.info("run_consolidation_cycle: created interim adapter %s", adapter_name)
 
-        # --- 9. Prepare episodic keys ---
+        # --- 8b. Materialize: recall-miss diagnostic + rebuild keying surface ---
+        # Scoped to the current slot: reconstruct only the slot's registered keys
+        # (tier=adapter_name, keys=active_keys_in_tier(adapter_name)) for the
+        # recall-miss diagnostic, then reset the keying graph and re-merge:
+        #   (a) registry-true relations for this slot
+        #   (b) the pending-session relations captured from merger.graph before the
+        #       reset (extra_relations), so they survive and co-reside with the
+        #       slot's recalled facts in the fresh keying surface.
+        #
+        # INVARIANT: extra_relations NEVER enter the recall_miss_keys set.
+        # recall_miss_keys is computed against store.all_active_keys() BEFORE the
+        # graph reset inside _materialize_consolidation_graph — pending unregistered
+        # relations therefore cannot distort it.
+        #
+        # Cap-absorb scope (risk #9): _resolve_target_slot returns the NEWEST slot
+        # as adapter_name when cap_reached_absorb=True; active_keys_in_tier
+        # correctly scopes to that slot's keys — no special-casing needed here.
+        #
+        # extra_relations are populated from merger.graph edges only when
+        # interim_refinement != "off" (under "off", extract_session skips the merge
+        # so merger.graph does not contain pending-session content; B6 will change
+        # this to always merge, but until then the "off" path passes None).
+        _pending_relations: "list[Relation] | None" = None
+        if self.config.interim_refinement != "off":
+            import networkx as _nx
+
+            _g = getattr(self.merger, "graph", None)
+            if isinstance(_g, _nx.MultiDiGraph) and _g.number_of_edges() > 0:
+                _pending_relations = []
+                for _er_subj, _er_obj, _er_data in _g.edges(data=True):
+                    _er_pred = _er_data.get("predicate", "")
+                    if not _er_pred:
+                        continue
+                    _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
+                    _er_rt: str = _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+                    # speaker_id: prefer the subject node's speaker_id attribute
+                    # (set by _upsert_entity for speaker entities, where the node
+                    # key IS the speaker_id).  Falls back to "" for non-speaker
+                    # subjects (B3 will improve this via entity re-merge).
+                    _er_subj_node = _g.nodes.get(_er_subj, {})
+                    _er_spk = _er_subj_node.get("speaker_id", "")
+                    _pending_relations.append(
+                        Relation(
+                            subject=_er_subj,
+                            predicate=_er_pred,
+                            object=_er_obj,
+                            relation_type=_er_rt,  # type: ignore[arg-type]
+                            confidence=_er_data.get("confidence", 1.0),
+                            speaker_id=_er_spk,
+                        )
+                    )
+
+        recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
+            tier=adapter_name,
+            keys=list(self.store.active_keys_in_tier(adapter_name)),
+            extra_relations=_pending_relations,
+        )
+        if recall_miss_keys:
+            logger.info(
+                "run_consolidation_cycle: %d recall-miss key(s) in slot %s "
+                "(kept in training set with registry-true content)",
+                len(recall_miss_keys),
+                adapter_name,
+            )
+
+        # --- 8c. Refine: SOTA enrichment (level-gated) + recurrence bumps ---
+        # enrich=True only when interim_refinement=="full"; the recurrence-bump
+        # loop inside _refine_consolidation_graph runs regardless of enrich so
+        # Case-1 duplicate-SPO collapses are captured at every merge level.
+        # Note on atomicity: bump_recurrence targets ALREADY-REGISTERED keys
+        # (Case-1 survivors from the merge); it does NOT register new keys.
+        # Bumping a registered key's counter before training is benign — the
+        # key remains valid whether training aborts or not, and the increment
+        # is re-applied identically on the next cycle (idempotent semantics).
+        self._refine_consolidation_graph(
+            recon_relations,
+            enrich=(self.config.interim_refinement == "full"),
+        )
+
+        # --- 9. Build keyed training set via graph-walk (B3) ---
+        # Replaces the flat _prepare_episodic_keys_for_tier probe path.  After
+        # _materialize_consolidation_graph (B1) + _refine_consolidation_graph (B2),
+        # merger.graph holds: (a) registry-true re-merged keys (as keyed edges with
+        # ik_key stamped) plus (b) the pending-session relations (as keyless edges).
+        # The three fold primitives extract both sets into tier_keyed:
+        #
+        #   _harvest_keyless_edge_entries  — collects keyless predicate-bearing edges
+        #                                    (pending-session facts = new keys)
+        #   _apply_keyless_edge_entries    — mints keys for them; with defer=True,
+        #                                    skips store writes + counter advances so
+        #                                    a training abort cannot leave orphan
+        #                                    registry entries (interim atomicity).
+        #   _collect_keyed_edges_into      — collects already-keyed edges (slot recall
+        #                                    = existing keys for anti-forgetting replay).
+        #
+        # Procedural handling (B3): tier_keyed["procedural"] may be populated by the
+        # walk (procedural-typed keyless edges from the pending sessions co-merged
+        # into merger.graph) but is NOT trained in B3 — _run_indexed_key_procedural
+        # (step 11) continues to handle procedural via the flat path.  Deferred
+        # writes for procedural entries are NOT flushed in B3 (no counter advance,
+        # no store write); _run_indexed_key_procedural owns the procedural indices
+        # from _procedural_next_index independently.
         if mode == "train":
             switch_adapter(self.model, adapter_name)
-        all_interim_keyed = self._prepare_episodic_keys_for_tier(
-            adapter_name, episodic_rels, speaker_id, mode=mode
+        _tier_keyed: dict[str, list[dict]] = {"episodic": [], "procedural": [], "semantic": []}
+        _harvested_interim = self._harvest_keyless_edge_entries(
+            tag_new=True,
+            default_speaker_id=speaker_id,
         )
-        # Identify the new entries returned by _prepare_episodic_keys_for_tier
-        # (marked with "_new": True).  store.put and _indexed_next_index advancement
-        # are deferred: applied AFTER _train_adapter returns (train mode) or
-        # immediately (simulate mode — no training step can fail).
-        new_keyed_episodic = [kp for kp in all_interim_keyed if kp.get("_new")]
-        new_key_ids = [kp["key"] for kp in new_keyed_episodic]
+        _, _deferred_writes = self._apply_keyless_edge_entries(
+            _harvested_interim, _tier_keyed, defer=True
+        )
+        self._collect_keyed_edges_into(_tier_keyed)
+
+        # all_interim_keyed: episodic entries only (new minted + existing keyed).
+        # Procedural bucket (_tier_keyed["procedural"]) is collected but unused in B3.
+        all_interim_keyed = _tier_keyed["episodic"]
+
+        # new_keyed_episodic: deferred writes for episodic minted entries only.
+        # Procedural deferred writes are excluded (handled by _run_indexed_key_procedural).
+        new_keyed_episodic = [rec for rec in _deferred_writes if rec["tier"] == "episodic"]
+        new_key_ids = [rec["entry"]["key"] for rec in new_keyed_episodic]
 
         if mode == "simulate":
-            # No training step — apply store mutations immediately.
-            for kp in new_keyed_episodic:
-                self.store.put(adapter_name, kp["key"], kp)
+            # No training step — apply episodic store mutations immediately.
+            # Mirrors the former new_keyed_episodic simulate path; uses the
+            # deferred-write payload from _apply_keyless_edge_entries(defer=True).
+            for rec in new_keyed_episodic:
+                _entry = rec["entry"]
+                _key = _entry["key"]
+                self.store.put(
+                    adapter_name,
+                    _key,
+                    _entry,
+                    simhash=compute_simhash(
+                        _key, _entry["subject"], rec["predicate"], _entry["object"]
+                    ),
+                )
                 self.store.set_bookkeeping(
-                    kp["key"],
-                    speaker_id=kp["speaker_id"],
-                    first_seen_cycle=kp["first_seen_cycle"],
-                    relation_type=kp.get("relation_type", "factual"),
+                    _key,
+                    speaker_id=rec["speaker_id"],
+                    first_seen_cycle=self.cycle_count,
+                    relation_type=rec["relation_type"],
                     recurrence_count=1,
                     last_seen_cycle=self.cycle_count,
                 )
@@ -2905,26 +2975,43 @@ class ConsolidationLoop:
 
         # --- 11b. Apply deferred episodic store mutations ---
         # Reached only when all training steps above completed without raising.
-        # In simulate mode this block was already handled before training.
+        # In simulate mode the episodic writes were already applied before training
+        # (in the simulate branch of step 9 above); the counter was already advanced.
+        #
+        # new_keyed_episodic carries the harvest records (from _deferred_writes)
+        # filtered to the episodic tier.  Each record has all fields needed for
+        # store.put (entry["key"], entry, canon_subj/pred/canon_obj for simhash)
+        # and store.set_bookkeeping (speaker_id, relation_type).
         if mode == "train":
-            for kp in new_keyed_episodic:
-                if _epi_passing is not None and kp["key"] not in _epi_passing:
+            _flushed_count = 0
+            for rec in new_keyed_episodic:
+                _entry = rec["entry"]
+                _key = _entry["key"]
+                if _epi_passing is not None and _key not in _epi_passing:
                     logger.debug(
                         "run_consolidation_cycle: key %s failed recall gate"
                         " — skipping registration",
-                        kp["key"],
+                        _key,
                     )
                     continue
-                self.store.put(adapter_name, kp["key"], kp)
+                self.store.put(
+                    adapter_name,
+                    _key,
+                    _entry,
+                    simhash=compute_simhash(
+                        _key, _entry["subject"], rec["predicate"], _entry["object"]
+                    ),
+                )
                 self.store.set_bookkeeping(
-                    kp["key"],
-                    speaker_id=kp["speaker_id"],
-                    first_seen_cycle=kp["first_seen_cycle"],
-                    relation_type=kp.get("relation_type", "factual"),
+                    _key,
+                    speaker_id=rec["speaker_id"],
+                    first_seen_cycle=self.cycle_count,
+                    relation_type=rec["relation_type"],
                     recurrence_count=1,
                     last_seen_cycle=self.cycle_count,
                 )
-            self._indexed_next_index += len(new_keyed_episodic)
+                _flushed_count += 1
+            self._indexed_next_index += _flushed_count
 
         # --- 12. Persist both tiers ---
         # Each commit_tier_slot is internally crash-safe (registry-last write is
@@ -3449,19 +3536,19 @@ class ConsolidationLoop:
                 interim_dir,
             )
 
-        # Merge through the merger (model-free — additive=True skips the only
-        # model-gated Case-2 branch; canonical() + Case-1 dedup are deterministic).
+        # Merge through the unified builder (model-free — additive=True skips
+        # the only model-gated Case-2 branch; canonical() + Case-1 dedup are
+        # deterministic).  _merge_registry_relations synthesises speaker
+        # entities via _synth_speaker_entities so person nodes carry
+        # speaker_id — the same path the train fold uses.
         if _all_relations:
-            _synthetic_session = SessionGraph(
+            self._merge_registry_relations(
+                _all_relations,
                 session_id="__simulate_consolidation_merge__",
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                entities=[],
-                relations=_all_relations,
+                log_label="relations via GraphMerger",
             )
-            self.merger.merge(_synthetic_session, additive=True)
             logger.info(
-                "consolidate_interim_graphs: merged %d relations via GraphMerger"
-                " (%d interim slot(s))",
+                "consolidate_interim_graphs: merged %d relations (%d interim slot(s))",
                 len(_all_relations),
                 len(interim_dirs_merged),
             )
@@ -3726,6 +3813,7 @@ class ConsolidationLoop:
         self,
         *,
         tag_new: bool,
+        default_speaker_id: str,
     ) -> list[dict]:
         """Walk the merged graph and collect mint records for keyless predicate-bearing edges.
 
@@ -3748,10 +3836,22 @@ class ConsolidationLoop:
         Tier derivation, display-name resolution, speaker_id resolution, and
         relation_type clamping all mirror the original combined method exactly.
 
+        Speaker-ID default: when a subject node has no ``speaker_id`` top-level
+        attribute (key absent from the node dict), ``default_speaker_id`` is used
+        as the fallback.  Nodes with an explicit ``speaker_id=""`` keep the empty
+        string — the default is applied only when the key is absent, matching the
+        semantics of :meth:`_tag_speaker_id_defaults`.
+
         Args:
             tag_new: Forwarded to :meth:`_mint_keyed_entries`.  Pass ``False``
                 for the fold pre-pass (current fold behavior) and ``True`` when
                 the caller needs the ``_new`` sentinel on minted entries.
+            default_speaker_id: Fallback speaker identifier used when a subject
+                node carries no ``speaker_id`` attribute (key absent).  The fold
+                passes ``""`` explicitly (no caller-supplied id); the interim path
+                passes the cycle's ``speaker_id`` argument so unattributed nodes
+                receive the cycle's attribution, matching the old
+                ``_tag_speaker_id_defaults`` behaviour.
 
         Returns:
             List of harvest records, one per edge that will receive a minted key.
@@ -3763,7 +3863,9 @@ class ConsolidationLoop:
             - ``"canon_obj"`` – canonical node key of the object (for simhash)
             - ``"predicate"`` – the raw predicate string
             - ``"relation_type"`` – the clamped relation type string
-            - ``"speaker_id"`` – the resolved speaker_id (may be ``""``)
+            - ``"speaker_id"`` – the resolved speaker_id (``""`` when the node has
+              an explicit empty value; ``default_speaker_id`` when the attribute is
+              absent)
         """
         from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
@@ -3798,9 +3900,16 @@ class ConsolidationLoop:
                 self.merger.graph.nodes[_t_obj].get("attributes", {}).get("name") or _t_obj
             )
             # Resolve speaker_id from the subject node's top-level attribute.
-            # Speaker person-nodes have this set by GraphMerger._upsert_entity;
-            # role-node subjects lack it and fall back to "".
-            _subj_sid = (self.merger.graph.nodes.get(_t_subj, {}) or {}).get("speaker_id") or ""
+            # Speaker person-nodes have this set by GraphMerger._upsert_entity.
+            # When the attribute key is ABSENT, use default_speaker_id (the
+            # caller-supplied fallback, "" for the fold and the cycle's speaker_id
+            # for the interim path).  When the attribute is PRESENT but empty
+            # (""), keep "" — the node explicitly carries no speaker attribution
+            # (matches _tag_speaker_id_defaults semantics: only absent keys receive
+            # the default, not explicit-empty values).
+            _node_attrs = self.merger.graph.nodes.get(_t_subj, {}) or {}
+            _subj_sid_raw = _node_attrs.get("speaker_id", None)  # None = key absent
+            _subj_sid = default_speaker_id if _subj_sid_raw is None else _subj_sid_raw
 
             # Derive tier with the same logic the keyed-edge walk uses.
             _dummy = [
@@ -3870,7 +3979,9 @@ class ConsolidationLoop:
         self,
         harvested: list[dict],
         tier_keyed: dict[str, list[dict]],
-    ) -> dict[str, int]:
+        *,
+        defer: bool = False,
+    ) -> "tuple[dict[str, int], list[dict]]":
         """Persist harvested keyless-edge mint records and populate *tier_keyed*.
 
         **Applier** — consumes the records returned by
@@ -3894,14 +4005,33 @@ class ConsolidationLoop:
                 populates.  This method appends directly to it so both the pre-pass
                 entries and the keyed-edge walk entries land in the same structure
                 that feeds training.
+            defer: When ``False`` (default, fold discipline) the store writes
+                (``store.put``, ``store.set_bookkeeping``) and counter advances
+                (``_indexed_next_index``, ``_procedural_next_index``) are applied
+                immediately — byte-identical to the original method.  When
+                ``True`` (interim path, B3) ALL store writes and counter advances
+                are SKIPPED; only ``tier_keyed`` is populated and the harvested
+                records are returned as the deferred-write payload so the caller
+                can apply them after recall-confirmed training (interim atomicity:
+                a training abort must not leave orphan registry entries).
 
         Returns:
-            Per-tier minted count, e.g. ``{"episodic": 2, "procedural": 1}``.
-            Mutates *tier_keyed* and the :class:`~paramem.memory.store.MemoryStore`
-            in-place.  Advances ``_indexed_next_index`` / ``_procedural_next_index``
-            by one for each minted key.
+            A 2-tuple ``(minted_by_tier, deferred_writes)`` where:
+
+            - ``minted_by_tier`` — per-tier minted count,
+              e.g. ``{"episodic": 2, "procedural": 1}``.
+            - ``deferred_writes`` — the harvested records that still need
+              ``store.put`` / ``store.set_bookkeeping`` / counter advances.
+              When ``defer=False`` (fold) this is always ``[]`` (writes already
+              applied); when ``defer=True`` (interim) this is the full
+              *harvested* list (writes deferred to the caller's flush site).
+
+            Mutates *tier_keyed* in-place.  When ``defer=False``, also mutates
+            the :class:`~paramem.memory.store.MemoryStore` and advances
+            ``_indexed_next_index`` / ``_procedural_next_index``.
         """
         minted_by_tier: dict[str, int] = {"episodic": 0, "procedural": 0}
+        deferred_writes: list[dict] = []
 
         for rec in harvested:
             entry = rec["entry"]
@@ -3913,22 +4043,26 @@ class ConsolidationLoop:
             _subj_sid = rec["speaker_id"]
             key = entry["key"]
 
-            # Persist using the fold's in-place mutation discipline.
-            # Use canonical node keys for simhash identity; display strings for entry payload.
-            self.store.put(
-                tier,
-                key,
-                entry,
-                simhash=compute_simhash(key, canon_subj, pred, canon_obj),
-            )
-            self.store.set_bookkeeping(
-                key,
-                speaker_id=_subj_sid,
-                first_seen_cycle=self.cycle_count,
-                relation_type=_rt,
-                recurrence_count=1,
-                last_seen_cycle=self.cycle_count,
-            )
+            if not defer:
+                # Fold discipline: persist immediately.
+                # Use canonical node keys for simhash identity; display strings for entry payload.
+                self.store.put(
+                    tier,
+                    key,
+                    entry,
+                    simhash=compute_simhash(key, canon_subj, pred, canon_obj),
+                )
+                self.store.set_bookkeeping(
+                    key,
+                    speaker_id=_subj_sid,
+                    first_seen_cycle=self.cycle_count,
+                    relation_type=_rt,
+                    recurrence_count=1,
+                    last_seen_cycle=self.cycle_count,
+                )
+            else:
+                # Interim path: collect for deferred flush after recall-confirmed training.
+                deferred_writes.append(rec)
 
             # Append to tier_keyed directly (direct-append variant).
             # The ik_key attribute is intentionally NOT stamped onto the edge so
@@ -3944,11 +4078,12 @@ class ConsolidationLoop:
                 }
             )
 
-            # Advance the committed counter for the chosen tier.
-            if tier == "procedural":
-                self._procedural_next_index += 1
-            else:
-                self._indexed_next_index += 1
+            if not defer:
+                # Advance the committed counter for the chosen tier.
+                if tier == "procedural":
+                    self._procedural_next_index += 1
+                else:
+                    self._indexed_next_index += 1
 
             minted_by_tier[tier] += 1
 
@@ -3956,12 +4091,13 @@ class ConsolidationLoop:
         if total_minted:
             logger.info(
                 "consolidate_interim_adapters: minted %d enrichment key(s) "
-                "(episodic=%d procedural=%d) for keyless edges",
+                "(episodic=%d procedural=%d) for keyless edges%s",
                 total_minted,
                 minted_by_tier["episodic"],
                 minted_by_tier["procedural"],
+                " [deferred]" if defer else "",
             )
-        return minted_by_tier
+        return minted_by_tier, deferred_writes
 
     def _build_tier_delta(
         self,
@@ -4204,11 +4340,138 @@ class ConsolidationLoop:
                 }
             )
 
+    def _synth_speaker_entities(self, relations: "list[Relation]") -> "list":
+        """Synthesise :class:`~paramem.graph.schema.Entity` objects for speaker-attributed subjects.
+
+        For each :class:`Relation` in *relations* whose ``speaker_id`` is non-empty
+        and whose ``subject`` equals ``speaker_id`` (the node key IS the speaker's
+        system ID per ``_resolve_entity``), emit one
+        :class:`~paramem.graph.schema.Entity` with ``entity_type="person"`` and the
+        matching ``speaker_id``.  Deduplicates by ``speaker_id`` so exactly one
+        entity is produced per unique speaker.
+
+        Non-speaker subjects (``speaker_id == ""`` OR ``subject != speaker_id``) are
+        skipped; their nodes retain no ``speaker_id`` attribute, which resolves to
+        ``""`` in the keyed-walk (the correct default for non-person nodes).
+
+        Used by :meth:`_merge_registry_relations` so that
+        :meth:`~paramem.graph.merger.GraphMerger._upsert_entity` stamps
+        ``speaker_id`` onto the subject node before the keyed-walk in
+        :meth:`_harvest_keyless_edge_entries` reads it.  Without the entity the
+        node would lack ``speaker_id``, causing minted keys to fall back to
+        ``speaker_id=""`` (dcf4189 regression).
+
+        Args:
+            relations: The list of :class:`Relation` objects from which speaker
+                entities are derived.  Both the recon path and the extra-relations
+                (pending-session) path pass their respective relation lists here.
+
+        Returns:
+            A :class:`list` of :class:`~paramem.graph.schema.Entity` objects, one
+            per unique speaker subject found in *relations*.  May be empty when no
+            relation carries a non-empty ``speaker_id`` whose subject equals the
+            speaker ID.
+        """
+        from paramem.graph.schema import Entity as _Entity
+
+        _seen_speaker_ids: set[str] = set()
+        entities: list[_Entity] = []
+        for _r in relations:
+            if _r.speaker_id and _r.speaker_id not in _seen_speaker_ids:
+                # Only create an entity when the subject is the speaker node
+                # (node key == speaker_id, set by _resolve_entity for speakers).
+                # Non-speaker subjects are skipped; their nodes retain no speaker_id.
+                if _r.subject == _r.speaker_id:
+                    entities.append(
+                        _Entity(
+                            name=_r.subject,
+                            entity_type="person",
+                            speaker_id=_r.speaker_id,
+                        )
+                    )
+                    _seen_speaker_ids.add(_r.speaker_id)
+        return entities
+
+    def _merge_registry_relations(
+        self,
+        relations: "list[Relation]",
+        *,
+        session_id: str,
+        log_label: str,
+    ) -> None:
+        """Build a synthetic :class:`SessionGraph` from *relations* and merge it.
+
+        This is the single shared builder for turning a ``list[Relation]`` into an
+        entitied, merged :class:`SessionGraph`.  All three merge paths route through
+        here: the recon path (``session_id="__full_consolidation_recon__"``), the
+        extra-relations (pending-session) path
+        (``session_id="__interim_pending_sessions__"``), and the simulate full-fold
+        path (``session_id="__simulate_consolidation_merge__"``).  There is exactly
+        ONE place that constructs a ``SessionGraph``.
+
+        The entity list is synthesised from *relations* via
+        :meth:`_synth_speaker_entities`, which stamps ``speaker_id`` onto speaker
+        subject nodes.  This ensures the keyed-walk in
+        :meth:`_harvest_keyless_edge_entries` reads the correct ``speaker_id`` from
+        each node (dcf4189 invariant).  Before this unification the recon path used
+        ``entities=[]``, causing reconstructed person nodes to be stored as
+        ``entity_type="concept"`` with no ``speaker_id``; graph-enrichment then
+        rooted facts at unattributed nodes.  The simulate path had the same latent
+        bug: relations with ``speaker_id`` set produced person nodes that became
+        concepts with no ``speaker_id`` because ``entities=[]`` was passed directly.
+
+        The gradient-checkpointing guard is conditional on ``self.model`` being
+        present.  Simulate callers may omit the model entirely (model-free paths);
+        ``additive=True`` skips the model-gated branch regardless, so the guard is
+        defensive-only for those callers.
+
+        Returns early without side effects when *relations* is empty.
+
+        Args:
+            relations: The :class:`Relation` objects to merge.  May be the
+                registry-true recon set, the pending extra-relations set, or the
+                simulate fold's collected interim-slot relations.
+            session_id: Synthetic session identifier passed to
+                :class:`~paramem.graph.schema.SessionGraph`.  Used only for
+                logging/debugging.
+            log_label: Human-readable label for the count log line, e.g.
+                ``"reconstructed triples"`` or ``"extra (pending-session) relations"``.
+        """
+        if not relations:
+            return
+        entities = self._synth_speaker_entities(relations)
+        _session = SessionGraph(
+            session_id=session_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            entities=entities,
+            relations=relations,
+        )
+        # Disable gradient checkpointing: merger.merge may call model.generate()
+        # for contradiction resolution when a model is present (CLAUDE.md rule
+        # applies to ANY model.generate() site).  Guard is conditional so that
+        # simulate callers where self.model is absent or None (model-free paths)
+        # do not crash — additive=True already skips the model-gated branch, so
+        # the guard is defensive-only for those callers.
+        _has_model = getattr(self, "model", None) is not None
+        if _has_model:
+            self._disable_gradient_checkpointing()
+        try:
+            self.merger.merge(_session, additive=True)
+        finally:
+            if _has_model:
+                self._enable_gradient_checkpointing()
+        logger.info(
+            "_materialize_consolidation_graph: re-merged %d %s into keying graph",
+            len(relations),
+            log_label,
+        )
+
     def _materialize_consolidation_graph(
         self,
         *,
         tier: "str | None" = None,
         keys: "list[str] | None" = None,
+        extra_relations: "list[Relation] | None" = None,
     ) -> "tuple[set[str], list[Relation]]":
         """Reconstruct active keys from adapter weights and re-merge registry-true relations.
 
@@ -4218,13 +4481,39 @@ class ConsolidationLoop:
            (``strict=False``).
         2. Compute ``recall_miss_keys`` — keys whose reconstructed SPO disagrees with
            registry-true SPO, or whose reconstruction failed outright.  The set is
-           computed against ``store.all_active_keys()`` unconditionally (scope is
-           never parameterised here).
+           computed against ``store.all_active_keys()`` BEFORE the graph reset, so
+           only registered keys can appear in the miss set.
         3. Reset the merger's keying graph to empty (``merger.reset_graph()``).
         4. Build registry-true :class:`Relation` objects via
            :meth:`_build_registry_true_relations` and re-merge them into the fresh
            keying graph inside a gradient-checkpointing guard.
-        5. Emit debug snapshots ("reconstructed" before re-merge, "merged" after).
+        5. If ``extra_relations`` is supplied and non-empty, re-merge those relations
+           into the fresh keying graph (additive, inside the same gradient-checkpointing
+           guard).  This allows the interim mini-fold to inject the current cycle's
+           pending-session relations alongside the slot's recalled registry-true keys.
+        6. Emit debug snapshots ("reconstructed" before re-merge, "merged" after).
+
+        **INVARIANT — extra_relations and the recall-miss set:**
+        ``extra_relations`` participate in the MERGE / Case-1-adopt step ONLY.
+        They MUST NOT enter the ``recall_miss_keys`` set.  That set is computed
+        against ``store.all_active_keys()`` in step 2, BEFORE the reset — pending
+        unregistered relations (not yet in the registry) therefore cannot distort it.
+        Both ``extra_relations=None`` and ``extra_relations=[]`` are valid no-ops for
+        the fold caller (fold passes ``None``; the check is ``if extra_relations``).
+
+        **Speaker-ID note (unified path):** Both the recon path and the
+        ``extra_relations`` path call :meth:`_merge_registry_relations`, which
+        invokes :meth:`_synth_speaker_entities` to produce a synthetic
+        :class:`~paramem.graph.schema.Entity` (``entity_type="person"``) for each
+        speaker-attributed subject.
+        :meth:`~paramem.graph.merger.GraphMerger._upsert_entity` stamps
+        ``speaker_id`` onto the subject node so that
+        :meth:`_harvest_keyless_edge_entries` reads the correct ``speaker_id``
+        (dcf4189 invariant: minted interim keys must inherit their subject node's
+        ``speaker_id``, not fall back to ``""``).
+        Non-speaker subjects (``speaker_id == ""``) require no entity — their nodes
+        remain attribute-free for ``speaker_id``, which resolves to ``""`` in the
+        walk (correct default).
 
         Args:
             tier: Forwarded to :func:`reconstruct_graph` as ``tier``.  When
@@ -4233,6 +4522,13 @@ class ConsolidationLoop:
             keys: Forwarded to :meth:`_build_registry_true_relations` as ``keys``.
                 When ``None`` (the default), all active keys are processed —
                 byte-identical to the original inline fold behaviour.
+            extra_relations: Optional list of :class:`Relation` objects to merge
+                into the fresh keying graph after the registry-true re-merge.
+                Intended for the interim mini-fold: the caller captures the
+                pending-session relations from ``self.merger.graph`` BEFORE calling
+                this method (since the reset inside will wipe them) and passes them
+                here so they survive the reset and co-reside with the slot's
+                recalled facts.  The fold caller passes ``None`` (no-op).
 
         Returns:
             A 2-tuple ``(recall_miss_keys, recon_relations)`` where:
@@ -4240,7 +4536,9 @@ class ConsolidationLoop:
             - ``recall_miss_keys`` — :class:`set` of key strings that failed
               reconstruction or whose SPO diverged from the registry.
             - ``recon_relations`` — the :class:`list` of :class:`Relation` objects
-              fed into the re-merge (registry-true SPO, with ``indexed_key`` set).
+              fed into the registry-true re-merge (registry-true SPO, with
+              ``indexed_key`` set).  ``extra_relations`` are NOT included here —
+              they travel through a separate merge call inside this method.
         """
         # --- Reconstruct all active keys from adapter weights ---
         # Probes every active key across all tiers; recovers (subject, predicate, object)
@@ -4336,27 +4634,27 @@ class ConsolidationLoop:
 
         recon_relations: list[Relation] = self._build_registry_true_relations(keys=keys)
 
-        if recon_relations:
-            _synthetic_session = SessionGraph(
-                session_id="__full_consolidation_recon__",
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                entities=[],
-                relations=recon_relations,
-            )
-            # Disable gradient checkpointing: merger.merge may call model.generate()
-            # for contradiction resolution when a model is present.  reconstruct_graph
-            # above already restored checkpointing in its finally block, so this merge
-            # needs its own guard (CLAUDE.md rule applies to ANY model.generate() site).
-            self._disable_gradient_checkpointing()
-            try:
-                self.merger.merge(_synthetic_session, additive=True)
-            finally:
-                self._enable_gradient_checkpointing()
-            logger.info(
-                "consolidate_interim_adapters: re-merged %d reconstructed triples "
-                "into keying graph",
-                len(recon_relations),
-            )
+        # Merge registry-true reconstructed relations.  _merge_registry_relations
+        # synthesises speaker entities from the relation list (same logic as the
+        # extra-relations path below) so reconstructed person nodes receive
+        # entity_type="person" + speaker_id from bookkeeping.  Before unification
+        # this block used entities=[] → concept nodes with no speaker_id.
+        self._merge_registry_relations(
+            recon_relations,
+            session_id="__full_consolidation_recon__",
+            log_label="reconstructed triples",
+        )
+
+        # --- Re-merge extra_relations (interim mini-fold pending-session content) ---
+        # INVARIANT: extra_relations participate in MERGE / Case-1-adopt ONLY.
+        # They are NOT included in recall_miss_keys (computed above, before the reset).
+        # extra_relations=None and extra_relations=[] are both valid no-ops (fold caller
+        # passes None; interim passes the pending-session relations from merger.graph).
+        self._merge_registry_relations(
+            extra_relations or [],
+            session_id="__interim_pending_sessions__",
+            log_label="extra (pending-session) relations",
+        )
 
         # Debug: snapshot the merged graph (after re-merge, before enrichment).
         # Emits even when recon_relations is empty so the fold always produces a
@@ -4365,18 +4663,25 @@ class ConsolidationLoop:
 
         return recall_miss_keys, recon_relations
 
-    def _refine_consolidation_graph(self, recon_relations: "list[Relation]") -> None:
+    def _refine_consolidation_graph(
+        self, recon_relations: "list[Relation]", *, enrich: bool = True
+    ) -> None:
         """Run graph enrichment and recurrence bumps after the Materialize stage.
 
         This is the *Refine* stage of the fold pipeline:
 
-        1. Run SOTA graph enrichment via :meth:`_run_graph_enrichment`, which
-           mutates ``self.merger.graph`` in place.
-        2. Emit a debug snapshot ("enriched") after enrichment.
+        1. Optionally run SOTA graph enrichment via :meth:`_run_graph_enrichment`,
+           which mutates ``self.merger.graph`` in place.  Enrichment is skipped
+           when *enrich* is ``False`` (interim path under ``light`` or ``off``
+           refinement level).
+        2. Emit a debug snapshot ("enriched") after enrichment (or immediately
+           when *enrich* is ``False``).
         3. If ``recon_relations`` is non-empty, scan ``merger.reinforcements`` for
            Case-1 duplicate-SPO collapses and call
            :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
-           surviving key.
+           surviving key.  The recurrence-bump runs regardless of *enrich* — it
+           reflects duplicate-SPO collapses from the merge, which happen at every
+           level that merges.
 
         Args:
             recon_relations: The list of registry-true :class:`Relation` objects
@@ -4384,6 +4689,10 @@ class ConsolidationLoop:
                 as a boolean guard — when empty, the recurrence-bump loop is
                 skipped (no re-merge was performed so ``merger.reinforcements``
                 will be empty too).
+            enrich: When ``True`` (the default), run ``_run_graph_enrichment``
+                before the recurrence-bump.  The full fold always passes the
+                default.  The interim path passes ``enrich=(interim_refinement
+                == "full")`` so SOTA enrichment is level-gated.
         """
         # --- Graph-level SOTA enrichment ---
         # Runs AFTER the re-merge so enrichment operates on the populated
@@ -4397,16 +4706,18 @@ class ConsolidationLoop:
         # which is correct — better than silently dropping all enrichment.
         # Enrichment-added edges are keyless and are picked up by the pre-pass that
         # runs after inline-promotion.
-        enrichment_result = self._run_graph_enrichment()
-        if not enrichment_result.get("skipped"):
-            logger.info(
-                "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d",
-                enrichment_result.get("chunks", 0),
-                enrichment_result.get("new_edges", 0),
-                enrichment_result.get("same_as_merges", 0),
-            )
+        if enrich:
+            enrichment_result = self._run_graph_enrichment()
+            if not enrichment_result.get("skipped"):
+                logger.info(
+                    "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d",
+                    enrichment_result.get("chunks", 0),
+                    enrichment_result.get("new_edges", 0),
+                    enrichment_result.get("same_as_merges", 0),
+                )
 
-        # Debug: snapshot the enriched graph (after SOTA enrichment).
+        # Debug: snapshot the enriched graph (after SOTA enrichment, or immediately
+        # when enrichment is skipped at this level).
         # Self-gated; no-op when save_cycle_snapshots=False.
         self._debug_writer.on_fold_graph(self.merger, label="enriched")
 
@@ -4600,8 +4911,8 @@ class ConsolidationLoop:
         # stamped (direct-append variant) to avoid the MultiDiGraph parallel-edge
         # integer-key hazard; the keyed-edge walk's explicit ``if not key: continue`` guard
         # (see below) makes the still-keyless post-pre-pass edges safe to skip.
-        _harvested = self._harvest_keyless_edge_entries(tag_new=False)
-        minted_by_tier = self._apply_keyless_edge_entries(_harvested, tier_keyed)
+        _harvested = self._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
+        minted_by_tier, _ = self._apply_keyless_edge_entries(_harvested, tier_keyed)
 
         # --- Assign per-tier keyed lists from merged-edge provenance ---
         # Walk merger.graph.edges(data=True); per edge, read ik_key from the edge
