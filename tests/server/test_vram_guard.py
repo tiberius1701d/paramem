@@ -482,34 +482,67 @@ class TestDoneCallbackErrorSurfacing:
         future.set_exception(exc)
         return future
 
-    def test_vram_exhausted_populates_state(self):
+    def test_vram_exhausted_populates_state(self, tmp_path):
+        """On VramExhausted, _scheduled_extract_done_callback records a durable
+        incident in the incident store (``incidents.json``) and clears the
+        ``consolidating`` flag.  The incident detail matches the historic shape
+        ``{"type", "phase", "at"}`` so downstream ``/status`` consumers stay
+        HTTP-stable.
+        """
         from paramem.server.app import _scheduled_extract_done_callback, _state
+        from paramem.server.config import PathsConfig, ServerConfig
+        from paramem.server.incidents import read_incidents
 
-        prior = _state.get("last_consolidation_error")
+        cfg = ServerConfig()
+        cfg.paths = PathsConfig(
+            data=tmp_path,
+            sessions=tmp_path / "sessions",
+            debug=tmp_path / "debug",
+        )
+        prior_config = _state.get("config")
         try:
+            _state["config"] = cfg
             future = self._make_future_with_exception(VramExhausted("session-xyz"))
             _scheduled_extract_done_callback(future)
-            err = _state["last_consolidation_error"]
-            assert err is not None
-            assert err["type"] == "vram_exhausted"
-            assert err["phase"] == "session-xyz"
-            assert "at" in err
+            # Incident must be recorded in the durable store.
+            incidents = read_incidents(tmp_path / "state")
+            active = [i for i in incidents if i.type == "vram_exhausted" and i.status == "active"]
+            assert len(active) == 1, f"Expected one active vram_exhausted incident; got {incidents}"
+            inc = active[0]
+            # Detail shape matches the historic {type, phase, at} contract.
+            assert inc.detail["type"] == "vram_exhausted"
+            assert inc.detail["phase"] == "session-xyz"
+            assert "at" in inc.detail
             assert _state["consolidating"] is False
         finally:
-            _state["last_consolidation_error"] = prior
+            _state["config"] = prior_config
 
-    def test_generic_exception_does_not_populate_state(self):
+    def test_generic_exception_does_not_populate_state(self, tmp_path):
+        """Non-VramExhausted exceptions do not record an incident and do not
+        populate the incident store.
+        """
         from paramem.server.app import _scheduled_extract_done_callback, _state
+        from paramem.server.config import PathsConfig, ServerConfig
+        from paramem.server.incidents import read_incidents
 
-        prior = _state.get("last_consolidation_error")
-        _state["last_consolidation_error"] = None
+        cfg = ServerConfig()
+        cfg.paths = PathsConfig(
+            data=tmp_path,
+            sessions=tmp_path / "sessions",
+            debug=tmp_path / "debug",
+        )
+        prior_config = _state.get("config")
         try:
+            _state["config"] = cfg
             future = self._make_future_with_exception(RuntimeError("unrelated"))
             _scheduled_extract_done_callback(future)
-            assert _state["last_consolidation_error"] is None
+            # No incident should be written for a generic exception.
+            incidents = read_incidents(tmp_path / "state")
+            vram_incidents = [i for i in incidents if i.type == "vram_exhausted"]
+            assert vram_incidents == [], f"Expected no vram_exhausted incident; got {incidents}"
             assert _state["consolidating"] is False
         finally:
-            _state["last_consolidation_error"] = prior
+            _state["config"] = prior_config
 
 
 class TestPerChunkOOMSkip:
@@ -739,14 +772,17 @@ class TestExtractionFailedAbortsCycle:
         - leave NO chunk marked consolidated, including chunk #1 which
           extracted successfully (no partial-CV bake)
         - record the failed chunk in _state["chunk_failures"]
-        - populate _state["last_consolidation_error"] with type=extraction_failed
+        - record an ``extraction_failed`` incident in the durable incident store
         - clear the consolidating flag
         """
         from unittest.mock import MagicMock, patch
 
         from paramem.server import app as app_module
+        from paramem.server.incidents import read_incidents
 
         config, buffer, loop = self._make_state(tmp_path)
+        # Incident store lives under config.paths.data / "state".
+        state_dir = config.paths.data / "state"
 
         marked: list[list[str]] = []
         original_mark = buffer.mark_consolidated
@@ -765,7 +801,6 @@ class TestExtractionFailedAbortsCycle:
             app_module._state["model"] = None
             app_module._state["tokenizer"] = None
             app_module._state["chunk_failures"] = []
-            app_module._state["last_consolidation_error"] = None
             app_module._state["consolidating"] = True
             app_module._state["ha_client"] = None
             app_module._state["speaker_store"] = None
@@ -810,12 +845,18 @@ class TestExtractionFailedAbortsCycle:
                     assert f["phase"] == "sota_enrich"
                     assert "529" in f["reason"]
 
-            # last_consolidation_error populated.
-            err = app_module._state.get("last_consolidation_error")
-            assert err is not None
-            assert err["type"] == "extraction_failed"
-            assert err["session_id"] == "doc-bbb"
-            assert err["phase"] == "sota_enrich"
+            # Extraction failure recorded as a durable incident.
+            incidents = read_incidents(state_dir)
+            ef_incidents = [
+                i for i in incidents if i.type == "extraction_failed" and i.status == "active"
+            ]
+            assert len(ef_incidents) >= 1, (
+                f"Expected at least one active extraction_failed incident; got {incidents}"
+            )
+            inc = ef_incidents[0]
+            assert inc.detail["type"] == "extraction_failed"
+            assert inc.detail["session_id"] == "doc-bbb"
+            assert inc.detail["phase"] == "sota_enrich"
 
             # Consolidating flag cleared.
             assert app_module._state["consolidating"] is False

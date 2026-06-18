@@ -62,6 +62,19 @@ logger = logging.getLogger(__name__)
 _VALID_RTYPES: frozenset[str] = frozenset(relation_types())
 _FALLBACK_RTYPE: str = fallback_relation_type()
 
+# Synthetic session-id sentinels used by the three fold/re-merge paths that
+# call _merge_registry_relations or GraphMerger.merge with a pseudo-id rather
+# than a real session identifier.  The harvest filter in
+# _build_all_edge_entries_into subtracts these from edge["sessions"] so that
+# the deferred-write record carries ONLY real contributing session ids (B7-A).
+_SYNTHETIC_SESSION_IDS: frozenset[str] = frozenset(
+    {
+        "__full_consolidation_recon__",
+        "__interim_pending_sessions__",
+        "__simulate_consolidation_merge__",
+    }
+)
+
 
 @dataclass
 class CycleResult:
@@ -2441,6 +2454,7 @@ class ConsolidationLoop:
         mode: "Literal['simulate', 'train']" = "train",
         stamp: "str | None" = None,
         run_label: str = "interim",
+        failed_session_ids: "set[str] | None" = None,
     ) -> Optional[float]:
         """Train (or simulate) the procedural adapter on *rels*.
 
@@ -2464,6 +2478,13 @@ class ConsolidationLoop:
                 an interim cycle.
             run_label: Tag woven into the wandb ``run_name`` for traceability.
                 Default ``"interim"``.
+            failed_session_ids: Mutable set shared with the caller
+                (:meth:`run_consolidation_cycle`).  When a new procedural key
+                fails the recall gate, its contributing session ids (from the
+                position-aligned ``_proc_sid_by_key`` dict built from the source
+                rels' T9 ``session_id`` fields) are added here so the caller can
+                keep those sessions pending (B7-B / T7).  ``None`` disables
+                collection (simulate mode or callers that do not need provenance).
 
         Returns:
             Train loss as ``float`` if training ran, otherwise ``None``.
@@ -2479,6 +2500,13 @@ class ConsolidationLoop:
         new_proc_keyed, existing_proc_keyed = self._prepare_procedural_keys_for_tier(
             rels, speaker_id, mode=mode
         )
+        # B7-B (T7): build key → contributing session ids map from the source rels
+        # (position-aligned with new_proc_keyed — _mint_keyed_entries is 1-to-1 with rels).
+        # Kept separate from the entry dict so session_ids are never persisted (D4 invariant).
+        _proc_sid_by_key: dict[str, list[str]] = {}
+        for _i, _kp in enumerate(new_proc_keyed):
+            _src_sid = rels[_i].get("session_id", "") if _i < len(rels) else ""
+            _proc_sid_by_key[_kp["key"]] = [_src_sid] if _src_sid else []
         all_procedural = existing_proc_keyed + new_proc_keyed
         if not (mode == "train" and all_procedural):
             return None
@@ -2526,6 +2554,14 @@ class ConsolidationLoop:
                     " — skipping registration",
                     kp["key"],
                 )
+                # B7-B (T7): accumulate the contributing session ids for this
+                # recall-failed key into the shared cycle-local set so the
+                # caller (_run_consolidation_cycle) can keep those sessions
+                # pending.  _proc_sid_by_key is built above from the source
+                # rels' T9 session_id fields; session_ids are NOT on the entry
+                # dict to preserve the D4 no-persistence invariant.
+                if failed_session_ids is not None:
+                    failed_session_ids.update(_proc_sid_by_key.get(kp["key"], []))
                 continue
             fingerprint = compute_simhash(kp["key"], kp["subject"], kp["predicate"], kp["object"])
             self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
@@ -2796,6 +2832,14 @@ class ConsolidationLoop:
                             relation_type=_er_rt,  # type: ignore[arg-type]
                             confidence=_er_data.get("confidence", 1.0),
                             speaker_id=_er_spk,
+                            # B7-A: recover the real contributing session ids
+                            # from the merger edge so they survive the re-merge
+                            # through _merge_registry_relations (T3).  The
+                            # merger already accumulated the UNION in
+                            # edge["sessions"] via T2; we carry them forward so
+                            # _build_all_edge_entries_into can expose them on
+                            # the deferred-write record (T5).
+                            session_ids=list(_er_data.get("sessions", [])),
                         )
                     )
 
@@ -2831,16 +2875,11 @@ class ConsolidationLoop:
         # _materialize_consolidation_graph (B1) + _refine_consolidation_graph (B2),
         # merger.graph holds: (a) registry-true re-merged keys (as keyed edges with
         # ik_key stamped) plus (b) the pending-session relations (as keyless edges).
-        # The three fold primitives extract both sets into tier_keyed:
-        #
-        #   _harvest_keyless_edge_entries  — collects keyless predicate-bearing edges
-        #                                    (pending-session facts = new keys)
-        #   _apply_keyless_edge_entries    — mints keys for them; with defer=True,
-        #                                    skips store writes + counter advances so
-        #                                    a training abort cannot leave orphan
-        #                                    registry entries (interim atomicity).
-        #   _collect_keyed_edges_into      — collects already-keyed edges (slot recall
-        #                                    = existing keys for anti-forgetting replay).
+        # _build_all_edge_entries_into handles both sets in one pass:
+        #   - Keyless edges (new): minted keys with defer=True so a training abort
+        #     cannot leave orphan registry entries (interim atomicity).
+        #   - Keyed edges (existing): anti-forgetting replay entries sourced from
+        #     the store — not registered as new.
         #
         # Procedural handling (B3): tier_keyed["procedural"] may be populated by the
         # walk (procedural-typed keyless edges from the pending sessions co-merged
@@ -2852,14 +2891,12 @@ class ConsolidationLoop:
         if mode == "train":
             switch_adapter(self.model, adapter_name)
         _tier_keyed: dict[str, list[dict]] = {"episodic": [], "procedural": [], "semantic": []}
-        _harvested_interim = self._harvest_keyless_edge_entries(
-            tag_new=True,
+        _, _deferred_writes = self._build_all_edge_entries_into(
+            _tier_keyed,
             default_speaker_id=speaker_id,
+            defer=True,
+            tag_new=True,
         )
-        _, _deferred_writes = self._apply_keyless_edge_entries(
-            _harvested_interim, _tier_keyed, defer=True
-        )
-        self._collect_keyed_edges_into(_tier_keyed)
 
         # all_interim_keyed: episodic entries only (new minted + existing keyed).
         # Procedural bucket (_tier_keyed["procedural"]) is collected but unused in B3.
@@ -2873,7 +2910,7 @@ class ConsolidationLoop:
         if mode == "simulate":
             # No training step — apply episodic store mutations immediately.
             # Mirrors the former new_keyed_episodic simulate path; uses the
-            # deferred-write payload from _apply_keyless_edge_entries(defer=True).
+            # deferred-write payload from _build_all_edge_entries_into(defer=True).
             for rec in new_keyed_episodic:
                 _entry = rec["entry"]
                 _key = _entry["key"]
@@ -2963,6 +3000,13 @@ class ConsolidationLoop:
         self.store.replace_simhashes_in_tier(adapter_name, build_registry(_passing_interim))
 
         # --- 11. Procedural (always onto stable "procedural" main adapter) ---
+        # B7-B (T6/T7): cycle-local set accumulates session ids whose contributed
+        # fact failed the recall gate (episodic at 11b, procedural inside
+        # _run_indexed_key_procedural).  Guarded to train mode: in simulate mode
+        # _epi_passing is None so the episodic drop site is never reached, and
+        # the procedural drop site only receives the set when mode=="train".
+        # Simulate callsite (app.py:12499 B2) is explicitly NOT plumbed.
+        _recall_failed_session_ids: set[str] = set()
         proc_train_loss: float | None = None
         if self.procedural_config is not None and procedural_rels:
             proc_train_loss = self._run_indexed_key_procedural(
@@ -2971,6 +3015,9 @@ class ConsolidationLoop:
                 mode=mode,
                 stamp=stamp,
                 run_label=run_label,
+                # Pass None in simulate mode so the procedural gate is not reached
+                # and the set stays empty (B2: simulate has no recall gate).
+                failed_session_ids=_recall_failed_session_ids if mode == "train" else None,
             )
 
         # --- 11b. Apply deferred episodic store mutations ---
@@ -2993,6 +3040,12 @@ class ConsolidationLoop:
                         " — skipping registration",
                         _key,
                     )
+                    # B7-B (T6): accumulate contributing session ids for this
+                    # recall-failed episodic key so the caller can keep those
+                    # sessions pending.  rec["session_ids"] is populated by
+                    # _build_all_edge_entries_into (T5) from edge["sessions"]
+                    # with synthetic sentinels already excluded.
+                    _recall_failed_session_ids.update(rec.get("session_ids", []))
                     continue
                 self.store.put(
                     adapter_name,
@@ -3076,6 +3129,11 @@ class ConsolidationLoop:
             "error": None,
             "episodic_train_loss": epi_train_loss,
             "procedural_train_loss": proc_train_loss,
+            # B7-B (T8): contributing session ids whose new key failed the recall
+            # gate this cycle.  Callers use .get("recall_failed_session_ids", [])
+            # so early-return paths (aborted, no-relations, queued) that do not
+            # run the recall gate are safe.  Simulate mode always produces [].
+            "recall_failed_session_ids": sorted(_recall_failed_session_ids),
         }
         self._debug_writer.on_cycle_end(cycle_summary, interim_stamp=stamp)
         return cycle_summary
@@ -3809,289 +3867,302 @@ class ConsolidationLoop:
 
         return newly_promoted
 
-    def _harvest_keyless_edge_entries(
+    def _build_all_edge_entries_into(
         self,
+        tier_keyed: "dict[str, list[dict]]",
         *,
-        tag_new: bool,
         default_speaker_id: str,
-    ) -> list[dict]:
-        """Walk the merged graph and collect mint records for keyless predicate-bearing edges.
+        defer: bool = False,
+        tag_new: bool = False,
+    ) -> "tuple[dict[str, int], list[dict]]":
+        """Walk ALL merged-graph edges and populate *tier_keyed* with uniform entry dicts.
 
-        **Pure harvester** — does NOT call ``store.put``, ``store.set_bookkeeping``,
-        advance ``_indexed_next_index`` / ``_procedural_next_index``, or append to
-        ``tier_keyed``.  All writes are deferred to
-        :meth:`_apply_keyless_edge_entries`.
+        Single unified edge→entry builder that subsumes the former three-step
+        sequence of ``_harvest_keyless_edge_entries`` →
+        ``_apply_keyless_edge_entries`` → ``_collect_keyed_edges_into``.
 
-        Called as the first half of the fold pre-pass (after
-        :meth:`_promote_mature_keys_inline` and before the per-tier keyed-edge
-        walk) so that SOTA-enrichment second-order facts are harvested in the same
-        fold that introduces them.
+        **One pass, two branches per edge:**
 
-        To reproduce the original sequential-index assignment without mutating the
-        real instance counters, the harvester maintains LOCAL running counters
-        initialised from ``_indexed_next_index`` / ``_procedural_next_index`` and
-        incremented per mint.  The real counters are advanced by
-        :meth:`_apply_keyless_edge_entries`.
+        Keyless edges (no ``ik_key`` on the edge attribute, i.e. newly-extracted or
+        SOTA-enrichment facts):
+            - A key is minted via :meth:`_mint_keyed_entries` using a local running
+              counter seeded from ``_indexed_next_index`` / ``_procedural_next_index``
+              (the real counters are never touched until the write is committed).
+            - ``speaker_id`` is resolved from the subject node's top-level
+              ``speaker_id`` attribute; when the attribute key is ABSENT,
+              ``default_speaker_id`` is used as the fallback (an explicit empty
+              value is kept as ``""`` — this matches :meth:`_tag_speaker_id_defaults`
+              semantics).
+            - When ``defer=False`` (fold discipline): ``store.put``,
+              ``store.set_bookkeeping``, and counter advances are applied immediately.
+            - When ``defer=True`` (interim atomicity): all store writes and counter
+              advances are SKIPPED; the harvest record is added to ``deferred_writes``
+              so the caller can flush after recall-confirmed training.
+            - ``tag_new=True`` attaches ``entry["_new"] = True`` for callers that
+              need to identify newly-minted entries in the result.
 
-        Tier derivation, display-name resolution, speaker_id resolution, and
-        relation_type clamping all mirror the original combined method exactly.
+        Keyed edges (``ik_key`` present):
+            - The training entry is sourced from ``store.get(key)`` (registry-true
+              content); edges with no content entry are silently skipped.
+            - ``speaker_id`` is sourced from bookkeeping (``bookkeeping_for_key``),
+              which carries the original attribution — not from the edge attribute
+              (which may reflect merge-time provenance rather than extraction-time
+              provenance).
+            - No ``store.put`` / ``store.set_bookkeeping`` / counter advances (key
+              already registered; these are anti-forgetting replay entries).
+            - ``_new`` is never set on existing keyed entries.
 
-        Speaker-ID default: when a subject node has no ``speaker_id`` top-level
-        attribute (key absent from the node dict), ``default_speaker_id`` is used
-        as the fallback.  Nodes with an explicit ``speaker_id=""`` keep the empty
-        string — the default is applied only when the key is absent, matching the
-        semantics of :meth:`_tag_speaker_id_defaults`.
+        Both branches append to ``tier_keyed`` with the **identical shape**:
+        ``{key, subject, predicate, object, speaker_id}``.  The deferred-write
+        record additionally carries ``session_ids`` (real contributing session ids,
+        synthetic fold sentinels excluded — B7-A provenance plumbing).
+
+        The ``ik_key`` attribute is intentionally NOT stamped onto keyless edges
+        (direct-append variant) to avoid the MultiDiGraph parallel-edge integer-key
+        hazard.  Both the keyless and keyed branch guard their pass via
+        ``if not key`` / ``if key`` rather than edge mutation, so the same edge
+        object is safe to iterate once.
 
         Args:
-            tag_new: Forwarded to :meth:`_mint_keyed_entries`.  Pass ``False``
-                for the fold pre-pass (current fold behavior) and ``True`` when
-                the caller needs the ``_new`` sentinel on minted entries.
-            default_speaker_id: Fallback speaker identifier used when a subject
-                node carries no ``speaker_id`` attribute (key absent).  The fold
-                passes ``""`` explicitly (no caller-supplied id); the interim path
-                passes the cycle's ``speaker_id`` argument so unattributed nodes
-                receive the cycle's attribution, matching the old
-                ``_tag_speaker_id_defaults`` behaviour.
+            tier_keyed: Mutable mapping of tier name → list of training-entry dicts.
+                Both branches append in-place.
+            default_speaker_id: Fallback ``speaker_id`` for keyless edges whose
+                subject node has no ``speaker_id`` attribute.  The fold passes ``""``
+                (no cycle attribution); the interim path passes the cycle's
+                ``speaker_id`` so unattributed nodes receive the cycle's attribution.
+            defer: When ``True`` (interim path), all store writes and counter
+                advances for NEW (keyless/minted) entries are deferred and returned
+                in ``deferred_writes``.  Existing keyed entries are never written
+                regardless of this flag.  Default ``False`` (fold discipline).
+            tag_new: When ``True``, each minted entry receives ``entry["_new"] =
+                True`` so the caller can identify newly-minted entries in
+                ``tier_keyed``.  Default ``False``.
 
         Returns:
-            List of harvest records, one per edge that will receive a minted key.
-            Each record is a ``dict`` with keys:
+            A 2-tuple ``(minted_by_tier, deferred_writes)`` where:
 
-            - ``"entry"`` – the minted entry dict from :meth:`_mint_keyed_entries`
-            - ``"tier"`` – ``"episodic"`` or ``"procedural"``
-            - ``"canon_subj"`` – canonical node key of the subject (for simhash)
-            - ``"canon_obj"`` – canonical node key of the object (for simhash)
-            - ``"predicate"`` – the raw predicate string
-            - ``"relation_type"`` – the clamped relation type string
-            - ``"speaker_id"`` – the resolved speaker_id (``""`` when the node has
-              an explicit empty value; ``default_speaker_id`` when the attribute is
-              absent)
+            - ``minted_by_tier`` — per-tier count of newly minted keys,
+              e.g. ``{"episodic": 2, "procedural": 1}``.  Existing keyed entries
+              do NOT contribute to this count.
+            - ``deferred_writes`` — harvest records for new entries whose store
+              writes have not yet been applied.  When ``defer=False`` this is
+              always ``[]``; when ``defer=True`` this is one record per minted key.
+              Each record has: ``"entry"``, ``"tier"``, ``"canon_subj"``,
+              ``"canon_obj"``, ``"predicate"``, ``"relation_type"``, ``"speaker_id"``,
+              ``"session_ids"`` (sorted list of real contributing session ids,
+              synthetic fold sentinels excluded — B7-A provenance plumbing).
+
+            Mutates *tier_keyed* in-place.  When ``defer=False``, also mutates
+            the :class:`~paramem.memory.store.MemoryStore` and advances
+            ``_indexed_next_index`` / ``_procedural_next_index`` for each minted key.
         """
         from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
-        # Local running counters — never touch the real self.* counters here.
-        # Seeded lazily on the first keyless edge of each tier: when the graph has
-        # no keyless edges to mint, the real counters are never read (matches the
-        # original loop, which only read them inside its mint branch).
+        minted_by_tier: dict[str, int] = {"episodic": 0, "procedural": 0}
+        deferred_writes: list[dict] = []
+
+        # Local running counters for key minting — never mutate the real self.*
+        # counters inside the walk; they are advanced only at the commit site
+        # (immediately for defer=False; by the caller for defer=True).
+        # Seeded lazily on first use per tier so the real counters are not read
+        # when no keyless edges of that tier are present.
         _local_indexed: int | None = None
         _local_procedural: int | None = None
 
-        harvested: list[dict] = []
-
         for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
-            existing = _t_data.get(_IK_ATTR)
+            key = _t_data.get(_IK_ATTR)
             pred = _t_data.get("predicate", "")
-            # Only process edges that are keyless AND have a predicate.
-            # Keyed edges are handled by the per-tier keyed-edge walk below;
-            # predicate-less edges are not keyable.
-            if existing or not pred:
+            if not pred:
+                # Edges with no predicate are not keyable — skip unconditionally.
                 continue
 
-            # Read relation_type from the edge; clamp to valid schema values.
-            _rt_raw = _t_data.get("relation_type", _FALLBACK_RTYPE)
-            _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+            if not key:
+                # ---- Keyless branch: mint a new key ----
+                # Read relation_type from the edge; clamp to valid schema values.
+                _rt_raw = _t_data.get("relation_type", _FALLBACK_RTYPE)
+                _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
 
-            # Resolve display names from node attributes["name"] (model-A: node keys
-            # are canonical; display surface lives in attributes["name"]).
-            _subj_display = (
-                self.merger.graph.nodes[_t_subj].get("attributes", {}).get("name") or _t_subj
-            )
-            _obj_display = (
-                self.merger.graph.nodes[_t_obj].get("attributes", {}).get("name") or _t_obj
-            )
-            # Resolve speaker_id from the subject node's top-level attribute.
-            # Speaker person-nodes have this set by GraphMerger._upsert_entity.
-            # When the attribute key is ABSENT, use default_speaker_id (the
-            # caller-supplied fallback, "" for the fold and the cycle's speaker_id
-            # for the interim path).  When the attribute is PRESENT but empty
-            # (""), keep "" — the node explicitly carries no speaker attribution
-            # (matches _tag_speaker_id_defaults semantics: only absent keys receive
-            # the default, not explicit-empty values).
-            _node_attrs = self.merger.graph.nodes.get(_t_subj, {}) or {}
-            _subj_sid_raw = _node_attrs.get("speaker_id", None)  # None = key absent
-            _subj_sid = default_speaker_id if _subj_sid_raw is None else _subj_sid_raw
+                # Resolve display names from node attributes["name"].
+                _subj_display = (
+                    self.merger.graph.nodes[_t_subj].get("attributes", {}).get("name") or _t_subj
+                )
+                _obj_display = (
+                    self.merger.graph.nodes[_t_obj].get("attributes", {}).get("name") or _t_obj
+                )
+                # Resolve speaker_id from the subject node's top-level attribute.
+                # When the attribute key is ABSENT, use default_speaker_id.
+                # When the attribute is PRESENT but empty (""), keep "" — the node
+                # explicitly carries no speaker attribution.
+                _node_attrs = self.merger.graph.nodes.get(_t_subj, {}) or {}
+                _subj_sid_raw = _node_attrs.get("speaker_id", None)  # None = key absent
+                _subj_sid = default_speaker_id if _subj_sid_raw is None else _subj_sid_raw
 
-            # Derive tier with the same logic the keyed-edge walk uses.
-            _dummy = [
-                {
-                    "subject": _subj_display,
-                    "predicate": pred,
-                    "object": _obj_display,
-                    "relation_type": _rt,
-                }
-            ]
-            _ep_rels, _proc_rels = partition_relations(
-                _dummy, procedural_enabled=self.procedural_config is not None
-            )
-            tier = "procedural" if _proc_rels else "episodic"
-
-            # Mint via the shared helper (single-element list).
-            # Use the LOCAL running counter as start_index to assign sequential
-            # indices without mutating the real self.* counters.  Seed the local
-            # counter from the real one on first use of each tier.
-            prefix = "proc" if tier == "procedural" else "graph"
-            if tier == "procedural":
-                if _local_procedural is None:
-                    _local_procedural = self._procedural_next_index
-                start_index = _local_procedural
-            else:
-                if _local_indexed is None:
-                    _local_indexed = self._indexed_next_index
-                start_index = _local_indexed
-            minted = self._mint_keyed_entries(
-                [
+                # Derive tier via partition_relations (mirrors the keyed branch).
+                _dummy = [
                     {
                         "subject": _subj_display,
                         "predicate": pred,
                         "object": _obj_display,
                         "relation_type": _rt,
-                        "speaker_id": _subj_sid,
                     }
-                ],
-                prefix=prefix,
-                start_index=start_index,
-                speaker_id=_subj_sid,
-                tag_new=tag_new,
-            )
+                ]
+                _ep_rels, _proc_rels = partition_relations(
+                    _dummy, procedural_enabled=self.procedural_config is not None
+                )
+                tier = "procedural" if _proc_rels else "episodic"
 
-            # Advance the local counter for the chosen tier so the next edge in
-            # this loop gets the next sequential index.
-            if tier == "procedural":
-                _local_procedural += 1
-            else:
-                _local_indexed += 1
+                # Mint via the shared helper (single-element list).
+                # Use LOCAL running counter as start_index; advance after each mint.
+                prefix = "proc" if tier == "procedural" else "graph"
+                if tier == "procedural":
+                    if _local_procedural is None:
+                        _local_procedural = self._procedural_next_index
+                    start_index = _local_procedural
+                else:
+                    if _local_indexed is None:
+                        _local_indexed = self._indexed_next_index
+                    start_index = _local_indexed
 
-            harvested.append(
-                {
-                    "entry": minted[0],
+                minted = self._mint_keyed_entries(
+                    [
+                        {
+                            "subject": _subj_display,
+                            "predicate": pred,
+                            "object": _obj_display,
+                            "relation_type": _rt,
+                            "speaker_id": _subj_sid,
+                        }
+                    ],
+                    prefix=prefix,
+                    start_index=start_index,
+                    speaker_id=_subj_sid,
+                    tag_new=tag_new,
+                )
+
+                # Advance the local counter for the chosen tier.
+                if tier == "procedural":
+                    _local_procedural += 1
+                else:
+                    _local_indexed += 1
+
+                entry = minted[0]
+                minted_key = entry["key"]
+                # B7-A: source the contributing session ids from the merged
+                # edge, excluding synthetic fold sentinels.  The result is a
+                # sorted list of REAL session ids that contributed this fact.
+                # This field is TRANSIENT — it rides the in-RAM record only;
+                # it is never written to the persisted entry dict (store.put)
+                # or to bookkeeping (store.set_bookkeeping).  The drop site
+                # (step 11b) reads rec["session_ids"] to identify which
+                # sessions contributed a recall-failed key.
+                _rec_session_ids: list[str] = sorted(
+                    set(_t_data.get("sessions", [])) - _SYNTHETIC_SESSION_IDS
+                )
+                rec = {
+                    "entry": entry,
                     "tier": tier,
                     "canon_subj": _t_subj,
                     "canon_obj": _t_obj,
                     "predicate": pred,
                     "relation_type": _rt,
                     "speaker_id": _subj_sid,
+                    "session_ids": _rec_session_ids,
                 }
-            )
 
-        return harvested
-
-    def _apply_keyless_edge_entries(
-        self,
-        harvested: list[dict],
-        tier_keyed: dict[str, list[dict]],
-        *,
-        defer: bool = False,
-    ) -> "tuple[dict[str, int], list[dict]]":
-        """Persist harvested keyless-edge mint records and populate *tier_keyed*.
-
-        **Applier** — consumes the records returned by
-        :meth:`_harvest_keyless_edge_entries` and reproduces exactly the writes
-        the original combined method performed:
-
-        - ``store.put`` with the minted entry and its simhash
-        - ``store.set_bookkeeping`` with the same kwargs as before
-        - Appending ``{key, subject, predicate, object}`` to ``tier_keyed[tier]``
-        - Advancing ``_indexed_next_index`` / ``_procedural_next_index`` by one
-          per minted episodic / procedural key
-
-        Uses canonical node keys (``canon_subj``, ``canon_obj``) for the simhash
-        and display strings (from ``entry["subject"]`` / ``entry["object"]``) for
-        the ``tier_keyed`` payload — identical to the original method.
-
-        Args:
-            harvested: List of harvest records from
-                :meth:`_harvest_keyless_edge_entries`.
-            tier_keyed: The tier → keyed-entries dict that the keyed-edge walk also
-                populates.  This method appends directly to it so both the pre-pass
-                entries and the keyed-edge walk entries land in the same structure
-                that feeds training.
-            defer: When ``False`` (default, fold discipline) the store writes
-                (``store.put``, ``store.set_bookkeeping``) and counter advances
-                (``_indexed_next_index``, ``_procedural_next_index``) are applied
-                immediately — byte-identical to the original method.  When
-                ``True`` (interim path, B3) ALL store writes and counter advances
-                are SKIPPED; only ``tier_keyed`` is populated and the harvested
-                records are returned as the deferred-write payload so the caller
-                can apply them after recall-confirmed training (interim atomicity:
-                a training abort must not leave orphan registry entries).
-
-        Returns:
-            A 2-tuple ``(minted_by_tier, deferred_writes)`` where:
-
-            - ``minted_by_tier`` — per-tier minted count,
-              e.g. ``{"episodic": 2, "procedural": 1}``.
-            - ``deferred_writes`` — the harvested records that still need
-              ``store.put`` / ``store.set_bookkeeping`` / counter advances.
-              When ``defer=False`` (fold) this is always ``[]`` (writes already
-              applied); when ``defer=True`` (interim) this is the full
-              *harvested* list (writes deferred to the caller's flush site).
-
-            Mutates *tier_keyed* in-place.  When ``defer=False``, also mutates
-            the :class:`~paramem.memory.store.MemoryStore` and advances
-            ``_indexed_next_index`` / ``_procedural_next_index``.
-        """
-        minted_by_tier: dict[str, int] = {"episodic": 0, "procedural": 0}
-        deferred_writes: list[dict] = []
-
-        for rec in harvested:
-            entry = rec["entry"]
-            tier = rec["tier"]
-            canon_subj = rec["canon_subj"]
-            canon_obj = rec["canon_obj"]
-            pred = rec["predicate"]
-            _rt = rec["relation_type"]
-            _subj_sid = rec["speaker_id"]
-            key = entry["key"]
-
-            if not defer:
-                # Fold discipline: persist immediately.
-                # Use canonical node keys for simhash identity; display strings for entry payload.
-                self.store.put(
-                    tier,
-                    key,
-                    entry,
-                    simhash=compute_simhash(key, canon_subj, pred, canon_obj),
-                )
-                self.store.set_bookkeeping(
-                    key,
-                    speaker_id=_subj_sid,
-                    first_seen_cycle=self.cycle_count,
-                    relation_type=_rt,
-                    recurrence_count=1,
-                    last_seen_cycle=self.cycle_count,
-                )
-            else:
-                # Interim path: collect for deferred flush after recall-confirmed training.
-                deferred_writes.append(rec)
-
-            # Append to tier_keyed directly (direct-append variant).
-            # The ik_key attribute is intentionally NOT stamped onto the edge so
-            # the MultiDiGraph parallel-edge integer key field is not disturbed.
-            # The keyed-edge walk will encounter this edge again as still-keyless
-            # and the explicit ``if not key: continue`` guard will skip it cleanly.
-            tier_keyed[tier].append(
-                {
-                    "key": key,
-                    "subject": entry["subject"],
-                    "predicate": pred,
-                    "object": entry["object"],
-                }
-            )
-
-            if not defer:
-                # Advance the committed counter for the chosen tier.
-                if tier == "procedural":
-                    self._procedural_next_index += 1
+                if not defer:
+                    # Fold discipline: persist immediately.
+                    self.store.put(
+                        tier,
+                        minted_key,
+                        entry,
+                        simhash=compute_simhash(minted_key, _t_subj, pred, _t_obj),
+                    )
+                    self.store.set_bookkeeping(
+                        minted_key,
+                        speaker_id=_subj_sid,
+                        first_seen_cycle=self.cycle_count,
+                        relation_type=_rt,
+                        recurrence_count=1,
+                        last_seen_cycle=self.cycle_count,
+                    )
+                    # Advance the committed counter for the chosen tier.
+                    if tier == "procedural":
+                        self._procedural_next_index += 1
+                    else:
+                        self._indexed_next_index += 1
                 else:
-                    self._indexed_next_index += 1
+                    # Interim atomicity: defer all store writes + counter advances.
+                    deferred_writes.append(rec)
 
-            minted_by_tier[tier] += 1
+                # Append to tier_keyed (uniform shape, same as the keyed branch).
+                # The ik_key attribute is intentionally NOT stamped onto the edge so
+                # the MultiDiGraph parallel-edge integer key field is not disturbed.
+                tier_keyed[tier].append(
+                    {
+                        "key": minted_key,
+                        "subject": entry["subject"],
+                        "predicate": pred,
+                        "object": entry["object"],
+                        "speaker_id": _subj_sid,
+                    }
+                )
+                minted_by_tier[tier] += 1
+
+            else:
+                # ---- Keyed branch: existing key, anti-forgetting replay ----
+                entry = self.store.get(key)
+                if entry is None:
+                    # Key is registered but has no content entry — skip.
+                    logger.debug(
+                        "_build_all_edge_entries_into: key %s has no content entry — skipping",
+                        key,
+                    )
+                    continue
+
+                # Tier from per-key bookkeeping relation_type (not from the edge,
+                # which may carry the merge-time value rather than the original type).
+                _bk = self.store.bookkeeping_for_key(key) or {}
+                _rt_raw = _bk.get("relation_type", _FALLBACK_RTYPE)
+                _rt = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+                # Speaker_id from bookkeeping — original extraction-time attribution.
+                _subj_sid = _bk.get("speaker_id") or ""
+                current_adapter_id = self.store.tier_for_active_key(key) or "episodic"
+                _dummy = [
+                    {
+                        "subject": _t_subj,
+                        "predicate": pred,
+                        "object": _t_obj,
+                        "relation_type": _rt,
+                    }
+                ]
+                _ep_rels, _proc_rels = partition_relations(
+                    _dummy, procedural_enabled=self.procedural_config is not None
+                )
+                if _proc_rels:
+                    tier = "procedural"
+                elif _ep_rels:
+                    # Semantic keys remain semantic; all others map to episodic.
+                    tier = "semantic" if current_adapter_id == "semantic" else "episodic"
+                else:
+                    tier = "episodic"
+
+                # Uniform entry shape — identical to the keyless branch.
+                tier_keyed[tier].append(
+                    {
+                        "key": key,
+                        "subject": entry["subject"],
+                        "predicate": entry["predicate"],
+                        "object": entry["object"],
+                        "speaker_id": _subj_sid,
+                    }
+                )
+                # Existing keyed entries are never counted as minted and never
+                # deferred — they are already in the store.
 
         total_minted = sum(minted_by_tier.values())
         if total_minted:
             logger.info(
-                "consolidate_interim_adapters: minted %d enrichment key(s) "
-                "(episodic=%d procedural=%d) for keyless edges%s",
+                "_build_all_edge_entries_into: minted %d new key(s) (episodic=%d procedural=%d)%s",
                 total_minted,
                 minted_by_tier["episodic"],
                 minted_by_tier["procedural"],
@@ -4252,94 +4323,6 @@ class ConsolidationLoop:
             )
         return relations
 
-    def _collect_keyed_edges_into(self, tier_keyed: "dict[str, list[dict]]") -> None:
-        """Walk the merged graph's keyed edges and append their training entries to tier_keyed.
-
-        Iterates ``self.merger.graph.edges(data=True)`` and, for each edge that
-        carries both a predicate and an ``ik_key`` attribute, resolves the training
-        entry from the content store and routes it to the appropriate tier via
-        bookkeeping ``relation_type`` + :func:`partition_relations`.
-
-        Skip conditions (same as the inline fold walk they replace):
-
-        - No predicate on the edge → skip (not keyable).
-        - No ``ik_key`` on the edge → skip (keyless edges are handled by the
-          pre-pass in ``_harvest_keyless_edge_entries`` / ``_apply_keyless_edge_entries``).
-        - ``store.get(key)`` returns ``None`` → skip (key registered but no content entry).
-
-        Tier derivation mirrors the fold:
-
-        - ``relation_type`` from bookkeeping (clamped to ``_VALID_RTYPES``).
-        - ``partition_relations`` decides procedural vs episodic/semantic.
-        - Semantic keys (``store.tier_for_active_key == "semantic"``) stay semantic
-          when they map to the episodic partition; all others map to episodic.
-
-        Results are appended **in-place** to ``tier_keyed``; the caller owns the
-        dict and its per-tier lists.
-
-        Args:
-            tier_keyed: Mutable mapping of tier name → list of training-entry dicts.
-                Each entry appended has the shape
-                ``{"key": str, "subject": str, "predicate": str, "object": str}``.
-        """
-        from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
-
-        for _t_subj, _t_obj, _t_data in self.merger.graph.edges(data=True):
-            key = _t_data.get(_IK_ATTR)
-            _t_pred = _t_data.get("predicate", "")
-            if not _t_pred:
-                # Edges with no predicate are not keyable — skip unconditionally.
-                continue
-            if not key:
-                # The pre-pass already appended this edge to tier_keyed; skip here
-                # to avoid a store.get(None) call.  This branch is reached for
-                # keyless-but-predicate-bearing edges (typically SOTA-enrichment
-                # facts) whose ik_key was intentionally not stamped onto the edge
-                # by the direct-append pre-pass.
-                continue
-
-            entry = self.store.get(key)
-            if entry is None:
-                # Key is registered but has no content entry — skip.
-                logger.debug(
-                    "consolidate_interim_adapters: key %s has no content entry — skipping", key
-                )
-                continue
-
-            # Tier from per-key bookkeeping relation_type (not from the edge, which
-            # may carry the merge-time value rather than the original extraction type).
-            _bk = self.store.bookkeeping_for_key(key) or {}
-            _rt_raw = _bk.get("relation_type", _FALLBACK_RTYPE)
-            _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
-            current_adapter_id = self.store.tier_for_active_key(key) or "episodic"
-            _dummy = [
-                {
-                    "subject": _t_subj,
-                    "predicate": _t_pred,
-                    "object": _t_obj,
-                    "relation_type": _rt,
-                }
-            ]
-            _ep_rels, _proc_rels = partition_relations(
-                _dummy, procedural_enabled=self.procedural_config is not None
-            )
-            if _proc_rels:
-                tier = "procedural"
-            elif _ep_rels:
-                # Semantic keys remain semantic; all others map to episodic.
-                tier = "semantic" if current_adapter_id == "semantic" else "episodic"
-            else:
-                tier = "episodic"
-
-            tier_keyed[tier].append(
-                {
-                    "key": key,
-                    "subject": entry["subject"],
-                    "predicate": entry["predicate"],
-                    "object": entry["object"],
-                }
-            )
-
     def _synth_speaker_entities(self, relations: "list[Relation]") -> "list":
         """Synthesise :class:`~paramem.graph.schema.Entity` objects for speaker-attributed subjects.
 
@@ -4356,8 +4339,8 @@ class ConsolidationLoop:
 
         Used by :meth:`_merge_registry_relations` so that
         :meth:`~paramem.graph.merger.GraphMerger._upsert_entity` stamps
-        ``speaker_id`` onto the subject node before the keyed-walk in
-        :meth:`_harvest_keyless_edge_entries` reads it.  Without the entity the
+        ``speaker_id`` onto the subject node before the edge walk in
+        :meth:`_build_all_edge_entries_into` reads it.  Without the entity the
         node would lack ``speaker_id``, causing minted keys to fall back to
         ``speaker_id=""`` (dcf4189 regression).
 
@@ -4411,8 +4394,8 @@ class ConsolidationLoop:
 
         The entity list is synthesised from *relations* via
         :meth:`_synth_speaker_entities`, which stamps ``speaker_id`` onto speaker
-        subject nodes.  This ensures the keyed-walk in
-        :meth:`_harvest_keyless_edge_entries` reads the correct ``speaker_id`` from
+        subject nodes.  This ensures the edge walk in
+        :meth:`_build_all_edge_entries_into` reads the correct ``speaker_id`` from
         each node (dcf4189 invariant).  Before this unification the recon path used
         ``entities=[]``, causing reconstructed person nodes to be stored as
         ``entity_type="concept"`` with no ``speaker_id``; graph-enrichment then
@@ -4508,7 +4491,7 @@ class ConsolidationLoop:
         speaker-attributed subject.
         :meth:`~paramem.graph.merger.GraphMerger._upsert_entity` stamps
         ``speaker_id`` onto the subject node so that
-        :meth:`_harvest_keyless_edge_entries` reads the correct ``speaker_id``
+        :meth:`_build_all_edge_entries_into` reads the correct ``speaker_id``
         (dcf4189 invariant: minted interim keys must inherit their subject node's
         ``speaker_id``, not fall back to ``""``).
         Non-speaker subjects (``speaker_id == ""``) require no entity — their nodes
@@ -4893,41 +4876,33 @@ class ConsolidationLoop:
             )
 
         # tier_keyed is initialised here (before the pre-pass) so that both
-        # _harvest_keyless_edge_entries/_apply_keyless_edge_entries and the keyed-edge
-        # walk below append to the same dict.
+        # _build_all_edge_entries_into populates tier_keyed in one pass over all edges.
         tier_keyed: dict[str, list[dict]] = {
             "episodic": [],
             "semantic": [],
             "procedural": [],
         }
 
-        # --- Enrichment pre-pass: mint keys for keyless predicate-bearing edges ---
-        # SOTA-enrichment adds edges to the merged graph without an ik_key attribute.
-        # The keyed-edge walk below would skip them (key is falsy → continue), causing every
-        # second-order enrichment fact to be silently dropped from the training set.
-        # This pre-pass walks the graph BEFORE the keyed-edge walk, mints a key for each such
-        # edge, registers it in the store, appends it to tier_keyed, and advances
-        # the committed counter.  The edge's ik_key attribute is intentionally NOT
-        # stamped (direct-append variant) to avoid the MultiDiGraph parallel-edge
-        # integer-key hazard; the keyed-edge walk's explicit ``if not key: continue`` guard
-        # (see below) makes the still-keyless post-pre-pass edges safe to skip.
-        _harvested = self._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        minted_by_tier, _ = self._apply_keyless_edge_entries(_harvested, tier_keyed)
-
-        # --- Assign per-tier keyed lists from merged-edge provenance ---
-        # Walk merger.graph.edges(data=True); per edge, read ik_key from the edge
-        # attribute (stamped by the re-merge via _upsert_relation new-edge insertion
-        # or Case-1-adopt).  Tier derived from per-key bookkeeping relation_type +
-        # partition_relations (triple-identity matching is no longer required because
-        # the key is stamped directly on the edge by the merger).
-        #
-        # When two active keys share an identical (s,p,o), the re-merge fires Case-1
-        # on the second arriving edge: the existing edge keeps its ik_key (the
-        # surviving key) and the incoming relation.indexed_key is recorded in
-        # merger.collapsed (the deduplicated key).  Only ONE edge survives in the
-        # merged graph, so only ONE key appears in tier_keyed.  The deduplicated
-        # key is absent from tier_keyed but its fact is preserved under the surviving
-        # twin — this is intended dedup, NOT data loss.
+        # --- Edge-to-entry pass: mint new keys + collect existing keys ---
+        # _build_all_edge_entries_into walks ALL merged-graph edges in one pass:
+        #   - Keyless edges (SOTA-enrichment or pending facts): minted immediately
+        #     (defer=False); the committed counter is advanced per minted key; the
+        #     ik_key attribute is intentionally NOT stamped onto the edge so the
+        #     MultiDiGraph parallel-edge integer key field is not disturbed.
+        #   - Keyed edges (registry-true reconstructed facts): anti-forgetting replay
+        #     entries sourced from the store; NOT counted as minted, NOT re-registered.
+        # Both branches produce uniform {key, subject, predicate, object, speaker_id}
+        # entries in tier_keyed.
+        # Dedup note: when two active keys share identical (s,p,o), the re-merge fires
+        # Case-1 — the surviving edge keeps its ik_key; the incoming key is recorded
+        # in merger.collapsed (soft-staled later).  Only ONE edge survives per (s,p,o),
+        # so only ONE key appears in tier_keyed — this is intended dedup, NOT data loss.
+        minted_by_tier, _ = self._build_all_edge_entries_into(
+            tier_keyed,
+            default_speaker_id="",
+            defer=False,
+            tag_new=False,
+        )
 
         if recall_miss_keys:
             logger.info(
@@ -4936,8 +4911,6 @@ class ConsolidationLoop:
                 len(recall_miss_keys),
                 sorted(recall_miss_keys),
             )
-
-        self._collect_keyed_edges_into(tier_keyed)
 
         # Debug: snapshot the graph after the keyed-edge walk (before the floor-gate pass
         # mutates tier_keyed).  Self-gated; no-op when save_cycle_snapshots=False.
@@ -5824,7 +5797,7 @@ class ConsolidationLoop:
 
         # --- Per-tier delta for train mode ---
         # Build the tier_delta record from the before-snapshot + serve_assignment
-        # (active after) + minted_by_tier from _apply_keyless_edge_entries.
+        # (active after) + minted_by_tier from _build_all_edge_entries_into.
         # staled_by_reason is derived from merger.removal_ledger via _build_tier_delta
         # (includes all removal reasons: dedup, enrichment_same_as, contradiction_*).
         _train_tiers = ("episodic", "semantic", "procedural")

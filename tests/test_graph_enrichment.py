@@ -1383,16 +1383,19 @@ class TestRefineConsolidationGraph:
 
 
 # ---------------------------------------------------------------------------
-# Tests for _harvest_keyless_edge_entries / _apply_keyless_edge_entries (fold pre-pass)
+# Tests for _build_all_edge_entries_into (unified edge→entry builder)
 # ---------------------------------------------------------------------------
 
 
 class TestHarvestKeylessEdges:
-    """Unit tests for the fold pre-pass that mints keys for keyless graph edges.
+    """Unit tests for the unified edge→entry builder (_build_all_edge_entries_into).
 
     Uses _make_loop from this module (real nx.MultiDiGraph + real MemoryStore,
     mocked model/tokenizer so no GPU).  replay_enabled=True so store.put()
     writes into the KeyRegistry.
+
+    These tests exercise the keyless-edge (minting) branch of the builder by
+    populating the graph with only keyless predicate-bearing edges.
     """
 
     def test_keyless_edge_minted_in_store_and_tier_keyed(self, tmp_path):
@@ -1413,8 +1416,7 @@ class TestHarvestKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         # Exactly one key minted (factual → episodic).
         assert len(tier_keyed["episodic"]) == 1
@@ -1455,8 +1457,7 @@ class TestHarvestKeylessEdges:
         graph.add_edge("Bob", "Coffee", predicate="likes", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         assert len(tier_keyed["episodic"]) == 2
         assert loop._indexed_next_index == initial_index + 2
@@ -1486,10 +1487,10 @@ class TestHarvestKeylessEdges:
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         initial_index = loop._indexed_next_index
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
-        # Nothing minted — the edge already has a key.
+        # The keyed edge has no store entry, so it is skipped — nothing in tier_keyed.
+        # No new key is minted (_indexed_next_index unchanged).
         assert tier_keyed["episodic"] == []
         assert loop._indexed_next_index == initial_index
 
@@ -1507,8 +1508,7 @@ class TestHarvestKeylessEdges:
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         initial_index = loop._indexed_next_index
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         assert tier_keyed["episodic"] == []
         assert tier_keyed["semantic"] == []
@@ -1527,8 +1527,7 @@ class TestHarvestKeylessEdges:
         graph.add_edge("Carol", "London", predicate="visited", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         minted_key = tier_keyed["episodic"][0]["key"]
         _all_keyed = {e["key"] for tl in tier_keyed.values() for e in tl}
@@ -1556,8 +1555,7 @@ class TestHarvestKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         # preference → episodic (no procedural adapter in _make_loop).
         assert len(tier_keyed["episodic"]) == 1
@@ -1570,7 +1568,7 @@ class TestHarvestKeylessEdges:
         """Keyless preference edge routes to procedural when procedural_config is set.
 
         _make_loop passes procedural_adapter_config=None so the procedural
-        branch of _harvest_keyless_edge_entries never fires in the other tests.
+        branch of _build_all_edge_entries_into never fires in the other tests.
         This test constructs the loop the same way _make_loop does but adds a
         real AdapterConfig as procedural_adapter_config and pre-populates
         "procedural" in model.peft_config so _ensure_adapters skips creation.
@@ -1625,8 +1623,7 @@ class TestHarvestKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         # The preference edge routes to procedural, not episodic.
         assert len(tier_keyed["procedural"]) == 1
@@ -1708,8 +1705,7 @@ class TestHarvestKeylessEdges:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         assert len(tier_keyed["episodic"]) == 1
         minted_key = tier_keyed["episodic"][0]["key"]
@@ -1723,53 +1719,15 @@ class TestHarvestKeylessEdges:
 
 
 class TestHarvestApplySplit:
-    """Tests verifying the pure-harvester / applier split of keyless-edge minting.
+    """Tests verifying the unified edge→entry builder (_build_all_edge_entries_into).
 
-    The harvester must be side-effect free; the applier must reproduce exactly
-    the writes the original combined method produced.
+    Covers the defer=True (interim atomicity) and defer=False (fold discipline)
+    paths, plus the minted_by_tier / deferred_writes return contract.
     """
 
-    def test_harvester_does_no_writes(self, tmp_path):
-        """_harvest_keyless_edge_entries must NOT call store.put, store.set_bookkeeping,
-        or advance self._indexed_next_index / self._procedural_next_index.  It must
-        return the expected number of harvest records.
-        """
-        from unittest.mock import patch
-
-        from paramem.training.key_registry import KeyRegistry
-
-        loop = _make_loop(tmp_path, replay_enabled=True)
-        for tier in ("episodic", "semantic", "procedural"):
-            loop.store.load_registry(tier, KeyRegistry())
-
-        loop.merger.graph.add_edge("Alice", "Berlin", predicate="lives_in", relation_type="factual")
-        loop.merger.graph.add_edge("Bob", "Coffee", predicate="likes", relation_type="factual")
-
-        initial_indexed = loop._indexed_next_index
-        initial_procedural = loop._procedural_next_index
-
-        with (
-            patch.object(loop.store, "put", wraps=loop.store.put) as mock_put,
-            patch.object(
-                loop.store, "set_bookkeeping", wraps=loop.store.set_bookkeeping
-            ) as mock_bk,
-        ):
-            harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-
-            # No store writes must occur during harvest.
-            mock_put.assert_not_called()
-            mock_bk.assert_not_called()
-
-        # Counters must be unchanged.
-        assert loop._indexed_next_index == initial_indexed
-        assert loop._procedural_next_index == initial_procedural
-
-        # Two keyless edges → two harvest records.
-        assert len(harvested) == 2
-
-    def test_applier_reproduces_writes(self, tmp_path):
-        """_apply_keyless_edge_entries must produce the same store writes, tier_keyed
-        entries, and counter end-state as the original combined method did.
+    def test_defer_false_produces_writes_and_count(self, tmp_path):
+        """defer=False (default) must write to the store, advance counters, and
+        return (minted_by_tier, []) — no deferred writes.
         """
         from paramem.training.key_registry import KeyRegistry
 
@@ -1781,11 +1739,12 @@ class TestHarvestApplySplit:
 
         initial_indexed = loop._indexed_next_index
 
-        harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        minted_by_tier, _deferred = loop._apply_keyless_edge_entries(harvested, tier_keyed)
+        minted_by_tier, _deferred = loop._build_all_edge_entries_into(
+            tier_keyed, default_speaker_id=""
+        )
 
-        # Exactly one episodic key minted.  defer=False (default) → no deferred writes.
+        # Exactly one episodic key minted.  defer=False → no deferred writes.
         assert minted_by_tier == {"episodic": 1, "procedural": 0}
         assert _deferred == [], "defer=False must produce empty deferred_writes"
         assert len(tier_keyed["episodic"]) == 1
@@ -1824,9 +1783,8 @@ class TestHarvestApplySplit:
         loop.merger.graph.add_edge("Dave", "Paris", predicate="lives_in", relation_type="factual")
         loop.merger.graph.add_edge("Eve", "Tea", predicate="likes", relation_type="factual")
 
-        harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._apply_keyless_edge_entries(harvested, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         assert len(tier_keyed["episodic"]) == 2
         assert loop._indexed_next_index == initial_indexed + 2
@@ -1836,13 +1794,13 @@ class TestHarvestApplySplit:
         assert f"graph{initial_indexed}" in minted_keys
         assert f"graph{initial_indexed + 1}" in minted_keys
 
-    def test_harvester_no_keyless_edges_does_not_read_counters(self, tmp_path):
-        """With no keyless edges to mint, the harvester must not read the index
-        counters at all — it returns [] even when those attributes are absent.
+    def test_no_keyless_edges_does_not_read_counters(self, tmp_path):
+        """With no keyless edges to mint, the builder must not read the index
+        counters at all (lazy-seed contract).
 
         Guards the lazy-seed contract: callers that exercise the keyed-edge walk
-        without any keyless edges (e.g. a graph of only keyed or predicate-less
-        edges) need not have the index counters initialised.
+        without any keyless edges (e.g. a graph of only predicate-less edges) need
+        not have the index counters initialised.
         """
         from paramem.training.key_registry import KeyRegistry
 
@@ -1857,8 +1815,13 @@ class TestHarvestApplySplit:
         # Only a predicate-less edge — nothing keyless+keyable to mint.
         loop.merger.graph.add_edge("Dave", "Paris")
 
-        harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        assert harvested == []
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        minted_by_tier, deferred = loop._build_all_edge_entries_into(
+            tier_keyed, default_speaker_id=""
+        )
+        assert minted_by_tier == {"episodic": 0, "procedural": 0}
+        assert deferred == []
+        assert tier_keyed == {"episodic": [], "semantic": [], "procedural": []}
 
 
 class TestEnrichmentRemovalLedger:
@@ -2003,22 +1966,22 @@ class TestEnrichmentRemovalLedger:
 
 
 class TestB3InterimKeyingSeams:
-    """B3: graph-walk keying for the interim path.
+    """B3: graph-walk keying for the interim path (_build_all_edge_entries_into).
 
     Covers:
     - dcf4189 invariant: speaker_id propagated through the graph-walk.
     - default_speaker_id fallback (absent node attr → caller's id).
     - Explicit speaker_id="" preserved (not overwritten by default).
     - defer=True performs NO store writes and NO counter advances.
-    - defer=True returns the full harvested list as deferred_writes.
+    - defer=True returns the deferred_writes list for later flush.
     - tag_new=True stamps minted entries with the _new sentinel.
     """
 
     def test_speaker_id_from_node_attr_carried_through(self, tmp_path):
-        """dcf4189 invariant: _harvest_keyless_edge_entries reads speaker_id from
-        the subject node's top-level attribute and threads it into the harvest
-        record, so _apply_keyless_edge_entries (and the interim flush at step 11b)
-        write the correct speaker_id to store.set_bookkeeping.
+        """dcf4189 invariant: _build_all_edge_entries_into reads speaker_id from
+        the subject node's top-level attribute and threads it into the entry and
+        deferred_writes record, so the interim flush at step 11b writes the correct
+        speaker_id to store.set_bookkeeping.
 
         A node WITH speaker_id set gets that value; a node WITHOUT speaker_id attr
         gets the caller-supplied default_speaker_id.
@@ -2034,20 +1997,21 @@ class TestB3InterimKeyingSeams:
         loop.merger.graph.add_node("berlin", attributes={"name": "Berlin"})
         loop.merger.graph.add_edge("alice", "berlin", predicate="lives_in", relation_type="factual")
 
-        # Node without speaker_id attr — harvester applies default_speaker_id.
+        # Node without speaker_id attr — builder applies default_speaker_id.
         loop.merger.graph.add_node("bob", attributes={"name": "Bob"})
         loop.merger.graph.add_node("coffee", attributes={"name": "Coffee"})
         loop.merger.graph.add_edge("bob", "coffee", predicate="likes", relation_type="factual")
 
-        harvested = loop._harvest_keyless_edge_entries(
-            tag_new=True, default_speaker_id="DefaultSpeaker"
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        _, deferred_writes = loop._build_all_edge_entries_into(
+            tier_keyed, default_speaker_id="DefaultSpeaker", defer=True, tag_new=True
         )
 
-        assert len(harvested) == 2
+        assert len(deferred_writes) == 2
 
         # Find each record by subject display name.
-        alice_rec = next(r for r in harvested if r["entry"]["subject"] == "Alice")
-        bob_rec = next(r for r in harvested if r["entry"]["subject"] == "Bob")
+        alice_rec = next(r for r in deferred_writes if r["entry"]["subject"] == "Alice")
+        bob_rec = next(r for r in deferred_writes if r["entry"]["subject"] == "Bob")
 
         # Alice's node has speaker_id="Speaker0" → entry gets that value.
         assert alice_rec["speaker_id"] == "Speaker0", (
@@ -2059,6 +2023,12 @@ class TestB3InterimKeyingSeams:
             f"Expected 'DefaultSpeaker' (default) for unattributed node; "
             f"got {bob_rec['speaker_id']!r}"
         )
+
+        # tier_keyed entries carry the same speaker_id — uniform entry shape.
+        alice_entry = next(e for e in tier_keyed["episodic"] if e["subject"] == "Alice")
+        bob_entry = next(e for e in tier_keyed["episodic"] if e["subject"] == "Bob")
+        assert alice_entry["speaker_id"] == "Speaker0"
+        assert bob_entry["speaker_id"] == "DefaultSpeaker"
 
     def test_explicit_empty_speaker_id_not_overwritten_by_default(self, tmp_path):
         """A node with speaker_id="" explicitly set keeps "" — the default is NOT
@@ -2076,20 +2046,23 @@ class TestB3InterimKeyingSeams:
         loop.merger.graph.add_node("london", attributes={"name": "London"})
         loop.merger.graph.add_edge("carol", "london", predicate="visits", relation_type="factual")
 
-        harvested = loop._harvest_keyless_edge_entries(
-            tag_new=True, default_speaker_id="ShouldNotAppear"
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        _, deferred_writes = loop._build_all_edge_entries_into(
+            tier_keyed, default_speaker_id="ShouldNotAppear", defer=True, tag_new=True
         )
 
-        assert len(harvested) == 1
-        rec = harvested[0]
+        assert len(deferred_writes) == 1
+        rec = deferred_writes[0]
 
         # Explicit "" is preserved — default_speaker_id must NOT overwrite it.
         assert rec["speaker_id"] == "", (
             f"Explicit speaker_id='' was overwritten; got {rec['speaker_id']!r}"
         )
+        # tier_keyed entry also carries "" — uniform entry shape.
+        assert tier_keyed["episodic"][0]["speaker_id"] == ""
 
     def test_defer_true_no_store_writes_no_counter_advance(self, tmp_path):
-        """_apply_keyless_edge_entries(defer=True) must NOT write to the store and
+        """_build_all_edge_entries_into(defer=True) must NOT write to the store and
         must NOT advance _indexed_next_index or _procedural_next_index.
 
         This is the interim-atomicity contract: store mutations are deferred until
@@ -2110,8 +2083,6 @@ class TestB3InterimKeyingSeams:
         initial_indexed = loop._indexed_next_index
         initial_procedural = loop._procedural_next_index
 
-        harvested = loop._harvest_keyless_edge_entries(tag_new=True, default_speaker_id="")
-
         with (
             patch.object(loop.store, "put", wraps=loop.store.put) as mock_put,
             patch.object(
@@ -2119,8 +2090,8 @@ class TestB3InterimKeyingSeams:
             ) as mock_bk,
         ):
             tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-            minted_by_tier, deferred_writes = loop._apply_keyless_edge_entries(
-                harvested, tier_keyed, defer=True
+            minted_by_tier, deferred_writes = loop._build_all_edge_entries_into(
+                tier_keyed, default_speaker_id="", defer=True, tag_new=True
             )
 
             # No store writes must occur when defer=True.
@@ -2153,7 +2124,7 @@ class TestB3InterimKeyingSeams:
         )
 
     def test_defer_true_deferred_writes_have_required_flush_fields(self, tmp_path):
-        """deferred_writes records from _apply_keyless_edge_entries(defer=True) must
+        """deferred_writes records from _build_all_edge_entries_into(defer=True) must
         carry all fields required for the caller's flush (entry, canon_subj, canon_obj,
         predicate, tier, speaker_id, relation_type).
         """
@@ -2169,9 +2140,10 @@ class TestB3InterimKeyingSeams:
             "frank", "hamburg", predicate="works_in", relation_type="factual"
         )
 
-        harvested = loop._harvest_keyless_edge_entries(tag_new=True, default_speaker_id="Speaker1")
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        _, deferred_writes = loop._apply_keyless_edge_entries(harvested, tier_keyed, defer=True)
+        _, deferred_writes = loop._build_all_edge_entries_into(
+            tier_keyed, default_speaker_id="Speaker1", defer=True, tag_new=True
+        )
 
         assert len(deferred_writes) == 1
         rec = deferred_writes[0]
@@ -2213,23 +2185,27 @@ class TestB3InterimKeyingSeams:
         loop.merger.graph.add_edge("Grace", "Oslo", predicate="visits", relation_type="factual")
 
         # tag_new=True — minted entries get the _new sentinel.
-        harvested_new = loop._harvest_keyless_edge_entries(tag_new=True, default_speaker_id="")
-        assert len(harvested_new) == 1
-        entry_new = harvested_new[0]["entry"]
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        _, deferred_writes = loop._build_all_edge_entries_into(
+            tier_keyed, default_speaker_id="", defer=True, tag_new=True
+        )
+        assert len(deferred_writes) == 1
+        entry_new = deferred_writes[0]["entry"]
         assert entry_new.get("_new") is True, (
             f"tag_new=True must set '_new'=True on the entry; got {entry_new!r}"
         )
 
         # tag_new=False — minted entries do NOT get the sentinel.
-        loop._indexed_next_index = 1  # reset so next harvest gets a fresh index
+        loop._indexed_next_index = 1  # reset so next call gets a fresh index
         loop.merger.graph.clear_edges()
         loop.merger.graph.add_edge("Hank", "Rome", predicate="visits", relation_type="factual")
 
-        harvested_nosentinel = loop._harvest_keyless_edge_entries(
-            tag_new=False, default_speaker_id=""
+        tier_keyed2: dict = {"episodic": [], "semantic": [], "procedural": []}
+        _, deferred_writes2 = loop._build_all_edge_entries_into(
+            tier_keyed2, default_speaker_id="", defer=True, tag_new=False
         )
-        assert len(harvested_nosentinel) == 1
-        entry_nosentinel = harvested_nosentinel[0]["entry"]
+        assert len(deferred_writes2) == 1
+        entry_nosentinel = deferred_writes2[0]["entry"]
         assert "_new" not in entry_nosentinel or entry_nosentinel.get("_new") is not True, (
             f"tag_new=False must NOT set '_new'=True; got {entry_nosentinel!r}"
         )

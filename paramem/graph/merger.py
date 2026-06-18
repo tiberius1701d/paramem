@@ -620,6 +620,13 @@ class GraphMerger:
             sessions = edge.get("sessions", [])
             if session_id not in sessions:
                 sessions.append(session_id)
+            # Union any per-relation session_ids carried on the Relation object
+            # (B7-A provenance plumbing).  These are the real contributing session
+            # ids stamped at the extraction point; the scalar session_id param may
+            # be a synthetic sentinel for fold/re-merge paths.
+            for _sid in relation.session_ids:
+                if _sid not in sessions:
+                    sessions.append(_sid)
             edge["sessions"] = sessions
             # Case-1-adopt: adopt incoming ik_key onto a keyless existing edge.
             if relation.indexed_key and not edge.get(_IK_KEY_ATTR):
@@ -830,6 +837,14 @@ class GraphMerger:
         # --- Case 3: New-edge insertion ---
         # After contradiction cleanup or when no same-pred edge exists.
         # Stamp ik_key from relation.indexed_key when set (fold-only; None = no-op).
+        # Union relation.session_ids into the initial sessions list so the real
+        # contributing session ids ride the edge from the first insertion
+        # (B7-A provenance plumbing; the scalar session_id may be a synthetic
+        # sentinel for fold/re-merge paths).
+        _initial_sessions: list[str] = [session_id]
+        for _sid in relation.session_ids:
+            if _sid not in _initial_sessions:
+                _initial_sessions.append(_sid)
         new_eid = self.graph.add_edge(
             subject,
             obj,
@@ -839,7 +854,7 @@ class GraphMerger:
             first_seen=session_id,
             last_seen=session_id,
             recurrence_count=1,
-            sessions=[session_id],
+            sessions=_initial_sessions,
         )
         if relation.indexed_key:
             self.graph[subject][obj][new_eid][_IK_KEY_ATTR] = relation.indexed_key

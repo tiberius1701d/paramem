@@ -51,6 +51,12 @@ from paramem.server.cloud import get_cloud_agent
 from paramem.server.config import TTSConfig, TTSVoiceConfig, load_server_config
 from paramem.server.consolidation import create_consolidation_loop
 from paramem.server.ha_graph import HAEntityGraph
+from paramem.server.incidents import (
+    ack_incident,
+    read_incidents,
+    record_incident,
+    resolve_incidents_by_type,
+)
 from paramem.server.inference import (
     ChatResult,
     _escalate_to_sota,
@@ -59,6 +65,7 @@ from paramem.server.inference import (
 )
 from paramem.server.post_session_queue import PostSessionQueue
 from paramem.server.router import QueryRouter
+from paramem.server.run_status import read_last_runs, record_last_run
 from paramem.server.session_buffer import SessionBuffer  # "session" here = conversation
 from paramem.server.tools.ha_client import HAClient
 from paramem.server.trial_state import (
@@ -141,12 +148,9 @@ _state = {
     "boot_degraded": None,
     "consolidating": False,
     "last_consolidation": None,
-    # Last structured error from a consolidation attempt. Populated by the
-    # done-callback when the cycle raised an exception that the operator
-    # should be able to see via /status without scraping logs. Currently
-    # populated only for VramExhausted; other failures still log loudly.
-    # Shape: {"type": "vram_exhausted", "phase": str, "at": iso8601} | None
-    "last_consolidation_error": None,
+    # NOTE: last_consolidation_error and last_consolidation_result are DERIVED
+    # from the durable incident store and run_status registry at /status build
+    # time (see _derive_consolidation_status_fields).  No RAM snapshot survives.
     "background_trainer": None,
     "reclaim_task": None,
     "config_path": None,
@@ -3663,6 +3667,71 @@ def _resolve_speaker(
     return None, None
 
 
+def _derive_consolidation_status_fields(
+    state_dir: Path,
+) -> tuple[dict | None, dict | None]:
+    """Derive ``last_consolidation_error`` and ``last_consolidation_result`` from disk.
+
+    Reads the incident store (``incidents.json``) and the run-status registry
+    (``run_status.json``) once and returns the two ``/status`` fields.  Both
+    sources are read at build time on every ``/status`` poll — no RAM snapshot
+    survives.
+
+    Returns
+    -------
+    tuple[dict | None, dict | None]
+        ``(last_consolidation_error, last_consolidation_result)``
+
+        ``last_consolidation_error``:
+            The ``detail`` dict of the most-recent **active** incident whose
+            type is one of the consolidation/vram/extraction failure families, or
+            ``None`` when none are active.  Shape for ``vram_exhausted`` matches
+            the historic ``{"type": "vram_exhausted", "phase": str, "at": iso8601}``
+            so the ``StatusResponse`` field stays HTTP-stable.
+
+        ``last_consolidation_result``:
+            The ``RunRecord.to_dict()`` for op_type ``"consolidation"`` from
+            ``run_status.json``, or ``None`` when no run has been recorded.
+    """
+    # --- last_consolidation_error: derived from active incidents ---
+    consolidation_error: dict | None = None
+    _consolidation_incident_types = frozenset(
+        {
+            "vram_exhausted",
+            "extraction_failed",
+            "consolidation_crash",
+            "training_crash",
+            "migration_phase_failed",
+            "migration_error",
+        }
+    )
+    try:
+        incidents = read_incidents(state_dir)
+        # Most-recent active incident from the relevant families.
+        active = [
+            i for i in incidents if i.status == "active" and i.type in _consolidation_incident_types
+        ]
+        if active:
+            # last_seen is an ISO string; lexicographic comparison of UTC ISO strings
+            # gives correct chronological ordering.
+            most_recent = max(active, key=lambda i: i.last_seen)
+            consolidation_error = most_recent.detail
+    except Exception:
+        logger.exception("_derive_consolidation_status_fields: could not read incidents")
+
+    # --- last_consolidation_result: derived from run_status.json ---
+    consolidation_result: dict | None = None
+    try:
+        last_runs = read_last_runs(state_dir)
+        rec = last_runs.get("consolidation")
+        if rec is not None:
+            consolidation_result = rec.to_dict()
+    except Exception:
+        logger.exception("_derive_consolidation_status_fields: could not read run_status")
+
+    return consolidation_error, consolidation_result
+
+
 @app.get("/status", response_model=StatusResponse)
 async def status():
     """Server health and state."""
@@ -4069,6 +4138,14 @@ async def status():
     except Exception:
         logger.exception("Failed to build backup block — returning empty default")
 
+    # Derive last_consolidation_error and last_consolidation_result from durable
+    # stores (incidents.json + run_status.json) rather than from RAM.  Both fields
+    # are computed once per /status poll; no RAM snapshot survives (DELTA 2).
+    _status_state_dir = (config.paths.data / "state").resolve()
+    _consolidation_error, _consolidation_result = _derive_consolidation_status_fields(
+        _status_state_dir
+    )
+
     return StatusResponse(
         model=config.model_name,
         model_id=model_id,
@@ -4089,7 +4166,7 @@ async def status():
         pending_sessions=summary["total"],
         consolidating=_state["consolidating"],
         last_consolidation=_state["last_consolidation"],
-        last_consolidation_error=_state.get("last_consolidation_error"),
+        last_consolidation_error=_consolidation_error,
         speaker_profiles=store.profile_count if store else 0,
         stt_loaded=stt_loaded,
         stt_model=stt.model_name if stt_loaded else None,
@@ -4110,7 +4187,7 @@ async def status():
         bg_trainer_active=bg_active,
         bg_trainer_adapter=bg_adapter,
         thermal_policy=thermal_policy,
-        last_consolidation_result=_state.get("last_consolidation_result"),
+        last_consolidation_result=_consolidation_result,
         pending_enrollments=len(_state.get("pending_enrollments") or []),
         scheduler_started=scheduler_active,
         adapter_health=adapter_health,
@@ -4806,6 +4883,7 @@ def _build_config_derived_state(
             config.session_dir,
             retain_sessions=config.consolidation.retain_sessions,
             debug=config.debug,
+            recall_retry_cap=config.consolidation.recall_retry_cap,
         )
         # Cold-start: rehydrate pending JSONL into memory before loading the
         # encrypted snapshot (snapshot carries mid-turn _sessions state only).
@@ -6195,6 +6273,29 @@ async def gpu_release():
         _state["reclaim_task"] = asyncio.create_task(_auto_reclaim_loop(reclaim_interval))
 
     return {"mode": "cloud-only", "released": True, "reason": "released"}
+
+
+@app.post("/incidents/{incident_id}/ack", dependencies=[Depends(require_admin)])
+async def incidents_ack(incident_id: str):
+    """Acknowledge an active incident, silencing its attention row.
+
+    Acknowledged incidents remain visible in the incident store but are omitted
+    from the loud attention signal in ``/status``.  A subsequent failure of the
+    same type reopens the incident (status → active, count bumped), making it
+    visible again.  Auto-resolve on the next successful run clears it entirely.
+
+    Args:
+        incident_id: Deterministic incident id (``f"{type}:{key}"``), e.g.
+            ``"vram_exhausted:phase1"``.  Stable across restarts.
+
+    Returns:
+        ``{"status": "ok", "id": incident_id}`` when acknowledged,
+        ``{"status": "not_found", "id": incident_id}`` when no matching
+        incident exists.
+    """
+    state_dir = _state["config"].paths.data / "state"
+    ok = ack_incident(state_dir, incident_id)
+    return {"status": "ok" if ok else "not_found", "id": incident_id}
 
 
 @app.post("/refresh-ha", dependencies=[Depends(require_admin)])
@@ -8863,6 +8964,17 @@ async def _run_base_swap_orchestration(
             }
         )
         logger.exception("base-swap orchestration failed (phase=%s): %s", _phase, exc)
+        # Record the phase failure as a durable incident (N7).  The existing
+        # bundle + POST /migration/rollback path is unchanged; this adds
+        # durability + /status visibility alongside the trial-gates marker.
+        record_incident(
+            _state["config"].paths.data / "state",
+            type="migration_phase_failed",
+            key=_status,
+            severity="failed",
+            summary=f"Base-swap migration {_status}",
+            detail={"phase": _phase, "exception": str(exc), "at": completed_at},
+        )
         # Bundle and marker are preserved for rollback.
 
     finally:
@@ -11240,7 +11352,6 @@ def _maybe_trigger_housekeeping() -> str:
         return _guard
 
     logger.info("Housekeeping: dispatching on-demand re-grooming fold")
-    _state["last_consolidation_error"] = None
     _state["consolidating"] = True
     event_loop = asyncio.get_running_loop()
     future = event_loop.run_in_executor(
@@ -11320,7 +11431,6 @@ def _maybe_trigger_scheduled_consolidation() -> str:
             )
             return "migration_skipped_degraded"
         logger.info("Scheduler tick: active-store migration pending — running migration")
-        _state["last_consolidation_error"] = None
         _state["consolidating"] = True
         event_loop = asyncio.get_running_loop()
         future = event_loop.run_in_executor(None, _run_active_store_migration_sync)
@@ -11333,9 +11443,9 @@ def _maybe_trigger_scheduled_consolidation() -> str:
     # acceptable given the period is much longer than the cadence.
     if _is_full_cycle_due(config):
         logger.info("Scheduler tick: full cycle due — running consolidate_interim_adapters")
-        # Clear stale error from a prior failed cycle — a new attempt is
-        # starting; the done-callback will re-populate on failure.
-        _state["last_consolidation_error"] = None
+        # S-2 / DELTA 4: do NOT clear last_consolidation_error here.  A failure
+        # row stays visible until the next op of that type SUCCEEDS (auto-resolved
+        # in the success paths below).  Clear-on-attempt hid still-failing conditions.
         _state["consolidating"] = True
         event_loop = asyncio.get_running_loop()
         future = event_loop.run_in_executor(None, _run_full_consolidation_sync)
@@ -11393,7 +11503,6 @@ def _maybe_trigger_scheduled_consolidation() -> str:
         return "noop_no_named"
 
     logger.info("Scheduler tick: %d NAMED session(s), starting extract + train", named_count)
-    _state["last_consolidation_error"] = None
     _state["consolidating"] = True
 
     event_loop = asyncio.get_running_loop()
@@ -11882,8 +11991,14 @@ def _run_extraction_phase(
 
         for qa in episodic_rels:
             qa["speaker_id"] = session_speaker_id
+            # B7-A: stamp the real session id for uniform provenance plumbing
+            # (D2 symmetric threading, T9).  Retention machinery (keep-pending)
+            # is NOT wired here — the trial path runs mark_sessions=False so
+            # sessions cannot be lost regardless (U-D2 CLOSED).
+            qa["session_id"] = session_id
         for rel in procedural_rels:
             rel["speaker_id"] = session_speaker_id
+            rel["session_id"] = session_id
 
         all_episodic_rels.extend(episodic_rels)
         all_procedural_rels.extend(procedural_rels)
@@ -12046,10 +12161,10 @@ def _scheduled_extract_done_callback(future):
     training job to the BG trainer and the flag will be cleared by the
     job's _finalize_interim closure when the worker thread completes.
 
-    On VramExhausted, populate ``_state["last_consolidation_error"]`` so
-    the failure is visible via ``/status`` without scraping logs. Other
-    exceptions still surface only through the loud ``logger.exception``
-    line (operators tail the journal).
+    On VramExhausted, record a durable ``vram_exhausted`` incident so the
+    failure is visible via ``/status`` without scraping logs (derived from
+    the incident store at status build time).  Other exceptions still surface
+    only through the loud ``logger.exception`` line (operators tail the journal).
 
     Self-healing voice restore: this callback is attached to three executor
     entry points — ``_extract_and_start_training``, ``_run_full_consolidation_sync``,
@@ -12064,11 +12179,15 @@ def _scheduled_extract_done_callback(future):
         logger.error("Scheduled extraction failed: %s", exc, exc_info=exc)
         if isinstance(exc, VramExhausted):
             phase = exc.args[0] if exc.args else "unknown"
-            _state["last_consolidation_error"] = {
-                "type": "vram_exhausted",
-                "phase": phase,
-                "at": datetime.now(timezone.utc).isoformat(),
-            }
+            _at = datetime.now(timezone.utc).isoformat()
+            record_incident(
+                _state["config"].paths.data / "state",
+                type="vram_exhausted",
+                key=str(phase),
+                severity="failed",
+                summary=f"Consolidation: VRAM exhausted at phase {phase}",
+                detail={"type": "vram_exhausted", "phase": phase, "at": _at},
+            )
         # Voice was evicted at the cycle's start (doc-only path). On
         # exception the cycle's normal end-of-cycle restore was not
         # reached; restore here so STT/TTS aren't stuck unloaded until
@@ -12277,13 +12396,21 @@ def _extract_and_start_training():
                         "at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
-                _state["last_consolidation_error"] = {
-                    "type": "extraction_failed",
-                    "phase": exc.phase,
-                    "reason": exc.reason,
-                    "session_id": session_id,
-                    "at": datetime.now(timezone.utc).isoformat(),
-                }
+                _ef_at = datetime.now(timezone.utc).isoformat()
+                record_incident(
+                    _state["config"].paths.data / "state",
+                    type="extraction_failed",
+                    key=str(exc.phase),
+                    severity="failed",
+                    summary=f"Consolidation: extraction failed at phase {exc.phase}",
+                    detail={
+                        "type": "extraction_failed",
+                        "phase": exc.phase,
+                        "reason": exc.reason,
+                        "session_id": session_id,
+                        "at": _ef_at,
+                    },
+                )
                 # Reclaim voice pipeline if we evicted it earlier — the cycle
                 # is dropping out without going through the normal finalize.
                 # This abort handler runs inside the `with gpu_lock_sync():` at
@@ -12297,8 +12424,13 @@ def _extract_and_start_training():
                 return
             for qa in episodic_rels:
                 qa["speaker_id"] = session_speaker_id
+                # B7-A: stamp the real session id so provenance survives the
+                # GraphMerger union into edge["sessions"].  Co-located with
+                # the speaker_id stamp (D2 symmetric plumbing, T9).
+                qa["session_id"] = session_id
             for rel in procedural_rels:
                 rel["speaker_id"] = session_speaker_id
+                rel["session_id"] = session_id
 
             all_episodic_rels.extend(episodic_rels)
             all_procedural_rels.extend(procedural_rels)
@@ -12336,13 +12468,22 @@ def _extract_and_start_training():
         def _finalize_no_facts() -> None:
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["router"].reload()
-            _state["last_consolidation_result"] = {
-                "status": "no_facts",
+            _no_facts_detail = {
                 "sessions": len(session_ids),
                 "skipped_oom": len(failed_session_ids),
                 "episodic_rels": 0,
                 "procedural_rels": 0,
             }
+            try:
+                record_last_run(
+                    _state["config"].paths.data / "state",
+                    op_type="consolidation",
+                    outcome="no_facts",
+                    summary=f"No facts extracted from {len(session_ids)} session(s)",
+                    detail=_no_facts_detail,
+                )
+            except Exception:
+                logger.exception("Failed to record no_facts run status (non-fatal)")
             _state["consolidating"] = False
 
         _dispatch_finalize(_finalize_no_facts)
@@ -12406,16 +12547,26 @@ def _extract_and_start_training():
         def _finalize_simulate() -> None:
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
             _state["router"].reload()
-            # A later flip to train mode — or any code path that re-reads —
-            # sees the stale snapshot from the last train cycle.
-            _state["last_consolidation_result"] = {
-                "status": "simulated",
+            _sim_detail = {
                 "sessions": len(session_ids),
                 "skipped_oom": len(failed_session_ids),
                 "episodic_rels": len(all_episodic_rels),
                 "procedural_rels": len(all_procedural_rels),
                 "simulated": sim_result.get("mode") == "simulated",
             }
+            try:
+                record_last_run(
+                    _state["config"].paths.data / "state",
+                    op_type="consolidation",
+                    outcome="simulated",
+                    summary=(
+                        f"Simulate: {len(all_episodic_rels)} episodic, "
+                        f"{len(all_procedural_rels)} procedural relations"
+                    ),
+                    detail=_sim_detail,
+                )
+            except Exception:
+                logger.exception("Failed to record simulated run status (non-fatal)")
             _state["consolidating"] = False
             logger.info(
                 "Simulation complete: %d episodic, %d procedural relations",
@@ -12487,10 +12638,14 @@ def _extract_and_start_training():
                 "Scheduled-tick interim training failed — leaving %d sessions pending",
                 len(session_ids),
             )
-            _state["last_consolidation_result"] = {
-                "status": "error",
-                "sessions": len(session_ids),
-            }
+            record_incident(
+                _state["config"].paths.data / "state",
+                type="training_crash",
+                key="interim",
+                severity="failed",
+                summary=f"Interim training crashed — {len(session_ids)} session(s) still pending",
+                detail={"sessions": len(session_ids)},
+            )
             # Restore voice pipeline even on training failure — we evicted
             # at cycle start, the device should return to its post-startup
             # baseline regardless of whether training succeeded.
@@ -12507,6 +12662,49 @@ def _extract_and_start_training():
             result.get("adapter_name"),
             len(result.get("new_keys", [])),
         )
+
+        # B7-B (T10): keep recall-failed sessions pending + bounded retry.
+        # In the SUCCESS path (cycle returned normally) — NOT inside the try that
+        # wraps run_consolidation_cycle (B3 constraint: crash ≠ recall failure).
+        # Simulate callsite (B2) never produces a non-empty failed set because
+        # _epi_passing is None in simulate mode, so this code is a no-op there.
+        _cycle_failed_sids = result.get("recall_failed_session_ids", [])
+        if _cycle_failed_sids:
+            failed_session_ids.update(_cycle_failed_sids)
+            # Increment per-session retry counter; release sessions that hit the cap.
+            _released_sids = session_buffer.bump_retry_and_release(set(_cycle_failed_sids))
+            if _released_sids:
+                # Remove capped sessions from failed_session_ids so they retire
+                # this cycle (un-pinned; the un-encodable fact is logged + incident-recorded).
+                failed_session_ids.difference_update(_released_sids)
+                _interim_state_dir_b7 = _state["config"].paths.data / "state"
+                for _capped_sid in _released_sids:
+                    try:
+                        record_incident(
+                            _interim_state_dir_b7,
+                            type="consolidation_recall_failure",
+                            key=_capped_sid,
+                            severity="warning",
+                            summary=(
+                                f"Session {_capped_sid}: facts could not be encoded "
+                                f"after {session_buffer._recall_retry_cap} cycle(s)"
+                            ),
+                            detail={
+                                "session_id": _capped_sid,
+                                "recall_retry_cap": session_buffer._recall_retry_cap,
+                            },
+                        )
+                    except Exception:
+                        logger.exception(
+                            "_run_interim_training: failed to record recall_failure incident "
+                            "for session %s (non-fatal)",
+                            _capped_sid,
+                        )
+                logger.warning(
+                    "_run_interim_training: %d session(s) hit recall-retry cap "
+                    "— releasing; facts could not be encoded",
+                    len(_released_sids),
+                )
 
         # Disk I/O — safe from any thread.  Key-metadata persistence mirrors the
         # previous main-write callback; the interim helper already handled the
@@ -12543,12 +12741,36 @@ def _extract_and_start_training():
             # The previous main-tier-simhash sum under-reported by the count of
             # keys living in episodic_interim_<stamp> slots between full cycles.
             total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
-            _state["last_consolidation_result"] = {
-                "status": result.get("mode", "trained"),
+            _interim_outcome = result.get("mode", "trained")
+            _interim_detail = {
                 "sessions": len(session_ids),
                 "total_keys": total_keys,
                 "adapter": result.get("adapter_name"),
             }
+            try:
+                record_last_run(
+                    _state["config"].paths.data / "state",
+                    op_type="consolidation",
+                    outcome=_interim_outcome,
+                    summary=(
+                        f"Interim {_interim_outcome}: adapter={result.get('adapter_name')}, "
+                        f"{total_keys} total keys"
+                    ),
+                    detail=_interim_detail,
+                )
+                # Auto-resolve op-level incidents cleared by a successful interim cycle.
+                _interim_state_dir = _state["config"].paths.data / "state"
+                resolve_incidents_by_type(_interim_state_dir, "training_crash")
+                resolve_incidents_by_type(_interim_state_dir, "vram_exhausted")
+                # S-4 conditional resolve (B7-B): resolve consolidation_recall_failure
+                # ONLY when ZERO keys failed this cycle.  When the failed set is
+                # non-empty, T10 has already recorded/bumped per-session incidents;
+                # resolving here would wipe the just-recorded incident from the
+                # same cycle — explicitly prohibited by the S-4 ordering rule.
+                if not result.get("recall_failed_session_ids", []):
+                    resolve_incidents_by_type(_interim_state_dir, "consolidation_recall_failure")
+            except Exception:
+                logger.exception("Post-interim run-status/incident bookkeeping failed (non-fatal)")
             _state["consolidating"] = False
             logger.info(
                 "Scheduled-tick complete — adapter=%s, %d total keys",
@@ -12643,13 +12865,33 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                     router=_state.get("router"),
                 )
         except AbortedDuringConsolidation as exc:
+            # aborted = normal yield-to-chat outcome; NOT an incident.
             logger.info("Full consolidation aborted for inference: %s", exc)
-            _state["last_consolidation_result"] = {"status": "aborted"}
+            try:
+                record_last_run(
+                    _state["config"].paths.data / "state",
+                    op_type="consolidation",
+                    outcome="aborted",
+                    summary="Full consolidation aborted to yield GPU for inference",
+                    detail={},
+                )
+            except Exception:
+                logger.exception("Failed to record aborted run status (non-fatal)")
             _state["consolidating"] = False
             return
         except Exception:
             logger.exception("Full consolidation failed")
-            _state["last_consolidation_result"] = {"status": "error"}
+            try:
+                record_incident(
+                    _state["config"].paths.data / "state",
+                    type="consolidation_crash",
+                    key="full",
+                    severity="failed",
+                    summary="Full consolidation crashed unexpectedly",
+                    detail={},
+                )
+            except Exception:
+                logger.exception("Failed to record consolidation_crash incident (non-fatal)")
             _state["consolidating"] = False
             return
 
@@ -12688,18 +12930,29 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # window stamp must NOT be updated so _is_full_cycle_due keeps returning
         # True and the fold re-fires next window.  Do not call mark_consolidated.
         if result.get("status") == "accumulating":
-            _state["last_consolidation_result"] = {
-                "status": "accumulating",
-                "accumulating_reason": result.get("accumulating_reason", {}),
-                "tiers_rebuilt": [],
-            }
+            _acc_reason = result.get("accumulating_reason", {})
+            try:
+                record_last_run(
+                    _state["config"].paths.data / "state",
+                    op_type="consolidation",
+                    outcome="accumulating",
+                    summary=(
+                        f"Accumulating — total keys below floor {_acc_reason.get('floor', '?')}"
+                    ),
+                    detail={
+                        "accumulating_reason": _acc_reason,
+                        "tiers_rebuilt": [],
+                    },
+                )
+            except Exception:
+                logger.exception("Failed to record accumulating run status (non-fatal)")
             _state["consolidating"] = False
             logger.info(
                 "Full cycle accumulating — total keys below floor %d; "
                 "sessions left pending, window stamp NOT updated so next tick re-fires. "
                 "Reason: %s",
-                result.get("accumulating_reason", {}).get("floor", "?"),
-                result.get("accumulating_reason"),
+                _acc_reason.get("floor", "?"),
+                _acc_reason,
             )
             return
 
@@ -12709,11 +12962,19 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # Only the SCHEDULED path returns early on the empty-tiers-rebuilt signal.
         if not housekeeping and not result.get("tiers_rebuilt"):
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-            _state["last_consolidation_result"] = {
-                "status": "noop",
-                "tiers_rebuilt": [],
-                "graph_drift_count": result.get("graph_drift_count", 0),
-            }
+            try:
+                record_last_run(
+                    _state["config"].paths.data / "state",
+                    op_type="consolidation",
+                    outcome="noop",
+                    summary="Full cycle no-op — nothing to rebuild",
+                    detail={
+                        "tiers_rebuilt": [],
+                        "graph_drift_count": result.get("graph_drift_count", 0),
+                    },
+                )
+            except Exception:
+                logger.exception("Failed to record noop run status (non-fatal)")
             _state["consolidating"] = False
             logger.info(
                 "Full cycle no-op — nothing to rebuild, inner finalize already "
@@ -12830,13 +13091,35 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
             # e. Result bookkeeping.
             total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-            _state["last_consolidation_result"] = {
-                "status": "rolled_back" if result.get("rolled_back") else "full_trained",
+            _full_outcome = "rolled_back" if result.get("rolled_back") else "full_trained"
+            _full_detail = {
                 "tiers_rebuilt": result.get("tiers_rebuilt", []),
                 "rollback_tier": result.get("rollback_tier"),
                 "graph_drift_count": result.get("graph_drift_count", 0),
                 "total_keys": total_keys,
             }
+            try:
+                record_last_run(
+                    _state["config"].paths.data / "state",
+                    op_type="consolidation",
+                    outcome=_full_outcome,
+                    summary=f"Full cycle {_full_outcome}: {total_keys} total keys",
+                    detail=_full_detail,
+                )
+                # Auto-resolve op-level incidents cleared by a successful full cycle.
+                _full_state_dir = _state["config"].paths.data / "state"
+                resolve_incidents_by_type(_full_state_dir, "consolidation_crash")
+                resolve_incidents_by_type(_full_state_dir, "vram_exhausted")
+                resolve_incidents_by_type(_full_state_dir, "extraction_failed")
+                # S-4 conditional resolve (B7-B): full-cycle path mirrors the
+                # interim path — resolve consolidation_recall_failure only when
+                # the cycle returned zero recall-failed session ids.
+                if not result.get("recall_failed_session_ids", []):
+                    resolve_incidents_by_type(_full_state_dir, "consolidation_recall_failure")
+            except Exception:
+                logger.exception(
+                    "Post-full-cycle run-status/incident bookkeeping failed (non-fatal)"
+                )
             _state["consolidating"] = False
             logger.info("Full cycle bookkeeping complete — %d total keys", total_keys)
 
@@ -12962,7 +13245,17 @@ def _run_active_store_migration_sync() -> None:
             updated = migrate(loop, config, state)
         except Exception:
             logger.exception("Active-store migration raised — leaving state file on disk")
-            _state["last_consolidation_result"] = {"status": "migration_error"}
+            try:
+                record_incident(
+                    _state["config"].paths.data / "state",
+                    type="migration_error",
+                    key="active_store",
+                    severity="failed",
+                    summary="Active-store migration raised unexpectedly",
+                    detail={},
+                )
+            except Exception:
+                logger.exception("Failed to record migration_error incident (non-fatal)")
             _state["consolidating"] = False
             return
 
@@ -12979,17 +13272,31 @@ def _run_active_store_migration_sync() -> None:
         def _finalize_migration() -> None:
             loop.model.eval()
             _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-            _state["last_consolidation_result"] = {
-                "status": (
-                    "migration_complete"
-                    if updated.all_tiers_done(loop.store.tiers_with_registry())
-                    else "migration_partial"
-                ),
+            _all_done = updated.all_tiers_done(loop.store.tiers_with_registry())
+            _mig_outcome = "migration_complete" if _all_done else "migration_partial"
+            _mig_detail = {
                 "direction": updated.direction,
                 "completed_tiers": list(updated.completed_tiers),
                 "failed_tiers": dict(updated.failed_tiers),
             }
-            if updated.all_tiers_done(loop.store.tiers_with_registry()):
+            try:
+                record_last_run(
+                    _state["config"].paths.data / "state",
+                    op_type="consolidation",
+                    outcome=_mig_outcome,
+                    summary=f"Migration {_mig_outcome}: direction={updated.direction}",
+                    detail=_mig_detail,
+                )
+                if _all_done:
+                    # Auto-resolve migration incidents on successful completion.
+                    _mig_state_dir = _state["config"].paths.data / "state"
+                    resolve_incidents_by_type(_mig_state_dir, "migration_error")
+                    resolve_incidents_by_type(_mig_state_dir, "migration_phase_failed")
+            except Exception:
+                logger.exception(
+                    "Post-migration run-status/incident bookkeeping failed (non-fatal)"
+                )
+            if _all_done:
                 _state["pending_rehydration"] = False
                 _state["effective_mode"] = config.consolidation.mode
                 logger.info(

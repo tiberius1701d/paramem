@@ -109,6 +109,57 @@ class TestRelation:
                 speaker_id="Speaker0",
             )
 
+    def test_session_ids_defaults_to_empty_list(self):
+        """Relation.session_ids defaults to [] when not supplied."""
+        rel = Relation(
+            subject="A",
+            predicate="lives_in",
+            object="B",
+            relation_type="factual",
+            speaker_id="Speaker0",
+        )
+        assert rel.session_ids == []
+
+    def test_session_ids_excluded_from_serialisation(self):
+        """session_ids is exclude=True — never persisted to JSON / registry.
+
+        B7-A acceptance test: a Relation round-trip through model_dump() (which
+        drives all JSON persistence in the pipeline) must NOT contain
+        'session_ids', so the field never leaks into the registry,
+        cumulative_graph.json, or adapter-training data.
+        """
+        import json
+
+        rel = Relation(
+            subject="Alex",
+            predicate="lives_in",
+            object="Berlin",
+            relation_type="factual",
+            speaker_id="Speaker0",
+            session_ids=["real-session-abc"],
+        )
+        dumped = rel.model_dump()
+        assert "session_ids" not in dumped, (
+            "session_ids must be excluded from model_dump() — it is a transient "
+            "carry-slot and must never be persisted to disk"
+        )
+        json_str = json.dumps(dumped)
+        assert "session_ids" not in json_str
+        assert "real-session-abc" not in json_str
+
+    def test_indexed_key_excluded_from_serialisation(self):
+        """indexed_key remains excluded from model_dump() (regression guard)."""
+        rel = Relation(
+            subject="A",
+            predicate="p",
+            object="B",
+            relation_type="factual",
+            speaker_id="Speaker0",
+            indexed_key="graph42",
+        )
+        dumped = rel.model_dump()
+        assert "indexed_key" not in dumped
+
 
 class TestSessionGraph:
     def test_empty_session_graph(self):

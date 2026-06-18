@@ -1599,15 +1599,15 @@ class TestRunFullConsolidationSyncAccumulating:
     the orchestrator in ``_run_full_cycle`` must:
     - NOT call ``session_buffer.mark_consolidated``
     - NOT stamp ``_state["last_consolidation"]``
-    - Record ``_state["last_consolidation_result"]["status"] == "accumulating"``
-      with ``accumulating_reason`` present
+    - Write a durable run-status record with ``outcome="accumulating"`` and
+      ``detail["accumulating_reason"]`` present (read back via ``read_last_runs``)
     - NOT call ``ConsolidationLoop._save_adapters`` (proxy for on-disk window
       stamp remaining unchanged — the real on-disk stamp lives in the main-slot
       meta.json written by ``_save_adapters``; no GPU/real fold machinery needed
       to assert this proxy)
     """
 
-    def _make_state(self) -> dict:
+    def _make_state(self, tmp_path=None) -> dict:
         """Minimal _state for _run_full_consolidation_sync.
 
         Uses a pre-populated ``consolidation_loop`` mock so the function's
@@ -1616,11 +1616,23 @@ class TestRunFullConsolidationSyncAccumulating:
         ``config.consolidation.training_temp_limit`` is set to 0 so that
         ``ThermalPolicy.from_consolidation_config`` returns None without
         comparing a MagicMock against an integer (which raises TypeError).
+
+        Args:
+            tmp_path: When provided, set ``config.paths.data`` to this real
+                path so that incident/run-status I/O writes land in
+                ``tmp_path/state/`` rather than creating a ``MagicMock/``
+                directory at the repo root.  Tests that read back the durable
+                run-status record must supply this.
         """
         mock_config = MagicMock()
         mock_config.consolidation.mode = "train"
         # training_temp_limit <= 0 → ThermalPolicy.from_consolidation_config returns None.
         mock_config.consolidation.training_temp_limit = 0
+        # Ground incident/run-status I/O in a real path so the writes land in
+        # the pytest tmp directory instead of creating a MagicMock/ tree at
+        # the repo root.
+        if tmp_path is not None:
+            mock_config.paths.data = tmp_path
 
         mock_loop = MagicMock()
         mock_loop.model = MagicMock(name="model")
@@ -1646,37 +1658,37 @@ class TestRunFullConsolidationSyncAccumulating:
             "event_loop": None,
         }
 
-    def test_accumulating_does_not_mark_consolidated(self, monkeypatch):
+    def test_accumulating_does_not_mark_consolidated(self, monkeypatch, tmp_path):
         """session_buffer.mark_consolidated is NOT called when fold returns accumulating."""
         from unittest.mock import patch
 
         import paramem.server.app as app_module
 
-        state = self._make_state()
+        state = self._make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", state)
 
         mock_bt = MagicMock()
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
-        with patch("paramem.server.background_trainer.BackgroundTrainer", return_value=mock_bt):
+        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
             app_module._run_full_consolidation_sync()
 
         state["session_buffer"].mark_consolidated.assert_not_called()
 
-    def test_accumulating_does_not_stamp_last_consolidation(self, monkeypatch):
+    def test_accumulating_does_not_stamp_last_consolidation(self, monkeypatch, tmp_path):
         """_state["last_consolidation"] is NOT updated when fold returns accumulating."""
         from unittest.mock import patch
 
         import paramem.server.app as app_module
 
-        state = self._make_state()
+        state = self._make_state(tmp_path)
         prior_stamp = state["last_consolidation"]  # None
         monkeypatch.setattr(app_module, "_state", state)
 
         mock_bt = MagicMock()
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
-        with patch("paramem.server.background_trainer.BackgroundTrainer", return_value=mock_bt):
+        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
             app_module._run_full_consolidation_sync()
 
         assert state["last_consolidation"] == prior_stamp, (
@@ -1684,31 +1696,43 @@ class TestRunFullConsolidationSyncAccumulating:
             f"was {prior_stamp!r}, got {state['last_consolidation']!r}"
         )
 
-    def test_accumulating_sets_result_status_and_reason(self, monkeypatch):
-        """_state["last_consolidation_result"] carries status='accumulating' and reason."""
+    def test_accumulating_sets_result_status_and_reason(self, monkeypatch, tmp_path):
+        """Durable run-status record carries outcome='accumulating' and reason.
+
+        The production site (app.py ``_run_full_consolidation_sync``) calls
+        ``record_last_run(op_type="consolidation", outcome="accumulating",
+        detail={"accumulating_reason": ..., "tiers_rebuilt": []})``.
+        This test reads back the written ``RunRecord`` via ``read_last_runs``
+        and asserts the exact durable shape rather than the deleted RAM field
+        ``_state["last_consolidation_result"]``.
+        """
         from unittest.mock import patch
 
         import paramem.server.app as app_module
+        from paramem.server.run_status import read_last_runs
 
-        state = self._make_state()
+        state = self._make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", state)
 
         mock_bt = MagicMock()
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
-        with patch("paramem.server.background_trainer.BackgroundTrainer", return_value=mock_bt):
+        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
             app_module._run_full_consolidation_sync()
 
-        result = state["last_consolidation_result"]
-        assert result is not None, "_state['last_consolidation_result'] must be set"
-        assert result["status"] == "accumulating", (
-            f"expected status='accumulating', got {result['status']!r}"
+        runs = read_last_runs(tmp_path / "state")
+        assert "consolidation" in runs, (
+            "run_status.json must contain a 'consolidation' record after accumulating fold"
         )
-        assert "accumulating_reason" in result, (
-            "last_consolidation_result must contain 'accumulating_reason'"
+        record = runs["consolidation"]
+        assert record.outcome == "accumulating", (
+            f"expected outcome='accumulating', got {record.outcome!r}"
+        )
+        assert "accumulating_reason" in record.detail, (
+            "run-status detail must contain 'accumulating_reason'"
         )
 
-    def test_accumulating_save_adapters_not_called(self, monkeypatch):
+    def test_accumulating_save_adapters_not_called(self, monkeypatch, tmp_path):
         """_save_adapters is NOT called when fold returns accumulating.
 
         _save_adapters writes the per-tier meta.json that carries the on-disk
@@ -1720,7 +1744,7 @@ class TestRunFullConsolidationSyncAccumulating:
 
         import paramem.server.app as app_module
 
-        state = self._make_state()
+        state = self._make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", state)
 
         mock_bt = MagicMock()
@@ -1729,7 +1753,7 @@ class TestRunFullConsolidationSyncAccumulating:
         save_spy = MagicMock()
 
         with (
-            patch("paramem.server.background_trainer.BackgroundTrainer", return_value=mock_bt),
+            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
             patch("paramem.training.consolidation.ConsolidationLoop._save_adapters", save_spy),
         ):
             app_module._run_full_consolidation_sync()
@@ -2574,9 +2598,9 @@ class TestAbortSkipsCommit:
 
         loop = self._make_minimal_loop(monkeypatch, tmp_path)
 
-        # B3: populate merger.graph with a real MultiDiGraph so _harvest_keyless_edge_entries
-        # finds a keyless edge and _apply_keyless_edge_entries(defer=True) produces a
-        # non-empty deferred write → all_interim_keyed is non-empty → training is triggered.
+        # B3: populate merger.graph with a real MultiDiGraph so _build_all_edge_entries_into
+        # (defer=True) finds a keyless edge and produces a non-empty deferred write →
+        # all_interim_keyed is non-empty → training is triggered.
         real_graph = nx.MultiDiGraph()
         real_graph.add_node("speaker0", speaker_id="Speaker0", attributes={"name": "Alex"})
         real_graph.add_node("millfield", attributes={"name": "Millfield"})
@@ -7251,8 +7275,7 @@ class TestHarvestKeylessEdgesSpeakerId:
         g.add_edge("spk-1", "python", predicate="has_skill", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         # Exactly one key must have been minted.
         assert len(tier_keyed["episodic"]) == 1, (
@@ -7275,8 +7298,7 @@ class TestHarvestKeylessEdgesSpeakerId:
         g.add_edge("developer", "python", predicate="requires", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _h = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_h, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         assert len(tier_keyed["episodic"]) == 1, (
             f"Expected 1 minted episodic entry; got {tier_keyed['episodic']}"
@@ -7288,25 +7310,26 @@ class TestHarvestKeylessEdgesSpeakerId:
 
 
 # ---------------------------------------------------------------------------
-# _collect_keyed_edges_into — keyed-edge walk extracted from the fold
+# _build_all_edge_entries_into — unified edge→entry builder (keyed branch)
 # ---------------------------------------------------------------------------
 
 
 class TestCollectKeyedEdgesInto:
-    """Unit tests for ConsolidationLoop._collect_keyed_edges_into.
+    """Unit tests for the keyed-edge branch of _build_all_edge_entries_into.
 
-    The method walks ``merger.graph.edges(data=True)`` and appends training-entry
-    dicts to ``tier_keyed`` for edges that carry both a predicate and an ik_key
-    attribute.  Three skip conditions are tested with distinct edge fixtures:
+    The unified builder walks ``merger.graph.edges(data=True)`` and handles:
+    - Keyed edges (with ik_key): sourced from store, appended to tier_keyed with
+      {key, subject, predicate, object, speaker_id}.
+    - Keyless edges: minted; tested separately in test_graph_enrichment.py.
+    - Predicate-less edges: skipped unconditionally.
 
-    (a) Keyed edge with a predicate and a content entry → appended, tier routed.
-    (b) Keyless edge with a predicate → skipped (no ik_key on edge).
-    (c) Predicate-less edge → skipped (not keyable).
+    These tests use only keyed and predicate-less edges to exercise the
+    keyed-branch behavior in isolation.
     """
 
     @staticmethod
     def _make_loop(tmp_path, *, procedural_enabled=False):
-        """Minimal ConsolidationLoop stub for _collect_keyed_edges_into tests."""
+        """Minimal ConsolidationLoop stub for keyed-edge tests."""
         import networkx as nx
         from peft import PeftModel
 
@@ -7358,8 +7381,8 @@ class TestCollectKeyedEdgesInto:
 
         Edge has: predicate='lives_in', ik_key='graph1', subject='Alice', object='Berlin'.
         Store entry has subject/predicate/object.  Bookkeeping relation_type='factual'
-        → routes to episodic tier.  Payload = {key, subject, predicate, object} from
-        store entry (not from the edge's raw attributes).
+        → routes to episodic tier.  Payload = {key, subject, predicate, object, speaker_id}
+        from store entry + bookkeeping (uniform shape, same as the keyless branch).
         """
 
         from paramem.memory.persistence import _IK_KEY_ATTR
@@ -7371,10 +7394,7 @@ class TestCollectKeyedEdgesInto:
         eid = g.add_edge("Alice", "Berlin", predicate="lives_in")
         g["Alice"]["Berlin"][eid][_IK_KEY_ATTR] = "graph1"
 
-        # (b) Keyless predicate-bearing edge — must be skipped.
-        g.add_edge("Bob", "Acme", predicate="works_at")
-
-        # (c) Predicate-less edge — must be skipped.
+        # (b) Predicate-less edge — must be skipped.
         g.add_edge("Charlie", "Dave")
 
         loop.store.put(
@@ -7395,7 +7415,7 @@ class TestCollectKeyedEdgesInto:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._collect_keyed_edges_into(tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         assert len(tier_keyed["episodic"]) == 1, (
             f"Expected exactly 1 episodic entry; got {tier_keyed['episodic']}"
@@ -7408,6 +7428,8 @@ class TestCollectKeyedEdgesInto:
         assert entry["subject"] == "Alice"
         assert entry["predicate"] == "lives_in"
         assert entry["object"] == "Berlin"
+        # Keyed branch now includes speaker_id in the uniform entry shape.
+        assert entry["speaker_id"] == "spk-0"
 
     def test_keyed_edge_with_no_content_entry_is_skipped(self, tmp_path):
         """A keyed edge whose store.get returns None is silently skipped."""
@@ -7422,7 +7444,7 @@ class TestCollectKeyedEdgesInto:
         # Intentionally: no store.put for 'ghost_key'.
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._collect_keyed_edges_into(tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         assert tier_keyed["episodic"] == [], "Keyed edge with no content entry must be skipped"
 
@@ -7455,7 +7477,7 @@ class TestCollectKeyedEdgesInto:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._collect_keyed_edges_into(tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         assert len(tier_keyed["procedural"]) == 1, (
             f"Expected 1 procedural entry; got {tier_keyed['procedural']}"
@@ -7491,13 +7513,85 @@ class TestCollectKeyedEdgesInto:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._collect_keyed_edges_into(tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         assert len(tier_keyed["semantic"]) == 1, (
             f"Expected 1 semantic entry; got {tier_keyed['semantic']}"
         )
         assert tier_keyed["semantic"][0]["key"] == "sem1"
         assert tier_keyed["episodic"] == []
+
+    def test_keyed_and_keyless_entries_have_identical_shape_including_speaker_id(self, tmp_path):
+        """Keyed and keyless edges produce tier_keyed entries with the same field
+        set including speaker_id.
+
+        Regression guard for B3b: before this refactor the keyless/minted branch
+        included speaker_id in tier_keyed entries but the keyed/existing branch
+        did not — the drift was the root cause of the /debug/dump empty-speaker_id
+        artifact.  After unification both branches must produce identical shapes.
+        """
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = self._make_loop(tmp_path)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        g = loop.merger.graph
+
+        # (a) Keyed edge with a store entry carrying speaker_id.
+        eid = g.add_edge("Alice", "Berlin", predicate="lives_in")
+        g["Alice"]["Berlin"][eid][_IK_KEY_ATTR] = "graph99"
+        loop.store.put(
+            "episodic",
+            "graph99",
+            {
+                "key": "graph99",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "spk-existing",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph99", speaker_id="spk-existing", first_seen_cycle=1, relation_type="factual"
+        )
+
+        # (b) Keyless edge (no ik_key) with a speaker_id-bearing subject node.
+        g.add_node("bob", speaker_id="spk-new", attributes={"name": "Bob"})
+        g.add_node("paris", attributes={"name": "Paris"})
+        g.add_edge("bob", "paris", predicate="visits", relation_type="factual")
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
+
+        episodic = tier_keyed["episodic"]
+        assert len(episodic) == 2, (
+            f"Expected 2 episodic entries (1 keyed + 1 minted); got {episodic}"
+        )
+
+        _required_fields = {"key", "subject", "predicate", "object", "speaker_id"}
+        for entry in episodic:
+            missing = _required_fields - entry.keys()
+            assert not missing, (
+                f"Entry missing fields {missing!r}: {entry!r}. "
+                "Both keyed and keyless branches must produce the same uniform shape."
+            )
+
+        # Locate each entry by key prefix.
+        keyed_entry = next(e for e in episodic if e["key"] == "graph99")
+        minted_entry = next(e for e in episodic if e["key"] != "graph99")
+
+        # Keyed entry: speaker_id from bookkeeping.
+        assert keyed_entry["speaker_id"] == "spk-existing", (
+            f"Keyed entry speaker_id should be 'spk-existing'; got {keyed_entry['speaker_id']!r}"
+        )
+        # Minted entry: speaker_id from subject node attribute.
+        assert minted_entry["speaker_id"] == "spk-new", (
+            f"Minted entry speaker_id should be 'spk-new'; got {minted_entry['speaker_id']!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -8014,13 +8108,13 @@ class TestMaterializeInterimB1:
         (a) It is called exactly once per cycle.
         (b) It is called with tier=adapter_name and the slot's active keys.
 
-        B3 note: key generation now uses the graph-walk (_harvest_keyless_edge_entries
-        + _apply_keyless_edge_entries(defer=True) + _collect_keyed_edges_into) rather
-        than _prepare_episodic_keys_for_tier.  When the materialize stub returns
-        (set(), []) and the merger graph is empty, the walk produces zero keys —
-        the store's tier is empty after the cycle (expected in this test context).
-        Tests that verify key minting (dcf4189, speaker_id inheritance) use a real
-        graph and are in TestInterimKeyedWalkB3.
+        B3 note: key generation now uses the unified graph-walk
+        (_build_all_edge_entries_into, defer=True) rather than
+        _prepare_episodic_keys_for_tier.  When the materialize stub returns
+        (set(), []) and the merger graph is empty, the walk produces zero keys
+        — the store's tier is empty after the cycle (expected here).
+        Tests that verify key minting (dcf4189, speaker_id) are in
+        TestInterimKeyedWalkB3.
         """
 
         loop = self._make_loop(tmp_path)
@@ -8186,7 +8280,7 @@ class TestInterimKeyedWalkB3:
           and Speaker1/lives_in/Paris (speaker_id="Speaker1").
         - Call _materialize_consolidation_graph(extra_relations=[...]) so it
           synthesises entities and stamps speaker_id on each subject node.
-        - Run _harvest_keyless_edge_entries + _apply_keyless_edge_entries.
+        - Run _build_all_edge_entries_into.
         - Assert: each minted key carries its own speaker's id; the two
           speaker_ids are different; neither equals "".
         """
@@ -8224,12 +8318,11 @@ class TestInterimKeyedWalkB3:
             )
 
         # After materialize, merger.graph has two keyless edges (one per relation).
-        # _harvest_keyless_edge_entries must resolve speaker_id from the subject node
+        # _build_all_edge_entries_into must resolve speaker_id from the subject node
         # for each — the entity re-synthesis in _materialize_consolidation_graph
         # stamps speaker_id onto the subject nodes so the walk reads them correctly.
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _harvested = loop._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop._apply_keyless_edge_entries(_harvested, tier_keyed)
+        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
 
         minted = tier_keyed["episodic"]
         assert len(minted) == 2, (
@@ -8275,8 +8368,7 @@ class TestInterimKeyedWalkB3:
         """The keyed-walk produces the same SPO content set as _prepare_episodic_keys_for_tier.
 
         For a fixed episodic input with no pre-existing tier keys:
-        - Graph-walk path: populate merger.graph, call _harvest_keyless_edge_entries
-          + _apply_keyless_edge_entries.
+        - Graph-walk path: populate merger.graph, call _build_all_edge_entries_into.
         - Flat path: call _prepare_episodic_keys_for_tier(simulate mode).
 
         Expected: both paths yield identical (subject, predicate, object) triples.
@@ -8286,11 +8378,11 @@ class TestInterimKeyedWalkB3:
         If this surfaces a real divergence — the graph-walk drops or adds facts
         vs the flat path — that is a B3 bug and must be reported, not masked.
 
-        Dedup note: _harvest_keyless_edge_entries skips edges that already carry
-        _IK_KEY_ATTR. _prepare_episodic_keys_for_tier deduplicates by existing
-        tier membership. With a clean (empty) graph and no pre-existing keys
-        both paths process all input relations; any difference in the SPO content
-        set is a genuine divergence.
+        Dedup note: _build_all_edge_entries_into skips edges that already carry
+        _IK_KEY_ATTR (via the keyed branch, not minting). _prepare_episodic_keys_for_tier
+        deduplicates by existing tier membership. With a clean (empty) graph and no
+        pre-existing keys both paths process all input relations; any difference in
+        the SPO content set is a genuine divergence.
         """
         # Fixed episodic input: two distinct SPO triples with explicit display names.
         # subject == display name (node key = canonical, attributes.name = display).
@@ -8331,8 +8423,7 @@ class TestInterimKeyedWalkB3:
             )
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _harvested = loop_gw._harvest_keyless_edge_entries(tag_new=False, default_speaker_id="")
-        loop_gw._apply_keyless_edge_entries(_harvested, tier_keyed)
+        loop_gw._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
         gw_entries = tier_keyed["episodic"]
 
         # ---- Flat path: _prepare_episodic_keys_for_tier (simulate) ----

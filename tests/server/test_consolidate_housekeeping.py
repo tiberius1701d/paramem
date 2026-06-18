@@ -42,6 +42,7 @@ def _make_hk_state(
     consolidating: bool = False,
     bg_is_training: bool = False,
     consolidation_mode: str = "train",
+    tmp_path=None,
 ) -> dict:
     """Minimal ``_state`` dict for housekeeping dispatch tests.
 
@@ -50,11 +51,20 @@ def _make_hk_state(
         consolidating: Whether ``_state["consolidating"]`` is already True.
         bg_is_training: Whether the BackgroundTrainer reports active training.
         consolidation_mode: Value for ``config.consolidation.mode``.
+        tmp_path: When provided, set ``config.paths.data`` to this real path so
+            that incident/run-status I/O writes land in ``tmp/state/`` rather
+            than creating a literal ``MagicMock/`` directory at the repo root.
+            Tests that exercise the full cycle path (``_run_full_consolidation_sync``)
+            must supply this; tests that only exercise dispatch guards do not.
     """
     mock_config = MagicMock()
     mock_config.consolidation.mode = consolidation_mode
     # Prevent ThermalPolicy.from_consolidation_config from comparing a MagicMock.
     mock_config.consolidation.training_temp_limit = 0
+    # Ground incident/run-status I/O in a real path so the writes land in the
+    # pytest tmp directory instead of creating a MagicMock/ tree at repo root.
+    if tmp_path is not None:
+        mock_config.paths.data = tmp_path
 
     mock_loop = MagicMock()
     mock_loop.model = MagicMock(name="model")
@@ -207,10 +217,10 @@ class TestRunFullConsolidationSyncHousekeeping:
         # submit() calls the closure synchronously so we can inspect state after.
         mock_bt.submit.side_effect = lambda fn, **kw: fn()
 
-        with patch("paramem.server.background_trainer.BackgroundTrainer", return_value=mock_bt):
+        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
             app_module._run_full_consolidation_sync(housekeeping=True)
 
-    def test_b1_fix_tiers_rebuilt_empty_does_not_noop(self, monkeypatch) -> None:
+    def test_b1_fix_tiers_rebuilt_empty_does_not_noop(self, monkeypatch, tmp_path) -> None:
         """B1 fix: housekeeping=True + tiers_rebuilt==[] does NOT trigger noop early-return.
 
         Under the scheduled fold, an empty tiers_rebuilt signals a no-op and the
@@ -219,7 +229,7 @@ class TestRunFullConsolidationSyncHousekeeping:
         pass — _save_key_metadata must still be called.
         """
 
-        state = _make_hk_state()
+        state = _make_hk_state(tmp_path=tmp_path)
         # run_housekeeping returns tiers_rebuilt=[] (simulate path, no interims).
         state["consolidation_loop"].run_housekeeping.return_value = {
             "tiers_rebuilt": [],
@@ -254,14 +264,14 @@ class TestRunFullConsolidationSyncHousekeeping:
             ("B1 fix: _save_key_metadata must be called even when tiers_rebuilt==[]"),
         )
 
-    def test_sessions_not_marked_consolidated(self, monkeypatch) -> None:
+    def test_sessions_not_marked_consolidated(self, monkeypatch, tmp_path) -> None:
         """housekeeping=True: session_buffer.mark_consolidated is NOT called.
 
         The housekeeping fold re-grooms the existing knowledge but does not
         consume pending sessions — they stay pending for the next scheduled tick.
         """
 
-        state = _make_hk_state()
+        state = _make_hk_state(tmp_path=tmp_path)
         # Return a successful result with non-empty tiers_rebuilt.
         state["consolidation_loop"].run_housekeeping.return_value = {
             "tiers_rebuilt": ["episodic"],
@@ -288,10 +298,10 @@ class TestRunFullConsolidationSyncHousekeeping:
             ("housekeeping=True: mark_consolidated must NOT be called"),
         )
 
-    def test_consolidating_cleared_on_completion(self, monkeypatch) -> None:
+    def test_consolidating_cleared_on_completion(self, monkeypatch, tmp_path) -> None:
         """_state['consolidating'] is cleared (set to False) after the fold completes."""
 
-        state = _make_hk_state()
+        state = _make_hk_state(tmp_path=tmp_path)
         state["consolidating"] = True  # set by dispatcher before submit
         state["consolidation_loop"].run_housekeeping.return_value = {
             "tiers_rebuilt": [],
@@ -317,11 +327,13 @@ class TestRunFullConsolidationSyncHousekeeping:
             "_state['consolidating'] must be cleared after fold completes"
         )
 
-    def test_run_housekeeping_called_not_consolidate_interim_adapters(self, monkeypatch) -> None:
+    def test_run_housekeeping_called_not_consolidate_interim_adapters(
+        self, monkeypatch, tmp_path
+    ) -> None:
         """_run_full_consolidation_sync(housekeeping=True) calls run_housekeeping, not
         consolidate_interim_adapters or consolidate_interim_graphs directly."""
 
-        state = _make_hk_state(consolidation_mode="train")
+        state = _make_hk_state(consolidation_mode="train", tmp_path=tmp_path)
         state["consolidation_loop"].store.replay_enabled = False
 
         with (

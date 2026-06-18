@@ -176,6 +176,25 @@ def test_consolidation_period_derived(example_config):
     assert example_config.consolidation.consolidation_period_string == "every 84h"
 
 
+@pytest.mark.parametrize(
+    "config_path",
+    ["configs/server.yaml.example", "tests/fixtures/server.yaml"],
+)
+def test_recall_retry_cap_loads_from_consolidation_section(config_path):
+    """Regression: ``recall_retry_cap`` belongs on ``ConsolidationScheduleConfig``,
+    not ``ConsolidationConfig``.
+
+    The YAML ``consolidation:`` section is parsed into
+    ``ConsolidationScheduleConfig``, and the runtime reads
+    ``config.consolidation.recall_retry_cap`` at SessionBuffer construction
+    (app.py). If the field is ever moved back onto the wrong config class,
+    ``load_server_config`` raises ``TypeError`` on the unexpected kwarg and
+    every server-config load fails. This guards both tracked config files.
+    """
+    cfg = load_server_config(config_path)
+    assert cfg.consolidation.recall_retry_cap == 3
+
+
 def test_voice_prompt_loads(example_config):
     """Voice prompt file referenced by the example must exist and be non-empty."""
     text = example_config.voice.load_prompt()

@@ -132,9 +132,12 @@ data/ha/debug/calibration/
 experiments/fixtures/
 
 # MagicMock-named directory leakage. Several tests mock snapshot_dir_for(...)
-# with a bare MagicMock; production code that calls .mkdir(parents=True,
-# exist_ok=True) on the mocked return value reaches the filesystem with
-# str(MagicMock()) as the path, creating directories like
-# "<MagicMock name='mock.snapshot_dir_for().__truediv__()' id='...'>".
-# Fixing every test to use spec=Path mocks is a separate pass.
+# or config.paths.data with a bare MagicMock; production code that calls
+# .mkdir(parents=True, exist_ok=True) on the mocked return value reaches the
+# filesystem with str(MagicMock()) as the path, creating directories like
+# "<MagicMock name='mock.snapshot_dir_for().__truediv__()' id='...'>" (repr
+# form) or "MagicMock/mock.paths.data.__truediv__()" (the durable-state
+# record_last_run/record_incident path form). Fixing every test to use
+# spec=Path mocks is a separate pass.
 <MagicMock*
+MagicMock/

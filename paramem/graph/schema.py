@@ -86,6 +86,25 @@ class Relation(BaseModel):
         ),
         exclude=True,
     )
+    session_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Transient carry-slot for the set of session ids that contributed "
+            "this relation.  Populated at the extraction stamp point "
+            "(app.py _extract_and_start_training / _run_extraction_phase) and "
+            "propagated through GraphMerger._upsert_relation into "
+            "edge['sessions'] so the merger accumulates the UNION across all "
+            "contributing sessions.  Read back from edge['sessions'] when "
+            "reconstructing Relation objects from the cumulative graph "
+            "(_pending_relations build in run_consolidation_cycle) and carried "
+            "on the deferred-write record in _build_all_edge_entries_into so "
+            "the episodic drop site (step 11b) can identify which sessions "
+            "contributed a recall-failed key.  Always [] for extraction-time "
+            "Relations that have not been stamped yet; never persisted to the "
+            "registry, cumulative_graph.json, or adapter weights."
+        ),
+        exclude=True,
+    )
 
 
 class SessionGraph(BaseModel):

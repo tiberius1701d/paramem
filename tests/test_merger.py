@@ -2126,3 +2126,172 @@ class TestObjectVariantDedup:
             "First-seen surface form must be preserved in attributes['name']; "
             f"got {node_data['attributes'].get('name')!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# B7-A — session_ids provenance union in _upsert_relation
+# Plan test 5: Relation.session_ids survives the merge as a SET union.
+# ---------------------------------------------------------------------------
+
+
+class TestSessionIdsProvenanceUnion:
+    """B7-A acceptance tests for session_ids provenance plumbing.
+
+    GraphMerger._upsert_relation must union Relation.session_ids into
+    edge['sessions'] in BOTH Case-1 (duplicate-SPO reinforcement) AND
+    Case-3 (new-edge insertion) so the real contributing session ids
+    accumulate on the edge across all extraction paths.
+
+    Locks T2 SET semantics across both merge cases.  The dcf4189
+    speaker-attribution invariant (T9) is also verified: minted-key
+    speaker_id comes from the SUBJECT NODE attribute, not from the
+    scalar session_id param; the session_ids union must not touch it.
+    """
+
+    @staticmethod
+    def _rel(session_ids: list[str], speaker_id: str = "Speaker0") -> Relation:
+        """Helper: build a minimal Relation with session_ids set."""
+        return Relation(
+            subject="Alex",
+            predicate="lives_in",
+            object="Berlin",
+            relation_type="factual",
+            speaker_id=speaker_id,
+            session_ids=session_ids,
+        )
+
+    def test_case3_new_edge_carries_session_ids(self):
+        """Case-3 new-edge insertion: Relation.session_ids are unioned into edge['sessions'].
+
+        The scalar session_id param may be a synthetic sentinel (as in
+        _merge_registry_relations); the real ids must still appear on the edge.
+
+        Speaker entities are keyed by speaker_id in the graph ("Speaker0"), not
+        by the display name ("Alex"); non-speaker entities are keyed by canonical
+        form ("berlin").  Edge lookup uses these canonical keys.
+        """
+        m = GraphMerger()
+        s1 = SessionGraph(
+            session_id="__interim_pending_sessions__",  # synthetic sentinel
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+                Entity(name="Berlin", entity_type="place"),
+            ],
+            relations=[self._rel(["real-session-abc"])],
+        )
+        m.merge(s1)
+
+        # Speaker entities are keyed by speaker_id; non-speakers by canonical form.
+        # Relation subject="Alex" with speaker_id="Speaker0" → node key "Speaker0".
+        # Relation object="Berlin" → canonical node key "berlin".
+        edges = list(m.graph["Speaker0"]["berlin"].values())
+        assert len(edges) == 1, f"expected 1 edge; got {len(edges)}"
+        sessions = edges[0]["sessions"]
+        assert "real-session-abc" in sessions, (
+            f"Real session id must be in edge['sessions']; got {sessions}"
+        )
+        # Synthetic sentinel is also in sessions (it was the scalar param).
+        assert "__interim_pending_sessions__" in sessions
+
+    def test_case3_new_edge_with_empty_session_ids(self):
+        """Case-3: empty Relation.session_ids — edge['sessions'] contains only scalar param."""
+        m = GraphMerger()
+        s1 = SessionGraph(
+            session_id="session-xyz",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[
+                Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+                Entity(name="Berlin", entity_type="place"),
+            ],
+            relations=[self._rel([])],
+        )
+        m.merge(s1)
+
+        edges = list(m.graph["Speaker0"]["berlin"].values())
+        sessions = edges[0]["sessions"]
+        assert sessions == ["session-xyz"], (
+            f"Empty session_ids → edge['sessions'] == [scalar]; got {sessions}"
+        )
+
+    def test_case1_duplicate_spo_unions_session_ids(self):
+        """Case-1 duplicate-SPO reinforcement: session_ids from both merges are unioned.
+
+        Plan test 5 core assertion: merge same (s,p,o) from sessions s1 and s2
+        under synthetic scalar ids.  edge['sessions'] must be the UNION
+        {s1_real, s2_real, synthetic_sentinel}.
+        """
+        m = GraphMerger()
+        entities = [
+            Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+            Entity(name="Berlin", entity_type="place"),
+        ]
+        # First merge: real id "session-A", scalar synthetic.
+        s1 = SessionGraph(
+            session_id="__interim_pending_sessions__",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=entities,
+            relations=[self._rel(["session-A"])],
+        )
+        m.merge(s1)
+
+        # Second merge: same (s,p,o) with real id "session-B".
+        s2 = SessionGraph(
+            session_id="__interim_pending_sessions__",
+            timestamp="2026-01-01T01:00:00Z",
+            entities=entities,
+            relations=[self._rel(["session-B"])],
+        )
+        m.merge(s2)
+
+        # Speaker entity keyed by speaker_id "Speaker0"; object "Berlin" → "berlin".
+        edges = list(m.graph["Speaker0"]["berlin"].values())
+        assert len(edges) == 1, f"Duplicate SPO must collapse to one edge; got {len(edges)}"
+        sessions = set(edges[0]["sessions"])
+        assert "session-A" in sessions, f"session-A missing from {sessions}"
+        assert "session-B" in sessions, f"session-B missing from {sessions}"
+        assert "__interim_pending_sessions__" in sessions, (
+            f"Synthetic sentinel missing from {sessions}"
+        )
+
+    def test_speaker_id_attribution_unchanged_by_session_ids_union(self):
+        """dcf4189 invariant: speaker_id on the SUBJECT NODE is unchanged by B7-A.
+
+        Multi-session edge: two merges under different scalar session_ids each
+        carrying a real session_id.  The subject node must retain speaker_id
+        from the entity (dcf4189), not from any session_id field.
+        """
+        m = GraphMerger()
+        entities = [
+            Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+            Entity(name="Berlin", entity_type="place"),
+        ]
+        s1 = SessionGraph(
+            session_id="scalar-1",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=entities,
+            relations=[self._rel(["session-A"], speaker_id="Speaker0")],
+        )
+        m.merge(s1)
+
+        s2 = SessionGraph(
+            session_id="scalar-2",
+            timestamp="2026-01-01T01:00:00Z",
+            entities=entities,
+            relations=[self._rel(["session-B"], speaker_id="Speaker0")],
+        )
+        m.merge(s2)
+
+        # Speaker entities are keyed by speaker_id in the graph.
+        # B7-A session_ids union touches only edge['sessions'] — never the node.
+        speaker_node = m.graph.nodes.get("Speaker0", {})
+        assert speaker_node.get("speaker_id") == "Speaker0", (
+            "speaker_id on the subject node must come from the Entity, not from "
+            f"session_ids union; got {speaker_node.get('speaker_id')!r}"
+        )
+        # And the edge carries both real session ids.
+        edges = list(m.graph["Speaker0"]["berlin"].values())
+        sessions = set(edges[0]["sessions"])
+        assert "session-A" in sessions and "session-B" in sessions, (
+            f"Both real session ids must be in edge['sessions']; got {sessions}"
+        )

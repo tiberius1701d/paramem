@@ -40,8 +40,17 @@ def _make_loop_no_qa():
     return loop
 
 
-def _make_config(mode="train"):
+def _make_config(mode="train", tmp_path=None):
+    """Build a minimal mock config for voice-profile consolidation tests.
 
+    Args:
+        mode: ``config.consolidation.mode`` value.
+        tmp_path: When provided, set ``config.paths.data`` to this real path so
+            that incident/run-status I/O writes (``record_last_run``,
+            ``record_incident``) land in ``tmp_path / "state"`` rather than
+            creating a literal ``MagicMock/`` directory at the repo root.
+            All tests that call ``_extract_and_start_training`` must supply this.
+    """
     cfg = MagicMock()
     cfg.adapters.episodic.enabled = True
     cfg.consolidation.mode = mode
@@ -56,6 +65,9 @@ def _make_config(mode="train"):
     cfg.consolidation.extraction_plausibility_stage = "post"
     cfg.consolidation.extraction_verify_anonymization = False
     cfg.debug = False
+    # Ground incident/run-status I/O in a real path when provided.
+    if tmp_path is not None:
+        cfg.paths.data = tmp_path
     return cfg
 
 
@@ -126,7 +138,7 @@ def _patch_extract_training(pending, config, target_profile="gpu"):
 # ---------------------------------------------------------------------------
 
 
-def test_document_cycle_swaps_to_cpu_then_gpu_in_local_mode():
+def test_document_cycle_swaps_to_cpu_then_gpu_in_local_mode(tmp_path):
     """Document session present: helper called with cpu (lock_held=True) then gpu (lock_held=False).
 
     The ``evict_voice_for_cycle`` predicate gates both calls.
@@ -136,7 +148,7 @@ def test_document_cycle_swaps_to_cpu_then_gpu_in_local_mode():
     import paramem.server.app as app_module
 
     pending = _make_pending(source_type="document", n=1)
-    config = _make_config()
+    config = _make_config(tmp_path=tmp_path)
 
     with _patch_extract_training(pending, config, target_profile="gpu") as (
         mock_profile,
@@ -154,12 +166,12 @@ def test_document_cycle_swaps_to_cpu_then_gpu_in_local_mode():
     assert calls[1] == call("gpu", lock_held=False), f"Expected gpu restore, got {calls[1]}"
 
 
-def test_voice_cycle_in_cloud_only_targets_cpu_after():
+def test_voice_cycle_in_cloud_only_targets_cpu_after(tmp_path):
     """In cloud-only mode, the post-cycle restore targets cpu via _target_profile()."""
     import paramem.server.app as app_module
 
     pending = _make_pending(source_type="document", n=1)
-    config = _make_config()
+    config = _make_config(tmp_path=tmp_path)
 
     with _patch_extract_training(pending, config, target_profile="cpu") as (
         mock_profile,
@@ -177,7 +189,7 @@ def test_voice_cycle_in_cloud_only_targets_cpu_after():
     )
 
 
-def test_pure_transcript_cycle_skips_voice_swap():
+def test_pure_transcript_cycle_skips_voice_swap(tmp_path):
     """A cycle with only transcript sessions must NOT call the helper.
 
     ``evict_voice_for_cycle`` is False when no session is a document — a
@@ -187,7 +199,7 @@ def test_pure_transcript_cycle_skips_voice_swap():
     import paramem.server.app as app_module
 
     pending = _make_pending(source_type="transcript", n=2)
-    config = _make_config()
+    config = _make_config(tmp_path=tmp_path)
 
     with _patch_extract_training(pending, config) as (mock_profile, mock_buffer):
         loop = _make_loop_no_qa()
@@ -198,7 +210,7 @@ def test_pure_transcript_cycle_skips_voice_swap():
     mock_profile.assert_not_called()
 
 
-def test_mixed_cycle_with_document_evicts_then_restores_voice():
+def test_mixed_cycle_with_document_evicts_then_restores_voice(tmp_path):
     """A cycle mixing a transcript probe + document sessions MUST evict voice.
 
     This is the regression case: under the prior all()-predicate the lone
@@ -214,7 +226,7 @@ def test_mixed_cycle_with_document_evicts_then_restores_voice():
         *_make_pending(source_type="transcript", n=1),
         *_make_pending(source_type="document", n=2),
     ]
-    config = _make_config()
+    config = _make_config(tmp_path=tmp_path)
 
     with _patch_extract_training(pending, config, target_profile="gpu") as (
         mock_profile,
@@ -254,7 +266,7 @@ def test_extract_failure_restores_voice_via_done_callback():
     mock_profile.assert_called_once_with("gpu", lock_held=False)
 
 
-def test_extraction_failed_abort_restores_voice_with_lock_held():
+def test_extraction_failed_abort_restores_voice_with_lock_held(tmp_path):
     """ExtractionFailed abort handler must restore voice with ``lock_held=True``.
 
     Regression for the deadlock discovered 2026-05-17: the abort handler at
@@ -273,7 +285,7 @@ def test_extraction_failed_abort_restores_voice_with_lock_held():
     from paramem.graph.extractor import ExtractionFailed
 
     pending = _make_pending(source_type="document", n=1)
-    config = _make_config()
+    config = _make_config(tmp_path=tmp_path)
 
     with _patch_extract_training(pending, config, target_profile="gpu") as (
         mock_profile,

@@ -860,6 +860,13 @@ class ConsolidationScheduleConfig:
     # simulate→train migration.  1.0 = sharp recall (all keys must be recalled).
     # Lower only with empirical evidence and explicit operator acknowledgment.
     recall_sanity_threshold: float = 1.0
+    # Maximum number of interim cycles a session can be held pending because
+    # a new key it contributed failed the recall gate.  When the counter
+    # reaches this cap the session is released (no longer pinned), a
+    # consolidation_recall_failure incident is recorded, and a WARNING is
+    # logged.  Must be a positive integer (> 0).  Read at SessionBuffer
+    # construction (app.py).
+    recall_retry_cap: int = 3
     # Floor below which a tier's keys park in episodic until the tier's own
     # population reaches this count.  30 is the conservative default (Test 19:
     # set size is the lever — 10 near-dup keys score 7/10 isolated, 51/51 when
@@ -1129,6 +1136,11 @@ class ConsolidationScheduleConfig:
             raise ValueError(
                 f"consolidation.recall_sanity_threshold must be in (0.0, 1.0]; "
                 f"got {self.recall_sanity_threshold!r}"
+            )
+
+        if self.recall_retry_cap < 1:
+            raise ValueError(
+                f"consolidation.recall_retry_cap must be > 0; got {self.recall_retry_cap!r}"
             )
 
         # orphan_retirement: validate the schedule string early so the operator

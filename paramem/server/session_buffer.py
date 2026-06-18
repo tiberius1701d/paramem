@@ -72,11 +72,13 @@ class SessionBuffer:
         session_dir: Path,
         retain_sessions: bool = True,
         debug: bool = False,
+        recall_retry_cap: int = 3,
     ):
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.retain_sessions = retain_sessions
         self.debug = debug
+        self._recall_retry_cap = recall_retry_cap
         self._snapshot_path = self.session_dir / "session_snapshot.enc"
 
         if _snapshots_enabled():
@@ -660,6 +662,65 @@ class SessionBuffer:
             if not remaining:
                 origdoc.unlink()
                 logger.info("Deleted origdoc for discarded doc: %s", doc_id)
+
+    def bump_retry_and_release(self, failed_ids: set[str]) -> list[str]:
+        """Increment the recall-retry counter for each failed session; release capped ones.
+
+        Called from the interim-training success path (``app.py
+        _run_interim_training``) after ``run_consolidation_cycle`` returns with
+        a non-empty ``recall_failed_session_ids`` set.  For each session id in
+        *failed_ids* that is currently buffered:
+
+        - Increment ``recall_retry_count`` (defaulting to 0 if absent).
+        - If the new count reaches :attr:`_recall_retry_cap`, add the session
+          id to the returned release list.
+
+        Released sessions are removed from the caller's ``failed_session_ids``
+        set so ``_completed_session_ids()`` retires them on the current cycle
+        (they are "un-pinned").  A WARNING is logged for each released session.
+        The corresponding incident is recorded by the caller (not here) so the
+        caller owns the per-session ``key`` for S-3 dedup.
+
+        Session ids absent from :attr:`_sessions` are silently skipped (R3
+        guard: synthetic-id leakage protection — synthetic ids are never
+        present in the buffer).
+
+        Reset-on-success: when a session is eventually retired via
+        :meth:`mark_consolidated`, its :attr:`_sessions` entry is popped,
+        clearing the counter naturally — no explicit reset needed.
+
+        Restart semantics: the counter is snapshotted only on graceful exit
+        (via :meth:`save_snapshot`); an ungraceful restart resets the budget to
+        0.  This is the correct safe default — a flapping fact can retry more
+        than ``recall_retry_cap`` times across crashes but is never stranded.
+
+        Args:
+            failed_ids: Session ids that contributed a recall-failed key this
+                cycle.  Typically derived from
+                ``result.get("recall_failed_session_ids", [])`` in the caller.
+
+        Returns:
+            List of session ids whose retry count reached the cap.  The caller
+            must remove them from its pending-failure set to un-pin them.
+        """
+        released: list[str] = []
+        for sid in failed_ids:
+            if sid not in self._sessions:
+                # R3: not a buffered session (already retired or a synthetic id
+                # that slipped through).  Skip silently — do not mutate state.
+                continue
+            session = self._sessions[sid]
+            new_count = session.get("recall_retry_count", 0) + 1
+            session["recall_retry_count"] = new_count
+            if new_count >= self._recall_retry_cap:
+                logger.warning(
+                    "SessionBuffer.bump_retry_and_release: session %s hit "
+                    "recall-retry cap (%d) — releasing; facts could not be encoded",
+                    sid,
+                    self._recall_retry_cap,
+                )
+                released.append(sid)
+        return released
 
     def get_session_turns(self, conversation_id: str) -> list[dict]:
         """Read all turns from a session."""

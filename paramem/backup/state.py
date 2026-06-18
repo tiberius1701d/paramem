@@ -22,13 +22,13 @@ timer runner).  The lock is released when the lock-file ``with`` block exits.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from paramem.server.atomic_json import atomic_write_json, flock_rmw, read_json_or_none
 
 if TYPE_CHECKING:
     from paramem.backup.runner import ScheduledBackupResult
@@ -37,8 +37,7 @@ logger = logging.getLogger(__name__)
 
 BACKUP_STATE_SCHEMA_VERSION: int = 1
 BACKUP_STATE_FILENAME: str = "backup.json"
-
-_PENDING_DIRNAME: str = ".pending"
+_BACKUP_LOCKFILE: str = "backup.lock"
 
 
 # ---------------------------------------------------------------------------
@@ -139,14 +138,8 @@ class BackupStateRecord:
 def write_backup_state(state_dir: Path, record: BackupStateRecord) -> Path:
     """Atomically write ``state_dir/backup.json`` via a ``.pending`` rename.
 
-    Mirrors ``paramem.server.trial_state.write_trial_marker``:
-
-    1. Create ``state_dir/.pending/`` if absent.
-    2. Write ``backup.json`` into the pending directory.
-    3. ``fsync`` the file fd.
-    4. ``fsync`` the pending directory entry.
-    5. ``os.rename(.pending/backup.json, state_dir/backup.json)`` — atomic.
-    6. ``fsync(state_dir)`` for rename durability.
+    Delegates to :func:`paramem.server.atomic_json.atomic_write_json` for the
+    atomic-write mechanics.
 
     Parameters
     ----------
@@ -161,49 +154,7 @@ def write_backup_state(state_dir: Path, record: BackupStateRecord) -> Path:
     Path
         The final path of the written file (``state_dir/backup.json``).
     """
-    state_dir = Path(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
-
-    pending_dir = state_dir / _PENDING_DIRNAME
-    pending_dir.mkdir(parents=True, exist_ok=True)
-
-    pending_file = pending_dir / BACKUP_STATE_FILENAME
-    final_path = state_dir / BACKUP_STATE_FILENAME
-
-    data = json.dumps(record.to_dict(), indent=2, ensure_ascii=False)
-
-    with open(pending_file, "w", encoding="utf-8") as fh:
-        fh.write(data)
-        fh.flush()
-        os.fsync(fh.fileno())
-
-    # fsync pending directory entry.
-    try:
-        pd_fd = os.open(str(pending_dir), os.O_RDONLY)
-        try:
-            os.fsync(pd_fd)
-        except OSError as exc:
-            logger.warning("write_backup_state: pending dir fsync failed: %s", exc)
-        finally:
-            os.close(pd_fd)
-    except OSError as exc:
-        logger.warning("write_backup_state: could not open pending dir for fsync: %s", exc)
-
-    os.rename(pending_file, final_path)
-
-    # fsync state_dir for rename durability.
-    try:
-        sd_fd = os.open(str(state_dir), os.O_RDONLY)
-        try:
-            os.fsync(sd_fd)
-        except OSError as exc:
-            logger.warning("write_backup_state: state_dir fsync failed: %s", exc)
-        finally:
-            os.close(sd_fd)
-    except OSError as exc:
-        logger.warning("write_backup_state: could not open state_dir for fsync: %s", exc)
-
-    return final_path
+    return atomic_write_json(Path(state_dir), BACKUP_STATE_FILENAME, record.to_dict())
 
 
 def read_backup_state(state_dir: Path) -> BackupStateRecord | None:
@@ -220,17 +171,15 @@ def read_backup_state(state_dir: Path) -> BackupStateRecord | None:
     -------
     BackupStateRecord or None
     """
-    state_path = Path(state_dir) / BACKUP_STATE_FILENAME
-    if not state_path.exists():
-        return None
-
     try:
-        raw = json.loads(state_path.read_text(encoding="utf-8"))
+        raw = read_json_or_none(Path(state_dir), BACKUP_STATE_FILENAME)
     except json.JSONDecodeError as exc:
         raise BackupStateSchemaError(f"backup state is not valid JSON: {exc}") from exc
     except OSError as exc:
         raise BackupStateSchemaError(f"cannot read backup state: {exc}") from exc
 
+    if raw is None:
+        return None
     return BackupStateRecord.from_dict(raw)
 
 
@@ -242,6 +191,9 @@ def update_backup_state(
 
     Acquires an exclusive ``fcntl.flock`` on ``state_dir/backup.lock`` before
     the read-modify-write to serialise concurrent callers (Fix 3).
+
+    Delegates locking and atomic-write mechanics to
+    :func:`paramem.server.atomic_json.flock_rmw`.
 
     Promotion rules:
 
@@ -265,31 +217,25 @@ def update_backup_state(
         The new record as written to disk.
     """
     state_dir = Path(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = state_dir / "backup.lock"
 
-    with open(lock_path, "w") as lockf:
-        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
-
-        # Read existing record (or start fresh).
-        existing = read_backup_state(state_dir)
-        if existing is None:
+    def _mutate(current: dict | None) -> dict:
+        if current is None:
             last_success_at = None
             last_failure_at = None
             last_failure_reason = None
         else:
+            # Re-parse through from_dict to get typed access; errors propagate.
+            existing = BackupStateRecord.from_dict(current)
             last_success_at = existing.last_success_at
             last_failure_at = existing.last_failure_at
             last_failure_reason = existing.last_failure_reason
 
-        # Update fields based on the new run.
         if new_run.success:
             last_success_at = new_run.completed_at
         else:
             last_failure_at = new_run.completed_at
             last_failure_reason = new_run.error
 
-        # Build the serialised last_run dict.
         last_run_dict = {
             "started_at": new_run.started_at,
             "completed_at": new_run.completed_at,
@@ -309,8 +255,7 @@ def update_backup_state(
             last_failure_at=last_failure_at,
             last_failure_reason=last_failure_reason,
         )
+        return new_record.to_dict()
 
-        write_backup_state(state_dir, new_record)
-        # Lock released on file close (exiting the with block).
-
-    return new_record
+    result_dict = flock_rmw(state_dir, _BACKUP_LOCKFILE, _mutate, BACKUP_STATE_FILENAME)
+    return BackupStateRecord.from_dict(result_dict)

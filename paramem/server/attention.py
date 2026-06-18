@@ -864,6 +864,65 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
     return items
 
 
+def _collect_incident_items(state: dict, config) -> list[AttentionItem]:
+    """Emit one ``AttentionItem`` per ACTIVE incident from the durable incident store.
+
+    Mirrors :func:`_collect_backup_items` exactly: reads ``incidents.json`` LIVE
+    from ``data/state/`` at every ``/status`` poll, returns ``[]`` on missing
+    config, import error, or ``IncidentStoreSchemaError``.
+
+    Only ``"active"`` incidents are emitted as attention rows.  Acknowledged
+    incidents are operator-silenced — they do NOT raise the loud attention signal
+    even after a ``count`` bump.  Resolved incidents are omitted entirely.
+
+    Parameters
+    ----------
+    state:
+        Server ``_state`` dict.  Read-only.
+    config:
+        Loaded ``ServerConfig``.  ``None`` → return ``[]`` immediately.
+
+    Returns
+    -------
+    list[AttentionItem]
+        One item per active (non-acknowledged, non-resolved) incident, in store
+        order.
+    """
+    if config is None:
+        return []
+
+    try:
+        from paramem.server.incidents import IncidentStoreSchemaError, read_incidents
+    except ImportError:
+        return []
+
+    state_dir = (config.paths.data / "state").resolve()
+
+    try:
+        incidents = read_incidents(state_dir)
+    except IncidentStoreSchemaError:
+        return []
+
+    items: list[AttentionItem] = []
+    for incident in incidents:
+        if incident.status != "active":
+            # Acknowledged incidents are silenced; resolved incidents are gone.
+            continue
+        items.append(
+            AttentionItem(
+                kind=f"incident_{incident.type}",
+                level=incident.severity,
+                summary=incident.summary,
+                action_hint=(
+                    f"POST /incidents/{incident.id}/ack to silence this alert; "
+                    f"it will auto-resolve on the next successful run."
+                ),
+                age_seconds=_age_seconds_from_iso(incident.first_seen),
+            )
+        )
+    return items
+
+
 def _collect_key_rotation_items(state: dict) -> list[AttentionItem]:
     """Emit key-rotation items when master-key fingerprint changed.
 
@@ -1080,11 +1139,13 @@ def collect_attention_items(
     items.extend(_collect_migration_items(state))
     items.extend(_collect_consolidation_items(state))
     items.extend(_collect_sweeper_items(state))
-    # NOTE: _collect_backup_items and _collect_pre_flight_items take
-    # (state, config); _collect_key_rotation_items and _collect_encryption_items
-    # are stubs that keep a (state)-only signature until they are wired — do NOT
-    # unify the signatures here before they are populated.
+    # NOTE: _collect_backup_items, _collect_incident_items, and
+    # _collect_pre_flight_items take (state, config); _collect_key_rotation_items
+    # and _collect_encryption_items are stubs that keep a (state)-only signature
+    # until they are wired — do NOT unify the signatures here before they are
+    # populated.
     items.extend(_collect_backup_items(state, config))
+    items.extend(_collect_incident_items(state, config))
     items.extend(_collect_config_drift_items(state))
     items.extend(_collect_boot_degraded_items(state))
     items.extend(_collect_integrity_cleanup_items(state))

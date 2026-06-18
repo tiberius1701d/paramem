@@ -144,13 +144,13 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     loop.shutdown_requested = False
     loop.merger = MagicMock()
 
-    # B3: _harvest_keyless_edge_entries reads merger.graph.edges(data=True).
+    # B3: _build_all_edge_entries_into reads merger.graph.edges(data=True).
     # Replace the MagicMock graph with a real MultiDiGraph populated from
     # _EPISODIC_RELS so the graph-walk mints keys for the parity tests.
     # The _materialize_consolidation_graph stub below skips merger.reset_graph(),
     # so the graph persists intact through the keyed-walk step.
     #
-    # Speaker-ID node seeding: _harvest_keyless_edge_entries distinguishes
+    # Speaker-ID node seeding: the unified builder distinguishes
     # "speaker_id key absent" (→ use default_speaker_id, i.e. the cycle's
     # speaker_id) from "speaker_id key present with explicit value" (→ keep as-is,
     # even if empty).  This mirrors _tag_speaker_id_defaults semantics.
