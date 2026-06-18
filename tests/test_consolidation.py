@@ -323,10 +323,11 @@ class TestExtractionPathParity:
 
 
 class TestInterimRefinementGate:
-    """extract_session merger.merge call is gated by config.interim_refinement.
+    """extract_session merger.merge is always called; additivity tracks refinement level.
 
-    These tests verify Path A (interim_refinement='light' or 'full') and Path B
-    (interim_refinement='off', default) without loading any model or GPU.
+    interim_refinement='off'  → additive merge (no supersession, both facts coexist).
+    interim_refinement='light'/'full' → non-additive merge (model may supersede edges).
+    All tests run without loading any model or GPU.
     """
 
     def _build_loop(self, monkeypatch, tmp_path, interim_refinement: str):
@@ -400,8 +401,8 @@ class TestInterimRefinementGate:
             or loop.merger.graph.number_of_edges() > initial_edges
         ), "Expected merger.graph to grow after extract_session with interim_refinement='full'"
 
-    def test_merge_not_called_when_interim_refinement_off(self, monkeypatch, tmp_path):
-        """interim_refinement='off': merger.merge is NOT called; graph unchanged."""
+    def test_merge_called_additive_when_interim_refinement_off(self, monkeypatch, tmp_path):
+        """interim_refinement='off': merger.merge IS called with additive=True; graph grows."""
         from unittest.mock import patch
 
         loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="off")
@@ -409,13 +410,20 @@ class TestInterimRefinementGate:
         initial_edges = loop.merger.graph.number_of_edges()
 
         with patch.object(loop.extraction, "run", return_value=self._session_graph):
-            with patch.object(loop.merger, "merge") as mock_merge:
+            with patch.object(loop.merger, "merge", wraps=loop.merger.merge) as mock_merge:
                 loop.extract_session("t", "s_gate", speaker_id="spk0")
-                mock_merge.assert_not_called()
+                # merge must be called exactly once with additive=True
+                mock_merge.assert_called_once()
+                _, kwargs = mock_merge.call_args
+                assert kwargs.get("additive") is True, (
+                    "interim_refinement='off' must call merge(additive=True)"
+                )
 
-        # Graph is also structurally unchanged.
-        assert loop.merger.graph.number_of_nodes() == initial_nodes
-        assert loop.merger.graph.number_of_edges() == initial_edges
+        # Graph must have grown — the additive merge still inserts edges.
+        assert (
+            loop.merger.graph.number_of_nodes() > initial_nodes
+            or loop.merger.graph.number_of_edges() > initial_edges
+        ), "Expected merger.graph to grow after extract_session with interim_refinement='off'"
 
     def test_episodic_rels_identical_regardless_of_interim_refinement(self, monkeypatch, tmp_path):
         """Returned (episodic_rels, procedural_rels) are identical regardless of interim_refinement.
@@ -440,6 +448,222 @@ class TestInterimRefinementGate:
             "episodic_rels differ between interim_refinement='full' and 'off'"
         )
         assert proc_a == proc_b == []
+
+    def test_off_additive_both_facts_survive(self, monkeypatch, tmp_path):
+        """interim_refinement='off': two facts with the same predicate but different
+        objects both survive (additive coexist — no supersession).
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+
+        # Override _session_graph for this test: same subject+predicate, two objects.
+        sg1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-06-01T00:00:00Z",
+            entities=[
+                Entity(name="Alice", entity_type="person"),
+                Entity(name="Berlin", entity_type="location"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Berlin",
+                    relation_type="factual",
+                    speaker_id="spk0",
+                ),
+            ],
+        )
+        sg2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-06-02T00:00:00Z",
+            entities=[
+                Entity(name="Alice", entity_type="person"),
+                Entity(name="Munich", entity_type="location"),
+            ],
+            relations=[
+                Relation(
+                    subject="Alice",
+                    predicate="lives_in",
+                    object="Munich",
+                    relation_type="factual",
+                    speaker_id="spk0",
+                ),
+            ],
+        )
+        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="off")
+
+        with patch.object(loop.extraction, "run", side_effect=[sg1, sg2]):
+            loop.extract_session("t1", "s1", speaker_id="spk0")
+            loop.extract_session("t2", "s2", speaker_id="spk0")
+
+        # Both objects must be present in the cumulative graph.
+        berlin_present = any(
+            loop.merger.graph.has_node(n) and "berlin" in n.lower()
+            for n in loop.merger.graph.nodes()
+        )
+        munich_present = any(
+            loop.merger.graph.has_node(n) and "munich" in n.lower()
+            for n in loop.merger.graph.nodes()
+        )
+        assert berlin_present and munich_present, (
+            f"Both 'Berlin' and 'Munich' must coexist under additive merge; "
+            f"nodes={list(loop.merger.graph.nodes())}"
+        )
+
+    def test_full_non_additive_supersession_removes_old_edge(self, monkeypatch, tmp_path):
+        """interim_refinement='full': non-additive merge calls Case-2 model verdict.
+
+        We stub check_predicate_coexistence to return REPLACE so the old edge is
+        removed.  A MagicMock/None model silently skips Case-2; we use a real stub
+        model so the cardinality path executes and the superseded edge disappears.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+
+        sg1 = SessionGraph(
+            session_id="sx1",
+            timestamp="2026-06-01T00:00:00Z",
+            entities=[
+                Entity(name="Bob", entity_type="person"),
+                Entity(name="London", entity_type="location"),
+            ],
+            relations=[
+                Relation(
+                    subject="Bob",
+                    predicate="lives_in",
+                    object="London",
+                    relation_type="factual",
+                    speaker_id="spk0",
+                ),
+            ],
+        )
+        sg2 = SessionGraph(
+            session_id="sx2",
+            timestamp="2026-06-02T00:00:00Z",
+            entities=[
+                Entity(name="Bob", entity_type="person"),
+                Entity(name="Paris", entity_type="location"),
+            ],
+            relations=[
+                Relation(
+                    subject="Bob",
+                    predicate="lives_in",
+                    object="Paris",
+                    relation_type="factual",
+                    speaker_id="spk0",
+                ),
+            ],
+        )
+        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="full")
+
+        # Inject a non-None model on the merger so Case-2 fires (the loop's
+        # MagicMock model is sufficient; merger.model is None by default).
+        loop.merger.model = MagicMock()
+        loop.merger.tokenizer = MagicMock()
+
+        # Stub check_predicate_coexistence to return REPLACE so the old edge is
+        # superseded.  The stub is patched at the call site in merger.py.
+        with (
+            patch.object(loop.extraction, "run", side_effect=[sg1, sg2]),
+            patch(
+                "paramem.graph.merger.check_predicate_coexistence",
+                return_value="REPLACE",
+            ),
+        ):
+            loop.extract_session("t1", "sx1", speaker_id="spk0")
+            loop.extract_session("t2", "sx2", speaker_id="spk0")
+
+        # After REPLACE: the Bob→London edge must be gone; Bob→Paris must exist.
+        bob_node = next((n for n in loop.merger.graph.nodes() if "bob" in n.lower()), None)
+        london_node = next((n for n in loop.merger.graph.nodes() if "london" in n.lower()), None)
+        paris_node = next((n for n in loop.merger.graph.nodes() if "paris" in n.lower()), None)
+        assert paris_node is not None, "Paris node must be in graph after REPLACE merge"
+        assert bob_node is not None, "Bob node must be in graph"
+        assert loop.merger.graph.has_edge(bob_node, paris_node), (
+            "Bob→Paris edge must exist after supersession"
+        )
+        # London node may survive as isolated; the edge must be gone.
+        if london_node is not None:
+            assert not loop.merger.graph.has_edge(bob_node, london_node), (
+                "Bob→London edge must be removed after REPLACE verdict; "
+                f"edges from bob: {list(loop.merger.graph.out_edges(bob_node, data=True))}"
+            )
+
+    def test_off_pending_session_content_reaches_extra_relations(self, monkeypatch, tmp_path):
+        """interim_refinement='off': run_consolidation_cycle passes the session's
+        edges as a non-empty extra_relations kwarg to _materialize_consolidation_graph.
+
+        Guards gate #3 — the unconditional _pending_relations capture inside
+        run_consolidation_cycle (consolidation.py).  The test FAILS if an
+        ``if self.config.interim_refinement != "off":`` guard is reintroduced
+        around the capture, because extra_relations would then be None/[] and the
+        assertion below would reject it.
+
+        Strategy: extract_session populates merger.graph with the X→Y 'knows' edge.
+        run_consolidation_cycle (mode='simulate') is then called with the returned
+        episodic_rels.  _materialize_consolidation_graph is replaced with a spy that
+        records extra_relations and returns the correct empty tuple, avoiding GPU/disk
+        I/O.  commit_tier_slot is stubbed out for the same reason.
+        """
+        from unittest.mock import patch
+
+        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="off")
+        # replay_enabled=True is required so run_consolidation_cycle passes guard #2.
+        loop.store._replay_enabled = True
+
+        with patch.object(loop.extraction, "run", return_value=self._session_graph):
+            episodic_rels, procedural_rels = loop.extract_session("t", "s_gate", speaker_id="spk0")
+
+        # episodic_rels must be non-empty; otherwise run_consolidation_cycle exits
+        # early at guard #3 before the extra_relations capture is ever reached.
+        assert episodic_rels, (
+            "extract_session must return non-empty episodic_rels for the test to be valid"
+        )
+
+        captured: list[dict] = []
+
+        def _spy_materialize(**kwargs):
+            captured.append(kwargs)
+            # Return the correct type: (recall_miss_keys, recon_relations).
+            return set(), []
+
+        with (
+            patch.object(loop, "_materialize_consolidation_graph", side_effect=_spy_materialize),
+            patch(
+                "paramem.memory.persistence.commit_tier_slot",
+            ),
+        ):
+            loop.run_consolidation_cycle(
+                episodic_rels,
+                procedural_rels,
+                speaker_id="spk0",
+                mode="simulate",
+                run_label="s_gate",
+                stamp="20260601T0000",
+                max_interim_count=7,
+            )
+
+        assert captured, "_materialize_consolidation_graph was not called"
+        call_kwargs = captured[0]
+
+        extra = call_kwargs.get("extra_relations")
+        assert extra is not None and len(extra) > 0, (
+            "extra_relations passed to _materialize_consolidation_graph must be "
+            f"non-empty when interim_refinement='off'; got {extra!r}"
+        )
+
+        # The X→Y 'knows' edge extracted from the session must be present.
+        subjects = {r.subject.lower() for r in extra}
+        objects = {r.object.lower() for r in extra}
+        predicates = {r.predicate.lower() for r in extra}
+        assert "x" in subjects, f"Subject 'X' must appear in extra_relations; subjects={subjects}"
+        assert "y" in objects, f"Object 'Y' must appear in extra_relations; objects={objects}"
+        assert "knows" in predicates, (
+            f"Predicate 'knows' must appear in extra_relations; predicates={predicates}"
+        )
 
 
 class TestInterimRefinementConfigRoundtrip:
@@ -7801,7 +8025,6 @@ class TestMaterializeInterimB1:
         loop.graph_enrichment_enabled = False
         loop.graph_enrichment_interim_enabled = False
         loop.graph_enrichment_min_triples_floor = 20
-        loop._triples_since_last_enrichment = 0
         loop.full_consolidation_period_string = ""
 
         # Real GraphMerger (no model) so merge/reset_graph run correctly.
@@ -8238,7 +8461,6 @@ class TestInterimKeyedWalkB3:
         loop.graph_enrichment_enabled = False
         loop.graph_enrichment_interim_enabled = False
         loop.graph_enrichment_min_triples_floor = 20
-        loop._triples_since_last_enrichment = 0
         loop.full_consolidation_period_string = ""
 
         loop.merger = GraphMerger(model=None)
@@ -8536,7 +8758,6 @@ class TestMergeRegistryRelationsUnification:
         loop.graph_enrichment_enabled = False
         loop.graph_enrichment_interim_enabled = False
         loop.graph_enrichment_min_triples_floor = 20
-        loop._triples_since_last_enrichment = 0
         loop.full_consolidation_period_string = ""
 
         loop.merger = GraphMerger(model=None)

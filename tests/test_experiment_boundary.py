@@ -138,32 +138,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ),
         # probe_adapter.py
         ("experiments/probe_adapter.py", "paramem.models.loader", "unload_model"),
-        # probe_extraction_merge_live.py
-        (
-            "experiments/probe_extraction_merge_live.py",
-            "paramem.graph.extraction_pipeline",
-            "ExtractionConfig",
-        ),
-        (
-            "experiments/probe_extraction_merge_live.py",
-            "paramem.graph.extraction_pipeline",
-            "ExtractionPipeline",
-        ),
-        (
-            "experiments/probe_extraction_merge_live.py",
-            "paramem.graph.merger",
-            "GraphMerger",
-        ),
-        (
-            "experiments/probe_extraction_merge_live.py",
-            "paramem.models.loader",
-            "load_base_model",
-        ),
-        (
-            "experiments/probe_extraction_merge_live.py",
-            "paramem.server.config",
-            "load_server_config",
-        ),
         # quadruple_adapter.py
         (
             "experiments/quadruple_adapter.py",

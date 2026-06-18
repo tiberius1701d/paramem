@@ -205,7 +205,6 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     loop.graph_enrichment_enabled = False
     loop.graph_enrichment_interim_enabled = False
     loop.graph_enrichment_min_triples_floor = 20
-    loop._triples_since_last_enrichment = 0
     loop.full_consolidation_period_string = ""
 
     return loop

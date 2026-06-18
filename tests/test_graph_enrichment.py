@@ -952,59 +952,6 @@ class TestInterimEnrichmentHook:
             ],
         )
 
-    def test_counter_increments_when_interim_refinement_not_off(self, tmp_path):
-        """extract_session increments the accumulator when interim_refinement != 'off'."""
-        loop = _make_loop(
-            tmp_path, consolidation_config=ConsolidationConfig(interim_refinement="full")
-        )
-        assert loop._triples_since_last_enrichment == 0
-
-        sg = self._make_session_graph()
-        with patch.object(loop.extraction, "run", return_value=sg):
-            loop.extract_session("ignored-transcript", "s1", speaker_id="Speaker0")
-
-        assert loop._triples_since_last_enrichment == 2
-
-    def test_counter_stays_zero_when_interim_refinement_off(self, tmp_path):
-        """extract_session does NOT increment the accumulator when interim_refinement='off'."""
-        loop = _make_loop(tmp_path)  # interim_refinement defaults to "off"
-        assert loop._triples_since_last_enrichment == 0
-
-        sg = self._make_session_graph()
-        with patch.object(loop.extraction, "run", return_value=sg):
-            loop.extract_session("ignored-transcript", "s1", speaker_id="Speaker0")
-
-        # Merge deferred to full consolidation — counter must remain 0.
-        assert loop._triples_since_last_enrichment == 0
-
-    def test_counter_resets_after_successful_enrichment(self, tmp_path):
-        """After _run_graph_enrichment returns non-skipped, the counter is zero."""
-        loop = _make_loop(tmp_path)
-        loop._triples_since_last_enrichment = 42
-        _populate_graph(loop.merger.graph, n_persons=12)
-
-        canned = ([], [], "raw")  # Empty enrichment output — still a "successful" pass
-        with (
-            patch("paramem.training.consolidation._graph_enrich_with_sota", return_value=canned),
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "x"}, clear=False),
-        ):
-            result = loop._run_graph_enrichment()
-
-        assert not result["skipped"]
-        assert loop._triples_since_last_enrichment == 0
-
-    def test_counter_preserved_when_enrichment_skipped(self, tmp_path):
-        """Skipped enrichment (e.g. graph-size floor) must NOT reset the counter."""
-        loop = _make_loop(tmp_path)
-        loop._triples_since_last_enrichment = 99
-        # Graph has < 10 nodes → floor skip path.
-        assert loop.merger.graph.number_of_nodes() < 10
-
-        result = loop._run_graph_enrichment()
-
-        assert result["skipped"] is True
-        assert loop._triples_since_last_enrichment == 99
-
     def test_interim_full_enrichment_calls_run_graph_enrichment(self, tmp_path):
         """interim_refinement='full' → _run_graph_enrichment called via refine stage."""
         from paramem.training.key_registry import KeyRegistry
@@ -1164,7 +1111,6 @@ class TestInterimEnrichmentHook:
         to the normal-branch else, not the cap-reached if.
         """
         loop = _make_loop(tmp_path, graph_enrichment_min_triples_floor=1)
-        loop._triples_since_last_enrichment = 100  # over floor
 
         loop.extract_session = MagicMock(
             return_value=(

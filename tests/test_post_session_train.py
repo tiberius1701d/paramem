@@ -147,7 +147,6 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.graph_enrichment_max_entities_per_pass = 50
     loop.graph_enrichment_interim_enabled = False
     loop.graph_enrichment_min_triples_floor = 20
-    loop._triples_since_last_enrichment = 0
 
     # Stub out the recall probe so tests with a MagicMock model do not
     # feed it into re.sub (which raises TypeError on non-string input).

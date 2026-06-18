@@ -262,12 +262,9 @@ class ConsolidationLoop:
         self.graph_enrichment_enabled = graph_enrichment_enabled
         self.graph_enrichment_neighborhood_hops = graph_enrichment_neighborhood_hops
         self.graph_enrichment_max_entities_per_pass = graph_enrichment_max_entities_per_pass
-        # Interim mini-enrichment: fires at sub-interval rollover when enough
-        # new triples have accumulated. RAM-only counter, reset after each
-        # successful enrichment pass (full or interim).
+        # Interim mini-enrichment: fires at sub-interval rollover.
         self.graph_enrichment_interim_enabled = graph_enrichment_interim_enabled
         self.graph_enrichment_min_triples_floor = graph_enrichment_min_triples_floor
-        self._triples_since_last_enrichment = 0
 
         gc = graph_config or GraphConfig()
         self.merger = GraphMerger(
@@ -1068,24 +1065,24 @@ class ConsolidationLoop:
 
             # --- MERGE ---
             with phase_trace("merge_into_cumulative") as t:
-                if self.config.interim_refinement != "off":
-                    # Path A: merge into cumulative graph each interim cycle.
-                    # Disable gradient checkpointing: merger.merge may call model.generate()
-                    # for contradiction resolution when a model is present.  HF silently
-                    # disables the KV cache when checkpointing is active (CLAUDE.md rule).
-                    self._disable_gradient_checkpointing()
-                    try:
-                        self.merger.merge(session_graph)
-                    finally:
-                        self._enable_gradient_checkpointing()
-                    self._triples_since_last_enrichment += len(session_graph.relations)
-                    t.add("triples_added", len(session_graph.relations))
-                else:
-                    # Path B: merge deferred to full consolidation (interim_refinement="off").
-                    # The counter is NOT incremented — interim enrichment consumes
-                    # _triples_since_last_enrichment over merger.graph, which was not
-                    # updated; enrichment stays Path-B-only by design.
-                    t.add("triples_added", 0)
+                # Always merge into the cumulative graph.  additive=True when
+                # interim_refinement="off" so Case-2 cardinality resolution is
+                # skipped (no model call, no edge removal) — the merge is purely
+                # additive and lossless at that level.  At "light"/"full",
+                # additive=False enables full supersession via the model.
+                # Disable gradient checkpointing: merger.merge may call
+                # model.generate() for contradiction resolution when a model is
+                # present.  HF silently disables the KV cache when checkpointing
+                # is active (CLAUDE.md rule).
+                self._disable_gradient_checkpointing()
+                try:
+                    self.merger.merge(
+                        session_graph,
+                        additive=(self.config.interim_refinement == "off"),
+                    )
+                finally:
+                    self._enable_gradient_checkpointing()
+                t.add("triples_added", len(session_graph.relations))
 
             # --- BUILD ENTRY RELATION DICTS ---
             # Single entry point for graph → entries.  Builds relation dicts
@@ -1752,16 +1749,20 @@ class ConsolidationLoop:
         result.relations_extracted = len(session_graph.relations)
 
         # --- 2. MERGE ---
-        if self.config.interim_refinement != "off":
-            # Path A: merge into cumulative graph each run_cycle call.
-            # Disable gradient checkpointing: merger.merge may call model.generate()
-            # for contradiction resolution when a model is present.  HF silently
-            # disables the KV cache when checkpointing is active (CLAUDE.md rule).
-            self._disable_gradient_checkpointing()
-            try:
-                self.merger.merge(session_graph)
-            finally:
-                self._enable_gradient_checkpointing()
+        # Always merge.  additive=True when interim_refinement="off" so
+        # Case-2 cardinality resolution is skipped (no model call, no edge
+        # removal).  Disable gradient checkpointing: merger.merge may call
+        # model.generate() for contradiction resolution when additive=False
+        # and a model is present.  HF silently disables the KV cache when
+        # checkpointing is active (CLAUDE.md rule).
+        self._disable_gradient_checkpointing()
+        try:
+            self.merger.merge(
+                session_graph,
+                additive=(self.config.interim_refinement == "off"),
+            )
+        finally:
+            self._enable_gradient_checkpointing()
 
         # --- 4. BUILD ENTRY RELATION DICTS ---
         # Single entry point: graph → (episodic_rels, procedural_rels).
@@ -2801,47 +2802,46 @@ class ConsolidationLoop:
         # as adapter_name when cap_reached_absorb=True; active_keys_in_tier
         # correctly scopes to that slot's keys — no special-casing needed here.
         #
-        # extra_relations are populated from merger.graph edges only when
-        # interim_refinement != "off" (under "off", extract_session skips the merge
-        # so merger.graph does not contain pending-session content; B6 will change
-        # this to always merge, but until then the "off" path passes None).
+        # extra_relations are always populated from merger.graph edges.  Under
+        # interim_refinement="off" the merge was additive (no supersession), so
+        # all pending-session content is present in merger.graph and reaches the
+        # interim keying surface here.
         _pending_relations: "list[Relation] | None" = None
-        if self.config.interim_refinement != "off":
-            import networkx as _nx
+        import networkx as _nx
 
-            _g = getattr(self.merger, "graph", None)
-            if isinstance(_g, _nx.MultiDiGraph) and _g.number_of_edges() > 0:
-                _pending_relations = []
-                for _er_subj, _er_obj, _er_data in _g.edges(data=True):
-                    _er_pred = _er_data.get("predicate", "")
-                    if not _er_pred:
-                        continue
-                    _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
-                    _er_rt: str = _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
-                    # speaker_id: prefer the subject node's speaker_id attribute
-                    # (set by _upsert_entity for speaker entities, where the node
-                    # key IS the speaker_id).  Falls back to "" for non-speaker
-                    # subjects (B3 will improve this via entity re-merge).
-                    _er_subj_node = _g.nodes.get(_er_subj, {})
-                    _er_spk = _er_subj_node.get("speaker_id", "")
-                    _pending_relations.append(
-                        Relation(
-                            subject=_er_subj,
-                            predicate=_er_pred,
-                            object=_er_obj,
-                            relation_type=_er_rt,  # type: ignore[arg-type]
-                            confidence=_er_data.get("confidence", 1.0),
-                            speaker_id=_er_spk,
-                            # B7-A: recover the real contributing session ids
-                            # from the merger edge so they survive the re-merge
-                            # through _merge_registry_relations (T3).  The
-                            # merger already accumulated the UNION in
-                            # edge["sessions"] via T2; we carry them forward so
-                            # _build_all_edge_entries_into can expose them on
-                            # the deferred-write record (T5).
-                            session_ids=list(_er_data.get("sessions", [])),
-                        )
+        _g = getattr(self.merger, "graph", None)
+        if isinstance(_g, _nx.MultiDiGraph) and _g.number_of_edges() > 0:
+            _pending_relations = []
+            for _er_subj, _er_obj, _er_data in _g.edges(data=True):
+                _er_pred = _er_data.get("predicate", "")
+                if not _er_pred:
+                    continue
+                _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
+                _er_rt: str = _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+                # speaker_id: prefer the subject node's speaker_id attribute
+                # (set by _upsert_entity for speaker entities, where the node
+                # key IS the speaker_id).  Falls back to "" for non-speaker
+                # subjects (B3 will improve this via entity re-merge).
+                _er_subj_node = _g.nodes.get(_er_subj, {})
+                _er_spk = _er_subj_node.get("speaker_id", "")
+                _pending_relations.append(
+                    Relation(
+                        subject=_er_subj,
+                        predicate=_er_pred,
+                        object=_er_obj,
+                        relation_type=_er_rt,  # type: ignore[arg-type]
+                        confidence=_er_data.get("confidence", 1.0),
+                        speaker_id=_er_spk,
+                        # B7-A: recover the real contributing session ids
+                        # from the merger edge so they survive the re-merge
+                        # through _merge_registry_relations (T3).  The
+                        # merger already accumulated the UNION in
+                        # edge["sessions"] via T2; we carry them forward so
+                        # _build_all_edge_entries_into can expose them on
+                        # the deferred-write record (T5).
+                        session_ids=list(_er_data.get("sessions", [])),
                     )
+                )
 
         recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
             tier=adapter_name,
@@ -3447,9 +3447,6 @@ class ConsolidationLoop:
                 "reason": "enrichment_same_as",
                 "merged_into": _keep,
             }
-        # Reset the accumulator — any subsequent interim-rollover pass must
-        # re-cross the floor before firing again.
-        self._triples_since_last_enrichment = 0
         return {
             "chunks": calls_made,
             "new_edges": total_new,
