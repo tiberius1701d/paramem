@@ -460,6 +460,221 @@ class TestIntentTierSelection:
 
 
 # ---------------------------------------------------------------------------
+# QueryRouter — COMMAND path privacy filter (B5)
+# ---------------------------------------------------------------------------
+
+
+class TestCommandInterimPrivacy:
+    """B5 regression: COMMAND path emits preference keys from interim slots
+    but NEVER emits factual/temporal/social interim keys.
+
+    The router reaches interim slots via ``_command_interim_tiers()`` which
+    reuses the same ``tiers_with_registry()`` enumeration as the PERSONAL
+    path.  Per-key filtering is applied by ``_tier_keys(preference_only=True)``:
+    only keys whose name starts with "proc" OR whose bookkeeping
+    ``relation_type`` is "preference" are included.  All other relation types
+    are excluded by construction (DEFAULT-DENY).
+    """
+
+    def _command_router_with_interim(
+        self, *, factual_key: bool = True, preference_key: bool = True, proc_main_key: bool = True
+    ):
+        """Build a router with procedural MAIN + one interim slot.
+
+        The interim slot contains:
+        - graph1 (factual, relation_type="factual") when factual_key=True
+        - proc1  (preference, relation_type="preference") when preference_key=True
+        The procedural MAIN contains:
+        - pref0  (preference, proc-prefix key) when proc_main_key=True
+        """
+        entries = []
+        if proc_main_key:
+            entries.append(
+                {
+                    **_make_entry(
+                        "pref0",
+                        "Alice",
+                        "Jazz",
+                        speaker_id="alice",
+                        adapter_id="procedural",
+                        predicate="likes",
+                    ),
+                    "relation_type": "preference",
+                }
+            )
+        if factual_key:
+            entries.append(
+                {
+                    **_make_entry(
+                        "graph1",
+                        "Alice",
+                        "London",
+                        speaker_id="alice",
+                        adapter_id="episodic_interim_20260618T0800",
+                        predicate="lives_in",
+                    ),
+                    "relation_type": "factual",
+                }
+            )
+        if preference_key:
+            entries.append(
+                {
+                    **_make_entry(
+                        "proc2",
+                        "Alice",
+                        "Tea",
+                        speaker_id="alice",
+                        adapter_id="episodic_interim_20260618T0800",
+                        predicate="prefers",
+                    ),
+                    "relation_type": "preference",
+                }
+            )
+        return _make_router_from_entries(entries)
+
+    def test_factual_interim_key_never_emitted_on_command(self, monkeypatch):
+        """Privacy invariant: COMMAND path must NOT emit factual interim keys.
+
+        graph1 (relation_type="factual") in an interim slot carries biographical
+        context (where Alice lives) that must not reach HA payloads.
+        """
+        _stub_intent(monkeypatch, Intent.COMMAND)
+        router = self._command_router_with_interim(
+            factual_key=True, preference_key=False, proc_main_key=False
+        )
+        plan = router.route("Turn off the lights.", speaker_id="alice")
+        all_keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "graph1" not in all_keys, (
+            "Factual interim key 'graph1' must never appear in COMMAND steps; "
+            f"got steps: {[(s.adapter_name, s.keys_to_probe) for s in plan.steps]}"
+        )
+
+    def test_preference_interim_key_emitted_on_command(self, monkeypatch):
+        """COMMAND path emits preference-typed interim keys.
+
+        Keys with proc-prefix or relation_type="preference" in an interim slot
+        carry style context (Alice prefers Tea) that is safe for HA payloads.
+        """
+        _stub_intent(monkeypatch, Intent.COMMAND)
+        router = self._command_router_with_interim(
+            factual_key=False, preference_key=True, proc_main_key=False
+        )
+        plan = router.route("Set the mood.", speaker_id="alice")
+        all_keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "proc2" in all_keys, (
+            "Preference-typed interim key 'proc2' must appear in COMMAND steps; "
+            f"got steps: {[(s.adapter_name, s.keys_to_probe) for s in plan.steps]}"
+        )
+
+    def test_proc_main_keys_unfiltered_on_command(self, monkeypatch):
+        """Procedural MAIN keys are always unfiltered on the COMMAND path.
+
+        pref0 (in procedural MAIN) must appear regardless of relation_type
+        — the preference_only filter applies ONLY to interim slots.
+        """
+        _stub_intent(monkeypatch, Intent.COMMAND)
+        router = self._command_router_with_interim(
+            factual_key=False, preference_key=False, proc_main_key=True
+        )
+        plan = router.route("Adjust lights.", speaker_id="alice")
+        all_keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "pref0" in all_keys, (
+            "Procedural MAIN key 'pref0' must appear in COMMAND steps (unfiltered); "
+            f"got steps: {[(s.adapter_name, s.keys_to_probe) for s in plan.steps]}"
+        )
+
+    def test_command_interim_step_is_for_interim_adapter_not_procedural(self, monkeypatch):
+        """Interim preference keys appear under the interim adapter name, not 'procedural'."""
+        _stub_intent(monkeypatch, Intent.COMMAND)
+        router = self._command_router_with_interim(
+            factual_key=False, preference_key=True, proc_main_key=False
+        )
+        plan = router.route("What music?", speaker_id="alice")
+        interim_steps = [s for s in plan.steps if s.adapter_name.startswith("episodic_interim_")]
+        assert interim_steps, (
+            "Interim preference key must appear in an episodic_interim_* step; "
+            f"got steps: {[(s.adapter_name, s.keys_to_probe) for s in plan.steps]}"
+        )
+        assert "proc2" in interim_steps[0].keys_to_probe, (
+            f"proc2 must be in the interim step's keys; got {interim_steps[0].keys_to_probe}"
+        )
+
+    def test_command_factual_and_preference_keys_together(self, monkeypatch):
+        """When interim has both factual and preference keys, only preference is emitted."""
+        _stub_intent(monkeypatch, Intent.COMMAND)
+        router = self._command_router_with_interim(
+            factual_key=True, preference_key=True, proc_main_key=False
+        )
+        plan = router.route("Turn on lights.", speaker_id="alice")
+        all_keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "graph1" not in all_keys, (
+            "Factual key 'graph1' must be excluded from COMMAND interim step"
+        )
+        assert "proc2" in all_keys, (
+            "Preference key 'proc2' must be included in COMMAND interim step"
+        )
+
+    def test_command_preference_or_branch_graph_prefix_with_preference_relation_type(
+        self, monkeypatch
+    ):
+        """OR-branch: a graph-prefixed key (NO proc prefix) with relation_type='preference'
+        IS admitted on the COMMAND interim path.
+
+        The filter is: key.startswith("proc") OR relation_type=="preference".
+        Both branches must be exercised; this test locks the standalone
+        relation_type=="preference" branch that proc-prefix keys never exercise.
+        """
+        _stub_intent(monkeypatch, Intent.COMMAND)
+        # graph-prefixed key, stored in an interim slot, relation_type="preference"
+        pref_graph_entry = {
+            **_make_entry(
+                "graph42",
+                "Alice",
+                "Jazz",
+                speaker_id="alice",
+                adapter_id="episodic_interim_20260618T0800",
+                predicate="enjoys",
+            ),
+            "relation_type": "preference",
+        }
+        router = _make_router_from_entries([pref_graph_entry])
+        plan = router.route("Play something.", speaker_id="alice")
+        all_keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "graph42" in all_keys, (
+            "graph-prefixed key with relation_type='preference' must be admitted on "
+            f"COMMAND interim path (OR-branch); got steps: "
+            f"{[(s.adapter_name, s.keys_to_probe) for s in plan.steps]}"
+        )
+
+    def test_command_or_branch_graph_prefix_factual_excluded(self, monkeypatch):
+        """OR-branch negative: a graph-prefixed key with relation_type='factual' is NOT admitted.
+
+        Confirms DEFAULT-DENY: only the preference OR-branch grants access;
+        any other relation_type is excluded even without the proc prefix.
+        """
+        _stub_intent(monkeypatch, Intent.COMMAND)
+        factual_graph_entry = {
+            **_make_entry(
+                "graph99",
+                "Alice",
+                "London",
+                speaker_id="alice",
+                adapter_id="episodic_interim_20260618T0800",
+                predicate="lives_in",
+            ),
+            "relation_type": "factual",
+        }
+        router = _make_router_from_entries([factual_graph_entry])
+        plan = router.route("Turn off all lights.", speaker_id="alice")
+        all_keys = [k for step in plan.steps for k in step.keys_to_probe]
+        assert "graph99" not in all_keys, (
+            "graph-prefixed key with relation_type='factual' must be excluded from "
+            f"COMMAND interim path; got steps: "
+            f"{[(s.adapter_name, s.keys_to_probe) for s in plan.steps]}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # QueryRouter — PERSONAL probe order with interim adapters
 # ---------------------------------------------------------------------------
 

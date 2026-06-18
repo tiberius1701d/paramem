@@ -94,10 +94,6 @@ class RoutingPlan:
 # 4. semantic — durable but most lossy/abstract; corroboration fallback.
 _PERSONAL_TIERS_PRE_INTERIM = ("procedural",)
 _PERSONAL_TIERS_POST_INTERIM = ("episodic", "semantic")
-# COMMAND injects only preferences into HA payloads — never identity facts.
-# Episodic / semantic tiers carry the speaker's personal context which must
-# not leak to HA conversation agents or third-party tools.
-_COMMAND_TIERS = ("procedural",)
 
 _INTERIM_DATE_RE = re.compile(r"^episodic_interim_(\d{8}T\d{4})$")
 
@@ -305,8 +301,10 @@ class QueryRouter:
         """Map intent → ordered :class:`RoutingStep` list, speaker-scoped.
 
         * ``PERSONAL`` — procedural → newest interim first → episodic → semantic.
-        * ``COMMAND``  — procedural only (preferences for HA injection;
-          identity facts must not leak to HA payloads).
+        * ``COMMAND``  — ``procedural`` MAIN (unfiltered, pure preferences after
+          a fold) then interim slots filtered to preference keys only (proc-prefix
+          OR ``relation_type=="preference"`` in bookkeeping).  Identity facts in
+          interim slots are excluded by construction (DEFAULT-DENY).
         * ``GENERAL``  — empty (route to SOTA with no personal injection).
         * ``UNKNOWN``  — resolved via ``IntentConfig.fail_closed_intent``
           (default ``PERSONAL`` — privacy-preserving fallback).
@@ -324,11 +322,24 @@ class QueryRouter:
         if effective is Intent.PERSONAL:
             tiers = self._personal_tier_order()
         elif effective is Intent.COMMAND:
-            tiers = list(_COMMAND_TIERS)
+            # COMMAND: probe procedural MAIN unfiltered, then interim slots with
+            # the preference-only filter so factual/temporal/social interim keys
+            # never reach HA payloads.
+            steps: list[RoutingStep] = []
+            proc_keys = self._tier_keys("procedural")
+            scoped_proc = sorted(allowed_keys & proc_keys)
+            if scoped_proc:
+                steps.append(RoutingStep(adapter_name="procedural", keys_to_probe=scoped_proc))
+            for interim_tier in self._command_interim_tiers():
+                interim_keys = self._tier_keys(interim_tier, preference_only=True)
+                scoped = sorted(allowed_keys & interim_keys)
+                if scoped:
+                    steps.append(RoutingStep(adapter_name=interim_tier, keys_to_probe=scoped))
+            return steps
         else:
             return []
 
-        steps: list[RoutingStep] = []
+        steps = []
         for tier in tiers:
             tier_keys = self._tier_keys(tier)
             scoped = sorted(allowed_keys & tier_keys)
@@ -380,11 +391,50 @@ class QueryRouter:
             *_PERSONAL_TIERS_POST_INTERIM,
         ]
 
-    def _tier_keys(self, tier: str) -> set[str]:
-        """Active key set for *tier* — reads
-        :meth:`MemoryStore.active_keys_in_tier`, which walks the registry,
-        not ``_entries``.  Preload-independent; empty when replay is
-        disabled or the tier has no registry."""
+    def _command_interim_tiers(self) -> list[str]:
+        """Interim slot names in newest-first order for the COMMAND probe.
+
+        Reuses the same :meth:`MemoryStore.tiers_with_registry` enumeration
+        as :meth:`_personal_tier_order` — no duplicate logic.  Only interim
+        slots are returned; ``procedural`` MAIN is handled separately in
+        :meth:`_steps_for_intent`.
+        """
+        store = self._memory_store
+        interim_names: list[str] = []
+        if store is not None:
+            for tier in store.tiers_with_registry():
+                if _interim_sort_key(tier) is not None:
+                    interim_names.append(tier)
+            interim_names.sort(key=lambda n: _interim_sort_key(n) or "", reverse=True)
+        return interim_names
+
+    def _tier_keys(self, tier: str, *, preference_only: bool = False) -> set[str]:
+        """Active key set for *tier*.
+
+        Reads :meth:`MemoryStore.active_keys_in_tier`, which walks the
+        registry, not ``_entries``.  Preload-independent; empty when replay
+        is disabled or the tier has no registry.
+
+        When ``preference_only=True``, restricts to keys whose key name
+        starts with ``"proc"`` OR whose bookkeeping ``relation_type`` is
+        ``"preference"``.  This is the COMMAND-path filter for interim slots:
+        factual, temporal, social, and unknown interim keys are excluded
+        (DEFAULT-DENY) so identity facts never reach HA payloads.
+
+        ``preference_only`` applies ONLY to interim slots on the COMMAND path.
+        ``procedural`` MAIN is always probed unfiltered.
+        """
         if self._memory_store is None:
             return set()
-        return set(self._memory_store.active_keys_in_tier(tier))
+        keys = set(self._memory_store.active_keys_in_tier(tier))
+        if not preference_only:
+            return keys
+        filtered: set[str] = set()
+        for key in keys:
+            if key.startswith("proc"):
+                filtered.add(key)
+                continue
+            bk = self._memory_store.bookkeeping_for_key(key) or {}
+            if bk.get("relation_type") == "preference":
+                filtered.add(key)
+        return filtered

@@ -2900,50 +2900,47 @@ class TestAbortSkipsCommit:
             f"replace_simhashes_in_tier must not be called after abort; called for {simhash_calls}"
         )
 
-    def test_run_indexed_key_procedural_skips_deferred_mutations_on_aborted(
-        self, monkeypatch, tmp_path
-    ):
-        """When proc train_adapter returns aborted=True, store.put must be
-        skipped — only the abort guard fires.
+    def test_interim_abort_skips_procedural_deferred_mutations(self, monkeypatch, tmp_path):
+        """When interim train_adapter returns aborted=True, store.put must be
+        skipped for BOTH episodic and procedural minted entries.
 
-        Note: sp_index (procedural_sp_index) was removed in the model-only
-        contradiction redesign (sp_index removal).
-        The 2-tuple return contract of _prepare_procedural_keys_for_tier
-        is tested here via the patched return value.
+        B5: procedural entries now ride the same interim slot as episodic and
+        are flushed in the same deferred-mutation block.  An abort before flush
+        must leave the store unchanged for both tiers.
+
+        The graph is populated with a procedural-typed keyless edge so
+        _build_all_edge_entries_into mints a proc-key into _deferred_writes,
+        giving the abort path something to guard against.
         """
         from unittest.mock import patch
+
+        import networkx as nx
 
         from paramem.training.consolidation import ConsolidationLoop
 
         loop = self._make_minimal_loop(monkeypatch, tmp_path)
 
-        # Pre-seed the store so _prepare_procedural_keys_for_tier sees existing keys.
-        loop.store.put(
-            "procedural",
-            "prc1",
-            {
-                "key": "prc1",
-                "subject": "Alex",
-                "predicate": "listens_to",
-                "object": "Jazz",
-                "speaker_id": "Speaker0",
-                "first_seen_cycle": 1,
-            },
-            register=True,
+        # Populate merger.graph with a procedural-typed keyless edge so the
+        # graph-walk mints a "proc…" key into _deferred_writes.
+        proc_graph = nx.MultiDiGraph()
+        proc_graph.add_node("alice", speaker_id="Speaker0", attributes={"name": "Alice"})
+        proc_graph.add_node("tea", attributes={"name": "Tea"})
+        proc_graph.add_edge(
+            "alice",
+            "tea",
+            predicate="prefers",
+            relation_type="preference",
         )
-        loop.store.put_simhash("procedural", "prc1", 0xABCD)
+        loop.merger.graph = proc_graph
+        # Enable procedural_config so partition_relations classifies the edge
+        # as procedural and the graph-walk populates _tier_keyed["procedural"].
+        from paramem.utils.config import AdapterConfig
+
+        loop.procedural_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
 
         aborted_metrics = {"train_loss": 0.3, "aborted": True}
-
-        store_delete_calls: list = []
         store_put_calls: list = []
-
-        original_delete = loop.store.delete
         original_put = loop.store.put
-
-        def _spy_delete(key):
-            store_delete_calls.append(key)
-            return original_delete(key)
 
         def _spy_put(tier, key, entry, **kwargs):
             store_put_calls.append((tier, key))
@@ -2956,75 +2953,51 @@ class TestAbortSkipsCommit:
                 MagicMock,
             ),
             patch("paramem.training.trainer.train_adapter", return_value=aborted_metrics),
-            patch.object(loop.store, "delete", side_effect=_spy_delete),
             patch.object(loop.store, "put", side_effect=_spy_put),
+            patch.object(
+                ConsolidationLoop,
+                "_resolve_target_slot",
+                return_value=("episodic_interim_t001", False, False, False),
+            ),
+            patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
             patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
-            ),
-            patch.object(
-                ConsolidationLoop,
-                "_prepare_procedural_keys_for_tier",
-                return_value=(
-                    [
-                        {
-                            "key": "prc2",
-                            "subject": "Alex",
-                            "predicate": "listens_to",
-                            "object": "Jazz",
-                            "speaker_id": "Speaker0",
-                            "first_seen_cycle": 1,
-                        }
-                    ],  # new_keyed
-                    [
-                        {
-                            "key": "prc1",
-                            "subject": "Alex",
-                            "predicate": "listens_to",
-                            "object": "Jazz",
-                            "speaker_id": "Speaker0",
-                            "first_seen_cycle": 1,
-                        }
-                    ],  # existing_keyed (2-tuple: sp_index removed)
-                ),
             ),
             patch("paramem.training.consolidation.switch_adapter"),
             patch(
                 "paramem.training.consolidation.format_entry_training",
                 return_value=[{"input_ids": [1], "labels": [1]}],
             ),
-            patch("paramem.training.consolidation.compute_simhash", return_value=0xBEEF),
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=lambda m, cfg, stamp: m,
+            ),
         ):
-            result = loop._run_indexed_key_procedural(
+            result = loop.run_consolidation_cycle(
                 [
                     {
-                        "subject": "Alex",
-                        "predicate": "listens_to",
-                        "object": "Jazz",
+                        "subject": "Alice",
+                        "predicate": "prefers",
+                        "object": "Tea",
                         "relation_type": "preference",
                         "speaker_id": "Speaker0",
                     }
                 ],
+                [],  # procedural_rels guard arg
                 speaker_id="Speaker0",
                 mode="train",
+                run_label="test_proc_abort",
                 stamp="t001",
-                run_label="test_proc",
             )
 
-        assert result is None, f"Expected None return on abort; got {result}"
-        # Deferred mutations must be entirely skipped.
-        assert store_delete_calls == [], (
-            f"store.delete must not be called after proc abort; called for {store_delete_calls}"
+        assert result.get("mode") == "aborted", (
+            f"Expected mode='aborted' when training aborted; got {result}"
         )
+        # No store.put calls must have fired — deferred flush skipped on abort.
         assert store_put_calls == [], (
-            f"store.put must not be called after proc abort; called for {store_put_calls}"
-        )
-        # procedural_sp_index has been removed from ConsolidationLoop
-        # sp_index was removed in the model-only contradiction redesign;
-        # the attribute must not exist.
-        assert not hasattr(loop, "procedural_sp_index"), (
-            "procedural_sp_index must not exist on ConsolidationLoop after sp_index removal"
+            f"store.put must not be called after abort; called for {store_put_calls}"
         )
 
     def test_consolidate_interim_adapters_raises_and_rolls_back_on_aborted(

@@ -505,12 +505,8 @@ def commit_tier_slot(
     # guard; no None check is needed here.
     tier_reg = loop.store.registry(adapter_name)
 
-    # F5 decision: empty commit is a real production path.  post_session_train
-    # writes the procedural registry file symmetrically (step 8) even when
-    # procedural keys are populated in a prior call — the caller already holds
-    # the keys in the store from _run_indexed_key_procedural.  No zero-key guard
-    # is added here; len(tier_reg) == 0 is permitted and produces an empty but
-    # valid registry file.
+    # Empty commit is a real production path: len(tier_reg) == 0 is permitted
+    # and produces an empty but valid registry file.  No zero-key guard is added.
 
     # --- Step 1+2: Serialize and hash (no disk I/O) ---
     payload = tier_reg.save_bytes()
@@ -561,10 +557,7 @@ def commit_tier_slot(
             )
         else:
             # Simulate mode: build graph from all_keyed and write graph.json.
-            # When all_keyed is empty but the store has entries for the tier
-            # (e.g. procedural, whose mutations are applied directly in
-            # _prepare_procedural_keys_for_tier rather than via the caller-
-            # supplied all_keyed list), re-project from the canonical store so
+            # When all_keyed is empty, re-project from the canonical store so
             # we do not overwrite prior content with an empty graph.
             if all_keyed:
                 graph = nx.MultiDiGraph()
@@ -579,10 +572,7 @@ def commit_tier_slot(
                         first_seen_cycle=kp.get("first_seen_cycle", 0),
                     )
             else:
-                # Caller passed [] — re-project from the canonical store to
-                # capture keys written directly by _prepare_procedural_keys_for_tier
-                # (which writes to loop.store in simulate mode instead of
-                # deferring to the caller-supplied list as the episodic path does).
+                # Caller passed [] — re-project from the canonical store.
                 graph = build_tier_graph_from_store(loop.store, adapter_name)
             graph_path = slot_root / "graph.json"
             save_memory_to_disk(graph, graph_path)

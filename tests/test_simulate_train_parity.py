@@ -553,35 +553,55 @@ class TestSimulateTrainParity:
                 f"  on-disk   ({len(on_disk_keys)} keys): {on_disk_keys[:5]}..."
             )
 
-    def test_procedural_graph_json_written_in_simulate_mode(self, loop_sim, tmp_path):
-        """Procedural simulate-mode cycle writes non-empty graph.json.
+    def test_procedural_persisted_in_interim_slot_in_simulate_mode(self, loop_sim, tmp_path):
+        """Procedural facts persist in the interim slot graph.json in simulate mode.
 
-        Regression: commit_tier_slot was called with all_keyed=[]
-        for the procedural tier, causing an empty graph.json to overwrite prior
-        content.  After the fix, the simulate branch re-projects from loop.store
-        when all_keyed is empty and the tier has entries.
+        B5 design: procedural entries ride the SINGLE interim slot
+        (``episodic_interim_<stamp>``) alongside episodic — there is no separate
+        per-cycle ``procedural/graph.json`` commit.  ``commit_tier_slot`` is called
+        once with ``tier="episodic"`` and ``adapter_name="episodic_interim_<stamp>"``;
+        ``all_keyed`` includes both episodic and procedural entries.
+
+        The fixture's ``_EPISODIC_RELS`` contains a ``likes`` predicate (Bob / likes /
+        Coffee), which ``filter_procedural_relations`` routes to the procedural tier via
+        the secondary ``_PROCEDURAL_PREDICATES`` gate.  After ``_run_sim`` that entry is
+        minted with a ``proc``-prefixed key and lands in the interim slot graph.json
+        alongside the episodic keys.
+
+        Asserts:
+          - The interim slot graph.json exists and is non-empty.
+          - At least one entry has a ``proc``-prefixed key (the durable procedural
+            signal; the key prefix is the stable identifier throughout the pipeline).
         """
         from paramem.memory.interim_adapter import adapter_slot_root_for_name
         from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         self._run_sim(loop_sim)
 
-        proc_slot = adapter_slot_root_for_name(loop_sim.output_dir, "procedural")
-        graph_path = proc_slot / "graph.json"
+        adapter_name = f"episodic_interim_{_STAMP}"
+        interim_slot = adapter_slot_root_for_name(loop_sim.output_dir, adapter_name)
+        graph_path = interim_slot / "graph.json"
 
-        assert graph_path.exists(), f"Procedural simulate graph.json missing at {graph_path}"
+        assert graph_path.exists(), (
+            f"Interim slot graph.json missing at {graph_path} — "
+            "B5: procedural facts must persist in the interim slot, not a separate procedural/ dir"
+        )
 
         graph = load_memory_from_disk(graph_path)
         entries = list(iter_entries(graph))
         assert len(entries) > 0, (
-            "Procedural graph.json is empty after simulate cycle — "
-            "regression: all_keyed=[] caused empty graph overwrite"
+            "Interim slot graph.json is empty after simulate cycle — "
+            "procedural and episodic entries must co-reside in the interim slot"
         )
 
-        # Verify the expected procedural keys are present.
-        proc_keys = {e["key"] for e in entries}
-        assert len(proc_keys) == len(_PROCEDURAL_RELS), (
-            f"Expected {len(_PROCEDURAL_RELS)} procedural keys, got {len(proc_keys)}: {proc_keys}"
+        # The proc-prefix is the durable signal that a procedural fact was minted.
+        # The fixture's "Bob likes Coffee" edge routes to procedural via
+        # _PROCEDURAL_PREDICATES ("likes") and receives a proc-prefixed key.
+        proc_keys = {e["key"] for e in entries if e.get("key", "").startswith("proc")}
+        assert proc_keys, (
+            f"No proc-prefixed keys found in interim slot graph.json — "
+            f"procedural facts must co-reside with episodic in the interim slot (B5). "
+            f"Keys present: {sorted(e.get('key') for e in entries)}"
         )
 
     def test_slot_layout_train_has_manifest_simulate_has_graph(self, loop_sim, loop_train):

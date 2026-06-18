@@ -87,7 +87,6 @@ class CycleResult:
     nodes_retained: int = 0
     episodic_train_loss: Optional[float] = None
     semantic_train_loss: Optional[float] = None
-    procedural_train_loss: Optional[float] = None
     episodic_recall: Optional[float] = None
     semantic_recall: Optional[float] = None
     wall_clock_seconds: float = 0.0
@@ -1114,6 +1113,20 @@ class ConsolidationLoop:
                     }
                     for r in proc_graph.relations
                 )
+                # Merge proc_graph into the cumulative graph so its relations
+                # reach the unified keying surface (_build_all_edge_entries_into)
+                # at the next run_consolidation_cycle call.  Same additive flag
+                # and gradient-checkpointing discipline as the session_graph merge
+                # above — merger.merge may call model.generate() when additive=False
+                # and a model is present (CLAUDE.md rule).
+                self._disable_gradient_checkpointing()
+                try:
+                    self.merger.merge(
+                        proc_graph,
+                        additive=(self.config.interim_refinement == "off"),
+                    )
+                finally:
+                    self._enable_gradient_checkpointing()
 
             # Unified dedup (identical policy as run_cycle + server path).
             with phase_trace("dedup_episodic") as t:
@@ -1247,7 +1260,6 @@ class ConsolidationLoop:
         # (experiment scripts) can inspect convergence without re-parsing logs.
         result = {
             "episodic_train_loss": cycle_result.get("episodic_train_loss"),
-            "procedural_train_loss": cycle_result.get("procedural_train_loss"),
         }
         logger.info("Training complete: %s", cycle_result)
         return result
@@ -1548,143 +1560,6 @@ class ConsolidationLoop:
 
         return existing_keyed + new_keyed
 
-    def _prepare_procedural_keys_for_tier(
-        self,
-        rels: list[dict],
-        speaker_id: str,
-        *,
-        mode: "Literal['simulate', 'train']",
-    ) -> tuple[list[dict], list[dict]]:
-        """Assign new procedural keys and gather existing keys for retraining.
-
-        Symmetric counterpart of :meth:`_prepare_episodic_keys_for_tier` for
-        the procedural tier.  Always targets the stable ``"procedural"`` main
-        adapter — there is no interim tier for procedural.
-
-        Per-session contradiction retirement via ``sp_index`` has been removed.
-        Procedural contradiction is now resolved at full consolidation by the
-        model-bearing :class:`~paramem.graph.merger.GraphMerger`.  Duplicate
-        procedural keys from within a session are tolerated in the interim and
-        collapsed at the next full-consolidation cycle.
-
-        Deferred-mutation discipline (TRAIN mode):
-            Store mutations are applied tentatively before the train call in
-            :meth:`run_consolidation_cycle`.  The index counter
-            (``_procedural_next_index``) is advanced only after this helper
-            returns successfully.
-
-        Simulate mode:
-            Writes the store immediately (no train call can fail so no
-            deferral is needed).
-
-        Args:
-            rels: Pre-extracted procedural relation dicts, already tagged with
-                ``speaker_id`` by ``_tag_speaker_id_defaults``.
-            speaker_id: Fallback speaker tag for new keys missing one.
-            mode: ``"train"`` or ``"simulate"``.
-
-        Returns:
-            ``(new_keyed, existing_keyed)`` as a 2-tuple.
-
-            - ``new_keyed``: cache-entry dicts for the new procedural keys.
-            - ``existing_keyed``: reconstructed / cache-read dicts for existing
-              procedural keys.
-        """
-        if not rels:
-            return [], []
-
-        logger.info("_prepare_procedural_keys_for_tier: %d relations (mode=%s)", len(rels), mode)
-
-        tentative_next = self._procedural_next_index
-        # Mint new keys via the shared helper; tag_new=False because the procedural
-        # TRAIN path does not use the _new sentinel (deferred mutations are tracked
-        # via _procedural_tentative_next_index on self instead).
-        new_keyed = self._mint_keyed_entries(
-            rels,
-            prefix="proc",
-            start_index=tentative_next,
-            speaker_id=speaker_id,
-            tag_new=False,
-        )
-        tentative_next += len(new_keyed)
-
-        new_key_set = {kp["key"] for kp in new_keyed}
-
-        if mode == "simulate":
-            # Apply mutations immediately — no train call that can fail.
-            for kp in new_keyed:
-                fingerprint = compute_simhash(
-                    kp["key"], kp["subject"], kp["predicate"], kp["object"]
-                )
-                self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
-                self.store.set_bookkeeping(
-                    kp["key"],
-                    speaker_id=kp["speaker_id"],
-                    first_seen_cycle=kp["first_seen_cycle"],
-                    relation_type=kp.get("relation_type", "factual"),
-                    recurrence_count=1,
-                    last_seen_cycle=self.cycle_count,
-                )
-            self._procedural_next_index = tentative_next
-            return new_keyed, []
-
-        # TRAIN mode: gather existing keys for reconstruction (deferred mutations).
-        # Use active-only fingerprints — stale keys must not be fed into reconstruction
-        # (they are superseded facts). The include_stale=False call makes the
-        # active-vs-known distinction explicit and prevents the enumeration-set bug.
-        existing_proc_keys = [
-            k
-            for k in self.store.tier_simhashes("procedural", include_stale=False)
-            if k not in new_key_set
-        ]
-
-        self._disable_gradient_checkpointing()
-        proc_simhash = self.store.tier_simhashes("procedural", include_stale=False)
-        reconstructed: dict[str, dict] = {}
-        entries = [{"key": k} for k in existing_proc_keys]
-        for entry, recalled in probe_entries(
-            self.model,
-            self.tokenizer,
-            entries,
-            registry=proc_simhash,
-            batch_size=self.training_config.recall_probe_batch_size,
-            confidence_threshold=0.5,
-        ):
-            key = entry["key"]
-            if recalled is not None and "failure_reason" not in recalled:
-                bk = self.store.bookkeeping_for_key(key) or {}
-                reconstructed[key] = {
-                    "key": key,
-                    "subject": recalled["subject"],
-                    "predicate": recalled["predicate"],
-                    "object": recalled["object"],
-                    "speaker_id": bk.get("speaker_id", speaker_id),
-                    "first_seen_cycle": bk.get("first_seen_cycle", self.cycle_count),
-                }
-
-        logger.info(
-            "_prepare_procedural_keys_for_tier: reconstruction %d/%d",
-            len(reconstructed),
-            len(existing_proc_keys),
-        )
-
-        existing_keyed: list[dict] = []
-        for key in existing_proc_keys:
-            if key in reconstructed:
-                existing_keyed.append(reconstructed[key])
-                continue
-            kp = self._safe_kp_from_cache(key)
-            if kp is not None:
-                existing_keyed.append(kp)
-
-        # Commit the counter ONLY if we return successfully (train path
-        # does not advance the counter here — it is advanced in
-        # run_consolidation_cycle after train_adapter returns).
-        # Store tentative_next on self so the caller can commit it.
-        self._procedural_tentative_next_index = tentative_next
-
-        return new_keyed, existing_keyed
-
     def finalize_training(self) -> None:
         """Save adapters and registries after background training completes."""
         self._save_adapters()
@@ -1793,6 +1668,18 @@ class ConsolidationLoop:
                 }
                 for r in proc_graph.relations
             )
+            # Merge proc_graph into the cumulative graph so its relations
+            # reach the unified keying surface (_build_all_edge_entries_into).
+            # Mirrors extract_session(): same additive flag and
+            # gradient-checkpointing discipline (CLAUDE.md rule).
+            self._disable_gradient_checkpointing()
+            try:
+                self.merger.merge(
+                    proc_graph,
+                    additive=(self.config.interim_refinement == "off"),
+                )
+            finally:
+                self._enable_gradient_checkpointing()
 
         # Apply same dedup as server path (identical policy across all paths).
         episodic_rels = self.dedup_episodic(episodic_rels)
@@ -1819,13 +1706,12 @@ class ConsolidationLoop:
                 new_promotions=None,
             )
             # cycle_count is now managed by run_consolidation_cycle.
-            # Propagate per-tier train losses from the cycle result dict.
+            # Propagate the episodic train loss from the cycle result dict.
+            # Procedural facts ride the interim slot so their loss folds into
+            # episodic_train_loss; procedural_train_loss was removed in B5.
             _epi_loss = cycle_result.get("episodic_train_loss")
-            _proc_loss = cycle_result.get("procedural_train_loss")
             if _epi_loss is not None:
                 result.episodic_train_loss = _epi_loss
-            if _proc_loss is not None:
-                result.procedural_train_loss = _proc_loss
 
         else:
             # --- 4b-alt. CURRICULUM PROBE (optional) ---
@@ -2315,10 +2201,9 @@ class ConsolidationLoop:
                 ``"episodic"``, ``"semantic"``, ``"procedural"``, or
                 ``"episodic_interim_<stamp>"``.
             interim_stamp: Optional YYYYMMDDTHHMM stamp passed directly by
-                callers (e.g. ``run_consolidation_cycle`` → ``_run_indexed_key_procedural``).
-                The ``_current_interim_stamp`` instance-attribute fallback is
-                preserved for backward-compat but is always ``None`` now that
-                the attribute is never set.
+                ``run_consolidation_cycle``.  The ``_current_interim_stamp``
+                instance-attribute fallback is preserved for backward-compat but
+                is always ``None`` now that the attribute is never set.
 
         Returns:
             Absolute :class:`~pathlib.Path` to give HF Trainer.
@@ -2447,135 +2332,6 @@ class ConsolidationLoop:
             recall_sanity_threshold=recall_sanity_threshold,
         )
 
-    def _run_indexed_key_procedural(
-        self,
-        rels: list[dict],
-        speaker_id: str,
-        *,
-        mode: "Literal['simulate', 'train']" = "train",
-        stamp: "str | None" = None,
-        run_label: str = "interim",
-        failed_session_ids: "set[str] | None" = None,
-    ) -> Optional[float]:
-        """Train (or simulate) the procedural adapter on *rels*.
-
-        Called by :meth:`run_consolidation_cycle` (primary) and the legacy
-        :meth:`run_cycle` path.  The method is extracted (rather than inlined)
-        so tests can patch it at the instance level to intercept the call.
-
-        All context that formerly leaked through instance attributes
-        (``_current_run_mode``, ``_current_run_label``, ``_current_interim_stamp``)
-        is now passed as explicit keyword arguments, eliminating the
-        set-before-call / clear-in-finally smuggling pattern.
-
-        Args:
-            rels: Deduplicated procedural relations for this cycle, already
-                tagged with ``speaker_id`` by ``_tag_speaker_id_defaults``.
-            speaker_id: Fallback speaker scope for contradiction detection.
-            mode: ``"train"`` writes adapter weights; ``"simulate"`` writes
-                sidecar JSON registry without touching PEFT.  Default ``"train"``.
-            stamp: Sub-interval stamp forwarded to ``_training_output_dir`` via
-                the ``interim_stamp`` parameter.  ``None`` when not called from
-                an interim cycle.
-            run_label: Tag woven into the wandb ``run_name`` for traceability.
-                Default ``"interim"``.
-            failed_session_ids: Mutable set shared with the caller
-                (:meth:`run_consolidation_cycle`).  When a new procedural key
-                fails the recall gate, its contributing session ids (from the
-                position-aligned ``_proc_sid_by_key`` dict built from the source
-                rels' T9 ``session_id`` fields) are added here so the caller can
-                keep those sessions pending (B7-B / T7).  ``None`` disables
-                collection (simulate mode or callers that do not need provenance).
-
-        Returns:
-            Train loss as ``float`` if training ran, otherwise ``None``.
-        """
-        if not rels:
-            return None
-
-        # Local import alias so tests can patch paramem.training.trainer.train_adapter.
-        from paramem.training.trainer import train_adapter as _train_adapter
-
-        if mode == "train":
-            switch_adapter(self.model, "procedural")
-        new_proc_keyed, existing_proc_keyed = self._prepare_procedural_keys_for_tier(
-            rels, speaker_id, mode=mode
-        )
-        # B7-B (T7): build key → contributing session ids map from the source rels
-        # (position-aligned with new_proc_keyed — _mint_keyed_entries is 1-to-1 with rels).
-        # Kept separate from the entry dict so session_ids are never persisted (D4 invariant).
-        _proc_sid_by_key: dict[str, list[str]] = {}
-        for _i, _kp in enumerate(new_proc_keyed):
-            _src_sid = rels[_i].get("session_id", "") if _i < len(rels) else ""
-            _proc_sid_by_key[_kp["key"]] = [_src_sid] if _src_sid else []
-        all_procedural = existing_proc_keyed + new_proc_keyed
-        if not (mode == "train" and all_procedural):
-            return None
-        examples = format_entry_training(all_procedural, self.tokenizer, max_length=1024)
-        dataset = self._indexed_dataset(examples)
-        training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
-        self._enable_gradient_checkpointing()
-        recall_cb, recall_state = self._maybe_make_recall_callback(
-            entries=all_procedural,
-            adapter_name="procedural",
-            output_dir=self._training_output_dir("procedural", interim_stamp=stamp),
-            phase_name=f"interim-procedural-{run_label}",
-        )
-        proc_metrics = _train_adapter(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            train_dataset=dataset,
-            adapter_name="procedural",
-            training_config=training_config,
-            adapter_config=self.procedural_config,
-            wandb_config=self.wandb_config,
-            output_dir=self._training_output_dir("procedural", interim_stamp=stamp),
-            run_name=f"interim-procedural-{run_label}",
-            thermal_policy=self._thermal_policy,
-            hooks=self._build_training_hooks(),
-            callbacks_extra=[recall_cb] if recall_cb is not None else None,
-        )
-        if proc_metrics is not None and proc_metrics.get("aborted"):
-            logger.info(
-                "_run_indexed_key_procedural: training aborted — skipping deferred mutations"
-            )
-            return None
-        # Deferred mutations — apply only after _train_adapter succeeds without abort.
-        # Compute the recall-passing set: keys whose exact_match verdict is True
-        # on the FINAL trained weights.  None recall_state means early-stop was
-        # disabled; fall back to a dedicated per-key probe.
-        passing = self._recall_passing_keys(recall_state, all_procedural)
-        if passing is None:
-            passing = self._probe_passing_keys("procedural", all_procedural)
-        self._procedural_next_index = self._procedural_tentative_next_index
-        for kp in new_proc_keyed:
-            if kp["key"] not in passing:
-                logger.debug(
-                    "_run_indexed_key_procedural: key %s failed recall gate"
-                    " — skipping registration",
-                    kp["key"],
-                )
-                # B7-B (T7): accumulate the contributing session ids for this
-                # recall-failed key into the shared cycle-local set so the
-                # caller (_run_consolidation_cycle) can keep those sessions
-                # pending.  _proc_sid_by_key is built above from the source
-                # rels' T9 session_id fields; session_ids are NOT on the entry
-                # dict to preserve the D4 no-persistence invariant.
-                if failed_session_ids is not None:
-                    failed_session_ids.update(_proc_sid_by_key.get(kp["key"], []))
-                continue
-            fingerprint = compute_simhash(kp["key"], kp["subject"], kp["predicate"], kp["object"])
-            self.store.put("procedural", kp["key"], kp, simhash=fingerprint)
-            self.store.set_bookkeeping(
-                kp["key"],
-                speaker_id=kp["speaker_id"],
-                first_seen_cycle=kp["first_seen_cycle"],
-                relation_type=kp.get("relation_type", "factual"),
-                recurrence_count=1,
-                last_seen_cycle=self.cycle_count,
-            )
-        return proc_metrics.get("train_loss") if proc_metrics is not None else None
-
     def run_consolidation_cycle(
         self,
         episodic_rels: list[dict],
@@ -2625,25 +2381,28 @@ class ConsolidationLoop:
         8c. Refine (B2): call :meth:`_refine_consolidation_graph` with
            ``enrich=(interim_refinement=="full")`` so SOTA enrichment is
            level-gated.  The recurrence-bump runs at every level.
-        9. Prepare episodic key list via ``_prepare_episodic_keys_for_tier``.
-           When *new_promotions* is non-empty, move matching keys from episodic
-           to semantic before training (mirrors the former
-           ``_run_indexed_key_episodic`` promotion-transfer step).
+        9. Build interim key list via graph-walk (B5: episodic + procedural entries).
+           Procedural entries ride the same interim slot as episodic (attn-only
+           config) between folds; the full fold retrain with procedural_config
+           (attn+MLP) is unchanged.
+           When *new_promotions* is non-empty, move matching episodic keys to
+           semantic before training.
         10. Train (train mode) or skip training (simulate mode).
-        11. Procedural: ``_prepare_procedural_keys_for_tier`` + train (train) or
-            skip (simulate).
-        12. Persist both tiers via ``commit_tier_slot``.
+        11. Apply deferred store mutations; advance counters for both episodic
+            and procedural minted keys.
+        12. Persist interim slot via ``commit_tier_slot``.
         13. Restore ``"episodic"`` as the active adapter (mode-agnostic).
         14. Return result dict.
 
         Args:
             episodic_rels: Pre-extracted episodic relations.  May already carry
                 ``speaker_id``; missing entries are tagged with *speaker_id*.
-            procedural_rels: Pre-extracted procedural relations.  Always trained
-                onto the stable ``"procedural"`` main adapter (no interim tier).
-            speaker_id: Default speaker tag for relations missing one; also
-                used for procedural contradiction scoping.  Required — callers
-                must always supply a real speaker ID.
+            procedural_rels: Pre-extracted procedural relations.  Used for the
+                no-relations guard (step 3) and debug output; procedural facts
+                reach the training set via merger.graph (merged by
+                extract_session / run_cycle), not via this argument directly.
+            speaker_id: Default speaker tag for relations missing one.
+                Required — callers must always supply a real speaker ID.
             mode: ``"train"`` writes adapter weights; ``"simulate"`` writes
                 sidecar JSON registry without touching PEFT.
             run_label: Tag woven into the wandb ``run_name`` for traceability.
@@ -2881,13 +2640,12 @@ class ConsolidationLoop:
         #   - Keyed edges (existing): anti-forgetting replay entries sourced from
         #     the store — not registered as new.
         #
-        # Procedural handling (B3): tier_keyed["procedural"] may be populated by the
-        # walk (procedural-typed keyless edges from the pending sessions co-merged
-        # into merger.graph) but is NOT trained in B3 — _run_indexed_key_procedural
-        # (step 11) continues to handle procedural via the flat path.  Deferred
-        # writes for procedural entries are NOT flushed in B3 (no counter advance,
-        # no store write); _run_indexed_key_procedural owns the procedural indices
-        # from _procedural_next_index independently.
+        # Procedural handling (B5): tier_keyed["procedural"] is populated by the
+        # walk (procedural-typed keyless edges from proc_graph, which is now merged
+        # into merger.graph by extract_session / run_cycle).  Procedural entries
+        # ride the SAME interim slot (adapter_name) as episodic and are flushed
+        # together after recall-confirmed training.  _procedural_next_index is
+        # advanced in the deferred-flush block below, mirroring _indexed_next_index.
         if mode == "train":
             switch_adapter(self.model, adapter_name)
         _tier_keyed: dict[str, list[dict]] = {"episodic": [], "procedural": [], "semantic": []}
@@ -2898,20 +2656,25 @@ class ConsolidationLoop:
             tag_new=True,
         )
 
-        # all_interim_keyed: episodic entries only (new minted + existing keyed).
-        # Procedural bucket (_tier_keyed["procedural"]) is collected but unused in B3.
-        all_interim_keyed = _tier_keyed["episodic"]
+        # all_interim_keyed: episodic + procedural entries (new minted + existing keyed).
+        # Procedural entries ride the same interim slot as episodic (B5).
+        all_interim_keyed = _tier_keyed["episodic"] + _tier_keyed["procedural"]
 
-        # new_keyed_episodic: deferred writes for episodic minted entries only.
-        # Procedural deferred writes are excluded (handled by _run_indexed_key_procedural).
+        # new_keyed_interim: deferred writes for all minted entries in this interim slot.
+        # Includes both episodic-tier and procedural-tier records; flushed together
+        # after recall-confirmed training.
         new_keyed_episodic = [rec for rec in _deferred_writes if rec["tier"] == "episodic"]
-        new_key_ids = [rec["entry"]["key"] for rec in new_keyed_episodic]
+        new_keyed_proc = [rec for rec in _deferred_writes if rec["tier"] == "procedural"]
+        new_keyed_interim = new_keyed_episodic + new_keyed_proc
+        new_key_ids = [rec["entry"]["key"] for rec in new_keyed_interim]
 
         if mode == "simulate":
-            # No training step — apply episodic store mutations immediately.
-            # Mirrors the former new_keyed_episodic simulate path; uses the
-            # deferred-write payload from _build_all_edge_entries_into(defer=True).
-            for rec in new_keyed_episodic:
+            # No training step — apply store mutations for both episodic and
+            # procedural minted entries immediately.  Mirrors the train-path
+            # deferred-flush below; both episodic and procedural entries go
+            # into adapter_name (the interim slot) because their weights are
+            # trained there.  Store tier == weight residence.
+            for rec in new_keyed_interim:
                 _entry = rec["entry"]
                 _key = _entry["key"]
                 self.store.put(
@@ -2931,6 +2694,7 @@ class ConsolidationLoop:
                     last_seen_cycle=self.cycle_count,
                 )
             self._indexed_next_index += len(new_keyed_episodic)
+            self._procedural_next_index += len(new_keyed_proc)
 
         # --- 9b. Semantic promotion transfer (train mode, when promotions supplied) ---
         # Move keys for promoted entities from episodic to the semantic tier so
@@ -2955,6 +2719,10 @@ class ConsolidationLoop:
             ]
 
         # --- 10. Train (train mode) or skip (simulate) ---
+        # all_interim_keyed holds both episodic and procedural entries (B5).
+        # The interim adapter uses episodic_config (attn-only); procedural entries
+        # ride the same slot between folds.  The full fold retrain with
+        # procedural_config (attn+MLP) at consolidate_interim_adapters is unchanged.
         epi_train_loss: float | None = None
         if mode == "train" and all_interim_keyed:
             epi_metrics, recall_state = self._train_tier_adapter(
@@ -2971,17 +2739,16 @@ class ConsolidationLoop:
             epi_train_loss = epi_metrics.get("train_loss") if epi_metrics is not None else None
             if epi_metrics is not None and epi_metrics.get("aborted"):
                 # Training was aborted for inference.  Skip simhash update,
-                # procedural training, deferred episodic mutations, and the
-                # commit_tier_slot call below.  The production adapter on disk
-                # is untouched; the next cycle will retrain from scratch.
-                logger.info("run_consolidation_cycle: episodic training aborted — skipping commit")
+                # deferred interim mutations, and the commit_tier_slot call below.
+                # The production adapter on disk is untouched; the next cycle will
+                # retrain from scratch.
+                logger.info("run_consolidation_cycle: interim training aborted — skipping commit")
                 return {"mode": "aborted", "adapter_name": adapter_name}
-            # Episodic store mutations are deferred until AFTER the procedural
-            # step completes — see the mutation block below the procedural gate.
-            # This guarantees full-cycle atomicity: if any training step fails,
-            # the registry stays clean.
+            # Store mutations are deferred until AFTER training succeeds — the
+            # deferred-flush block below applies them.  This guarantees interim
+            # atomicity: if training raises, the registry stays clean.
 
-            # Compute the recall-passing set for the episodic interim tier.
+            # Compute the recall-passing set for the interim adapter.
             # None state means early-stop disabled; fall back to dedicated probe.
             # FAIL-SAFE: None MUST route to the probe — never treated as empty.
             _epi_passing = self._recall_passing_keys(recall_state, all_interim_keyed)
@@ -2991,7 +2758,7 @@ class ConsolidationLoop:
             # Simulate mode or no keyed pairs: admit all without a probe.
             _epi_passing = None
 
-        # Update episodic-interim simhash registry from ground-truth pairs,
+        # Update interim simhash registry from ground-truth pairs,
         # filtered to recall-passing keys only.
         if _epi_passing is not None:
             _passing_interim = [kp for kp in all_interim_keyed if kp["key"] in _epi_passing]
@@ -2999,39 +2766,24 @@ class ConsolidationLoop:
             _passing_interim = all_interim_keyed
         self.store.replace_simhashes_in_tier(adapter_name, build_registry(_passing_interim))
 
-        # --- 11. Procedural (always onto stable "procedural" main adapter) ---
-        # B7-B (T6/T7): cycle-local set accumulates session ids whose contributed
-        # fact failed the recall gate (episodic at 11b, procedural inside
-        # _run_indexed_key_procedural).  Guarded to train mode: in simulate mode
-        # _epi_passing is None so the episodic drop site is never reached, and
-        # the procedural drop site only receives the set when mode=="train".
+        # --- 11. Apply deferred interim store mutations (train mode) ---
+        # B7-B (T6): cycle-local set accumulates session ids whose contributed
+        # fact failed the recall gate.  Guarded to train mode: in simulate mode
+        # _epi_passing is None so the drop site is never reached.
         # Simulate callsite (app.py:12499 B2) is explicitly NOT plumbed.
-        _recall_failed_session_ids: set[str] = set()
-        proc_train_loss: float | None = None
-        if self.procedural_config is not None and procedural_rels:
-            proc_train_loss = self._run_indexed_key_procedural(
-                procedural_rels,
-                speaker_id,
-                mode=mode,
-                stamp=stamp,
-                run_label=run_label,
-                # Pass None in simulate mode so the procedural gate is not reached
-                # and the set stays empty (B2: simulate has no recall gate).
-                failed_session_ids=_recall_failed_session_ids if mode == "train" else None,
-            )
-
-        # --- 11b. Apply deferred episodic store mutations ---
-        # Reached only when all training steps above completed without raising.
-        # In simulate mode the episodic writes were already applied before training
-        # (in the simulate branch of step 9 above); the counter was already advanced.
         #
-        # new_keyed_episodic carries the harvest records (from _deferred_writes)
-        # filtered to the episodic tier.  Each record has all fields needed for
-        # store.put (entry["key"], entry, canon_subj/pred/canon_obj for simhash)
-        # and store.set_bookkeeping (speaker_id, relation_type).
+        # new_keyed_interim carries both episodic-tier and procedural-tier harvest
+        # records from _deferred_writes.  All writes go to adapter_name (the
+        # interim slot) regardless of rec["tier"] because the weights for BOTH
+        # episodic and procedural entries live in that interim adapter.  Store
+        # tier must equal weight residence so the router probes the right adapter.
+        # The bookkeeping relation_type field carries the procedural classification
+        # forward for the COMMAND-path preference filter and the fold partition.
+        _recall_failed_session_ids: set[str] = set()
         if mode == "train":
-            _flushed_count = 0
-            for rec in new_keyed_episodic:
+            _ep_flushed = 0
+            _proc_flushed = 0
+            for rec in new_keyed_interim:
                 _entry = rec["entry"]
                 _key = _entry["key"]
                 if _epi_passing is not None and _key not in _epi_passing:
@@ -3041,8 +2793,8 @@ class ConsolidationLoop:
                         _key,
                     )
                     # B7-B (T6): accumulate contributing session ids for this
-                    # recall-failed episodic key so the caller can keep those
-                    # sessions pending.  rec["session_ids"] is populated by
+                    # recall-failed key so the caller can keep those sessions
+                    # pending.  rec["session_ids"] is populated by
                     # _build_all_edge_entries_into (T5) from edge["sessions"]
                     # with synthetic sentinels already excluded.
                     _recall_failed_session_ids.update(rec.get("session_ids", []))
@@ -3063,24 +2815,19 @@ class ConsolidationLoop:
                     recurrence_count=1,
                     last_seen_cycle=self.cycle_count,
                 )
-                _flushed_count += 1
-            self._indexed_next_index += _flushed_count
+                if rec["tier"] == "procedural":
+                    _proc_flushed += 1
+                else:
+                    _ep_flushed += 1
+            self._indexed_next_index += _ep_flushed
+            self._procedural_next_index += _proc_flushed
 
-        # --- 12. Persist both tiers ---
-        # Each commit_tier_slot is internally crash-safe (registry-last write is
-        # the commit signal; a torn slot is skipped by the boot validator).  The
-        # PAIR is NOT transactional: a crash between the episodic and procedural
-        # commits leaves the episodic interim slot committed and the procedural
-        # main slot at its prior state.  That window is RECOVERABLE and must stay
-        # so: the source session is NOT marked consolidated until this method
-        # returns successfully (the production caller — app.py's post-session
-        # tick / full-cycle path — calls session_buffer.mark_consolidated only
-        # after run_consolidation_cycle returns).  A crash here therefore raises,
-        # the caller never marks consolidated, the session stays pending, and the
-        # procedural facts are re-extracted next cycle.  Do NOT mark sessions
-        # consolidated from inside this method, and do NOT wrap these commits in a
-        # heavy pseudo-transaction — the residual "re-extract procedural next
-        # cycle" cost is acceptable and the recovery is provably safe.
+        # --- 12. Persist interim slot ---
+        # commit_tier_slot is internally crash-safe (registry-last write is the
+        # commit signal; a torn slot is skipped by the boot validator).  The
+        # source session is NOT marked consolidated until this method returns
+        # successfully (the production caller marks consolidated only after
+        # run_consolidation_cycle returns without raising).
         # Regression guard: tests/test_post_session_train.py
         # ::TestInterTierCommitRecoverable.
         commit_tier_slot(
@@ -3092,18 +2839,6 @@ class ConsolidationLoop:
             all_keyed=all_interim_keyed,
             output_dir=self.output_dir,
         )
-        if self.procedural_config is not None and "procedural" in (
-            self.model.peft_config if mode == "train" else {"procedural"}
-        ):
-            commit_tier_slot(
-                loop=self,
-                tier="procedural",
-                adapter_name="procedural",
-                stamp=stamp,
-                mode=mode,
-                all_keyed=[],
-                output_dir=self.output_dir,
-            )
 
         # --- 13. End-of-cycle: restore episodic as active adapter ---
         # Mode-agnostic: the peft_config check already short-circuits in simulate
@@ -3113,7 +2848,7 @@ class ConsolidationLoop:
             switch_adapter(self.model, "episodic")
 
         logger.info(
-            "run_consolidation_cycle: %s %s — %d new keys, %d total episodic keys",
+            "run_consolidation_cycle: %s %s — %d new keys, %d total interim keys",
             mode,
             adapter_name,
             len(new_key_ids),
@@ -3128,7 +2863,6 @@ class ConsolidationLoop:
             "venue": mode,
             "error": None,
             "episodic_train_loss": epi_train_loss,
-            "procedural_train_loss": proc_train_loss,
             # B7-B (T8): contributing session ids whose new key failed the recall
             # gate this cycle.  Callers use .get("recall_failed_session_ids", [])
             # so early-return paths (aborted, no-relations, queued) that do not
@@ -6256,8 +5990,6 @@ class ConsolidationLoop:
             episodic / interim / fold training path; run_consolidation_cycle
             and consolidate_interim_adapters reach this callback transitively
             via _train_tier_adapter and do not call it directly.
-          - ConsolidationLoop._run_indexed_key_procedural (direct — procedural
-            inline path bypasses _train_tier_adapter)
           - active_store_migration._migrate_tier_simulate_to_train (direct)
             (paramem/server/active_store_migration.py)
 

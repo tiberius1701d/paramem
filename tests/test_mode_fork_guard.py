@@ -41,8 +41,6 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         ("paramem/training/consolidation.py", "run_consolidation_cycle"),
         ("paramem/training/consolidation.py", "_resolve_target_slot"),
         ("paramem/training/consolidation.py", "_prepare_episodic_keys_for_tier"),
-        ("paramem/training/consolidation.py", "_prepare_procedural_keys_for_tier"),
-        ("paramem/training/consolidation.py", "_run_indexed_key_procedural"),
         # housekeeping re-grooming: train retrains adapters, simulate writes graph.json —
         # persistence-tail divergence only; grooming logic is identical in both branches.
         ("paramem/training/consolidation.py", "run_housekeeping"),

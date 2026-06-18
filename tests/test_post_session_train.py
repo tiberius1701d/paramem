@@ -710,13 +710,32 @@ _COMMON_PATCHES = [
 
 
 class TestProceduralRelsRoutedToProceduralAdapter:
-    """Procedural relations must reach the procedural adapter, not be silently dropped."""
+    """Procedural relations must reach the interim training set, not be silently dropped.
 
-    def test_procedural_train_called_when_proc_rels_present(self, tmp_path: Path) -> None:
-        """_run_indexed_key_procedural is called when procedural_rels are non-empty."""
+    B5: procedural-typed edges flow into the same interim slot as episodic facts.
+    The per-cycle ``_run_indexed_key_procedural`` helper is deleted; proc facts
+    reach the training set via ``merger.graph`` (merged by ``extract_session`` /
+    ``run_cycle``).  Tests here verify the pass-through contract at the
+    ``run_consolidation_cycle`` boundary.
+    """
+
+    def test_procedural_rels_passed_to_run_consolidation_cycle(self, tmp_path: Path) -> None:
+        """post_session_train forwards procedural_rels to run_consolidation_cycle.
+
+        B5: proc_rels are still forwarded as the second positional argument so
+        the "no-relations" guard fires correctly.  The actual proc-fact training
+        happens via merger.graph (merged inside the real extract_session), not via
+        a separate per-cycle training call.
+        """
         loop = _make_mock_loop_with_procedural(tmp_path)
         stamp = "20260418T1430"
         loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
+
+        captured_proc_rels: list = []
+
+        def _capture_cycle(episodic_rels, procedural_rels, **kwargs):
+            captured_proc_rels.extend(procedural_rels)
+            return {"mode": "trained", "new_keys": [], "adapter_name": None}
 
         with (
             patch.object(
@@ -724,20 +743,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 "extract_session",
                 return_value=(_fake_qa(2), _fake_proc_rels(1)),
             ),
-            patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-            patch.object(loop, "_run_indexed_key_procedural") as mock_proc,
+            patch.object(loop, "run_consolidation_cycle", side_effect=_capture_cycle),
         ):
             loop.post_session_train(
                 "Transcript with prefs",
@@ -748,28 +754,22 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 stamp=stamp,
             )
 
-        mock_proc.assert_called_once()
-        # First positional arg is the procedural relations list.
-        called_rels = mock_proc.call_args[0][0]
-        assert len(called_rels) == 1
-
-        # Procedural flush invariant: whenever the procedural manifest is stamped
-        # (gate: procedural_config is not None and "procedural" in peft_config),
-        # the per-tier indexed_key_registry.json must land on disk in the same
-        # consolidation window so the manifest's registry_sha256 is verifiable
-        # on restart.  Pre-fix this file was absent — procedural slot orphaned.
-        proc_registry = loop.output_dir / "procedural" / "indexed_key_registry.json"
-        assert proc_registry.exists(), (
-            f"Procedural tier registry not written to {proc_registry} — "
-            "step-8 symmetric flush regression (was absent before "
-            "post_session_train Step 8 procedural flush was added)."
+        assert len(captured_proc_rels) == 1, (
+            f"Expected 1 procedural rel forwarded to run_consolidation_cycle; "
+            f"got {captured_proc_rels}"
         )
 
-    def test_procedural_train_not_called_when_no_proc_rels(self, tmp_path: Path) -> None:
-        """_run_indexed_key_procedural is NOT called when procedural_rels is empty."""
+    def test_empty_proc_rels_forwarded_to_cycle(self, tmp_path: Path) -> None:
+        """post_session_train forwards empty procedural_rels when extract returns none."""
         loop = _make_mock_loop_with_procedural(tmp_path)
         stamp = "20260418T1430"
         loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
+
+        captured_proc_rels: list = []
+
+        def _capture_cycle(episodic_rels, procedural_rels, **kwargs):
+            captured_proc_rels.extend(procedural_rels)
+            return {"mode": "trained", "new_keys": [], "adapter_name": None}
 
         with (
             patch.object(
@@ -777,20 +777,7 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 "extract_session",
                 return_value=(_fake_qa(2), []),  # empty procedural_rels
             ),
-            patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-            patch.object(loop, "_run_indexed_key_procedural") as mock_proc,
+            patch.object(loop, "run_consolidation_cycle", side_effect=_capture_cycle),
         ):
             loop.post_session_train(
                 "Transcript no prefs",
@@ -801,15 +788,23 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 stamp=stamp,
             )
 
-        mock_proc.assert_not_called()
+        assert captured_proc_rels == [], (
+            f"Empty procedural_rels must be forwarded as-is; got {captured_proc_rels}"
+        )
 
-    def test_procedural_train_not_called_when_procedural_config_is_none(
-        self, tmp_path: Path
-    ) -> None:
-        """_run_indexed_key_procedural is NOT called when procedural_config is None."""
+    def test_procedural_config_none_does_not_raise(self, tmp_path: Path) -> None:
+        """post_session_train completes normally when procedural_config is None.
+
+        B5: procedural-config=None means partition_relations classifies ALL
+        edges as episodic.  No procedural keys are minted; the cycle still
+        trains on the episodic-only set.
+        """
         loop = _make_mock_loop(tmp_path)  # procedural_config=None by default
         stamp = "20260418T1430"
         loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
+
+        def _capture_cycle(episodic_rels, procedural_rels, **kwargs):
+            return {"mode": "trained", "new_keys": [], "adapter_name": None}
 
         with (
             patch.object(
@@ -817,22 +812,9 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 "extract_session",
                 return_value=(_fake_qa(2), _fake_proc_rels(2)),
             ),
-            patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-            patch.object(loop, "_run_indexed_key_procedural") as mock_proc,
+            patch.object(loop, "run_consolidation_cycle", side_effect=_capture_cycle),
         ):
-            loop.post_session_train(
+            result = loop.post_session_train(
                 "Transcript",
                 "conv-p-003",
                 speaker_id="Speaker0",
@@ -841,72 +823,43 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 stamp=stamp,
             )
 
-        mock_proc.assert_not_called()
+        # No exception; mode reflects what the cycle returned.
+        assert result.get("mode") == "trained"
 
-    def test_procedural_failure_leaves_registry_clean(self, tmp_path: Path) -> None:
-        """train_adapter raising on the procedural pass leaves all state unchanged.
+    def test_training_abort_leaves_registry_clean(self, tmp_path: Path) -> None:
+        """train_adapter returning aborted=True leaves the registry unchanged.
 
-        This test does NOT mock ``_run_indexed_key_procedural`` — it exercises the
-        actual mutation-ordering invariant inside that method.  ``train_adapter`` is
-        mocked to succeed on the first (episodic) call and raise on the second
-        (procedural) call.
-
-        Note: per-session sp_index-driven retirement was removed (architecture §4.3).
-        Contradiction resolution is deferred to full consolidation via the model-bearing
-        merger.  The pre-existing proc0 key coexists with the new preference — it is
-        NOT retired during this session.
+        B5: there is ONE unified interim training pass covering both episodic
+        and procedural entries.  When training aborts, the deferred-flush block
+        is skipped and no new keys are registered.
 
         Pre-conditions
         --------------
-        - One old procedural key ``proc0`` exists in the procedural simhash and
-          indexed_key_cache.
+        - One old procedural key ``proc0`` exists in the store.
 
-        Post-conditions after the procedural training failure
-        -----------------------------------------------------
-        - ``indexed_key_registry`` is empty: episodic step 7 never ran.
-        - ``indexed_key_cache`` does NOT contain any new procedural key.
-        - ``procedural_simhash`` is unchanged: old key still present.
-        - Old procedural key ``proc0`` was NOT removed from any index.
+        Post-conditions after abort
+        ---------------------------
+        - ``indexed_key_registry`` contains only the pre-existing entry.
+        - No new proc- or graph-prefixed keys were added.
         """
         loop = _make_mock_loop_with_procedural(tmp_path)
         stamp = "20260418T1430"
         loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
 
-        # Pre-existing procedural state: proc0.
-        # _fake_proc_rels(1) produces subject="Subject1", predicate="prefers".
         old_proc_key = "proc0"
-        old_qa_entry = {
-            "key": old_proc_key,
-            "question": "Old question?",
-            "answer": "Old answer.",
-            "subject": "Subject1",
-            "predicate": "prefers",
-            "object": "OldThing",
-            "speaker_id": "",
-        }
         loop.store.put_simhash("procedural", old_proc_key, 0xDEADBEEF)
-        loop.store._entries_flat_view()[old_proc_key] = old_qa_entry
-
-        call_count = {"n": 0}
-
-        def _train_side_effect(*args, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] >= 2:
-                # Second call is the procedural train_adapter — raise.
-                raise RuntimeError("procedural training failed")
-            return {"train_loss": 0.5, "aborted": False}
-
-        # Synthetic QA for generate_qa_from_relations (called inside
-        # _run_indexed_key_procedural).
-        proc_qa_out = [
+        loop.store.put(
+            "procedural",
+            old_proc_key,
             {
-                "question": "What does Subject1 prefer?",
-                "answer": "NewThing1.",
+                "key": old_proc_key,
                 "subject": "Subject1",
                 "predicate": "prefers",
-                "object": "NewThing1",
-            }
-        ]
+                "object": "OldThing",
+                "speaker_id": "",
+                "first_seen_cycle": 1,
+            },
+        )
 
         with (
             patch.object(
@@ -915,20 +868,9 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                 return_value=(_fake_qa(2), _fake_proc_rels(1)),
             ),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            # train_adapter is imported at module level in consolidation.py;
-            # patch it there so both the episodic (_train_adapter local alias)
-            # and procedural (module-level train_adapter) calls are intercepted.
-            patch(
-                "paramem.training.consolidation.train_adapter",
-                side_effect=_train_side_effect,
-            ),
             patch(
                 "paramem.training.trainer.train_adapter",
-                side_effect=_train_side_effect,
-            ),
-            patch(
-                "paramem.graph.qa_generator.generate_qa_from_relations",
-                return_value=proc_qa_out,
+                return_value={"train_loss": 0.5, "aborted": True},
             ),
             patch(
                 "paramem.training.consolidation.format_entry_training",
@@ -939,81 +881,53 @@ class TestProceduralRelsRoutedToProceduralAdapter:
             patch.object(loop, "_disable_gradient_checkpointing"),
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
-            # probe_entries: proc0 is probed (it is an existing key, not retired),
-            # but fails reconstruction — falls back to cache read.
-            patch(
-                "paramem.training.consolidation.probe_entries",
-                side_effect=lambda model, tokenizer, entries, **kw: (
-                    (e, {"failure_reason": "no_match"}) for e in entries
-                ),
-            ),
             patch(
                 "paramem.training.consolidation.build_registry",
                 return_value={},
             ),
         ):
-            with pytest.raises(RuntimeError, match="procedural training failed"):
-                loop.post_session_train(
-                    "Transcript",
-                    "conv-p-004",
-                    speaker_id="Speaker0",
-                    schedule="every 2h",
-                    max_interim_count=4,
-                    stamp=stamp,
-                )
+            result = loop.run_consolidation_cycle(
+                _fake_qa(2),
+                _fake_proc_rels(1),
+                speaker_id="Speaker0",
+                mode="train",
+                run_label="conv-p-004",
+                stamp=stamp,
+            )
 
-        # Episodic key registration never ran — registry stays empty.
-        assert _count_registry_keys(loop) == 0, (
-            "Episodic keys must not be registered when procedural training fails."
+        assert result.get("mode") == "aborted", (
+            f"Expected mode='aborted' after train_adapter returns aborted=True; got {result}"
         )
 
-        # No new procedural key in indexed_key_cache — only the pre-existing old entry.
-        proc_keys_in_qa = [k for k in loop.store._entries_flat_view() if k.startswith("proc")]
-        assert proc_keys_in_qa == [old_proc_key], (
-            f"Expected only old procedural key '{old_proc_key}' in indexed_key_cache; "
-            f"found: {proc_keys_in_qa}"
+        # Only the pre-existing proc0 is in the store — no new keys.
+        proc_keys = list(loop.store.active_keys_in_tier("procedural"))
+        assert proc_keys == [old_proc_key], (
+            f"Only pre-existing procedural key '{old_proc_key}' must survive abort; "
+            f"found: {proc_keys}"
         )
-
-        # Old contradicted key must NOT have been retired from procedural_simhash.
+        # Old key simhash must be intact.
         assert old_proc_key in loop.store.tier_simhashes("procedural", include_stale=False), (
-            "Old procedural key must still be in procedural_simhash after training failure."
+            "Old procedural key simhash must be untouched after abort."
         )
 
-        # Old key must NOT have been removed from indexed_key_cache.
-        assert old_proc_key in loop.store._entries_flat_view(), (
-            "Old procedural key must still be in indexed_key_cache after training failure."
-        )
+    def test_post_session_train_propagates_extract_error(self, tmp_path: Path) -> None:
+        """An error raised by extract_session propagates out of post_session_train.
 
-    def test_interim_stamp_cleared_after_procedural_failure(self, tmp_path: Path) -> None:
-        """_current_interim_stamp is cleared even when procedural training fails."""
+        B5 removed the ``_current_interim_stamp`` finally-guard on the procedural
+        path.  Errors from extract_session now propagate normally without any
+        per-cycle stamp cleanup (there is nothing to clean up at the cycle level).
+        """
         loop = _make_mock_loop_with_procedural(tmp_path)
         stamp = "20260418T1430"
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
 
         with (
             patch.object(
                 loop,
                 "extract_session",
-                return_value=(_fake_qa(1), _fake_proc_rels(1)),
-            ),
-            patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch.object(
-                loop,
-                "_run_indexed_key_procedural",
-                side_effect=RuntimeError("boom"),
+                side_effect=RuntimeError("extraction failed"),
             ),
         ):
-            with pytest.raises(RuntimeError):
+            with pytest.raises(RuntimeError, match="extraction failed"):
                 loop.post_session_train(
                     "Transcript",
                     "conv-p-005",
@@ -1022,9 +936,6 @@ class TestProceduralRelsRoutedToProceduralAdapter:
                     max_interim_count=4,
                     stamp=stamp,
                 )
-
-        # _current_interim_stamp must be cleaned up (finally block).
-        assert getattr(loop, "_current_interim_stamp", None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1112,8 +1023,13 @@ class TestTrainingOutputDirUniqueness:
         assert f"interim_{stamp_a}" in dirs_a[0]
         assert f"interim_{stamp_b}" in dirs_b[0]
 
-    def test_procedural_output_dir_uses_interim_stamp(self, tmp_path: Path) -> None:
-        """Procedural training output dir also uses the interim stamp, not cycle_count."""
+    def test_interim_slot_output_dir_uses_stamp(self, tmp_path: Path) -> None:
+        """Training output dir uses the interim stamp (B5: single unified slot for all facts).
+
+        B5: procedural and episodic entries now train in the SAME interim slot.
+        There is exactly ONE train_adapter call per cycle; its output_dir must
+        contain the stamp so checkpoints are namespace-isolated per sub-interval.
+        """
         loop = _make_mock_loop_with_procedural(tmp_path)
         stamp = "20260418T1430"
         loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
@@ -1122,6 +1038,7 @@ class TestTrainingOutputDirUniqueness:
 
         def _capture_train(*args, **kwargs):
             captured_dirs.append(str(kwargs.get("output_dir", "")))
+            return {"train_loss": 0.1, "aborted": False}
 
         with (
             patch.object(
@@ -1139,41 +1056,25 @@ class TestTrainingOutputDirUniqueness:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
             patch("paramem.models.loader.save_adapter"),
-            # Mock _run_indexed_key_procedural at the method level to inspect what
-            # _training_output_dir returns when called with the stamp in effect.
-            # We call it for real via the loop's method to exercise the stamp routing.
+            patch("paramem.memory.persistence.commit_tier_slot"),
         ):
-            # Temporarily patch _run_indexed_key_procedural to capture the stamp.
-            original_proc = loop._run_indexed_key_procedural
+            loop.post_session_train(
+                "Transcript with prefs",
+                "conv-d-004",
+                speaker_id="Speaker0",
+                schedule="every 2h",
+                max_interim_count=4,
+                stamp=stamp,
+            )
 
-            def _proc_capture(rels, speaker_id, **kwargs):
-                # Record the output dir that would be used (via _training_output_dir).
-                # Accepts mode/stamp/run_label forwarded by run_consolidation_cycle.
-                # Pass interim_stamp so the path includes the stamp segment.
-                interim_stamp = kwargs.get("stamp")
-                captured_dirs.append(
-                    str(loop._training_output_dir("procedural", interim_stamp=interim_stamp))
-                )
-
-            loop._run_indexed_key_procedural = _proc_capture
-            try:
-                loop.post_session_train(
-                    "Transcript with prefs",
-                    "conv-d-004",
-                    speaker_id="Speaker0",
-                    schedule="every 2h",
-                    max_interim_count=4,
-                    stamp=stamp,
-                )
-            finally:
-                loop._run_indexed_key_procedural = original_proc
-
-        # The procedural output dir captured inside _run_indexed_key_procedural
-        # (during post_session_train's finally-guarded call) must contain the stamp.
-        proc_dirs = [d for d in captured_dirs if "procedural" in d]
-        assert len(proc_dirs) >= 1, f"No procedural output dir captured: {captured_dirs}"
-        for d in proc_dirs:
-            assert f"interim_{stamp}" in d, f"Procedural output dir must contain interim stamp: {d}"
+        assert len(captured_dirs) == 1, (
+            f"B5: expected exactly ONE train_adapter call (unified interim slot); "
+            f"got {len(captured_dirs)} with dirs: {captured_dirs}"
+        )
+        assert f"interim_{stamp}" in captured_dirs[0], (
+            f"Unified interim training output dir must contain stamp {stamp!r}; "
+            f"got {captured_dirs[0]!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1675,47 +1576,33 @@ class TestManifestWrittenPostSession:
 
 
 class TestInterTierCommitRecoverable:
-    """A crash between the episodic and procedural ``commit_tier_slot`` calls
-    must always be RECOVERABLE: the session is NOT marked consolidated until
-    ``run_consolidation_cycle`` (here via ``post_session_train``) returns
-    successfully, so on a simulated reboot the source session stays pending and
-    is re-extracted.  The two commits are NOT transactional together, but the
-    consolidated-marking contract makes that residual window safe.
+    """A crash during ``commit_tier_slot`` must always be RECOVERABLE.
 
-    Reference: ``run_consolidation_cycle`` (consolidation.py step 12) commits
-    episodic then procedural; the production caller (``app.py`` post-session
-    tick) calls ``session_buffer.mark_consolidated`` ONLY after the cycle
-    returns.  This test locks that contract in so a future refactor cannot mark
-    sessions consolidated mid-cycle.
+    B5: the unified interim slot now covers both episodic and procedural entries
+    in a SINGLE ``commit_tier_slot`` call (step 12 of run_consolidation_cycle).
+    If that commit crashes, the session is NOT marked consolidated — the production
+    caller (``app.py`` post-session tick) calls ``session_buffer.mark_consolidated``
+    ONLY after the cycle returns successfully.
+
+    Reference: ``run_consolidation_cycle`` (consolidation.py step 12) commits the
+    single interim slot; the production caller marks consolidated ONLY after return.
     """
 
-    def test_procedural_commit_crash_leaves_session_pending(self, tmp_path: Path) -> None:
-        """Procedural ``commit_tier_slot`` raising must propagate out of the
-        cycle so a caller's ``mark_consolidated`` is never reached.
+    def test_commit_crash_leaves_session_pending(self, tmp_path: Path) -> None:
+        """``commit_tier_slot`` raising must propagate out of the cycle so a
+        caller's ``mark_consolidated`` is never reached.
 
-        Models a caller that only marks the session consolidated when
-        ``post_session_train`` returns normally.  Because the procedural commit
-        crashes, the exception propagates, the mark-callback is never invoked,
-        and the session remains pending (recoverable on reboot).
+        B5: there is ONE commit for the unified interim slot.  A crash in it
+        propagates; the session stays pending and is re-extracted on reboot.
         """
         loop = _make_mock_loop_with_procedural(tmp_path)
         stamp = "20260418T1430"
         loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
 
-        # Track which tiers were committed and whether the (simulated) caller
-        # would have marked the session consolidated.
-        committed_tiers: list[str] = []
         session_marked_consolidated: list[str] = []
 
         def _commit_side_effect(*args, **kwargs):
-            tier = kwargs["tier"]
-            if tier == "procedural":
-                # Crash AFTER the episodic commit already landed.  Each commit
-                # is internally crash-safe (registry-last commit signal); the
-                # pair is what we are proving recoverable here, so the episodic
-                # commit's real disk I/O is irrelevant — record-and-return.
-                raise RuntimeError("simulated crash during procedural commit_tier_slot")
-            committed_tiers.append(tier)
+            raise RuntimeError("simulated crash during commit_tier_slot")
 
         def _caller_mark_consolidated(session_id: str) -> None:
             # The production caller only calls this AFTER the cycle returns.
@@ -1732,10 +1619,6 @@ class TestInterTierCommitRecoverable:
                 "paramem.training.trainer.train_adapter",
                 return_value={"train_loss": 0.5, "aborted": False},
             ),
-            patch(
-                "paramem.training.consolidation.train_adapter",
-                return_value={"train_loss": 0.5, "aborted": False},
-            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),
@@ -1743,8 +1626,6 @@ class TestInterTierCommitRecoverable:
             patch.object(loop, "_enable_gradient_checkpointing"),
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
-            # Procedural pass is a no-op success — the crash is at the commit seam.
-            patch.object(loop, "_run_indexed_key_procedural", return_value=0.5),
             patch(
                 "paramem.memory.persistence.commit_tier_slot",
                 side_effect=_commit_side_effect,
@@ -1760,21 +1641,17 @@ class TestInterTierCommitRecoverable:
                     stamp=stamp,
                 )
             except RuntimeError as exc:
-                assert "procedural commit_tier_slot" in str(exc)
+                assert "commit_tier_slot" in str(exc)
             else:
-                pytest.fail("procedural commit crash must propagate out of the cycle")
+                pytest.fail("commit crash must propagate out of the cycle")
             # The caller's mark_consolidated would run here ONLY on success.
             # The except branch above skipped it, mirroring production.
 
-        # Episodic landed; procedural did not — the documented residual state.
-        assert committed_tiers == ["episodic"], (
-            f"expected only the episodic commit to land before the crash; got {committed_tiers}"
-        )
         # The session was NEVER marked consolidated → it stays pending →
         # re-extractable on the next cycle. This is the recoverability invariant.
         assert session_marked_consolidated == [], (
             "session must NOT be marked consolidated when a commit crashes mid-cycle — "
-            "it must stay pending so the procedural facts are re-extracted next cycle"
+            "it must stay pending so the facts are re-extracted next cycle"
         )
 
 
@@ -2381,28 +2258,29 @@ class TestRecallFailedSessionStaysPending:
     ) -> None:
         """New procedural key that fails the recall gate → session id collected.
 
-        The procedural carrier is the fact-dict session_id (T9 stamp, app.py).
-        _mint_keyed_entries copies rel["session_id"] → kp["session_ids"].
-        The drop site in _run_indexed_key_procedural updates the shared set.
-        Procedural path works under interim_refinement="off" too (always fact-dict).
+        B5: proc facts flow through merger.graph (merged by extract_session/run_cycle).
+        The session_id rides on the graph edge's ``sessions`` set (same path as
+        episodic B7).  When _probe_passing_keys returns an empty set, every new
+        key fails and the session id lands in recall_failed_session_ids.
         """
         loop = _make_mock_loop_with_procedural(tmp_path)
         loop.model.peft_config["episodic_interim_20260617T0000"] = MagicMock()
 
         proc_sid = "session-proc-fail"
-        # Procedural relation with session_id stamped (T9 mirrors app.py:12432).
-        proc_rels = [
-            {
-                "subject": "Alice",
-                "predicate": "prefers",
-                "object": "Tea",
-                "relation_type": "preference",
-                "speaker_id": "Speaker0",
-                "session_id": proc_sid,
-            }
-        ]
+        # B5: inject the procedural fact into merger.graph with the session_id on
+        # the edge's sessions set — that's how extract_session delivers it in prod.
+        loop.merger.graph.add_node("Alice", attributes={"name": "Alice"})
+        loop.merger.graph.add_node("Tea", attributes={"name": "Tea"})
+        loop.merger.graph.add_edge(
+            "Alice",
+            "Tea",
+            predicate="prefers",
+            relation_type="preference",
+            confidence=1.0,
+            sessions={proc_sid},
+        )
 
-        # Override proc probe to fail all keys.
+        # Override probe to fail all keys — every deferred write stays pending.
         loop._probe_passing_keys = lambda adapter_name, entries: set()
 
         with (
@@ -2426,7 +2304,7 @@ class TestRecallFailedSessionStaysPending:
         ):
             result = loop.run_consolidation_cycle(
                 [],
-                proc_rels,
+                [{"relation_type": "preference"}],  # non-empty so no-relations guard passes
                 speaker_id="Speaker0",
                 mode="train",
                 run_label="test",
