@@ -79,7 +79,8 @@ def compute_pre_flight_check(
         ``None`` when the server is in cloud-only mode; the graph contribution
         is then 0.  Graph bytes are sourced from the persisted on-disk file
         ``loop.output_dir / "episodic" / "graph.json"`` (not from the
-        in-memory ``merger.graph``, which is empty between cycles after W1).
+        in-memory ``merger.graph``, which is cleared at cycle-end and is empty
+        between cycles).
     backups_root:
         Root of the backup store (e.g. ``data/ha/backups/``).
     live_config_path:
@@ -105,9 +106,9 @@ def compute_pre_flight_check(
       transient read error — the estimate is a heuristic, not an authoritative
       size.
     - Graph bytes are read from the persisted ``episodic/graph.json`` file
-      (W2: ``loop.merger.graph`` is cleared at cycle-end; re-serializing it
-      would always yield an empty-graph estimate).  Reading the on-disk file
-      also reflects what the actual backup would capture.
+      (``loop.merger.graph`` is cleared at cycle-end; re-serializing it would
+      always yield an empty-graph estimate).  Reading the on-disk file also
+      reflects what the actual backup would capture.
     - Any I/O error inside the estimate loop is swallowed (logged WARN) and
       counted as 0 bytes for that component (accepted — heuristic, not
       authoritative).
@@ -152,7 +153,7 @@ def compute_pre_flight_check(
         logger.warning("compute_pre_flight_check: could not read live config for estimate: %s", exc)
 
     # Graph contribution: read the canonical episodic/graph.json on disk.
-    # W2: merger.graph is cleared at cycle-end (W1 finally block), so calling
+    # merger.graph is cleared at cycle-end (in the finally block), so calling
     # save_bytes() on it would re-serialize an empty graph and underestimate.
     # The on-disk file is the durable artifact that the backup itself would
     # capture, so reading it is both correct and avoids a re-serialization.

@@ -66,7 +66,8 @@ _FALLBACK_RTYPE: str = fallback_relation_type()
 # call _merge_registry_relations or GraphMerger.merge with a pseudo-id rather
 # than a real session identifier.  The harvest filter in
 # _build_all_edge_entries_into subtracts these from edge["sessions"] so that
-# the deferred-write record carries ONLY real contributing session ids (B7-A).
+# the deferred-write record carries ONLY real contributing session ids — synthetic
+# sentinels are subtracted in _build_all_edge_entries_into.
 _SYNTHETIC_SESSION_IDS: frozenset[str] = frozenset(
     {
         "__full_consolidation_recon__",
@@ -814,7 +815,7 @@ class ConsolidationLoop:
         blindly — that would constitute silent total knowledge loss if the model
         had not actually learned them.
 
-        B1 (soft-stale preservation): the fresh ``KeyRegistry()`` that replaces the
+        Soft-stale preservation: the fresh ``KeyRegistry()`` that replaces the
         live registry would wipe any stale flip applied during the drift-partition
         step.  Pass ``soft_stale_by_tier`` so the rebuilt registry seeds the stale
         partition BEFORE adding passing (active) keys.  Stale simhashes are also
@@ -872,7 +873,7 @@ class ConsolidationLoop:
                 keyed = [kp for kp in keyed if kp["key"] in passing]
 
             # Build the fresh registry:
-            # (a) seed stale records FIRST (B1 — must survive the rebuild);
+            # (a) seed stale records FIRST — they must survive the rebuild;
             # (b) then add passing active keys with their simhashes.
             # Simhashes are set directly on the registry; stale simhashes live
             # in _stale[key]["simhash"] already (carried by the stale records).
@@ -1708,7 +1709,7 @@ class ConsolidationLoop:
             # cycle_count is now managed by run_consolidation_cycle.
             # Propagate the episodic train loss from the cycle result dict.
             # Procedural facts ride the interim slot so their loss folds into
-            # episodic_train_loss; procedural_train_loss was removed in B5.
+            # episodic_train_loss (no separate procedural_train_loss field).
             _epi_loss = cycle_result.get("episodic_train_loss")
             if _epi_loss is not None:
                 result.episodic_train_loss = _epi_loss
@@ -2374,17 +2375,18 @@ class ConsolidationLoop:
            degenerated_skip)``.
         6. Handle control-flow branches: queue-only and degenerated-skip.
         7. Mint PEFT slot (train only).
-        8. Materialize (B1): call :meth:`_materialize_consolidation_graph` scoped
+        8. Materialize: call :meth:`_materialize_consolidation_graph` scoped
            to the current slot for the recall-miss diagnostic and to rebuild the
            keying surface (pending-session relations from ``merger.graph`` are
            passed as ``extra_relations`` so they survive the graph reset).
-        8c. Refine (B2): call :meth:`_refine_consolidation_graph` with
+        8c. Refine: call :meth:`_refine_consolidation_graph` with
            ``enrich=(interim_refinement=="full")`` so SOTA enrichment is
            level-gated.  The recurrence-bump runs at every level.
-        9. Build interim key list via graph-walk (B5: episodic + procedural entries).
-           Procedural entries ride the same interim slot as episodic (attn-only
-           config) between folds; the full fold retrain with procedural_config
-           (attn+MLP) is unchanged.
+        9. Build interim key list via graph-walk (episodic + procedural entries).
+           The interim slot holds BOTH factual (episodic) and preference
+           (procedural) keys, trained with the attention-only episodic adapter
+           config by design; procedural keys fold to the ``procedural`` main
+           adapter only at the full fold.
            When *new_promotions* is non-empty, move matching episodic keys to
            semantic before training.
         10. Train (train mode) or skip training (simulate mode).
@@ -2521,10 +2523,11 @@ class ConsolidationLoop:
             self._debug_writer.on_cycle_end(degenerated_summary, interim_stamp=stamp)
             return degenerated_summary
 
-        # W1: clear merger.graph at every exit that follows (success, aborted,
-        # exception propagation).  Early returns above (no-registry, no-relations,
-        # queued, degenerated) do not touch merger.graph so the reset there is a
-        # safe no-op.  A finally for cleanup re-raises unchanged — not suppression.
+        # Clear merger.graph at every exit that follows (success, aborted,
+        # exception propagation) so it never leaks into the next cycle.  Early
+        # returns above (no-registry, no-relations, queued, degenerated) do not
+        # touch merger.graph so the reset there is a safe no-op.  A finally for
+        # cleanup re-raises unchanged — not suppression.
         try:
             # --- End-of-extraction debug dump (per-tier relation lists) ---
             # Self-gated; no-op when save_cycle_snapshots=False.
@@ -2587,7 +2590,7 @@ class ConsolidationLoop:
                     # speaker_id: prefer the subject node's speaker_id attribute
                     # (set by _upsert_entity for speaker entities, where the node
                     # key IS the speaker_id).  Falls back to "" for non-speaker
-                    # subjects (B3 will improve this via entity re-merge).
+                    # subjects; falls back to "" for non-speaker subjects.
                     _er_subj_node = _g.nodes.get(_er_subj, {})
                     _er_spk = _er_subj_node.get("speaker_id", "")
                     _pending_relations.append(
@@ -2598,13 +2601,12 @@ class ConsolidationLoop:
                             relation_type=_er_rt,  # type: ignore[arg-type]
                             confidence=_er_data.get("confidence", 1.0),
                             speaker_id=_er_spk,
-                            # B7-A: recover the real contributing session ids
-                            # from the merger edge so they survive the re-merge
-                            # through _merge_registry_relations (T3).  The
-                            # merger already accumulated the UNION in
-                            # edge["sessions"] via T2; we carry them forward so
-                            # _build_all_edge_entries_into can expose them on
-                            # the deferred-write record (T5).
+                            # Recover the real contributing session ids from
+                            # the merger edge so they survive the re-merge
+                            # through _merge_registry_relations.  The merger
+                            # accumulated the UNION in edge["sessions"]; we
+                            # carry them forward so _build_all_edge_entries_into
+                            # can expose them on the deferred-write record.
                             session_ids=list(_er_data.get("sessions", [])),
                         )
                     )
@@ -2636,9 +2638,8 @@ class ConsolidationLoop:
                 enrich=(self.config.interim_refinement == "full"),
             )
 
-            # --- 9. Build keyed training set via graph-walk (B3) ---
-            # Replaces the flat _prepare_episodic_keys_for_tier probe path.  After
-            # _materialize_consolidation_graph (B1) + _refine_consolidation_graph (B2),
+            # --- 9. Build keyed training set via graph-walk ---
+            # After _materialize_consolidation_graph + _refine_consolidation_graph,
             # merger.graph holds: (a) registry-true re-merged keys (as keyed edges with
             # ik_key stamped) plus (b) the pending-session relations (as keyless edges).
             # _build_all_edge_entries_into handles both sets in one pass:
@@ -2647,12 +2648,12 @@ class ConsolidationLoop:
             #   - Keyed edges (existing): anti-forgetting replay entries sourced from
             #     the store — not registered as new.
             #
-            # Procedural handling (B5): tier_keyed["procedural"] is populated by the
-            # walk (procedural-typed keyless edges from proc_graph, which is now merged
-            # into merger.graph by extract_session / run_cycle).  Procedural entries
-            # ride the SAME interim slot (adapter_name) as episodic and are flushed
-            # together after recall-confirmed training.  _procedural_next_index is
-            # advanced in the deferred-flush block below, mirroring _indexed_next_index.
+            # tier_keyed["procedural"] is populated by the walk (procedural-typed
+            # keyless edges merged into merger.graph by extract_session / run_cycle).
+            # Procedural entries ride the SAME interim slot (adapter_name) as episodic
+            # and are flushed together after recall-confirmed training.
+            # _procedural_next_index is advanced in the deferred-flush block below,
+            # mirroring _indexed_next_index.
             if mode == "train":
                 switch_adapter(self.model, adapter_name)
             _tier_keyed: dict[str, list[dict]] = {"episodic": [], "procedural": [], "semantic": []}
@@ -2664,7 +2665,7 @@ class ConsolidationLoop:
             )
 
             # all_interim_keyed: episodic + procedural entries (new minted + existing keyed).
-            # Procedural entries ride the same interim slot as episodic (B5).
+            # Both fact types ride the same interim slot until the full fold.
             all_interim_keyed = _tier_keyed["episodic"] + _tier_keyed["procedural"]
 
             # new_keyed_interim: deferred writes for all minted entries in this interim slot.
@@ -2728,7 +2729,7 @@ class ConsolidationLoop:
                 ]
 
             # --- 10. Train (train mode) or skip (simulate) ---
-            # all_interim_keyed holds both episodic and procedural entries (B5).
+            # all_interim_keyed holds both episodic and procedural entries.
             # The interim adapter uses episodic_config (attn-only); procedural entries
             # ride the same slot between folds.  The full fold retrain with
             # procedural_config (attn+MLP) at consolidate_interim_adapters is unchanged.
@@ -2778,10 +2779,10 @@ class ConsolidationLoop:
             self.store.replace_simhashes_in_tier(adapter_name, build_registry(_passing_interim))
 
             # --- 11. Apply deferred interim store mutations (train mode) ---
-            # B7-B (T6): cycle-local set accumulates session ids whose contributed
-            # fact failed the recall gate.  Guarded to train mode: in simulate mode
-            # _epi_passing is None so the drop site is never reached.
-            # Simulate callsite (app.py:12499 B2) is explicitly NOT plumbed.
+            # A cycle-local set accumulates session ids whose contributed fact failed
+            # the recall gate.  Guarded to train mode: in simulate mode _epi_passing
+            # is None so the drop site is never reached.
+            # The simulate callsite is explicitly not plumbed for recall-failure tracking.
             #
             # new_keyed_interim carries both episodic-tier and procedural-tier harvest
             # records from _deferred_writes.  All writes go to adapter_name (the
@@ -2803,11 +2804,11 @@ class ConsolidationLoop:
                             " — skipping registration",
                             _key,
                         )
-                        # B7-B (T6): accumulate contributing session ids for this
-                        # recall-failed key so the caller can keep those sessions
-                        # pending.  rec["session_ids"] is populated by
-                        # _build_all_edge_entries_into (T5) from edge["sessions"]
-                        # with synthetic sentinels already excluded.
+                        # Accumulate contributing session ids for this recall-failed
+                        # key so the caller can keep those sessions pending.
+                        # rec["session_ids"] is populated by
+                        # _build_all_edge_entries_into from edge["sessions"] with
+                        # synthetic sentinels already excluded.
                         _recall_failed_session_ids.update(rec.get("session_ids", []))
                         continue
                     self.store.put(
@@ -2874,16 +2875,16 @@ class ConsolidationLoop:
                 "venue": mode,
                 "error": None,
                 "episodic_train_loss": epi_train_loss,
-                # B7-B (T8): contributing session ids whose new key failed the recall
-                # gate this cycle.  Callers use .get("recall_failed_session_ids", [])
-                # so early-return paths (aborted, no-relations, queued) that do not
+                # contributing session ids whose new key failed the recall gate this
+                # cycle.  Callers use .get("recall_failed_session_ids", []) so
+                # early-return paths (aborted, no-relations, queued) that do not
                 # run the recall gate are safe.  Simulate mode always produces [].
                 "recall_failed_session_ids": sorted(_recall_failed_session_ids),
             }
             self._debug_writer.on_cycle_end(cycle_summary, interim_stamp=stamp)
             return cycle_summary
         finally:
-            # W1: clear the keying graph so the next cycle starts empty.
+            # Clear the keying graph so the next cycle starts empty.
             # Also clears removal_ledger, collapsed, reinforcements.
             self.merger.reset_graph()
 
@@ -3282,8 +3283,9 @@ class ConsolidationLoop:
         # Reset the merger's keying surface so provenance keying is unconditional
         # (mirrors the train fold's reset_graph() call before re-merging registry
         # relations).
-        # W1: clear merger.graph at every exit (noop early-return and success).
-        # The finally re-raises unchanged — not error suppression.
+        # Clear merger.graph at every exit (noop early-return and success) so it
+        # never leaks into the next cycle.  The finally re-raises unchanged — not
+        # error suppression.
         try:
             self.merger.reset_graph()
 
@@ -3472,7 +3474,7 @@ class ConsolidationLoop:
                 "tier_delta": _sim_tier_delta,
             }
         finally:
-            # W1: clear the keying graph (removal_ledger, collapsed, reinforcements).
+            # Clear the keying graph (removal_ledger, collapsed, reinforcements).
             self.merger.reset_graph()
 
     def run_housekeeping(
@@ -3672,7 +3674,7 @@ class ConsolidationLoop:
         Both branches append to ``tier_keyed`` with the **identical shape**:
         ``{key, subject, predicate, object, speaker_id}``.  The deferred-write
         record additionally carries ``session_ids`` (real contributing session ids,
-        synthetic fold sentinels excluded — B7-A provenance plumbing).
+        synthetic fold sentinels excluded).
 
         The ``ik_key`` attribute is intentionally NOT stamped onto keyless edges
         (direct-append variant) to avoid the MultiDiGraph parallel-edge integer-key
@@ -3707,7 +3709,7 @@ class ConsolidationLoop:
               Each record has: ``"entry"``, ``"tier"``, ``"canon_subj"``,
               ``"canon_obj"``, ``"predicate"``, ``"relation_type"``, ``"speaker_id"``,
               ``"session_ids"`` (sorted list of real contributing session ids,
-              synthetic fold sentinels excluded — B7-A provenance plumbing).
+              synthetic fold sentinels excluded).
 
             Mutates *tier_keyed* in-place.  When ``defer=False``, also mutates
             the :class:`~paramem.memory.store.MemoryStore` and advances
@@ -3804,9 +3806,9 @@ class ConsolidationLoop:
 
                 entry = minted[0]
                 minted_key = entry["key"]
-                # B7-A: source the contributing session ids from the merged
-                # edge, excluding synthetic fold sentinels.  The result is a
-                # sorted list of REAL session ids that contributed this fact.
+                # Source the contributing session ids from the merged edge,
+                # excluding synthetic fold sentinels.  The result is a sorted
+                # list of real session ids that contributed this fact.
                 # This field is TRANSIENT — it rides the in-RAM record only;
                 # it is never written to the persisted entry dict (store.put)
                 # or to bookkeeping (store.set_bookkeeping).  The drop site
@@ -4539,7 +4541,7 @@ class ConsolidationLoop:
 
         Args:
             trainer: BackgroundTrainer instance (must be the one holding the GPU
-                lock via submit()).  Required for per-tier B2 re-arm pattern.
+                lock via submit()).  Required for the per-tier re-arm pattern.
             router: Router instance whose reload() is called at the end of the
                 atomic finalize sequence.  Optional — skipped when None.
             recall_sanity_threshold: Override for the minimum recall rate for the
@@ -4614,9 +4616,9 @@ class ConsolidationLoop:
         else:
             self._current_interim_stamp = None  # type: ignore[assignment]
 
-        # W1: clear merger.graph at every exit (accumulating early-return,
-        # rollback-raise, save-fail-raise, and normal success).  The finally
-        # re-raises unchanged — not error suppression.
+        # Clear merger.graph at every exit (accumulating early-return, rollback-raise,
+        # save-fail-raise, and normal success) so it never leaks into the next cycle.
+        # The finally re-raises unchanged — not error suppression.
         try:
             recall_miss_keys, recon_relations = self._materialize_consolidation_graph()
             self._refine_consolidation_graph(recon_relations)
@@ -5343,7 +5345,7 @@ class ConsolidationLoop:
                         tier,
                     )
 
-                # d. B2 re-arm: flip _is_training True BEFORE _train_adapter,
+                # d. Re-arm: flip _is_training True BEFORE _train_adapter,
                 #    False in finally so it fires on success AND failure.
                 #    Also swap _current_job to the per-tier job so that pause()
                 #    reads the correct inference_fallback_adapter (e.g.
@@ -5466,7 +5468,7 @@ class ConsolidationLoop:
                 # Reset each main tier's registry AND simhash to the post-consolidation
                 # membership (the pairing is load-bearing — see the helper's docstring).
                 # Thread soft_stale_by_tier so the rebuilt registry seeds the stale
-                # partition (B1 fix — a bare new KeyRegistry() would wipe it).
+                # partition — a bare new KeyRegistry() would wipe it.
                 self._reset_main_tier_registries_and_simhashes(
                     serve_assignment,
                     passing_sets_by_tier,
@@ -5527,7 +5529,7 @@ class ConsolidationLoop:
                 for _st_tier in ("episodic", "semantic", "procedural"):
                     # registry() always returns a real KeyRegistry when replay is
                     # enabled (registry-always-exists invariant; the None guard
-                    # was dead and is removed per plan F6).
+                    # was dead and is removed).
                     self.store.registry(_st_tier).increment_stale_cycles()
                 logger.debug(
                     "consolidate_interim_adapters: stale_cycles advanced for %d soft-staled key(s)",
@@ -5614,7 +5616,7 @@ class ConsolidationLoop:
                 "tier_delta": _train_tier_delta,
             }
         finally:
-            # W1: clear the keying graph (removal_ledger, collapsed, reinforcements).
+            # Clear the keying graph (removal_ledger, collapsed, reinforcements).
             self.merger.reset_graph()
 
     def _run_recall_sanity_probe(

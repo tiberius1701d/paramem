@@ -401,7 +401,7 @@ class StatusResponse(BaseModel):
     # session_buffer.get_summary()["per_source_type"].
     pending_documents: int = 0
     pending_transcripts: int = 0
-    # Auto-reclaim error tracking (D3). Populated when the in-process reclaim
+    # Auto-reclaim error tracking. Populated when the in-process reclaim
     # loop fails a tick; cleared on next successful reclaim. None means the last
     # reclaim completed cleanly (or none has run yet).
     # Shape: {"at": <iso8601>, "error": <str>, "attempt_count": <int>}
@@ -2028,7 +2028,7 @@ async def lifespan(app: FastAPI):
     # Config-derived component construction — single shared routine called by
     # BOTH the lifespan (here) and the live-apply path.  At boot the session
     # buffer is always rebuilt (rebuild_session_buffer=True, the default).
-    # Note: _apply_config_in_progress is not set here (boot path); the D6 gate
+    # Note: _apply_config_in_progress is not set here (boot path); the re-probe gate
     # inside the routine treats a None/absent store as cold and runs the probe.
     _build_config_derived_state(config, cloud_only=cloud_only)
 
@@ -4140,7 +4140,7 @@ async def status():
 
     # Derive last_consolidation_error and last_consolidation_result from durable
     # stores (incidents.json + run_status.json) rather than from RAM.  Both fields
-    # are computed once per /status poll; no RAM snapshot survives (DELTA 2).
+    # are computed once per /status poll; no RAM snapshot survives across restarts.
     _status_state_dir = (config.paths.data / "state").resolve()
     _consolidation_error, _consolidation_result = _derive_consolidation_status_fields(
         _status_state_dir
@@ -4833,7 +4833,7 @@ def _build_config_derived_state(
     5. ha_client (close old → construct new) + ha_graph
        — ``full_rebuild=True`` only.
     6. memory store preload (``_preload_memory_store``) → assign
-       ``_state["memory_store"]`` — always (D6 gate may skip probe on warm).
+       ``_state["memory_store"]`` — always (re-probe gate may skip probe on warm).
     7. router (captures memory_store + ha_graph)  — always.
     8. exemplar banks + ``set_classifier_model``
        — ``full_rebuild=True`` only for exemplar banks; ``set_classifier_model``
@@ -4860,7 +4860,7 @@ def _build_config_derived_state(
         When ``False`` (plain ``/gpu/acquire`` + auto-reclaim same config):
         skip the expensive, potentially network-touching steps (speaker_store,
         STT/TTS construction, sota_agent, ha_client reconnect, exemplar banks,
-        language_tracker).  Only steps 6 (memory-store probe, D6-gated) and 7
+        language_tracker).  Only steps 6 (memory-store probe, re-probe-gated) and 7
         (Router re-point) are run, plus ``set_classifier_model`` to register
         the freshly reloaded model handle (step 8 partial).  This avoids
         spurious STT/TTS ``load()`` calls and HA ``health_check()`` /
@@ -5080,7 +5080,7 @@ def _build_config_derived_state(
         )
 
     # ── 6. Memory store preload ───────────────────────────────────────────────
-    # D6 gate: re-probe only when (a) the cache is cold (boot_degraded set or
+    # Re-probe gate: re-probe only when (a) the cache is cold (boot_degraded set or
     # store is None/empty), or (b) called from the apply path (caller sets
     # _state["_apply_config_in_progress"] = True before calling this routine
     # and clears it after).  On a plain reclaim with a warm store, still
@@ -5102,7 +5102,7 @@ def _build_config_derived_state(
         # Warm store survives — keep it, just rebuild the Router below.
         logger.info(
             "_build_config_derived_state: warm store present (boot_degraded=None) — "
-            "skipping re-probe (D6 gate); rebuilding router only"
+            "skipping re-probe (re-probe gate); rebuilding router only"
         )
         memory_store = _state["memory_store"]
 
@@ -5366,7 +5366,7 @@ def _live_reload_base_model(
 
         - Model reload + ``set_classifier_model`` (to register the new handle).
         - ``_build_config_derived_state`` is called with ``full_rebuild=False``
-          (rebuilds memory-store probe [D6-gated] + Router re-point only).
+          (rebuilds memory-store probe [re-probe-gated] + Router re-point only).
           STT/TTS, HA reconnect, exemplar banks, and language_tracker are
           skipped — same config, no delta.
     rebuild_session_buffer:
@@ -5502,11 +5502,11 @@ def _live_reload_base_model(
 
     if refresh_config_from_disk:
         # Config-apply path: full component rebuild via the shared routine.
-        # Signal D6 gate that this is an apply (probe even when store is warm).
+        # Signal the re-probe gate that this is an apply (probe even when store is warm).
         _state["_apply_config_in_progress"] = True
         rebuild_failed = False
         try:
-            # S3: rebuild_session_buffer is threaded from _apply_config_live
+            # rebuild_session_buffer is threaded from _apply_config_live
             # (True when retain_sessions or debug changed between A and B).
             _build_config_derived_state(
                 config,
@@ -5541,13 +5541,13 @@ def _live_reload_base_model(
         logger.info("Live config apply — complete; mode=local")
     else:
         # Plain reclaim path (same config): rebuild Router + classifier handle.
-        # D6 gate: _build_config_derived_state skips the expensive weight-probe
+        # Re-probe gate: _build_config_derived_state skips the expensive weight-probe
         # when the store is warm (boot_degraded=None, memory_store non-None).
         # _apply_config_in_progress is NOT set here.
         rebuild_failed = False
         try:
-            # S1: full_rebuild=False — plain reclaim rebuilds only the memory
-            # store (D6-gated), Router (re-point at warm store), and
+            # full_rebuild=False — plain reclaim rebuilds only the memory
+            # store (re-probe-gated), Router (re-point at warm store), and
             # set_classifier_model (re-register the new model handle).
             # STT/TTS construction, HA reconnect, sota_agent, exemplar banks,
             # and language_tracker are skipped (same config, no delta).
@@ -6126,7 +6126,7 @@ def _apply_config_live() -> dict:
                     }
                 # Mixed delta: fall through to reload; carve signalled in return dict.
 
-        # ── S3: compute retain_sessions / debug delta → rebuild_session_buffer ─
+        # ── compute retain_sessions / debug delta → rebuild_session_buffer ─
         # Compare config A (in-memory, pre-apply) against config B (on-disk,
         # already loaded above).  If either field changed, the SessionBuffer must
         # be rebuilt so the new retention / debug semantics take effect.
@@ -6184,8 +6184,8 @@ async def _apply_config_live_guarded() -> dict:
     """Dispatch ``_apply_config_live`` under the synchronous maintenance guard.
 
     Sole owner of the guard+dispatch+restore pattern shared by the migration
-    accept, base-swap-rollback, and migration_rollback handlers (correction
-    S-4).  Sets the cloud-only guard (``mode="cloud-only"``,
+    accept, base-swap-rollback, and migration_rollback handlers.  Sets the
+    cloud-only guard (``mode="cloud-only"``,
     ``cloud_only_reason="live_reload"``) BEFORE dispatching so the scheduler's
     ``mode != "local"`` defer fires during the ~25-30 s GPU reload, runs
     ``_apply_config_live`` in an executor (it blocks), then restores the
@@ -6463,9 +6463,9 @@ async def speaker_forget(request: SpeakerForgetRequest):
     config = _state["config"]
     speaker_id = request.speaker_id
 
-    # W2: locate keys for this speaker via the registry bookkeeping (source of
-    # truth) rather than the resident merger.graph (which is now cleared at
-    # cycle-end per W1 and would be empty between cycles).
+    # Locate keys for this speaker via the registry bookkeeping (source of
+    # truth) rather than the resident merger.graph (which is cleared at
+    # cycle-end and would be empty between cycles).
     # NOTE: keys minted before dcf4189 carry speaker_id="" in bookkeeping
     # (the fix was not retroactive).  Those keys are a silent-miss here by
     # accepted design — the live setup is for debugging; legacy keys are not
@@ -8154,8 +8154,8 @@ async def _run_trial_consolidation() -> None:
                 ha_context = _state.get("ha_context")
                 speaker_store = _state.get("speaker_store")
 
-                # FIX 1: closure dict used by _run() to pass graph stash results
-                # back to the outer scope without changing _run()'s return type.
+                # Closure dict used by _run() to pass graph stash results back to
+                # the outer scope without changing _run()'s return type.
                 # Keys populated inside the gpu_lock_sync block (where GPU is held):
                 #   "pre_trial_graph_path"  — Path (simulate) or None
                 #   "pre_trial_graph"       — nx.MultiDiGraph (train) or None
@@ -8195,7 +8195,7 @@ async def _run_trial_consolidation() -> None:
                     _state["speaker_store"] = speaker_store
                     try:
                         with gpu_lock_sync():
-                            # FIX 1 — Pre-trial graph capture (train mode only).
+                            # Pre-trial graph capture (train mode only).
                             # In simulate mode the canonical episodic/graph.json on
                             # disk is the pre-trial artifact; migration_status reads it
                             # directly from the production loop's output_dir (unchanged).
@@ -8231,7 +8231,7 @@ async def _run_trial_consolidation() -> None:
                                 mark_sessions=False,
                             )
 
-                            # FIX 1 — Trial graph capture (after extraction completes).
+                            # Trial graph capture (after extraction completes).
                             # simulate: stash the newest interim-slot graph.json the
                             # trial just wrote (the fold writes to
                             # episodic/interim_<stamp>/graph.json, NOT the canonical
@@ -8331,8 +8331,8 @@ async def _run_trial_consolidation() -> None:
             if exc_captured is not None:
                 gates_payload["exception"] = str(exc_captured)  # backward-compat with 3b.3
 
-        # FIX 1: stash graph shape artifacts captured inside _run() (under the GPU
-        # lock) so migration_status can pass them to build_comparison_report.
+        # Stash graph shape artifacts captured inside _run() (under the GPU lock)
+        # so migration_status can pass them to build_comparison_report.
         # simulate → Path to the newest interim-slot graph.json (trial) and the
         #            canonical episodic/graph.json (pre_trial, read by migration_status
         #            directly from the production loop's output_dir — no stash needed).
@@ -9221,7 +9221,7 @@ async def _stash_trial_graph(
 
     Called from ``_run_trial_consolidation`` after the fold completes so that
     ``migration_status`` can pass them to ``build_comparison_report`` without
-    reading the in-memory merger graph (cleared by W1's finally block).
+    reading the in-memory merger graph (cleared at cycle-end by the finally block).
 
     Mirrors ``_update_trial_gates`` in structure; holds ``migration_lock``
     to avoid a race with ``/migration/cancel`` that could clear the trial stash
@@ -9303,7 +9303,7 @@ async def migration_status():
         and gates.get("status") in _ACCEPT_ELIGIBLE_STATUSES
         and gates.get("completed_at")
     ):
-        # FIX 1: Resolve graph shape from stashed artifacts.
+        # Resolve graph shape from stashed artifacts.
         #
         # Pre-trial simulate: canonical episodic/graph.json from the production
         # loop's output_dir (on disk before the trial ran).  Resolved here
@@ -10097,7 +10097,7 @@ async def migration_rollback():
         # and returns plaintext — then write plaintext to a .pending temp,
         # fsync, and atomic rename.  A raw os.rename of the artifact would
         # write ciphertext bytes into configs/server.yaml, causing
-        # yaml.safe_load to fail on the next server start (B6 — 2026-04-22).
+        # yaml.safe_load to fail on the next server start.
         # RuntimeError = daily identity not loaded; other exceptions surface
         # as a generic decrypt failure with the exception message included.
         try:
@@ -10912,7 +10912,7 @@ async def backup_restore(req: BackupRestoreRequest):
             },
         )
 
-    # Background trainer check (S3 from plan-review): a live BG trainer could
+    # Background trainer check: a live BG trainer could
     # call find_live_slot on the restored slot between the registry swap and the
     # server restart, stomping the restored weights with a checkpoint.
     _bg_trainer = _state.get("background_trainer")
@@ -11012,7 +11012,7 @@ async def backup_restore(req: BackupRestoreRequest):
                 },
             ) from exc
         except RestoreAbortedError as exc:
-            # S3: restore_bundle raises RestoreAbortedError when the atomic
+            # restore_bundle raises RestoreAbortedError when the atomic
             # write phase (step 5) fails after the safety bundle was already
             # captured (step 4).  Surface the safety_slot path so the operator
             # can recover without searching server logs.
@@ -11569,9 +11569,9 @@ def _maybe_trigger_scheduled_consolidation() -> str:
     # acceptable given the period is much longer than the cadence.
     if _is_full_cycle_due(config):
         logger.info("Scheduler tick: full cycle due — running consolidate_interim_adapters")
-        # S-2 / DELTA 4: do NOT clear last_consolidation_error here.  A failure
-        # row stays visible until the next op of that type SUCCEEDS (auto-resolved
-        # in the success paths below).  Clear-on-attempt hid still-failing conditions.
+        # Do NOT clear last_consolidation_error here.  A failure row stays visible
+        # until the next op of that type SUCCEEDS (auto-resolved in the success paths
+        # below).  Clear-on-attempt hid still-failing conditions.
         _state["consolidating"] = True
         event_loop = asyncio.get_running_loop()
         future = event_loop.run_in_executor(None, _run_full_consolidation_sync)
@@ -11734,7 +11734,7 @@ def _set_voice_pipeline_profile(
     Idempotent: returns immediately (DEBUG) when the current profile already
     matches ``profile``.
 
-    Atomic ordering (B2): construct/ensure NEW pair loaded → update
+    Atomic ordering: construct/ensure NEW pair loaded → update
     ``_state["voice_box"]`` and ``_state["stt"]``/``_state["tts_manager"]``
     mirrors → unload OLD GPU pair (only on gpu→cpu; CPU pair is never torn
     down).
@@ -11813,7 +11813,7 @@ def _set_voice_pipeline_profile(
             old_stt_gpu = _state.get("stt_gpu")
             old_tts_gpu = _state.get("tts_gpu")
 
-            # Atomic flip: box and mirrors point at CPU pair BEFORE unloading GPU pair (B2).
+            # Atomic flip: box and mirrors point at CPU pair BEFORE unloading GPU pair.
             _state["voice_box"] = {
                 "stt": _state.get("stt_cpu"),
                 "tts_manager": _state.get("tts_cpu"),
@@ -12021,7 +12021,7 @@ def _run_extraction_phase(
 
     Returns a result dict including the loop instance for reuse.
 
-    D2 classification: all class-1 mock sites (prevent real execution only;
+    Classification: all class-1 mock sites (prevent real execution only;
     ``_run_extraction_phase`` may close over ``_state`` directly).
     """
     import time
@@ -12117,10 +12117,9 @@ def _run_extraction_phase(
 
         for qa in episodic_rels:
             qa["speaker_id"] = session_speaker_id
-            # B7-A: stamp the real session id for uniform provenance plumbing
-            # (D2 symmetric threading, T9).  Retention machinery (keep-pending)
-            # is NOT wired here — the trial path runs mark_sessions=False so
-            # sessions cannot be lost regardless (U-D2 CLOSED).
+            # Stamp the real session id for uniform provenance plumbing.
+            # Retention machinery (keep-pending) is NOT wired here — the trial
+            # path runs mark_sessions=False so sessions cannot be lost regardless.
             qa["session_id"] = session_id
         for rel in procedural_rels:
             rel["speaker_id"] = session_speaker_id
@@ -12550,9 +12549,9 @@ def _extract_and_start_training():
                 return
             for qa in episodic_rels:
                 qa["speaker_id"] = session_speaker_id
-                # B7-A: stamp the real session id so provenance survives the
+                # Stamp the real session id so provenance survives the
                 # GraphMerger union into edge["sessions"].  Co-located with
-                # the speaker_id stamp (D2 symmetric plumbing, T9).
+                # the speaker_id stamp.
                 qa["session_id"] = session_id
             for rel in procedural_rels:
                 rel["speaker_id"] = session_speaker_id
@@ -12789,10 +12788,11 @@ def _extract_and_start_training():
             len(result.get("new_keys", [])),
         )
 
-        # B7-B (T10): keep recall-failed sessions pending + bounded retry.
+        # Keep recall-failed sessions pending with bounded retry.
         # In the SUCCESS path (cycle returned normally) — NOT inside the try that
-        # wraps run_consolidation_cycle (B3 constraint: crash ≠ recall failure).
-        # Simulate callsite (B2) never produces a non-empty failed set because
+        # wraps run_consolidation_cycle (crash ≠ recall failure — the failed-session
+        # set is populated only on a successful cycle return).
+        # The simulate callsite never produces a non-empty failed set because
         # _epi_passing is None in simulate mode, so this code is a no-op there.
         _cycle_failed_sids = result.get("recall_failed_session_ids", [])
         if _cycle_failed_sids:
@@ -12888,11 +12888,10 @@ def _extract_and_start_training():
                 _interim_state_dir = _state["config"].paths.data / "state"
                 resolve_incidents_by_type(_interim_state_dir, "training_crash")
                 resolve_incidents_by_type(_interim_state_dir, "vram_exhausted")
-                # S-4 conditional resolve (B7-B): resolve consolidation_recall_failure
-                # ONLY when ZERO keys failed this cycle.  When the failed set is
-                # non-empty, T10 has already recorded/bumped per-session incidents;
-                # resolving here would wipe the just-recorded incident from the
-                # same cycle — explicitly prohibited by the S-4 ordering rule.
+                # Resolve consolidation_recall_failure ONLY when ZERO keys failed
+                # this cycle.  When the failed set is non-empty, the bump-and-record
+                # block above already logged per-session incidents; resolving here
+                # would wipe the just-recorded incident from the same cycle.
                 if not result.get("recall_failed_session_ids", []):
                     resolve_incidents_by_type(_interim_state_dir, "consolidation_recall_failure")
             except Exception:
@@ -13237,9 +13236,9 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 resolve_incidents_by_type(_full_state_dir, "consolidation_crash")
                 resolve_incidents_by_type(_full_state_dir, "vram_exhausted")
                 resolve_incidents_by_type(_full_state_dir, "extraction_failed")
-                # S-4 conditional resolve (B7-B): full-cycle path mirrors the
-                # interim path — resolve consolidation_recall_failure only when
-                # the cycle returned zero recall-failed session ids.
+                # Full-cycle path mirrors the interim path — resolve
+                # consolidation_recall_failure only when the cycle returned zero
+                # recall-failed session ids.
                 if not result.get("recall_failed_session_ids", []):
                     resolve_incidents_by_type(_full_state_dir, "consolidation_recall_failure")
             except Exception:
@@ -13895,7 +13894,7 @@ async def _auto_reclaim_loop(interval_minutes: int = 10):
 def _restart_service():
     """Restart the systemd service for a clean process.
 
-    No longer called from auto-reclaim (D3: auto-reclaim now uses in-process
+    No longer called from auto-reclaim (auto-reclaim now uses in-process
     reload via ``_live_reload_base_model`` + ``_set_voice_pipeline_profile``).
     Still used by :func:`gpu_acquire` as a fallback when in-process reload
     fails, and is kept defined for future emergency use. Process-level death

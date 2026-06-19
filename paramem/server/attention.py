@@ -808,10 +808,10 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
     if usage is not None:
         disk_used = usage.total_bytes
         disk_cap = usage.cap_bytes
-        # B4 fix (2026-04-22 E2E baseline): when cap_bytes==0, compute_disk_usage
-        # returns pct_of_cap=0.0 and the old guard "usage.cap_bytes > 0" skipped
-        # the alert entirely.  cap=0 + any non-zero usage means the store is over
-        # capacity (infinite percent), so emit at level "failed".
+        # When cap_bytes==0, compute_disk_usage returns pct_of_cap=0.0 and the
+        # previous guard "usage.cap_bytes > 0" skipped the alert entirely.
+        # cap=0 + any non-zero usage means the store is over capacity (infinite
+        # percent), so emit at level "failed".
         if disk_cap == 0:
             pct = float("inf") if disk_used > 0 else 0.0
         else:

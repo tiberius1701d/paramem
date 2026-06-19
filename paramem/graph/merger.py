@@ -620,10 +620,10 @@ class GraphMerger:
             sessions = edge.get("sessions", [])
             if session_id not in sessions:
                 sessions.append(session_id)
-            # Union any per-relation session_ids carried on the Relation object
-            # (B7-A provenance plumbing).  These are the real contributing session
-            # ids stamped at the extraction point; the scalar session_id param may
-            # be a synthetic sentinel for fold/re-merge paths.
+            # Union any per-relation session_ids carried on the Relation object.
+            # These are the real contributing session ids stamped at the extraction
+            # point; the scalar session_id param may be a synthetic sentinel for
+            # fold/re-merge paths.
             for _sid in relation.session_ids:
                 if _sid not in sessions:
                     sessions.append(_sid)
@@ -838,9 +838,8 @@ class GraphMerger:
         # After contradiction cleanup or when no same-pred edge exists.
         # Stamp ik_key from relation.indexed_key when set (fold-only; None = no-op).
         # Union relation.session_ids into the initial sessions list so the real
-        # contributing session ids ride the edge from the first insertion
-        # (B7-A provenance plumbing; the scalar session_id may be a synthetic
-        # sentinel for fold/re-merge paths).
+        # contributing session ids ride the edge from the first insertion.
+        # The scalar session_id may be a synthetic sentinel for fold/re-merge paths.
         _initial_sessions: list[str] = [session_id]
         for _sid in relation.session_ids:
             if _sid not in _initial_sessions:

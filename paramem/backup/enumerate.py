@@ -6,8 +6,8 @@ Public surface
   ``data/ha/backups/``, skip ``.pending/`` residue, return newest-first list
   of ``BackupRecord`` instances.
 
-Bundle-aware enumeration (B2 fix)
------------------------------------
+Bundle-aware enumeration
+------------------------
 Bundle slots (``snapshot_bundle`` kind) store a ``bundle.meta.json`` top-level
 manifest instead of the per-artifact ``<kind>-<ts>.meta.json`` sidecar that
 ``read_meta`` expects.  ``enumerate_backups`` detects the presence of
@@ -182,7 +182,7 @@ def enumerate_backups(
 
     Bundle-aware: slot directories containing ``bundle.meta.json`` are
     detected **before** ``read_meta`` is called, so bundle slots are never
-    mis-classified as invalid per-artifact slots (B2 fix from plan-review).
+    mis-classified as invalid per-artifact slots.
 
     Parameters
     ----------
@@ -232,7 +232,7 @@ def enumerate_backups(
                 logger.warning("enumerate_backups: skipping symlink %s", slot)
                 continue
 
-            # B2 fix: detect bundle slots BEFORE calling read_meta.
+            # Detect bundle slots BEFORE calling read_meta.
             # bundle.meta.json is the index for snapshot_bundle slots; calling
             # read_meta on a bundle slot would fail because there is no
             # per-artifact .meta.json sidecar.

@@ -679,7 +679,7 @@ class SessionBuffer:
         set so ``_completed_session_ids()`` retires them on the current cycle
         (they are "un-pinned").  A WARNING is logged for each released session.
         The corresponding incident is recorded by the caller (not here) so the
-        caller owns the per-session ``key`` for S-3 dedup.
+        caller owns the per-session ``key`` for dedup.
 
         Session ids absent from :attr:`_sessions` are silently skipped (R3
         guard: synthetic-id leakage protection — synthetic ids are never
