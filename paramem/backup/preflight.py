@@ -58,7 +58,8 @@ def compute_pre_flight_check(
     Steps
     -----
     1. ``estimate = len(live_config_path.read_bytes()) if exists else 0``
-       ``       + len(loop.merger.save_bytes()) if loop and hasattr(loop, "merger") else 0``
+       ``       + len(read_maybe_encrypted(loop.output_dir / "episodic" / "graph.json"))``
+       ``         if loop and loop.output_dir/episodic/graph.json exists else 0``
        ``       + len(registry_path.read_bytes())``
        ``         if registry_path and registry_path.exists() else 0``
     2. ``usage = compute_disk_usage(backups_root, server_config.security.backups)``
@@ -74,8 +75,11 @@ def compute_pre_flight_check(
         ``ServerConfig`` providing backups config and cap.  The
         ``security.backups`` sub-config is used directly.
     loop:
-        ``ConsolidationLoop`` instance for graph access.  ``None`` when the
-        server is in cloud-only mode; the graph contribution is then 0.
+        ``ConsolidationLoop`` instance for graph path access (``loop.output_dir``).
+        ``None`` when the server is in cloud-only mode; the graph contribution
+        is then 0.  Graph bytes are sourced from the persisted on-disk file
+        ``loop.output_dir / "episodic" / "graph.json"`` (not from the
+        in-memory ``merger.graph``, which is empty between cycles after W1).
     backups_root:
         Root of the backup store (e.g. ``data/ha/backups/``).
     live_config_path:
@@ -100,14 +104,13 @@ def compute_pre_flight_check(
       counted as 0 bytes for that component.  The preview must not crash on a
       transient read error — the estimate is a heuristic, not an authoritative
       size.
-    - Graph bytes from ``loop.merger.save_bytes()`` may be expensive on very
-      large graphs; acceptable because preview is operator-driven (not polled).
-
-    .. todo:: compute_pre_flight_check re-serializes loop.merger.graph every
-       /status poll (via _collect_pre_flight_items). Acceptable today
-       (STAGING/TRIAL suppression covers the hot path; graph sizes modest),
-       but if graph grows or poll rate increases, wrap this helper in a 5s TTL
-       cache parallel to compute_disk_usage.
+    - Graph bytes are read from the persisted ``episodic/graph.json`` file
+      (W2: ``loop.merger.graph`` is cleared at cycle-end; re-serializing it
+      would always yield an empty-graph estimate).  Reading the on-disk file
+      also reflects what the actual backup would capture.
+    - Any I/O error inside the estimate loop is swallowed (logged WARN) and
+      counted as 0 bytes for that component (accepted — heuristic, not
+      authoritative).
     """
     from paramem.backup.encryption import read_maybe_encrypted
     from paramem.backup.retention import compute_disk_usage
@@ -148,18 +151,20 @@ def compute_pre_flight_check(
     except (OSError, Exception) as exc:  # noqa: BLE001
         logger.warning("compute_pre_flight_check: could not read live config for estimate: %s", exc)
 
-    # Graph contribution (loop.merger.save_bytes()).
-    # TODO: compute_pre_flight_check re-serializes loop.merger.graph every /status
-    # poll. Acceptable today (STAGING/TRIAL suppression covers the hot path; graph
-    # sizes modest), but if graph grows or poll rate increases, wrap this helper in
-    # a 5s TTL cache parallel to compute_disk_usage.
-    if loop is not None and hasattr(loop, "merger"):
+    # Graph contribution: read the canonical episodic/graph.json on disk.
+    # W2: merger.graph is cleared at cycle-end (W1 finally block), so calling
+    # save_bytes() on it would re-serialize an empty graph and underestimate.
+    # The on-disk file is the durable artifact that the backup itself would
+    # capture, so reading it is both correct and avoids a re-serialization.
+    if loop is not None and hasattr(loop, "output_dir"):
         try:
-            graph_bytes = loop.merger.save_bytes()
-            estimate_bytes += len(graph_bytes)
+            _graph_path = Path(getattr(loop, "output_dir")) / "episodic" / "graph.json"
+            if _graph_path.exists():
+                estimate_bytes += len(read_maybe_encrypted(_graph_path))
         except Exception as exc:
             logger.warning(
-                "compute_pre_flight_check: could not get graph bytes for estimate: %s", exc
+                "compute_pre_flight_check: could not read episodic graph.json for estimate: %s",
+                exc,
             )
 
     # Registry contribution.  See note above on decrypted-length choice.

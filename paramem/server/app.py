@@ -6404,9 +6404,10 @@ async def speaker_forget(request: SpeakerForgetRequest):
 
     Steps
     -----
-    1. **Locate the speaker's indexed-memory keys** via
-       :func:`~paramem.memory.persistence.keys_for_speaker` on the live merged
-       graph held by the :class:`~paramem.training.consolidation.ConsolidationLoop`.
+    1. **Locate the speaker's indexed-memory keys** via the registry bookkeeping
+       (``store.iter_bookkeeping()``), which is the source of truth for
+       speaker→key and is available between cycles (unlike the transient merged
+       graph, which is cleared at cycle-end).
 
     2. **Remove keys from every per-tier KeyRegistry** — both in-memory (so
        keyed recall no longer serves them) and on disk (so the next restart
@@ -6438,8 +6439,6 @@ async def speaker_forget(request: SpeakerForgetRequest):
     scope for this revision.  Extend ``SpeakerForgetRequest.strategy`` and add
     a handler branch here when that strategy is needed.
     """
-    from paramem.memory.persistence import keys_for_speaker as _keys_for_speaker
-
     if request.strategy != "mark_stale":
         raise HTTPException(
             status_code=400,
@@ -6464,9 +6463,18 @@ async def speaker_forget(request: SpeakerForgetRequest):
     config = _state["config"]
     speaker_id = request.speaker_id
 
-    # Locate keys for this speaker via the live merged graph.
-    graph = loop.merger.graph
-    keys: set[str] = _keys_for_speaker(graph, speaker_id)
+    # W2: locate keys for this speaker via the registry bookkeeping (source of
+    # truth) rather than the resident merger.graph (which is now cleared at
+    # cycle-end per W1 and would be empty between cycles).
+    # NOTE: keys minted before dcf4189 carry speaker_id="" in bookkeeping
+    # (the fix was not retroactive).  Those keys are a silent-miss here by
+    # accepted design — the live setup is for debugging; legacy keys are not
+    # preserved (per OWNER DECISION 2026-06-18).
+    keys: set[str] = {
+        key
+        for key, record in loop.store.iter_bookkeeping()
+        if record.get("speaker_id") == speaker_id
+    }
     stale_keys: list[str] = sorted(keys)
 
     # Remove keys from every per-tier KeyRegistry (in-memory + disk).
@@ -8146,6 +8154,15 @@ async def _run_trial_consolidation() -> None:
                 ha_context = _state.get("ha_context")
                 speaker_store = _state.get("speaker_store")
 
+                # FIX 1: closure dict used by _run() to pass graph stash results
+                # back to the outer scope without changing _run()'s return type.
+                # Keys populated inside the gpu_lock_sync block (where GPU is held):
+                #   "pre_trial_graph_path"  — Path (simulate) or None
+                #   "pre_trial_graph"       — nx.MultiDiGraph (train) or None
+                #   "trial_graph_path"      — Path (simulate) or None
+                #   "trial_graph"           — nx.MultiDiGraph (train) or None
+                _graph_stash: dict = {}
+
                 def _run():
                     # Temporarily override _state for the trial context so that
                     # _run_extraction_phase reads the trial config and the live
@@ -8178,12 +8195,76 @@ async def _run_trial_consolidation() -> None:
                     _state["speaker_store"] = speaker_store
                     try:
                         with gpu_lock_sync():
+                            # FIX 1 — Pre-trial graph capture (train mode only).
+                            # In simulate mode the canonical episodic/graph.json on
+                            # disk is the pre-trial artifact; migration_status reads it
+                            # directly from the production loop's output_dir (unchanged).
+                            # In train mode there is no canonical file, so we reconstruct
+                            # the graph from adapter weights BEFORE the trial extraction
+                            # mutates the adapter state.  This call needs the GPU lock —
+                            # reconstruct_graph calls model.generate(); do NOT move it
+                            # outside this block or into the async GET handler.
+                            _trial_mode = trial_config.consolidation.mode
+                            if _trial_mode != "simulate":
+                                from paramem.graph.reconstruct import reconstruct_graph
+
+                                _prod_loop = _state.get("consolidation_loop")
+                                if _prod_loop is not None:
+                                    try:
+                                        _pre_result = reconstruct_graph(
+                                            _prod_loop,
+                                            tier="episodic",
+                                            strict=False,
+                                        )
+                                        _graph_stash["pre_trial_graph"] = _pre_result.graph
+                                    except Exception as _rg_exc:  # noqa: BLE001
+                                        logger.warning(
+                                            "trial: pre_trial graph reconstruct failed"
+                                            " (non-fatal, report row will show —): %s",
+                                            _rg_exc,
+                                        )
+
                             # Trial path: mark_sessions=False so sessions stay
                             # pending (spec L364) and /migration/rollback can restore queue.
-                            return _run_extraction_phase(
+                            _extraction_result = _run_extraction_phase(
                                 loop,
                                 mark_sessions=False,
                             )
+
+                            # FIX 1 — Trial graph capture (after extraction completes).
+                            # simulate: stash the newest interim-slot graph.json the
+                            # trial just wrote (the fold writes to
+                            # episodic/interim_<stamp>/graph.json, NOT the canonical
+                            # episodic/graph.json).
+                            # train: reconstruct the trial loop's adapter weights.
+                            if _trial_mode == "simulate":
+                                from paramem.memory.interim_adapter import iter_interim_dirs
+
+                                _loop_out = getattr(loop, "output_dir", None)
+                                if _loop_out is not None:
+                                    _slots = list(iter_interim_dirs(Path(_loop_out)))
+                                    if _slots:
+                                        # Newest slot last (iter_interim_dirs sorts by stamp).
+                                        _newest_path = _slots[-1][1] / "graph.json"
+                                        _graph_stash["trial_graph_path"] = _newest_path
+                            else:
+                                from paramem.graph.reconstruct import reconstruct_graph
+
+                                try:
+                                    _trial_result = reconstruct_graph(
+                                        loop,
+                                        tier="episodic",
+                                        strict=False,
+                                    )
+                                    _graph_stash["trial_graph"] = _trial_result.graph
+                                except Exception as _rg_exc2:  # noqa: BLE001
+                                    logger.warning(
+                                        "trial: trial graph reconstruct failed"
+                                        " (non-fatal, report row will show —): %s",
+                                        _rg_exc2,
+                                    )
+
+                            return _extraction_result
                     finally:
                         _state["config"] = prior_config
                         _state["ha_client"] = prior_ha_client
@@ -8250,12 +8331,20 @@ async def _run_trial_consolidation() -> None:
             if exc_captured is not None:
                 gates_payload["exception"] = str(exc_captured)  # backward-compat with 3b.3
 
-        # Stash the trial loop's in-memory graph so migration_status can pass
-        # it directly to build_comparison_report without requiring a file on disk.
+        # FIX 1: stash graph shape artifacts captured inside _run() (under the GPU
+        # lock) so migration_status can pass them to build_comparison_report.
+        # simulate → Path to the newest interim-slot graph.json (trial) and the
+        #            canonical episodic/graph.json (pre_trial, read by migration_status
+        #            directly from the production loop's output_dir — no stash needed).
+        # train   → in-memory nx.MultiDiGraph from reconstruct_graph (both sides).
+        # _stash_trial_graph writes "trial_graph_path" or "trial_graph" to the stash;
+        # migration_status reads both and passes whichever is set to build_comparison_report.
         if not session_buffer_empty and "loop" in locals() and loop is not None:
-            _trial_graph_obj = getattr(getattr(loop, "merger", None), "graph", None)
-            if _trial_graph_obj is not None:
-                await _stash_trial_graph(_trial_graph_obj)
+            await _stash_trial_graph(
+                trial_graph_path=_graph_stash.get("trial_graph_path"),
+                trial_graph=_graph_stash.get("trial_graph"),
+                pre_trial_graph=_graph_stash.get("pre_trial_graph"),
+            )
 
         await _update_trial_gates(gates_payload)
         logger.info("trial consolidation complete: status=%s", overall_status)
@@ -9122,11 +9211,18 @@ async def _update_trial_gates(gates: dict) -> None:
         trial["gates"] = gates
 
 
-async def _stash_trial_graph(graph: object) -> None:
-    """Store the trial loop's in-memory merger graph on the trial stash.
+async def _stash_trial_graph(
+    *,
+    trial_graph_path: "Path | None",
+    trial_graph: "object | None",
+    pre_trial_graph: "object | None",
+) -> None:
+    """Store graph shape artifacts on the trial stash for the comparison report.
 
     Called from ``_run_trial_consolidation`` after the fold completes so that
-    ``migration_status`` can read the graph without requiring a file on disk.
+    ``migration_status`` can pass them to ``build_comparison_report`` without
+    reading the in-memory merger graph (cleared by W1's finally block).
+
     Mirrors ``_update_trial_gates`` in structure; holds ``migration_lock``
     to avoid a race with ``/migration/cancel`` that could clear the trial stash
     between the fold completing and this write.
@@ -9136,8 +9232,20 @@ async def _stash_trial_graph(graph: object) -> None:
 
     Parameters
     ----------
-    graph:
-        ``nx.MultiDiGraph`` from ``loop.merger.graph`` after the trial fold.
+    trial_graph_path:
+        ``Path`` to the newest interim-slot ``graph.json`` written by the
+        simulate fold.  ``None`` when the fold ran in train mode or produced
+        no interim slots.
+    trial_graph:
+        In-memory ``nx.MultiDiGraph`` reconstructed from the trial adapter
+        weights (train mode).  ``None`` in simulate mode or on reconstruct
+        failure.
+    pre_trial_graph:
+        In-memory ``nx.MultiDiGraph`` reconstructed from the production
+        adapter weights before the trial ran (train mode).  ``None`` in
+        simulate mode (the production ``episodic/graph.json`` is used instead,
+        resolved directly by ``migration_status`` from the production loop's
+        ``output_dir``).
     """
     lock: asyncio.Lock = _state.get("migration_lock") or asyncio.Lock()
     async with lock:
@@ -9147,7 +9255,11 @@ async def _stash_trial_graph(graph: object) -> None:
         trial = migration.get("trial")
         if trial is None:
             return
-        trial["trial_graph_obj"] = graph
+        # Store whatever was captured; migration_status reads each key
+        # independently and falls back to None (→ "—" in the report row).
+        trial["trial_graph_path"] = trial_graph_path
+        trial["trial_graph"] = trial_graph
+        trial["pre_trial_graph"] = pre_trial_graph
 
 
 # Accept-eligible gate statuses (set membership for forward-compat).
@@ -9191,25 +9303,37 @@ async def migration_status():
         and gates.get("status") in _ACCEPT_ELIGIBLE_STATUSES
         and gates.get("completed_at")
     ):
-        # Resolve graph objects from state.
-        # Pre-trial: in-memory merger graph from the production loop (RAM-only).
-        # No file-based fallback — the graph is never persisted to disk in the
-        # production server; the file path construction was dead (no producer).
-        pre_trial_graph = None
-        _loop_obj = _state.get("consolidation_loop")
-        if _loop_obj is not None:
-            _merger = getattr(_loop_obj, "merger", None)
-            if _merger is not None:
-                pre_trial_graph = getattr(_merger, "graph", None)
+        # FIX 1: Resolve graph shape from stashed artifacts.
+        #
+        # Pre-trial simulate: canonical episodic/graph.json from the production
+        # loop's output_dir (on disk before the trial ran).  Resolved here
+        # without GPU access — the file already exists.
+        # Pre-trial train: in-memory graph reconstructed before extraction ran
+        # (captured proactively under the GPU lock in _run_trial_consolidation).
+        #
+        # Trial simulate: Path to the newest interim-slot graph.json the trial
+        # wrote (episodic/interim_<stamp>/graph.json), stashed by _stash_trial_graph.
+        # Trial train: in-memory graph reconstructed from trial adapter weights,
+        # stashed by _stash_trial_graph.
+        #
+        # _summarise_graph returns "—" gracefully for any None/absent value.
+        pre_trial_graph_path: Path | None = None
+        pre_trial_graph: object | None = trial.get("pre_trial_graph")
+        if pre_trial_graph is None:
+            # simulate mode: read from the canonical on-disk file.
+            _loop_obj = _state.get("consolidation_loop")
+            if _loop_obj is not None:
+                _out_dir = getattr(_loop_obj, "output_dir", None)
+                if _out_dir is not None:
+                    pre_trial_graph_path = Path(_out_dir) / "episodic" / "graph.json"
 
-        # Trial graph: read from the stash set by _run_trial_consolidation
-        # (_stash_trial_graph stores the in-memory merger graph after the fold).
-        trial_graph = trial.get("trial_graph_obj")
+        trial_graph_path: Path | None = trial.get("trial_graph_path")
+        trial_graph: object | None = trial.get("trial_graph")
 
         comparison_report = build_comparison_report(
             gates=gates,
-            pre_trial_graph_path=None,
-            trial_graph_path=None,
+            pre_trial_graph_path=pre_trial_graph_path,
+            trial_graph_path=trial_graph_path,
             pre_trial_graph=pre_trial_graph,
             trial_graph=trial_graph,
         )
@@ -9473,8 +9597,10 @@ async def migration_accept():
 
         # --- Step 4: Move trial adapter into the rotation slot; delete trial graph dir ---
         # Non-fatal: config + marker are already coherent. Rotation is cosmetic.
-        # The trial graph is RAM-only (stashed in _state["migration"]["trial"]
-        # as "trial_graph_obj" by _stash_trial_graph); no file was written.
+        # The trial graph path is stashed in _state["migration"]["trial"]["trial_graph_path"]
+        # by _stash_trial_graph; the file (episodic/interim_<stamp>/graph.json in simulate
+        # mode; a reconstructed in-memory graph in train mode) lives inside
+        # trial_adapter_dir which is moved/deleted below.
         # The trial_graph dir (if it exists) is deleted unconditionally as
         # cleanup; it is empty by design.
         rotation_incomplete = False
@@ -12843,14 +12969,14 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # Mode dispatch: simulate mode has no PEFT interim adapters —
         # calling consolidate_interim_adapters would trigger
         # delete_adapter / create_adapter on a non-existent slot.
-        # Simulate mode uses consolidate_interim_graphs instead, which
+        # Simulate mode uses consolidate_interim_to_canonical_graph instead, which
         # merges the per-cycle graph.json sidecars into the canonical
         # main-tier graph without touching PEFT weights.
         _mode = config.consolidation.mode
         try:
             if housekeeping:
                 # run_housekeeping dispatches to the mode-correct underlying method
-                # (consolidate_interim_graphs for simulate, consolidate_interim_adapters
+                # (consolidate_interim_to_canonical_graph for simulate, consolidate_interim_adapters
                 # for train) with housekeeping=True so gate (d) is bypassed.
                 result = loop.run_housekeeping(
                     trainer=bt,
@@ -12858,7 +12984,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                     mode=_mode,
                 )
             elif _mode == "simulate":
-                result = loop.consolidate_interim_graphs()
+                result = loop.consolidate_interim_to_canonical_graph()
             else:
                 result = loop.consolidate_interim_adapters(
                     trainer=bt,

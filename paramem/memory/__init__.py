@@ -42,7 +42,6 @@ from paramem.memory.persistence import (
     entry_by_key,
     iter_entries,
     keys_for_entity,
-    keys_for_speaker,
     load_memory_from_disk,
     save_memory_to_disk,
 )
@@ -75,7 +74,6 @@ __all__ = [
     "iter_entries",
     "iter_interim_dirs",
     "keys_for_entity",
-    "keys_for_speaker",
     "load_memory_from_disk",
     "load_registry",
     "parse_recalled_entry",

@@ -331,7 +331,7 @@ class TestRunFullConsolidationSyncHousekeeping:
         self, monkeypatch, tmp_path
     ) -> None:
         """_run_full_consolidation_sync(housekeeping=True) calls run_housekeeping, not
-        consolidate_interim_adapters or consolidate_interim_graphs directly."""
+        consolidate_interim_adapters or consolidate_interim_to_canonical_graph directly."""
 
         state = _make_hk_state(consolidation_mode="train", tmp_path=tmp_path)
         state["consolidation_loop"].store.replay_enabled = False
@@ -349,7 +349,7 @@ class TestRunFullConsolidationSyncHousekeeping:
         # class (missing mode= on run_housekeeping) is caught at this seam.
         mock_loop.run_housekeeping.assert_called_once_with(trainer=ANY, router=ANY, mode="train")
         mock_loop.consolidate_interim_adapters.assert_not_called()
-        mock_loop.consolidate_interim_graphs.assert_not_called()
+        mock_loop.consolidate_interim_to_canonical_graph.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -502,10 +502,10 @@ class TestRunHousekeepingModeParam:
 
     These tests pin the contract that the live train-mode housekeeping run requires:
     - ``mode="train"`` routes to ``consolidate_interim_adapters(housekeeping=True, ...)``.
-    - ``mode="simulate"`` routes to ``consolidate_interim_graphs(housekeeping=True)``.
+    - ``mode="simulate"`` routes to ``consolidate_interim_to_canonical_graph(housekeeping=True)``.
     - Default (no mode arg) routes to simulate — safe when no GPU is available.
 
-    Both ``consolidate_interim_adapters`` and ``consolidate_interim_graphs`` are
+    Both ``consolidate_interim_adapters`` and ``consolidate_interim_to_canonical_graph`` are
     replaced by MagicMocks so no GPU or real training is required.
     """
 
@@ -529,7 +529,7 @@ class TestRunHousekeepingModeParam:
                 "tier_delta": {},
             }
         )
-        loop.consolidate_interim_graphs = MagicMock(
+        loop.consolidate_interim_to_canonical_graph = MagicMock(
             return_value={
                 "tiers_rebuilt": [],
                 "graph_drift_count": 0,
@@ -548,7 +548,7 @@ class TestRunHousekeepingModeParam:
     def test_train_mode_dispatches_to_consolidate_interim_adapters(self, tmp_path) -> None:
         """mode="train" calls consolidate_interim_adapters with housekeeping=True.
 
-        The simulate branch (consolidate_interim_graphs) must NOT be called.
+        The simulate branch (consolidate_interim_to_canonical_graph) must NOT be called.
         """
         loop = self._make_bare_loop(tmp_path)
 
@@ -570,10 +570,12 @@ class TestRunHousekeepingModeParam:
             "train mode: consolidate_interim_adapters must receive window_stamp_override; "
             f"actual kwargs: {kwargs}"
         )
-        loop.consolidate_interim_graphs.assert_not_called()
+        loop.consolidate_interim_to_canonical_graph.assert_not_called()
 
-    def test_simulate_mode_dispatches_to_consolidate_interim_graphs(self, tmp_path) -> None:
-        """mode="simulate" calls consolidate_interim_graphs(housekeeping=True).
+    def test_simulate_mode_dispatches_to_consolidate_interim_to_canonical_graph(
+        self, tmp_path
+    ) -> None:
+        """mode="simulate" calls consolidate_interim_to_canonical_graph(housekeeping=True).
 
         The train branch (consolidate_interim_adapters) must NOT be called.
         """
@@ -581,7 +583,7 @@ class TestRunHousekeepingModeParam:
 
         loop.run_housekeeping(mode="simulate")
 
-        loop.consolidate_interim_graphs.assert_called_once_with(housekeeping=True)
+        loop.consolidate_interim_to_canonical_graph.assert_called_once_with(housekeeping=True)
         loop.consolidate_interim_adapters.assert_not_called()
 
     def test_default_mode_is_simulate(self, tmp_path) -> None:
@@ -594,5 +596,5 @@ class TestRunHousekeepingModeParam:
 
         loop.run_housekeeping()  # no mode arg
 
-        loop.consolidate_interim_graphs.assert_called_once_with(housekeeping=True)
+        loop.consolidate_interim_to_canonical_graph.assert_called_once_with(housekeeping=True)
         loop.consolidate_interim_adapters.assert_not_called()

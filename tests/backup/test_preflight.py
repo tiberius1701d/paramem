@@ -5,7 +5,7 @@ Tests cover:
 - Over-cap → disk_pressure
 - Cloud-only (loop=None) → graph contribution = 0
 - Missing registry file → registry contribution = 0
-- I/O errors swallowed (PermissionError) → valid result without crash
+- I/O errors swallowed (PermissionError or graph.json read error) → valid result without crash
 """
 
 from __future__ import annotations
@@ -44,11 +44,23 @@ def _make_config(tmp_path: Path, max_total_disk_gb: float = 1.0) -> ServerConfig
     return config
 
 
-def _make_loop(graph_bytes: bytes = b"{}") -> MagicMock:
-    """Return a mock ConsolidationLoop with a merger that saves bytes."""
+def _make_loop(graph_bytes: bytes, tmp_path: Path) -> MagicMock:
+    """Return a mock ConsolidationLoop with output_dir set and episodic/graph.json on disk.
+
+    W2.3: preflight reads the on-disk ``output_dir/episodic/graph.json`` via
+    ``read_maybe_encrypted`` rather than calling ``loop.merger.save_bytes()``
+    (which serialises an empty in-memory graph after W1's cycle-end reset).
+    The test fixture writes ``graph_bytes`` to the file so the preflight
+    estimate equals ``len(graph_bytes)`` for the graph contribution.
+
+    The assertion in each test must match ``len(graph_bytes)`` (the on-disk
+    length returned by ``read_maybe_encrypted``), NOT ``loop.merger.save_bytes()``.
+    """
     loop = MagicMock()
-    loop.merger = MagicMock()
-    loop.merger.save_bytes.return_value = graph_bytes
+    graph_path = tmp_path / "episodic" / "graph.json"
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_path.write_bytes(graph_bytes)
+    loop.output_dir = str(tmp_path)
     return loop
 
 
@@ -69,7 +81,7 @@ class TestPreFlightPassCleanStore:
 
         result = compute_pre_flight_check(
             server_config=config,
-            loop=_make_loop(b"{}"),
+            loop=_make_loop(b"{}", tmp_path),
             backups_root=backups_root,
             live_config_path=live_config,
             registry_path=None,
@@ -167,13 +179,15 @@ class TestPreFlightNoRegistryFile:
 
         result = compute_pre_flight_check(
             server_config=config,
-            loop=_make_loop(b"graph_bytes"),
+            loop=_make_loop(b"graph_bytes", tmp_path),
             backups_root=backups_root,
             live_config_path=live_config,
             registry_path=missing_registry,
         )
 
-        # estimate = config_bytes + graph_bytes + 0 (missing registry)
+        # estimate = config_bytes + on-disk graph_bytes + 0 (missing registry).
+        # _make_loop writes graph_bytes to output_dir/episodic/graph.json;
+        # read_maybe_encrypted returns exactly those bytes.
         expected = len(b"model: mistral\n") + len(b"graph_bytes")
         assert result.estimate_bytes == expected
         assert result.fail_code is None
@@ -186,7 +200,7 @@ class TestPreFlightNoRegistryFile:
 
 class TestPreFlightSwallowsReadErrors:
     def test_preflight_swallows_permission_error_on_config(self, tmp_path: Path) -> None:
-        """PermissionError reading live config → counted as 0 bytes; no crash."""
+        """PermissionError reading live config → counted as 0 bytes; graph still counted."""
         config = _make_config(tmp_path, max_total_disk_gb=10.0)
         backups_root = tmp_path / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -194,7 +208,12 @@ class TestPreFlightSwallowsReadErrors:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
 
-        # Simulate PermissionError on read_bytes for the config path.
+        # Use a separate subdirectory for the loop so _patched_read_bytes can
+        # distinguish the config path from the graph.json path.
+        loop_dir = tmp_path / "loop_dir"
+        loop = _make_loop(b"graph", loop_dir)
+
+        # Simulate PermissionError on read_bytes ONLY for the config path.
         original_read_bytes = Path.read_bytes
 
         def _patched_read_bytes(self):
@@ -205,7 +224,7 @@ class TestPreFlightSwallowsReadErrors:
         with patch.object(Path, "read_bytes", _patched_read_bytes):
             result = compute_pre_flight_check(
                 server_config=config,
-                loop=_make_loop(b"graph"),
+                loop=loop,
                 backups_root=backups_root,
                 live_config_path=live_config,
                 registry_path=None,
@@ -217,8 +236,14 @@ class TestPreFlightSwallowsReadErrors:
         # estimate = 0 (config error) + len(b"graph") = 5
         assert result.estimate_bytes == len(b"graph")
 
-    def test_preflight_swallows_graph_save_error(self, tmp_path: Path) -> None:
-        """loop.merger.save_bytes() raising → graph counted as 0 bytes; no crash."""
+    def test_preflight_swallows_graph_read_error(self, tmp_path: Path) -> None:
+        """read_maybe_encrypted on graph.json raising → graph counted as 0 bytes; no crash.
+
+        W2.3: preflight reads graph bytes from output_dir/episodic/graph.json via
+        read_maybe_encrypted instead of loop.merger.save_bytes().  When that read
+        fails (e.g. PermissionError), the graph contribution must be 0 and the
+        function must not raise.
+        """
         config = _make_config(tmp_path, max_total_disk_gb=10.0)
         backups_root = tmp_path / "backups"
         backups_root.mkdir(parents=True, exist_ok=True)
@@ -226,21 +251,32 @@ class TestPreFlightSwallowsReadErrors:
         live_config = tmp_path / "server.yaml"
         live_config.write_bytes(b"model: mistral\n")
 
-        bad_loop = MagicMock()
-        bad_loop.merger = MagicMock()
-        bad_loop.merger.save_bytes.side_effect = RuntimeError("graph serialisation failed")
+        # Write a valid graph.json so output_dir/episodic/graph.json exists,
+        # then simulate a PermissionError on its read_bytes call.
+        loop_dir = tmp_path / "loop_dir"
+        loop = _make_loop(b'{"nodes":[],"links":[]}', loop_dir)
+        graph_path = loop_dir / "episodic" / "graph.json"
 
-        result = compute_pre_flight_check(
-            server_config=config,
-            loop=bad_loop,
-            backups_root=backups_root,
-            live_config_path=live_config,
-            registry_path=None,
-        )
+        original_read_bytes = Path.read_bytes
+
+        def _fail_graph_read(self):
+            if self == graph_path:
+                raise PermissionError("graph read denied")
+            return original_read_bytes(self)
+
+        with patch.object(Path, "read_bytes", _fail_graph_read):
+            result = compute_pre_flight_check(
+                server_config=config,
+                loop=loop,
+                backups_root=backups_root,
+                live_config_path=live_config,
+                registry_path=None,
+            )
 
         assert isinstance(result, PreFlightCheck)
         assert result.fail_code is None
-        assert result.estimate_bytes == len(b"model: mistral\n")  # only config
+        # estimate = config_bytes + 0 (graph read error)
+        assert result.estimate_bytes == len(b"model: mistral\n")
 
 
 # ---------------------------------------------------------------------------

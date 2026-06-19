@@ -48,6 +48,10 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         ("paramem/server/app.py", "_run_extraction_phase"),
         ("paramem/server/app.py", "_extract_and_start_training"),
         ("paramem/server/app.py", "_run_full_cycle"),
+        # migration trial graph readout — sources the comparison-report graph per the
+        # 2-way storage mode: simulate reads the persisted interim-slot graph.json, train
+        # reconstructs from adapter weights. Intentional, mirrors active_store_migration's split.
+        ("paramem/server/app.py", "_run"),
         # Memory store hydration source selection reads consolidation.mode, not runtime mode.
         # Moved from _hydrate_memory_store_in_place into the store-free builder so both
         # boot-preload and post-fold reconcile share the same selection logic.

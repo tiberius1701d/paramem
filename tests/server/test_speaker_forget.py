@@ -6,9 +6,9 @@ Mocked — no GPU, no real model.  Mirrors the mocking style of
 Coverage
 --------
 - ``store.discard_keys(keys, mode="erase")`` called with exactly the keys
-  ``keys_for_speaker`` returns: hard-removes keys from the registry (GONE from
-  both active and stale); registry saved for affected tiers; simhash saved for
-  affected main tiers.
+  resolved via ``store.iter_bookkeeping()`` for the speaker: hard-removes
+  keys from the registry (GONE from both active and stale); registry saved
+  for affected tiers; simhash saved for affected main tiers.
 - Speaker profile removed: ``speaker_store.remove`` called; response reflects
   the bool return.
 - Pending sessions for the speaker discarded: ``discard_sessions`` called;
@@ -58,22 +58,25 @@ def _make_config(tmp_path: Path) -> MagicMock:
 
 
 def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
-    """Build a MagicMock ConsolidationLoop whose merger.graph returns *keys* for *speaker_id*.
+    """Build a MagicMock ConsolidationLoop; store.iter_bookkeeping yields *keys* for *speaker_id*.
 
     The store exposes two main tiers (``episodic`` and ``semantic``) whose
     ``KeyRegistry`` objects contain the supplied keys so registry saves can be
     verified.  The simhash dicts include the keys so the simhash clean-up branch
     is exercised.
 
-    ``/forget`` now routes through ``store.discard_keys(keys, mode="erase")``
-    (the shared helper).  Tests verify that the helper is called with the correct
-    arguments (mode="erase", not mode="stale") and that registry + simhash saves
-    are persisted for the affected tiers.
+    ``/forget`` routes through ``store.iter_bookkeeping()`` to resolve speaker
+    keys (W2: ``merger.graph`` is cleared at cycle-end, so the old graph-based
+    ``keys_for_speaker`` path cannot be used after W1).  It then calls
+    ``store.discard_keys(keys, mode="erase")`` (the shared helper).  Tests verify
+    that the helper is called with the correct arguments.
     """
     loop = MagicMock()
 
-    # Merger graph — keys_for_speaker is patched at call site, so any graph is fine.
-    loop.merger.graph = MagicMock()
+    # W2: iter_bookkeeping returns bookkeeping records keyed by speaker_id.
+    # The handler iterates all records and filters by record.get("speaker_id").
+    bk_records = [(k, {"speaker_id": speaker_id, "relation_type": "episodic"}) for k in keys]
+    loop.store.iter_bookkeeping.return_value = iter(bk_records)
 
     # Per-tier KeyRegistry mocks.
     ep_registry = MagicMock(spec=KeyRegistry)
@@ -142,7 +145,7 @@ def _make_client(monkeypatch, state: dict) -> TestClient:
 
 
 class TestMarkStaleKeys:
-    """Keys returned by keys_for_speaker are hard-erased via store.discard_keys(mode="erase")."""
+    """Keys from store.iter_bookkeeping are hard-erased via store.discard_keys(mode="erase")."""
 
     def test_keys_removed_from_registry_and_saved(self, tmp_path, monkeypatch):
         """store.discard_keys called with mode='erase'; registry.save called for affected tier."""
@@ -158,12 +161,7 @@ class TestMarkStaleKeys:
             config=cfg,
         )
 
-        with (
-            patch(
-                "paramem.memory.persistence.keys_for_speaker", return_value=set(keys)
-            ) as mock_kfs,
-            patch("paramem.memory.persistence.save_registry"),
-        ):
+        with patch("paramem.memory.persistence.save_registry"):
             client = _make_client(monkeypatch, state)
             resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
@@ -173,8 +171,8 @@ class TestMarkStaleKeys:
         # Response lists stale keys (sorted).
         assert sorted(body["stale_keys"]) == sorted(keys)
 
-        # keys_for_speaker was called with the graph and speaker_id.
-        mock_kfs.assert_called_once_with(loop.merger.graph, speaker_id)
+        # W2: iter_bookkeeping was called (not keys_for_speaker which used merger.graph).
+        loop.store.iter_bookkeeping.assert_called_once_with()
 
         # store.discard_keys must be called with mode="erase" (hard erasure, not soft-stale).
         # Verify the helper was called; the erase-vs-stale distinction is tested in
@@ -210,6 +208,13 @@ class TestMarkStaleKeys:
             {"key": key, "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
             simhash=fingerprint,
         )
+        # W2: seed bookkeeping so iter_bookkeeping() resolves the key for this speaker.
+        real_store.set_bookkeeping(
+            key,
+            speaker_id=speaker_id,
+            first_seen_cycle=1,
+            relation_type="factual",
+        )
 
         # Assemble the loop mock, replacing .store with the real MemoryStore.
         loop = _make_loop(speaker_id, keys)
@@ -224,9 +229,8 @@ class TestMarkStaleKeys:
             config=cfg,
         )
 
-        with patch("paramem.memory.persistence.keys_for_speaker", return_value=set(keys)):
-            client = _make_client(monkeypatch, state)
-            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200, resp.text
 
@@ -237,7 +241,7 @@ class TestMarkStaleKeys:
         )
 
     def test_no_keys_no_registry_mutations(self, tmp_path, monkeypatch):
-        """When keys_for_speaker returns empty set, discard_keys is not called."""
+        """When iter_bookkeeping yields no keys for the speaker, discard_keys is not called."""
         speaker_id = "Speaker0"
         loop = _make_loop(speaker_id, [])
         state = _make_state(
@@ -247,10 +251,9 @@ class TestMarkStaleKeys:
             buffer=_make_buffer(speaker_id, []),
         )
 
-        with patch("paramem.memory.persistence.keys_for_speaker", return_value=set()):
-            with patch("paramem.memory.persistence.save_registry") as mock_save:
-                client = _make_client(monkeypatch, state)
-                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        with patch("paramem.memory.persistence.save_registry") as mock_save:
+            client = _make_client(monkeypatch, state)
+            resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200
         body = resp.json()
@@ -279,10 +282,8 @@ class TestSpeakerProfileRemoval:
             buffer=_make_buffer(speaker_id, []),
         )
 
-        with patch("paramem.memory.persistence.keys_for_speaker", return_value=set()):
-            with patch("paramem.memory.persistence.save_registry"):
-                client = _make_client(monkeypatch, state)
-                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200
         body = resp.json()
@@ -300,10 +301,8 @@ class TestSpeakerProfileRemoval:
             buffer=_make_buffer(speaker_id, []),
         )
 
-        with patch("paramem.memory.persistence.keys_for_speaker", return_value=set()):
-            with patch("paramem.memory.persistence.save_registry"):
-                client = _make_client(monkeypatch, state)
-                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200
         body = resp.json()
@@ -320,10 +319,8 @@ class TestSpeakerProfileRemoval:
             buffer=_make_buffer(speaker_id, []),
         )
 
-        with patch("paramem.memory.persistence.keys_for_speaker", return_value=set()):
-            with patch("paramem.memory.persistence.save_registry"):
-                client = _make_client(monkeypatch, state)
-                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200
         body = resp.json()
@@ -351,10 +348,8 @@ class TestPendingSessionDiscard:
             buffer=buffer,
         )
 
-        with patch("paramem.memory.persistence.keys_for_speaker", return_value=set()):
-            with patch("paramem.memory.persistence.save_registry"):
-                client = _make_client(monkeypatch, state)
-                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200
         body = resp.json()
@@ -374,10 +369,8 @@ class TestPendingSessionDiscard:
             buffer=buffer,
         )
 
-        with patch("paramem.memory.persistence.keys_for_speaker", return_value=set()):
-            with patch("paramem.memory.persistence.save_registry"):
-                client = _make_client(monkeypatch, state)
-                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200
         body = resp.json()
@@ -402,10 +395,8 @@ class TestPendingSessionDiscard:
             buffer=buffer,
         )
 
-        with patch("paramem.memory.persistence.keys_for_speaker", return_value=set()):
-            with patch("paramem.memory.persistence.save_registry"):
-                client = _make_client(monkeypatch, state)
-                resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
+        client = _make_client(monkeypatch, state)
+        resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
         assert resp.status_code == 200
         body = resp.json()
@@ -532,7 +523,6 @@ class TestLiveSlotManifestReStamp:
 
         # Build the loop mock, using the real MemoryStore for registry + discard_keys.
         loop = MagicMock()
-        loop.merger.graph = MagicMock()
         loop.store = real_store
 
         # Add a simhash entry so the simhash-clean branch is exercised too.
@@ -550,6 +540,16 @@ class TestLiveSlotManifestReStamp:
                 "object": "Berlin",
             },
             simhash=fingerprint,
+        )
+
+        # W2: seed bookkeeping so iter_bookkeeping() resolves key_to_forget for speaker_id.
+        # Bookkeeping is separate from save_bytes() (KeyRegistry only), so this
+        # does NOT affect H_old — the computation below remains correct.
+        real_store.set_bookkeeping(
+            key_to_forget,
+            speaker_id=speaker_id,
+            first_seen_cycle=1,
+            relation_type="factual",
         )
 
         # Compute H_old — the hash of the registry BEFORE the erase.
@@ -580,10 +580,7 @@ class TestLiveSlotManifestReStamp:
             config=cfg,
         )
 
-        with (
-            patch("paramem.memory.persistence.keys_for_speaker", return_value={key_to_forget}),
-            patch("paramem.memory.persistence.save_registry"),
-        ):
+        with patch("paramem.memory.persistence.save_registry"):
             client = _make_client(monkeypatch, state)
             resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
 
@@ -627,6 +624,14 @@ class TestLiveSlotManifestReStamp:
         ep_reg = real_store.registry(tier_name)
         ep_reg.add(key_to_forget)
 
+        # W2: seed bookkeeping so iter_bookkeeping() resolves key_to_forget for speaker_id.
+        real_store.set_bookkeeping(
+            key_to_forget,
+            speaker_id=speaker_id,
+            first_seen_cycle=1,
+            relation_type="factual",
+        )
+
         # Write a slot with a DIFFERENT registry_sha256 so find_live_slot won't match H_old.
         slot_dir = tmp_path / "adapters" / tier_name / "20260612-000000"
         slot_dir.mkdir(parents=True)
@@ -637,7 +642,6 @@ class TestLiveSlotManifestReStamp:
         cfg.adapter_dir = tmp_path / "adapters"
 
         loop = MagicMock()
-        loop.merger.graph = MagicMock()
         loop.store = real_store
 
         state = _make_state(
@@ -656,10 +660,7 @@ class TestLiveSlotManifestReStamp:
         caplog.set_level(logging.ERROR, logger="paramem.server.app")
         named.addHandler(caplog.handler)
         try:
-            with (
-                patch("paramem.memory.persistence.keys_for_speaker", return_value={key_to_forget}),
-                patch("paramem.memory.persistence.save_registry"),
-            ):
+            with patch("paramem.memory.persistence.save_registry"):
                 client = _make_client(monkeypatch, state)
                 resp = client.post("/speaker/forget", json={"speaker_id": speaker_id})
         finally:

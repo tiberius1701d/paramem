@@ -852,12 +852,12 @@ class TestProbeKeysFromGraph:
 
 
 # ---------------------------------------------------------------------------
-# TestConsolidateInterimGraphs
+# TestConsolidateInterimToCanonicalGraph
 # ---------------------------------------------------------------------------
 
 
 def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
-    """Build the minimal ConsolidationLoop required by consolidate_interim_graphs.
+    """Build the minimal ConsolidationLoop required by consolidate_interim_to_canonical_graph.
 
     Attributes set:
       - ``output_dir`` — used as the adapter_dir root.
@@ -918,8 +918,8 @@ def _write_interim_graph(adapter_dir: Path, stamp: str, triples: list[dict]) -> 
     return interim_dir
 
 
-class TestConsolidateInterimGraphs:
-    """consolidate_interim_graphs merges simulate-mode interim slots into main episodic graph."""
+class TestConsolidateInterimToCanonicalGraph:
+    """Tests for consolidate_interim_to_canonical_graph (simulate-mode full fold)."""
 
     def test_no_interim_slots_returns_noop_result(self, tmp_path):
         """Empty interim set: no main-graph write, no crash, result signals noop.
@@ -930,7 +930,7 @@ class TestConsolidateInterimGraphs:
         """
         loop = _make_bare_loop(tmp_path)
 
-        result = loop.consolidate_interim_graphs()
+        result = loop.consolidate_interim_to_canonical_graph()
 
         assert result["tiers_rebuilt"] == [], "No interim slots → tiers_rebuilt must be empty"
         assert result["rolled_back"] is False
@@ -954,7 +954,7 @@ class TestConsolidateInterimGraphs:
         ]
         interim_dir = _write_interim_graph(tmp_path, "20260101T0000", triples)
 
-        result = loop.consolidate_interim_graphs()
+        result = loop.consolidate_interim_to_canonical_graph()
 
         assert result["tiers_rebuilt"] == ["episodic"]
         main_graph_path = tmp_path / "episodic" / "graph.json"
@@ -983,7 +983,7 @@ class TestConsolidateInterimGraphs:
             [{"key": "graph2", "subject": "Bob", "predicate": "works_at", "object": "Acme"}],
         )
 
-        result = loop.consolidate_interim_graphs()
+        result = loop.consolidate_interim_to_canonical_graph()
 
         main_graph_path = tmp_path / "episodic" / "graph.json"
         assert main_graph_path.exists()
@@ -1017,7 +1017,7 @@ class TestConsolidateInterimGraphs:
         _write_interim_graph(tmp_path, "20260101T0000", [shared_triple])
         _write_interim_graph(tmp_path, "20260102T0000", [shared_triple])
 
-        loop.consolidate_interim_graphs()
+        loop.consolidate_interim_to_canonical_graph()
 
         main_graph_path = tmp_path / "episodic" / "graph.json"
         merged = load_memory_from_disk(main_graph_path)
@@ -1046,7 +1046,7 @@ class TestConsolidateInterimGraphs:
             for i in range(1, 4)
         ]
 
-        loop.consolidate_interim_graphs()
+        loop.consolidate_interim_to_canonical_graph()
 
         for d in dirs:
             assert not d.exists(), f"Interim dir {d} must be removed after consolidation"
@@ -1070,7 +1070,7 @@ class TestConsolidateInterimGraphs:
             [{"key": "graph1", "subject": "Alice", "predicate": "likes", "object": "Tea"}],
         )
 
-        result = loop.consolidate_interim_graphs()
+        result = loop.consolidate_interim_to_canonical_graph()
 
         assert "tier_delta" in result, (
             f"Result must contain 'tier_delta'; got {list(result.keys())}"
@@ -1103,7 +1103,7 @@ class TestConsolidateInterimGraphs:
         loop = _make_bare_loop(tmp_path)
         # No interim slots, no pre-existing main graph.
 
-        result = loop.consolidate_interim_graphs(housekeeping=True)
+        result = loop.consolidate_interim_to_canonical_graph(housekeeping=True)
 
         assert result["tiers_rebuilt"] == ["episodic"], (
             "housekeeping=True: tiers_rebuilt must be ['episodic'] even with no interims; "
@@ -1115,7 +1115,7 @@ class TestConsolidateInterimGraphs:
         )
 
     def test_housekeeping_sets_current_interim_stamp(self, tmp_path):
-        """During consolidate_interim_graphs(housekeeping=True) the loop's
+        """During consolidate_interim_to_canonical_graph(housekeeping=True) the loop's
         _current_interim_stamp is set to 'housekeeping_<ts>' and then cleared.
 
         After the method returns, the stamp is None (cleared on exit).  This test
@@ -1123,17 +1123,17 @@ class TestConsolidateInterimGraphs:
         observable from a unit test).
         """
         loop = _make_bare_loop(tmp_path)
-        loop.consolidate_interim_graphs(housekeeping=True)
+        loop.consolidate_interim_to_canonical_graph(housekeeping=True)
 
         # Stamp must be cleared on normal return.
         stamp = getattr(loop, "_current_interim_stamp", "NOT_SET")
         assert stamp is None, (
-            f"_current_interim_stamp must be None after consolidate_interim_graphs returns; "
-            f"got {stamp!r}"
+            "_current_interim_stamp must be None after "
+            f"consolidate_interim_to_canonical_graph returns; got {stamp!r}"
         )
 
-    def test_run_housekeeping_dispatches_to_consolidate_interim_graphs(self, tmp_path):
-        """run_housekeeping() on a simulate-mode loop calls consolidate_interim_graphs
+    def test_run_housekeeping_dispatches_to_consolidate_interim_to_canonical_graph(self, tmp_path):
+        """run_housekeeping() on a simulate-mode loop calls consolidate_interim_to_canonical_graph
         with housekeeping=True, NOT consolidate_interim_adapters.
 
         With config=None the loop's run_housekeeping() falls through to 'simulate'
@@ -1144,9 +1144,8 @@ class TestConsolidateInterimGraphs:
         loop = _make_bare_loop(tmp_path)
         # config=None → mode defaults to "simulate" in run_housekeeping.
 
-        with patch.object(
-            loop, "consolidate_interim_graphs", wraps=loop.consolidate_interim_graphs
-        ) as mock_cig:
+        _meth = loop.consolidate_interim_to_canonical_graph
+        with patch.object(loop, "consolidate_interim_to_canonical_graph", wraps=_meth) as mock_cig:
             loop.run_housekeeping()
 
         mock_cig.assert_called_once_with(housekeeping=True)
@@ -1157,15 +1156,13 @@ class TestConsolidateInterimGraphs:
 
         Seeds two interim graph.json slots whose surfaces differ but canonicalize
         to the same identity (subject "Alice" vs "alice", object "Acme Corp" vs
-        "acme corp").  After consolidate_interim_graphs(housekeeping=True):
+        "acme corp").  After consolidate_interim_to_canonical_graph(housekeeping=True):
 
         (a) The variants COLLAPSE to a single edge in the persisted main graph.json
             (canonical() node identity + Case-1 dedup in the GraphMerger topology,
             simulate/train parity satisfied end-to-end).
-        (b) The removal_ledger carries a "dedup" entry for the discarded variant key
-            with pre_surfaces recording the differing incoming and surviving surfaces
-            (evidence that the dedup was caused by a surface variant, not a genuine
-            duplicate with identical raw text).
+        (b) W1: merger.removal_ledger is cleared by the cycle's finally block; the
+            dedup evidence is verified via the single-edge graph output instead.
 
         This is the end-to-end assertion the merger-isolation tests cannot cover:
         it verifies that the simulate path routes through GraphMerger so grooming
@@ -1206,7 +1203,7 @@ class TestConsolidateInterimGraphs:
             ],
         )
 
-        loop.consolidate_interim_graphs(housekeeping=True)
+        loop.consolidate_interim_to_canonical_graph(housekeeping=True)
 
         # (a) Main graph.json must contain exactly ONE edge (the variants collapsed).
         main_graph_path = tmp_path / "episodic" / "graph.json"
@@ -1219,38 +1216,16 @@ class TestConsolidateInterimGraphs:
             f"(keys: {[e['key'] for e in entries]})"
         )
 
-        # (b) removal_ledger must carry a "dedup" entry for the discarded variant key
-        # with pre_surfaces evidencing the surface-variant collapse.
-        ledger = getattr(loop.merger, "removal_ledger", {})
-        dedup_entries = {k: v for k, v in ledger.items() if v.get("reason") == "dedup"}
-        assert dedup_entries, (
-            f"removal_ledger must contain at least one 'dedup' entry after variant collapse; "
-            f"ledger={ledger!r}"
-        )
-        # Identify the collapsed key (graph2) by confirming its pre_surfaces show
-        # differing incoming vs surviving subject and/or object surfaces.
-        variant_collapse_keys = [
-            k
-            for k, v in dedup_entries.items()
-            if (
-                v.get("pre_surfaces", {}).get("incoming", {}).get("subject")
-                != v.get("pre_surfaces", {}).get("surviving", {}).get("subject")
-                or v.get("pre_surfaces", {}).get("incoming", {}).get("object")
-                != v.get("pre_surfaces", {}).get("surviving", {}).get("object")
-            )
-        ]
-        assert variant_collapse_keys, (
-            "removal_ledger must have at least one 'dedup' entry where pre_surfaces "
-            "shows differing incoming vs surviving subject/object surfaces; dedup entries: "
-            + str({k: v for k, v in dedup_entries.items()})
-        )
-        # The surviving key must be present in the merged graph.
+        # (b) W1: merger.removal_ledger is cleared by the cycle's finally block and
+        # is not observable after the call.  The variant-collapse is already verified by
+        # the single-edge assertion above.  Additionally verify that only the canonical
+        # surface key survives (Alice/Acme Corp, not alice/acme corp).
         surviving_keys = {e["key"] for e in entries}
-        discarded_keys = set(variant_collapse_keys)
-        # Surviving key is NOT in the discarded set.
-        assert not (surviving_keys & discarded_keys), (
-            f"Surviving key(s) {surviving_keys} must not appear in the collapsed "
-            f"(discarded) set {discarded_keys}"
+        # graph1 was the first-seen key (canonical surface), graph2 was the variant.
+        # The dedup collapses graph2 into graph1, so graph1 should survive.
+        assert "graph1" in surviving_keys, (
+            f"graph1 (canonical surface) must survive the variant collapse; "
+            f"surviving keys: {surviving_keys}"
         )
 
     def test_enrichment_survives_into_persisted_graph_after_merge(self, tmp_path):
@@ -1262,7 +1237,7 @@ class TestConsolidateInterimGraphs:
         merged interim edges in the persisted output.
 
         Strategy: monkeypatch _run_graph_enrichment to add a sentinel edge to
-        self.merger.graph and return new_edges=1.  After consolidate_interim_graphs(
+        self.merger.graph and return new_edges=1.  After consolidate_interim_to_canonical_graph(
         housekeeping=True), assert:
         (a) the sentinel edge is present in the persisted graph.json, and
         (b) the merged interim edge is also present (sentinel coexists with merged content),
@@ -1313,7 +1288,7 @@ class TestConsolidateInterimGraphs:
         from unittest.mock import patch
 
         with patch.object(loop, "_run_graph_enrichment", side_effect=_fake_enrichment):
-            result = loop.consolidate_interim_graphs(housekeeping=True)
+            result = loop.consolidate_interim_to_canonical_graph(housekeeping=True)
 
         # (a) Sentinel edge must be present in the persisted graph.json.
         main_graph_path = tmp_path / "episodic" / "graph.json"
@@ -1344,7 +1319,7 @@ class TestConsolidateInterimGraphs:
     def test_simulate_merge_produces_person_node_with_speaker_id(self, tmp_path):
         """Simulate path via _merge_registry_relations stamps entity_type='person' + speaker_id.
 
-        Regression guard: before routing consolidate_interim_graphs through
+        Regression guard: before routing consolidate_interim_to_canonical_graph through
         _merge_registry_relations, the simulate path used entities=[] directly
         (same latent bug as the recon path fixed by _merge_registry_relations
         unification).  A relation whose subject == speaker_id (i.e. a speaker
@@ -1377,15 +1352,22 @@ class TestConsolidateInterimGraphs:
             ],
         )
 
-        loop.consolidate_interim_graphs()
+        loop.consolidate_interim_to_canonical_graph()
+
+        # W1: merger.graph is cleared at cycle-end; read the persisted graph.json instead.
+        from paramem.memory.persistence import load_memory_from_disk
+
+        main_path = tmp_path / "episodic" / "graph.json"
+        assert main_path.exists(), "graph.json must be written after the simulate fold"
+        saved_graph = load_memory_from_disk(main_path)
 
         # _resolve_entity keys speaker nodes by speaker_id directly.
         node_key = "Speaker0"
-        assert node_key in loop.merger.graph.nodes, (
+        assert node_key in saved_graph.nodes, (
             f"Speaker subject node {node_key!r} missing from merged graph after simulate path; "
-            f"nodes present: {list(loop.merger.graph.nodes)}"
+            f"nodes present: {list(saved_graph.nodes)}"
         )
-        node_data = loop.merger.graph.nodes[node_key]
+        node_data = saved_graph.nodes[node_key]
         assert node_data.get("entity_type") == "person", (
             f"Simulate path: expected entity_type='person' on speaker subject node; "
             f"got entity_type={node_data.get('entity_type')!r}. "
@@ -1624,7 +1606,7 @@ class TestBuildTierDelta:
             [{"key": "graph2", "subject": "alice", "predicate": "works at", "object": "acme corp"}],
         )
 
-        result = loop.consolidate_interim_graphs(housekeeping=True)
+        result = loop.consolidate_interim_to_canonical_graph(housekeeping=True)
 
         td = result["tier_delta"]
         assert "episodic" in td
@@ -1635,12 +1617,16 @@ class TestBuildTierDelta:
             f" has no entries for attribution; got {ep['staled_by_reason']!r}"
         )
 
-        # Confirm the ledger DID fire (dedup collapse happened).
-        ledger = getattr(loop.merger, "removal_ledger", {})
-        dedup_entries = [k for k, v in ledger.items() if v.get("reason") == "dedup"]
-        assert dedup_entries, (
-            "Variant-collapse fixture must produce at least one dedup ledger entry;"
-            f" ledger={ledger!r}"
+        # W1: merger.removal_ledger is cleared by the cycle's finally block.
+        # Confirm the dedup collapse happened via the persisted graph output (1 edge).
+        main_path = tmp_path / "episodic" / "graph.json"
+        assert main_path.exists(), "graph.json must exist after housekeeping fold"
+        from paramem.memory.persistence import load_memory_from_disk
+
+        merged = load_memory_from_disk(main_path)
+        assert merged.number_of_edges() == 1, (
+            "Variant-collapse fixture must produce exactly 1 edge (dedup collapse);"
+            f" got {merged.number_of_edges()} edges"
         )
 
 
@@ -2144,4 +2130,266 @@ class TestDebugSnapshotOnTierDelta:
         written_files = list(tmp_path.rglob("tier_delta.json"))
         assert written_files == [], (
             f"No tier_delta.json must be written when snapshots disabled; found {written_files}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestGraphLifecycle — W1 regression: merger.graph cleared at cycle-end
+# ---------------------------------------------------------------------------
+
+
+class TestGraphLifecycle:
+    """W1 regression: consolidate_interim_to_canonical_graph clears merger.graph at every exit.
+
+    Uses a REAL GraphMerger (not MagicMock) so reset_graph() actually clears the
+    graph, not a no-op as it would be under MagicMock.  This validates the W1
+    try/finally placement.
+
+    Root cause being tested: before W1, merger.graph leaked across cycles —
+    a prior fold's ~199 reconstructed relations were captured into the next
+    interim cycle's extra_relations, producing a spurious 208-key interim slot
+    (live observed: graph_reconstructed=0, graph_merged=199 from extra_relations).
+    """
+
+    def test_graph_empty_after_successful_fold(self, tmp_path):
+        """merger.graph is empty (0 nodes, 0 edges) after a successful fold.
+
+        Arrange: one interim slot with a real triple.
+        Act: consolidate_interim_to_canonical_graph().
+        Assert: merger.graph has 0 nodes and 0 edges.
+        """
+        loop = _make_bare_loop(tmp_path)
+        # No pre-existing graph.json — load_memory_from_disk returns an empty
+        # MultiDiGraph when the file is absent; the fold creates the file itself.
+        _write_interim_graph(
+            tmp_path,
+            "20260101T0000",
+            [{"key": "graph1", "subject": "Alice", "predicate": "knows", "object": "Bob"}],
+        )
+
+        loop.consolidate_interim_to_canonical_graph()
+
+        assert loop.merger.graph.number_of_nodes() == 0, (
+            f"W1 regression: merger.graph must be empty after successful fold; "
+            f"got {loop.merger.graph.number_of_nodes()} nodes"
+        )
+        assert loop.merger.graph.number_of_edges() == 0, (
+            f"W1 regression: merger.graph must be empty after successful fold; "
+            f"got {loop.merger.graph.number_of_edges()} edges"
+        )
+
+    def test_graph_empty_after_noop_fold(self, tmp_path):
+        """merger.graph is empty after a no-op fold (no interim slots).
+
+        The fold exits early (no slots to merge), but the finally block still fires.
+        """
+        loop = _make_bare_loop(tmp_path)
+        # No pre-existing graph.json — the fold handles a missing file via
+        # load_memory_from_disk returning an empty MultiDiGraph.
+
+        loop.consolidate_interim_to_canonical_graph()
+
+        assert loop.merger.graph.number_of_nodes() == 0, (
+            f"W1 regression: merger.graph must be empty after noop fold; "
+            f"got {loop.merger.graph.number_of_nodes()} nodes"
+        )
+        assert loop.merger.graph.number_of_edges() == 0, (
+            "W1 regression: merger.graph must be empty after noop fold; "
+            f"got {loop.merger.graph.number_of_edges()} edges"
+        )
+
+    def test_no_cross_cycle_bleed(self, tmp_path):
+        """Two sequential folds with disjoint inputs produce disjoint canonical graphs.
+
+        Regression for the 208-key bug: if merger.graph leaked from fold-1 into
+        fold-2, the second fold's output would contain fold-1's edges.  After W1
+        both folds start with an empty graph.
+        """
+        loop = _make_bare_loop(tmp_path)
+        # No pre-existing graph.json for fold 1 — load_memory_from_disk returns
+        # an empty MultiDiGraph when the file is absent; the fold creates/overwrites it.
+
+        # Fold 1: one triple Alice→Bob.
+        _write_interim_graph(
+            tmp_path,
+            "20260101T0000",
+            [{"key": "graph1", "subject": "Alice", "predicate": "knows", "object": "Bob"}],
+        )
+        result1 = loop.consolidate_interim_to_canonical_graph()
+        assert result1.get("tiers_rebuilt") == ["episodic"]
+
+        # After fold 1 the graph must be EMPTY.
+        assert loop.merger.graph.number_of_nodes() == 0, (
+            "W1 regression: merger.graph must be empty between folds; "
+            f"got {loop.merger.graph.number_of_nodes()} nodes"
+        )
+
+        # Fold 2: a fresh interim slot with a different, disjoint triple.
+        # The canonical graph.json was written by fold-1 (Alice→Bob).  This
+        # simulates a fresh cycle where only Carol's fact is new.
+        _write_interim_graph(
+            tmp_path,
+            "20260102T0000",
+            [{"key": "graph2", "subject": "Carol", "predicate": "lives_in", "object": "Berlin"}],
+        )
+        result2 = loop.consolidate_interim_to_canonical_graph()
+        assert result2.get("tiers_rebuilt") == ["episodic"]
+
+        # The canonical graph after fold 2 must contain BOTH folds' edges
+        # (fold 2 reloads the canonical graph.json written by fold 1), NOT
+        # just fold-1 edges re-injected via a leaked merger.graph.
+        # keys_per_tier for episodic should be ≥ 2 (both triples).
+        keys_after = result2.get("keys_per_tier", {}).get("episodic", 0)
+        assert keys_after >= 2, (
+            f"W1 regression: fold-2 canonical graph must contain both triples; "
+            f"got keys_per_tier.episodic={keys_after}"
+        )
+
+        # Critically, merger.graph is STILL empty after fold 2.
+        assert loop.merger.graph.number_of_nodes() == 0, (
+            "W1 regression: merger.graph must be empty after fold 2; "
+            f"got {loop.merger.graph.number_of_nodes()} nodes"
+        )
+
+    # --- run_consolidation_cycle lifecycle tests ---
+
+    def _build_loop_with_real_merger(self, tmp_path: Path):
+        """Build a _build_loop() loop but replace merger with a real GraphMerger.
+
+        The existing _build_loop() uses MagicMock for merger and stubs
+        _materialize_consolidation_graph.  This helper swaps in a real
+        GraphMerger so reset_graph() actually clears the graph (instead of
+        being a no-op on a MagicMock).
+
+        The _materialize_consolidation_graph stub is kept so the test does not
+        need a GPU — it bypasses reconstruct_graph.  W1's finally block calls
+        the REAL merger.reset_graph(), which this test verifies.
+        """
+        from paramem.graph.merger import GraphMerger
+
+        loop = _build_loop(tmp_path)
+        loop.merger = GraphMerger(model=None)
+        # Pre-seed the graph with a real edge so there is content to clear.
+        loop.merger.graph.add_node("Alice")
+        loop.merger.graph.add_node("Bob")
+        loop.merger.graph.add_edge("Alice", "Bob", predicate="knows")
+        return loop
+
+    def test_run_consolidation_cycle_graph_empty_after_success(self, tmp_path):
+        """merger.graph is empty (0 nodes, 0 edges) after a successful simulate cycle.
+
+        W1: the try/finally in run_consolidation_cycle calls reset_graph() on every
+        exit that goes through the main try block.  This test uses a REAL GraphMerger
+        so reset_graph() actually clears the graph.
+
+        Mutation check: if the finally block were removed, merger.graph would retain
+        the edges seeded before the call.
+        """
+        loop = self._build_loop_with_real_merger(tmp_path)
+        assert loop.merger.graph.number_of_nodes() > 0, "Precondition: graph must be non-empty"
+
+        loop.run_consolidation_cycle(
+            list(_EPISODIC_RELS),
+            list(_PROCEDURAL_RELS),
+            speaker_id=_SPEAKER_ID,
+            mode="simulate",
+            run_label="lifecycle-test",
+            stamp=_STAMP,
+        )
+
+        assert loop.merger.graph.number_of_nodes() == 0, (
+            "W1 regression: run_consolidation_cycle finally must clear merger.graph; "
+            f"got {loop.merger.graph.number_of_nodes()} nodes after successful cycle"
+        )
+        assert loop.merger.graph.number_of_edges() == 0, (
+            "W1 regression: run_consolidation_cycle finally must clear merger.graph; "
+            f"got {loop.merger.graph.number_of_edges()} edges after successful cycle"
+        )
+
+    def test_run_consolidation_cycle_graph_empty_after_abort(self, tmp_path):
+        """merger.graph is empty after an aborted cycle (exception propagated).
+
+        Arrange: patch commit_tier_slot to raise RuntimeError to simulate an
+        I/O failure inside the try block.  The finally must still clear the graph.
+
+        Mutation check: without the finally, merger.graph retains the pre-seeded
+        edges and this assertion fails.
+        """
+        loop = self._build_loop_with_real_merger(tmp_path)
+        assert loop.merger.graph.number_of_nodes() > 0, "Precondition: graph must be non-empty"
+
+        with patch(
+            "paramem.memory.persistence.commit_tier_slot",
+            side_effect=RuntimeError("simulated I/O failure"),
+        ):
+            try:
+                loop.run_consolidation_cycle(
+                    list(_EPISODIC_RELS),
+                    list(_PROCEDURAL_RELS),
+                    speaker_id=_SPEAKER_ID,
+                    mode="simulate",
+                    run_label="lifecycle-abort",
+                    stamp=_STAMP,
+                )
+            except RuntimeError:
+                pass  # expected — the abort propagated
+
+        assert loop.merger.graph.number_of_nodes() == 0, (
+            "W1 regression: run_consolidation_cycle finally must clear merger.graph "
+            "even when an exception propagates; "
+            f"got {loop.merger.graph.number_of_nodes()} nodes after aborted cycle"
+        )
+
+    # --- consolidate_interim_adapters lifecycle tests ---
+
+    def test_consolidate_interim_adapters_graph_empty_after_accumulating_return(self, tmp_path):
+        """merger.graph is empty after consolidate_interim_adapters accumulating return.
+
+        The accumulating early return fires when total trainable keys < floor (30).
+        With an empty MemoryStore and no interim slots, _total_trainable == 0 < 30.
+
+        This test patches:
+        - _gpu_thread_lock.acquire(blocking=False) → False (pretend lock is held),
+          bypassing the entry guard without needing a real BackgroundTrainer.
+        - _materialize_consolidation_graph → (set(), []) to skip reconstruct_graph
+          (GPU call).
+
+        The real GraphMerger is used so reset_graph() in the finally actually clears
+        the graph.
+
+        Mutation check: without the W1 finally block, merger.graph retains the
+        pre-seeded edge.
+        """
+        from paramem.graph.merger import GraphMerger
+
+        loop = _build_loop(tmp_path)
+        loop.merger = GraphMerger(model=None)
+        # Pre-seed the graph with a real edge.
+        loop.merger.graph.add_node("Alice")
+        loop.merger.graph.add_node("Bob")
+        loop.merger.graph.add_edge("Alice", "Bob", predicate="knows")
+
+        assert loop.merger.graph.number_of_nodes() > 0, "Precondition: graph must be non-empty"
+
+        # Patch the GPU lock entry guard: replace the module-level lock object with
+        # a MagicMock whose acquire(blocking=False) returns False so the entry guard
+        # believes the lock is already held.  patch.object cannot patch a C-level
+        # threading.Lock attribute, so we replace the module-level name instead.
+        _mock_lock = MagicMock()
+        _mock_lock.acquire.return_value = False  # pretend caller already holds the lock
+        with patch("paramem.server.gpu_lock._gpu_thread_lock", _mock_lock):
+            result = loop.consolidate_interim_adapters(trainer=None)
+
+        assert result.get("status") == "accumulating", (
+            f"Expected status='accumulating' with 0 keys < floor 30; got {result!r}"
+        )
+        assert loop.merger.graph.number_of_nodes() == 0, (
+            "W1 regression: consolidate_interim_adapters finally must clear merger.graph "
+            "on accumulating return; "
+            f"got {loop.merger.graph.number_of_nodes()} nodes"
+        )
+        assert loop.merger.graph.number_of_edges() == 0, (
+            "W1 regression: consolidate_interim_adapters finally must clear merger.graph "
+            "on accumulating return; "
+            f"got {loop.merger.graph.number_of_edges()} edges"
         )

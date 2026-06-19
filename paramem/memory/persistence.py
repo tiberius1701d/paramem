@@ -14,7 +14,6 @@ Public API
 - :func:`entry_by_key` — look up a single key; ``None`` on miss.
 - :func:`keys_for_entity` — edge keys where lower(subject) or lower(object)
   matches the query.
-- :func:`keys_for_speaker` — edge keys where ``speaker_id`` matches.
 - :func:`build_tier_graph_from_store` — project a :class:`MemoryStore` tier
   to a fresh ``MultiDiGraph`` for persistence.
 - :func:`commit_tier_slot` — atomic write of one interim tier slot (registry written last
@@ -27,9 +26,9 @@ NetworkX's ``node_link_data`` serialisation format uses ``"key"`` as the
 reserved field name for the multigraph edge-key integer in the JSON output.
 To avoid collision, the indexed-memory key string is stored as the internal
 edge-data attribute ``"ik_key"``.  All public API functions
-(:func:`iter_entries`, :func:`entry_by_key`, :func:`keys_for_entity`,
-:func:`keys_for_speaker`) map ``"ik_key"`` to ``"key"`` in the dict they
-return so callers see the canonical entry shape.
+(:func:`iter_entries`, :func:`entry_by_key`, :func:`keys_for_entity`)
+map ``"ik_key"`` to ``"key"`` in the dict they return so callers see the
+canonical entry shape.
 
 The public entry schema is:
 
@@ -225,27 +224,6 @@ def keys_for_entity(graph: nx.MultiDiGraph, entity_lower: str) -> set[str]:
     matched: set[str] = set()
     for entry in iter_entries(graph):
         if entry["subject"].lower() == entity_lower or entry["object"].lower() == entity_lower:
-            matched.add(entry["key"])
-    return matched
-
-
-def keys_for_speaker(graph: nx.MultiDiGraph, speaker_id: str) -> set[str]:
-    """Return every indexed-memory key whose ``speaker_id`` matches *speaker_id*.
-
-    Exact string match (not case-insensitive) to preserve speaker ID
-    semantics — speaker IDs are controlled identifiers, not free-form names.
-
-    Args:
-        graph: Source ``MultiDiGraph``.
-        speaker_id: Speaker ID to match (e.g. ``"Speaker0"``).
-
-    Returns:
-        Set of key strings where the edge ``speaker_id`` matches; may be
-        empty.
-    """
-    matched: set[str] = set()
-    for entry in iter_entries(graph):
-        if entry["speaker_id"] == speaker_id:
             matched.add(entry["key"])
     return matched
 

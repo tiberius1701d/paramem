@@ -109,8 +109,9 @@ class TestBuildTrialLoop:
     def test_trial_loop_graph_is_ram_only(self, tmp_path):
         """_build_trial_loop does not set persist_graph or graph_path.
 
-        The graph is RAM-only; the in-memory merger graph is stashed into
-        _state by _stash_trial_graph after the fold, not written to disk.
+        The trial loop writes no dedicated graph file; _stash_trial_graph stashes
+        either the interim-slot graph.json path (simulate) or a reconstructed
+        in-memory graph (train) after the fold, not a persisted merger graph.
         """
         state = _make_state(tmp_path)
         trial_adapter_dir = Path(state["migration"]["trial"]["trial_adapter_dir"])

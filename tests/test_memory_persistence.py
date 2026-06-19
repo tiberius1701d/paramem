@@ -1,7 +1,7 @@
 """Unit tests for paramem.memory.persistence.
 
 Covers round-trip contract, encryption awareness, iter_entries edge-skipping,
-entry_by_key hit/miss, entity/speaker index helpers, and build_tier_graph_from_store.
+entry_by_key hit/miss, entity index helpers, and build_tier_graph_from_store.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ from paramem.memory.persistence import (
     entry_by_key,
     iter_entries,
     keys_for_entity,
-    keys_for_speaker,
     load_memory_from_disk,
     save_memory_to_disk,
 )
@@ -464,75 +463,6 @@ class TestKeysForEntity:
         g.add_edge("Alice", "Berlin")  # no "key" attribute in data
         result = keys_for_entity(g, "alice")
         assert result == set()
-
-
-# ---------------------------------------------------------------------------
-# 7. keys_for_speaker: exact speaker_id match
-# ---------------------------------------------------------------------------
-
-
-class TestKeysForSpeaker:
-    def test_filters_by_speaker_id(self):
-        """keys_for_speaker returns only keys belonging to the given speaker."""
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g,
-            "Alice",
-            "Berlin",
-            indexed_key="graph1",
-            predicate="lives_in",
-            speaker_id="Speaker0",
-            first_seen_cycle=1,
-        )
-        _add_keyed_edge(
-            g,
-            "Bob",
-            "London",
-            indexed_key="graph2",
-            predicate="lives_in",
-            speaker_id="Speaker1",
-            first_seen_cycle=2,
-        )
-        assert keys_for_speaker(g, "Speaker0") == {"graph1"}
-        assert keys_for_speaker(g, "Speaker1") == {"graph2"}
-
-    def test_no_match_returns_empty_set(self):
-        """keys_for_speaker returns an empty set when no edge matches."""
-        g = _make_simple_graph()
-        assert keys_for_speaker(g, "Speaker99") == set()
-
-    def test_multiple_keys_same_speaker(self):
-        """Multiple edges with the same speaker are all returned."""
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g,
-            "A",
-            "B",
-            indexed_key="graph1",
-            predicate="p",
-            speaker_id="Speaker0",
-            first_seen_cycle=1,
-        )
-        _add_keyed_edge(
-            g,
-            "C",
-            "D",
-            indexed_key="graph2",
-            predicate="p",
-            speaker_id="Speaker0",
-            first_seen_cycle=2,
-        )
-        _add_keyed_edge(
-            g,
-            "E",
-            "F",
-            indexed_key="graph3",
-            predicate="p",
-            speaker_id="Speaker1",
-            first_seen_cycle=3,
-        )
-        assert keys_for_speaker(g, "Speaker0") == {"graph1", "graph2"}
-        assert keys_for_speaker(g, "Speaker1") == {"graph3"}
 
 
 # ---------------------------------------------------------------------------
