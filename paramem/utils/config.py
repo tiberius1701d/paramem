@@ -20,6 +20,12 @@ from typing import Optional
 
 import yaml
 
+# Valid values for interim_refinement and fold_refinement.
+# Shared between utils.config and server.config (server.config imports this).
+# off=additive accumulation only; light=whole-graph model-driven normalization
+# (synonym-predicate dedup); full=light + second-order SOTA enrichment.
+_REFINEMENT_LEVELS: frozenset[str] = frozenset({"off", "light", "full"})
+
 
 @dataclass
 class ModelConfig:
@@ -159,12 +165,25 @@ class ConsolidationConfig:
     key_retirement_threshold: float = 0.1
     key_retirement_cycles: int = 3
     indexed_key_replay_enabled: bool = False
-    # Controls whether per-session graph merges are interleaved with each interim
-    # cycle.  "off" defers cumulative-graph merge/contradiction/enrichment to full
-    # consolidation (cheap interim posture).  "light" and "full" both merge the
-    # cumulative graph on every interim cycle (per-cycle merge posture) and
-    # currently behave identically.
+    # Refinement level for the interim mini-fold (one interim adapter slot per
+    # consolidation cycle).  Grammar shared with fold_refinement:
+    # "off" = additive accumulation only — exact-(s,p,o) dedup, no model calls.
+    # "light" = whole-graph model-driven normalization pass (synonym-predicate
+    #           dedup).  Default OFF: unreliable on the local model at scale; the
+    #           code is wired and re-enabled by setting "light".
+    # "full" = light + second-order SOTA enrichment (cloud; HELD until cross-doc
+    #          probe quantifies value and known inflation/fabrication is remedied).
     interim_refinement: str = "off"  # Literal["off", "light", "full"]
+    # Refinement level for the full fold (consolidate_interim_adapters).  Same
+    # grammar as interim_refinement.  Defaults to "off"; "full" is HELD.
+    fold_refinement: str = "off"  # Literal["off", "light", "full"]
+    # Whether the merger resolves same-predicate/different-object cardinality
+    # conflicts (Case-2 COEXIST/REPLACE) at ingest and interim cycles.  Applied
+    # wherever a NEW-vs-OLD temporal partition supplies the recency signal:
+    # ingest (later statement supersedes earlier within a session) and interim
+    # (NEW pending vs OLD slot — new supersedes old).  OFF at the full fold
+    # (old-vs-old consolidation, no recency) until per-edge timestamps land.
+    contradiction_detection: bool = True
     # Minimum recall fraction (0, 1] that every recall gate must reach before the
     # adapter fold is accepted.  Applied to: post-save disk-integrity probes
     # (_verify_saved_adapter_from_disk), interim-cycle training
@@ -177,11 +196,15 @@ class ConsolidationConfig:
 
     def __post_init__(self) -> None:
         """Validate field values at construction time."""
-        _valid = {"off", "light", "full"}
-        if self.interim_refinement not in _valid:
+        if self.interim_refinement not in _REFINEMENT_LEVELS:
             raise ValueError(
                 f"ConsolidationConfig.interim_refinement must be one of "
-                f"{sorted(_valid)!r}; got {self.interim_refinement!r}"
+                f"{sorted(_REFINEMENT_LEVELS)!r}; got {self.interim_refinement!r}"
+            )
+        if self.fold_refinement not in _REFINEMENT_LEVELS:
+            raise ValueError(
+                f"ConsolidationConfig.fold_refinement must be one of "
+                f"{sorted(_REFINEMENT_LEVELS)!r}; got {self.fold_refinement!r}"
             )
         if not (0.0 < self.recall_sanity_threshold <= 1.0):
             raise ValueError(

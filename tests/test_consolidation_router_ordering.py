@@ -161,7 +161,9 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
 
     from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
-    def _merge_into_graph(session_graph, *, additive: bool = False):
+    def _merge_into_graph(
+        session_graph, *, resolve_contradictions: bool = True, align_predicates: bool = False
+    ):
         for _rel in getattr(session_graph, "relations", []):
             eid = _merger_graph.add_edge(
                 _rel.subject,

@@ -121,8 +121,8 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.graph_enrichment_enabled": Tier.PIPELINE_ALTERING,
     "consolidation.graph_enrichment_neighborhood_hops": Tier.PIPELINE_ALTERING,
     "consolidation.graph_enrichment_max_entities_per_pass": Tier.PIPELINE_ALTERING,
-    "consolidation.graph_enrichment_interim_enabled": Tier.PIPELINE_ALTERING,
-    "consolidation.graph_enrichment_min_triples_floor": Tier.PIPELINE_ALTERING,
+    "consolidation.fold_refinement": Tier.PIPELINE_ALTERING,
+    "consolidation.contradiction_detection": Tier.PIPELINE_ALTERING,
     # --- agents.sota ---
     "agents.sota.enabled": Tier.PIPELINE_ALTERING,
     "agents.sota.provider": Tier.PIPELINE_ALTERING,

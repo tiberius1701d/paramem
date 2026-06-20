@@ -100,8 +100,6 @@ SCENARIOS = [
             "consolidation.graph_enrichment_enabled": True,
             "consolidation.graph_enrichment_neighborhood_hops": 1,
             "consolidation.graph_enrichment_max_entities_per_pass": 400,
-            "consolidation.graph_enrichment_interim_enabled": True,
-            "consolidation.graph_enrichment_min_triples_floor": 1,
             "adapters.episodic.rank": 8,
             "adapters.episodic.alpha": 16,
             "adapters.episodic.learning_rate": 1e-4,
@@ -201,15 +199,6 @@ def test_factory_threads_every_config_knob(
         captured["graph_enrichment_max_entities_per_pass"]
         == cfg.consolidation.graph_enrichment_max_entities_per_pass
     )
-    assert (
-        captured["graph_enrichment_interim_enabled"]
-        == cfg.consolidation.graph_enrichment_interim_enabled
-    )
-    assert (
-        captured["graph_enrichment_min_triples_floor"]
-        == cfg.consolidation.graph_enrichment_min_triples_floor
-    )
-
     # --- Extraction knobs ---
     assert captured["extraction_stt_correction"] == cfg.consolidation.extraction_stt_correction
     assert captured["extraction_ha_validation"] == cfg.consolidation.extraction_ha_validation

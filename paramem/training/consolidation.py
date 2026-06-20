@@ -163,8 +163,6 @@ class ConsolidationLoop:
         graph_enrichment_enabled: bool = True,
         graph_enrichment_neighborhood_hops: int = 2,
         graph_enrichment_max_entities_per_pass: int = 50,
-        graph_enrichment_interim_enabled: bool = True,
-        graph_enrichment_min_triples_floor: int = 20,
         state_provider=None,
         thermal_policy: ThermalPolicy | None = None,
         keep_prior_slots: int = 3,
@@ -262,9 +260,6 @@ class ConsolidationLoop:
         self.graph_enrichment_enabled = graph_enrichment_enabled
         self.graph_enrichment_neighborhood_hops = graph_enrichment_neighborhood_hops
         self.graph_enrichment_max_entities_per_pass = graph_enrichment_max_entities_per_pass
-        # Interim mini-enrichment: fires at sub-interval rollover.
-        self.graph_enrichment_interim_enabled = graph_enrichment_interim_enabled
-        self.graph_enrichment_min_triples_floor = graph_enrichment_min_triples_floor
 
         gc = graph_config or GraphConfig()
         self.merger = GraphMerger(
@@ -1065,20 +1060,19 @@ class ConsolidationLoop:
 
             # --- MERGE ---
             with phase_trace("merge_into_cumulative") as t:
-                # Always merge into the cumulative graph.  additive=True when
-                # interim_refinement="off" so Case-2 cardinality resolution is
-                # skipped (no model call, no edge removal) — the merge is purely
-                # additive and lossless at that level.  At "light"/"full",
-                # additive=False enables full supersession via the model.
+                # Always merge into the cumulative graph.  resolve_contradictions
+                # is driven by contradiction_detection config: when False, Case-2
+                # cardinality resolution is skipped (no model call, no edge removal).
+                # When True, the model may supersede older edges (REPLACE verdict).
                 # Disable gradient checkpointing: merger.merge may call
-                # model.generate() for contradiction resolution when a model is
-                # present.  HF silently disables the KV cache when checkpointing
-                # is active (CLAUDE.md rule).
+                # model.generate() when a model is present and
+                # resolve_contradictions=True.  HF silently disables the KV cache
+                # when checkpointing is active (CLAUDE.md rule).
                 self._disable_gradient_checkpointing()
                 try:
                     self.merger.merge(
                         session_graph,
-                        additive=(self.config.interim_refinement == "off"),
+                        resolve_contradictions=self.config.contradiction_detection,
                     )
                 finally:
                     self._enable_gradient_checkpointing()
@@ -1116,15 +1110,15 @@ class ConsolidationLoop:
                 )
                 # Merge proc_graph into the cumulative graph so its relations
                 # reach the unified keying surface (_build_all_edge_entries_into)
-                # at the next run_consolidation_cycle call.  Same additive flag
-                # and gradient-checkpointing discipline as the session_graph merge
-                # above — merger.merge may call model.generate() when additive=False
-                # and a model is present (CLAUDE.md rule).
+                # at the next run_consolidation_cycle call.  Same
+                # resolve_contradictions flag and gradient-checkpointing discipline
+                # as the session_graph merge above — merger.merge may call
+                # model.generate() when a model is present (CLAUDE.md rule).
                 self._disable_gradient_checkpointing()
                 try:
                     self.merger.merge(
                         proc_graph,
-                        additive=(self.config.interim_refinement == "off"),
+                        resolve_contradictions=self.config.contradiction_detection,
                     )
                 finally:
                     self._enable_gradient_checkpointing()
@@ -1625,17 +1619,17 @@ class ConsolidationLoop:
         result.relations_extracted = len(session_graph.relations)
 
         # --- 2. MERGE ---
-        # Always merge.  additive=True when interim_refinement="off" so
-        # Case-2 cardinality resolution is skipped (no model call, no edge
-        # removal).  Disable gradient checkpointing: merger.merge may call
-        # model.generate() for contradiction resolution when additive=False
-        # and a model is present.  HF silently disables the KV cache when
-        # checkpointing is active (CLAUDE.md rule).
+        # Always merge.  resolve_contradictions is driven by contradiction_detection
+        # config: when False, Case-2 cardinality resolution is skipped (no model
+        # call, no edge removal).  When True, the model may supersede older edges.
+        # Disable gradient checkpointing: merger.merge may call model.generate()
+        # when a model is present and resolve_contradictions=True.  HF silently
+        # disables the KV cache when checkpointing is active (CLAUDE.md rule).
         self._disable_gradient_checkpointing()
         try:
             self.merger.merge(
                 session_graph,
-                additive=(self.config.interim_refinement == "off"),
+                resolve_contradictions=self.config.contradiction_detection,
             )
         finally:
             self._enable_gradient_checkpointing()
@@ -1671,13 +1665,13 @@ class ConsolidationLoop:
             )
             # Merge proc_graph into the cumulative graph so its relations
             # reach the unified keying surface (_build_all_edge_entries_into).
-            # Mirrors extract_session(): same additive flag and
+            # Mirrors extract_session(): same resolve_contradictions flag and
             # gradient-checkpointing discipline (CLAUDE.md rule).
             self._disable_gradient_checkpointing()
             try:
                 self.merger.merge(
                     proc_graph,
-                    additive=(self.config.interim_refinement == "off"),
+                    resolve_contradictions=self.config.contradiction_detection,
                 )
             finally:
                 self._enable_gradient_checkpointing()
@@ -2571,10 +2565,9 @@ class ConsolidationLoop:
             # as adapter_name when cap_reached_absorb=True; active_keys_in_tier
             # correctly scopes to that slot's keys — no special-casing needed here.
             #
-            # extra_relations are always populated from merger.graph edges.  Under
-            # interim_refinement="off" the merge was additive (no supersession), so
-            # all pending-session content is present in merger.graph and reaches the
-            # interim keying surface here.
+            # extra_relations are always populated from merger.graph edges.  At every
+            # refinement level all pending-session content is present in merger.graph
+            # and reaches the interim keying surface here.
             _pending_relations: "list[Relation] | None" = None
             import networkx as _nx
 
@@ -2615,6 +2608,10 @@ class ConsolidationLoop:
                 tier=adapter_name,
                 keys=list(self.store.active_keys_in_tier(adapter_name)),
                 extra_relations=_pending_relations,
+                # Recon merge is always old-vs-old (no recency signal at slot recall).
+                resolve_contradictions_recon=False,
+                # Pending merge: NEW supersedes OLD slot when contradiction_detection=True.
+                resolve_contradictions_extra=self.config.contradiction_detection,
             )
             if recall_miss_keys:
                 logger.info(
@@ -2624,10 +2621,13 @@ class ConsolidationLoop:
                     adapter_name,
                 )
 
-            # --- 8c. Refine: SOTA enrichment (level-gated) + recurrence bumps ---
-            # enrich=True only when interim_refinement=="full"; the recurrence-bump
-            # loop inside _refine_consolidation_graph runs regardless of enrich so
-            # Case-1 duplicate-SPO collapses are captured at every merge level.
+            # --- 8c. Refine: normalization (light+) + SOTA enrichment (full only) ---
+            # normalize=True at interim_refinement light+: whole-graph local-model
+            # predicate alignment + entity merge + dedup (time-invariant, local model).
+            # enrich=True only when interim_refinement=="full": cloud-SOTA additive
+            # discovery (HELD at production defaults).
+            # The recurrence-bump loop inside _refine_consolidation_graph runs
+            # regardless of flags so Case-1 duplicate-SPO collapses are always captured.
             # Note on atomicity: bump_recurrence targets ALREADY-REGISTERED keys
             # (Case-1 survivors from the merge); it does NOT register new keys.
             # Bumping a registered key's counter before training is benign — the
@@ -2635,6 +2635,7 @@ class ConsolidationLoop:
             # is re-applied identically on the next cycle (idempotent semantics).
             self._refine_consolidation_graph(
                 recon_relations,
+                normalize=(self.config.interim_refinement != "off"),
                 enrich=(self.config.interim_refinement == "full"),
             )
 
@@ -2834,12 +2835,28 @@ class ConsolidationLoop:
                 self._indexed_next_index += _ep_flushed
                 self._procedural_next_index += _proc_flushed
 
+            # --- Shared soft-stale stage (M5) ---
+            # Consume removal_ledger entries for subtractive removal reasons
+            # (predicate_synonym_collapse, and at interim contradiction_same_pred)
+            # and soft-stale their keys in memory.  MUST run:
+            #   (a) AFTER the deferred store.put loop above (new keys must exist
+            #       in the registry before the stale helper can find and flip them);
+            #   (b) BEFORE commit_tier_slot (the commit serializes the registry;
+            #       staling after the commit means the on-disk slot does NOT carry
+            #       the stale flag → staled keys resurrect as active on boot-preload);
+            #   (c) BEFORE merger.reset_graph() (the finally block below) because
+            #       reset_graph() clears removal_ledger.
+            self._apply_subtractive_removals_to_store(scope="interim")
+
             # --- 12. Persist interim slot ---
             # commit_tier_slot is internally crash-safe (registry-last write is the
             # commit signal; a torn slot is skipped by the boot validator).  The
             # source session is NOT marked consolidated until this method returns
             # successfully (the production caller marks consolidated only after
             # run_consolidation_cycle returns without raising).
+            # The stale mutations from the M5 stage above are already in the
+            # in-memory registry; commit_tier_slot serializes that registry as the
+            # final write, so the on-disk slot carries the correct stale flags.
             # Regression guard: tests/test_post_session_train.py
             # ::TestInterTierCommitRecoverable.
             commit_tier_slot(
@@ -2887,6 +2904,108 @@ class ConsolidationLoop:
             # Clear the keying graph so the next cycle starts empty.
             # Also clears removal_ledger, collapsed, reinforcements.
             self.merger.reset_graph()
+
+    def _apply_subtractive_removals_to_store(
+        self,
+        *,
+        scope: str,
+    ) -> "dict[str, dict[str, dict]]":
+        """Consume ``merger.removal_ledger`` entries and soft-stale their keys.
+
+        This is the shared soft-stale stage (M5) called by BOTH
+        ``run_consolidation_cycle`` (interim) and ``consolidate_interim_adapters``
+        (fold) after every merge that can produce subtractive removals.  The
+        shared body is identical for both scopes; the persist/registry-seed step
+        that follows is scope-specific and stays in the caller.
+
+        **Always-stale reasons (both scopes):**
+        - ``"predicate_synonym_collapse"`` — synonym-predicate collapse from the
+          whole-graph normalization pass (:meth:`_run_graph_normalization`).
+        - ``"semantic_dedup"`` — near-duplicate triple collapse from the normalization
+          pass.
+        - ``"entity_merge"`` — edge incident to a same_as variant node (normalization
+          pass stale+add).
+        - ``"duplicate_merge"`` — key retired by the key-referenced delta merge in the
+          normalization pass; all four are time-invariant: safe to retire at fold and
+          interim.
+
+        At the interim scope, ``"contradiction_same_pred"`` removals are also
+        soft-staled (the OLD slot key is superseded by the NEW pending merge; the
+        recency signal is present).  At the fold scope, ``"contradiction_same_pred"``
+        is structurally absent (contradiction is off at fold), but if any
+        ``"contradiction_same_pred"`` entry were present in the ledger it would
+        NOT be soft-staled here to avoid unsafe cross-predicate removal without a
+        recency signal.
+
+        ``"enrichment_same_as"`` and other retain-only reasons stay in the fold's
+        ``drift_intended_removal`` bucket (handled inline in
+        ``consolidate_interim_adapters``); this helper does NOT soft-stale those.
+
+        Args:
+            scope: ``"interim"`` or ``"fold"``.  At ``"interim"``,
+                ``"contradiction_same_pred"`` entries are soft-staled (NEW
+                supersedes OLD).  At ``"fold"``, ``"predicate_synonym_collapse"``
+                and ``"semantic_dedup"`` entries are soft-staled (both scopes).
+
+        Returns:
+            ``soft_stale_by_tier`` — a per-tier dict mapping staled key strings
+            to ``{"stale_cycles": int, "simhash": int|None}`` records.  Passed
+            by the fold caller to
+            :meth:`_reset_main_tier_registries_and_simhashes` so the rebuilt
+            registry seeds the stale partition.  Interim callers can ignore the
+            return value (``store.discard_keys`` already mutated the in-memory
+            registry; ``commit_tier_slot`` persists it).
+        """
+        _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
+        # Reasons that become soft-stale at both scopes.
+        # predicate_synonym_collapse: synonym-predicate collapse (normalization pass).
+        # semantic_dedup: near-duplicate triple collapse (normalization pass).
+        # entity_merge: edge incident to a same_as variant node (normalization pass).
+        # duplicate_merge: key-delta merge from the key-referenced normalization pass.
+        # All four are time-invariant (safe to stale at fold and interim).
+        _always_stale_reasons = {
+            "predicate_synonym_collapse",
+            "semantic_dedup",
+            "entity_merge",
+            "duplicate_merge",
+        }
+        # Additional reason soft-staled only at the interim scope (NEW supersedes OLD).
+        _interim_only_stale_reasons = {"contradiction_same_pred"}
+
+        soft_stale_by_tier: dict[str, dict[str, dict]] = {}
+
+        for _ik, _entry in list(_ledger.items()):
+            _reason = _entry.get("reason", "")
+            _should_stale = _reason in _always_stale_reasons or (
+                scope == "interim" and _reason in _interim_only_stale_reasons
+            )
+            if not _should_stale:
+                continue
+
+            # LOAD-BEARING ORDERING: resolve tier BEFORE flipping the key stale.
+            # KeyRegistry.stale() removes the key from _active_keys, so
+            # tier_for_active_key() called AFTER the flip returns None.
+            _dk_tier = self.store.tier_for_active_key(_ik)
+            _dk_simhash: int | None = None
+            if _dk_tier is not None:
+                _dk_simhash = self.store.simhash(_dk_tier, _ik)
+
+            # Soft-stale in-memory: registry entry retained, simhash retained.
+            self.store.discard_keys([_ik], mode="stale")
+
+            if _dk_tier is not None:
+                _stale_rec: dict = {"stale_cycles": 0}
+                if _dk_simhash is not None:
+                    _stale_rec["simhash"] = _dk_simhash
+                soft_stale_by_tier.setdefault(_dk_tier, {})[_ik] = _stale_rec
+            logger.info(
+                "subtractive_removal soft-staled key=%s reason=%s scope=%s",
+                _ik,
+                _reason,
+                scope,
+            )
+
+        return soft_stale_by_tier
 
     def _run_graph_enrichment(self) -> dict:
         """Post-merge graph-level SOTA enrichment pass (Task #10).
@@ -3205,6 +3324,361 @@ class ConsolidationLoop:
             "skip_reason": None,
         }
 
+    def _query_model_for_kept_relations(self, edge_list: list[dict]) -> list[dict]:
+        """Invoke the local model to dedup a list of predicate-bearing edges.
+
+        Serializes ``edge_list`` as bare ``subject | predicate | object`` lines,
+        feeds them to the local model using the ``graph_normalization.txt`` prompt
+        (relations-envelope schema), and returns the list of relation dicts the
+        model kept in its ``{"relations": [...]}`` output.
+
+        This helper is factored out of :meth:`_run_graph_normalization` so the
+        caller can hand it different slices of the graph without duplicating the
+        model-invocation machinery.  Batching is NOT implemented here; the caller
+        passes the full edge list for the current scope and this function makes a
+        single model call.
+
+        Args:
+            edge_list: List of edge info dicts, each with keys ``u`` (source node),
+                ``v`` (target node), and ``edata`` (edge attribute dict containing
+                at least ``"predicate"``).
+
+        Returns:
+            List of raw relation dicts as returned by the model (keys: ``subject``,
+            ``predicate``, ``object``).  Returns an empty list on parse failure or
+            model exception.  Relations whose ``(subject, predicate, object)`` triple
+            is not grounded in the input are filtered out by the caller.
+        """
+        import json
+
+        from paramem.evaluation.recall import generate_answer
+        from paramem.graph.extractor import _extract_json_block
+        from paramem.graph.prompts import _load_prompt
+        from paramem.models.loader import adapt_messages
+
+        _norm_prompt = _load_prompt("graph_normalization.txt", "", None)
+        if not _norm_prompt:
+            logger.warning("graph_normalization: prompt file missing — skipping model call")
+            return []
+
+        _system_content = _load_prompt("extraction_system.txt", "", None)
+        if not _system_content:
+            # Inline fallback mirrors extraction_system.txt content.
+            _system_content = (
+                "You are a precise knowledge graph extractor. Output a single raw JSON "
+                "object only. No code fences, no markdown, no wrapping tags, no "
+                "explanatory text before or after the JSON."
+            )
+
+        # Serialize as bare "subject | predicate | object" lines (no index).
+        _fact_lines_text = "\n".join(
+            f"{info['u']} | {info['edata'].get('predicate', '')} | {info['v']}"
+            for info in edge_list
+        )
+
+        try:
+            prompt_text = _norm_prompt.format(fact_lines=_fact_lines_text)
+            messages = adapt_messages(
+                [
+                    {"role": "system", "content": _system_content},
+                    {"role": "user", "content": prompt_text},
+                ],
+                self.tokenizer,
+            )
+            formatted = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            raw_output = generate_answer(
+                self.model,
+                self.tokenizer,
+                formatted,
+                max_new_tokens=512,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "graph_normalization: exception during model call — %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return []
+
+        # Parse using extraction's proven parser (_extract_json_block recognises the
+        # "relations" envelope, tolerates fences/arrays/preamble).
+        try:
+            json_str = _extract_json_block(raw_output)
+            result = json.loads(json_str)
+        except Exception as exc:
+            logger.warning(
+                "graph_normalization: JSON parse failed — %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return []
+
+        relations = result.get("relations", []) if isinstance(result, dict) else []
+        if isinstance(result, list):
+            relations = result
+        return relations if isinstance(relations, list) else []
+
+    def _run_graph_normalization(self) -> dict:
+        """Whole-graph local-model normalization pass (relations-envelope schema).
+
+        Runs after the Materialize stage at refinement level ``light`` or higher,
+        over the cumulative ``merger.graph``.  Unlike :meth:`_run_graph_enrichment`
+        (which uses a cloud SOTA model to ADD new edges), this pass uses the LOCAL
+        model to COLLAPSE synonym predicates on the same ``(subject, object)`` pair.
+
+        Privacy: the graph holds personal facts; LOCAL inference is the default so no
+        personal data is sent to an external API.  The model choice is configured by
+        the presence of ``self.model``; if no model is set the pass is skipped.
+
+        The model receives a bare ``subject | predicate | object`` serialization of ALL
+        predicate-bearing edges and emits the DEDUPLICATED set as a ``{"relations": [...]}``
+        envelope — the same schema as the extraction pipeline.  Only the fields
+        ``subject``, ``predicate``, and ``object`` are read from each relation entry.
+
+        Applied changes — same-(subject, object) collapse only (subtractive, grounded in
+        input):
+
+        1. Group INPUT edges by ``(canonical(subject), canonical(object))``.  Only
+           groups with **2+ distinct predicates** are dedup candidates; single-predicate
+           groups are never touched.
+        2. For each candidate ``(s, o)`` group: collect the predicates the model KEPT
+           for that ``(s, o)`` in its output (canonical-form match; output relations
+           whose ``(s, o)`` or predicate are not in the input are silently discarded).
+        3. If the model kept FEWER predicates than the input had for that ``(s, o)``
+           AND at least one kept predicate is an input predicate for that ``(s, o)``
+           (a survivor exists):
+           a. Union the ``sessions`` and sum the ``recurrence_count`` (and max
+              ``confidence``) of the retired edges onto the survivor edge's attributes
+              BEFORE removal (mirrors the merger Case-1 provenance pattern).
+           b. Retire each non-kept input edge: always ``graph.remove_edge``; write to
+              ``merger.removal_ledger[ik_key]`` ONLY when the edge carries an
+              ``ik_key`` (so keyless edges are retired silently).
+        4. Single-predicate ``(s, o)`` facts are NEVER retired, even if the model
+           omitted them from its output (model omission must not delete a fact).
+        5. Output relations not grounded in the input (hallucinated
+           subject/object/predicate) are silently ignored — no new edges are minted.
+
+        All keyed removals are written to ``self.merger.removal_ledger``, which
+        :meth:`_apply_subtractive_removals_to_store` consumes to soft-stale the
+        corresponding store entries.
+
+        Early-return conditions (all return ``skipped=True``):
+        - No local model available (``self.model is None``).
+        - Graph has fewer than 10 nodes (too little signal).
+        - Prompt file missing (detected inside the model-query helper).
+
+        Returns:
+            Diagnostics dict with keys:
+                - ``groups_collapsed`` (int): number of ``(s, o)`` groups where at
+                  least one synonym predicate was retired.
+                - ``edges_retired`` (int): total edges removed across all groups.
+                - ``chunks`` (int): model calls made (always 1 when not skipped).
+                - ``skipped`` (bool): ``True`` when the pass was bypassed.
+                - ``skip_reason`` (str | None): reason token when skipped.
+        """
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        _empty = {"groups_collapsed": 0, "edges_retired": 0, "chunks": 0}
+
+        if self.model is None:
+            logger.info("graph_normalization: no local model — skipping")
+            return {**_empty, "skipped": True, "skip_reason": "no_model"}
+
+        graph = self.merger.graph
+        node_count = graph.number_of_nodes()
+
+        if node_count < 10:
+            logger.info(
+                "graph_normalization: graph too small (%d nodes < 10 floor) — skipping",
+                node_count,
+            )
+            return {**_empty, "skipped": True, "skip_reason": "floor"}
+
+        # --- Build edge list and per-(s,o) group index ---
+        # Each entry: {u, v, eid, edata, ik_key, can_s, can_o, can_pred}
+        # Groups: (can_s, can_o) -> list of entries with 2+ distinct predicates.
+        _edge_list: list[dict] = []
+        # (can_s, can_o) -> {can_pred -> list of edge_info dicts}
+        _so_groups: dict[tuple, dict[str, list[dict]]] = {}
+
+        for _u, _v, _eid, _edata in graph.edges(keys=True, data=True):
+            _pred = _edata.get("predicate", "")
+            if not _pred:
+                continue
+            _ik = _edata.get(_IK_KEY_ATTR) or None
+            _can_s = canonical(_u)
+            _can_o = canonical(_v)
+            _can_pred = canonical(_pred)
+            _info = {
+                "u": _u,
+                "v": _v,
+                "eid": _eid,
+                "edata": _edata,
+                "ik_key": _ik,
+                "can_s": _can_s,
+                "can_o": _can_o,
+                "can_pred": _can_pred,
+            }
+            _edge_list.append(_info)
+            _so_groups.setdefault((_can_s, _can_o), {}).setdefault(_can_pred, []).append(_info)
+
+        # Filter to groups with 2+ distinct predicates (dedup candidates only).
+        _candidates = {
+            so_key: pred_map for so_key, pred_map in _so_groups.items() if len(pred_map) >= 2
+        }
+
+        if not _candidates:
+            logger.info(
+                "graph_normalization: no multi-predicate (s,o) groups — skipping model call"
+            )
+            return {**_empty, "skipped": False, "skip_reason": None}
+
+        # Disable gradient checkpointing around model.generate() per CLAUDE.md rule.
+        self._disable_gradient_checkpointing()
+        try:
+            raw_relations = self._query_model_for_kept_relations(_edge_list)
+        finally:
+            self._enable_gradient_checkpointing()
+
+        calls_made = 1
+        _debug_raw_relations: list[dict] = list(raw_relations)
+
+        # --- Apply: same-(s,o) collapse only ---
+        # Index the model's kept relations by (can_s, can_o) -> set of can_pred.
+        # Discard any model output relation whose (s,o) pair or predicate is not in
+        # the input (hallucination guard: purely subtractive, grounded in input).
+        _model_kept: dict[tuple, set[str]] = {}
+        for _rel in raw_relations:
+            if not isinstance(_rel, dict):
+                continue
+            _rel_s = canonical(_rel.get("subject", ""))
+            _rel_o = canonical(_rel.get("object", ""))
+            _rel_p = canonical(_rel.get("predicate", ""))
+            if not (_rel_s and _rel_o and _rel_p):
+                continue
+            so_key = (_rel_s, _rel_o)
+            # Discard if (s,o) group not in input OR predicate not in that group.
+            if so_key not in _so_groups:
+                continue
+            if _rel_p not in _so_groups[so_key]:
+                continue
+            _model_kept.setdefault(so_key, set()).add(_rel_p)
+
+        total_edges_retired = 0
+        total_groups_collapsed = 0
+
+        for so_key, pred_map in _candidates.items():
+            kept_preds = _model_kept.get(so_key, set())
+
+            # Determine which input predicates were NOT kept by the model.
+            all_input_preds = set(pred_map.keys())
+            retired_preds = all_input_preds - kept_preds
+
+            # Non-breaking guarantee: if model kept nothing (or returned nothing for
+            # this (s,o)), skip the group — do not delete all facts.
+            if not kept_preds:
+                logger.debug(
+                    "graph_normalization: model kept no predicates for (%r, %r) — group skipped",
+                    so_key[0],
+                    so_key[1],
+                )
+                continue
+
+            # Genuine collapse: fewer predicates kept than input had.
+            if not retired_preds:
+                continue  # model kept all input predicates — nothing to retire
+
+            # At least one survivor exists (kept_preds ∩ all_input_preds is non-empty,
+            # verified above).  Pick the first kept predicate's first edge as survivor
+            # for provenance union target.
+            _survivor_pred = next(iter(kept_preds & all_input_preds))
+            _survivor_edges = pred_map[_survivor_pred]
+            _survivor_edata = _survivor_edges[0]["edata"]
+
+            # Union provenance from retired edges onto the survivor BEFORE removal.
+            _surv_sessions: list[str] = list(_survivor_edata.get("sessions", []))
+            _surv_recurrence: int = _survivor_edata.get("recurrence_count", 1)
+            _surv_confidence: float = _survivor_edata.get("confidence", 0.0)
+
+            for _ret_pred in retired_preds:
+                for _ret_info in pred_map[_ret_pred]:
+                    for _sid in _ret_info["edata"].get("sessions", []):
+                        if _sid not in _surv_sessions:
+                            _surv_sessions.append(_sid)
+                    _surv_recurrence += _ret_info["edata"].get("recurrence_count", 1)
+                    _surv_confidence = max(
+                        _surv_confidence, _ret_info["edata"].get("confidence", 0.0)
+                    )
+
+            # Write unioned provenance back onto the survivor edge.
+            _survivor_edata["sessions"] = _surv_sessions
+            _survivor_edata["recurrence_count"] = _surv_recurrence
+            _survivor_edata["confidence"] = _surv_confidence
+
+            # Retire each non-kept edge.
+            group_retired = 0
+            for _ret_pred in retired_preds:
+                for _ret_info in pred_map[_ret_pred]:
+                    _ret_ik = _ret_info["ik_key"]
+                    if _ret_ik:
+                        self.merger.removal_ledger[_ret_ik] = {
+                            "reason": "duplicate_merge",
+                            "merged_into": _survivor_pred,
+                        }
+                    try:
+                        graph.remove_edge(_ret_info["u"], _ret_info["v"], _ret_info["eid"])
+                    except Exception as _re:
+                        logger.warning(
+                            "graph_normalization: remove_edge failed for (%r, %r, pred=%r): %s",
+                            _ret_info["u"],
+                            _ret_info["v"],
+                            _ret_pred,
+                            _re,
+                        )
+                        continue
+                    logger.info(
+                        "graph_normalization: retired (%r, %r, %r) → survivor predicate=%r",
+                        _ret_info["u"],
+                        _ret_info["v"],
+                        _ret_pred,
+                        _survivor_pred,
+                    )
+                    group_retired += 1
+
+            if group_retired:
+                total_groups_collapsed += 1
+                total_edges_retired += group_retired
+
+        logger.info(
+            "graph_normalization: groups_collapsed=%d edges_retired=%d",
+            total_groups_collapsed,
+            total_edges_retired,
+        )
+
+        _applied = {
+            "groups_collapsed": total_groups_collapsed,
+            "edges_retired": total_edges_retired,
+        }
+        # Route raw relations + applied counts through the debug-snapshot writer so
+        # personal facts stay out of the system journal (self-gated by save_cycle_snapshots).
+        self._debug_writer.on_normalization(
+            [],
+            [{"relations": _debug_raw_relations}],
+            _applied,
+        )
+
+        return {
+            **_applied,
+            "chunks": calls_made,
+            "skipped": False,
+            "skip_reason": None,
+        }
+
     def consolidate_interim_to_canonical_graph(self, *, housekeeping: bool = False) -> dict:
         """Full-cycle consolidation for simulate mode: merge interim graph.json sidecars.
 
@@ -3224,10 +3698,10 @@ class ConsolidationLoop:
         - **sink**: write ``graph.json`` (``save_memory_to_disk``) vs retrain adapters.
 
         The cross-slot merge routes through
-        ``self.merger.merge(_synthetic_session, additive=True)`` so
+        ``self.merger.merge(_synthetic_session, resolve_contradictions=False)`` so
         ``canonical()`` + Case-1/Case-2 dedup apply identically to the train fold.
-        ``additive=True`` skips the model-gated Case-2 branch, so no model is
-        required (the simulate merger typically holds ``model=None``).
+        ``resolve_contradictions=False`` skips the model-gated Case-2 branch, so no
+        model is required (the simulate merger typically holds ``model=None``).
 
         Args:
             housekeeping: When ``True``, bypass the empty-interim-slot noop so the
@@ -3239,7 +3713,8 @@ class ConsolidationLoop:
 
         1. Reset the merger and build ``Relation`` objects from the disk-loaded canonical
            graph AND every interim ``graph.json`` slot, then merge them via
-           ``self.merger.merge(additive=True)`` — the same topology the train fold uses.
+           ``self.merger.merge(resolve_contradictions=False)`` — the same topology the
+           train fold uses.
         2. Optional SOTA enrichment (same guard as ``consolidate_interim_adapters``).
            Runs AFTER the merge on the freshly-merged ``self.merger.graph``, mirroring
            the train fold's re-merge → enrichment ordering.
@@ -3345,16 +3820,18 @@ class ConsolidationLoop:
                     interim_dir,
                 )
 
-            # Merge through the unified builder (model-free — additive=True skips
-            # the only model-gated Case-2 branch; canonical() + Case-1 dedup are
-            # deterministic).  _merge_registry_relations synthesises speaker
-            # entities via _synth_speaker_entities so person nodes carry
-            # speaker_id — the same path the train fold uses.
+            # Merge through the unified builder.  resolve_contradictions=False
+            # (simulate is old-vs-old, no recency signal — mirrors the fold).
+            # canonical() + Case-1 dedup are deterministic.
+            # _merge_registry_relations synthesises speaker entities via
+            # _synth_speaker_entities so person nodes carry speaker_id — the same
+            # path the train fold uses.
             if _all_relations:
                 self._merge_registry_relations(
                     _all_relations,
                     session_id="__simulate_consolidation_merge__",
                     log_label="relations via GraphMerger",
+                    resolve_contradictions=False,
                 )
                 logger.info(
                     "consolidate_interim_to_canonical_graph: merged %d relations"
@@ -3368,24 +3845,35 @@ class ConsolidationLoop:
             # Debug: snapshot the merged graph.  Self-gated.
             self._debug_writer.on_fold_graph(self.merger, label="merged")
 
-            # --- Optional SOTA graph enrichment ---
-            # Runs AFTER the merge on the freshly-merged self.merger.graph, mirroring
-            # the train fold's re-merge → enrichment ordering so both modes apply the
-            # same grooming topology.  The external/SOTA boundary is handled inside
-            # _run_graph_enrichment (per-chunk except catches network errors), so a
-            # network failure degrades gracefully there.  A programming error here
-            # propagates and aborts the fold — correct behaviour, same as train.
-            _enrichment_result = self._run_graph_enrichment()
-            if not _enrichment_result.get("skipped"):
-                logger.info(
-                    "consolidate_interim_to_canonical_graph: graph_enrichment complete:"
-                    " chunks=%d new_edges=%d same_as_merges=%d",
-                    _enrichment_result.get("chunks", 0),
-                    _enrichment_result.get("new_edges", 0),
-                    _enrichment_result.get("same_as_merges", 0),
-                )
+            # --- Optional normalization + SOTA graph enrichment ---
+            # Mirrors the train fold path (_refine_consolidation_graph):
+            #   normalize: fold_refinement != "off" (light+, local model, predicate align + dedup)
+            #   enrich:    fold_refinement == "full" (cloud-SOTA additive discovery, HELD)
+            # Normalization runs FIRST, enrichment after, matching the train fold's ordering.
+            if self.config.fold_refinement != "off":
+                _norm_result = self._run_graph_normalization()
+                if not _norm_result.get("skipped"):
+                    logger.info(
+                        "consolidate_interim_to_canonical_graph: graph_normalization complete:"
+                        " chunks=%d groups_collapsed=%d edges_retired=%d",
+                        _norm_result.get("chunks", 0),
+                        _norm_result.get("groups_collapsed", 0),
+                        _norm_result.get("edges_retired", 0),
+                    )
 
-            # Debug: snapshot the enriched graph (after SOTA enrichment).  Self-gated.
+            _enrichment_result: dict = {}
+            if self.config.fold_refinement == "full":
+                _enrichment_result = self._run_graph_enrichment()
+                if not _enrichment_result.get("skipped"):
+                    logger.info(
+                        "consolidate_interim_to_canonical_graph: graph_enrichment complete:"
+                        " chunks=%d new_edges=%d same_as_merges=%d",
+                        _enrichment_result.get("chunks", 0),
+                        _enrichment_result.get("new_edges", 0),
+                        _enrichment_result.get("same_as_merges", 0),
+                    )
+
+            # Debug: snapshot the enriched graph (after normalization + enrichment).  Self-gated.
             self._debug_writer.on_fold_graph(self.merger, label="enriched")
 
             # When housekeeping=True, ALWAYS persist the enriched graph back to disk —
@@ -4140,6 +4628,7 @@ class ConsolidationLoop:
         *,
         session_id: str,
         log_label: str,
+        resolve_contradictions: bool = False,
     ) -> None:
         """Build a synthetic :class:`SessionGraph` from *relations* and merge it.
 
@@ -4162,10 +4651,9 @@ class ConsolidationLoop:
         bug: relations with ``speaker_id`` set produced person nodes that became
         concepts with no ``speaker_id`` because ``entities=[]`` was passed directly.
 
-        The gradient-checkpointing guard is conditional on ``self.model`` being
-        present.  Simulate callers may omit the model entirely (model-free paths);
-        ``additive=True`` skips the model-gated branch regardless, so the guard is
-        defensive-only for those callers.
+        The gradient-checkpointing guard fires when ``resolve_contradictions`` is
+        True and a model is present — the contradiction path calls
+        ``model.generate()``.  Simulate callers may omit the model entirely.
 
         Returns early without side effects when *relations* is empty.
 
@@ -4178,6 +4666,11 @@ class ConsolidationLoop:
                 logging/debugging.
             log_label: Human-readable label for the count log line, e.g.
                 ``"reconstructed triples"`` or ``"extra (pending-session) relations"``.
+            resolve_contradictions: Forwarded to
+                :meth:`~paramem.graph.merger.GraphMerger.merge`.  Default
+                ``False`` (fold recon path — old-vs-old, no recency signal).
+                Set ``True`` for the interim pending-session merge where NEW
+                supersedes OLD.
         """
         if not relations:
             return
@@ -4188,19 +4681,19 @@ class ConsolidationLoop:
             entities=entities,
             relations=relations,
         )
-        # Disable gradient checkpointing: merger.merge may call model.generate()
-        # for contradiction resolution when a model is present (CLAUDE.md rule
-        # applies to ANY model.generate() site).  Guard is conditional so that
-        # simulate callers where self.model is absent or None (model-free paths)
-        # do not crash — additive=True already skips the model-gated branch, so
-        # the guard is defensive-only for those callers.
+        # The gradient-checkpointing guard fires when resolve_contradictions is
+        # True and a model is present — the contradiction path calls model.generate().
         _has_model = getattr(self, "model", None) is not None
-        if _has_model:
+        _needs_guard = _has_model and resolve_contradictions
+        if _needs_guard:
             self._disable_gradient_checkpointing()
         try:
-            self.merger.merge(_session, additive=True)
+            self.merger.merge(
+                _session,
+                resolve_contradictions=resolve_contradictions,
+            )
         finally:
-            if _has_model:
+            if _needs_guard:
                 self._enable_gradient_checkpointing()
         logger.info(
             "_materialize_consolidation_graph: re-merged %d %s into keying graph",
@@ -4214,6 +4707,8 @@ class ConsolidationLoop:
         tier: "str | None" = None,
         keys: "list[str] | None" = None,
         extra_relations: "list[Relation] | None" = None,
+        resolve_contradictions_recon: bool = False,
+        resolve_contradictions_extra: bool = False,
     ) -> "tuple[set[str], list[Relation]]":
         """Reconstruct active keys from adapter weights and re-merge registry-true relations.
 
@@ -4230,9 +4725,11 @@ class ConsolidationLoop:
            :meth:`_build_registry_true_relations` and re-merge them into the fresh
            keying graph inside a gradient-checkpointing guard.
         5. If ``extra_relations`` is supplied and non-empty, re-merge those relations
-           into the fresh keying graph (additive, inside the same gradient-checkpointing
-           guard).  This allows the interim mini-fold to inject the current cycle's
-           pending-session relations alongside the slot's recalled registry-true keys.
+           into the fresh keying graph (see *resolve_contradictions_extra*).  This
+           allows the interim mini-fold to inject the current cycle's pending-session
+           relations alongside the slot's recalled registry-true keys.  At interim,
+           merge order (slot first, pending second) encodes recency: the NEW pending
+           supersedes the OLD slot when ``resolve_contradictions_extra=True``.
         6. Emit debug snapshots ("reconstructed" before re-merge, "merged" after).
 
         **INVARIANT — extra_relations and the recall-miss set:**
@@ -4271,6 +4768,15 @@ class ConsolidationLoop:
                 this method (since the reset inside will wipe them) and passes them
                 here so they survive the reset and co-reside with the slot's
                 recalled facts.  The fold caller passes ``None`` (no-op).
+            resolve_contradictions_recon: Forwarded to
+                :meth:`_merge_registry_relations` for the registry-true recon
+                merge.  Always ``False`` (old-vs-old, no recency signal).  Named
+                explicitly so the caller's intent is readable at the call site.
+            resolve_contradictions_extra: Forwarded to
+                :meth:`_merge_registry_relations` for the ``extra_relations``
+                (pending-session) merge.  At interim this should match
+                ``config.contradiction_detection`` because NEW pending supersedes
+                OLD slot.  Ignored when ``extra_relations`` is empty.
 
         Returns:
             A 2-tuple ``(recall_miss_keys, recon_relations)`` where:
@@ -4364,9 +4870,9 @@ class ConsolidationLoop:
         # Each relation carries its indexed_key so the key travels through
         # GraphMerger.merge() onto the merged edge (provenance keying).
         #
-        # additive=True (fold-only): the merger never removes a registered edge during
-        # the re-merge.  All registry-true keys coexist after the fold regardless
-        # of same-(s,p)/different-o conflicts; REPLACE cardinality is skipped.
+        # resolve_contradictions=False (fold-only): the merger never removes a registered
+        # edge during the re-merge.  All registry-true keys coexist after the fold
+        # regardless of same-(s,p)/different-o conflicts; REPLACE cardinality is skipped.
         # Two registry keys sharing identical (s,p,o) STILL fire Case-1 (the merger
         # identity is correct given correct inputs), and the collapsed key is recorded
         # in merger.collapsed.  The drift-partition step below soft-stales that key.
@@ -4381,10 +4887,12 @@ class ConsolidationLoop:
         # extra-relations path below) so reconstructed person nodes receive
         # entity_type="person" + speaker_id from bookkeeping.  Before unification
         # this block used entities=[] → concept nodes with no speaker_id.
+        # resolve_contradictions_recon is always False (old-vs-old, no recency).
         self._merge_registry_relations(
             recon_relations,
             session_id="__full_consolidation_recon__",
             log_label="reconstructed triples",
+            resolve_contradictions=resolve_contradictions_recon,
         )
 
         # --- Re-merge extra_relations (interim mini-fold pending-session content) ---
@@ -4392,10 +4900,13 @@ class ConsolidationLoop:
         # They are NOT included in recall_miss_keys (computed above, before the reset).
         # extra_relations=None and extra_relations=[] are both valid no-ops (fold caller
         # passes None; interim passes the pending-session relations from merger.graph).
+        # resolve_contradictions_extra: at interim NEW pending supersedes OLD slot
+        # (merge order encodes recency); at fold extra_relations=None so this is a no-op.
         self._merge_registry_relations(
             extra_relations or [],
             session_id="__interim_pending_sessions__",
             log_label="extra (pending-session) relations",
+            resolve_contradictions=resolve_contradictions_extra,
         )
 
         # Debug: snapshot the merged graph (after re-merge, before enrichment).
@@ -4406,24 +4917,32 @@ class ConsolidationLoop:
         return recall_miss_keys, recon_relations
 
     def _refine_consolidation_graph(
-        self, recon_relations: "list[Relation]", *, enrich: bool = True
+        self,
+        recon_relations: "list[Relation]",
+        *,
+        normalize: bool = False,
+        enrich: bool = False,
     ) -> None:
-        """Run graph enrichment and recurrence bumps after the Materialize stage.
+        """Run graph normalization, enrichment, and recurrence bumps after the Materialize stage.
 
         This is the *Refine* stage of the fold pipeline:
 
-        1. Optionally run SOTA graph enrichment via :meth:`_run_graph_enrichment`,
-           which mutates ``self.merger.graph`` in place.  Enrichment is skipped
-           when *enrich* is ``False`` (interim path under ``light`` or ``off``
-           refinement level).
-        2. Emit a debug snapshot ("enriched") after enrichment (or immediately
-           when *enrich* is ``False``).
-        3. If ``recon_relations`` is non-empty, scan ``merger.reinforcements`` for
+        1. Optionally run the whole-graph local-model normalization pass via
+           :meth:`_run_graph_normalization` (predicate alignment + entity merge +
+           semantic dedup).  Runs when *normalize* is ``True`` (level ``light``
+           or ``full`` at both interim and fold scopes).  Uses the local model;
+           no cloud dependency.
+        2. Optionally run SOTA graph enrichment via :meth:`_run_graph_enrichment`
+           (additive second-order discovery).  Runs when *enrich* is ``True``
+           (level ``full`` only).  Cloud dependency; HELD at production defaults.
+        3. Emit a debug snapshot ("enriched") after the refine step (or immediately
+           when both stages are skipped at level ``off``).
+        4. If ``recon_relations`` is non-empty, scan ``merger.reinforcements`` for
            Case-1 duplicate-SPO collapses and call
            :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
-           surviving key.  The recurrence-bump runs regardless of *enrich* — it
-           reflects duplicate-SPO collapses from the merge, which happen at every
-           level that merges.
+           surviving key.  The recurrence-bump runs regardless of *normalize* or
+           *enrich* — it reflects duplicate-SPO collapses from the merge, which
+           happen at every level that merges.
 
         Args:
             recon_relations: The list of registry-true :class:`Relation` objects
@@ -4431,21 +4950,36 @@ class ConsolidationLoop:
                 as a boolean guard — when empty, the recurrence-bump loop is
                 skipped (no re-merge was performed so ``merger.reinforcements``
                 will be empty too).
-            enrich: When ``True`` (the default), run ``_run_graph_enrichment``
-                before the recurrence-bump.  The full fold always passes the
-                default.  The interim path passes ``enrich=(interim_refinement
-                == "full")`` so SOTA enrichment is level-gated.
+            normalize: When ``True``, run :meth:`_run_graph_normalization`
+                (local-model predicate alignment + entity merge + dedup).
+                Callers pass ``normalize=(level != "off")`` for both scopes.
+                Default ``False`` (level ``off``).
+            enrich: When ``True``, run :meth:`_run_graph_enrichment` (cloud-SOTA
+                additive discovery).  Callers pass ``enrich=(level == "full")``.
+                Default ``False`` (HELD at production defaults).
         """
-        # --- Graph-level SOTA enrichment ---
-        # Runs AFTER the re-merge so enrichment operates on the populated
-        # reconstructed graph (not an empty one).  Under production defaults the
-        # pre-fold graph was always empty, so enrichment silently skipped every cycle
-        # at the node_count<10 floor; now it fires on the reconstructed knowledge.
-        # Mutates self.merger.graph in place.  The external/SOTA boundary is handled
-        # inside _run_graph_enrichment (per-chunk except catches network errors and
-        # continues), so a network failure degrades gracefully there.  A programming
-        # error here propagates and aborts the fold (sessions stay pending/retriable),
-        # which is correct — better than silently dropping all enrichment.
+        # --- Whole-graph local-model normalization (predicate align + entity merge + dedup) ---
+        # Runs at level light+ for BOTH interim and fold scopes (time-invariant).
+        # The local model sees the full merged graph and collapses synonym predicates,
+        # confirms entity merges, and deduplicates near-duplicate triples.
+        # Removals flow into merger.removal_ledger and are consumed by
+        # _apply_subtractive_removals_to_store after this method returns.
+        if normalize:
+            norm_result = self._run_graph_normalization()
+            if not norm_result.get("skipped"):
+                logger.info(
+                    "graph_normalization complete: chunks=%d groups_collapsed=%d edges_retired=%d",
+                    norm_result.get("chunks", 0),
+                    norm_result.get("groups_collapsed", 0),
+                    norm_result.get("edges_retired", 0),
+                )
+
+        # --- Graph-level SOTA enrichment (additive, cloud, HELD) ---
+        # Runs AFTER normalization so enrichment operates on the already-normalized
+        # graph.  The external/SOTA boundary is handled inside _run_graph_enrichment
+        # (per-chunk except catches network errors and continues), so a network
+        # failure degrades gracefully there.  A programming error here propagates
+        # and aborts the fold (sessions stay pending/retriable) — correct behaviour.
         # Enrichment-added edges are keyless and are picked up by the pre-pass that
         # runs after inline-promotion.
         if enrich:
@@ -4458,8 +4992,8 @@ class ConsolidationLoop:
                     enrichment_result.get("same_as_merges", 0),
                 )
 
-        # Debug: snapshot the enriched graph (after SOTA enrichment, or immediately
-        # when enrichment is skipped at this level).
+        # Debug: snapshot the refined graph (after normalization + enrichment, or
+        # immediately when both are skipped at level off).
         # Self-gated; no-op when save_cycle_snapshots=False.
         self._debug_writer.on_fold_graph(self.merger, label="enriched")
 
@@ -4620,8 +5154,18 @@ class ConsolidationLoop:
         # save-fail-raise, and normal success) so it never leaks into the next cycle.
         # The finally re-raises unchanged — not error suppression.
         try:
-            recall_miss_keys, recon_relations = self._materialize_consolidation_graph()
-            self._refine_consolidation_graph(recon_relations)
+            recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
+                # Fold: recon is old-vs-old (no recency, contradiction structurally off).
+                resolve_contradictions_recon=False,
+                # Fold: no extra_relations (pending sessions were extracted before the
+                # fold; they are part of the interim slots, not a separate set here).
+                resolve_contradictions_extra=False,
+            )
+            self._refine_consolidation_graph(
+                recon_relations,
+                normalize=(self.config.fold_refinement != "off"),
+                enrich=(self.config.fold_refinement == "full"),
+            )
 
             # --- Inline promotion: move matured episodic keys to semantic ---
             # Runs AFTER the recurrence-bump step (so bump-triggered threshold crossings
@@ -4890,9 +5434,10 @@ class ConsolidationLoop:
                 }
 
             # Compute drift: active keys with no surviving merged edge after the fold.
-            # Under additive fold, a key drifts iff its recon edge was absent (recon
-            # failure) — REPLACE cardinality is skipped at fold time so it can never
-            # remove a registered edge.  No triple-identity matching — provenance from
+            # With resolve_contradictions=False at fold, a key drifts iff its recon
+            # edge was absent (recon failure) — REPLACE cardinality is skipped at fold
+            # time so it can never remove a registered edge.  No triple-identity
+            # matching — provenance from
             # the merged edge is the sole authority.
             # serve_assignment is the authoritative served layout; train_assignment may
             # contain additional graduating keys in episodic's training set but those
@@ -4908,6 +5453,15 @@ class ConsolidationLoop:
                 _sbk = self.store.bookkeeping_for_key(_surviving_key)
                 if _sbk is not None:
                     _sbk["last_seen_cycle"] = self.cycle_count
+
+            # --- Shared soft-stale stage (M5 / M6) ---
+            # Consume removal_ledger entries for predicate_synonym_collapse (and at
+            # interim also contradiction_same_pred) and soft-stale their keys BEFORE
+            # the drift partition reads active_keys.  Keys staled here are removed
+            # from _active_keys, so they do NOT appear in _drift_keys and are NOT
+            # bucketed into drift_intended_removal — that is the M6 reclassification.
+            # The returned soft_stale_by_tier feeds the registry rebuild below.
+            _subtractive_stale_by_tier = self._apply_subtractive_removals_to_store(scope="fold")
 
             active_keys = self.store.all_active_keys()
             _drift_keys = [k for k in active_keys if k not in _all_keyed]
@@ -4945,7 +5499,11 @@ class ConsolidationLoop:
             # Per-tier dict capturing soft-staled keys for
             # _reset_main_tier_registries_and_simhashes.
             # Maps tier -> {key: {"stale_since": ISO, "stale_cycles": int, "simhash": int|None}}.
-            soft_stale_by_tier: dict[str, dict[str, dict]] = {}
+            # Seeded from _subtractive_stale_by_tier (M6-reclassified keys from the
+            # shared helper above); the drift loop below adds the dedup-collapsed keys.
+            soft_stale_by_tier: dict[str, dict[str, dict]] = {
+                tier: dict(entries) for tier, entries in _subtractive_stale_by_tier.items()
+            }
 
             for _dk in _drift_keys:
                 if _dk in _collapsed_set:

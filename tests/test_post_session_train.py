@@ -139,14 +139,11 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     _real_graph.add_node("object2", attributes={"name": "Object2"})
     _real_graph.add_edge("subject2", "object2", predicate="knows", relation_type="factual")
     loop.merger.graph = _real_graph
-    # Graph-enrichment knobs (Task #10). Hook fires inside the normal
-    # fresh-interim branch; default to disabled for these unit tests so the
+    # Graph-enrichment knobs. Default to disabled for these unit tests so the
     # hook stays inert and we don't need to stub _run_graph_enrichment.
     loop.graph_enrichment_enabled = False
     loop.graph_enrichment_neighborhood_hops = 2
     loop.graph_enrichment_max_entities_per_pass = 50
-    loop.graph_enrichment_interim_enabled = False
-    loop.graph_enrichment_min_triples_floor = 20
 
     # Stub out the recall probe so tests with a MagicMock model do not
     # feed it into re.sub (which raises TypeError on non-string input).

@@ -164,8 +164,6 @@ def create_consolidation_loop(
         graph_enrichment_enabled=config.consolidation.graph_enrichment_enabled,
         graph_enrichment_neighborhood_hops=config.consolidation.graph_enrichment_neighborhood_hops,
         graph_enrichment_max_entities_per_pass=config.consolidation.graph_enrichment_max_entities_per_pass,
-        graph_enrichment_interim_enabled=config.consolidation.graph_enrichment_interim_enabled,
-        graph_enrichment_min_triples_floor=config.consolidation.graph_enrichment_min_triples_floor,
         # Same `cloud_scope` knob as inference-time cloud egress: the SOTA
         # enrichment cycle sends placeholders to the cloud just like the
         # cloud_anonymizer egress path, so the privacy policy must match.

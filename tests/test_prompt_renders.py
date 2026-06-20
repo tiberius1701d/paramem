@@ -156,3 +156,44 @@ class TestProceduralPromptRender:
         )
         assert "person" in rendered
         assert "preference" in rendered
+
+
+class TestGraphNormalizationPromptRender:
+    """The whole-graph normalization prompt is .format()-ed with fact_lines at
+    runtime (consolidation._run_graph_normalization).  Its JSON example literals
+    MUST be double-escaped ({{ }}) or .format() raises KeyError on the first
+    '{"relations"' token (regression guard).  Only {fact_lines} is a format field."""
+
+    def _load(self):
+        from paramem.graph.prompts import _load_prompt
+
+        return _load_prompt("graph_normalization.txt", "", None)
+
+    def test_renders_without_exception(self):
+        prompt = self._load()
+        assert prompt, "graph_normalization.txt must exist and be non-empty"
+        # Must not raise KeyError (the {"relations"} brace-escape regression).
+        rendered = prompt.format(fact_lines="[0]: A | x | B")
+        assert isinstance(rendered, str)
+
+    def test_only_expected_format_fields(self):
+        import string
+
+        prompt = self._load()
+        fields = {f for _, f, _, _ in string.Formatter().parse(prompt) if f}
+        assert fields == {"fact_lines"}, (
+            f"Unexpected format fields (JSON braces likely unescaped): {sorted(fields)}"
+        )
+
+    def test_json_examples_render_to_valid_single_brace(self):
+        prompt = self._load()
+        rendered = prompt.format(fact_lines="A | x | B")
+        # The escaped relations envelope collapses to real single-brace JSON.
+        assert '{"relations":' in rendered
+        assert "A | x | B" in rendered
+
+    def test_no_leftover_placeholders(self):
+        prompt = self._load()
+        rendered = prompt.format(fact_lines="[0]: A | x | B")
+        leftover = _LEFTOVER_PLACEHOLDER.findall(rendered)
+        assert leftover == [], f"Leftover placeholders after render: {leftover}"

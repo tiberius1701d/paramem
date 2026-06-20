@@ -188,38 +188,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.training.consolidation",
             "serialize_subgraph_triples",
         ),
-        # smoke_interim_rollover_enrichment.py
-        (
-            "experiments/smoke_interim_rollover_enrichment.py",
-            "paramem.graph.extraction_pipeline",
-            "ExtractionConfig",
-        ),
-        (
-            "experiments/smoke_interim_rollover_enrichment.py",
-            "paramem.graph.extraction_pipeline",
-            "ExtractionPipeline",
-        ),
-        (
-            "experiments/smoke_interim_rollover_enrichment.py",
-            "paramem.training.consolidation",
-            "ConsolidationLoop",
-        ),
-        # smoke_interim_rollover_live_gpu.py
-        (
-            "experiments/smoke_interim_rollover_live_gpu.py",
-            "paramem.models.loader",
-            "load_base_model",
-        ),
-        (
-            "experiments/smoke_interim_rollover_live_gpu.py",
-            "paramem.server.config",
-            "load_server_config",
-        ),
-        (
-            "experiments/smoke_interim_rollover_live_gpu.py",
-            "paramem.server.consolidation",
-            "create_consolidation_loop",
-        ),
         # smoke_procedural_mlp.py
         ("experiments/smoke_procedural_mlp.py", "paramem.models.loader", "load_base_model"),
         ("experiments/smoke_procedural_mlp.py", "paramem.server.config", "ServerConfig"),

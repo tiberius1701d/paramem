@@ -4,11 +4,11 @@ Contradiction resolution:
 - Same-predicate, different-object cardinality resolution: the model returns one of two
   verdicts (COEXIST / REPLACE) for each same-(subject, predicate)/different-object pair.
   Cardinality judgment is cached per predicate (one model call per unique predicate).
-  Active whenever a model is present; unaffected by ``cross_predicate_contradiction``.
+  Active whenever a model is present and ``resolve_contradictions=True``.
 - COEXIST: both values are independent and multi-valued; keep both edges.
 - REPLACE: new value supersedes old (single-valued predicate); old edge removed.
-  At fold time (``additive=True``), REPLACE is skipped — folds are purely additive and
-  never remove a registered edge.
+  With ``resolve_contradictions=False`` (fold-only path), REPLACE is skipped — the
+  fold is old-vs-old consolidation with no recency signal, so no edge is removed.
 - Cross-predicate contradiction detection (REPLACE across different predicates):
   OFF by default (``cross_predicate_contradiction=False``) because it over-removes
   legitimate multi-valued and independent facts (observed over-removing valid facts in live use).
@@ -300,7 +300,7 @@ class GraphMerger:
         # reset_graph(), NOT in merge() — must survive the fold's
         # reset_graph→re-merge→enrich→classify span.
         # reason ∈ {"dedup", "contradiction_same_pred", "contradiction_cross_pred",
-        #            "enrichment_same_as"}
+        #            "enrichment_same_as", "predicate_synonym_collapse", "semantic_dedup"}
         self.removal_ledger: dict[str, dict] = {}
         # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
         self._predicate_cardinality: dict[str, bool] = {}
@@ -311,18 +311,26 @@ class GraphMerger:
             "merger_contradiction.txt", _CONTRADICTION_PROMPT, _pd
         )
 
-    def merge(self, session_graph: SessionGraph, *, additive: bool = False) -> nx.MultiDiGraph:
+    def merge(
+        self,
+        session_graph: SessionGraph,
+        *,
+        resolve_contradictions: bool = True,
+    ) -> nx.MultiDiGraph:
         """Merge a session graph into the cumulative graph.
 
         Args:
             session_graph: The per-session graph to merge in.
-            additive: When ``True`` (fold-only path), Case-2 same-predicate
-                cardinality resolution is short-circuited — no model call, no
-                edge removal.  Every reconstructed edge is inserted as a new
-                edge regardless of existing same-(subject, predicate) edges.
-                This makes full-consolidation folds purely additive and lossless
-                with respect to registered edges.  Defaults to ``False`` so
-                normal per-session live-ingest REPLACE is unaffected.
+            resolve_contradictions: When ``True`` (default), Case-2
+                same-predicate/different-object cardinality resolution fires
+                when a model is present — the model returns COEXIST or REPLACE,
+                and REPLACE removes the superseded edge.  Applied at ingest and
+                interim cycles where a NEW-vs-OLD temporal partition supplies the
+                recency signal (new statement supersedes older).
+                When ``False`` (fold-only path), Case-2 is short-circuited — no
+                model call, no edge removal.  The fold operates on old-vs-old
+                stored knowledge with no recency signal, so contradiction
+                detection is structurally off until per-edge timestamps land.
 
         Returns the updated cumulative graph.
 
@@ -392,7 +400,14 @@ class GraphMerger:
                         node_attrs["name"] = _endpoint_display[name]
                         self.graph.nodes[name]["attributes"] = node_attrs
 
-            self._upsert_relation(subject, obj, relation, session_id, timestamp, additive=additive)
+            self._upsert_relation(
+                subject,
+                obj,
+                relation,
+                session_id,
+                timestamp,
+                resolve_contradictions=resolve_contradictions,
+            )
 
         logger.info(
             "Merged session %s: graph now has %d nodes, %d edges",
@@ -566,7 +581,7 @@ class GraphMerger:
         session_id: str,
         timestamp: str,
         *,
-        additive: bool = False,
+        resolve_contradictions: bool = True,
     ) -> None:
         """Insert or update a relation edge.
 
@@ -577,15 +592,15 @@ class GraphMerger:
            the incoming ``relation.indexed_key`` is set, adopt the key onto the
            existing edge (fold-only provenance carry-through).
         2. Same (subject, predicate) but different object — 2-way cardinality
-           resolution when a model is present and ``additive=False`` (live ingest):
+           resolution when a model is present and ``resolve_contradictions=True``
+           (ingest and interim paths where new supersedes old):
 
            - ``COEXIST``: both values are independent; both edges kept.
            - ``REPLACE``: new value supersedes old; old edge removed.
 
-           When ``additive=True`` (fold-only), Case-2 is short-circuited: no
-           model call, no edge removal.  The incoming edge is inserted as a new
-           edge (Case 3) so folds are purely additive and never remove a
-           registered edge.
+           When ``resolve_contradictions=False`` (fold-only), Case-2 is
+           short-circuited: no model call, no edge removal.  The fold operates
+           on old-vs-old stored knowledge with no recency signal.
 
            Cardinality (COEXIST vs REPLACE axis) is cached per predicate.
         3. New (subject, predicate, object) — net-new edge insertion.  The
@@ -680,14 +695,16 @@ class GraphMerger:
             return None
 
         # --- Case 2: Same-predicate, different-object cardinality resolution ---
-        # At live ingest (additive=False): ask the model for a 2-way verdict
-        # (COEXIST / REPLACE).  Cardinality judgment is cached per predicate.
-        # At fold time (additive=True): skip entirely — folds are purely additive
-        # and never remove a registered edge; fall through to new-edge insertion.
+        # At ingest/interim (resolve_contradictions=True): ask the model for a
+        # 2-way verdict (COEXIST / REPLACE).  Cardinality judgment is cached per
+        # predicate.  Requires a model to be present.
+        # At fold time (resolve_contradictions=False): skip entirely — the fold
+        # is old-vs-old consolidation with no recency signal, so no removal is
+        # made; fall through to new-edge insertion.
         # When no model is present, fall through to new-edge insertion (coexist-all).
         graph_resolved = False
 
-        if not additive and self.model is not None and self.graph.has_node(subject):
+        if resolve_contradictions and self.model is not None and self.graph.has_node(subject):
             for old_obj in list(self.graph.successors(subject)):
                 if old_obj == obj:
                     continue
@@ -835,7 +852,7 @@ class GraphMerger:
                             )
 
         # --- Case 3: New-edge insertion ---
-        # After contradiction cleanup or when no same-pred edge exists.
+        # After contradiction cleanup, alignment check, or when no same-pred edge exists.
         # Stamp ik_key from relation.indexed_key when set (fold-only; None = no-op).
         # Union relation.session_ids into the initial sessions list so the real
         # contributing session ids ride the edge from the first insertion.

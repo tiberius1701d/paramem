@@ -177,7 +177,7 @@ class TestProcGraphMergeGap:
         """A procedural-typed keyless edge in merger.graph appears in _tier_keyed["procedural"]."""
         loop = _make_minimal_loop(tmp_path)
 
-        # Simulate the result of merger.merge(proc_graph, additive=True):
+        # Simulate the result of merger.merge(proc_graph, ...):
         # one procedural-typed edge in merger.graph.
         g = nx.MultiDiGraph()
         g.add_node("alice", speaker_id="Speaker0", attributes={"name": "Alice"})

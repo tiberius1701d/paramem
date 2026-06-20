@@ -203,8 +203,6 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
 
     # Enrichment flags — disabled to keep tests deterministic.
     loop.graph_enrichment_enabled = False
-    loop.graph_enrichment_interim_enabled = False
-    loop.graph_enrichment_min_triples_floor = 20
     loop.full_consolidation_period_string = ""
 
     return loop
@@ -862,14 +860,15 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     Attributes set:
       - ``output_dir`` — used as the adapter_dir root.
       - ``graph_enrichment_enabled`` — False so ``_run_graph_enrichment`` no-ops.
-      - ``merger`` — a model-free ``GraphMerger`` so the additive-merge topology
-        can run without a GPU or loaded model (``additive=True`` skips the only
-        model-gated branch; ``merger.model=None`` is the production-correct
-        configuration for simulate mode).
+      - ``merger`` — a model-free ``GraphMerger`` so the merge topology
+        can run without a GPU or loaded model (``merger.model=None`` means the
+        model-gated Case-2 branch is skipped; production-correct for simulate mode).
       - ``save_cycle_snapshots`` — False so ``_debug_writer`` gates to no-op.
       - ``_debug_base`` — None so ``_debug_writer._active_base()`` returns None.
-      - ``config`` — None so ``run_housekeeping`` callers that rely on the default
-        ``mode="simulate"`` work without needing a server config object.
+      - ``config`` — minimal ``ConsolidationConfig`` with ``fold_refinement="off"`` so
+        ``consolidate_interim_to_canonical_graph`` can read ``config.fold_refinement``
+        without a full server config; enrichment is suppressed (matches the intent of
+        the ``graph_enrichment_enabled=False`` attribute above).
 
     All other attributes are left unset; any unintended access will raise
     AttributeError rather than silently returning a MagicMock value.
@@ -880,9 +879,14 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     loop.output_dir = tmp_path
     loop.graph_enrichment_enabled = False
     loop.merger = GraphMerger(model=None)
+    # model/tokenizer None: the whole-graph normalization pass reads self.model and
+    # cleanly skips (skip_reason="no_model") — production-correct for simulate mode,
+    # which has no local model resident.
+    loop.model = None
+    loop.tokenizer = None
     loop.save_cycle_snapshots = False
     loop._debug_base = None
-    loop.config = None
+    loop.config = ConsolidationConfig(fold_refinement="off")
     return loop
 
 
@@ -999,7 +1003,7 @@ class TestConsolidateInterimToCanonicalGraph:
     def test_overlapping_triples_deduplicated_in_main_graph(self, tmp_path):
         """Two slots sharing the same SPO triple dedup to a single edge via GraphMerger.
 
-        The simulate merge routes through ``GraphMerger.merge(additive=True)``.
+        The simulate merge routes through ``GraphMerger.merge(resolve_contradictions=False)``.
         When the same SPO (and same ik_key) arrives from both the main graph and an
         interim slot, the merger's Case-1 (identical SPO) fires and produces exactly ONE
         surviving edge.  The merged graph must therefore have ``number_of_edges() == 1``
@@ -1246,6 +1250,9 @@ class TestConsolidateInterimToCanonicalGraph:
         from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         loop = _make_bare_loop(tmp_path)
+        # fold_refinement="full" is required so consolidate_interim_to_canonical_graph
+        # calls _run_graph_enrichment; default "off" (set by _make_bare_loop) skips it.
+        loop.config = ConsolidationConfig(fold_refinement="full")
 
         # Seed one interim slot so there is merged content to coexist with.
         _write_interim_graph(

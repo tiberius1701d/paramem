@@ -17,7 +17,7 @@ Purpose-keyed graph snapshot vocabulary (BINDING):
 
 - ``reconstructed`` (fold only): ``graph_reconstructed_snapshot.json``
 - ``merged`` (fold + interim): ``graph_merged_snapshot.json``
-  Fold: after additive re-merge; interim: after per-session merge,
+  Fold: after re-merge (resolve_contradictions=False); interim: after per-session merge,
   before enrichment.
 - ``enriched`` (fold + interim): ``graph_enriched_snapshot.json``
 - ``keyed`` (fold only): ``graph_keyed_snapshot.json``
@@ -369,6 +369,49 @@ class DebugSnapshotWriter:
             return
         _write_json(base / "fold" / "tier_delta.json", tier_delta)
         logger.info("Debug tier_delta written: %d tier(s)", len(tier_delta))
+
+    def on_normalization(
+        self,
+        raw_outputs: list[str],
+        decisions: list[dict],
+        applied: dict[str, int],
+        *,
+        interim_stamp: str | None = None,
+    ) -> None:
+        """Persist the whole-graph normalization pass outputs as a debug artifact.
+
+        Writes ``<base>/fold/normalization_snapshot.json`` via the plaintext
+        atomic writer.  The snapshot carries the raw model output(s), the parsed
+        decisions, and the count of applied operations so personal facts stay
+        out of the system journal.
+
+        Args:
+            raw_outputs: List of raw model output strings (one per chunk call).
+            decisions: List of parsed JSON decision dicts (one per chunk call,
+                ``None`` entries excluded so length may be less than
+                ``raw_outputs``).
+            applied: Counts of applied operations, e.g.
+                ``{"groups_collapsed": N, "edges_retired": M}``.
+            interim_stamp: When set, resolves the base directory under the
+                matching ``interim_<stamp>/`` subdirectory.
+
+        Self-gated on ``save_cycle_snapshots`` / ``_debug_base``; no-op when
+        debug is disabled.
+        """
+        base = self._active_base(interim_stamp=interim_stamp)
+        if base is None:
+            return
+        payload = {
+            "raw_outputs": raw_outputs,
+            "decisions": decisions,
+            "applied": applied,
+        }
+        _write_json(base / "fold" / "normalization_snapshot.json", payload)
+        logger.info(
+            "Debug normalization_snapshot written: %d chunk(s) %s",
+            len(raw_outputs),
+            applied,
+        )
 
     def on_cycle_end(
         self,

@@ -223,7 +223,9 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  interim_refinement: "off"    # "off" = cheap interim (additive merge, no supersession); "light"/"full" = non-additive merge with model-based cardinality resolution
+  interim_refinement: "off"   # whole-graph normalization pass (interim scope) — OFF (experimental/unreliable on the local model; wired for later iteration; "light" re-enables). Independent of Case-1 dedup + Case-2 cardinality, which stay on.
+  fold_refinement: "off"      # whole-graph normalization pass (full-fold scope) — OFF. Same status as interim_refinement.
+  contradiction_detection: true  # Case-2 same-(subject,predicate)/different-object cardinality at ingest + interim; per-conflict in the merger, unaffected by the normalization knobs above.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
   recall_retry_cap: 3           # cycles a session stays pending on recall failure before being released (B7-B)
   min_tier_key_floor: 30
@@ -316,11 +318,6 @@ consolidation:
   graph_enrichment_enabled: true             # dev-test posture: exercise enrichment code paths
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
   graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
-  # Mini-enrichment at interim-adapter rollover (sub-interval boundary,
-  # default 12h). Amortises the 84h enrichment cost across the cycle.
-  # Fires only when enough new triples have accumulated since the last pass.
-  graph_enrichment_interim_enabled: true     # dev-test posture: exercise interim-rollover enrichment
-  graph_enrichment_min_triples_floor: 20     # skip mini-pass below this many new triples
   # RAM-mode checkpointing. Mirrors server.yaml.example (same values required
   # for fixture/example parity). Per-test overrides go in code.
   training_save_steps_ram: 0

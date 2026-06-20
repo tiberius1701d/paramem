@@ -1389,7 +1389,7 @@ class TestIkKeyProvenance:
             "paramem.graph.merger.check_predicate_coexistence",
             return_value="COEXIST",
         ):
-            m.merge(session, additive=True)
+            m.merge(session, resolve_contradictions=False)
 
         # Both edges must coexist.
         # Node keys are canonical: "alex", "cat", "dog"
@@ -1429,7 +1429,7 @@ class TestReinforcementTracking:
                 )
             ],
         )
-        m.merge(session, additive=True)
+        m.merge(session, resolve_contradictions=False)
         assert m.reinforcements == [], "No duplicate → reinforcements must be empty"
 
     def test_reinforcements_populated_on_duplicate_spo_collapse(self):
@@ -1456,7 +1456,7 @@ class TestReinforcementTracking:
                 )
             ],
         )
-        m.merge(s1, additive=True)
+        m.merge(s1, resolve_contradictions=False)
         assert m.reinforcements == [], "First merge is net-new — no reinforcement yet"
 
         # Second merge: same (s,p,o), different ik_key → Case-1 → reinforcement.
@@ -1476,7 +1476,7 @@ class TestReinforcementTracking:
                 )
             ],
         )
-        m.merge(s2, additive=True)
+        m.merge(s2, resolve_contradictions=False)
 
         assert len(m.reinforcements) == 1, (
             f"Duplicate-SPO collapse must produce 1 reinforcement entry; got {m.reinforcements}"
@@ -1524,7 +1524,7 @@ class TestReinforcementTracking:
                 )
             ],
         )
-        m.merge(s1, additive=True)
+        m.merge(s1, resolve_contradictions=False)
         assert m.collapsed == [], "First merge is net-new — no collapse yet"
 
         # Second merge: same (s,p,o), different ik_key → Case-1 → collapse.
@@ -1544,7 +1544,7 @@ class TestReinforcementTracking:
                 )
             ],
         )
-        m.merge(s2, additive=True)
+        m.merge(s2, resolve_contradictions=False)
 
         # The incoming (drifting) key must appear in collapsed.
         assert len(m.collapsed) == 1, (
@@ -1637,12 +1637,12 @@ class TestReinforcementTracking:
         # Key was adopted onto the existing edge.
         assert m.graph["alice"]["berlin"][existing_eid].get(_IK_KEY_ATTR) == "graph5"
 
-    def test_additive_fold_short_circuits_replace_both_edges_survive(self):
-        """additive=True short-circuits Case-2: even when check_predicate_coexistence returns
-        REPLACE, the old edge is NOT removed and both keys survive.
+    def test_fold_non_subtractive_short_circuits_replace_both_edges_survive(self):
+        """resolve_contradictions=False short-circuits Case-2: even when check_predicate_coexistence
+        returns REPLACE, the old edge is NOT removed and both keys survive.
 
-        This is the regression guard for the purely-additive fold: no model call, no edge
-        removal, no registered fact lost at fold time.
+        This is the regression guard for the fold-is-non-subtractive invariant: no model call,
+        no edge removal, no registered fact lost at fold time.
         """
         from unittest.mock import MagicMock, patch
 
@@ -1684,13 +1684,18 @@ class TestReinforcementTracking:
             indexed_key="key_berlin",
         )
 
-        # Even though the model would say REPLACE, additive=True must skip it entirely.
+        # Even though the model would say REPLACE, resolve_contradictions=False must skip it.
         with patch(
             "paramem.graph.merger.check_predicate_coexistence",
             return_value="REPLACE",
         ) as mock_coexist:
             m._upsert_relation(
-                "alex", "berlin", incoming, "s2", "2026-01-02T00:00:00Z", additive=True
+                "alex",
+                "berlin",
+                incoming,
+                "s2",
+                "2026-01-02T00:00:00Z",
+                resolve_contradictions=False,
             )
             # check_predicate_coexistence must NOT have been called (short-circuit).
             mock_coexist.assert_not_called()
@@ -1704,10 +1709,10 @@ class TestReinforcementTracking:
             if d.get("predicate") == "lives in"
         ]
         assert "munich" in lives_in_objects, (
-            "Old edge (Munich) must NOT be removed when additive=True"
+            "Old edge (Munich) must NOT be removed when resolve_contradictions=False"
         )
         assert "berlin" in lives_in_objects, (
-            "New edge (Berlin) must be inserted even when additive=True"
+            "New edge (Berlin) must be inserted even when resolve_contradictions=False"
         )
 
         # Both ik_keys must be stamped on their respective edges.
@@ -1762,7 +1767,7 @@ class TestRemovalLedger:
                 )
             ],
         )
-        m.merge(s1, additive=True)
+        m.merge(s1, resolve_contradictions=False)
 
         s2 = SessionGraph(
             session_id="recon2",
@@ -1780,7 +1785,7 @@ class TestRemovalLedger:
                 )
             ],
         )
-        m.merge(s2, additive=True)
+        m.merge(s2, resolve_contradictions=False)
 
         # Existing collapsed assertion must still hold.
         assert m.collapsed == ["key_drifter"], (
@@ -1804,8 +1809,9 @@ class TestRemovalLedger:
         """Same-(s,p)/different-o single-valued (REPLACE) contradiction writes the
         removed edge's ik_key to removal_ledger with reason='contradiction_same_pred'.
 
-        The path is dormant under additive=True (fold path); we use additive=False
-        (live ingest) with a patched check_predicate_coexistence that returns REPLACE.
+        The path is dormant under resolve_contradictions=False (fold path); we use
+        resolve_contradictions=True (live ingest) with a patched
+        check_predicate_coexistence that returns REPLACE.
         Pre-seed the first edge with an ik_key directly on the graph.
         """
         from unittest.mock import patch
@@ -1921,7 +1927,7 @@ class TestRemovalLedger:
                 )
             ],
         )
-        m.merge(s1, additive=True)
+        m.merge(s1, resolve_contradictions=False)
 
         # Second session: "ALICE" / "lives_in" / "berlin" — same canonical forms;
         # surfaces differ, so pre_surfaces must record the mismatch.
@@ -1941,7 +1947,7 @@ class TestRemovalLedger:
                 )
             ],
         )
-        m.merge(s2, additive=True)
+        m.merge(s2, resolve_contradictions=False)
 
         assert "key_drifter" in m.removal_ledger, "Drifting key must appear in removal_ledger"
         entry = m.removal_ledger["key_drifter"]
@@ -2009,8 +2015,8 @@ class TestRemovalLedger:
                 )
             ],
         )
-        m.merge(s1, additive=True)
-        m.merge(s2, additive=True)
+        m.merge(s1, resolve_contradictions=False)
+        m.merge(s2, resolve_contradictions=False)
 
         entry = m.removal_ledger.get("k_drifter", {})
         assert "pre_surfaces" in entry, (

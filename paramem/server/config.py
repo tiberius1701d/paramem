@@ -10,6 +10,7 @@ import yaml
 
 from paramem.backup.types import FatalConfigError
 from paramem.utils.config import (
+    _REFINEMENT_LEVELS,
     AdapterConfig,
     ConsolidationConfig,
     GraphConfig,
@@ -848,12 +849,24 @@ class ConsolidationScheduleConfig:
     retain_sessions: bool = True
     indexed_key_replay: bool = True  # indexed key training mechanism
     decay_window: int = 10  # cycles before unreinforced keys decay
-    # Controls whether per-session graph merges are interleaved with each interim
-    # cycle.  "off" defers cumulative-graph merge/contradiction/enrichment to full
-    # consolidation (cheap interim posture).  "light" and "full" both merge the
-    # cumulative graph on every interim cycle (per-cycle merge posture) and
-    # currently behave identically.
+    # Refinement level for the interim mini-fold (one interim adapter slot per
+    # consolidation cycle).  Grammar shared with fold_refinement:
+    # "off" = additive accumulation only — exact-(s,p,o) dedup, no model calls.
+    # "light" = whole-graph model-driven normalization pass (synonym-predicate
+    #           dedup).  Default OFF: unreliable on the local model at scale; the
+    #           code is wired and re-enabled by setting "light".
+    # "full" = light + second-order SOTA enrichment (cloud; HELD until cross-doc
+    #          probe quantifies value and known inflation/fabrication is remedied).
     interim_refinement: str = "off"  # Literal["off", "light", "full"]
+    # Refinement level for the full fold (consolidate_interim_adapters).  Same
+    # grammar as interim_refinement.  Defaults to "off"; "full" is HELD.
+    fold_refinement: str = "off"  # Literal["off", "light", "full"]
+    # Whether the merger resolves same-predicate/different-object cardinality
+    # conflicts (Case-2 COEXIST/REPLACE) at ingest and interim cycles.  Applied
+    # wherever a NEW-vs-OLD temporal partition supplies the recency signal.
+    # OFF at the full fold (old-vs-old consolidation, no recency) until per-edge
+    # timestamps are introduced.
+    contradiction_detection: bool = True
     # Minimum recall fraction (0, 1] that every recall gate must reach before the
     # adapter fold is accepted.  Applied to: post-save disk-integrity probes,
     # interim-cycle training, full-fold training, housekeeping re-train, and
@@ -1032,11 +1045,6 @@ class ConsolidationScheduleConfig:
     graph_enrichment_enabled: bool = True
     graph_enrichment_neighborhood_hops: int = 2
     graph_enrichment_max_entities_per_pass: int = 50
-    # Mini-enrichment at interim-adapter rollover (per sub-interval, default 12h).
-    # Amortises enrichment cost across the 84h full-consolidation cycle. Gated
-    # on a minimum triple-floor so low-traffic sub-intervals skip the pass.
-    graph_enrichment_interim_enabled: bool = True
-    graph_enrichment_min_triples_floor: int = 20
     # RAM-mode checkpointing: when > 0, train_adapter writes checkpoints to
     # /dev/shm instead of the caller's output_dir, then copies the latest
     # checkpoint to <output_dir>/bg_checkpoint_epoch/ at each epoch boundary.
@@ -1125,11 +1133,15 @@ class ConsolidationScheduleConfig:
                 f"local judging."
             )
 
-        _valid_refinement = {"off", "light", "full"}
-        if self.interim_refinement not in _valid_refinement:
+        if self.interim_refinement not in _REFINEMENT_LEVELS:
             raise ValueError(
                 f"consolidation.interim_refinement must be one of "
-                f"{sorted(_valid_refinement)!r}; got {self.interim_refinement!r}"
+                f"{sorted(_REFINEMENT_LEVELS)!r}; got {self.interim_refinement!r}"
+            )
+        if self.fold_refinement not in _REFINEMENT_LEVELS:
+            raise ValueError(
+                f"consolidation.fold_refinement must be one of "
+                f"{sorted(_REFINEMENT_LEVELS)!r}; got {self.fold_refinement!r}"
             )
 
         if not (0.0 < self.recall_sanity_threshold <= 1.0):
@@ -1591,12 +1603,19 @@ class ServerConfig:
 
     @property
     def consolidation_config(self) -> ConsolidationConfig:
-        """Build ConsolidationConfig for ConsolidationLoop."""
+        """Build ConsolidationConfig for ConsolidationLoop.
+
+        All three-axis knobs (interim_refinement, fold_refinement,
+        contradiction_detection) are threaded through here so ConsolidationLoop
+        reads them from config rather than from direct attribute access.
+        """
         return ConsolidationConfig(
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
             interim_refinement=self.consolidation.interim_refinement,
+            fold_refinement=self.consolidation.fold_refinement,
+            contradiction_detection=self.consolidation.contradiction_detection,
             recall_sanity_threshold=self.consolidation.recall_sanity_threshold,
             min_tier_key_floor=self.consolidation.min_tier_key_floor,
             tier_fast_start=self.consolidation.tier_fast_start,

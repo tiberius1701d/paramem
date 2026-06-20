@@ -75,10 +75,6 @@ def test_graph_enrichment_disabled_by_default(example_config):
     assert example_config.consolidation.graph_enrichment_enabled is False
 
 
-def test_graph_enrichment_interim_disabled_by_default(example_config):
-    assert example_config.consolidation.graph_enrichment_interim_enabled is False
-
-
 def test_headless_boot_disabled_by_default(example_config):
     assert example_config.headless_boot is False
 

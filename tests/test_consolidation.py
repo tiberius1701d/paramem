@@ -323,14 +323,20 @@ class TestExtractionPathParity:
 
 
 class TestInterimRefinementGate:
-    """extract_session merger.merge is always called; additivity tracks refinement level.
+    """extract_session merger.merge is always called; resolve_contradictions tracks config.
 
-    interim_refinement='off'  → additive merge (no supersession, both facts coexist).
-    interim_refinement='light'/'full' → non-additive merge (model may supersede edges).
+    contradiction_detection=False → additive merge (no supersession, both facts coexist).
+    contradiction_detection=True  → non-additive merge (model may supersede edges).
     All tests run without loading any model or GPU.
     """
 
-    def _build_loop(self, monkeypatch, tmp_path, interim_refinement: str):
+    def _build_loop(
+        self,
+        monkeypatch,
+        tmp_path,
+        interim_refinement: str = "off",
+        contradiction_detection: bool = True,
+    ):
         from unittest.mock import MagicMock
 
         from peft import PeftModel
@@ -374,7 +380,10 @@ class TestInterimRefinementGate:
         loop = ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
-            consolidation_config=ConsolidationConfig(interim_refinement=interim_refinement),
+            consolidation_config=ConsolidationConfig(
+                interim_refinement=interim_refinement,
+                contradiction_detection=contradiction_detection,
+            ),
             training_config=TrainingConfig(),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
@@ -401,29 +410,33 @@ class TestInterimRefinementGate:
             or loop.merger.graph.number_of_edges() > initial_edges
         ), "Expected merger.graph to grow after extract_session with interim_refinement='full'"
 
-    def test_merge_called_additive_when_interim_refinement_off(self, monkeypatch, tmp_path):
-        """interim_refinement='off': merger.merge IS called with additive=True; graph grows."""
+    def test_merge_called_non_contradiction_when_contradiction_detection_off(
+        self, monkeypatch, tmp_path
+    ):
+        """contradiction_detection=False: merge uses resolve_contradictions=False; graph grows."""
         from unittest.mock import patch
 
-        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="off")
+        loop = self._build_loop(
+            monkeypatch, tmp_path, interim_refinement="off", contradiction_detection=False
+        )
         initial_nodes = loop.merger.graph.number_of_nodes()
         initial_edges = loop.merger.graph.number_of_edges()
 
         with patch.object(loop.extraction, "run", return_value=self._session_graph):
             with patch.object(loop.merger, "merge", wraps=loop.merger.merge) as mock_merge:
                 loop.extract_session("t", "s_gate", speaker_id="spk0")
-                # merge must be called exactly once with additive=True
+                # merge must be called exactly once with resolve_contradictions=False
                 mock_merge.assert_called_once()
                 _, kwargs = mock_merge.call_args
-                assert kwargs.get("additive") is True, (
-                    "interim_refinement='off' must call merge(additive=True)"
+                assert kwargs.get("resolve_contradictions") is False, (
+                    "contradiction_detection=False must call merge(resolve_contradictions=False)"
                 )
 
-        # Graph must have grown — the additive merge still inserts edges.
+        # Graph must have grown — the non-resolving merge still inserts edges.
         assert (
             loop.merger.graph.number_of_nodes() > initial_nodes
             or loop.merger.graph.number_of_edges() > initial_edges
-        ), "Expected merger.graph to grow after extract_session with interim_refinement='off'"
+        ), "Expected merger.graph to grow after extract_session with contradiction_detection=False"
 
     def test_episodic_rels_identical_regardless_of_interim_refinement(self, monkeypatch, tmp_path):
         """Returned (episodic_rels, procedural_rels) are identical regardless of interim_refinement.
@@ -449,9 +462,9 @@ class TestInterimRefinementGate:
         )
         assert proc_a == proc_b == []
 
-    def test_off_additive_both_facts_survive(self, monkeypatch, tmp_path):
-        """interim_refinement='off': two facts with the same predicate but different
-        objects both survive (additive coexist — no supersession).
+    def test_contradiction_detection_off_both_facts_survive(self, monkeypatch, tmp_path):
+        """contradiction_detection=False: two facts with the same predicate but different
+        objects both survive (no supersession — Case-2 cardinality skipped).
         """
         from unittest.mock import patch
 
@@ -492,7 +505,9 @@ class TestInterimRefinementGate:
                 ),
             ],
         )
-        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="off")
+        loop = self._build_loop(
+            monkeypatch, tmp_path, interim_refinement="off", contradiction_detection=False
+        )
 
         with patch.object(loop.extraction, "run", side_effect=[sg1, sg2]):
             loop.extract_session("t1", "s1", speaker_id="spk0")
@@ -508,12 +523,12 @@ class TestInterimRefinementGate:
             for n in loop.merger.graph.nodes()
         )
         assert berlin_present and munich_present, (
-            f"Both 'Berlin' and 'Munich' must coexist under additive merge; "
+            f"Both 'Berlin' and 'Munich' must coexist with contradiction_detection=False; "
             f"nodes={list(loop.merger.graph.nodes())}"
         )
 
-    def test_full_non_additive_supersession_removes_old_edge(self, monkeypatch, tmp_path):
-        """interim_refinement='full': non-additive merge calls Case-2 model verdict.
+    def test_contradiction_detection_on_supersession_removes_old_edge(self, monkeypatch, tmp_path):
+        """contradiction_detection=True: non-additive merge calls Case-2 model verdict.
 
         We stub check_predicate_coexistence to return REPLACE so the old edge is
         removed.  A MagicMock/None model silently skips Case-2; we use a real stub
@@ -557,7 +572,9 @@ class TestInterimRefinementGate:
                 ),
             ],
         )
-        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="full")
+        loop = self._build_loop(
+            monkeypatch, tmp_path, interim_refinement="off", contradiction_detection=True
+        )
 
         # Inject a non-None model on the merger so Case-2 fires (the loop's
         # MagicMock model is sufficient; merger.model is None by default).
@@ -761,6 +778,34 @@ consolidation:
 
         with pytest.raises(ValueError, match="interim_refinement"):
             ConsolidationConfig(interim_refinement="daily")
+
+    def test_invalid_fold_refinement_value_raises(self, tmp_path):
+        """An invalid fold_refinement value raises ValueError from dataclass validation."""
+        import pytest
+
+        from paramem.server.config import load_server_config
+
+        yaml_text = """
+model:
+  name: "mistralai/Mistral-7B-Instruct-v0.3"
+consolidation:
+  refresh_cadence: "12h"
+  fold_refinement: daily
+"""
+        cfg_path = tmp_path / "server_invalid_fold_refinement.yaml"
+        cfg_path.write_text(yaml_text)
+
+        with pytest.raises(ValueError, match="fold_refinement"):
+            load_server_config(str(cfg_path))
+
+    def test_consolidation_config_invalid_fold_refinement_raises(self):
+        """ConsolidationConfig rejects an invalid fold_refinement value directly."""
+        import pytest
+
+        from paramem.utils.config import ConsolidationConfig
+
+        with pytest.raises(ValueError, match="fold_refinement"):
+            ConsolidationConfig(fold_refinement="daily")
 
 
 # ---------------------------------------------------------------------------
@@ -1401,8 +1446,6 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
         cfg.consolidation.graph_enrichment_enabled = False
         cfg.consolidation.graph_enrichment_neighborhood_hops = 1
         cfg.consolidation.graph_enrichment_max_entities_per_pass = 5
-        cfg.consolidation.graph_enrichment_interim_enabled = False
-        cfg.consolidation.graph_enrichment_min_triples_floor = 0
         # ThermalPolicy.from_consolidation_config reads training_temp_limit
         # at create_consolidation_loop construction; a default-MagicMock value
         # would raise on the int comparison.  0 = throttle disabled (fixture
@@ -3208,6 +3251,8 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.pending_interim_triples = []
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.graph_enrichment_neighborhood_hops = 2
         return loop
 
     @staticmethod
@@ -3225,7 +3270,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         from paramem.graph.name_match import canonical as _canonical
         from paramem.memory.persistence import _IK_KEY_ATTR
 
-        def _spy_merge(session_graph, *, additive=False):
+        def _spy_merge(session_graph, *, resolve_contradictions=True, align_predicates=False):
             for rel in session_graph.relations:
                 if rel.indexed_key:
                     _subj = rel.subject
@@ -3516,7 +3561,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         # Capture merger.merge() call args.
         merge_calls: list = []
 
-        def _spy_merge(session_graph, *, additive=False):
+        def _spy_merge(session_graph, *, resolve_contradictions=True, align_predicates=False):
             merge_calls.append(session_graph)
             # Stamp the ik_key from the Relation onto the merged graph edge so
             # the edge-walk stage can read it back (mirrors real _upsert_relation behaviour).
@@ -4031,15 +4076,14 @@ class TestConsolidateInterimAdaptersFullFlow:
             f"Expected exactly 1 edge after Case-1-adopt; got {len(same_pred_edges)}"
         )
 
-    def test_additive_fold_replace_classified_predicate_both_keys_survive(self, tmp_path):
-        """Additive fold: two registered keys with same (s,p), different objects,
-        REPLACE-classified predicate — under additive=True, BOTH keys survive with
-        zero drift.
+    def test_fold_no_contradiction_both_keys_survive(self, tmp_path):
+        """Fold with resolve_contradictions=False: two registered keys with same (s,p),
+        different objects, REPLACE-classified predicate — both keys survive with zero drift.
 
-        This is the canonical regression guard for the purely-additive fold bugfix:
+        This is the canonical regression guard for the fold-is-non-subtractive invariant:
         a REPLACE-classified predicate must NOT remove a registered edge at fold time.
-        The merger is driven via _install_provenance_merge_spy (additive=True short-
-        circuits Case-2, so both Munich and Berlin edges land in the merged graph).
+        The merger is driven via _install_provenance_merge_spy (resolve_contradictions=False
+        skips Case-2, so both Munich and Berlin edges land in the merged graph).
         """
         import networkx as nx
 
@@ -4055,7 +4099,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         recon_g["Alex"]["Berlin"][berlin_eid][_IK_KEY_ATTR] = "key_berlin"
 
         # Use a REAL GraphMerger with a model stub whose cardinality is REPLACE.
-        # Under additive=True the model must NOT be called and the old edge must survive.
+        # Under resolve_contradictions=False the model must NOT be called; old edge must survive.
         from unittest.mock import MagicMock
 
         model_stub = MagicMock()
@@ -4087,9 +4131,9 @@ class TestConsolidateInterimAdaptersFullFlow:
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # Under additive fold: BOTH keys must survive — zero drift.
+        # With resolve_contradictions=False at fold: BOTH keys must survive — zero drift.
         assert result["graph_drift_count"] == 0, (
-            f"Expected 0 drift under additive fold (both Munich and Berlin must survive); "
+            f"Expected 0 drift (fold is non-subtractive — both Munich and Berlin must survive); "
             f"got drift={result['graph_drift_count']}"
         )
         assert result["keys_per_tier"].get("episodic", 0) == 2, (
@@ -4097,10 +4141,10 @@ class TestConsolidateInterimAdaptersFullFlow:
             f"got {result['keys_per_tier']}"
         )
 
-    def test_munich_berlin_additive_fold_no_drift(self, tmp_path):
-        """Additive fold with mock merger: Munich and Berlin are both registered keys
-        for the same (subject, predicate).  Under additive=True the spy inserts both
-        edges; neither key drifts.
+    def test_munich_berlin_fold_non_subtractive_no_drift(self, tmp_path):
+        """Fold with mock merger: Munich and Berlin are both registered keys
+        for the same (subject, predicate).  With resolve_contradictions=False the
+        spy inserts both edges; neither key drifts.
 
         This mirrors the old test_munich_berlin_replace_retires_munich but asserts
         the correct post-bugfix behaviour: zero drift, both keys tiered.
@@ -4137,15 +4181,15 @@ class TestConsolidateInterimAdaptersFullFlow:
                 key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
             )
 
-        # Spy that inserts BOTH edges (additive=True behaviour).
+        # Spy that inserts BOTH edges (resolve_contradictions=False at fold).
         self._install_provenance_merge_spy(loop)
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
         # Both keys must survive — zero drift.
         assert result["graph_drift_count"] == 0, (
-            f"Expected 0 drift (both Munich and Berlin survive under additive fold); "
-            f"got drift={result['graph_drift_count']}"
+            f"Expected 0 drift (fold is non-subtractive — "
+            f"both Munich and Berlin survive); got drift={result['graph_drift_count']}"
         )
         assert result["keys_per_tier"].get("episodic", 0) == 2, (
             f"Expected key_munich and key_berlin in episodic tier; got {result['keys_per_tier']}"
@@ -4609,6 +4653,13 @@ class TestDriftIntendedRemoval:
         recon_g["Dave"]["London"][eid_ok][_IK_KEY_ATTR] = "key_ok"
 
         loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        # fold_refinement="full" is required for _run_graph_enrichment to be called;
+        # default is "light" which skips enrichment.
+        loop.config = loop.config.__class__(
+            min_tier_key_floor=0,
+            tier_fast_start=False,
+            fold_refinement="full",
+        )
         loop.merger = GraphMerger(model=None)
 
         # key_ok — survives (recon edge present, full SPO).
@@ -5495,6 +5546,11 @@ class TestTierFloor:
                 patch.object(
                     ConsolidationLoop,
                     "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_normalization",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -7996,8 +8052,6 @@ class TestMaterializeInterimB1:
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
-        loop.graph_enrichment_interim_enabled = False
-        loop.graph_enrichment_min_triples_floor = 20
         loop.full_consolidation_period_string = ""
 
         # Real GraphMerger (no model) so merge/reset_graph run correctly.
@@ -8093,10 +8147,11 @@ class TestMaterializeInterimB1:
           edges because they arrive in different merge calls and have no key to
           trigger the duplicate-key path).
         - Specifically: the registry-true relation carries indexed_key='graph1';
-          the extra relation has no indexed_key.  After additive re-merge, both
-          edges coexist (additive=True skips Case-2; the existing edge has ik_key
-          and the extra relation lacks one so Case-1-adopt writes ik_key to the
-          new keyless edge on a same-SPO collision — recurrence bump).
+          the extra relation has no indexed_key.  After the fold re-merge (which
+          uses resolve_contradictions=False, skipping Case-2), both edges coexist:
+          the existing edge has ik_key and the extra relation lacks one so Case-1-
+          adopt writes ik_key to the new keyless edge on a same-SPO collision
+          (recurrence bump).
         - The edge with ik_key='graph1' must be present.
         - The merger.reinforcements list records the surviving key (bump path).
         """
@@ -8432,8 +8487,6 @@ class TestInterimKeyedWalkB3:
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
-        loop.graph_enrichment_interim_enabled = False
-        loop.graph_enrichment_min_triples_floor = 20
         loop.full_consolidation_period_string = ""
 
         loop.merger = GraphMerger(model=None)
@@ -8729,8 +8782,6 @@ class TestMergeRegistryRelationsUnification:
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
-        loop.graph_enrichment_interim_enabled = False
-        loop.graph_enrichment_min_triples_floor = 20
         loop.full_consolidation_period_string = ""
 
         loop.merger = GraphMerger(model=None)
@@ -8932,3 +8983,1478 @@ class TestMergeRegistryRelationsUnification:
                 f"Non-speaker subject node should NOT have speaker_id set; "
                 f"got speaker_id={node_data.get('speaker_id')!r}."
             )
+
+
+# ---------------------------------------------------------------------------
+# Subtractive removals helper + whole-graph normalization pass tests
+# ---------------------------------------------------------------------------
+
+
+class TestSubtractiveRemovalsHelperInterim:
+    """_apply_subtractive_removals_to_store(scope='interim') soft-stales the correct reasons.
+
+    Tests:
+    - ASRI-1: predicate_synonym_collapse is soft-staled at interim scope.
+    - ASRI-2: contradiction_same_pred is soft-staled at interim scope.
+    - ASRI-3: enrichment_same_as is NOT soft-staled at interim scope (retain-only bucket).
+    - ASRI-4: key absent from any active tier is a no-op (no crash, empty return).
+    """
+
+    @staticmethod
+    def _make_loop_with_ledger(tmp_path, *, ledger: dict) -> "ConsolidationLoop":
+        """Minimal ConsolidationLoop with a seeded removal_ledger and replay store."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.pending_interim_triples = []
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_enabled = False
+        loop.full_consolidation_period_string = ""
+
+        merger = GraphMerger(model=None)
+        # Seed the removal_ledger with supplied entries.
+        merger.removal_ledger = dict(ledger)
+        loop.merger = merger
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+        return loop
+
+    def test_synonym_collapse_key_is_soft_staled_at_interim(self, tmp_path):
+        """ASRI-1: predicate_synonym_collapse reason → key soft-staled at interim scope.
+
+        The helper must call store.discard_keys([key], mode='stale') for a ledger
+        entry with reason 'predicate_synonym_collapse'.  After the call the key
+        must be stale (not active) in the store.
+        """
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph_collapse_k1": {
+                    "reason": "predicate_synonym_collapse",
+                    "subject": "Jordan",
+                    "object": "TechCorp",
+                    "existing_predicate": "works_for",
+                    "incoming_predicate": "employed_by",
+                },
+            },
+        )
+        # Register the key as active so the soft-stale has something to flip.
+        loop.store.put(
+            "episodic",
+            "graph_collapse_k1",
+            {
+                "key": "graph_collapse_k1",
+                "subject": "Jordan",
+                "predicate": "works_for",
+                "object": "TechCorp",
+                "speaker_id": "Jordan",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        assert not loop.store.is_stale("graph_collapse_k1"), "Precondition: key must be active"
+
+        result = loop._apply_subtractive_removals_to_store(scope="interim")
+
+        assert loop.store.is_stale("graph_collapse_k1"), (
+            "predicate_synonym_collapse key must be soft-staled at interim scope"
+        )
+        # The returned dict must include the tier entry for the staled key.
+        assert "episodic" in result, "Return must include the tier that held the key"
+        assert "graph_collapse_k1" in result["episodic"], (
+            "Staled key must appear in returned soft_stale_by_tier dict"
+        )
+
+    def test_contradiction_same_pred_soft_staled_at_interim(self, tmp_path):
+        """ASRI-2: contradiction_same_pred is soft-staled at interim scope (NEW supersedes OLD).
+
+        At the interim scope the recency signal is present: the NEW pending merge
+        has already replaced the OLD slot's object.  The OLD slot key must be
+        soft-staled so it does not return at the next cycle.
+        """
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph_contra_k1": {
+                    "reason": "contradiction_same_pred",
+                    "subject": "Casey",
+                    "object": "Berlin",
+                    "predicate": "lives_in",
+                },
+            },
+        )
+        loop.store.put(
+            "episodic",
+            "graph_contra_k1",
+            {
+                "key": "graph_contra_k1",
+                "subject": "Casey",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "Casey",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+
+        loop._apply_subtractive_removals_to_store(scope="interim")
+
+        assert loop.store.is_stale("graph_contra_k1"), (
+            "contradiction_same_pred key must be soft-staled at interim scope"
+        )
+
+    def test_enrichment_same_as_not_soft_staled_at_interim(self, tmp_path):
+        """ASRI-3: enrichment_same_as stays in the retain-only bucket at interim scope.
+
+        The helper must NOT soft-stale keys whose removal reason is
+        'enrichment_same_as' — those belong to the fold's drift_intended_removal
+        bucket, not to subtractive processing.
+        """
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph_enrich_k1": {
+                    "reason": "enrichment_same_as",
+                    "subject": "Riley",
+                    "object": "AlternateName",
+                },
+            },
+        )
+        loop.store.put(
+            "episodic",
+            "graph_enrich_k1",
+            {
+                "key": "graph_enrich_k1",
+                "subject": "Riley",
+                "predicate": "also_known_as",
+                "object": "AlternateName",
+                "speaker_id": "Riley",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+
+        loop._apply_subtractive_removals_to_store(scope="interim")
+
+        assert not loop.store.is_stale("graph_enrich_k1"), (
+            "enrichment_same_as key must NOT be soft-staled at interim scope "
+            "(retain-only bucket; handled by fold drift_intended_removal)"
+        )
+
+    def test_key_absent_from_active_tier_is_noop(self, tmp_path):
+        """ASRI-4: a removal_ledger key that is not active in any tier must not crash.
+
+        The helper calls tier_for_active_key(key); when the key is absent the
+        method returns None and the helper must proceed silently.
+        """
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph_absent_k1": {
+                    "reason": "predicate_synonym_collapse",
+                    "subject": "Quinn",
+                    "object": "Somewhere",
+                    "existing_predicate": "lives_in",
+                    "incoming_predicate": "resides_in",
+                },
+            },
+        )
+        # Do NOT register the key — it is absent from the store.
+
+        result = loop._apply_subtractive_removals_to_store(scope="interim")
+
+        # No crash; result contains no entry for the absent key.
+        all_stale_keys = {k for tier in result.values() for k in tier}
+        assert "graph_absent_k1" not in all_stale_keys, (
+            "Absent key must not appear in soft_stale_by_tier (no active tier entry)"
+        )
+
+    def test_stale_flag_persisted_to_disk_before_commit(self, tmp_path):
+        """ASRI-5: stale flag written to disk via commit_tier_slot after M5 reorder.
+
+        Regression test for the MF-1 durability bug: ``_apply_subtractive_removals_to_store``
+        must run BEFORE ``commit_tier_slot`` so the on-disk registry carries the stale
+        flag.  If the order is reversed (stale after commit), the reloaded registry
+        shows the key as active and this test fails.
+
+        The test drives the post-fix ordering directly:
+        1. Register key as active.
+        2. ``_apply_subtractive_removals_to_store(scope='interim')`` — stales in memory.
+        3. ``commit_tier_slot(mode='simulate')`` — serializes the now-staled registry.
+        4. Reload registry from disk into a fresh ``KeyRegistry`` instance.
+        5. Assert the reloaded registry shows the key as stale (not active).
+        """
+        from paramem.memory.persistence import commit_tier_slot
+        from paramem.training.key_registry import KeyRegistry
+
+        _adapter = "episodic"
+        _key = "disk_stale_k1"
+
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                _key: {
+                    "reason": "predicate_synonym_collapse",
+                    "subject": "Jordan",
+                    "object": "TechCorp",
+                    "existing_predicate": "works_for",
+                    "incoming_predicate": "employed_by",
+                },
+            },
+        )
+        # Register the key as active.
+        loop.store.put(
+            _adapter,
+            _key,
+            {
+                "key": _key,
+                "subject": "Jordan",
+                "predicate": "works_for",
+                "object": "TechCorp",
+                "speaker_id": "Jordan",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+        assert not loop.store.is_stale(_key), "Precondition: key must be active before staling"
+
+        # Step 2: soft-stale in memory (M5 stage — must precede commit).
+        loop._apply_subtractive_removals_to_store(scope="interim")
+        assert loop.store.is_stale(_key), "Key must be stale in memory after M5 stage"
+
+        # Step 3: commit — serializes the already-staled registry to disk.
+        commit_tier_slot(
+            loop=loop,
+            tier=_adapter,
+            adapter_name=_adapter,
+            stamp="20260101T0000",
+            mode="simulate",
+            all_keyed=[],
+            output_dir=tmp_path,
+        )
+
+        # Step 4: reload the registry from disk into a fresh instance.
+        registry_path = tmp_path / _adapter / "indexed_key_registry.json"
+        assert registry_path.exists(), f"Registry file must exist on disk: {registry_path}"
+        reloaded = KeyRegistry.load(registry_path)
+
+        # Step 5: the reloaded registry must show the key as stale.
+        assert _key not in reloaded.list_active(), (
+            "Reloaded registry must NOT list the staled key as active "
+            "(MF-1: stale flag must be captured on disk before the commit write)"
+        )
+        assert reloaded.is_stale(_key), (
+            "Reloaded registry must show the key as stale "
+            "(MF-1: stale flag must be captured on disk before the commit write)"
+        )
+
+
+class TestSubtractiveRemovalsHelperFold:
+    """_apply_subtractive_removals_to_store(scope='fold') scoping invariants.
+
+    Tests:
+    - ASRF-1: predicate_synonym_collapse IS soft-staled at fold (time-invariant).
+    - ASRF-2: contradiction_same_pred is NOT soft-staled at fold (no recency signal).
+    """
+
+    @staticmethod
+    def _make_loop_with_ledger(tmp_path, *, ledger: dict) -> "ConsolidationLoop":
+        """Identical to TestSubtractiveRemovalsHelperInterim._make_loop_with_ledger."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.pending_interim_triples = []
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_enabled = False
+        loop.full_consolidation_period_string = ""
+
+        merger = GraphMerger(model=None)
+        merger.removal_ledger = dict(ledger)
+        loop.merger = merger
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+        return loop
+
+    def test_synonym_collapse_soft_staled_at_fold(self, tmp_path):
+        """ASRF-1: predicate_synonym_collapse is soft-staled at fold scope (time-invariant)."""
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph_fold_collapse_k1": {
+                    "reason": "predicate_synonym_collapse",
+                    "subject": "Morgan",
+                    "object": "German",
+                    "existing_predicate": "speaks",
+                    "incoming_predicate": "speaks_language",
+                },
+            },
+        )
+        loop.store.put(
+            "episodic",
+            "graph_fold_collapse_k1",
+            {
+                "key": "graph_fold_collapse_k1",
+                "subject": "Morgan",
+                "predicate": "speaks",
+                "object": "German",
+                "speaker_id": "Morgan",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+
+        result = loop._apply_subtractive_removals_to_store(scope="fold")
+
+        assert loop.store.is_stale("graph_fold_collapse_k1"), (
+            "predicate_synonym_collapse key must be soft-staled at fold scope"
+        )
+        assert "episodic" in result and "graph_fold_collapse_k1" in result["episodic"], (
+            "Returned soft_stale_by_tier must contain the fold-staled key"
+        )
+
+    def test_contradiction_same_pred_not_soft_staled_at_fold(self, tmp_path):
+        """ASRF-2: contradiction_same_pred is NOT soft-staled at fold scope.
+
+        At fold scope there is no recency signal: the recon merge is old-vs-old.
+        Soft-staling the OLD slot at fold would remove valid facts without
+        evidence that the NEW version is more recent.  The helper must skip
+        contradiction_same_pred entries when scope='fold'.
+        """
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph_fold_contra_k1": {
+                    "reason": "contradiction_same_pred",
+                    "subject": "Avery",
+                    "object": "Berlin",
+                    "predicate": "lives_in",
+                },
+            },
+        )
+        loop.store.put(
+            "episodic",
+            "graph_fold_contra_k1",
+            {
+                "key": "graph_fold_contra_k1",
+                "subject": "Avery",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "Avery",
+                "first_seen_cycle": 1,
+            },
+            register=True,
+        )
+
+        result = loop._apply_subtractive_removals_to_store(scope="fold")
+
+        assert not loop.store.is_stale("graph_fold_contra_k1"), (
+            "contradiction_same_pred key must NOT be soft-staled at fold scope "
+            "(no recency signal; only interim scope has NEW supersedes OLD)"
+        )
+        assert not result, (
+            "Returned soft_stale_by_tier must be empty when only fold-excluded reasons present"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _extract_json_block — relations-envelope parser path for normalization
+# ---------------------------------------------------------------------------
+
+
+class TestExtractJsonBlockRelationsEnvelope:
+    """_extract_json_block recognises the {"relations":[...]} envelope emitted by
+    the normalization prompt.
+
+    Tests:
+    - REL-1: wrapped {"relations":[...]} envelope parsed and returned.
+    - REL-2: bare array [{...}] with subject/predicate/object elements accepted.
+    - REL-3: markdown-fenced {"relations":[...]} accepted (fence stripped).
+    - REL-4: no JSON at all raises ValueError.
+    - REL-5: multiple relation entries preserved.
+    """
+
+    @staticmethod
+    def _parse(raw: str):
+        import json
+
+        from paramem.graph.extractor import _extract_json_block
+
+        return json.loads(_extract_json_block(raw))
+
+    def test_relations_envelope_parsed(self):
+        """REL-1: {"relations":[...]} envelope is accepted by _extract_json_block."""
+        raw = '{"relations": [{"subject": "Alex", "predicate": "works_for", "object": "Acme"}]}'
+        result = self._parse(raw)
+        assert isinstance(result, dict)
+        assert "relations" in result
+        assert len(result["relations"]) == 1
+        assert result["relations"][0]["predicate"] == "works_for"
+
+    def test_bare_array_with_spo_elements_accepted(self):
+        """REL-2: bare array where first element has subject/predicate/object is accepted."""
+        raw = '[{"subject": "Alex", "predicate": "lives_in", "object": "Berlin"}]'
+        result = self._parse(raw)
+        assert isinstance(result, list)
+        assert result[0]["object"] == "Berlin"
+
+    def test_markdown_fenced_relations_envelope(self):
+        """REL-3: code-fenced {"relations":[...]} is parsed after fence-stripping."""
+        raw = '```json\n{"relations": [{"subject": "A", "predicate": "b", "object": "C"}]}\n```'
+        result = self._parse(raw)
+        assert "relations" in result
+
+    def test_no_json_raises(self):
+        """REL-4: no JSON in output → ValueError from _extract_json_block."""
+        from paramem.graph.extractor import _extract_json_block
+
+        with pytest.raises((ValueError, Exception)):
+            _extract_json_block("The graph has no redundancy.")
+
+    def test_multiple_relation_entries_preserved(self):
+        """REL-5: multiple relation entries are all present in parsed output."""
+        raw = (
+            '{"relations": ['
+            '{"subject": "Morgan", "predicate": "born_in", "object": "Germany"},'
+            '{"subject": "Jordan", "predicate": "works_for", "object": "TechCorp"}'
+            "]}"
+        )
+        result = self._parse(raw)
+        assert len(result["relations"]) == 2
+        assert result["relations"][1]["object"] == "TechCorp"
+
+
+# ---------------------------------------------------------------------------
+# _run_graph_normalization — apply path: relations-envelope + same-(s,o) collapse
+# ---------------------------------------------------------------------------
+
+
+class TestRunGraphNormalizationApply:
+    """Integration tests for the whole-graph normalization apply path.
+
+    The model is stubbed to return a known JSON payload via generate_answer.
+    All assertions are on graph-edge changes and removal_ledger entries.
+    The factory builds graphs large enough to pass the 10-node floor
+    (node_count=15 default).
+
+    The model output uses the relations-envelope schema:
+    ``{"relations": [{"subject": "...", "predicate": "...", "object": "..."}]}``.
+    The apply logic performs SAME-(subject, object) collapse only:
+    - Groups with 2+ distinct predicates where the model returned fewer predicates
+      than the input → retire non-kept predicates, union provenance onto survivor.
+    - Single-predicate groups are NEVER touched even if model omits them.
+    - Output relations not in the input (hallucinated s/o/pred) are ignored.
+
+    Tests:
+    - NDA-1: two keyed synonym predicates for same (s,o) — model keeps one →
+             non-kept keyed edge removed + removal_ledger 'duplicate_merge'.
+    - NDA-2: two keyless synonym predicates — model keeps one → retired edge
+             removed, no ledger entry (no ik_key).
+    - NDA-3: provenance (sessions union, recurrence sum, max confidence) is
+             carried onto the survivor edge before the retired edges are removed.
+    - NDA-4: output relation with predicate not in input for that (s,o) ignored.
+    - NDA-5: model returns all predicates unchanged → no-op (graph unchanged).
+    - NDA-6: model=None → skipped=True, graph unchanged.
+    - NDA-7: graph < 10 nodes → skipped=True (floor).
+    - NDA-8: mixed keyed + keyless — keyed retired → ledger; keyless retired → no ledger;
+             survivor (keyed graph42) intact; result counts correct.
+    - NDA-9: single-predicate (s,o) group not touched even if model omits it.
+    - NDA-10: output relation with (s,o) not in input at all is silently ignored.
+    """
+
+    # ---------------------------------------------------------------------------
+    # Shared factory
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _make_loop(tmp_path, *, model=None, node_count: int = 15):
+        """Build a ConsolidationLoop with a seeded merger graph."""
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = model if model is not None else MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.tokenizer.apply_chat_template.return_value = "formatted_prompt"
+        loop.config = ConsolidationConfig(
+            indexed_key_replay_enabled=True,
+            interim_refinement="light",
+            fold_refinement="light",
+        )
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.pending_interim_triples = []
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_enabled = False
+        loop.full_consolidation_period_string = ""
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.graph_enrichment_neighborhood_hops = 2
+
+        merger = GraphMerger(model=None)
+        loop.merger = merger
+
+        g = nx.MultiDiGraph()
+        for i in range(node_count):
+            g.add_node(f"node{i}", recurrence_count=0, attributes={"name": f"node{i}"})
+        loop.merger.graph = g
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+        return loop
+
+    # ---------------------------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------------------------
+
+    @staticmethod
+    def _add_keyed_edge(graph, subj, obj, predicate, ik_key, *, sessions=None, recurrence=1):
+        """Add a directed edge with standard attributes and a keyed ik_key."""
+        from paramem.graph.name_match import canonical as _can
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        subj = _can(subj)
+        obj = _can(obj)
+        predicate = _can(predicate)
+        attrs = {
+            "predicate": predicate,
+            "relation_type": "factual",
+            "sessions": sessions or ["sess1"],
+            "recurrence_count": recurrence,
+            "confidence": 0.9,
+            _IK_KEY_ATTR: ik_key,
+        }
+        graph.add_node(subj, recurrence_count=1, attributes={"name": subj})
+        graph.add_node(obj, recurrence_count=1, attributes={"name": obj})
+        graph.add_edge(subj, obj, **attrs)
+
+    @staticmethod
+    def _add_keyless_edge(graph, subj, obj, predicate, *, sessions=None, recurrence=1):
+        """Add a directed edge WITHOUT an ik_key (simulates a fresh-ingested fact)."""
+        from paramem.graph.name_match import canonical as _can
+
+        subj = _can(subj)
+        obj = _can(obj)
+        predicate = _can(predicate)
+        attrs = {
+            "predicate": predicate,
+            "relation_type": "factual",
+            "sessions": sessions or ["sess1"],
+            "recurrence_count": recurrence,
+            "confidence": 0.9,
+        }
+        graph.add_node(subj, recurrence_count=1, attributes={"name": subj})
+        graph.add_node(obj, recurrence_count=1, attributes={"name": obj})
+        graph.add_edge(subj, obj, **attrs)
+
+    # Prompt stub: only {fact_lines} placeholder (matches prompt schema).
+    _PROMPT_STUB = "dummy {fact_lines}"
+
+    def _relations_response(self, relations: list[dict]) -> str:
+        """Encode a relations-envelope model response."""
+        import json
+
+        return json.dumps({"relations": relations})
+
+    # ---------------------------------------------------------------------------
+    # Tests
+    # ---------------------------------------------------------------------------
+
+    def test_keyed_synonym_retired_and_ledgered(self, tmp_path):
+        """NDA-1: two keyed synonym predicates for same (s,o) — model keeps one.
+
+        Graph: jordan → techcorp with keyed edges 'works_for' (graph42) and
+        'employed_by' (graph87).  Model returns only works_for for (jordan, techcorp).
+        After apply:
+        - graph87 (non-kept) removed + in removal_ledger with reason 'duplicate_merge'.
+        - graph42 (survivor) still in graph.
+        - result["edges_retired"]==1, result["groups_collapsed"]==1.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        self._add_keyed_edge(graph, "jordan", "techcorp", "works_for", "graph42", sessions=["s1"])
+        self._add_keyed_edge(
+            graph, "jordan", "techcorp", "employed_by", "graph87", sessions=["s2"], recurrence=2
+        )
+
+        model_response = self._relations_response(
+            [{"subject": "jordan", "predicate": "works_for", "object": "techcorp"}]
+        )
+
+        with (
+            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            result = loop._run_graph_normalization()
+
+        all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
+        assert "graph87" not in all_keys, "graph87 (non-kept) must be removed"
+        assert "graph42" in all_keys, "graph42 (survivor) must remain"
+        assert "graph87" in loop.merger.removal_ledger
+        assert loop.merger.removal_ledger["graph87"]["reason"] == "duplicate_merge"
+        assert "graph42" not in loop.merger.removal_ledger, "survivor must NOT be ledgered"
+
+        assert result["edges_retired"] == 1
+        assert result["groups_collapsed"] == 1
+        assert result["skipped"] is False
+
+    def test_keyless_synonym_retired_no_ledger(self, tmp_path):
+        """NDA-2: two keyless synonym predicates — retired edge removed, no ledger entry.
+
+        Fresh-ingest case: facts arrive keyless.  Graph has two keyless edges for
+        (jordan, techcorp): 'works_for' and 'employed_by'.  Model keeps only
+        'works_for'.  After apply: 'employed_by' edge removed; removal_ledger empty.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        self._add_keyless_edge(
+            graph, "jordan", "techcorp", "works_for", sessions=["s1"], recurrence=1
+        )
+        self._add_keyless_edge(
+            graph, "jordan", "techcorp", "employed_by", sessions=["s2"], recurrence=3
+        )
+
+        model_response = self._relations_response(
+            [{"subject": "jordan", "predicate": "works_for", "object": "techcorp"}]
+        )
+
+        with (
+            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            result = loop._run_graph_normalization()
+
+        remaining_preds = {
+            edata["predicate"] for _, _, edata in graph.edges(data=True) if edata.get("predicate")
+        }
+        # canonical() folds underscores to spaces.
+        assert "employed by" not in remaining_preds, "retired edge must be removed"
+        assert "works for" in remaining_preds, "survivor edge must remain"
+        assert not loop.merger.removal_ledger, "no ledger entry for keyless retirements"
+
+        assert result["edges_retired"] == 1
+        assert result["groups_collapsed"] == 1
+
+    def test_provenance_unioned_onto_survivor(self, tmp_path):
+        """NDA-3: sessions, recurrence, and confidence are unioned onto the survivor.
+
+        Graph: morgan → germany with 'born_in' (graph12, sessions=['s1'], rec=1)
+        and 'birthplace' (graph34, sessions=['s2'], rec=2, confidence=0.95).
+        Model keeps only 'born_in'.
+        After apply: graph12 survivor has sessions=['s1','s2'], recurrence>=3,
+        confidence>=0.95; graph34 retired and in ledger.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        self._add_keyed_edge(
+            graph, "morgan", "germany", "born_in", "graph12", sessions=["s1"], recurrence=1
+        )
+        self._add_keyed_edge(
+            graph, "morgan", "germany", "birthplace", "graph34", sessions=["s2"], recurrence=2
+        )
+        # Patch confidence on the graph34 edge so we can assert max.
+        for _, _, edata in graph.edges(data=True):
+            if edata.get(_IK_KEY_ATTR) == "graph34":
+                edata["confidence"] = 0.95
+
+        model_response = self._relations_response(
+            [{"subject": "morgan", "predicate": "born_in", "object": "germany"}]
+        )
+
+        with (
+            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            result = loop._run_graph_normalization()
+
+        assert "graph34" in loop.merger.removal_ledger
+        assert loop.merger.removal_ledger["graph34"]["reason"] == "duplicate_merge"
+        assert "graph12" not in loop.merger.removal_ledger, "survivor must not be ledgered"
+
+        survivor = [
+            edata for _, _, edata in graph.edges(data=True) if edata.get(_IK_KEY_ATTR) == "graph12"
+        ]
+        assert survivor, "graph12 survivor must remain in graph"
+        e = survivor[0]
+        assert "s1" in e.get("sessions", []), "s1 must be retained"
+        assert "s2" in e.get("sessions", []), "s2 from retired edge must be unioned"
+        assert e.get("recurrence_count", 0) >= 3, "recurrence must be summed (1+2=3)"
+        assert e.get("confidence", 0) >= 0.95, "max confidence from retired edge must be applied"
+
+        assert result["edges_retired"] == 1
+        assert result["groups_collapsed"] == 1
+
+    def test_output_predicate_not_in_input_ignored(self, tmp_path):
+        """NDA-4: model output with predicate not in the input for that (s,o) is ignored.
+
+        Graph: morgan → germany with only 'born_in' (graph12).  Model emits
+        'birthplace' for (morgan, germany) — predicate not in input for that pair.
+        The group has only one input predicate so it is never a candidate anyway;
+        additionally the hallucinated predicate is rejected by the grounding check.
+        After apply: graph12 survives, ledger empty.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        self._add_keyed_edge(graph, "morgan", "germany", "born_in", "graph12", sessions=["s1"])
+
+        # Model invents 'birthplace' — not in input for (morgan, germany).
+        model_response = self._relations_response(
+            [{"subject": "morgan", "predicate": "birthplace", "object": "germany"}]
+        )
+
+        with (
+            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            result = loop._run_graph_normalization()
+
+        all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
+        assert "graph12" in all_keys, "graph12 must survive (not a multi-predicate group)"
+        assert not loop.merger.removal_ledger, "Ledger must be empty"
+        assert result["edges_retired"] == 0
+        assert result["groups_collapsed"] == 0
+
+    def test_model_keeps_all_predicates_is_noop(self, tmp_path):
+        """NDA-5: model returns all input predicates for a group → no retirement.
+
+        Graph: jordan → techcorp with 'works_for' (graph42) and 'employed_by' (graph87).
+        Model keeps BOTH predicates.  After apply: both edges survive, ledger empty.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        self._add_keyed_edge(graph, "jordan", "techcorp", "works_for", "graph42")
+        self._add_keyed_edge(graph, "jordan", "techcorp", "employed_by", "graph87")
+
+        # Model keeps both predicates — no collapse.
+        model_response = self._relations_response(
+            [
+                {"subject": "jordan", "predicate": "works_for", "object": "techcorp"},
+                {"subject": "jordan", "predicate": "employed_by", "object": "techcorp"},
+            ]
+        )
+
+        with (
+            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            result = loop._run_graph_normalization()
+
+        all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
+        assert "graph42" in all_keys, "graph42 must survive"
+        assert "graph87" in all_keys, "graph87 must survive"
+        assert not loop.merger.removal_ledger, "Ledger must be empty"
+        assert result["edges_retired"] == 0
+        assert result["groups_collapsed"] == 0
+
+    def test_no_model_returns_skipped(self, tmp_path):
+        """NDA-6: model=None → pass skipped immediately, graph unchanged."""
+        loop = self._make_loop(tmp_path, model=None)
+        loop.model = None
+
+        initial_nodes = loop.merger.graph.number_of_nodes()
+        result = loop._run_graph_normalization()
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == "no_model"
+        assert loop.merger.graph.number_of_nodes() == initial_nodes
+
+    def test_small_graph_returns_skipped(self, tmp_path):
+        """NDA-7: graph < 10 nodes → pass skipped (below floor)."""
+        loop = self._make_loop(tmp_path, node_count=5)
+
+        result = loop._run_graph_normalization()
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == "floor"
+
+    def test_mixed_keyed_and_keyless_correct_ledger(self, tmp_path):
+        """NDA-8: mixed keyed + keyless — keyed retired → ledger; keyless retired → no ledger.
+
+        Graph: jordan → techcorp with three edges:
+        - 'works_for', keyed graph42 (survivor)
+        - 'employed_by', keyed graph87 (to be retired)
+        - 'is_employed_at', keyless (to be retired)
+
+        Model keeps only 'works_for'.
+        After apply:
+        - graph87 removed + in removal_ledger.
+        - keyless 'is_employed_at' removed, NOT in ledger.
+        - graph42 survives.
+        - result["edges_retired"]==2, result["groups_collapsed"]==1.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        self._add_keyed_edge(graph, "jordan", "techcorp", "works_for", "graph42", sessions=["s1"])
+        self._add_keyed_edge(graph, "jordan", "techcorp", "employed_by", "graph87", sessions=["s2"])
+        self._add_keyless_edge(graph, "jordan", "techcorp", "is_employed_at", sessions=["s3"])
+
+        model_response = self._relations_response(
+            [{"subject": "jordan", "predicate": "works_for", "object": "techcorp"}]
+        )
+
+        with (
+            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            result = loop._run_graph_normalization()
+
+        all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
+        assert "graph87" not in all_keys, "graph87 (keyed) must be removed"
+        assert "graph42" in all_keys, "graph42 must survive"
+        assert "graph87" in loop.merger.removal_ledger
+        assert loop.merger.removal_ledger["graph87"]["reason"] == "duplicate_merge"
+        assert len(loop.merger.removal_ledger) == 1, "keyless retirement must not add ledger entry"
+
+        assert result["edges_retired"] == 2
+        assert result["groups_collapsed"] == 1
+
+    def test_single_predicate_group_untouched_even_if_model_omits_it(self, tmp_path):
+        """NDA-9: single-predicate (s,o) group untouched even when model omits it.
+
+        Graph: sam → berlin with only 'lives_in' (graph99).  A separate two-predicate
+        group (jordan/techcorp works_for/employed_by) is present so the model IS called.
+        Model returns ONLY the jordan/techcorp relation and omits sam→berlin entirely.
+        sam→berlin must survive (model omission must not delete a fact).
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        self._add_keyed_edge(graph, "sam", "berlin", "lives_in", "graph99", sessions=["s1"])
+        self._add_keyed_edge(graph, "jordan", "techcorp", "works_for", "graph42", sessions=["s2"])
+        self._add_keyed_edge(graph, "jordan", "techcorp", "employed_by", "graph87", sessions=["s3"])
+
+        # Model returns only one relation for the multi-predicate group; omits sam→berlin.
+        model_response = self._relations_response(
+            [{"subject": "jordan", "predicate": "works_for", "object": "techcorp"}]
+        )
+
+        with (
+            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            result = loop._run_graph_normalization()
+
+        all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
+        assert "graph99" in all_keys, "single-predicate (s,o) must survive model omission"
+        assert result["edges_retired"] == 1, "only graph87 retired (the jordan/techcorp group)"
+        assert result["groups_collapsed"] == 1
+
+    def test_hallucinated_subject_object_ignored(self, tmp_path):
+        """NDA-10: model output with (s,o) pair not in input is silently discarded.
+
+        Graph: morgan → germany with 'born_in' (graph12) and 'birthplace' (graph34) —
+        a valid two-predicate group.  Model also returns a hallucinated relation
+        (alex, lives_in, paris) that has no corresponding input edge.
+        After apply: graph12/graph34 group collapsed normally; hallucinated relation
+        produces no new edge in the graph.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        self._add_keyed_edge(
+            graph, "morgan", "germany", "born_in", "graph12", sessions=["s1"], recurrence=1
+        )
+        self._add_keyed_edge(
+            graph, "morgan", "germany", "birthplace", "graph34", sessions=["s2"], recurrence=2
+        )
+
+        model_response = self._relations_response(
+            [
+                {"subject": "morgan", "predicate": "born_in", "object": "germany"},
+                # Hallucinated (s,o) not in graph input:
+                {"subject": "alex", "predicate": "lives_in", "object": "paris"},
+            ]
+        )
+
+        with (
+            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            result = loop._run_graph_normalization()
+
+        all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
+        assert "graph34" not in all_keys, "birthplace edge must be retired"
+        assert "graph12" in all_keys, "born_in survivor must remain"
+
+        # Hallucinated edge must not exist in graph.
+        subjects_in_graph = {u for u, _v in graph.edges()}
+        assert "alex" not in subjects_in_graph, "hallucinated subject must not appear"
+
+        assert result["edges_retired"] == 1
+        assert result["groups_collapsed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _apply_subtractive_removals_to_store — duplicate_merge reason
+# ---------------------------------------------------------------------------
+
+
+class TestSubtractiveRemovalsDuplicateMerge:
+    """_apply_subtractive_removals_to_store soft-stales 'duplicate_merge' at both scopes.
+
+    Tests:
+    - DM-1: duplicate_merge is soft-staled at interim scope.
+    - DM-2: duplicate_merge is soft-staled at fold scope.
+    """
+
+    @staticmethod
+    def _make_loop_with_ledger(tmp_path, *, ledger: dict):
+        """Minimal ConsolidationLoop with a seeded removal_ledger and replay store."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.pending_interim_triples = []
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_enabled = False
+        loop.full_consolidation_period_string = ""
+
+        merger = GraphMerger(model=None)
+        merger.removal_ledger = dict(ledger)
+        loop.merger = merger
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+        return loop
+
+    @staticmethod
+    def _put_key(loop, key: str) -> None:
+        """Register key as active in the episodic tier."""
+        loop.store.put(
+            "episodic",
+            key,
+            {
+                "key": key,
+                "subject": "Jordan",
+                "predicate": "works for",
+                "object": "TechCorp",
+                "speaker_id": "Jordan",
+                "sessions": ["s1"],
+                "relation_type": "factual",
+            },
+        )
+
+    def test_duplicate_merge_soft_staled_at_interim(self, tmp_path):
+        """DM-1: duplicate_merge reason is soft-staled at interim scope."""
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph87": {
+                    "reason": "duplicate_merge",
+                    "merged_into": "graph42",
+                },
+            },
+        )
+        self._put_key(loop, "graph87")
+
+        loop._apply_subtractive_removals_to_store(scope="interim")
+
+        # Key must now be stale (not active): is_stale returns True once moved to stale partition.
+        registry = loop.store._registry["episodic"]
+        assert registry.is_stale("graph87"), (
+            "duplicate_merge key must be soft-staled at interim scope"
+        )
+
+    def test_duplicate_merge_soft_staled_at_fold(self, tmp_path):
+        """DM-2: duplicate_merge reason is soft-staled at fold scope."""
+        loop = self._make_loop_with_ledger(
+            tmp_path,
+            ledger={
+                "graph87": {
+                    "reason": "duplicate_merge",
+                    "merged_into": "graph42",
+                },
+            },
+        )
+        self._put_key(loop, "graph87")
+
+        loop._apply_subtractive_removals_to_store(scope="fold")
+
+        registry = loop.store._registry["episodic"]
+        assert registry.is_stale("graph87"), "duplicate_merge key must be soft-staled at fold scope"
+
+
+# ---------------------------------------------------------------------------
+# Debug snapshot — on_normalization writes normalization_snapshot.json
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizationDebugSnapshot:
+    """on_normalization routes raw outputs + decisions + applied counts through
+    DebugSnapshotWriter and writes normalization_snapshot.json under fold/.
+
+    Tests:
+    - DS-1: save_cycle_snapshots=True → normalization_snapshot.json written with
+            raw_outputs, decisions, and applied counts (index-delta schema).
+    - DS-2: save_cycle_snapshots=False → no file written (self-gated no-op).
+    """
+
+    @staticmethod
+    def _make_debug_loop(tmp_path, *, save_cycle_snapshots: bool):
+        """Build a ConsolidationLoop with debug snapshot writing enabled/disabled."""
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.debug_snapshot import DebugSnapshotWriter
+        from paramem.utils.config import ConsolidationConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+        loop.save_cycle_snapshots = save_cycle_snapshots
+        loop._current_interim_stamp = None  # type: ignore[assignment]
+        loop.cycle_count = 0
+        loop.run_id = "test_run"
+
+        if save_cycle_snapshots:
+            debug_base = tmp_path / "debug"
+            debug_base.mkdir()
+            loop._debug_base = debug_base
+            loop.snapshot_dir = tmp_path / "snapshot"
+            loop.snapshot_dir.mkdir()
+        else:
+            loop._debug_base = None
+            loop.snapshot_dir = None
+
+        loop._debug_writer = DebugSnapshotWriter(loop)
+        return loop
+
+    def test_normalization_snapshot_written_when_debug_enabled(self, tmp_path):
+        """DS-1: save_cycle_snapshots=True → normalization_snapshot.json written."""
+        import json
+
+        loop = self._make_debug_loop(tmp_path, save_cycle_snapshots=True)
+
+        raw_outputs = ["raw model output goes here"]
+        decisions = [{"relations": [{"subject": "A", "predicate": "b", "object": "C"}]}]
+        applied = {"groups_collapsed": 1, "edges_retired": 1}
+
+        loop._debug_writer.on_normalization(raw_outputs, decisions, applied)
+
+        matches = list(tmp_path.rglob("normalization_snapshot.json"))
+        assert matches, "normalization_snapshot.json must be written when debug is enabled"
+        payload = json.loads(matches[0].read_text())
+        assert payload["raw_outputs"] == raw_outputs
+        assert payload["decisions"] == decisions
+        assert payload["applied"] == applied
+
+    def test_normalization_snapshot_not_written_when_debug_disabled(self, tmp_path):
+        """DS-2: save_cycle_snapshots=False → no file written (self-gated no-op)."""
+        loop = self._make_debug_loop(tmp_path, save_cycle_snapshots=False)
+
+        raw_outputs = ["raw output"]
+        decisions = [{"relations": []}]
+        applied = {"groups_collapsed": 0, "edges_retired": 0}
+
+        loop._debug_writer.on_normalization(raw_outputs, decisions, applied)
+
+        matches = list(tmp_path.rglob("normalization_snapshot.json"))
+        assert not matches, "normalization_snapshot.json must NOT be written when debug is disabled"
+
+
+# ---------------------------------------------------------------------------
+# Level gating — normalize flag for interim_refinement / fold_refinement
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizationLevelGating:
+    """_refine_consolidation_graph gates _run_graph_normalization on normalize flag.
+
+    Tests:
+    - LG-1: interim_refinement='off' → normalize=False → normalization NOT called.
+    - LG-2: interim_refinement='light' → normalize=True → normalization IS called.
+    - LG-3: interim_refinement='full' → normalize=True AND enrich=True.
+    - LG-4: fold_refinement='off' → normalize=False.
+    - LG-5: fold_refinement='light' → normalize=True, enrich=False.
+    - LG-6: fold_refinement='full' → normalize=True, enrich=True.
+    """
+
+    @staticmethod
+    def _make_loop_for_refine(tmp_path, *, interim_refinement="off", fold_refinement="off"):
+        """Build a minimal loop for _refine_consolidation_graph gating tests."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(
+            indexed_key_replay_enabled=True,
+            interim_refinement=interim_refinement,
+            fold_refinement=fold_refinement,
+        )
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.pending_interim_triples = []
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_enabled = False
+        loop.full_consolidation_period_string = ""
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.graph_enrichment_neighborhood_hops = 2
+
+        merger = GraphMerger(model=None)
+        loop.merger = merger
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+        return loop
+
+    _NORM_RETURN = {
+        "skipped": False,
+        "chunks": 1,
+        "groups_collapsed": 0,
+        "edges_retired": 0,
+    }
+
+    # -- Interim scope --
+
+    def test_interim_off_normalization_not_called(self, tmp_path):
+        """LG-1: interim_refinement='off' → normalize=False → normalization not called."""
+        from unittest.mock import patch
+
+        loop = self._make_loop_for_refine(tmp_path, interim_refinement="off")
+        with (
+            patch.object(
+                loop, "_run_graph_normalization", return_value={"skipped": True}
+            ) as mock_norm,
+            patch.object(loop, "_run_graph_enrichment", return_value={"skipped": True}),
+        ):
+            loop._refine_consolidation_graph(
+                [],
+                normalize=(loop.config.interim_refinement != "off"),
+                enrich=(loop.config.interim_refinement == "full"),
+            )
+        mock_norm.assert_not_called()
+
+    def test_interim_light_normalization_called_enrichment_not_called(self, tmp_path):
+        """LG-2: interim_refinement='light' → normalize=True, enrich=False."""
+        from unittest.mock import patch
+
+        loop = self._make_loop_for_refine(tmp_path, interim_refinement="light")
+        with (
+            patch.object(
+                loop,
+                "_run_graph_normalization",
+                return_value=self._NORM_RETURN,
+            ) as mock_norm,
+            patch.object(
+                loop, "_run_graph_enrichment", return_value={"skipped": True}
+            ) as mock_enrich,
+        ):
+            loop._refine_consolidation_graph(
+                [],
+                normalize=(loop.config.interim_refinement != "off"),
+                enrich=(loop.config.interim_refinement == "full"),
+            )
+        mock_norm.assert_called_once()
+        mock_enrich.assert_not_called()
+
+    def test_interim_full_both_called(self, tmp_path):
+        """LG-3: interim_refinement='full' → normalize=True, enrich=True."""
+        from unittest.mock import patch
+
+        loop = self._make_loop_for_refine(tmp_path, interim_refinement="full")
+        with (
+            patch.object(
+                loop,
+                "_run_graph_normalization",
+                return_value=self._NORM_RETURN,
+            ) as mock_norm,
+            patch.object(
+                loop,
+                "_run_graph_enrichment",
+                return_value={
+                    "skipped": False,
+                    "chunks": 0,
+                    "new_edges": 0,
+                    "same_as_merges": 0,
+                },
+            ) as mock_enrich,
+        ):
+            loop._refine_consolidation_graph(
+                [],
+                normalize=(loop.config.interim_refinement != "off"),
+                enrich=(loop.config.interim_refinement == "full"),
+            )
+        mock_norm.assert_called_once()
+        mock_enrich.assert_called_once()
+
+    # -- Fold scope --
+
+    def test_fold_off_normalization_not_called(self, tmp_path):
+        """LG-4: fold_refinement='off' → normalize=False → normalization not called."""
+        from unittest.mock import patch
+
+        loop = self._make_loop_for_refine(tmp_path, fold_refinement="off")
+        with (
+            patch.object(
+                loop, "_run_graph_normalization", return_value={"skipped": True}
+            ) as mock_norm,
+            patch.object(loop, "_run_graph_enrichment", return_value={"skipped": True}),
+        ):
+            loop._refine_consolidation_graph(
+                [],
+                normalize=(loop.config.fold_refinement != "off"),
+                enrich=(loop.config.fold_refinement == "full"),
+            )
+        mock_norm.assert_not_called()
+
+    def test_fold_light_normalization_called_enrichment_not_called(self, tmp_path):
+        """LG-5: fold_refinement='light' → normalize=True, enrich=False."""
+        from unittest.mock import patch
+
+        loop = self._make_loop_for_refine(tmp_path, fold_refinement="light")
+        with (
+            patch.object(
+                loop,
+                "_run_graph_normalization",
+                return_value=self._NORM_RETURN,
+            ) as mock_norm,
+            patch.object(
+                loop, "_run_graph_enrichment", return_value={"skipped": True}
+            ) as mock_enrich,
+        ):
+            loop._refine_consolidation_graph(
+                [],
+                normalize=(loop.config.fold_refinement != "off"),
+                enrich=(loop.config.fold_refinement == "full"),
+            )
+        mock_norm.assert_called_once()
+        mock_enrich.assert_not_called()
+
+    def test_fold_full_both_called(self, tmp_path):
+        """LG-6: fold_refinement='full' → normalize=True, enrich=True."""
+        from unittest.mock import patch
+
+        loop = self._make_loop_for_refine(tmp_path, fold_refinement="full")
+        with (
+            patch.object(
+                loop,
+                "_run_graph_normalization",
+                return_value=self._NORM_RETURN,
+            ) as mock_norm,
+            patch.object(
+                loop,
+                "_run_graph_enrichment",
+                return_value={
+                    "skipped": False,
+                    "chunks": 0,
+                    "new_edges": 0,
+                    "same_as_merges": 0,
+                },
+            ) as mock_enrich,
+        ):
+            loop._refine_consolidation_graph(
+                [],
+                normalize=(loop.config.fold_refinement != "off"),
+                enrich=(loop.config.fold_refinement == "full"),
+            )
+        mock_norm.assert_called_once()
+        mock_enrich.assert_called_once()

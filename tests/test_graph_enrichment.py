@@ -1110,7 +1110,7 @@ class TestInterimEnrichmentHook:
         imports — still proving the rollover hook is structurally bound
         to the normal-branch else, not the cap-reached if.
         """
-        loop = _make_loop(tmp_path, graph_enrichment_min_triples_floor=1)
+        loop = _make_loop(tmp_path)
 
         loop.extract_session = MagicMock(
             return_value=(
@@ -1190,15 +1190,17 @@ class TestRefineConsolidationGraph:
 
         loop._run_graph_enrichment.assert_called_once()
 
-    def test_enrich_default_calls_run_graph_enrichment(self, tmp_path):
-        """enrich defaults to True — fold passes no keyword and gets enrichment."""
+    def test_default_skips_both_normalize_and_enrich(self, tmp_path):
+        """normalize and enrich both default False (level "off") — refine calls neither."""
         loop = _make_loop(tmp_path)
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
+        loop._run_graph_normalization = MagicMock(return_value={"skipped": True})
 
-        # No enrich kwarg — fold behavior (default=True).
+        # No kwargs — level "off" semantics (both default False).
         loop._refine_consolidation_graph([])
 
-        loop._run_graph_enrichment.assert_called_once()
+        loop._run_graph_enrichment.assert_not_called()
+        loop._run_graph_normalization.assert_not_called()
 
     def test_enrich_false_skips_run_graph_enrichment(self, tmp_path):
         """_refine_consolidation_graph(recon, enrich=False) does NOT call _run_graph_enrichment."""
@@ -1305,27 +1307,20 @@ class TestRefineConsolidationGraph:
 
         bump_spy.assert_not_called()
 
-    def test_fold_call_byte_identical_behavior(self, tmp_path):
-        """The fold's call _refine_consolidation_graph(recon) uses enrich=True default.
+    def test_normalize_true_calls_run_graph_normalization(self, tmp_path):
+        """normalize=True runs the whole-graph normalization pass (light+, both scopes).
 
-        Verify the fold's unchanged call site (_refine_consolidation_graph without
-        enrich kwarg) produces identical behavior to passing enrich=True explicitly.
-        Both must call _run_graph_enrichment.
+        The normalization pass is independent of enrich: normalize=True without
+        enrich runs normalization only (the light default), not SOTA enrichment.
         """
-        loop_a = _make_loop(tmp_path / "a")
-        loop_a._run_graph_enrichment = MagicMock(return_value={"skipped": True})
-        loop_a._refine_consolidation_graph([])  # fold call (no kwarg)
-        count_a = loop_a._run_graph_enrichment.call_count
+        loop = _make_loop(tmp_path)
+        loop._run_graph_normalization = MagicMock(return_value={"skipped": True})
+        loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
 
-        loop_b = _make_loop(tmp_path / "b")
-        loop_b._run_graph_enrichment = MagicMock(return_value={"skipped": True})
-        loop_b._refine_consolidation_graph([], enrich=True)  # explicit True
-        count_b = loop_b._run_graph_enrichment.call_count
+        loop._refine_consolidation_graph([], normalize=True)
 
-        assert count_a == count_b == 1, (
-            f"Fold call and enrich=True must both call _run_graph_enrichment once; "
-            f"got {count_a} vs {count_b}"
-        )
+        loop._run_graph_normalization.assert_called_once()
+        loop._run_graph_enrichment.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
