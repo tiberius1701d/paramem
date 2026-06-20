@@ -850,12 +850,12 @@ class TestProbeKeysFromGraph:
 
 
 # ---------------------------------------------------------------------------
-# TestConsolidateInterimToCanonicalGraph
+# TestConsolidateSimulateFold
 # ---------------------------------------------------------------------------
 
 
 def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
-    """Build the minimal ConsolidationLoop required by consolidate_interim_to_canonical_graph.
+    """Build the minimal ConsolidationLoop required by consolidate_simulate_fold.
 
     Attributes set:
       - ``output_dir`` — used as the adapter_dir root.
@@ -866,7 +866,7 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
       - ``save_cycle_snapshots`` — False so ``_debug_writer`` gates to no-op.
       - ``_debug_base`` — None so ``_debug_writer._active_base()`` returns None.
       - ``config`` — minimal ``ConsolidationConfig`` with ``fold_refinement="off"`` so
-        ``consolidate_interim_to_canonical_graph`` can read ``config.fold_refinement``
+        ``consolidate_simulate_fold`` can read ``config.fold_refinement``
         without a full server config; enrichment is suppressed (matches the intent of
         the ``graph_enrichment_enabled=False`` attribute above).
 
@@ -922,8 +922,8 @@ def _write_interim_graph(adapter_dir: Path, stamp: str, triples: list[dict]) -> 
     return interim_dir
 
 
-class TestConsolidateInterimToCanonicalGraph:
-    """Tests for consolidate_interim_to_canonical_graph (simulate-mode full fold)."""
+class TestConsolidateSimulateFold:
+    """Tests for consolidate_simulate_fold (simulate-mode full fold)."""
 
     def test_no_interim_slots_returns_noop_result(self, tmp_path):
         """Empty interim set: no main-graph write, no crash, result signals noop.
@@ -934,7 +934,7 @@ class TestConsolidateInterimToCanonicalGraph:
         """
         loop = _make_bare_loop(tmp_path)
 
-        result = loop.consolidate_interim_to_canonical_graph()
+        result = loop.consolidate_simulate_fold()
 
         assert result["tiers_rebuilt"] == [], "No interim slots → tiers_rebuilt must be empty"
         assert result["rolled_back"] is False
@@ -958,7 +958,7 @@ class TestConsolidateInterimToCanonicalGraph:
         ]
         interim_dir = _write_interim_graph(tmp_path, "20260101T0000", triples)
 
-        result = loop.consolidate_interim_to_canonical_graph()
+        result = loop.consolidate_simulate_fold()
 
         assert result["tiers_rebuilt"] == ["episodic"]
         main_graph_path = tmp_path / "episodic" / "graph.json"
@@ -987,7 +987,7 @@ class TestConsolidateInterimToCanonicalGraph:
             [{"key": "graph2", "subject": "Bob", "predicate": "works_at", "object": "Acme"}],
         )
 
-        result = loop.consolidate_interim_to_canonical_graph()
+        result = loop.consolidate_simulate_fold()
 
         main_graph_path = tmp_path / "episodic" / "graph.json"
         assert main_graph_path.exists()
@@ -1021,7 +1021,7 @@ class TestConsolidateInterimToCanonicalGraph:
         _write_interim_graph(tmp_path, "20260101T0000", [shared_triple])
         _write_interim_graph(tmp_path, "20260102T0000", [shared_triple])
 
-        loop.consolidate_interim_to_canonical_graph()
+        loop.consolidate_simulate_fold()
 
         main_graph_path = tmp_path / "episodic" / "graph.json"
         merged = load_memory_from_disk(main_graph_path)
@@ -1050,7 +1050,7 @@ class TestConsolidateInterimToCanonicalGraph:
             for i in range(1, 4)
         ]
 
-        loop.consolidate_interim_to_canonical_graph()
+        loop.consolidate_simulate_fold()
 
         for d in dirs:
             assert not d.exists(), f"Interim dir {d} must be removed after consolidation"
@@ -1074,7 +1074,7 @@ class TestConsolidateInterimToCanonicalGraph:
             [{"key": "graph1", "subject": "Alice", "predicate": "likes", "object": "Tea"}],
         )
 
-        result = loop.consolidate_interim_to_canonical_graph()
+        result = loop.consolidate_simulate_fold()
 
         assert "tier_delta" in result, (
             f"Result must contain 'tier_delta'; got {list(result.keys())}"
@@ -1107,7 +1107,7 @@ class TestConsolidateInterimToCanonicalGraph:
         loop = _make_bare_loop(tmp_path)
         # No interim slots, no pre-existing main graph.
 
-        result = loop.consolidate_interim_to_canonical_graph(housekeeping=True)
+        result = loop.consolidate_simulate_fold(housekeeping=True)
 
         assert result["tiers_rebuilt"] == ["episodic"], (
             "housekeeping=True: tiers_rebuilt must be ['episodic'] even with no interims; "
@@ -1119,7 +1119,7 @@ class TestConsolidateInterimToCanonicalGraph:
         )
 
     def test_housekeeping_sets_current_interim_stamp(self, tmp_path):
-        """During consolidate_interim_to_canonical_graph(housekeeping=True) the loop's
+        """During consolidate_simulate_fold(housekeeping=True) the loop's
         _current_interim_stamp is set to 'housekeeping_<ts>' and then cleared.
 
         After the method returns, the stamp is None (cleared on exit).  This test
@@ -1127,17 +1127,17 @@ class TestConsolidateInterimToCanonicalGraph:
         observable from a unit test).
         """
         loop = _make_bare_loop(tmp_path)
-        loop.consolidate_interim_to_canonical_graph(housekeeping=True)
+        loop.consolidate_simulate_fold(housekeeping=True)
 
         # Stamp must be cleared on normal return.
         stamp = getattr(loop, "_current_interim_stamp", "NOT_SET")
         assert stamp is None, (
             "_current_interim_stamp must be None after "
-            f"consolidate_interim_to_canonical_graph returns; got {stamp!r}"
+            f"consolidate_simulate_fold returns; got {stamp!r}"
         )
 
-    def test_run_housekeeping_dispatches_to_consolidate_interim_to_canonical_graph(self, tmp_path):
-        """run_housekeeping() on a simulate-mode loop calls consolidate_interim_to_canonical_graph
+    def test_run_housekeeping_dispatches_to_consolidate_simulate_fold(self, tmp_path):
+        """run_housekeeping() on a simulate-mode loop calls consolidate_simulate_fold
         with housekeeping=True, NOT consolidate_interim_adapters.
 
         With config=None the loop's run_housekeeping() falls through to 'simulate'
@@ -1148,8 +1148,8 @@ class TestConsolidateInterimToCanonicalGraph:
         loop = _make_bare_loop(tmp_path)
         # config=None → mode defaults to "simulate" in run_housekeeping.
 
-        _meth = loop.consolidate_interim_to_canonical_graph
-        with patch.object(loop, "consolidate_interim_to_canonical_graph", wraps=_meth) as mock_cig:
+        _meth = loop.consolidate_simulate_fold
+        with patch.object(loop, "consolidate_simulate_fold", wraps=_meth) as mock_cig:
             loop.run_housekeeping()
 
         mock_cig.assert_called_once_with(housekeeping=True)
@@ -1160,7 +1160,7 @@ class TestConsolidateInterimToCanonicalGraph:
 
         Seeds two interim graph.json slots whose surfaces differ but canonicalize
         to the same identity (subject "Alice" vs "alice", object "Acme Corp" vs
-        "acme corp").  After consolidate_interim_to_canonical_graph(housekeeping=True):
+        "acme corp").  After consolidate_simulate_fold(housekeeping=True):
 
         (a) The variants COLLAPSE to a single edge in the persisted main graph.json
             (canonical() node identity + Case-1 dedup in the GraphMerger topology,
@@ -1207,7 +1207,7 @@ class TestConsolidateInterimToCanonicalGraph:
             ],
         )
 
-        loop.consolidate_interim_to_canonical_graph(housekeeping=True)
+        loop.consolidate_simulate_fold(housekeeping=True)
 
         # (a) Main graph.json must contain exactly ONE edge (the variants collapsed).
         main_graph_path = tmp_path / "episodic" / "graph.json"
@@ -1241,7 +1241,7 @@ class TestConsolidateInterimToCanonicalGraph:
         merged interim edges in the persisted output.
 
         Strategy: monkeypatch _run_graph_enrichment to add a sentinel edge to
-        self.merger.graph and return new_edges=1.  After consolidate_interim_to_canonical_graph(
+        self.merger.graph and return new_edges=1.  After consolidate_simulate_fold(
         housekeeping=True), assert:
         (a) the sentinel edge is present in the persisted graph.json, and
         (b) the merged interim edge is also present (sentinel coexists with merged content),
@@ -1250,7 +1250,7 @@ class TestConsolidateInterimToCanonicalGraph:
         from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         loop = _make_bare_loop(tmp_path)
-        # fold_refinement="full" is required so consolidate_interim_to_canonical_graph
+        # fold_refinement="full" is required so consolidate_simulate_fold
         # calls _run_graph_enrichment; default "off" (set by _make_bare_loop) skips it.
         loop.config = ConsolidationConfig(fold_refinement="full")
 
@@ -1295,7 +1295,7 @@ class TestConsolidateInterimToCanonicalGraph:
         from unittest.mock import patch
 
         with patch.object(loop, "_run_graph_enrichment", side_effect=_fake_enrichment):
-            result = loop.consolidate_interim_to_canonical_graph(housekeeping=True)
+            result = loop.consolidate_simulate_fold(housekeeping=True)
 
         # (a) Sentinel edge must be present in the persisted graph.json.
         main_graph_path = tmp_path / "episodic" / "graph.json"
@@ -1326,7 +1326,7 @@ class TestConsolidateInterimToCanonicalGraph:
     def test_simulate_merge_produces_person_node_with_speaker_id(self, tmp_path):
         """Simulate path via _merge_registry_relations stamps entity_type='person' + speaker_id.
 
-        Regression guard: before routing consolidate_interim_to_canonical_graph through
+        Regression guard: before routing consolidate_simulate_fold through
         _merge_registry_relations, the simulate path used entities=[] directly
         (same latent bug as the recon path fixed by _merge_registry_relations
         unification).  A relation whose subject == speaker_id (i.e. a speaker
@@ -1359,7 +1359,7 @@ class TestConsolidateInterimToCanonicalGraph:
             ],
         )
 
-        loop.consolidate_interim_to_canonical_graph()
+        loop.consolidate_simulate_fold()
 
         # W1: merger.graph is cleared at cycle-end; read the persisted graph.json instead.
         from paramem.memory.persistence import load_memory_from_disk
@@ -1613,7 +1613,7 @@ class TestBuildTierDelta:
             [{"key": "graph2", "subject": "alice", "predicate": "works at", "object": "acme corp"}],
         )
 
-        result = loop.consolidate_interim_to_canonical_graph(housekeeping=True)
+        result = loop.consolidate_simulate_fold(housekeeping=True)
 
         td = result["tier_delta"]
         assert "episodic" in td
@@ -2146,7 +2146,7 @@ class TestDebugSnapshotOnTierDelta:
 
 
 class TestGraphLifecycle:
-    """W1 regression: consolidate_interim_to_canonical_graph clears merger.graph at every exit.
+    """W1 regression: consolidate_simulate_fold clears merger.graph at every exit.
 
     Uses a REAL GraphMerger (not MagicMock) so reset_graph() actually clears the
     graph, not a no-op as it would be under MagicMock.  This validates the W1
@@ -2162,7 +2162,7 @@ class TestGraphLifecycle:
         """merger.graph is empty (0 nodes, 0 edges) after a successful fold.
 
         Arrange: one interim slot with a real triple.
-        Act: consolidate_interim_to_canonical_graph().
+        Act: consolidate_simulate_fold().
         Assert: merger.graph has 0 nodes and 0 edges.
         """
         loop = _make_bare_loop(tmp_path)
@@ -2174,7 +2174,7 @@ class TestGraphLifecycle:
             [{"key": "graph1", "subject": "Alice", "predicate": "knows", "object": "Bob"}],
         )
 
-        loop.consolidate_interim_to_canonical_graph()
+        loop.consolidate_simulate_fold()
 
         assert loop.merger.graph.number_of_nodes() == 0, (
             f"W1 regression: merger.graph must be empty after successful fold; "
@@ -2194,7 +2194,7 @@ class TestGraphLifecycle:
         # No pre-existing graph.json — the fold handles a missing file via
         # load_memory_from_disk returning an empty MultiDiGraph.
 
-        loop.consolidate_interim_to_canonical_graph()
+        loop.consolidate_simulate_fold()
 
         assert loop.merger.graph.number_of_nodes() == 0, (
             f"W1 regression: merger.graph must be empty after noop fold; "
@@ -2222,7 +2222,7 @@ class TestGraphLifecycle:
             "20260101T0000",
             [{"key": "graph1", "subject": "Alice", "predicate": "knows", "object": "Bob"}],
         )
-        result1 = loop.consolidate_interim_to_canonical_graph()
+        result1 = loop.consolidate_simulate_fold()
         assert result1.get("tiers_rebuilt") == ["episodic"]
 
         # After fold 1 the graph must be EMPTY.
@@ -2239,7 +2239,7 @@ class TestGraphLifecycle:
             "20260102T0000",
             [{"key": "graph2", "subject": "Carol", "predicate": "lives_in", "object": "Berlin"}],
         )
-        result2 = loop.consolidate_interim_to_canonical_graph()
+        result2 = loop.consolidate_simulate_fold()
         assert result2.get("tiers_rebuilt") == ["episodic"]
 
         # The canonical graph after fold 2 must contain BOTH folds' edges
@@ -2399,4 +2399,414 @@ class TestGraphLifecycle:
             "W1 regression: consolidate_interim_adapters finally must clear merger.graph "
             "on accumulating return; "
             f"got {loop.merger.graph.number_of_edges()} edges"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestCollectDiskFoldRelations (B8a-1 unit: new helper)
+# ---------------------------------------------------------------------------
+
+
+class TestCollectDiskFoldRelations:
+    """Unit tests for :meth:`ConsolidationLoop._collect_disk_fold_relations`.
+
+    Verifies:
+    - ``active_before_count`` is the canonical graph's pre-merge edge count (MF-2).
+    - Train-mode interim slots (no ``graph.json``) are skipped (WARN-6).
+    - ``interim_dirs`` contains only simulate-mode slots that have a ``graph.json``.
+    - Relations are built from BOTH the canonical graph and simulate-mode interim slots.
+    - Missing canonical graph returns ``active_before_count=0`` (empty graph).
+    """
+
+    def test_active_before_count_from_canonical_graph(self, tmp_path):
+        """active_before_count reflects the canonical episodic/graph.json edge count.
+
+        Writes a canonical graph.json with 2 edges and one interim slot with
+        1 edge.  active_before_count must equal 2 (canonical pre-merge count),
+        NOT 3 (total after merging interim).
+        """
+        import networkx as nx
+
+        from paramem.memory.persistence import _IK_KEY_ATTR, save_memory_to_disk
+
+        # Write canonical graph with 2 edges.
+        canonical_path = tmp_path / "episodic" / "graph.json"
+        canonical_path.parent.mkdir(parents=True, exist_ok=True)
+        canonical_g = nx.MultiDiGraph()
+        canonical_g.add_edge("A", "B", **{_IK_KEY_ATTR: "k1", "predicate": "p1", "speaker_id": ""})
+        canonical_g.add_edge("C", "D", **{_IK_KEY_ATTR: "k2", "predicate": "p2", "speaker_id": ""})
+        save_memory_to_disk(canonical_g, canonical_path, encrypted=False)
+
+        # Write one simulate-mode interim slot with 1 edge.
+        _write_interim_graph(
+            tmp_path,
+            "20260301T0000",
+            [
+                {"key": "k3", "subject": "E", "predicate": "p3", "object": "F"},
+            ],
+        )
+
+        loop = _make_bare_loop(tmp_path)
+        inp = loop._collect_disk_fold_relations(tmp_path)
+
+        assert inp.active_before_count == 2, (
+            f"active_before_count must equal canonical graph edge count (2); "
+            f"got {inp.active_before_count}"
+        )
+
+    def test_no_canonical_graph_returns_zero_active_before(self, tmp_path):
+        """When canonical episodic/graph.json does not exist, active_before_count == 0.
+
+        The first fold has no prior canonical graph; load_memory_from_disk returns
+        an empty graph whose edge count is 0.
+        """
+        _write_interim_graph(
+            tmp_path,
+            "20260301T0000",
+            [
+                {"key": "k1", "subject": "A", "predicate": "p1", "object": "B"},
+            ],
+        )
+
+        loop = _make_bare_loop(tmp_path)
+        inp = loop._collect_disk_fold_relations(tmp_path)
+
+        assert inp.active_before_count == 0, (
+            f"No canonical graph → active_before_count must be 0; got {inp.active_before_count}"
+        )
+
+    def test_train_mode_slot_skipped_no_graph_json(self, tmp_path):
+        """Train-mode interim slots (no graph.json) are skipped (WARN-6).
+
+        Creates one simulate-mode slot (has graph.json) and one train-mode slot
+        (directory with no graph.json, only a sentinel file).  Only the simulate
+        slot must appear in interim_dirs.
+        """
+        # Simulate-mode slot: has graph.json.
+        simulate_dir = _write_interim_graph(
+            tmp_path,
+            "20260301T0000",
+            [
+                {"key": "k1", "subject": "A", "predicate": "p1", "object": "B"},
+            ],
+        )
+
+        # Train-mode slot: directory with no graph.json (mimics a PEFT weights slot).
+        train_slot_dir = tmp_path / "episodic" / "interim_20260302T0000"
+        train_slot_dir.mkdir(parents=True, exist_ok=True)
+        # Place a sentinel file (not graph.json) to confirm the directory exists.
+        (train_slot_dir / "adapter_config.json").write_text('{"r": 8}')
+
+        loop = _make_bare_loop(tmp_path)
+        inp = loop._collect_disk_fold_relations(tmp_path)
+
+        assert simulate_dir in inp.interim_dirs, (
+            "Simulate-mode slot (has graph.json) must appear in interim_dirs"
+        )
+        assert train_slot_dir not in inp.interim_dirs, (
+            "Train-mode slot (no graph.json) must be skipped (WARN-6)"
+        )
+        # Relations from simulate slot are present; train slot contributes nothing.
+        rel_keys = {r.indexed_key for r in inp.relations}
+        assert "k1" in rel_keys, "Relation from simulate slot must be collected"
+
+    def test_relations_from_canonical_and_interim_slots(self, tmp_path):
+        """Relations are built from both the canonical graph and simulate-mode interim slots.
+
+        Writes a canonical graph with key k1 and an interim slot with key k2.
+        The returned relations must contain both.
+        """
+        import networkx as nx
+
+        from paramem.memory.persistence import _IK_KEY_ATTR, save_memory_to_disk
+
+        canonical_path = tmp_path / "episodic" / "graph.json"
+        canonical_path.parent.mkdir(parents=True, exist_ok=True)
+        canonical_g = nx.MultiDiGraph()
+        canonical_g.add_edge("A", "B", **{_IK_KEY_ATTR: "k1", "predicate": "p1", "speaker_id": ""})
+        save_memory_to_disk(canonical_g, canonical_path, encrypted=False)
+
+        _write_interim_graph(
+            tmp_path,
+            "20260301T0000",
+            [
+                {"key": "k2", "subject": "C", "predicate": "p2", "object": "D"},
+            ],
+        )
+
+        loop = _make_bare_loop(tmp_path)
+        inp = loop._collect_disk_fold_relations(tmp_path)
+
+        rel_keys = {r.indexed_key for r in inp.relations}
+        assert "k1" in rel_keys, "Canonical graph relation (k1) must be collected"
+        assert "k2" in rel_keys, "Interim slot relation (k2) must be collected"
+
+
+# ---------------------------------------------------------------------------
+# TestMaterializeConsolidationGraphDiskSource (B8a-1 unit: source="disk" axis)
+# ---------------------------------------------------------------------------
+
+
+class TestMaterializeConsolidationGraphDiskSource:
+    """Unit tests for :meth:`ConsolidationLoop._materialize_consolidation_graph` with
+    ``source="disk"``.
+
+    Verifies:
+    - ``recall_miss_keys`` is always ``set()`` (no weight reconstruction).
+    - ``recon_relations`` is always ``[]`` (no registry-true re-merge).
+    - Disk relations fed via ``extra_relations`` appear in ``merger.graph`` after the call.
+    - The ``source="weights"`` default path is unchanged (existing callers byte-identical).
+    """
+
+    def test_disk_source_recall_miss_empty(self, tmp_path):
+        """source='disk': recall_miss_keys is always the empty set.
+
+        The disk path skips weight reconstruction entirely; no adapter weights are
+        probed, so no failures can occur.  recall_miss_keys must be set() regardless
+        of the extra_relations content.
+        """
+        from paramem.graph.schema import Relation
+
+        loop = _make_bare_loop(tmp_path)
+        # Provide some disk relations.
+        relations = [
+            Relation(
+                subject="Alice",
+                predicate="lives_in",
+                object="Berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="",
+                indexed_key="k1",
+            )
+        ]
+
+        recall_miss_keys, recon_relations = loop._materialize_consolidation_graph(
+            source="disk",
+            extra_relations=relations,
+        )
+        # Reset graph so it doesn't leak (the loop's finally would do this in production).
+        loop.merger.reset_graph()
+
+        assert recall_miss_keys == set(), (
+            f"source='disk': recall_miss_keys must be empty set(); got {recall_miss_keys!r}"
+        )
+        assert recon_relations == [], (
+            f"source='disk': recon_relations must be [] (no registry-true re-merge); "
+            f"got {recon_relations!r}"
+        )
+
+    def test_disk_source_merges_extra_relations_into_graph(self, tmp_path):
+        """source='disk': extra_relations appear in merger.graph after the call.
+
+        Disk relations are the ONLY merge input for the disk path.  After the call,
+        merger.graph must contain an edge for each supplied relation.
+        """
+        from paramem.graph.schema import Relation
+
+        loop = _make_bare_loop(tmp_path)
+        relations = [
+            Relation(
+                subject="Bob",
+                predicate="works_at",
+                object="Acme",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="",
+                indexed_key="k2",
+            ),
+            Relation(
+                subject="Carol",
+                predicate="visits",
+                object="London",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="",
+                indexed_key="k3",
+            ),
+        ]
+
+        loop._materialize_consolidation_graph(
+            source="disk",
+            extra_relations=relations,
+        )
+
+        # merger.graph must have at least 2 edges (one per relation).
+        n_edges = loop.merger.graph.number_of_edges()
+        assert n_edges >= 2, (
+            f"source='disk': merger.graph must have edges for each extra_relation; "
+            f"got {n_edges} edges (expected >= 2)"
+        )
+        # Reset to avoid leaking into other tests.
+        loop.merger.reset_graph()
+
+    def test_disk_source_empty_extra_relations_noop(self, tmp_path):
+        """source='disk' with empty extra_relations: merger.graph stays empty, no crash.
+
+        An empty extra_relations list is a valid no-op (housekeeping on an empty
+        canonical graph with no interim slots).
+        """
+        loop = _make_bare_loop(tmp_path)
+
+        recall_miss_keys, recon_relations = loop._materialize_consolidation_graph(
+            source="disk",
+            extra_relations=[],
+        )
+        loop.merger.reset_graph()
+
+        assert recall_miss_keys == set()
+        assert recon_relations == []
+
+    def test_weights_source_default_unchanged(self, tmp_path):
+        """source='weights' (default) falls through to the existing weights path.
+
+        The default must not invoke the disk branch.  We verify this by checking
+        that passing source='weights' with no extra_relations and a stubbed store
+        does NOT immediately return (set(), []) without calling reconstruct_graph.
+        A MagicMock model is injected so reconstruct_graph actually runs (and
+        returns an empty recon result due to no PEFT adapters).
+        """
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_bare_loop(tmp_path)
+        # Wire a real (but empty) store so all_active_keys() returns [].
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+
+        # stub reconstruct_graph so we can confirm the weights path runs it.
+        import unittest.mock as _mock
+
+        _recon_mock = _mock.MagicMock()
+        _recon_mock.failures = []
+        _recon_mock.graph.edges.return_value = []
+
+        with _mock.patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            return_value=_recon_mock,
+        ) as _patched_recon:
+            recall_miss_keys, recon_relations = loop._materialize_consolidation_graph(
+                source="weights",
+            )
+            loop.merger.reset_graph()
+
+        # source='weights' must call reconstruct_graph (not the disk short-circuit).
+        assert _patched_recon.called, "source='weights' must call reconstruct_graph"
+        assert recall_miss_keys == set(), (
+            "Weights path with empty store: recall_miss_keys must be empty set()"
+        )
+        assert recon_relations == [], (
+            "Weights path with empty store: recon_relations must be [] (no active keys)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSimulateFoldReturnSchema (B8a-1/MF-3: return schema completeness)
+# ---------------------------------------------------------------------------
+
+
+class TestSimulateFoldReturnSchema:
+    """Assert that consolidate_simulate_fold returns the FULL train schema.
+
+    MF-3 (B8a-2 parity): the train return dict carries ``drift_intended_removal``,
+    ``drift_intended_removal_by_reason``, ``recall_miss_keys``, and ``tier_keyed``.
+    The simulate path must return zero/empty equivalents so callers never KeyError
+    post-collapse.
+
+    Both the noop path (no interim slots) and the active path (slots present) are
+    covered.
+    """
+
+    _REQUIRED_KEYS = frozenset(
+        {
+            "tiers_rebuilt",
+            "graph_drift_count",
+            "drift_deduplicated",
+            "drift_orphan",
+            "drift_genuine_loss",
+            "drift_intended_removal",
+            "drift_intended_removal_by_reason",
+            "recall_miss_keys",
+            "keys_per_tier",
+            "recall_per_tier",
+            "tier_keyed",
+            "rolled_back",
+            "rollback_tier",
+        }
+    )
+
+    def test_noop_return_has_full_schema(self, tmp_path):
+        """Noop return (no interim slots, no housekeeping) carries all required keys.
+
+        The early-return path (no interim slots, housekeeping=False) must include
+        drift_intended_removal, drift_intended_removal_by_reason, recall_miss_keys,
+        and tier_keyed with zero/empty values.
+        """
+        loop = _make_bare_loop(tmp_path)
+        # No interim slots → noop path.
+        result = loop.consolidate_simulate_fold()
+
+        missing = self._REQUIRED_KEYS - set(result.keys())
+        assert not missing, (
+            f"Noop return missing required schema keys: {sorted(missing)}\n"
+            f"  actual keys: {sorted(result.keys())}"
+        )
+        assert result["drift_intended_removal"] == 0
+        assert result["drift_intended_removal_by_reason"] == {}
+        assert result["recall_miss_keys"] == []
+        assert result["tier_keyed"] == {}
+
+    def test_active_return_has_full_schema(self, tmp_path):
+        """Active return (interim slots present) carries all required keys.
+
+        After a successful merge, the result must include all required schema
+        keys — including the MF-3 additions with their zero/empty values.
+        """
+        loop = _make_bare_loop(tmp_path)
+        _write_interim_graph(
+            tmp_path,
+            "20260301T0000",
+            [
+                {"key": "k1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
+            ],
+        )
+
+        result = loop.consolidate_simulate_fold()
+
+        missing = self._REQUIRED_KEYS - set(result.keys())
+        assert not missing, (
+            f"Active return missing required schema keys: {sorted(missing)}\n"
+            f"  actual keys: {sorted(result.keys())}"
+        )
+        assert result["drift_intended_removal"] == 0
+        assert result["drift_intended_removal_by_reason"] == {}
+        assert result["recall_miss_keys"] == []
+        assert result["tier_keyed"] == {}
+        # Sanity: active path does produce a tier_delta.
+        assert "tier_delta" in result
+
+    def test_drift_genuine_loss_is_zero_for_disk_source(self, tmp_path):
+        """drift_genuine_loss is always 0 for the disk-source (simulate) path.
+
+        The simulate venue has an empty store; the recall-miss set is empty
+        (no weight reconstruction); drift_genuine_loss == 0 reproduces the
+        invariant from §7 of the B8a plan.
+        """
+        loop = _make_bare_loop(tmp_path)
+        _write_interim_graph(
+            tmp_path,
+            "20260301T0000",
+            [
+                {"key": "k1", "subject": "Alice", "predicate": "likes", "object": "Tea"},
+                {"key": "k2", "subject": "Bob", "predicate": "works_at", "object": "Acme"},
+            ],
+        )
+
+        result = loop.consolidate_simulate_fold()
+
+        assert result["drift_genuine_loss"] == 0, (
+            f"Disk-source (simulate) path: drift_genuine_loss must always be 0; "
+            f"got {result['drift_genuine_loss']!r}"
         )

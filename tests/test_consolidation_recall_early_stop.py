@@ -316,13 +316,15 @@ class TestCallSiteWiringSourcePresence:
             "_maybe_make_recall_callback",
         )
 
-    def test_site1_unified_cycle_calls_funnel(self) -> None:
-        """run_consolidation_cycle must call _train_tier_adapter (the funnel),
-        not invoke train_adapter directly.
+    def test_run_fold_calls_funnel(self) -> None:
+        """_run_fold must call _train_tier_adapter (the funnel), not invoke
+        train_adapter directly.  Both run_consolidation_cycle and
+        consolidate_interim_adapters now delegate their training to _run_fold,
+        so a single check on _run_fold is sufficient.
         """
         assert self._function_contains_attr_call(
             PROJECT_ROOT / "paramem/training/consolidation.py",
-            "run_consolidation_cycle",
+            "_run_fold",
             "_train_tier_adapter",
         )
 
@@ -347,16 +349,6 @@ class TestCallSiteWiringSourcePresence:
         )
         assert "_prepare_procedural_keys_for_tier" not in func_names, (
             "_prepare_procedural_keys_for_tier must not exist after B5 deletion"
-        )
-
-    def test_site3_consolidate_interim_calls_funnel(self) -> None:
-        """consolidate_interim_adapters must call _train_tier_adapter (the funnel),
-        not invoke train_adapter directly.
-        """
-        assert self._function_contains_attr_call(
-            PROJECT_ROOT / "paramem/training/consolidation.py",
-            "consolidate_interim_adapters",
-            "_train_tier_adapter",
         )
 
     def test_site4_migration(self) -> None:

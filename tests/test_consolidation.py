@@ -5511,13 +5511,17 @@ class TestTierFloor:
             loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
 
     @staticmethod
-    def _run_fold(
+    def _run_full_fold_mocked(
         loop,
         *,
         probe_side_effect=None,
         train_adapter_spy=None,
     ):
         """Run consolidate_interim_adapters with heavy ops mocked.
+
+        Wraps consolidate_interim_adapters (the full-fold thin wrapper), which now
+        delegates its body to _run_fold(FoldScope(persist="main_tiers", ...)).
+        Heavy GPU ops are mocked so this runs without hardware.
 
         probe_side_effect: callable(adapter_name, entries) → set[str].
             Defaults to returning all keys (pass-all probe).
@@ -5643,7 +5647,7 @@ class TestTierFloor:
             )
             loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
 
-        result = self._run_fold(loop)
+        result = self._run_full_fold_mocked(loop)
 
         # Under-floor tiers end up empty after park.
         assert result["keys_per_tier"]["procedural"] == 0, (
@@ -5731,7 +5735,7 @@ class TestTierFloor:
             )
             loop.merger.graph[e["subject"]][e["object"]][eid][_IK_KEY_ATTR] = e["key"]
 
-        self._run_fold(loop)
+        self._run_full_fold_mocked(loop)
 
         bk = loop.store.bookkeeping_for_key("sem0")
         assert bk is not None
@@ -6428,7 +6432,7 @@ class TestTierFloor:
             ] = k
 
         # Must not raise.
-        result = self._run_fold(loop)
+        result = self._run_full_fold_mocked(loop)
         assert result["status"] == "accumulating"
 
     # =========================================================================
@@ -6621,7 +6625,7 @@ class TestTierFloor:
             ],
         )
 
-        result = self._run_fold(loop)
+        result = self._run_full_fold_mocked(loop)
 
         # Each key appears at most once across all serve tiers.
         all_served = [e["key"] for tl in result["tier_keyed"].values() for e in tl]

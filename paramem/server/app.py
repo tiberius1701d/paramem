@@ -13047,14 +13047,14 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # Mode dispatch: simulate mode has no PEFT interim adapters —
         # calling consolidate_interim_adapters would trigger
         # delete_adapter / create_adapter on a non-existent slot.
-        # Simulate mode uses consolidate_interim_to_canonical_graph instead, which
+        # Simulate mode uses consolidate_simulate_fold instead, which
         # merges the per-cycle graph.json sidecars into the canonical
         # main-tier graph without touching PEFT weights.
         _mode = config.consolidation.mode
         try:
             if housekeeping:
                 # run_housekeeping dispatches to the mode-correct underlying method
-                # (consolidate_interim_to_canonical_graph for simulate, consolidate_interim_adapters
+                # (consolidate_simulate_fold for simulate, consolidate_interim_adapters
                 # for train) with housekeeping=True so gate (d) is bypassed.
                 result = loop.run_housekeeping(
                     trainer=bt,
@@ -13062,7 +13062,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                     mode=_mode,
                 )
             elif _mode == "simulate":
-                result = loop.consolidate_interim_to_canonical_graph()
+                result = loop.consolidate_simulate_fold()
             else:
                 result = loop.consolidate_interim_adapters(
                     trainer=bt,

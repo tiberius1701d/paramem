@@ -38,7 +38,6 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         # persistence layer — the one sanctioned fork point for venue dispatch
         ("paramem/memory/persistence.py", "commit_tier_slot"),
         # consolidation — unified entry and its helpers
-        ("paramem/training/consolidation.py", "run_consolidation_cycle"),
         ("paramem/training/consolidation.py", "_resolve_target_slot"),
         ("paramem/training/consolidation.py", "_prepare_episodic_keys_for_tier"),
         # housekeeping re-grooming: train retrains adapters, simulate writes graph.json —

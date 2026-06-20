@@ -114,6 +114,127 @@ class AbortedDuringConsolidation(Exception):
     """
 
 
+@dataclass(frozen=True)
+class FoldScope:
+    """Immutable descriptor that parameterizes one invocation of
+    :meth:`ConsolidationLoop._run_fold`.
+
+    A frozen dataclass (not a mode string) so dispatch is structural — no
+    ``mode == "simulate"`` / ``mode == "train"`` literals inside
+    :meth:`_run_fold` or its wrappers (the mode-fork-guard enforces this).
+
+    Attributes:
+        name: Human-readable label (``"interim"`` | ``"full"``).  Used in log
+            messages and debug artifacts only; has no dispatch semantics.
+        source: Materialize axis forwarded to
+            :meth:`~ConsolidationLoop._materialize_consolidation_graph`.
+            ``"weights"`` reconstructs from adapter weights (train path);
+            ``"disk"`` loads relations from ``graph.json`` files (simulate path).
+        persist: Persist venue, dispatched at the end of the spine.
+
+            - ``"interim_slot"`` — call
+              :func:`~paramem.memory.persistence.commit_tier_slot` (interim cycle).
+            - ``"main_tiers"`` — call :meth:`~ConsolidationLoop._save_adapters`
+              (full-fold train path).
+            - ``"graph_json"`` — write
+              :func:`~paramem.memory.persistence.save_memory_to_disk` **directly**
+              on ``self.merger.graph`` (simulate full fold).  MUST NOT derive the
+              graph from ``tier_keyed``: for ``source="disk"`` disk relations carry
+              ``ik_key``, the keyed branch of ``_build_all_edge_entries_into`` does
+              ``store.get(key)`` against the empty simulate store and silently skips
+              unmatched edges → ``tier_keyed`` is empty.  S1 / MF-1.
+        tier: Target adapter name for the interim scope (e.g.
+            ``"episodic_interim_YYYYMMDDTHHMM"``).  ``None`` for the full fold
+            (all tiers are rebuilt).
+        extra_relations_source: Origin of supplemental relations injected via the
+            ``extra_relations`` channel of
+            :meth:`~ConsolidationLoop._materialize_consolidation_graph`.
+
+            - ``"pending"`` — relations captured from ``merger.graph`` (interim
+              cycle pending-session content).
+            - ``"disk"`` — relations from ``_collect_disk_fold_relations``
+              (simulate full fold).
+            - ``"none"`` — no supplemental relations (full-fold train path).
+        defer: Forwarded as the ``defer`` flag to
+            :meth:`~ConsolidationLoop._build_all_edge_entries_into`.  ``True``
+            for the interim slot (atomicity: registry entry deferred until after
+            training succeeds); ``False`` for the full fold.
+        tag_new: Forwarded as the ``tag_new`` flag to
+            :meth:`~ConsolidationLoop._build_all_edge_entries_into`.  ``True``
+            for the interim slot (new-entry tracking); ``False`` for the full fold.
+        level: Refinement level forwarded to
+            :meth:`~ConsolidationLoop._refine_consolidation_graph` (``"off"`` |
+            ``"light"`` | ``"full"``).
+        promote: When ``True``, call
+            :meth:`~ConsolidationLoop._promote_mature_keys_inline` after the
+            Refine stage.  ``True`` for the full-fold train path only — the
+            simulate path skips it because there are no weight-resident keys to
+            promote.
+        tier_floor: When ``True``, run the per-tier floor park/graduate pass
+            (Pass-2) after the build-entries stage.  ``True`` for the full-fold
+            train path only.
+        subtractive_scope: Forwarded to
+            :meth:`~ConsolidationLoop._apply_subtractive_removals_to_store`
+            (``"interim"`` | ``"fold"``).
+        consume_pending: Reserved for B8a-5 (``max_interim_count == 0``
+            consume-pending mode).  Not activated in B8a-2.
+        cross_tier_resume: Reserved for B8a-4 (cross-tier resume checkpointing).
+            Not activated in B8a-2.
+    """
+
+    # --- identity / dispatch ---
+    name: str  # "interim" | "full"  (log/debug label only)
+    source: "Literal['weights', 'disk']"
+    persist: "Literal['interim_slot', 'main_tiers', 'graph_json']"
+
+    # --- materialize scoping ---
+    tier: "str | None" = None
+    extra_relations_source: "Literal['pending', 'disk', 'none']" = "none"
+    defer: bool = False
+    tag_new: bool = False
+
+    # --- refine gate ---
+    level: "Literal['off', 'light', 'full']" = "off"
+
+    # --- spine stage gates ---
+    promote: bool = False
+    tier_floor: bool = False
+    subtractive_scope: "Literal['interim', 'fold']" = "fold"
+
+    # --- reserved for future slices ---
+    consume_pending: bool = False  # B8a-5: extract pending sessions in-fold
+    cross_tier_resume: bool = False  # B8a-4: checkpoint completed tiers
+
+
+@dataclass(frozen=True)
+class DiskFoldInput:
+    """Collected input for a disk-source (simulate-mode) full fold.
+
+    Produced by :meth:`ConsolidationLoop._collect_disk_fold_relations` and
+    consumed by :meth:`ConsolidationLoop._run_fold` (via the ``"disk"``
+    persist venue) so that ``active_before_count`` is captured BEFORE
+    :meth:`~ConsolidationLoop._materialize_consolidation_graph` resets the
+    merger graph (after the reset the pre-merge edge count is unrecoverable).
+
+    Attributes:
+        relations: All :class:`~paramem.graph.schema.Relation` objects
+            collected from the canonical ``episodic/graph.json`` and every
+            simulate-mode interim slot ``graph.json``.  Fed into
+            ``_materialize_consolidation_graph`` via ``extra_relations``.
+        interim_dirs: Directories that were merged, in iteration order.
+            The caller uses this list for the post-persist ``shutil.rmtree``
+            cleanup step.
+        active_before_count: Number of edges in the canonical graph BEFORE
+            the reset/merge, captured from the just-loaded canonical graph.
+            Required by :meth:`~ConsolidationLoop._build_tier_delta` as the
+            ``active_before`` input for the ``episodic`` tier.
+    """
+
+    relations: list  # list[Relation] — avoids forward-ref in frozen dataclass
+    interim_dirs: list  # list[Path]
+    active_before_count: int
+
+
 class ConsolidationLoop:
     """Manages the full consolidation pipeline across sessions.
 
@@ -2427,11 +2548,7 @@ class ConsolidationLoop:
             ``"degenerated"``, or ``"noop"``); ``venue`` is the training
             medium (``"train"`` or ``"simulate"``).
         """
-        from paramem.memory.persistence import commit_tier_slot
-
         # Resolve threshold from config when the caller did not supply an override.
-        # Not currently consumed inside this method; resolved here so the override
-        # contract is honoured and future callers can rely on the config path.
         if recall_sanity_threshold is None:
             recall_sanity_threshold = self.config.recall_sanity_threshold
 
@@ -2467,7 +2584,7 @@ class ConsolidationLoop:
         self._tag_speaker_id_defaults(episodic_rels, speaker_id)
         self._tag_speaker_id_defaults(procedural_rels, speaker_id)
 
-        # --- 6. Resolve stamp and target slot ---
+        # --- 5. Resolve stamp and target slot ---
         if stamp is None:
             from paramem.memory.interim_adapter import current_interim_stamp as _cis
 
@@ -2477,7 +2594,7 @@ class ConsolidationLoop:
             stamp, max_interim_count, mode=mode
         )
 
-        # --- 7a. Queue-only branch ---
+        # --- 6a. Queue-only branch ---
         if queue_only:
             self.pending_interim_triples.extend(episodic_rels)
             logger.info(
@@ -2497,7 +2614,7 @@ class ConsolidationLoop:
             self._debug_writer.on_cycle_end(queued_summary, interim_stamp=stamp)
             return queued_summary
 
-        # --- 7b. Degenerated-skip branch (train mode only) ---
+        # --- 6b. Degenerated-skip branch (train mode only) ---
         if degenerated_skip:
             self.pending_interim_triples.extend(episodic_rels)
             logger.warning(
@@ -2517,393 +2634,38 @@ class ConsolidationLoop:
             self._debug_writer.on_cycle_end(degenerated_summary, interim_stamp=stamp)
             return degenerated_summary
 
-        # Clear merger.graph at every exit that follows (success, aborted,
-        # exception propagation) so it never leaks into the next cycle.  Early
-        # returns above (no-registry, no-relations, queued, degenerated) do not
-        # touch merger.graph so the reset there is a safe no-op.  A finally for
-        # cleanup re-raises unchanged — not suppression.
-        try:
-            # --- End-of-extraction debug dump (per-tier relation lists) ---
-            # Self-gated; no-op when save_cycle_snapshots=False.
-            self._debug_writer.on_extraction_end(
-                episodic_rels, procedural_rels, interim_stamp=stamp
-            )
-
-            # --- 8. Mint PEFT slot (train only) ---
-            if mode == "train":
-                from paramem.memory.interim_adapter import create_interim_adapter
-                from paramem.models.loader import create_adapter as _create_adapter
-
-                if cap_reached_absorb:
-                    # Reset absorb target to LoRA zeros for a clean retrain.
-                    self.model.delete_adapter(adapter_name)
-                    self.model = _create_adapter(self.model, self.episodic_config, adapter_name)
-                    logger.info(
-                        "run_consolidation_cycle: cap-reached — reset %s to LoRA zeros",
-                        adapter_name,
-                    )
-                elif adapter_name not in self.model.peft_config:
-                    # Fresh slot for this sub-interval.
-                    self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
-                    logger.info("run_consolidation_cycle: created interim adapter %s", adapter_name)
-
-            # --- 8b. Materialize: recall-miss diagnostic + rebuild keying surface ---
-            # Scoped to the current slot: reconstruct only the slot's registered keys
-            # (tier=adapter_name, keys=active_keys_in_tier(adapter_name)) for the
-            # recall-miss diagnostic, then reset the keying graph and re-merge:
-            #   (a) registry-true relations for this slot
-            #   (b) the pending-session relations captured from merger.graph before the
-            #       reset (extra_relations), so they survive and co-reside with the
-            #       slot's recalled facts in the fresh keying surface.
-            #
-            # INVARIANT: extra_relations NEVER enter the recall_miss_keys set.
-            # recall_miss_keys is computed against store.all_active_keys() BEFORE the
-            # graph reset inside _materialize_consolidation_graph — pending unregistered
-            # relations therefore cannot distort it.
-            #
-            # Cap-absorb scope (risk #9): _resolve_target_slot returns the NEWEST slot
-            # as adapter_name when cap_reached_absorb=True; active_keys_in_tier
-            # correctly scopes to that slot's keys — no special-casing needed here.
-            #
-            # extra_relations are always populated from merger.graph edges.  At every
-            # refinement level all pending-session content is present in merger.graph
-            # and reaches the interim keying surface here.
-            _pending_relations: "list[Relation] | None" = None
-            import networkx as _nx
-
-            _g = getattr(self.merger, "graph", None)
-            if isinstance(_g, _nx.MultiDiGraph) and _g.number_of_edges() > 0:
-                _pending_relations = []
-                for _er_subj, _er_obj, _er_data in _g.edges(data=True):
-                    _er_pred = _er_data.get("predicate", "")
-                    if not _er_pred:
-                        continue
-                    _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
-                    _er_rt: str = _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
-                    # speaker_id: prefer the subject node's speaker_id attribute
-                    # (set by _upsert_entity for speaker entities, where the node
-                    # key IS the speaker_id).  Falls back to "" for non-speaker
-                    # subjects; falls back to "" for non-speaker subjects.
-                    _er_subj_node = _g.nodes.get(_er_subj, {})
-                    _er_spk = _er_subj_node.get("speaker_id", "")
-                    _pending_relations.append(
-                        Relation(
-                            subject=_er_subj,
-                            predicate=_er_pred,
-                            object=_er_obj,
-                            relation_type=_er_rt,  # type: ignore[arg-type]
-                            confidence=_er_data.get("confidence", 1.0),
-                            speaker_id=_er_spk,
-                            # Recover the real contributing session ids from
-                            # the merger edge so they survive the re-merge
-                            # through _merge_registry_relations.  The merger
-                            # accumulated the UNION in edge["sessions"]; we
-                            # carry them forward so _build_all_edge_entries_into
-                            # can expose them on the deferred-write record.
-                            session_ids=list(_er_data.get("sessions", [])),
-                        )
-                    )
-
-            recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
+        # --- 7. Delegate pipeline to _run_fold (interim_slot scope) ---
+        # source is derived from mode: "weights" for train, "disk" for simulate.
+        # All pipeline stages (materialize, refine, build-keyed, train/skip, commit)
+        # execute inside _run_fold; this wrapper only owns pre-resolution + early-exits.
+        # WARN-5 (B8a-2): new_promotions forwarded as a parameter — _run_fold handles
+        # the semantic-transfer block scope-gated on source=="weights" && new_promotions.
+        # Map the caller's mode Literal to the FoldScope source axis without a mode== fork.
+        _interim_source = {"train": "weights", "simulate": "disk"}[mode]
+        return self._run_fold(
+            FoldScope(
+                name="interim",
+                source=_interim_source,
+                persist="interim_slot",
                 tier=adapter_name,
-                keys=list(self.store.active_keys_in_tier(adapter_name)),
-                extra_relations=_pending_relations,
-                # Recon merge is always old-vs-old (no recency signal at slot recall).
-                resolve_contradictions_recon=False,
-                # Pending merge: NEW supersedes OLD slot when contradiction_detection=True.
-                resolve_contradictions_extra=self.config.contradiction_detection,
-            )
-            if recall_miss_keys:
-                logger.info(
-                    "run_consolidation_cycle: %d recall-miss key(s) in slot %s "
-                    "(kept in training set with registry-true content)",
-                    len(recall_miss_keys),
-                    adapter_name,
-                )
-
-            # --- 8c. Refine: normalization (light+) + SOTA enrichment (full only) ---
-            # normalize=True at interim_refinement light+: whole-graph local-model
-            # predicate alignment + entity merge + dedup (time-invariant, local model).
-            # enrich=True only when interim_refinement=="full": cloud-SOTA additive
-            # discovery (HELD at production defaults).
-            # The recurrence-bump loop inside _refine_consolidation_graph runs
-            # regardless of flags so Case-1 duplicate-SPO collapses are always captured.
-            # Note on atomicity: bump_recurrence targets ALREADY-REGISTERED keys
-            # (Case-1 survivors from the merge); it does NOT register new keys.
-            # Bumping a registered key's counter before training is benign — the
-            # key remains valid whether training aborts or not, and the increment
-            # is re-applied identically on the next cycle (idempotent semantics).
-            self._refine_consolidation_graph(
-                recon_relations,
-                normalize=(self.config.interim_refinement != "off"),
-                enrich=(self.config.interim_refinement == "full"),
-            )
-
-            # --- 9. Build keyed training set via graph-walk ---
-            # After _materialize_consolidation_graph + _refine_consolidation_graph,
-            # merger.graph holds: (a) registry-true re-merged keys (as keyed edges with
-            # ik_key stamped) plus (b) the pending-session relations (as keyless edges).
-            # _build_all_edge_entries_into handles both sets in one pass:
-            #   - Keyless edges (new): minted keys with defer=True so a training abort
-            #     cannot leave orphan registry entries (interim atomicity).
-            #   - Keyed edges (existing): anti-forgetting replay entries sourced from
-            #     the store — not registered as new.
-            #
-            # tier_keyed["procedural"] is populated by the walk (procedural-typed
-            # keyless edges merged into merger.graph by extract_session / run_cycle).
-            # Procedural entries ride the SAME interim slot (adapter_name) as episodic
-            # and are flushed together after recall-confirmed training.
-            # _procedural_next_index is advanced in the deferred-flush block below,
-            # mirroring _indexed_next_index.
-            if mode == "train":
-                switch_adapter(self.model, adapter_name)
-            _tier_keyed: dict[str, list[dict]] = {"episodic": [], "procedural": [], "semantic": []}
-            _, _deferred_writes = self._build_all_edge_entries_into(
-                _tier_keyed,
-                default_speaker_id=speaker_id,
+                extra_relations_source="pending",
                 defer=True,
                 tag_new=True,
-            )
-
-            # all_interim_keyed: episodic + procedural entries (new minted + existing keyed).
-            # Both fact types ride the same interim slot until the full fold.
-            all_interim_keyed = _tier_keyed["episodic"] + _tier_keyed["procedural"]
-
-            # new_keyed_interim: deferred writes for all minted entries in this interim slot.
-            # Includes both episodic-tier and procedural-tier records; flushed together
-            # after recall-confirmed training.
-            new_keyed_episodic = [rec for rec in _deferred_writes if rec["tier"] == "episodic"]
-            new_keyed_proc = [rec for rec in _deferred_writes if rec["tier"] == "procedural"]
-            new_keyed_interim = new_keyed_episodic + new_keyed_proc
-            new_key_ids = [rec["entry"]["key"] for rec in new_keyed_interim]
-
-            if mode == "simulate":
-                # No training step — apply store mutations for both episodic and
-                # procedural minted entries immediately.  Mirrors the train-path
-                # deferred-flush below; both episodic and procedural entries go
-                # into adapter_name (the interim slot) because their weights are
-                # trained there.  Store tier == weight residence.
-                for rec in new_keyed_interim:
-                    _entry = rec["entry"]
-                    _key = _entry["key"]
-                    self.store.put(
-                        adapter_name,
-                        _key,
-                        _entry,
-                        simhash=compute_simhash(
-                            _key, _entry["subject"], rec["predicate"], _entry["object"]
-                        ),
-                    )
-                    self.store.set_bookkeeping(
-                        _key,
-                        speaker_id=rec["speaker_id"],
-                        first_seen_cycle=self.cycle_count,
-                        relation_type=rec["relation_type"],
-                        recurrence_count=1,
-                        last_seen_cycle=self.cycle_count,
-                    )
-                self._indexed_next_index += len(new_keyed_episodic)
-                self._procedural_next_index += len(new_keyed_proc)
-
-            # --- 9b. Semantic promotion transfer (train mode, when promotions supplied) ---
-            # Move keys for promoted entities from episodic to the semantic tier so
-            # they are excluded from the episodic training set.  This mirrors the
-            # logic that formerly lived inside _run_indexed_key_episodic.
-            promoted_key_set: set[str] = set()
-            if mode == "train" and new_promotions:
-                promoted_set = {n.lower() for n in new_promotions}
-                for _tier, key, entry in list(self.store.iter_entries()):
-                    if key.startswith("proc"):
-                        continue
-                    subject = entry.get("subject", "").lower()
-                    obj = entry.get("object", "").lower()
-                    mentions = (subject and subject in promoted_set) or (
-                        obj and obj in promoted_set
-                    )
-                    if mentions and not self.store.has_simhash("semantic", key):
-                        promoted_key_set.add(key)
-                for key in promoted_key_set:
-                    self.store.move(key, "semantic")
-                # Exclude promoted keys from the episodic training set.
-                all_interim_keyed = [
-                    kp for kp in all_interim_keyed if kp["key"] not in promoted_key_set
-                ]
-
-            # --- 10. Train (train mode) or skip (simulate) ---
-            # all_interim_keyed holds both episodic and procedural entries.
-            # The interim adapter uses episodic_config (attn-only); procedural entries
-            # ride the same slot between folds.  The full fold retrain with
-            # procedural_config (attn+MLP) at consolidate_interim_adapters is unchanged.
-            epi_train_loss: float | None = None
-            if mode == "train" and all_interim_keyed:
-                epi_metrics, recall_state = self._train_tier_adapter(
-                    all_interim_keyed,
-                    adapter_name=adapter_name,
-                    adapter_config=self.episodic_config,
-                    training_config=self._make_training_config(
-                        num_epochs=self.training_config.num_epochs
-                    ),
-                    output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
-                    run_name=f"interim-{adapter_name}-{run_label}",
-                    phase_name=f"interim-{adapter_name}-{run_label}",
-                )
-                epi_train_loss = epi_metrics.get("train_loss") if epi_metrics is not None else None
-                if epi_metrics is not None and epi_metrics.get("aborted"):
-                    # Training was aborted for inference.  Skip simhash update,
-                    # deferred interim mutations, and the commit_tier_slot call below.
-                    # The production adapter on disk is untouched; the next cycle will
-                    # retrain from scratch.
-                    logger.info(
-                        "run_consolidation_cycle: interim training aborted — skipping commit"
-                    )
-                    return {"mode": "aborted", "adapter_name": adapter_name}
-                # Store mutations are deferred until AFTER training succeeds — the
-                # deferred-flush block below applies them.  This guarantees interim
-                # atomicity: if training raises, the registry stays clean.
-
-                # Compute the recall-passing set for the interim adapter.
-                # None state means early-stop disabled; fall back to dedicated probe.
-                # FAIL-SAFE: None MUST route to the probe — never treated as empty.
-                _epi_passing = self._recall_passing_keys(recall_state, all_interim_keyed)
-                if _epi_passing is None:
-                    _epi_passing = self._probe_passing_keys(adapter_name, all_interim_keyed)
-            else:
-                # Simulate mode or no keyed pairs: admit all without a probe.
-                _epi_passing = None
-
-            # Update interim simhash registry from ground-truth pairs,
-            # filtered to recall-passing keys only.
-            if _epi_passing is not None:
-                _passing_interim = [kp for kp in all_interim_keyed if kp["key"] in _epi_passing]
-            else:
-                _passing_interim = all_interim_keyed
-            self.store.replace_simhashes_in_tier(adapter_name, build_registry(_passing_interim))
-
-            # --- 11. Apply deferred interim store mutations (train mode) ---
-            # A cycle-local set accumulates session ids whose contributed fact failed
-            # the recall gate.  Guarded to train mode: in simulate mode _epi_passing
-            # is None so the drop site is never reached.
-            # The simulate callsite is explicitly not plumbed for recall-failure tracking.
-            #
-            # new_keyed_interim carries both episodic-tier and procedural-tier harvest
-            # records from _deferred_writes.  All writes go to adapter_name (the
-            # interim slot) regardless of rec["tier"] because the weights for BOTH
-            # episodic and procedural entries live in that interim adapter.  Store
-            # tier must equal weight residence so the router probes the right adapter.
-            # The bookkeeping relation_type field carries the procedural classification
-            # forward for the COMMAND-path preference filter and the fold partition.
-            _recall_failed_session_ids: set[str] = set()
-            if mode == "train":
-                _ep_flushed = 0
-                _proc_flushed = 0
-                for rec in new_keyed_interim:
-                    _entry = rec["entry"]
-                    _key = _entry["key"]
-                    if _epi_passing is not None and _key not in _epi_passing:
-                        logger.debug(
-                            "run_consolidation_cycle: key %s failed recall gate"
-                            " — skipping registration",
-                            _key,
-                        )
-                        # Accumulate contributing session ids for this recall-failed
-                        # key so the caller can keep those sessions pending.
-                        # rec["session_ids"] is populated by
-                        # _build_all_edge_entries_into from edge["sessions"] with
-                        # synthetic sentinels already excluded.
-                        _recall_failed_session_ids.update(rec.get("session_ids", []))
-                        continue
-                    self.store.put(
-                        adapter_name,
-                        _key,
-                        _entry,
-                        simhash=compute_simhash(
-                            _key, _entry["subject"], rec["predicate"], _entry["object"]
-                        ),
-                    )
-                    self.store.set_bookkeeping(
-                        _key,
-                        speaker_id=rec["speaker_id"],
-                        first_seen_cycle=self.cycle_count,
-                        relation_type=rec["relation_type"],
-                        recurrence_count=1,
-                        last_seen_cycle=self.cycle_count,
-                    )
-                    if rec["tier"] == "procedural":
-                        _proc_flushed += 1
-                    else:
-                        _ep_flushed += 1
-                self._indexed_next_index += _ep_flushed
-                self._procedural_next_index += _proc_flushed
-
-            # --- Shared soft-stale stage (M5) ---
-            # Consume removal_ledger entries for subtractive removal reasons
-            # (predicate_synonym_collapse, and at interim contradiction_same_pred)
-            # and soft-stale their keys in memory.  MUST run:
-            #   (a) AFTER the deferred store.put loop above (new keys must exist
-            #       in the registry before the stale helper can find and flip them);
-            #   (b) BEFORE commit_tier_slot (the commit serializes the registry;
-            #       staling after the commit means the on-disk slot does NOT carry
-            #       the stale flag → staled keys resurrect as active on boot-preload);
-            #   (c) BEFORE merger.reset_graph() (the finally block below) because
-            #       reset_graph() clears removal_ledger.
-            self._apply_subtractive_removals_to_store(scope="interim")
-
-            # --- 12. Persist interim slot ---
-            # commit_tier_slot is internally crash-safe (registry-last write is the
-            # commit signal; a torn slot is skipped by the boot validator).  The
-            # source session is NOT marked consolidated until this method returns
-            # successfully (the production caller marks consolidated only after
-            # run_consolidation_cycle returns without raising).
-            # The stale mutations from the M5 stage above are already in the
-            # in-memory registry; commit_tier_slot serializes that registry as the
-            # final write, so the on-disk slot carries the correct stale flags.
-            # Regression guard: tests/test_post_session_train.py
-            # ::TestInterTierCommitRecoverable.
-            commit_tier_slot(
-                loop=self,
-                tier="episodic",
-                adapter_name=adapter_name,
-                stamp=stamp,
-                mode=mode,
-                all_keyed=all_interim_keyed,
-                output_dir=self.output_dir,
-            )
-
-            # --- 13. End-of-cycle: restore episodic as active adapter ---
-            # Mode-agnostic: the peft_config check already short-circuits in simulate
-            # (no adapters were created), so the guard is sufficient without the
-            # mode == "train" clause.
-            if "episodic" in self.model.peft_config:
-                switch_adapter(self.model, "episodic")
-
-            logger.info(
-                "run_consolidation_cycle: %s %s — %d new keys, %d total interim keys",
-                mode,
-                adapter_name,
-                len(new_key_ids),
-                len(all_interim_keyed),
-            )
-
-            cycle_summary = {
-                "triples_extracted": triples_extracted,
-                "new_keys": new_key_ids,
-                "adapter_name": adapter_name,
-                "mode": "trained" if mode == "train" else "simulated",
-                "venue": mode,
-                "error": None,
-                "episodic_train_loss": epi_train_loss,
-                # contributing session ids whose new key failed the recall gate this
-                # cycle.  Callers use .get("recall_failed_session_ids", []) so
-                # early-return paths (aborted, no-relations, queued) that do not
-                # run the recall gate are safe.  Simulate mode always produces [].
-                "recall_failed_session_ids": sorted(_recall_failed_session_ids),
-            }
-            self._debug_writer.on_cycle_end(cycle_summary, interim_stamp=stamp)
-            return cycle_summary
-        finally:
-            # Clear the keying graph so the next cycle starts empty.
-            # Also clears removal_ledger, collapsed, reinforcements.
-            self.merger.reset_graph()
+                level=self.config.interim_refinement,
+                promote=False,
+                tier_floor=False,
+                subtractive_scope="interim",
+            ),
+            adapter_name=adapter_name,
+            stamp=stamp,
+            speaker_id=speaker_id,
+            new_promotions=new_promotions,
+            cap_reached_absorb=cap_reached_absorb,
+            run_label=run_label,
+            triples_extracted=triples_extracted,
+            episodic_rels=episodic_rels,
+            procedural_rels=procedural_rels,
+        )
 
     def _apply_subtractive_removals_to_store(
         self,
@@ -3679,104 +3441,75 @@ class ConsolidationLoop:
             "skip_reason": None,
         }
 
-    def consolidate_interim_to_canonical_graph(self, *, housekeeping: bool = False) -> dict:
-        """Full-cycle consolidation for simulate mode: merge interim graph.json sidecars.
+    def _collect_disk_fold_relations(self, adapter_dir: "Path") -> "DiskFoldInput":
+        """Load all :class:`Relation` objects from the canonical graph and interim slots.
 
-        Called by ``_run_full_consolidation_sync`` when
-        ``config.consolidation.mode == "simulate"``.  Simulate mode writes per-cycle
-        graph.json files under ``<adapter_dir>/episodic/interim_<stamp>/graph.json``
-        rather than PEFT adapter weights.  This method merges those interim graphs into
-        the canonical main-tier graph at ``<adapter_dir>/episodic/graph.json`` and
-        removes the interim slot directories.
-
-        Architectural symmetry with the train fold: grooming is LITERALLY identical
-        (``canonical()`` node identity + Case-1/Case-2 dedup via ``self.merger``,
-        then ``_run_graph_enrichment``).  The ONLY permitted divergence is the
-        persistence/retrain tail:
-
-        - **source**: disk-load (``load_memory_from_disk``) vs reconstruct-from-weights.
-        - **sink**: write ``graph.json`` (``save_memory_to_disk``) vs retrain adapters.
-
-        The cross-slot merge routes through
-        ``self.merger.merge(_synthetic_session, resolve_contradictions=False)`` so
-        ``canonical()`` + Case-1/Case-2 dedup apply identically to the train fold.
-        ``resolve_contradictions=False`` skips the model-gated Case-2 branch, so no
-        model is required (the simulate merger typically holds ``model=None``).
-
-        Args:
-            housekeeping: When ``True``, bypass the empty-interim-slot noop so the
-                enriched graph is persisted even with no interims present.  Used by
-                :meth:`run_housekeeping` for on-demand re-grooming.  Sessions are
-                NOT marked consolidated; window stamp is not advanced.
+        Extracts the disk-relation BUILD for the simulate-mode full fold.  Returns a
+        :class:`DiskFoldInput` containing the collected relations, the list of interim
+        directories merged (for post-persist ``shutil.rmtree``), and the pre-merge
+        edge count from the canonical graph (captured BEFORE
+        :meth:`_materialize_consolidation_graph` resets the merger — after the reset
+        the count is unrecoverable).
 
         Steps:
 
-        1. Reset the merger and build ``Relation`` objects from the disk-loaded canonical
-           graph AND every interim ``graph.json`` slot, then merge them via
-           ``self.merger.merge(resolve_contradictions=False)`` — the same topology the
-           train fold uses.
-        2. Optional SOTA enrichment (same guard as ``consolidate_interim_adapters``).
-           Runs AFTER the merge on the freshly-merged ``self.merger.graph``, mirroring
-           the train fold's re-merge → enrichment ordering.
-        3. Write the enriched, merged (canonicalized, deduped) graph to
-           ``<adapter_dir>/episodic/graph.json`` via
-           :func:`paramem.memory.persistence.save_memory_to_disk`.
-        4. Remove the interim slot directories that were merged.
-        5. Return a result dict shaped like ``consolidate_interim_adapters``'s return
-           (``tiers_rebuilt``, ``graph_drift_count``, etc.) for compatibility with the
-           post-cycle bookkeeping in ``_run_full_consolidation_sync``.
+        1. Load the canonical ``episodic/graph.json`` via
+           :func:`~paramem.memory.persistence.load_memory_from_disk`.  Capture its
+           edge count as ``active_before_count`` (MF-2: must be captured here, before
+           the merger reset in :meth:`_materialize_consolidation_graph`).
+        2. Build :class:`Relation` objects from every edge in the canonical graph.
+        3. For each ``episodic/interim_<stamp>`` directory via
+           :func:`~paramem.memory.interim_adapter.iter_interim_dirs`: skip slots
+           without a ``graph.json`` (train-mode interim slots carry only PEFT weights —
+           WARN-6 guard); build :class:`Relation` objects from the slot graph.
+        4. Return a :class:`DiskFoldInput` with the accumulated relations, the interim
+           directory list, and the pre-merge edge count.
+
+        Args:
+            adapter_dir: The loop's ``output_dir``, used as the adapter root.
 
         Returns:
-            Result dict with keys matching ``consolidate_interim_adapters``'s schema
-            so the caller (``_run_full_consolidation_sync``) can handle both paths
-            with the same bookkeeping logic.  Simulate mode never rolls back, so
-            ``rolled_back`` is always ``False``.
+            A :class:`DiskFoldInput` with ``relations``, ``interim_dirs``, and
+            ``active_before_count``.
         """
-        import shutil as _shutil
-
         from paramem.memory.interim_adapter import iter_interim_dirs
-        from paramem.memory.persistence import (
-            iter_entries,
-            load_memory_from_disk,
-            save_memory_to_disk,
-        )
+        from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
-        adapter_dir = self.output_dir
+        canonical_graph_path = adapter_dir / "episodic" / "graph.json"
+        # Capture the pre-merge edge count BEFORE _materialize resets the merger.
+        # load_memory_from_disk returns an empty graph when the file does not exist
+        # (first fold, no prior canonical graph).
+        _canonical_graph_before = load_memory_from_disk(canonical_graph_path)
+        active_before_count = _canonical_graph_before.number_of_edges()
 
-        # Housekeeping debug-dir labeling: stamp the interim slot so the
-        # housekeeping run's debug artifacts nest under a housekeeping-labelled
-        # dir distinct from a scheduled fold's.  Reuses the existing nesting
-        # mechanism (_current_interim_stamp → snapshot_dir_for nesting).
-        if housekeeping:
-            _hk_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            self._current_interim_stamp = f"housekeeping_{_hk_ts}"
-        else:
-            # Ensure no stale housekeeping stamp leaks into a scheduled run.
-            self._current_interim_stamp = None  # type: ignore[assignment]
+        _all_relations: list[Relation] = []
+        interim_dirs: list[Path] = []
 
-        # --- Seed merger from disk-loaded main graph + interim slots ---
-        # Reset the merger's keying surface so provenance keying is unconditional
-        # (mirrors the train fold's reset_graph() call before re-merging registry
-        # relations).
-        # Clear merger.graph at every exit (noop early-return and success) so it
-        # never leaks into the next cycle.  The finally re-raises unchanged — not
-        # error suppression.
-        try:
-            self.merger.reset_graph()
+        # Build Relations from the canonical graph.
+        for _entry in iter_entries(_canonical_graph_before):
+            _pred = _entry.get("predicate", "")
+            if not _pred:
+                continue
+            _all_relations.append(
+                Relation(
+                    subject=_entry["subject"],
+                    predicate=_pred,
+                    object=_entry["object"],
+                    relation_type=_FALLBACK_RTYPE,  # graph.json edges carry no relation_type
+                    confidence=1.0,
+                    speaker_id=_entry.get("speaker_id", ""),
+                    indexed_key=_entry["key"],
+                )
+            )
 
-            canonical_graph_path = adapter_dir / "episodic" / "graph.json"
-            # Count edges BEFORE the merge to compute active_before for tier_delta.
-            _canonical_graph_before = load_memory_from_disk(canonical_graph_path)
-            _active_before_count = _canonical_graph_before.number_of_edges()
-
-            # Collect all Relation objects from the main graph + all interim slots.
-            # For each graph entry, build a Relation with indexed_key so provenance
-            # is carried through the merger onto the merged edge (same pattern as
-            # _build_registry_true_relations used by the train fold).
-            _all_relations: list[Relation] = []
-            interim_dirs_merged: list[Path] = []
-
-            for _entry in iter_entries(_canonical_graph_before):
+        # Build Relations from each simulate-mode interim slot.
+        for _interim_name, interim_dir in iter_interim_dirs(adapter_dir):
+            interim_graph_path = interim_dir / "graph.json"
+            if not interim_graph_path.exists():
+                # WARN-6: Skip train-mode interim slots (no graph.json — only PEFT weights).
+                continue
+            slot_graph = load_memory_from_disk(interim_graph_path)
+            for _entry in iter_entries(slot_graph):
                 _pred = _entry.get("predicate", "")
                 if not _pred:
                     continue
@@ -3785,105 +3518,188 @@ class ConsolidationLoop:
                         subject=_entry["subject"],
                         predicate=_pred,
                         object=_entry["object"],
-                        relation_type=_FALLBACK_RTYPE,  # graph.json edges carry no relation_type
+                        relation_type=_FALLBACK_RTYPE,  # type: ignore[arg-type]
                         confidence=1.0,
                         speaker_id=_entry.get("speaker_id", ""),
                         indexed_key=_entry["key"],
                     )
                 )
+            interim_dirs.append(interim_dir)
+            logger.debug(
+                "_collect_disk_fold_relations: queued %d entries from %s",
+                slot_graph.number_of_edges(),
+                interim_dir,
+            )
 
-            for _interim_name, interim_dir in iter_interim_dirs(adapter_dir):
-                interim_graph_path = interim_dir / "graph.json"
-                if not interim_graph_path.exists():
-                    # Skip train-mode interim slots (no graph.json).
-                    continue
-                slot_graph = load_memory_from_disk(interim_graph_path)
-                for _entry in iter_entries(slot_graph):
-                    _pred = _entry.get("predicate", "")
-                    if not _pred:
-                        continue
-                    _all_relations.append(
-                        Relation(
-                            subject=_entry["subject"],
-                            predicate=_pred,
-                            object=_entry["object"],
-                            relation_type=_FALLBACK_RTYPE,  # type: ignore[arg-type]
-                            confidence=1.0,
-                            speaker_id=_entry.get("speaker_id", ""),
-                            indexed_key=_entry["key"],
-                        )
-                    )
-                interim_dirs_merged.append(interim_dir)
-                logger.debug(
-                    "consolidate_interim_to_canonical_graph: queued %d entries from %s",
-                    slot_graph.number_of_edges(),
-                    interim_dir,
-                )
+        return DiskFoldInput(
+            relations=_all_relations,
+            interim_dirs=interim_dirs,
+            active_before_count=active_before_count,
+        )
 
-            # Merge through the unified builder.  resolve_contradictions=False
-            # (simulate is old-vs-old, no recency signal — mirrors the fold).
-            # canonical() + Case-1 dedup are deterministic.
-            # _merge_registry_relations synthesises speaker entities via
-            # _synth_speaker_entities so person nodes carry speaker_id — the same
-            # path the train fold uses.
-            if _all_relations:
-                self._merge_registry_relations(
-                    _all_relations,
-                    session_id="__simulate_consolidation_merge__",
-                    log_label="relations via GraphMerger",
-                    resolve_contradictions=False,
-                )
-                logger.info(
-                    "consolidate_interim_to_canonical_graph: merged %d relations"
-                    " (%d interim slot(s))",
-                    len(_all_relations),
-                    len(interim_dirs_merged),
-                )
-            else:
-                logger.debug("consolidate_interim_to_canonical_graph: no relations to merge")
+    def _run_fold(
+        self,
+        scope: "FoldScope",
+        *,
+        trainer=None,
+        router=None,
+        recall_sanity_threshold: "float | None" = None,
+        refresh_epochs: int = 30,
+        housekeeping: bool = False,
+        window_stamp_override: "str | None" = None,
+        # interim-scope extras (only consumed when scope.persist == "interim_slot")
+        adapter_name: "str | None" = None,
+        stamp: "str | None" = None,
+        speaker_id: str,
+        new_promotions: "list[str] | None" = None,
+        cap_reached_absorb: bool = False,
+        run_label: str = "",
+        triples_extracted: int = 0,
+        episodic_rels: "list[dict] | None" = None,
+        procedural_rels: "list[dict] | None" = None,
+    ) -> dict:
+        """Scope-parameterized consolidation fold spine — the single shared pipeline.
 
-            # Debug: snapshot the merged graph.  Self-gated.
-            self._debug_writer.on_fold_graph(self.merger, label="merged")
+        All three consolidation paths route through this method:
 
-            # --- Optional normalization + SOTA graph enrichment ---
-            # Mirrors the train fold path (_refine_consolidation_graph):
-            #   normalize: fold_refinement != "off" (light+, local model, predicate align + dedup)
-            #   enrich:    fold_refinement == "full" (cloud-SOTA additive discovery, HELD)
-            # Normalization runs FIRST, enrichment after, matching the train fold's ordering.
-            if self.config.fold_refinement != "off":
-                _norm_result = self._run_graph_normalization()
-                if not _norm_result.get("skipped"):
-                    logger.info(
-                        "consolidate_interim_to_canonical_graph: graph_normalization complete:"
-                        " chunks=%d groups_collapsed=%d edges_retired=%d",
-                        _norm_result.get("chunks", 0),
-                        _norm_result.get("groups_collapsed", 0),
-                        _norm_result.get("edges_retired", 0),
-                    )
+        - ``scope.persist == "interim_slot"`` (interim mini-fold): single-tier
+          training + :func:`~paramem.memory.persistence.commit_tier_slot`.
+          Replaces the pipeline body of ``run_consolidation_cycle``.
+        - ``scope.persist == "main_tiers"`` (full-fold train): multi-tier rebuild
+          + :meth:`_save_adapters`.  Extracted from ``consolidate_interim_adapters``.
+        - ``scope.persist == "graph_json"`` (full-fold simulate): disk-source merge
+          + :func:`~paramem.memory.persistence.save_memory_to_disk`.
+          Replaces the deleted ``consolidate_interim_to_canonical_graph``.
 
-            _enrichment_result: dict = {}
-            if self.config.fold_refinement == "full":
-                _enrichment_result = self._run_graph_enrichment()
-                if not _enrichment_result.get("skipped"):
-                    logger.info(
-                        "consolidate_interim_to_canonical_graph: graph_enrichment complete:"
-                        " chunks=%d new_edges=%d same_as_merges=%d",
-                        _enrichment_result.get("chunks", 0),
-                        _enrichment_result.get("new_edges", 0),
-                        _enrichment_result.get("same_as_merges", 0),
-                    )
+        The three paths differ ONLY in ``scope.source`` (weights vs disk) and the
+        persist tail (``scope.persist``).  All grooming stages
+        (:meth:`_materialize_consolidation_graph`, :meth:`_refine_consolidation_graph`,
+        :meth:`_build_all_edge_entries_into`, :meth:`_apply_subtractive_removals_to_store`)
+        are shared and unconditional.
 
-            # Debug: snapshot the enriched graph (after normalization + enrichment).  Self-gated.
-            self._debug_writer.on_fold_graph(self.merger, label="enriched")
+        Promotion (:meth:`_promote_mature_keys_inline`) and the tier-floor pass are
+        scope-gated via ``scope.promote`` and ``scope.tier_floor`` respectively — both
+        are weight-venue stages that the simulate path correctly skips by scope design.
 
-            # When housekeeping=True, ALWAYS persist the enriched graph back to disk —
-            # even when no interim slots were present.  The scheduled path returns a noop
-            # dict here (nothing changed), but the housekeeping path re-grooms the
-            # persisted knowledge so it MUST write the merger's canonicalized graph back
-            # to disk.
-            if not housekeeping and not interim_dirs_merged:
-                logger.info("consolidate_interim_to_canonical_graph: no simulate-mode slots — noop")
-                # Reset the housekeeping stamp before returning.
+        **Return schema (MF-3 / B8a-2):** always returns the FULL train schema.
+        The ``graph_json`` persist path returns zero/empty equivalents for fields that
+        have no meaning for the disk venue (``drift_intended_removal``,
+        ``recall_miss_keys``, ``tier_keyed``, etc.) so callers never ``KeyError``
+        after the collapse.
+
+        **Mode-fork-guard invariant:** this method and all callers dispatch on
+        ``scope.source`` / ``scope.persist`` structural enum attributes — never on
+        a ``mode == "simulate"`` / ``mode == "train"`` string literal.  The
+        ``mode`` string is computed internally only where required by lower-level
+        helpers (``commit_tier_slot``) that are themselves in the allowlist.
+
+        Args:
+            scope: Immutable :class:`FoldScope` descriptor.  Selects pipeline stages
+                and the persist venue.  Constructed by the thin public-method wrappers;
+                never by app-layer callers.
+            trainer: :class:`~paramem.server.background_trainer.BackgroundTrainer`
+                instance.  Required for the per-tier re-arm pattern in the
+                ``main_tiers`` path; ``None`` for ``graph_json`` and for ``interim_slot``
+                paths that do not need the abort-for-inference machinery.
+            router: Router instance whose ``reload()`` is called at fold completion
+                (``main_tiers`` path only).  ``None`` is safe — skipped.
+            recall_sanity_threshold: Override for the recall gate (``main_tiers`` path).
+                Reads ``self.config.recall_sanity_threshold`` when ``None``.
+            refresh_epochs: Training epochs for the full per-tier rebuild
+                (``main_tiers`` path only; ``interim_slot`` uses
+                ``self.training_config.num_epochs``).
+            housekeeping: When ``True`` (``graph_json`` path), bypass the noop gate so
+                the re-groomed graph is persisted even with no interim slots.
+            window_stamp_override: Forwarded to :meth:`_save_adapters` (``main_tiers``
+                path).  Preserves the prior fold's window stamp for housekeeping runs.
+            adapter_name: Interim adapter name (``interim_slot`` path only).  Matches
+                ``scope.tier``.
+            stamp: Sub-interval stamp for :func:`~paramem.memory.persistence.commit_tier_slot`
+                (``interim_slot`` path only).
+            speaker_id: Default speaker tag for deferred store mutations
+                (``interim_slot`` path only).
+            new_promotions: Optional list of entity names to transfer to semantic
+                before training (``interim_slot`` / ``source="weights"`` path only).
+                WARN-5 (B8a-2): retained explicitly so the semantic-transfer block is
+                not lost when ``run_consolidation_cycle`` becomes a thin wrapper.
+            cap_reached_absorb: Whether the interim slot was absorb-reset to LoRA zeros
+                (``interim_slot`` / ``source="weights"`` path only).
+            run_label: Tag woven into the wandb ``run_name`` for traceability
+                (``interim_slot`` path only).
+            triples_extracted: Number of episodic relations extracted this cycle
+                (``interim_slot`` path only; carried through to the result dict).
+            episodic_rels: Pre-extracted episodic relations, used only for the
+                end-of-extraction debug snapshot (``interim_slot`` path only).
+            procedural_rels: Pre-extracted procedural relations, used only for the
+                end-of-extraction debug snapshot (``interim_slot`` path only).
+
+        Returns:
+            Result dict using the full train schema.  Fields present in all paths::
+
+                {
+                    "tiers_rebuilt": list[str],
+                    "graph_drift_count": int,
+                    "drift_deduplicated": int,
+                    "drift_orphan": int,
+                    "drift_genuine_loss": int,
+                    "drift_intended_removal": int,
+                    "drift_intended_removal_by_reason": dict,
+                    "recall_miss_keys": list[str],
+                    "keys_per_tier": dict[str, int],
+                    "recall_per_tier": dict[str, float],
+                    "tier_keyed": dict,
+                    "rolled_back": bool,
+                    "rollback_tier": str | None,
+                    "tier_delta": dict,
+                }
+
+            The ``interim_slot`` path additionally carries::
+
+                {
+                    "triples_extracted": int,
+                    "new_keys": list[str],
+                    "adapter_name": str | None,
+                    "mode": "trained" | "simulated",
+                    "venue": "train" | "simulate",
+                    "error": str | None,
+                    "episodic_train_loss": float | None,
+                    "recall_failed_session_ids": list[str],
+                }
+        """
+        import shutil as _shutil
+
+        if recall_sanity_threshold is None:
+            recall_sanity_threshold = self.config.recall_sanity_threshold
+
+        # ------------------------------------------------------------------
+        # PATH A: simulate full fold (scope.persist == "graph_json")
+        # ------------------------------------------------------------------
+        # Source: disk (graph.json files); no weight reconstruction.
+        # Persist: save_memory_to_disk(merger.graph, canonical_graph_path).
+        # No training, no registry mutation, no tier-floor.
+        # Replaces the deleted consolidate_interim_to_canonical_graph body.
+        # ------------------------------------------------------------------
+        if scope.persist == "graph_json":
+            from paramem.memory.persistence import save_memory_to_disk
+
+            adapter_dir = self.output_dir
+            canonical_graph_path = adapter_dir / "episodic" / "graph.json"
+
+            # Collect disk relations + pre-merge edge count BEFORE _materialize
+            # resets the merger graph (after the reset the count is unrecoverable).
+            inp = self._collect_disk_fold_relations(adapter_dir)
+
+            logger.info(
+                "_run_fold[graph_json]: collected %d relations from canonical graph"
+                " + %d interim slot(s)",
+                len(inp.relations),
+                len(inp.interim_dirs),
+            )
+
+            # Noop gate: when housekeeping=False and no interim slots are present,
+            # there is nothing to merge — return the full schema with zero values.
+            if not housekeeping and not inp.interim_dirs:
+                logger.info("_run_fold[graph_json]: no simulate-mode slots — noop")
                 self._current_interim_stamp = None  # type: ignore[assignment]
                 return {
                     "tiers_rebuilt": [],
@@ -3891,79 +3707,1105 @@ class ConsolidationLoop:
                     "drift_deduplicated": 0,
                     "drift_orphan": 0,
                     "drift_genuine_loss": 0,
+                    "drift_intended_removal": 0,
+                    "drift_intended_removal_by_reason": {},
+                    "recall_miss_keys": [],
                     "keys_per_tier": {},
+                    "recall_per_tier": {},
+                    "tier_keyed": {},
+                    "rolled_back": False,
+                    "rollback_tier": None,
+                    "tier_delta": {},
+                }
+
+            try:
+                # Materialize: merge disk relations via the shared helper.
+                # source="disk" skips weight reconstruction; feeds inp.relations as
+                # extra_relations; merger.reset_graph() runs inside;
+                # recall_miss_keys=set() (§7 of B8a plan).
+                # MF-1: persist tail writes merger.graph DIRECTLY via save_memory_to_disk
+                # — NOT via tier_keyed.  Disk edges carry ik_key; the keyed branch of
+                # _build_all_edge_entries_into does store.get against the empty simulate
+                # store and silently skips unmatched edges → tier_keyed would be empty.
+                self._materialize_consolidation_graph(
+                    source="disk",
+                    extra_relations=inp.relations,
+                )
+
+                # Capture edge count BEFORE refine so we can compute minted edges.
+                # minted_count = enrichment new_edges (refine-added beyond the post-merge
+                # count).  NOTE: also nets normalization removals that reduce the
+                # post-merge edge count before enrichment adds edges; this is a known
+                # approximation (same as the previous inline body).
+                _after_merge_count = self.merger.graph.number_of_edges()
+                self._refine_consolidation_graph(
+                    [],
+                    normalize=(scope.level != "off"),
+                    enrich=(scope.level == "full"),
+                )
+
+                # MF-1: write merger.graph directly (not tier_keyed).
+                canonical_graph_path.parent.mkdir(parents=True, exist_ok=True)
+                save_memory_to_disk(self.merger.graph, canonical_graph_path)
+                _after_count = self.merger.graph.number_of_edges()
+                _minted_count = max(0, _after_count - _after_merge_count)
+                _collapsed_count = sum(
+                    1
+                    for _rl_e in self.merger.removal_ledger.values()
+                    if _rl_e.get("reason") == "dedup"
+                )
+                logger.info(
+                    "_run_fold[graph_json]: wrote merged graph to %s"
+                    " (%d edges, %d interim slot(s), %d dedup collapse(s))",
+                    canonical_graph_path,
+                    _after_count,
+                    len(inp.interim_dirs),
+                    _collapsed_count,
+                )
+
+                _sim_tier_delta = self._build_tier_delta(
+                    active_before={"episodic": inp.active_before_count},
+                    active_after={"episodic": _after_count},
+                    minted_by_tier={"episodic": _minted_count},
+                )
+                self._debug_writer.on_tier_delta(_sim_tier_delta)
+                self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
+
+                for _idir in inp.interim_dirs:
+                    try:
+                        _shutil.rmtree(_idir, ignore_errors=True)
+                        logger.debug("_run_fold[graph_json]: removed interim slot %s", _idir)
+                    except Exception as _rm_exc:
+                        logger.warning(
+                            "_run_fold[graph_json]: failed to remove %s: %s",
+                            _idir,
+                            _rm_exc,
+                        )
+
+                self._current_interim_stamp = None  # type: ignore[assignment]
+
+                return {
+                    "tiers_rebuilt": ["episodic"],
+                    "graph_drift_count": _collapsed_count,
+                    "drift_deduplicated": _collapsed_count,
+                    "drift_orphan": 0,
+                    "drift_genuine_loss": 0,
+                    "drift_intended_removal": 0,
+                    "drift_intended_removal_by_reason": {},
+                    "recall_miss_keys": [],
+                    "keys_per_tier": {"episodic": _after_count},
+                    "recall_per_tier": {"episodic": 1.0},  # graph merge is lossless
+                    "tier_keyed": {},
+                    "rolled_back": False,
+                    "rollback_tier": None,
+                    "tier_delta": _sim_tier_delta,
+                }
+            finally:
+                self.merger.reset_graph()
+
+        # ------------------------------------------------------------------
+        # PATH B: interim mini-fold (scope.persist == "interim_slot")
+        # ------------------------------------------------------------------
+        # Source: weights (reconstruct from adapter weights, scoped to tier).
+        # Persist: commit_tier_slot (writes adapter weights + sidecar JSON).
+        # Single-tier training; promote=False, tier_floor=False.
+        # Extracted from the training body of run_consolidation_cycle.
+        # ------------------------------------------------------------------
+        if scope.persist == "interim_slot":
+            from paramem.memory.persistence import commit_tier_slot
+
+            # _run_fold always controls the merger.graph lifecycle for the interim path.
+            try:
+                # --- End-of-extraction debug dump (interim only) ---
+                self._debug_writer.on_extraction_end(
+                    episodic_rels or [],
+                    procedural_rels or [],
+                    interim_stamp=stamp,
+                )
+
+                # --- Mint PEFT slot (weights source only) ---
+                if scope.source == "weights":
+                    from paramem.memory.interim_adapter import create_interim_adapter
+                    from paramem.models.loader import create_adapter as _create_adapter
+
+                    if cap_reached_absorb:
+                        # Reset absorb target to LoRA zeros for a clean retrain.
+                        self.model.delete_adapter(adapter_name)
+                        self.model = _create_adapter(self.model, self.episodic_config, adapter_name)
+                        logger.info(
+                            "_run_fold[interim]: cap-reached — reset %s to LoRA zeros",
+                            adapter_name,
+                        )
+                    elif adapter_name not in self.model.peft_config:
+                        self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
+                        logger.info("_run_fold[interim]: created interim adapter %s", adapter_name)
+
+                # --- Materialize: recall-miss diagnostic + rebuild keying surface ---
+                # Scoped to the current slot: reconstruct only the slot's registered keys
+                # (tier=adapter_name) for the recall-miss diagnostic, then reset and re-merge:
+                #   (a) registry-true relations for this slot
+                #   (b) the pending-session relations captured from merger.graph before the
+                #       reset (extra_relations), so they survive the graph reset.
+                _extra: "list[Relation] | None" = None
+                if scope.extra_relations_source == "pending":
+                    import networkx as _nx
+
+                    _g = getattr(self.merger, "graph", None)
+                    if isinstance(_g, _nx.MultiDiGraph) and _g.number_of_edges() > 0:
+                        _extra = []
+                        for _er_subj, _er_obj, _er_data in _g.edges(data=True):
+                            _er_pred = _er_data.get("predicate", "")
+                            if not _er_pred:
+                                continue
+                            _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
+                            _er_rt: str = (
+                                _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+                            )
+                            _er_subj_node = _g.nodes.get(_er_subj, {})
+                            _er_spk = _er_subj_node.get("speaker_id", "")
+                            _extra.append(
+                                Relation(
+                                    subject=_er_subj,
+                                    predicate=_er_pred,
+                                    object=_er_obj,
+                                    relation_type=_er_rt,  # type: ignore[arg-type]
+                                    confidence=_er_data.get("confidence", 1.0),
+                                    speaker_id=_er_spk,
+                                    session_ids=list(_er_data.get("sessions", [])),
+                                )
+                            )
+
+                recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
+                    tier=scope.tier,
+                    keys=list(self.store.active_keys_in_tier(adapter_name or scope.tier)),
+                    extra_relations=_extra,
+                    resolve_contradictions_recon=False,
+                    resolve_contradictions_extra=self.config.contradiction_detection,
+                )
+                if recall_miss_keys:
+                    logger.info(
+                        "_run_fold[interim]: %d recall-miss key(s) in slot %s "
+                        "(kept in training set with registry-true content)",
+                        len(recall_miss_keys),
+                        adapter_name,
+                    )
+
+                # --- Refine ---
+                self._refine_consolidation_graph(
+                    recon_relations,
+                    normalize=(scope.level != "off"),
+                    enrich=(scope.level == "full"),
+                )
+
+                # --- Build keyed training set ---
+                if scope.source == "weights":
+                    switch_adapter(self.model, adapter_name)
+                _tier_keyed: dict[str, list[dict]] = {
+                    "episodic": [],
+                    "procedural": [],
+                    "semantic": [],
+                }
+                _, _deferred_writes = self._build_all_edge_entries_into(
+                    _tier_keyed,
+                    default_speaker_id=speaker_id,
+                    defer=scope.defer,
+                    tag_new=scope.tag_new,
+                )
+
+                all_interim_keyed = _tier_keyed["episodic"] + _tier_keyed["procedural"]
+                new_keyed_episodic = [r for r in _deferred_writes if r["tier"] == "episodic"]
+                new_keyed_proc = [r for r in _deferred_writes if r["tier"] == "procedural"]
+                new_keyed_interim = new_keyed_episodic + new_keyed_proc
+                new_key_ids = [r["entry"]["key"] for r in new_keyed_interim]
+
+                # Simulate path: apply store mutations immediately (no training step).
+                if scope.source != "weights":
+                    for rec in new_keyed_interim:
+                        _entry = rec["entry"]
+                        _key = _entry["key"]
+                        self.store.put(
+                            adapter_name,
+                            _key,
+                            _entry,
+                            simhash=compute_simhash(
+                                _key, _entry["subject"], rec["predicate"], _entry["object"]
+                            ),
+                        )
+                        self.store.set_bookkeeping(
+                            _key,
+                            speaker_id=rec["speaker_id"],
+                            first_seen_cycle=self.cycle_count,
+                            relation_type=rec["relation_type"],
+                            recurrence_count=1,
+                            last_seen_cycle=self.cycle_count,
+                        )
+                    self._indexed_next_index += len(new_keyed_episodic)
+                    self._procedural_next_index += len(new_keyed_proc)
+
+                # --- WARN-5 (B8a-2): Semantic promotion transfer (weights path, when
+                # promotions supplied).  Separate from _promote_mature_keys_inline;
+                # operates on the interim keyed set before training.
+                promoted_key_set: set[str] = set()
+                if scope.source == "weights" and new_promotions:
+                    _promo_set = {n.lower() for n in new_promotions}
+                    for _t, _k, _e in list(self.store.iter_entries()):
+                        if _k.startswith("proc"):
+                            continue
+                        _subj = _e.get("subject", "").lower()
+                        _obj = _e.get("object", "").lower()
+                        _mentions = (_subj and _subj in _promo_set) or (_obj and _obj in _promo_set)
+                        if _mentions and not self.store.has_simhash("semantic", _k):
+                            promoted_key_set.add(_k)
+                    for _pk in promoted_key_set:
+                        self.store.move(_pk, "semantic")
+                    all_interim_keyed = [
+                        kp for kp in all_interim_keyed if kp["key"] not in promoted_key_set
+                    ]
+
+                # --- Train (weights source) or skip (disk source) ---
+                epi_train_loss: "float | None" = None
+                if scope.source == "weights" and all_interim_keyed:
+                    epi_metrics, recall_state = self._train_tier_adapter(
+                        all_interim_keyed,
+                        adapter_name=adapter_name,
+                        adapter_config=self.episodic_config,
+                        training_config=self._make_training_config(
+                            num_epochs=self.training_config.num_epochs
+                        ),
+                        output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
+                        run_name=f"interim-{adapter_name}-{run_label}",
+                        phase_name=f"interim-{adapter_name}-{run_label}",
+                    )
+                    epi_train_loss = (
+                        epi_metrics.get("train_loss") if epi_metrics is not None else None
+                    )
+                    if epi_metrics is not None and epi_metrics.get("aborted"):
+                        logger.info("_run_fold[interim]: training aborted — skipping commit")
+                        return {"mode": "aborted", "adapter_name": adapter_name}
+
+                    _epi_passing = self._recall_passing_keys(recall_state, all_interim_keyed)
+                    if _epi_passing is None:
+                        _epi_passing = self._probe_passing_keys(adapter_name, all_interim_keyed)
+                else:
+                    _epi_passing = None
+
+                # Update interim simhash registry.
+                _passing_interim = (
+                    [kp for kp in all_interim_keyed if kp["key"] in _epi_passing]
+                    if _epi_passing is not None
+                    else all_interim_keyed
+                )
+                self.store.replace_simhashes_in_tier(adapter_name, build_registry(_passing_interim))
+
+                # --- Apply deferred interim store mutations (weights source) ---
+                _recall_failed_session_ids: set[str] = set()
+                if scope.source == "weights":
+                    _ep_flushed = 0
+                    _proc_flushed = 0
+                    for rec in new_keyed_interim:
+                        _entry = rec["entry"]
+                        _key = _entry["key"]
+                        if _epi_passing is not None and _key not in _epi_passing:
+                            logger.debug(
+                                "_run_fold[interim]: key %s failed recall gate"
+                                " — skipping registration",
+                                _key,
+                            )
+                            _recall_failed_session_ids.update(rec.get("session_ids", []))
+                            continue
+                        self.store.put(
+                            adapter_name,
+                            _key,
+                            _entry,
+                            simhash=compute_simhash(
+                                _key,
+                                _entry["subject"],
+                                rec["predicate"],
+                                _entry["object"],
+                            ),
+                        )
+                        self.store.set_bookkeeping(
+                            _key,
+                            speaker_id=rec["speaker_id"],
+                            first_seen_cycle=self.cycle_count,
+                            relation_type=rec["relation_type"],
+                            recurrence_count=1,
+                            last_seen_cycle=self.cycle_count,
+                        )
+                        if rec["tier"] == "procedural":
+                            _proc_flushed += 1
+                        else:
+                            _ep_flushed += 1
+                    self._indexed_next_index += _ep_flushed
+                    self._procedural_next_index += _proc_flushed
+
+                # --- Shared soft-stale stage (M5) ---
+                self._apply_subtractive_removals_to_store(scope=scope.subtractive_scope)
+
+                # --- Persist interim slot ---
+                # Derive the mode string required by commit_tier_slot from scope.source.
+                # The commit_tier_slot function is in the allowlist for mode comparisons.
+                _interim_venue = "train" if scope.source == "weights" else "simulate"
+                commit_tier_slot(
+                    loop=self,
+                    tier="episodic",
+                    adapter_name=adapter_name,
+                    stamp=stamp,
+                    mode=_interim_venue,
+                    all_keyed=all_interim_keyed,
+                    output_dir=self.output_dir,
+                )
+
+                # --- Restore episodic as active adapter ---
+                if "episodic" in self.model.peft_config:
+                    switch_adapter(self.model, "episodic")
+
+                _interim_mode_label = "trained" if scope.source == "weights" else "simulated"
+                logger.info(
+                    "_run_fold[interim]: %s %s — %d new keys, %d total interim keys",
+                    _interim_mode_label,
+                    adapter_name,
+                    len(new_key_ids),
+                    len(all_interim_keyed),
+                )
+
+                cycle_summary = {
+                    "triples_extracted": triples_extracted,
+                    "new_keys": new_key_ids,
+                    "adapter_name": adapter_name,
+                    "mode": _interim_mode_label,
+                    "venue": _interim_venue,
+                    "error": None,
+                    "episodic_train_loss": epi_train_loss,
+                    "recall_failed_session_ids": sorted(_recall_failed_session_ids),
+                    # Full schema fields (zeros/empties for interim path callers that
+                    # don't use them — ensures the dict is always a superset of the
+                    # train schema so generic callers never KeyError).
+                    "tiers_rebuilt": [adapter_name] if scope.source == "weights" else [],
+                    "graph_drift_count": 0,
+                    "drift_deduplicated": 0,
+                    "drift_orphan": 0,
+                    "drift_genuine_loss": 0,
+                    "drift_intended_removal": 0,
+                    "drift_intended_removal_by_reason": {},
+                    "recall_miss_keys": sorted(recall_miss_keys),
+                    "keys_per_tier": {
+                        "episodic": len(_tier_keyed["episodic"]),
+                        "procedural": len(_tier_keyed["procedural"]),
+                    },
+                    "recall_per_tier": {},
+                    "tier_keyed": _tier_keyed,
+                    "rolled_back": False,
+                    "rollback_tier": None,
+                    "tier_delta": {},
+                }
+                self._debug_writer.on_cycle_end(cycle_summary, interim_stamp=stamp)
+                return cycle_summary
+            finally:
+                self.merger.reset_graph()
+
+        # ------------------------------------------------------------------
+        # PATH C: full-fold train (scope.persist == "main_tiers")
+        # ------------------------------------------------------------------
+        # Source: weights (reconstruct all tiers from adapter weights).
+        # Persist: _save_adapters (rebuild main adapter weights + manifest).
+        # Multi-tier training loop; promote=scope.promote, tier_floor=scope.tier_floor.
+        # Extracted from consolidate_interim_adapters.
+        # ------------------------------------------------------------------
+        from paramem.memory.interim_adapter import unload_interim_adapters
+        from paramem.models.loader import create_adapter
+
+        try:
+            recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
+                source=scope.source,
+                resolve_contradictions_recon=False,
+                resolve_contradictions_extra=False,
+            )
+            self._refine_consolidation_graph(
+                recon_relations,
+                normalize=(scope.level != "off"),
+                enrich=(scope.level == "full"),
+            )
+
+            # --- Inline promotion (scope-gated) ---
+            if scope.promote:
+                _inline_promoted = self._promote_mature_keys_inline()
+                if _inline_promoted:
+                    logger.info(
+                        "_run_fold[main_tiers]: %d key(s) promoted to semantic "
+                        "before tier assignment",
+                        len(_inline_promoted),
+                    )
+
+            tier_keyed: dict[str, list[dict]] = {
+                "episodic": [],
+                "semantic": [],
+                "procedural": [],
+            }
+
+            minted_by_tier, _ = self._build_all_edge_entries_into(
+                tier_keyed,
+                default_speaker_id="",
+                defer=scope.defer,
+                tag_new=scope.tag_new,
+            )
+
+            if recall_miss_keys:
+                logger.info(
+                    "_run_fold[main_tiers]: %d key(s) in recall-miss set "
+                    "(retrained with registry-true content — not dropped): %s",
+                    len(recall_miss_keys),
+                    sorted(recall_miss_keys),
+                )
+
+            self._debug_writer.on_fold_graph(self.merger, label="keyed")
+
+            # --- Per-tier floor gate (scope-gated) ---
+            _floor = self.config.min_tier_key_floor
+            _fast_start_graduating: set[str] = set()
+
+            def _tier_has_disk_slot(tier_name: str) -> bool:
+                from paramem.adapters.manifest import is_slot_name as _isn
+
+                tier_dir = self.output_dir / tier_name
+                if not tier_dir.is_dir():
+                    return False
+                return any(entry.is_dir() and _isn(entry.name) for entry in tier_dir.iterdir())
+
+            if scope.tier_floor:
+                for _pt in ("semantic", "procedural"):
+                    _pt_entries = tier_keyed[_pt]
+                    if not _pt_entries:
+                        continue
+                    if len(_pt_entries) < _floor:
+                        logger.info(
+                            "_run_fold[main_tiers]: tier %s has %d key(s) < floor %d"
+                            " — parking in episodic until floor reached",
+                            _pt,
+                            len(_pt_entries),
+                            _floor,
+                        )
+                        for _pe in _pt_entries:
+                            tier_keyed["episodic"].append(_pe)
+                            _cur = self.store.tier_for_active_key(_pe["key"])
+                            if _cur is not None and _cur != "episodic":
+                                self.store.move(_pe["key"], "episodic")
+                            self.promoted_keys.discard(_pe["key"])
+                        tier_keyed[_pt] = []
+                    else:
+                        _tier_is_live = _tier_has_disk_slot(_pt)
+                        if not _tier_is_live:
+                            if self.config.tier_fast_start:
+                                logger.info(
+                                    "_run_fold[main_tiers]: tier %s graduating (fast-start)"
+                                    " — %d key(s) >= floor %d; will copy episodic weights",
+                                    _pt,
+                                    len(_pt_entries),
+                                    _floor,
+                                )
+                                _fast_start_graduating.add(_pt)
+                            else:
+                                logger.info(
+                                    "_run_fold[main_tiers]: tier %s graduating"
+                                    " (train-from-scratch) — %d key(s) >= floor %d",
+                                    _pt,
+                                    len(_pt_entries),
+                                    _floor,
+                                )
+                                for _pe in _pt_entries:
+                                    self.store.move(_pe["key"], _pt)
+
+            serve_assignment = tier_keyed
+
+            train_assignment: dict[str, list[dict]] = {
+                t: list(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
+            }
+            for _fst in _fast_start_graduating:
+                _ep_union: dict[str, dict] = {e["key"]: e for e in train_assignment["episodic"]}
+                for _fse in serve_assignment[_fst]:
+                    _ep_union.setdefault(_fse["key"], _fse)
+                train_assignment["episodic"] = list(_ep_union.values())
+                train_assignment[_fst] = []
+
+            self._debug_writer.on_fold_assignments(serve_assignment, train_assignment)
+
+            _train_active_before: dict[str, int] = {
+                t: len(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
+            }
+
+            # --- Whole-fold accumulate guard ---
+            _total_trainable = sum(len(v) for v in serve_assignment.values())
+            if not housekeeping and _total_trainable < _floor:
+                logger.info(
+                    "_run_fold[main_tiers]: total trainable keys %d < floor %d"
+                    " — returning accumulating (sessions stay pending)",
+                    _total_trainable,
+                    _floor,
+                )
+                _acc_parked = {
+                    t: len(serve_assignment[t])
+                    for t in ("semantic", "procedural")
+                    if len(serve_assignment[t]) > 0
+                }
+                for _bname in (
+                    "episodic_backup",
+                    "semantic_backup",
+                    "procedural_backup",
+                ):
+                    if _bname in self.model.peft_config:
+                        self.model.delete_adapter(_bname)
+                        logger.debug(
+                            "_run_fold[main_tiers]: cleaned up stale backup %s"
+                            " (left by prior aborted fold) on accumulating return",
+                            _bname,
+                        )
+                self._current_interim_stamp = None  # type: ignore[assignment]
+                return {
+                    "status": "accumulating",
+                    "accumulating_reason": {
+                        "floor": _floor,
+                        "parked": _acc_parked,
+                        "episodic": len(serve_assignment["episodic"]),
+                    },
+                    "tiers_rebuilt": [],
+                    "graph_drift_count": 0,
+                    "drift_deduplicated": 0,
+                    "drift_orphan": 0,
+                    "drift_genuine_loss": 0,
+                    "drift_intended_removal": 0,
+                    "drift_intended_removal_by_reason": {},
+                    "recall_miss_keys": [],
+                    "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
+                    "tier_keyed": serve_assignment,
                     "recall_per_tier": {},
                     "rolled_back": False,
                     "rollback_tier": None,
                 }
 
-            # --- Write merged graph to main episodic slot ---
-            canonical_graph_path.parent.mkdir(parents=True, exist_ok=True)
-            save_memory_to_disk(self.merger.graph, canonical_graph_path)
-            _after_count = self.merger.graph.number_of_edges()
-            _collapsed_count = sum(
-                1
-                for _rl_entry in self.merger.removal_ledger.values()
-                if _rl_entry.get("reason") == "dedup"
-            )
-            logger.info(
-                "consolidate_interim_to_canonical_graph: wrote merged graph to %s"
-                " (%d edges, %d interim slot(s), %d dedup collapse(s))",
-                canonical_graph_path,
-                _after_count,
-                len(interim_dirs_merged),
-                _collapsed_count,
+            # --- Drift partition ---
+            _all_keyed = {e["key"] for tier_list in serve_assignment.values() for e in tier_list}
+
+            for _surviving_key in _all_keyed:
+                _sbk = self.store.bookkeeping_for_key(_surviving_key)
+                if _sbk is not None:
+                    _sbk["last_seen_cycle"] = self.cycle_count
+
+            _subtractive_stale_by_tier = self._apply_subtractive_removals_to_store(
+                scope=scope.subtractive_scope
             )
 
-            # Per-tier delta for simulate path.
-            # staled_by_reason is derived from merger.removal_ledger via _build_tier_delta;
-            # for simulate mode the entry store is empty (no KeyRegistry mutation) so
-            # tier_of returns None for all removed keys and staled_by_reason == {} in
-            # practice — a persistence-tail divergence, NOT a skipped grooming step.
-            # The merger's Case-1 collapse STILL fires and is recorded in removal_ledger.
-            _sim_tier_delta = self._build_tier_delta(
-                active_before={"episodic": _active_before_count},
-                active_after={"episodic": _after_count},
-                minted_by_tier={"episodic": _enrichment_result.get("new_edges", 0)},
+            active_keys = self.store.all_active_keys()
+            _drift_keys = [k for k in active_keys if k not in _all_keyed]
+
+            _collapsed_set: set[str] = set(getattr(self.merger, "collapsed", []))
+            _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
+
+            drift_deduplicated: list[str] = []
+            drift_orphan: list[str] = []
+            drift_genuine_loss: list[str] = []
+            drift_intended_removal: list[str] = []
+            drift_intended_removal_by_reason: dict[str, int] = {}
+
+            soft_stale_by_tier: dict[str, dict[str, dict]] = {
+                tier: dict(entries) for tier, entries in _subtractive_stale_by_tier.items()
+            }
+
+            for _dk in _drift_keys:
+                if _dk in _collapsed_set:
+                    drift_deduplicated.append(_dk)
+                    _dk_tier = self.store.tier_for_active_key(_dk)
+                    _dk_simhash: "int | None" = None
+                    if _dk_tier is not None:
+                        _dk_simhash = self.store.simhash(_dk_tier, _dk)
+                    self.store.discard_keys([_dk], mode="stale")
+                    if _dk_tier is not None:
+                        _stale_rec = {"stale_cycles": 0}
+                        if _dk_simhash is not None:
+                            _stale_rec["simhash"] = _dk_simhash
+                        soft_stale_by_tier.setdefault(_dk_tier, {})[_dk] = _stale_rec
+                elif _dk in _ledger:
+                    drift_intended_removal.append(_dk)
+                    _r = _ledger[_dk]["reason"]
+                    drift_intended_removal_by_reason[_r] = (
+                        drift_intended_removal_by_reason.get(_r, 0) + 1
+                    )
+                else:
+                    _dk_bk = self.store.bookkeeping_for_key(_dk)
+                    _dk_entry = self.store.get(_dk)
+                    _entry_subj = (_dk_entry or {}).get("subject", "")
+                    _entry_pred = (_dk_entry or {}).get("predicate", "")
+                    _entry_obj = (_dk_entry or {}).get("object", "")
+                    _bk_subj = (_dk_bk or {}).get("subject", "")
+                    _bk_pred = (_dk_bk or {}).get("predicate", "")
+                    _bk_obj = (_dk_bk or {}).get("object", "")
+                    if not _entry_subj and not _entry_pred and not _entry_obj:
+                        if _bk_subj or _bk_pred or _bk_obj:
+                            drift_genuine_loss.append(_dk)
+                        else:
+                            drift_orphan.append(_dk)
+                    else:
+                        drift_genuine_loss.append(_dk)
+
+            graph_drift_count = len(_drift_keys)
+            drift_deduplicated_count = len(drift_deduplicated)
+            drift_orphan_count = len(drift_orphan)
+            drift_genuine_loss_count = len(drift_genuine_loss)
+            drift_intended_removal_count = len(drift_intended_removal)
+
+            _soft_stale_keys: set[str] = {
+                k for tier_stale in soft_stale_by_tier.values() for k in tier_stale
+            }
+            _stale_in_active = _soft_stale_keys & _all_keyed
+            if _stale_in_active:
+                logger.warning(
+                    "_run_fold[main_tiers]: R4 invariant violation — %d key(s) appear"
+                    " in both soft_stale_by_tier and _all_keyed (trained as active AND stale);"
+                    " this indicates tier_keyed was mutated after _all_keyed was built: %s",
+                    len(_stale_in_active),
+                    sorted(_stale_in_active),
+                )
+
+            for _dk in drift_deduplicated:
+                _dk_entry = self.store.get(_dk)
+                logger.info(
+                    "graph_drift_key key=%s bucket=deduplicated subject=%r predicate=%r object=%r"
+                    " (registry-true duplicate — soft-staled; record retained for stale-echo seam)",
+                    _dk,
+                    (_dk_entry or {}).get("subject", ""),
+                    (_dk_entry or {}).get("predicate", ""),
+                    (_dk_entry or {}).get("object", ""),
+                )
+            for _dk in drift_orphan:
+                logger.info(
+                    "graph_drift_key key=%s bucket=orphan (no subject/predicate/object content;"
+                    " correctly dropped)",
+                    _dk,
+                )
+            for _dk in drift_genuine_loss:
+                _dk_entry = self.store.get(_dk)
+                logger.info(
+                    "graph_drift_key key=%s bucket=genuine_loss subject=%r predicate=%r object=%r"
+                    " (reconstruction failure or hydration-miss — retrained with registry-true"
+                    " content; not a data loss)",
+                    _dk,
+                    (_dk_entry or {}).get("subject", ""),
+                    (_dk_entry or {}).get("predicate", ""),
+                    (_dk_entry or {}).get("object", ""),
+                )
+            for _dk in drift_intended_removal:
+                logger.info(
+                    "graph_drift_key key=%s bucket=intended_removal reason=%s"
+                    " (merger-recorded intentional removal — key retained, not staled)",
+                    _dk,
+                    (_ledger.get(_dk) or {}).get("reason", ""),
+                )
+
+            if drift_deduplicated_count:
+                logger.info(
+                    "_run_fold[main_tiers]: %d key(s) deduplicated (registry-true"
+                    " duplicate; soft-staled — record retained, excluded from training)",
+                    drift_deduplicated_count,
+                )
+            if drift_orphan_count:
+                logger.info(
+                    "_run_fold[main_tiers]: %d orphan key(s) dropped (no SPO content)",
+                    drift_orphan_count,
+                )
+            if drift_intended_removal_count:
+                logger.info(
+                    "_run_fold[main_tiers]: %d key(s) in intended_removal"
+                    " (merger-recorded removal: by_reason=%s)",
+                    drift_intended_removal_count,
+                    drift_intended_removal_by_reason,
+                )
+
+            if drift_genuine_loss_count > 0:
+                logger.warning(
+                    "_run_fold[main_tiers]: %d genuine reconstruction loss(es) — "
+                    "these keys had content but produced no merged edge (reconstruction"
+                    " failure or hydration-miss); they were retrained with registry-true"
+                    " content (should trend to ~0): %s",
+                    drift_genuine_loss_count,
+                    drift_genuine_loss,
+                )
+
+            logger.info(
+                "_run_fold[main_tiers]: key distribution — episodic=%d semantic=%d "
+                "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d"
+                " intended_removal=%d)",
+                len(serve_assignment["episodic"]),
+                len(serve_assignment["semantic"]),
+                len(serve_assignment["procedural"]),
+                graph_drift_count,
+                drift_deduplicated_count,
+                drift_orphan_count,
+                drift_genuine_loss_count,
+                drift_intended_removal_count,
             )
-            self._debug_writer.on_tier_delta(_sim_tier_delta)
-            # Also emit the removal ledger so the pre_surfaces evidence is
-            # visible in the simulate housekeeping artifacts.
+
             self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
-            # --- Remove merged interim slot directories ---
-            for interim_dir in interim_dirs_merged:
-                try:
-                    _shutil.rmtree(interim_dir, ignore_errors=True)
-                    logger.debug(
-                        "consolidate_interim_to_canonical_graph: removed interim slot %s",
-                        interim_dir,
+            # --- Build per-tier TrainingJob objects ---
+            from paramem.server.background_trainer import TrainingJob
+
+            refresh_training_config = self._make_training_config(num_epochs=refresh_epochs)
+
+            jobs_by_tier = {
+                "episodic": TrainingJob(
+                    entries=train_assignment["episodic"],
+                    adapter_name="episodic",
+                    adapter_config=self.episodic_config,
+                    inference_fallback_adapter="episodic_backup",
+                ),
+                "semantic": TrainingJob(
+                    entries=train_assignment["semantic"],
+                    adapter_name="semantic",
+                    adapter_config=self.semantic_config,
+                    inference_fallback_adapter="semantic_backup",
+                ),
+                "procedural": TrainingJob(
+                    entries=train_assignment["procedural"],
+                    adapter_name="procedural",
+                    adapter_config=self.procedural_config or self.episodic_config,
+                    inference_fallback_adapter="procedural_backup",
+                ),
+            }
+
+            # --- Per-tier fresh-adapter rebuild ---
+            tier_config_for_backup = {
+                "episodic": self.episodic_config,
+                "semantic": self.semantic_config,
+                "procedural": self.procedural_config or self.episodic_config,
+            }
+            for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
+                if backup_name not in self.model.peft_config:
+                    base_tier = backup_name.replace("_backup", "")
+                    if base_tier in self.model.peft_config:
+                        from paramem.models.loader import copy_adapter_weights
+
+                        backup_config = tier_config_for_backup[base_tier]
+                        self.model = create_adapter(self.model, backup_config, backup_name)
+                        copy_adapter_weights(self.model, src=base_tier, dst=backup_name)
+                        logger.info(
+                            "_run_fold[main_tiers]: created in-memory backup %s from %s",
+                            backup_name,
+                            base_tier,
+                        )
+
+            tiers_rebuilt: list[str] = []
+            recall_per_tier: dict[str, float] = {}
+            last_per_key_by_tier: dict[str, "list | None"] = {}
+
+            for tier in ("episodic", "semantic", "procedural"):
+                backup_name = f"{tier}_backup"
+                job = jobs_by_tier[tier]
+
+                if not job.entries and tier not in _fast_start_graduating:
+                    logger.info(
+                        "_run_fold[main_tiers]: no keys for tier %s — skipping rebuild", tier
                     )
-                except Exception as _rm_exc:
-                    logger.warning(
-                        "consolidate_interim_to_canonical_graph: failed to remove %s: %s",
-                        interim_dir,
-                        _rm_exc,
+                    continue
+
+                if backup_name in self.model.peft_config:
+                    from paramem.models.loader import switch_adapter as _sw_backup
+
+                    _sw_backup(self.model, backup_name)
+
+                if tier in self.model.peft_config:
+                    self.model.delete_adapter(tier)
+                    logger.debug("_run_fold[main_tiers]: deleted adapter %s", tier)
+
+                tier_cfg = (
+                    self.episodic_config
+                    if tier == "episodic"
+                    else (
+                        self.semantic_config
+                        if tier == "semantic"
+                        else (self.procedural_config or self.episodic_config)
+                    )
+                )
+                self.model = create_adapter(self.model, tier_cfg, tier)
+                logger.debug("_run_fold[main_tiers]: created fresh adapter %s", tier)
+
+                from paramem.models.loader import switch_adapter as _sw
+
+                _sw(self.model, tier)
+
+                # --- Fast-start graduation branch ---
+                if tier in _fast_start_graduating:
+                    from paramem.models.loader import copy_adapter_weights as _copy_aw
+                    from paramem.models.loader import (
+                        copy_adapter_weights_subset as _copy_aw_subset,
                     )
 
-            # Reset housekeeping stamp.
+                    if tier == "procedural":
+                        _copy_aw_subset(self.model, src="episodic", dst=tier)
+                        logger.info(
+                            "_run_fold[main_tiers]: fast-start graduation — "
+                            "copied episodic attn weights into procedural (mlp stays zero-init)"
+                        )
+                    else:
+                        _copy_aw(self.model, src="episodic", dst=tier)
+                        logger.info(
+                            "_run_fold[main_tiers]: fast-start graduation — "
+                            "copied episodic weights into %s (full param set)",
+                            tier,
+                        )
+
+                    _serve_entries = serve_assignment[tier]
+                    _probe_passing = self._probe_passing_keys(tier, _serve_entries)
+                    _probe_rate = (
+                        len(_probe_passing) / len(_serve_entries) if _serve_entries else 1.0
+                    )
+                    logger.info(
+                        "_run_fold[main_tiers]: fast-start graduation probe %s"
+                        " — %d/%d passed (%.3f), threshold %.3f",
+                        tier,
+                        len(_probe_passing),
+                        len(_serve_entries),
+                        _probe_rate,
+                        recall_sanity_threshold,
+                    )
+
+                    if _probe_rate >= recall_sanity_threshold:
+                        for _fse in _serve_entries:
+                            self.store.move(_fse["key"], tier)
+                        last_per_key_by_tier[tier] = None
+                        tiers_rebuilt.append(tier)
+                        logger.info(
+                            "_run_fold[main_tiers]: fast-start graduation accepted"
+                            " for %s (%d keys rebooked)",
+                            tier,
+                            len(_serve_entries),
+                        )
+                        continue
+
+                    logger.warning(
+                        "_run_fold[main_tiers]: fast-start probe FAILED for %s"
+                        " (%.3f < %.3f) — falling back to train-from-scratch",
+                        tier,
+                        _probe_rate,
+                        recall_sanity_threshold,
+                    )
+                    _fast_start_graduating.discard(tier)
+                    job.entries = list(_serve_entries)
+                    for _fse in _serve_entries:
+                        self.store.move(_fse["key"], tier)
+                    if tier in self.model.peft_config:
+                        if backup_name in self.model.peft_config:
+                            _sw(self.model, backup_name)
+                        self.model.delete_adapter(tier)
+                    self.model = create_adapter(self.model, tier_cfg, tier)
+                    _sw(self.model, tier)
+                    logger.debug(
+                        "_run_fold[main_tiers]: recreated fresh adapter %s for fallback training",
+                        tier,
+                    )
+
+                prior_job = None
+                recall_state = None
+                if trainer is not None:
+                    prior_job = trainer._current_job
+                    trainer._current_job = job
+                    trainer._set_is_training(True)
+                try:
+                    _tier_metrics, recall_state = self._train_tier_adapter(
+                        job.entries,
+                        adapter_name=tier,
+                        adapter_config=tier_cfg,
+                        training_config=refresh_training_config,
+                        output_dir=self.output_dir / "consolidation_refresh" / tier,
+                        run_name=f"consolidate-{tier}",
+                        phase_name=f"consolidate-{tier}",
+                        num_epochs=refresh_epochs,
+                    )
+                    if _tier_metrics is not None:
+                        if _tier_metrics.get("aborted"):
+                            logger.info(
+                                "_run_fold[main_tiers]: training aborted on tier %s "
+                                "— restoring all tiers from backups",
+                                tier,
+                            )
+                            from paramem.models.loader import copy_adapter_weights as _copy_w
+
+                            for _t in ("episodic", "semantic", "procedural"):
+                                _backup = f"{_t}_backup"
+                                if (
+                                    _backup in self.model.peft_config
+                                    and _t in self.model.peft_config
+                                ):
+                                    _copy_w(self.model, src=_backup, dst=_t)
+                            self._current_interim_stamp = None  # type: ignore[assignment]
+                            raise AbortedDuringConsolidation(f"training aborted on tier {tier!r}")
+                        else:
+                            logger.info(
+                                "_run_fold[main_tiers]: trained %s on %d keys",
+                                tier,
+                                len(job.entries),
+                            )
+                finally:
+                    if trainer is not None:
+                        trainer._set_is_training(False)
+                        trainer._current_job = prior_job
+
+                last_per_key_by_tier[tier] = (
+                    recall_state.last_per_key if recall_state is not None else None
+                )
+                if recall_state is not None and recall_state.last_per_key is not None:
+                    self._debug_writer.on_recall_probe(
+                        recall_state.last_per_key,
+                        phase="train_fill",
+                        adapter_name=tier,
+                    )
+                tiers_rebuilt.append(tier)
+
+            if trainer is not None:
+                trainer._set_is_training(False)
+
+            # --- Atomic finalize ---
+            if self.store.replay_enabled:
+                passing_sets_by_tier: dict[str, "set[str] | None"] = {}
+                for _tier in ("episodic", "semantic", "procedural"):
+                    _lpk = last_per_key_by_tier.get(_tier)
+                    if _lpk is not None:
+                        _serve_keys = {e["key"] for e in serve_assignment[_tier]}
+                        passing_sets_by_tier[_tier] = {
+                            r["key"] for r in _lpk if r["exact_match"]
+                        } & _serve_keys
+                    else:
+                        passing_sets_by_tier[_tier] = None
+
+                self._reset_main_tier_registries_and_simhashes(
+                    serve_assignment,
+                    passing_sets_by_tier,
+                    soft_stale_by_tier=soft_stale_by_tier,
+                )
+                self._drop_interim_tier_registries()
+                for _reg_tier in ("episodic", "semantic", "procedural"):
+                    _reg_tier_dir = self.output_dir / _reg_tier
+                    _reg_tier_dir.mkdir(parents=True, exist_ok=True)
+                    _reg_path = _reg_tier_dir / "indexed_key_registry.json"
+                    self.store.registry(_reg_tier).save(_reg_path)
+                    logger.info(
+                        "_run_fold[main_tiers]: registry rewritten to %s",
+                        _reg_path,
+                    )
+
+            if self.store.replay_enabled and tiers_rebuilt:
+                try:
+                    self._save_adapters(
+                        window_stamp_override=window_stamp_override,
+                    )
+                except Exception:
+                    self._current_interim_stamp = None  # type: ignore[assignment]
+                    raise
+                logger.info("_run_fold[main_tiers]: merged main weights persisted+verified")
+
+            if self.store.replay_enabled and soft_stale_by_tier:
+                for _st_tier in ("episodic", "semantic", "procedural"):
+                    self.store.registry(_st_tier).increment_stale_cycles()
+                logger.debug(
+                    "_run_fold[main_tiers]: stale_cycles advanced for %d soft-staled key(s)",
+                    sum(len(v) for v in soft_stale_by_tier.values()),
+                )
+
+            unload_interim_adapters(self.model, self.output_dir)
+            logger.info("_run_fold[main_tiers]: interim adapters unloaded")
+
+            if router is not None:
+                try:
+                    router.reload()
+                    logger.info("_run_fold[main_tiers]: router reloaded")
+                except Exception:
+                    logger.exception("_run_fold[main_tiers]: router reload failed")
+
+            for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
+                if backup_name in self.model.peft_config:
+                    self.model.delete_adapter(backup_name)
+                    logger.debug("_run_fold[main_tiers]: unloaded backup adapter %s", backup_name)
+
+            if "episodic" in self.model.peft_config:
+                from paramem.models.loader import switch_adapter as _sw2
+
+                _sw2(self.model, "episodic")
+
+            _train_tiers = ("episodic", "semantic", "procedural")
+            _train_tier_delta = self._build_tier_delta(
+                active_before=_train_active_before,
+                active_after={t: len(serve_assignment.get(t, [])) for t in _train_tiers},
+                minted_by_tier=minted_by_tier,
+            )
+            self._debug_writer.on_tier_delta(_train_tier_delta)
+
             self._current_interim_stamp = None  # type: ignore[assignment]
 
+            logger.info(
+                "_run_fold[main_tiers]: complete — rebuilt %s, drift=%d"
+                " (deduplicated=%d orphan=%d genuine_loss=%d intended_removal=%d)",
+                tiers_rebuilt,
+                graph_drift_count,
+                drift_deduplicated_count,
+                drift_orphan_count,
+                drift_genuine_loss_count,
+                drift_intended_removal_count,
+            )
+
             return {
-                "tiers_rebuilt": ["episodic"],
-                "graph_drift_count": _collapsed_count,
-                "drift_deduplicated": _collapsed_count,
-                "drift_orphan": 0,
-                "drift_genuine_loss": 0,
-                "keys_per_tier": {"episodic": _after_count},
-                "recall_per_tier": {"episodic": 1.0},  # graph merge is lossless
+                "tiers_rebuilt": tiers_rebuilt,
+                "graph_drift_count": graph_drift_count,
+                "drift_deduplicated": drift_deduplicated_count,
+                "drift_orphan": drift_orphan_count,
+                "drift_genuine_loss": drift_genuine_loss_count,
+                "drift_intended_removal": drift_intended_removal_count,
+                "drift_intended_removal_by_reason": drift_intended_removal_by_reason,
+                "recall_miss_keys": sorted(recall_miss_keys),
+                "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
+                "tier_keyed": serve_assignment,
+                "recall_per_tier": recall_per_tier,
                 "rolled_back": False,
                 "rollback_tier": None,
-                "tier_delta": _sim_tier_delta,
+                "tier_delta": _train_tier_delta,
             }
         finally:
-            # Clear the keying graph (removal_ledger, collapsed, reinforcements).
             self.merger.reset_graph()
+
+    def consolidate_simulate_fold(self, *, housekeeping: bool = False) -> dict:
+        """Thin public entry for the simulate full fold — routes to :meth:`_run_fold`.
+
+        Replaces the deleted ``consolidate_interim_to_canonical_graph``.  Builds the
+        :class:`FoldScope` for the ``graph_json`` persist venue and delegates all logic
+        to :meth:`_run_fold`.  Callers (``run_housekeeping``, ``app.py``) never
+        construct :class:`FoldScope` directly (layering rule).
+
+        Args:
+            housekeeping: Forwarded to :meth:`_run_fold`; bypasses the noop gate when
+                ``True`` so the re-groomed graph is persisted even with no interim slots.
+        """
+        if housekeeping:
+            _hk_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            self._current_interim_stamp = f"housekeeping_{_hk_ts}"
+        else:
+            self._current_interim_stamp = None  # type: ignore[assignment]
+
+        return self._run_fold(
+            FoldScope(
+                name="full",
+                source="disk",
+                persist="graph_json",
+                tier=None,
+                extra_relations_source="disk",
+                defer=False,
+                tag_new=False,
+                level=self.config.fold_refinement,
+                promote=False,
+                tier_floor=False,
+                subtractive_scope="fold",
+            ),
+            # Fold has no single-session speaker; per-key attribution is sourced
+            # from bookkeeping, so the fold-venue speaker_id is the empty string.
+            speaker_id="",
+            housekeeping=housekeeping,
+        )
 
     def run_housekeeping(
         self,
@@ -3978,7 +4820,7 @@ class ConsolidationLoop:
         This is a thin dispatcher for the ``POST /consolidate/housekeeping`` endpoint.
         It routes to the correct underlying fold method depending on ``mode``:
 
-        - **simulate**: calls :meth:`consolidate_interim_to_canonical_graph`
+        - **simulate**: calls :meth:`consolidate_simulate_fold`
           with ``housekeeping=True``.
           Re-runs the GraphMerger topology over the persisted main graph (with no interim
           slots required).  Writes the canonicalized/deduped graph back to disk.  Clears
@@ -4013,7 +4855,7 @@ class ConsolidationLoop:
             Result dict from the underlying fold, with ``tier_delta`` guaranteed present.
         """
         if mode == "simulate":
-            return self.consolidate_interim_to_canonical_graph(housekeeping=True)
+            return self.consolidate_simulate_fold(housekeeping=True)
         else:
             # Read the window stamp that was written by the last scheduled fold and
             # pass it as window_stamp_override so _save_adapters re-writes the SAME
@@ -4704,6 +5546,7 @@ class ConsolidationLoop:
     def _materialize_consolidation_graph(
         self,
         *,
+        source: "Literal['weights', 'disk']" = "weights",
         tier: "str | None" = None,
         keys: "list[str] | None" = None,
         extra_relations: "list[Relation] | None" = None,
@@ -4715,7 +5558,8 @@ class ConsolidationLoop:
         This is the *Materialize* stage of the fold pipeline:
 
         1. Probe every active key from adapter weights via :func:`reconstruct_graph`
-           (``strict=False``).
+           (``strict=False``).  Skipped when ``source="disk"`` (no weight reconstruction
+           for the simulate venue — disk relations are supplied via ``extra_relations``).
         2. Compute ``recall_miss_keys`` — keys whose reconstructed SPO disagrees with
            registry-true SPO, or whose reconstruction failed outright.  The set is
            computed against ``store.all_active_keys()`` BEFORE the graph reset, so
@@ -4755,12 +5599,36 @@ class ConsolidationLoop:
         walk (correct default).
 
         Args:
+            source: Materialize axis — ``"weights"`` (default) or ``"disk"``.
+
+                - ``"weights"``: today's behaviour byte-for-byte.  Calls
+                  :func:`reconstruct_graph`, computes ``recall_miss_keys``, resets
+                  the merger, builds registry-true :class:`Relation` objects via
+                  :meth:`_build_registry_true_relations` and re-merges them.
+                - ``"disk"``: skips weight reconstruction entirely (no adapter weights
+                  available in the simulate venue).  ``recall_miss_keys`` is the empty
+                  ``set()`` — a retrain signal is meaningless when no retraining
+                  occurs.  The disk :class:`Relation` objects are supplied by the
+                  caller via ``extra_relations`` and enter the merge via the same
+                  ``extra_relations`` channel.  :meth:`_build_registry_true_relations`
+                  is NOT called (returns ``[]`` from the empty simulate store — calling
+                  it would silently zero the merge input).  ``recon_relations`` returns
+                  ``[]``, making :meth:`_refine_consolidation_graph`'s recurrence-bump
+                  guard a no-op (correct: simulate store has no registered keys to bump).
+
+                **MF-1 persist contract (B8a-1):** for ``source="disk"`` the persist tail
+                MUST write ``save_memory_to_disk(self.merger.graph, path)`` DIRECTLY —
+                NOT derive the graph from ``tier_keyed``.  Disk relations carry ``ik_key``;
+                the keyed branch of ``_build_all_edge_entries_into`` does ``store.get(key)``
+                against the empty simulate store and silently skips unmatched edges, making
+                ``tier_keyed`` empty.  The direct graph write is the only correct path.
             tier: Forwarded to :func:`reconstruct_graph` as ``tier``.  When
                 ``None`` (the default), all tiers are probed — byte-identical to
-                the original inline fold behaviour.
+                the original inline fold behaviour.  Ignored when ``source="disk"``.
             keys: Forwarded to :meth:`_build_registry_true_relations` as ``keys``.
                 When ``None`` (the default), all active keys are processed —
-                byte-identical to the original inline fold behaviour.
+                byte-identical to the original inline fold behaviour.  Ignored when
+                ``source="disk"``.
             extra_relations: Optional list of :class:`Relation` objects to merge
                 into the fresh keying graph after the registry-true re-merge.
                 Intended for the interim mini-fold: the caller captures the
@@ -4768,10 +5636,13 @@ class ConsolidationLoop:
                 this method (since the reset inside will wipe them) and passes them
                 here so they survive the reset and co-reside with the slot's
                 recalled facts.  The fold caller passes ``None`` (no-op).
+                For ``source="disk"`` callers, pass the disk-loaded :class:`Relation`
+                objects here — they are the ONLY merge input for the disk path.
             resolve_contradictions_recon: Forwarded to
                 :meth:`_merge_registry_relations` for the registry-true recon
                 merge.  Always ``False`` (old-vs-old, no recency signal).  Named
                 explicitly so the caller's intent is readable at the call site.
+                Ignored when ``source="disk"`` (no recon merge performed).
             resolve_contradictions_extra: Forwarded to
                 :meth:`_merge_registry_relations` for the ``extra_relations``
                 (pending-session) merge.  At interim this should match
@@ -4782,12 +5653,43 @@ class ConsolidationLoop:
             A 2-tuple ``(recall_miss_keys, recon_relations)`` where:
 
             - ``recall_miss_keys`` — :class:`set` of key strings that failed
-              reconstruction or whose SPO diverged from the registry.
+              reconstruction or whose SPO diverged from the registry.  Always
+              ``set()`` for ``source="disk"`` (no weight reconstruction).
             - ``recon_relations`` — the :class:`list` of :class:`Relation` objects
               fed into the registry-true re-merge (registry-true SPO, with
               ``indexed_key`` set).  ``extra_relations`` are NOT included here —
               they travel through a separate merge call inside this method.
+              Always ``[]`` for ``source="disk"``.
         """
+        # --- Disk-source path: skip weight reconstruction entirely ---
+        # For the simulate venue (source="disk") there are no adapter weights to probe.
+        # The disk-loaded Relations are supplied via extra_relations and enter the merge
+        # through the existing extra_relations channel below.
+        # recall_miss_keys is empty: a retrain signal is meaningless for a venue that
+        # does not retrain (§7 of the B8a plan).
+        # _build_registry_true_relations is NOT called: it reads self.store (empty in
+        # simulate) and would return [], silently zeroing the merge input.
+        if source == "disk":
+            self.merger.reset_graph()
+            logger.info(
+                "_materialize_consolidation_graph(source=disk): keying graph reset;"
+                " merging %d disk relations via extra_relations channel",
+                len(extra_relations) if extra_relations else 0,
+            )
+            # Emit debug snapshot of the empty (pre-merge) graph so the artifact
+            # chain matches the weights path (reconstructed → merged → enriched).
+            self._debug_writer.on_fold_graph(self.merger, label="reconstructed")
+            # Merge the disk-loaded relations through the extra_relations channel.
+            # resolve_contradictions=False: old-vs-old, no recency signal.
+            self._merge_registry_relations(
+                extra_relations or [],
+                session_id="__simulate_consolidation_merge__",
+                log_label="disk relations (simulate full fold)",
+                resolve_contradictions=False,
+            )
+            self._debug_writer.on_fold_graph(self.merger, label="merged")
+            return set(), []
+
         # --- Reconstruct all active keys from adapter weights ---
         # Probes every active key across all tiers; recovers (subject, predicate, object)
         # from the trained weights.  Reconstruction yields SPO ONLY — no relation_type.
@@ -5121,13 +6023,7 @@ class ConsolidationLoop:
                     "rollback_tier": str | None,
                 }
         """
-        from paramem.memory.interim_adapter import unload_interim_adapters
-        from paramem.models.loader import create_adapter
         from paramem.server.gpu_lock import _gpu_thread_lock
-
-        # Resolve threshold from config when the caller did not supply an override.
-        if recall_sanity_threshold is None:
-            recall_sanity_threshold = self.config.recall_sanity_threshold
 
         # --- Entry guard: verify the GPU lock is held by the caller (leak-safe) ---
         acquired = _gpu_thread_lock.acquire(blocking=False)
@@ -5143,1039 +6039,37 @@ class ConsolidationLoop:
         # --- Housekeeping debug-dir labeling ---
         # Set a distinct interim stamp so debug artifacts for a housekeeping fold
         # land under ``housekeeping_<ts>/`` rather than a scheduled fold name.
-        # Cleared in the finally-equivalent tail (after _save_adapters / rollback).
+        # Cleared inside _run_fold (main_tiers path) at success / abort.
         if housekeeping:
             _hk_ts_adp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             self._current_interim_stamp = f"housekeeping_{_hk_ts_adp}"
         else:
             self._current_interim_stamp = None  # type: ignore[assignment]
 
-        # Clear merger.graph at every exit (accumulating early-return, rollback-raise,
-        # save-fail-raise, and normal success) so it never leaks into the next cycle.
-        # The finally re-raises unchanged — not error suppression.
-        try:
-            recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
-                # Fold: recon is old-vs-old (no recency, contradiction structurally off).
-                resolve_contradictions_recon=False,
-                # Fold: no extra_relations (pending sessions were extracted before the
-                # fold; they are part of the interim slots, not a separate set here).
-                resolve_contradictions_extra=False,
-            )
-            self._refine_consolidation_graph(
-                recon_relations,
-                normalize=(self.config.fold_refinement != "off"),
-                enrich=(self.config.fold_refinement == "full"),
-            )
-
-            # --- Inline promotion: move matured episodic keys to semantic ---
-            # Runs AFTER the recurrence-bump step (so bump-triggered threshold crossings
-            # are captured) and BEFORE tier_keyed is built (so the promoted key lands
-            # in tier_keyed["semantic"] and is trained into the semantic adapter this
-            # fold).  Ordering invariant: reconstruction ran while the key was still in
-            # episodic, so its weights were found there; only NOW is it
-            # moved to semantic.
-            _inline_promoted = self._promote_mature_keys_inline()
-            if _inline_promoted:
-                logger.info(
-                    "consolidate_interim_adapters: %d key(s) promoted to semantic "
-                    "before tier assignment",
-                    len(_inline_promoted),
-                )
-
-            # tier_keyed is initialised here (before the pre-pass) so that both
-            # _build_all_edge_entries_into populates tier_keyed in one pass over all edges.
-            tier_keyed: dict[str, list[dict]] = {
-                "episodic": [],
-                "semantic": [],
-                "procedural": [],
-            }
-
-            # --- Edge-to-entry pass: mint new keys + collect existing keys ---
-            # _build_all_edge_entries_into walks ALL merged-graph edges in one pass:
-            #   - Keyless edges (SOTA-enrichment or pending facts): minted immediately
-            #     (defer=False); the committed counter is advanced per minted key; the
-            #     ik_key attribute is intentionally NOT stamped onto the edge so the
-            #     MultiDiGraph parallel-edge integer key field is not disturbed.
-            #   - Keyed edges (registry-true reconstructed facts): anti-forgetting replay
-            #     entries sourced from the store; NOT counted as minted, NOT re-registered.
-            # Both branches produce uniform {key, subject, predicate, object, speaker_id}
-            # entries in tier_keyed.
-            # Dedup note: when two active keys share identical (s,p,o), the re-merge fires
-            # Case-1 — the surviving edge keeps its ik_key; the incoming key is recorded
-            # in merger.collapsed (soft-staled later).  Only ONE edge survives per (s,p,o),
-            # so only ONE key appears in tier_keyed — this is intended dedup, NOT data loss.
-            minted_by_tier, _ = self._build_all_edge_entries_into(
-                tier_keyed,
-                default_speaker_id="",
+        return self._run_fold(
+            FoldScope(
+                name="full",
+                source="weights",
+                persist="main_tiers",
+                tier=None,
+                extra_relations_source="none",
                 defer=False,
                 tag_new=False,
-            )
-
-            if recall_miss_keys:
-                logger.info(
-                    "consolidate_interim_adapters: %d key(s) in recall-miss set "
-                    "(retrained with registry-true content — not dropped): %s",
-                    len(recall_miss_keys),
-                    sorted(recall_miss_keys),
-                )
-
-            # Debug: snapshot the graph after the keyed-edge walk (before the floor-gate pass
-            # mutates tier_keyed).  Self-gated; no-op when save_cycle_snapshots=False.
-            self._debug_writer.on_fold_graph(self.merger, label="keyed")
-
-            # --- Per-tier floor gate (must run BEFORE _all_keyed is computed) ---
-            # This pass runs before _all_keyed is built so the post-park, post-graduation
-            # serve_assignment is the source for all downstream consumers: _all_keyed,
-            # last_seen refresh, and the soft-stale/drift partition.
-            #
-            # Two-map decoupling:
-            #   serve_assignment — which tier SERVES/RECALLS each key (registry + simhash
-            #                      owner).  This IS the returned "tier_keyed" layout.
-            #   train_assignment — what each adapter TRAINS on.  For fast-start graduating
-            #                      tiers, episodic trains on the graduating keys too (as
-            #                      universal donor); the graduating tier trains on nothing
-            #                      (empty list, copied from the informed episodic instead).
-            # The two maps are IDENTICAL for all steady-state and parked keys; they diverge
-            # ONLY for fast-start graduating tiers.  All downstream registry/drift/stale
-            # consumers read serve_assignment; only jobs_by_tier reads train_assignment.
-            #
-            # Liveness signal — disk-slot presence (NOT store-tier label, NOT peft_config):
-            #   _promote_mature_keys_inline store.move()s keys to "semantic" WITHOUT training
-            #   the semantic adapter.  After promotion, store.tier_for_active_key(key) ==
-            #   "semantic" even though the WEIGHTS are still in episodic.  Using the store
-            #   tier for liveness would wrongly exclude semantic from fast-start (the
-            #   weights-vs-store-tier conflation bug).  The correct signal is whether the
-            #   tier's output_dir has any saved adapter slot written by a prior
-            #   _save_adapters call.  A tier with NO disk slot was NEVER trained →
-            #   first-cross graduation applies.  A tier WITH any disk slot was trained
-            #   before → steady-state train normally.
-            #
-            # Episodic is the parking lot and is exempt from parking-into-episodic.
-            # Episodic's own floor (whole-fold accumulate) is handled by the
-            # accumulating early-return below.
-            _floor = self.config.min_tier_key_floor
-            # _fast_start_graduating: tiers graduating via copy-from-episodic this fold.
-            # The per-tier loop skips train_adapter for these and copies instead.
-            _fast_start_graduating: set[str] = set()
-
-            # Helper: True when tier has at least one saved adapter slot on disk.
-            # A slot name is a YYYYMMDD-HHMMSS timestamp (is_slot_name).  Using
-            # disk-slot presence (not store-tier, not peft_config) avoids the
-            # store-tier-vs-weights conflation for promotion-moved semantic keys.
-            def _tier_has_disk_slot(tier_name: str) -> bool:
-                from paramem.adapters.manifest import is_slot_name as _isn
-
-                tier_dir = self.output_dir / tier_name
-                if not tier_dir.is_dir():
-                    return False
-                return any(entry.is_dir() and _isn(entry.name) for entry in tier_dir.iterdir())
-
-            # serve_assignment: repurpose tier_keyed as the served layout after Pass-2.
-            # The variable is renamed at the end of the pass; upstream keyed-edge-walk code keeps
-            # tier_keyed as its local name until this rename point so no callers change.
-            for _pt in ("semantic", "procedural"):
-                _pt_entries = tier_keyed[_pt]
-                if not _pt_entries:
-                    continue
-                if len(_pt_entries) < _floor:
-                    # --- PARK: under floor — move to episodic ---
-                    logger.info(
-                        "consolidate_interim_adapters: tier %s has %d key(s) < floor %d"
-                        " — parking in episodic until floor reached",
-                        _pt,
-                        len(_pt_entries),
-                        _floor,
-                    )
-                    for _pe in _pt_entries:
-                        tier_keyed["episodic"].append(_pe)
-                        # If the key is currently in a non-episodic store tier, move it back.
-                        _current_store_tier = self.store.tier_for_active_key(_pe["key"])
-                        if _current_store_tier is not None and _current_store_tier != "episodic":
-                            self.store.move(_pe["key"], "episodic")
-                        # Discard from promoted_keys so the key can be re-promoted on a
-                        # future fold once the tier's population crosses the floor.
-                        self.promoted_keys.discard(_pe["key"])
-                    tier_keyed[_pt] = []
-                else:
-                    # At or above floor.  Check whether this tier is graduating for the
-                    # FIRST TIME — i.e. it has NO saved adapter slot on disk.  Liveness
-                    # uses disk-slot presence to avoid the store-tier-vs-weights conflation:
-                    # a promoted semantic key has store-tier "semantic" but its WEIGHTS are
-                    # still in episodic (promotion does NOT train the semantic adapter).
-                    _tier_is_live = _tier_has_disk_slot(_pt)
-                    if not _tier_is_live:
-                        # First-time graduation: tier crossed floor and has no trained
-                        # adapter on disk — episodic's weights are the valid donor.
-                        if self.config.tier_fast_start:
-                            # Strategy (b): copy episodic weights + rebook.  The actual
-                            # copy runs in the per-tier loop; mark for fast-start here.
-                            # Keys STAY in tier_keyed[_pt] (serve_assignment[_pt]) so the
-                            # registry serves them from _pt.  NO store.move needed here —
-                            # semantic keys are already store-tier semantic (promotion);
-                            # procedural keys' deferred store.move runs at accept (:4563).
-                            logger.info(
-                                "consolidate_interim_adapters: tier %s graduating (fast-start)"
-                                " — %d key(s) >= floor %d; will copy episodic weights",
-                                _pt,
-                                len(_pt_entries),
-                                _floor,
-                            )
-                            _fast_start_graduating.add(_pt)
-                        else:
-                            # Strategy (a): move keys to their own store tier so they
-                            # train from scratch under the tier's own adapter config.
-                            # For semantic keys that are already store-tier "semantic" via
-                            # promotion, store.move is a no-op (move to same tier).
-                            logger.info(
-                                "consolidate_interim_adapters: tier %s graduating"
-                                " (train-from-scratch) — %d key(s) >= floor %d",
-                                _pt,
-                                len(_pt_entries),
-                                _floor,
-                            )
-                            for _pe in _pt_entries:
-                                self.store.move(_pe["key"], _pt)
-                    # (No action needed for already-live tiers: they are >= floor
-                    # and already have a disk slot — flow through normally.)
-
-            # Rename tier_keyed to serve_assignment at the end of Pass-2 so all
-            # downstream consumers read the served layout (not the training layout).
-            # The local name tier_keyed is reused in the keyed-edge walk above to avoid
-            # upstream churn; from this point on only serve_assignment is read by registry,
-            # drift, and finalize consumers.
-            serve_assignment = tier_keyed
-
-            # Build train_assignment from serve_assignment: identical for all tiers
-            # except fast-start graduating ones.  Episodic is the UNIVERSAL DONOR:
-            # it trains on its own served keys PLUS every graduating tier's served keys,
-            # so the copy that follows reads an episodic adapter that already encodes
-            # all graduating keys.  A fast-start graduating tier trains on NOTHING (the
-            # copy replaces training); the dedup is a construction property of the union
-            # (graduating keys are in serve_assignment[T], NOT in serve_assignment["episodic"],
-            # so the two sets are disjoint — no per-key guard required).
-            train_assignment: dict[str, list[dict]] = {
-                t: list(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
-            }
-            for _fst in _fast_start_graduating:
-                # Build episodic's augmented training set as a dict keyed on entry["key"]
-                # to guarantee dedup (in case an upstream double-insert ever occurs).
-                _ep_union: dict[str, dict] = {e["key"]: e for e in train_assignment["episodic"]}
-                for _fse in serve_assignment[_fst]:
-                    _ep_union.setdefault(_fse["key"], _fse)
-                train_assignment["episodic"] = list(_ep_union.values())
-                train_assignment[_fst] = []
-
-            # Debug: persist serve/train tier assignment maps.  Self-gated.
-            self._debug_writer.on_fold_assignments(serve_assignment, train_assignment)
-
-            # --- Capture per-tier active_before for the tier_delta record ---
-            # Must run BEFORE the whole-fold accumulate guard (which may early-return
-            # without building tier_delta) and BEFORE training mutates the store so
-            # the "before" snapshot is accurate.  The matching "active_after" snapshot
-            # runs after _save_adapters in the finalize section.
-            _train_active_before: dict[str, int] = {
-                t: len(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
-            }
-
-            # --- Whole-fold accumulate guard ---
-            # After Pass-2, any under-floor non-episodic tier is empty (parked into
-            # episodic).  If episodic itself is also below the floor, the total
-            # served set is too small — return accumulating without training.
-            # Read serve_assignment, NOT train_assignment: graduating keys inflate the
-            # episodic training set but the floor is about the SERVED key population.
-            _total_trainable = sum(len(v) for v in serve_assignment.values())
-            if not housekeeping and _total_trainable < _floor:
-                logger.info(
-                    "consolidate_interim_adapters: total trainable keys %d < floor %d"
-                    " — returning accumulating (sessions stay pending)",
-                    _total_trainable,
-                    _floor,
-                )
-                _acc_parked = {
-                    t: len(serve_assignment[t])
-                    for t in ("semantic", "procedural")
-                    if len(serve_assignment[t]) > 0
-                }
-                # Defensive cleanup: remove any backup adapter left by a prior aborted
-                # fold.  The accumulating early-return fires BEFORE this fold's per-tier
-                # backup-creation loop, so there are no new backups to clean up here —
-                # only pre-existing leftovers from an earlier run that crashed between
-                # backup-creation and the success-commit cleanup.
-                for _bname in ("episodic_backup", "semantic_backup", "procedural_backup"):
-                    if _bname in self.model.peft_config:
-                        self.model.delete_adapter(_bname)
-                        logger.debug(
-                            "consolidate_interim_adapters: cleaned up stale backup %s"
-                            " (left by prior aborted fold) on accumulating return",
-                            _bname,
-                        )
-                # Reset housekeeping stamp (not cleared on success path at this point).
-                self._current_interim_stamp = None  # type: ignore[assignment]
-                return {
-                    "status": "accumulating",
-                    "accumulating_reason": {
-                        "floor": _floor,
-                        "parked": _acc_parked,
-                        "episodic": len(serve_assignment["episodic"]),
-                    },
-                    "tiers_rebuilt": [],
-                    "graph_drift_count": 0,
-                    "drift_deduplicated": 0,
-                    "drift_orphan": 0,
-                    "drift_genuine_loss": 0,
-                    "drift_intended_removal": 0,
-                    "drift_intended_removal_by_reason": {},
-                    "recall_miss_keys": [],
-                    "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
-                    "tier_keyed": serve_assignment,
-                    "recall_per_tier": {},
-                    "rolled_back": False,
-                    "rollback_tier": None,
-                }
-
-            # Compute drift: active keys with no surviving merged edge after the fold.
-            # With resolve_contradictions=False at fold, a key drifts iff its recon
-            # edge was absent (recon failure) — REPLACE cardinality is skipped at fold
-            # time so it can never remove a registered edge.  No triple-identity
-            # matching — provenance from
-            # the merged edge is the sole authority.
-            # serve_assignment is the authoritative served layout; train_assignment may
-            # contain additional graduating keys in episodic's training set but those
-            # must NOT influence drift/stale accounting (they are served from tier T).
-            _all_keyed = {e["key"] for tier_list in serve_assignment.values() for e in tier_list}
-
-            # Refresh last_seen_cycle for every key that survived into tier_keyed.
-            # A key whose adapter successfully recalled its fact this fold was
-            # "seen" this cycle — refresh so decay never fires for stable keys.
-            # This is separate from the recurrence bump (which only fires on
-            # duplicate-SPO collapses); every surviving key gets a last_seen refresh.
-            for _surviving_key in _all_keyed:
-                _sbk = self.store.bookkeeping_for_key(_surviving_key)
-                if _sbk is not None:
-                    _sbk["last_seen_cycle"] = self.cycle_count
-
-            # --- Shared soft-stale stage (M5 / M6) ---
-            # Consume removal_ledger entries for predicate_synonym_collapse (and at
-            # interim also contradiction_same_pred) and soft-stale their keys BEFORE
-            # the drift partition reads active_keys.  Keys staled here are removed
-            # from _active_keys, so they do NOT appear in _drift_keys and are NOT
-            # bucketed into drift_intended_removal — that is the M6 reclassification.
-            # The returned soft_stale_by_tier feeds the registry rebuild below.
-            _subtractive_stale_by_tier = self._apply_subtractive_removals_to_store(scope="fold")
-
-            active_keys = self.store.all_active_keys()
-            _drift_keys = [k for k in active_keys if k not in _all_keyed]
-
-            # --- 3-way drift partition + soft-stale write-back ---
-            # merger.collapsed records INCOMING keys that were deduplicated away in a
-            # Case-1 duplicate-SPO collapse.  Because the merge input is registry-true,
-            # a Case-1 collapse means TWO registry keys genuinely share the same (s,p,o).
-            # The discarded key is SOFT-STALED: registry entry retained, simhash
-            # retained, excluded from training.
-            #
-            # LOAD-BEARING ORDERING: resolve tier BEFORE flipping the key stale.
-            # KeyRegistry.stale() removes the key from _active_keys, so
-            # tier_for_active_key() called AFTER the flip returns None.
-            _collapsed_set: set[str] = set(getattr(self.merger, "collapsed", []))
-            # Removal ledger: records every edge removed by the merger (dedup,
-            # contradiction, enrichment same_as) with a stable reason code.
-            # Keyed by the removed edge's ik_key; values carry "reason" + per-reason detail.
-            _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
-
-            drift_deduplicated: list[str] = []
-            drift_orphan: list[str] = []
-            # drift_genuine_loss: reconstruction-failed non-duplicate keys now in the
-            # recall-miss/retry set.  Because the merge input is registry-true, these
-            # keys stay in the training set so they are retrained; they should trend to
-            # ~0.  Kept as a counter for monitoring but they are NOT dropped.
-            drift_genuine_loss: list[str] = []
-            # drift_intended_removal: keys removed by the merger for a known, intentional
-            # reason (enrichment same_as contraction, contradiction resolution).  These
-            # are RETAIN-ONLY — no staling, no tier-resolution.  Separate from dedup
-            # which has its own soft-stale semantics.
-            drift_intended_removal: list[str] = []
-            drift_intended_removal_by_reason: dict[str, int] = {}
-
-            # Per-tier dict capturing soft-staled keys for
-            # _reset_main_tier_registries_and_simhashes.
-            # Maps tier -> {key: {"stale_since": ISO, "stale_cycles": int, "simhash": int|None}}.
-            # Seeded from _subtractive_stale_by_tier (M6-reclassified keys from the
-            # shared helper above); the drift loop below adds the dedup-collapsed keys.
-            soft_stale_by_tier: dict[str, dict[str, dict]] = {
-                tier: dict(entries) for tier, entries in _subtractive_stale_by_tier.items()
-            }
-
-            for _dk in _drift_keys:
-                if _dk in _collapsed_set:
-                    drift_deduplicated.append(_dk)
-                    # LOAD-BEARING: resolve tier BEFORE staling (staling removes from _active_keys).
-                    _dk_tier = self.store.tier_for_active_key(_dk)
-                    # Capture current simhash BEFORE any registry mutation so the finalize
-                    # step can re-insert it into the rebuilt simhash dict.
-                    _dk_simhash: int | None = None
-                    if _dk_tier is not None:
-                        _dk_simhash = self.store.simhash(_dk_tier, _dk)
-                    # Flip to stale in the live in-memory registry.
-                    self.store.discard_keys([_dk], mode="stale")
-                    # Record for the finalize step that rebuilds registries with stale-seeding.
-                    if _dk_tier is not None:
-                        _stale_rec = {"stale_cycles": 0}
-                        if _dk_simhash is not None:
-                            _stale_rec["simhash"] = _dk_simhash
-                        soft_stale_by_tier.setdefault(_dk_tier, {})[_dk] = _stale_rec
-                elif _dk in _ledger:
-                    # Intended removal: the merger recorded a known-reason removal for
-                    # this key (enrichment same_as contraction or contradiction
-                    # resolution).  RETAIN-ONLY — no staling, no tier-resolution.
-                    # Note: dedup keys are ALSO in _ledger, but the _collapsed_set
-                    # branch above fires first for them (preserving soft-stale + R4
-                    # semantics).  Only non-collapsed ledger entries reach here.
-                    drift_intended_removal.append(_dk)
-                    _r = _ledger[_dk]["reason"]
-                    drift_intended_removal_by_reason[_r] = (
-                        drift_intended_removal_by_reason.get(_r, 0) + 1
-                    )
-                else:
-                    _dk_bk = self.store.bookkeeping_for_key(_dk)
-                    _dk_entry = self.store.get(_dk)
-                    # Distinguish hydration-miss from true orphan.
-                    # Orphan: entry is present but carries empty SPO (all-empty test).
-                    # Hydration-miss: entry is None but bookkeeping carries SPO — the
-                    # key is live; the cache merely failed to hydrate (boot_degraded).
-                    # In both cases we do NOT drop the key from training (it is already
-                    # in recon_relations via _build_registry_true_relations).
-                    _entry_subj = (_dk_entry or {}).get("subject", "")
-                    _entry_pred = (_dk_entry or {}).get("predicate", "")
-                    _entry_obj = (_dk_entry or {}).get("object", "")
-                    _bk_subj = (_dk_bk or {}).get("subject", "")
-                    _bk_pred = (_dk_bk or {}).get("predicate", "")
-                    _bk_obj = (_dk_bk or {}).get("object", "")
-                    if not _entry_subj and not _entry_pred and not _entry_obj:
-                        if _bk_subj or _bk_pred or _bk_obj:
-                            # Hydration-miss: no content entry but bookkeeping has SPO.
-                            # Bucket as genuine_loss (recall miss, retry), not orphan.
-                            drift_genuine_loss.append(_dk)
-                        else:
-                            drift_orphan.append(_dk)
-                    else:
-                        # Registry-true content present but no merged edge: recall miss / retry.
-                        drift_genuine_loss.append(_dk)
-
-            graph_drift_count = len(_drift_keys)
-            drift_deduplicated_count = len(drift_deduplicated)
-            drift_orphan_count = len(drift_orphan)
-            drift_genuine_loss_count = len(drift_genuine_loss)
-            drift_intended_removal_count = len(drift_intended_removal)
-
-            # R4 invariant: soft-stale keys must be disjoint from _all_keyed.
-            # A key in both sets would be trained as active this fold AND written to
-            # the stale partition — contradictory states that indicate tier_keyed[T]
-            # was cleared after _all_keyed was computed, which would be a regression.
-            _soft_stale_keys: set[str] = {
-                k for tier_stale in soft_stale_by_tier.values() for k in tier_stale
-            }
-            _stale_in_active = _soft_stale_keys & _all_keyed
-            if _stale_in_active:
-                logger.warning(
-                    "consolidate_interim_adapters: R4 invariant violation — %d key(s) appear"
-                    " in both soft_stale_by_tier and _all_keyed (trained as active AND stale);"
-                    " this indicates tier_keyed was mutated after _all_keyed was built: %s",
-                    len(_stale_in_active),
-                    sorted(_stale_in_active),
-                )
-
-            # Per-key log lines name the bucket so the journal is self-explanatory.
-            for _dk in drift_deduplicated:
-                _dk_entry = self.store.get(_dk)
-                logger.info(
-                    "graph_drift_key key=%s bucket=deduplicated subject=%r predicate=%r object=%r"
-                    " (registry-true duplicate — soft-staled; record retained for stale-echo seam)",
-                    _dk,
-                    (_dk_entry or {}).get("subject", ""),
-                    (_dk_entry or {}).get("predicate", ""),
-                    (_dk_entry or {}).get("object", ""),
-                )
-            for _dk in drift_orphan:
-                logger.info(
-                    "graph_drift_key key=%s bucket=orphan (no subject/predicate/object content;"
-                    " correctly dropped)",
-                    _dk,
-                )
-            for _dk in drift_genuine_loss:
-                _dk_entry = self.store.get(_dk)
-                logger.info(
-                    "graph_drift_key key=%s bucket=genuine_loss subject=%r predicate=%r object=%r"
-                    " (reconstruction failure or hydration-miss — retrained with registry-true"
-                    " content; not a data loss)",
-                    _dk,
-                    (_dk_entry or {}).get("subject", ""),
-                    (_dk_entry or {}).get("predicate", ""),
-                    (_dk_entry or {}).get("object", ""),
-                )
-            for _dk in drift_intended_removal:
-                logger.info(
-                    "graph_drift_key key=%s bucket=intended_removal reason=%s"
-                    " (merger-recorded intentional removal — key retained, not staled)",
-                    _dk,
-                    (_ledger.get(_dk) or {}).get("reason", ""),
-                )
-
-            if drift_deduplicated_count:
-                logger.info(
-                    "consolidate_interim_adapters: %d key(s) deduplicated (registry-true"
-                    " duplicate; soft-staled — record retained, excluded from training)",
-                    drift_deduplicated_count,
-                )
-            if drift_orphan_count:
-                logger.info(
-                    "consolidate_interim_adapters: %d orphan key(s) dropped (no SPO content)",
-                    drift_orphan_count,
-                )
-            if drift_intended_removal_count:
-                logger.info(
-                    "consolidate_interim_adapters: %d key(s) in intended_removal"
-                    " (merger-recorded removal: by_reason=%s)",
-                    drift_intended_removal_count,
-                    drift_intended_removal_by_reason,
-                )
-
-            # Gate the WARNING on genuine_loss only — dedup, orphan, and intended_removal
-            # are expected/normal.  genuine_loss should trend to ~0 because the registry-
-            # true merge input means a recall miss keeps the key in training rather than
-            # dropping it.  genuine_loss strictly covers reconstruction failure or
-            # hydration-miss — enrichment/contradiction removals are captured in
-            # drift_intended_removal.
-            if drift_genuine_loss_count > 0:
-                logger.warning(
-                    "consolidate_interim_adapters: %d genuine reconstruction loss(es) — "
-                    "these keys had content but produced no merged edge (reconstruction"
-                    " failure or hydration-miss); they were retrained with registry-true"
-                    " content (should trend to ~0): %s",
-                    drift_genuine_loss_count,
-                    drift_genuine_loss,
-                )
-
-            logger.info(
-                "consolidate_interim_adapters: key distribution — episodic=%d semantic=%d "
-                "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d"
-                " intended_removal=%d)",
-                len(serve_assignment["episodic"]),
-                len(serve_assignment["semantic"]),
-                len(serve_assignment["procedural"]),
-                graph_drift_count,
-                drift_deduplicated_count,
-                drift_orphan_count,
-                drift_genuine_loss_count,
-                drift_intended_removal_count,
-            )
-
-            # Debug: persist the merger removal ledger — reset_graph cleared it before
-            # the fold; re-merge + enrichment populated it.  Emitted here (always
-            # reached) so the artifact exists even on a rolled-back or aborted fold.
-            # Self-gated.
-            self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
-
-            # --- Build per-tier TrainingJob objects ---
-            # Must be constructed before any tier rebuild begins so that
-            # inference_fallback_adapter is set to the backup adapter name.
-            # Because the public train_adapter (not BackgroundTrainer._train_adapter)
-            # is called here, _current_job is NOT updated automatically.  The
-            # per-tier loop manually swaps trainer._current_job to the tier-specific
-            # job before calling train_adapter so that pause() reads the correct
-            # inference_fallback_adapter for each tier rebuild.
-            from paramem.server.background_trainer import TrainingJob
-
-            refresh_training_config = self._make_training_config(num_epochs=refresh_epochs)
-
-            # train_assignment drives each adapter's training set.  For fast-start
-            # graduating tiers, train_assignment[T] == [] (the tier is copied from the
-            # informed episodic, not trained); episodic's set is augmented with all
-            # graduating keys so the copy donor is informed before the copy reads it.
-            # All other tiers: train_assignment[T] == serve_assignment[T].
-            jobs_by_tier = {
-                "episodic": TrainingJob(
-                    entries=train_assignment["episodic"],
-                    adapter_name="episodic",
-                    adapter_config=self.episodic_config,
-                    inference_fallback_adapter="episodic_backup",
-                ),
-                "semantic": TrainingJob(
-                    entries=train_assignment["semantic"],
-                    adapter_name="semantic",
-                    adapter_config=self.semantic_config,
-                    inference_fallback_adapter="semantic_backup",
-                ),
-                "procedural": TrainingJob(
-                    entries=train_assignment["procedural"],
-                    adapter_name="procedural",
-                    adapter_config=self.procedural_config or self.episodic_config,
-                    inference_fallback_adapter="procedural_backup",
-                ),
-            }
-
-            # --- Per-tier fresh-adapter rebuild ---
-            # Load backup adapters (PEFT load-or-skip idempotency).
-            # In the absence of a real encrypted backup dir we skip the load
-            # and fall back to the live main adapters as the de-facto backup.
-            # Production systems should implement an encrypted backup path for
-            # durable out-of-process backup.
-            #
-            # Each backup MUST be created from its source tier's config — the tiers
-            # have heterogeneous LoRA shapes (procedural targets attn+mlp,
-            # episodic/semantic target attn-only) so a single template can't serve
-            # all three. ``copy_adapter_weights`` checks parameter-set equality and
-            # would otherwise raise on procedural → procedural_backup.
-            tier_config_for_backup = {
-                "episodic": self.episodic_config,
-                "semantic": self.semantic_config,
-                "procedural": self.procedural_config or self.episodic_config,
-            }
-            for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
-                if backup_name not in self.model.peft_config:
-                    # No backup available — copy main weights into backup slot.
-                    # This keeps PEFT adapter count ≥ 5 throughout the rebuild.
-                    base_tier = backup_name.replace("_backup", "")
-                    if base_tier in self.model.peft_config:
-                        from paramem.models.loader import copy_adapter_weights
-
-                        backup_config = tier_config_for_backup[base_tier]
-                        self.model = create_adapter(self.model, backup_config, backup_name)
-                        copy_adapter_weights(self.model, src=base_tier, dst=backup_name)
-                        logger.info(
-                            "consolidate_interim_adapters: created in-memory backup %s from %s",
-                            backup_name,
-                            base_tier,
-                        )
-
-            tiers_rebuilt: list[str] = []
-            recall_per_tier: dict[str, float] = {}
-            # Per-tier per-key verdict from the forced final-epoch fill probe.
-            # None for a tier that was skipped (no entries) or trained without
-            # a recall callback (early-stop disabled).  Passed into
-            # _reset_main_tier_registries_and_simhashes to filter registration.
-            last_per_key_by_tier: dict[str, list | None] = {}
-
-            for tier in ("episodic", "semantic", "procedural"):
-                backup_name = f"{tier}_backup"
-                job = jobs_by_tier[tier]
-
-                # A fast-start graduating tier has train_assignment[T] == [] (it is
-                # copied from the informed episodic, not trained) but MUST reach the
-                # copy block below; skip only non-graduating empty-train tiers.
-                # Invariant: a fast-start graduating tier always has
-                # serve_assignment[T] >= floor, so the probe denominator is never 0.
-                if not job.entries and tier not in _fast_start_graduating:
-                    logger.info(
-                        "consolidate_interim_adapters: no keys for tier %s — skipping rebuild", tier
-                    )
-                    continue
-
-                # a. Switch active adapter away from the tier being rebuilt so
-                #    delete_adapter does not fire a PEFT UserWarning and auto-pick.
-                if backup_name in self.model.peft_config:
-                    from paramem.models.loader import switch_adapter
-
-                    switch_adapter(self.model, backup_name)
-
-                # b. delete_adapter(<tier>) + create_adapter(<tier>) — safe because
-                #    ≥5 adapters remain at this point ({2 other mains + 3 backups +
-                #    N interims}).
-                if tier in self.model.peft_config:
-                    self.model.delete_adapter(tier)
-                    logger.debug("consolidate_interim_adapters: deleted adapter %s", tier)
-
-                tier_cfg = (
-                    self.episodic_config
-                    if tier == "episodic"
-                    else (
-                        self.semantic_config
-                        if tier == "semantic"
-                        else (self.procedural_config or self.episodic_config)
-                    )
-                )
-                self.model = create_adapter(self.model, tier_cfg, tier)
-                logger.debug("consolidate_interim_adapters: created fresh adapter %s", tier)
-
-                # c. Set <tier> active for training.
-                from paramem.models.loader import switch_adapter as _sw
-
-                _sw(self.model, tier)
-
-                # --- Fast-start graduation branch (strategy (b), R2 pre-save probe) ---
-                # When this tier graduated for the first time this fold via copy-from-
-                # episodic, copy the episodic adapter's LoRA weights into the fresh tier
-                # adapter, run a pre-save recall probe (R2), and — if the probe passes —
-                # rebook the keys into the tier's registry and add to tiers_rebuilt
-                # WITHOUT calling train_adapter.  If the probe fails, fall through to
-                # the normal train-from-scratch path (strategy (a) fall-back).
-                if tier in _fast_start_graduating:
-                    from paramem.models.loader import copy_adapter_weights as _copy_aw
-                    from paramem.models.loader import (
-                        copy_adapter_weights_subset as _copy_aw_subset,
-                    )
-
-                    # Semantic and episodic share the same 4 attn modules (equal param
-                    # sets); procedural has 7 modules (attn+mlp) — use subset copy.
-                    if tier == "procedural":
-                        _copy_aw_subset(self.model, src="episodic", dst=tier)
-                        logger.info(
-                            "consolidate_interim_adapters: fast-start graduation — "
-                            "copied episodic attn weights into procedural (mlp stays zero-init)"
-                        )
-                    else:
-                        _copy_aw(self.model, src="episodic", dst=tier)
-                        logger.info(
-                            "consolidate_interim_adapters: fast-start graduation — "
-                            "copied episodic weights into %s (full param set)",
-                            tier,
-                        )
-
-                    # R2: pre-save recall probe on the copied adapter (tier is now active).
-                    # Use serve_assignment[tier] as the probe target — NOT job.entries, which
-                    # is train_assignment[tier] == [] for a fast-start graduating tier.
-                    # serve_assignment[tier] holds the keys T must recall after the copy.
-                    _serve_entries = serve_assignment[tier]
-                    _probe_passing = self._probe_passing_keys(tier, _serve_entries)
-                    _probe_rate = (
-                        len(_probe_passing) / len(_serve_entries) if _serve_entries else 1.0
-                    )
-                    logger.info(
-                        "consolidate_interim_adapters: fast-start graduation probe %s"
-                        " — %d/%d passed (%.3f), threshold %.3f",
-                        tier,
-                        len(_probe_passing),
-                        len(_serve_entries),
-                        _probe_rate,
-                        recall_sanity_threshold,
-                    )
-
-                    if _probe_rate >= recall_sanity_threshold:
-                        # Copy recalled at or above threshold: rebook keys and accept.
-                        # Iterate serve_assignment[tier], NOT job.entries (empty for fast-start).
-                        # For procedural: keys are still store-tier "episodic" (parked) →
-                        #   store.move genuinely rebooks them to "procedural".
-                        # For semantic: keys are already store-tier "semantic" (promotion) →
-                        #   store.move is a no-op (store.py:372-376), harmlessly elided.
-                        for _fse in _serve_entries:
-                            self.store.move(_fse["key"], tier)
-                        # Record None verdict so _reset_main_tier_registries_and_simhashes
-                        # falls into its _probe_passing_keys fail-safe, which will re-probe
-                        # the copied weights and admit only the passing keys.
-                        last_per_key_by_tier[tier] = None
-                        tiers_rebuilt.append(tier)
-                        logger.info(
-                            "consolidate_interim_adapters: fast-start graduation accepted"
-                            " for %s (%d keys rebooked)",
-                            tier,
-                            len(_serve_entries),
-                        )
-                        continue  # skip train_adapter for this tier
-
-                    # Probe failed: fall back to strategy (a) — delete the copied adapter,
-                    # recreate it fresh, and let the normal train path below handle it.
-                    logger.warning(
-                        "consolidate_interim_adapters: fast-start probe FAILED for %s"
-                        " (%.3f < %.3f) — falling back to train-from-scratch",
-                        tier,
-                        _probe_rate,
-                        recall_sanity_threshold,
-                    )
-                    _fast_start_graduating.discard(tier)
-                    # Restore train entries from serve set so the fallback train path
-                    # trains T on its full ≥N serve set (train_assignment[T] was [] for
-                    # fast-start; job.entries must be updated before format_entry_training).
-                    job.entries = list(_serve_entries)
-                    # Move keys to their own store tier so train-from-scratch uses the
-                    # correct config and the registry reflects the new tier owner.
-                    # For semantic keys already store-tier "semantic", store.move is no-op.
-                    for _fse in _serve_entries:
-                        self.store.move(_fse["key"], tier)
-                    # Recreate the adapter fresh (the copy corrupted its init).
-                    if tier in self.model.peft_config:
-                        if backup_name in self.model.peft_config:
-                            _sw(self.model, backup_name)
-                        self.model.delete_adapter(tier)
-                    self.model = create_adapter(self.model, tier_cfg, tier)
-                    _sw(self.model, tier)
-                    logger.debug(
-                        "consolidate_interim_adapters: recreated fresh adapter %s"
-                        " for fallback training",
-                        tier,
-                    )
-
-                # d. Re-arm: flip _is_training True BEFORE _train_adapter,
-                #    False in finally so it fires on success AND failure.
-                #    Also swap _current_job to the per-tier job so that pause()
-                #    reads the correct inference_fallback_adapter (e.g.
-                #    "episodic_backup") during this tier's rebuild.  The prior
-                #    sentinel (installed by _run_callable_queue) is restored in
-                #    the finally block to preserve the outer invariant.
-                prior_job = None
-                recall_state = None  # initialise so the capture below is always defined
-                if trainer is not None:
-                    prior_job = trainer._current_job
-                    trainer._current_job = job
-                    trainer._set_is_training(True)
-                try:
-                    # Format, build recall callback, and train — shared seam.
-                    # Fresh recall callback per tier — _signaled_stop and
-                    # epoch_log do not leak across tiers.
-                    _tier_metrics, recall_state = self._train_tier_adapter(
-                        job.entries,
-                        adapter_name=tier,
-                        adapter_config=tier_cfg,
-                        training_config=refresh_training_config,
-                        output_dir=self.output_dir / "consolidation_refresh" / tier,
-                        run_name=f"consolidate-{tier}",
-                        phase_name=f"consolidate-{tier}",
-                        num_epochs=refresh_epochs,
-                    )
-                    if _tier_metrics is not None:
-                        if _tier_metrics.get("aborted"):
-                            # Training was aborted for inference mid-tier.  Restore
-                            # all three production tiers from their backup slots so
-                            # VRAM and weights are consistent with the pre-cycle
-                            # baseline, then raise AbortedDuringConsolidation so the
-                            # outer caller (app.py _run_full_cycle) can log and skip
-                            # the atomic finalize step.
-                            logger.info(
-                                "consolidate_interim_adapters: training aborted on tier %s "
-                                "— restoring all tiers from backups",
-                                tier,
-                            )
-                            from paramem.models.loader import copy_adapter_weights as _copy_w
-
-                            for _t in ("episodic", "semantic", "procedural"):
-                                _backup = f"{_t}_backup"
-                                if (
-                                    _backup in self.model.peft_config
-                                    and _t in self.model.peft_config
-                                ):
-                                    _copy_w(self.model, src=_backup, dst=_t)
-                            # Clear the housekeeping stamp before propagating so the next
-                            # call does not inherit a stale label (self-heals on re-entry
-                            # anyway, but explicit clear is more robust).
-                            self._current_interim_stamp = None  # type: ignore[assignment]
-                            raise AbortedDuringConsolidation(f"training aborted on tier {tier!r}")
-                        else:
-                            logger.info(
-                                "consolidate_interim_adapters: trained %s on %d keys",
-                                tier,
-                                len(job.entries),
-                            )
-                finally:
-                    if trainer is not None:
-                        trainer._set_is_training(False)
-                        trainer._current_job = prior_job
-
-                # Disk-integrity for this tier is gated post-save by _save_adapters
-                # (via _verify_saved_adapter_from_disk on each saved slot).  The
-                # pre-save in-RAM recall probe has been removed; a post-save failure
-                # propagates as RuntimeError from _save_adapters so the caller
-                # (app.py _run_full_cycle) skips mark_consolidated and sessions stay
-                # pending for the next cycle.
-                # Capture the per-key verdict from the forced final-epoch fill probe
-                # so _reset_main_tier_registries_and_simhashes can filter by recall.
-                last_per_key_by_tier[tier] = (
-                    recall_state.last_per_key if recall_state is not None else None
-                )
-                if recall_state is not None and recall_state.last_per_key is not None:
-                    self._debug_writer.on_recall_probe(
-                        recall_state.last_per_key,
-                        phase="train_fill",
-                        adapter_name=tier,
-                    )
-                tiers_rebuilt.append(tier)
-
-            # flip off _is_training at finalize entry (belt-and-braces).
-            if trainer is not None:
-                trainer._set_is_training(False)
-
-            # --- Atomic finalize ---
-            # Invariant: registry rewrite FIRST, Router.reload() LAST.
-            # The finalize block runs purely as registry / disk / PEFT / router ops.
-            # No _train_adapter() call, no HF Trainer-driven routine may appear here.
-
-            # Registry rewrite (MUST be first).
-            # Rebuild per-tier registries from the authoritative tier_keyed layout:
-            # each tier gets a fresh KeyRegistry containing only the keys that belong
-            # to it after re-derivation from the cumulative graph.  Interim-tier
-            # registries are then dropped (they are superseded by the main tiers).
-            if self.store.replay_enabled:
-                # Build per-tier passing-sets from the captured final-epoch verdict.
-                # _recall_passing_keys returns None when the verdict is absent (disabled
-                # early-stop or skipped tier); _reset_main_tier_registries_and_simhashes
-                # will call _probe_passing_keys for those tiers as the fail-safe.
-                passing_sets_by_tier: dict[str, set[str] | None] = {}
-                for _tier in ("episodic", "semantic", "procedural"):
-                    _lpk = last_per_key_by_tier.get(_tier)
-                    if _lpk is not None:
-                        # Intersect with serve_assignment[_tier] so graduating keys whose
-                        # verdicts appear in episodic's last_per_key (because episodic
-                        # trained on the augmented set) cannot enter episodic's registry
-                        # or inflate the recall-gate log.  For semantic/procedural the
-                        # intersection is a no-op (they trained on their own serve set);
-                        # applying it uniformly is the clean invariant.
-                        _serve_keys = {e["key"] for e in serve_assignment[_tier]}
-                        passing_sets_by_tier[_tier] = {
-                            r["key"] for r in _lpk if r["exact_match"]
-                        } & _serve_keys
-                    else:
-                        passing_sets_by_tier[_tier] = None
-
-                # Reset each main tier's registry AND simhash to the post-consolidation
-                # membership (the pairing is load-bearing — see the helper's docstring).
-                # Thread soft_stale_by_tier so the rebuilt registry seeds the stale
-                # partition — a bare new KeyRegistry() would wipe it.
-                self._reset_main_tier_registries_and_simhashes(
-                    serve_assignment,
-                    passing_sets_by_tier,
-                    soft_stale_by_tier=soft_stale_by_tier,
-                )
-                # Drop interim-tier registries — they are no longer valid.
-                self._drop_interim_tier_registries()
-                # Save each main tier's registry unconditionally (create dir if needed).
-                for _reg_tier in ("episodic", "semantic", "procedural"):
-                    _reg_tier_dir = self.output_dir / _reg_tier
-                    _reg_tier_dir.mkdir(parents=True, exist_ok=True)
-                    _reg_path = _reg_tier_dir / "indexed_key_registry.json"
-                    self.store.registry(_reg_tier).save(_reg_path)
-                    logger.info(
-                        "consolidate_interim_adapters: registry rewritten to %s",
-                        _reg_path,
-                    )
-
-            # Persist + verify the merged main-tier weights BEFORE purging the interim slots
-            # (crash-window guard — MUST precede the interim purge below).
-            # The interim slot dirs hold the ONLY durable copy of the folded
-            # knowledge until the rebuilt main weights are written+verified to disk.
-            # _save_adapters() writes the main adapter weights + manifest + registry
-            # and runs a post-save disk-integrity verify that RAISES on a corrupt /
-            # partial artifact.  Persisting here — BEFORE the interim purge below —
-            # closes the data-loss window: if the save (or its verify) fails, the
-            # exception propagates, the purge does NOT run, the interim slots
-            # survive, and the cycle stays retriable.  On-disk result of an
-            # interrupted fold is therefore always "interims present OR main fully
-            # persisted", never neither.  Mirrors the simulate-mode ordering in
-            # consolidate_interim_to_canonical_graph (merged graph written before interim rmtree).
-            #
-            # Gated on tiers_rebuilt: a no-op fold (nothing trained) has no fresh
-            # weights to stamp — re-saving zero-init slots would corrupt the live
-            # main manifests (the same precondition the caller honored at the
-            # orchestration layer).
-            if self.store.replay_enabled and tiers_rebuilt:
-                try:
-                    self._save_adapters(
-                        window_stamp_override=window_stamp_override,
-                    )
-                except Exception:
-                    # Clear the housekeeping stamp before propagating so the next call
-                    # does not inherit a stale label.  try/finally is not used here
-                    # because the success path does its own explicit clear below and
-                    # the exception must propagate unchanged (crash-window guard:
-                    # callers skip mark_consolidated so sessions stay pending).
-                    self._current_interim_stamp = None  # type: ignore[assignment]
-                    raise
-                logger.info("consolidate_interim_adapters: merged main weights persisted+verified")
-
-            # Increment stale_cycles AFTER the durable write.
-            # A fold that aborts before the durable write does NOT advance decay on
-            # un-persisted stale sets.  A key staled in this fold has stale_cycles=0
-            # at the durable write; stale_cycles=1 after this call (unobservable until
-            # the NEXT fold reads it from disk).
-            if self.store.replay_enabled and soft_stale_by_tier:
-                for _st_tier in ("episodic", "semantic", "procedural"):
-                    # registry() always returns a real KeyRegistry when replay is
-                    # enabled (registry-always-exists invariant; the None guard
-                    # was dead and is removed).
-                    self.store.registry(_st_tier).increment_stale_cycles()
-                logger.debug(
-                    "consolidate_interim_adapters: stale_cycles advanced for %d soft-staled key(s)",
-                    sum(len(v) for v in soft_stale_by_tier.values()),
-                )
-
-            # Interim purge — single call covers both PEFT delete AND on-disk rmtree.
-            unload_interim_adapters(self.model, self.output_dir)
-            logger.info("consolidate_interim_adapters: interim adapters unloaded")
-
-            # Router reload (MUST be last).
-            if router is not None:
-                try:
-                    router.reload()
-                    logger.info("consolidate_interim_adapters: router reloaded")
-                except Exception:
-                    logger.exception("consolidate_interim_adapters: router reload failed")
-
-            # --- Success commit: unload backup adapters ---
-            # The three main adapters remain loaded throughout; only the backups are cleaned up.
-            for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
-                if backup_name in self.model.peft_config:
-                    self.model.delete_adapter(backup_name)
-                    logger.debug(
-                        "consolidate_interim_adapters: unloaded backup adapter %s",
-                        backup_name,
-                    )
-
-            # Restore episodic as the active adapter for subsequent inference.
-            if "episodic" in self.model.peft_config:
-                from paramem.models.loader import switch_adapter as _sw2
-
-                _sw2(self.model, "episodic")
-
-            # --- Per-tier delta for train mode ---
-            # Build the tier_delta record from the before-snapshot + serve_assignment
-            # (active after) + minted_by_tier from _build_all_edge_entries_into.
-            # staled_by_reason is derived from merger.removal_ledger via _build_tier_delta
-            # (includes all removal reasons: dedup, enrichment_same_as, contradiction_*).
-            _train_tiers = ("episodic", "semantic", "procedural")
-            _train_tier_delta = self._build_tier_delta(
-                active_before=_train_active_before,
-                active_after={t: len(serve_assignment.get(t, [])) for t in _train_tiers},
-                minted_by_tier=minted_by_tier,
-            )
-            self._debug_writer.on_tier_delta(_train_tier_delta)
-
-            # Reset housekeeping interim stamp.
-            self._current_interim_stamp = None  # type: ignore[assignment]
-
-            logger.info(
-                "consolidate_interim_adapters: complete — rebuilt %s, drift=%d"
-                " (deduplicated=%d orphan=%d genuine_loss=%d intended_removal=%d)",
-                tiers_rebuilt,
-                graph_drift_count,
-                drift_deduplicated_count,
-                drift_orphan_count,
-                drift_genuine_loss_count,
-                drift_intended_removal_count,
-            )
-
-            return {
-                "tiers_rebuilt": tiers_rebuilt,
-                # graph_drift_count: total keys absent from tier_keyed (backward-compat).
-                "graph_drift_count": graph_drift_count,
-                # 4-way breakdown — callers that want accurate data-loss signal use these.
-                "drift_deduplicated": drift_deduplicated_count,
-                "drift_orphan": drift_orphan_count,
-                # genuine_loss = reconstruction-failure / hydration-miss keys (not dropped;
-                # retrained); should trend to ~0 as the store stabilises.
-                "drift_genuine_loss": drift_genuine_loss_count,
-                # Merger-recorded intentional removals (enrichment, contradiction).
-                # RETAIN-ONLY: keys are not staled, not dropped, not trained (absorbed).
-                "drift_intended_removal": drift_intended_removal_count,
-                "drift_intended_removal_by_reason": drift_intended_removal_by_reason,
-                # recall_miss_keys: keys whose reconstructed SPO disagreed with registry-true
-                # SPO, or whose reconstruction failed.  Retry signal; keys were retrained.
-                "recall_miss_keys": sorted(recall_miss_keys),
-                "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
-                "tier_keyed": serve_assignment,
-                "recall_per_tier": recall_per_tier,
-                "rolled_back": False,
-                "rollback_tier": None,
-                "tier_delta": _train_tier_delta,
-            }
-        finally:
-            # Clear the keying graph (removal_ledger, collapsed, reinforcements).
-            self.merger.reset_graph()
+                level=self.config.fold_refinement,
+                promote=True,
+                tier_floor=True,
+                subtractive_scope="fold",
+            ),
+            # Fold has no single-session speaker; per-key attribution is sourced
+            # from bookkeeping, so the fold-venue speaker_id is the empty string.
+            speaker_id="",
+            trainer=trainer,
+            router=router,
+            recall_sanity_threshold=recall_sanity_threshold,
+            refresh_epochs=refresh_epochs,
+            housekeeping=housekeeping,
+            window_stamp_override=window_stamp_override,
+        )
 
     def _run_recall_sanity_probe(
         self,
