@@ -266,7 +266,7 @@ class TestConsolidationIntegration:
     def _make_session_buffer(tmp_path, conv_id, speaker_id):
         from paramem.server.session_buffer import SessionBuffer
 
-        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
         buffer.set_speaker(conv_id, speaker_id, speaker_id)
         buffer.append(conv_id, "user", "Hello there")
         buffer.append(conv_id, "assistant", "Hi!")
@@ -592,7 +592,7 @@ class TestPerChunkOOMSkip:
 
         (ha / "adapters").mkdir(parents=True, exist_ok=True)
 
-        buffer = SessionBuffer(ha / "sessions", debug=False)
+        buffer = SessionBuffer(ha / "sessions", state_dir=ha / "state", debug=False)
         # Two pending document sessions, both with speaker_id set.
         for sid in ("doc-aaa", "doc-bbb"):
             buffer.set_speaker(sid, "Speaker1", "Speaker1")
@@ -739,7 +739,7 @@ class TestExtractionFailedAbortsCycle:
         config.consolidation.indexed_key_replay = False
         (ha / "adapters").mkdir(parents=True, exist_ok=True)
 
-        buffer = SessionBuffer(ha / "sessions", debug=False)
+        buffer = SessionBuffer(ha / "sessions", state_dir=ha / "state", debug=False)
         for sid in ("doc-aaa", "doc-bbb", "doc-ccc"):
             buffer.set_speaker(sid, "Speaker1", "Speaker1")
             buffer.append(

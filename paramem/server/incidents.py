@@ -83,7 +83,7 @@ class Incident:
         used by ``ack_incident``.
     type:
         Discriminator string (e.g. ``"vram_exhausted"``,
-        ``"consolidation_recall_failure"``).  Extensible: new failure types
+        ``"consolidation_retry_exhausted"``).  Extensible: new failure types
         add a ``type`` without a schema bump.
     severity:
         One of ``"info"``, ``"warning"``, ``"failed"``.  Maps 1:1 to

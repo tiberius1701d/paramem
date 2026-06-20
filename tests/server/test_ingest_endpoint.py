@@ -30,7 +30,9 @@ def _make_state(tmp_path: Path) -> dict:
     config.paths.sessions = sessions_dir
     config.debug = False
 
-    buffer = SessionBuffer(session_dir=sessions_dir, debug=False)
+    buffer = SessionBuffer(
+        session_dir=sessions_dir, state_dir=sessions_dir.parent / "state", debug=False
+    )
 
     # Build a real SpeakerStore with one known speaker.
     from paramem.server.speaker import SpeakerStore

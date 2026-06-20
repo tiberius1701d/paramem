@@ -2033,10 +2033,10 @@ class TestRecallFailedSessionStaysPending:
     # ------------------------------------------------------------------
 
     def test_bump_retry_and_release_increments_counter(self, tmp_path: Path) -> None:
-        """bump_retry_and_release increments recall_retry_count per session."""
+        """bump_retry_and_release increments recall_retry_count per session durably."""
         from paramem.server.session_buffer import SessionBuffer
 
-        buf = SessionBuffer(tmp_path, recall_retry_cap=3)
+        buf = SessionBuffer(tmp_path, state_dir=tmp_path / "state", consolidation_retry_cap=3)
         sid = "session-retry-001"
         buf._sessions[sid] = {"speaker": None, "state": "new"}
 
@@ -2049,9 +2049,15 @@ class TestRecallFailedSessionStaysPending:
         """When retry count reaches cap, session is returned in released list."""
         from paramem.server.session_buffer import SessionBuffer
 
-        buf = SessionBuffer(tmp_path, recall_retry_cap=3)
+        buf = SessionBuffer(tmp_path, state_dir=tmp_path / "state", consolidation_retry_cap=3)
         sid = "session-retry-cap"
+        # Seed in-memory count (matches durable — hydrate would do the same).
         buf._sessions[sid] = {"speaker": None, "state": "new", "recall_retry_count": 2}
+        # Pre-seed durable store so bump sees count=2 before increment.
+        from paramem.server.retry_state import bump_retry_count
+
+        bump_retry_count(tmp_path / "state", sid)
+        bump_retry_count(tmp_path / "state", sid)
 
         released = buf.bump_retry_and_release({sid})
 
@@ -2062,27 +2068,30 @@ class TestRecallFailedSessionStaysPending:
         """R3 guard: ids absent from _sessions are silently skipped."""
         from paramem.server.session_buffer import SessionBuffer
 
-        buf = SessionBuffer(tmp_path, recall_retry_cap=3)
+        buf = SessionBuffer(tmp_path, state_dir=tmp_path / "state", consolidation_retry_cap=3)
         # synthetic id that is not in _sessions
         released = buf.bump_retry_and_release({"__interim_pending_sessions__"})
         assert released == []
 
     def test_cap_release_records_incident_and_logs_warning(self, tmp_path: Path, caplog) -> None:
-        """Hitting the cap → consolidation_recall_failure incident recorded + WARNING logged.
+        """Hitting the cap → consolidation_retry_exhausted incident recorded + WARNING logged.
 
-        The test simulates the T10 wiring by running bump_retry_and_release
-        directly (the app.py closure is tested via integration; here we test
-        the incident-record contract independently of app.py).
+        The test simulates the _run_interim_training wiring by running
+        bump_retry_and_release directly (the app.py closure is tested via
+        integration; here we test the incident-record contract independently).
         """
         import logging
 
         from paramem.server.incidents import read_incidents, record_incident
+        from paramem.server.retry_state import bump_retry_count
         from paramem.server.session_buffer import SessionBuffer
 
-        buf = SessionBuffer(tmp_path, recall_retry_cap=2)
+        state_dir = tmp_path / "state"
+        buf = SessionBuffer(tmp_path, state_dir=state_dir, consolidation_retry_cap=2)
         sid = "session-cap-incident"
         buf._sessions[sid] = {"speaker": None, "state": "new", "recall_retry_count": 1}
-        state_dir = tmp_path / "state"
+        # Pre-seed durable store to count=1 so bump brings it to cap (2).
+        bump_retry_count(state_dir, sid)
 
         # Explicitly wire caplog handler into the session_buffer logger so the
         # WARNING emitted by bump_retry_and_release is captured by caplog.
@@ -2097,27 +2106,33 @@ class TestRecallFailedSessionStaysPending:
 
         assert sid in released
 
-        # Record the incident (mirrors T10's for-loop in _run_interim_training).
+        # Record the incident (mirrors _run_interim_training's for-loop).
         record_incident(
             state_dir,
-            type="consolidation_recall_failure",
+            type="consolidation_retry_exhausted",
             key=sid,
             severity="warning",
             summary=(
-                f"Session {sid}: facts could not be encoded after {buf._recall_retry_cap} cycle(s)"
+                f"Session {sid}: facts could not be encoded after "
+                f"{buf._consolidation_retry_cap} cycle(s)"
             ),
-            detail={"session_id": sid, "recall_retry_cap": buf._recall_retry_cap},
+            detail={
+                "session_id": sid,
+                "consolidation_retry_cap": buf._consolidation_retry_cap,
+                "cycle_mode": "trained",
+            },
         )
 
         incidents = read_incidents(state_dir)
-        recall_incidents = [i for i in incidents if i.type == "consolidation_recall_failure"]
-        assert len(recall_incidents) == 1
-        # Incident id is f"{type}:{key}" (S-3 dedup key = session id).
-        assert recall_incidents[0].id == f"consolidation_recall_failure:{sid}"
+        retry_incidents = [i for i in incidents if i.type == "consolidation_retry_exhausted"]
+        assert len(retry_incidents) == 1
+        # Incident id is f"{type}:{key}" (dedup key = session id).
+        assert retry_incidents[0].id == f"consolidation_retry_exhausted:{sid}"
 
         # WARNING logged by bump_retry_and_release.
-        assert any("recall-retry cap" in r.message for r in caplog.records), (
-            f"Expected WARNING about recall-retry cap; got: {[r.message for r in caplog.records]}"
+        assert any("consolidation-retry cap" in r.message for r in caplog.records), (
+            f"Expected WARNING about consolidation-retry cap; "
+            f"got: {[r.message for r in caplog.records]}"
         )
 
     # ------------------------------------------------------------------
@@ -2339,7 +2354,7 @@ class TestRecallFailedSessionStaysPending:
         # Pre-record an incident (simulates a prior cycle having recorded it).
         record_incident(
             state_dir,
-            type="consolidation_recall_failure",
+            type="consolidation_retry_exhausted",
             key=sid,
             severity="warning",
             summary=f"Session {sid}: facts could not be encoded",
@@ -2349,11 +2364,11 @@ class TestRecallFailedSessionStaysPending:
         # Simulate the S-4 conditional: result has a non-empty failed set.
         result_with_failures = {"recall_failed_session_ids": [sid]}
         if not result_with_failures.get("recall_failed_session_ids", []):
-            resolve_incidents_by_type(state_dir, "consolidation_recall_failure")
+            resolve_incidents_by_type(state_dir, "consolidation_retry_exhausted")
         # Since failed is non-empty, we do NOT resolve — incident stays active.
 
         incidents = read_incidents(state_dir)
-        recall_incidents = [i for i in incidents if i.type == "consolidation_recall_failure"]
+        recall_incidents = [i for i in incidents if i.type == "consolidation_retry_exhausted"]
         assert len(recall_incidents) == 1
         assert recall_incidents[0].status == "active", (
             "Incident must remain active when failing cycle runs (S-4 ordering)"
@@ -2362,7 +2377,7 @@ class TestRecallFailedSessionStaysPending:
     def test_s4_clean_cycle_resolves_recall_failure_incident(self, tmp_path: Path) -> None:
         """A cycle returning empty recall_failed_session_ids RESOLVES the incident.
 
-        S-4 resolution rule: resolve consolidation_recall_failure ONLY when ZERO
+        S-4 resolution rule: resolve consolidation_retry_exhausted ONLY when ZERO
         keys failed this cycle.
         """
         from paramem.server.incidents import (
@@ -2375,7 +2390,7 @@ class TestRecallFailedSessionStaysPending:
         sid = "session-s4-clean"
         record_incident(
             state_dir,
-            type="consolidation_recall_failure",
+            type="consolidation_retry_exhausted",
             key=sid,
             severity="warning",
             summary=f"Session {sid}: facts could not be encoded",
@@ -2385,10 +2400,10 @@ class TestRecallFailedSessionStaysPending:
         # Simulate the S-4 conditional: result has an empty failed set.
         result_clean = {"recall_failed_session_ids": []}
         if not result_clean.get("recall_failed_session_ids", []):
-            resolve_incidents_by_type(state_dir, "consolidation_recall_failure")
+            resolve_incidents_by_type(state_dir, "consolidation_retry_exhausted")
 
         incidents = read_incidents(state_dir)
-        recall_incidents = [i for i in incidents if i.type == "consolidation_recall_failure"]
+        recall_incidents = [i for i in incidents if i.type == "consolidation_retry_exhausted"]
         assert len(recall_incidents) == 1
         assert recall_incidents[0].status == "resolved", (
             "Incident must be resolved when clean cycle runs (S-4 ordering)"

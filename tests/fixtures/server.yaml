@@ -227,7 +227,7 @@ consolidation:
   fold_refinement: "off"      # whole-graph normalization pass (full-fold scope) — OFF. Same status as interim_refinement.
   contradiction_detection: true  # Case-2 same-(subject,predicate)/different-object cardinality at ingest + interim; per-conflict in the merger, unaffected by the normalization knobs above.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
-  recall_retry_cap: 3           # cycles a session stays pending on recall failure before being released (B7-B)
+  consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
   min_tier_key_floor: 30
   tier_fast_start: true
   # max_epochs: ceiling for LoRA training epochs per consolidation cycle.

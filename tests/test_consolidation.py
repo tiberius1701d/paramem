@@ -889,7 +889,7 @@ class TestSessionClassification:
         """
         from paramem.server.session_buffer import SessionBuffer
 
-        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
         conv_id = "conv-test"
         if speaker_id is not None:
             buffer.set_speaker(conv_id, speaker_id, speaker_id)
@@ -1144,7 +1144,7 @@ class TestTickGateNoNamed:
         """When all sessions are UNIDENTIFIABLE, tick returns noop_no_named."""
         from paramem.server.session_buffer import SessionBuffer
 
-        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
         conv_id = "conv-unid"
         # No speaker_id, no embedding → UNIDENTIFIABLE
         buffer.append(conv_id, "user", "Hello")
@@ -1160,7 +1160,7 @@ class TestTickGateNoNamed:
         """When all sessions are HOLDABLE, tick returns noop_no_named."""
         from paramem.server.session_buffer import SessionBuffer
 
-        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
         conv_id = "conv-hold"
         # No speaker_id but has embedding → HOLDABLE
         buffer.append(conv_id, "user", "Hello", embedding=[0.1, 0.2])
@@ -1179,7 +1179,7 @@ class TestTickGateNoNamed:
         """
         from paramem.server.session_buffer import SessionBuffer
 
-        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
         conv_id = "conv-unid2"
         buffer.append(conv_id, "user", "Text only, no speaker")
         buffer.append(conv_id, "assistant", "Ok")
@@ -1197,7 +1197,7 @@ class TestTickGateNoNamed:
         """HOLDABLE sessions (fresh, TTL=off) remain pending after tick."""
         from paramem.server.session_buffer import SessionBuffer
 
-        buffer = SessionBuffer(tmp_path / "sessions", debug=False)
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
         conv_id = "conv-hold2"
         # embedding present → HOLDABLE
         buffer.append(conv_id, "user", "Hello", embedding=[0.3, 0.4])

@@ -132,7 +132,7 @@ class TestEscalation:
 
 class TestSessionBuffer:
     def test_append_and_get_pending(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buffer.append("conv1", "user", "Hello")
         buffer.append("conv1", "assistant", "Hi there!")
 
@@ -143,7 +143,7 @@ class TestSessionBuffer:
         assert "[assistant] Hi there!" in pending[0]["transcript"]
 
     def test_multiple_conversations(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buffer.append("conv1", "user", "Hello")
         buffer.append("conv2", "user", "Hi")
 
@@ -151,7 +151,7 @@ class TestSessionBuffer:
         assert len(pending) == 2
 
     def test_mark_consolidated(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buffer.append("conv1", "user", "Hello")
         buffer.append("conv2", "user", "Hi")
 
@@ -163,7 +163,7 @@ class TestSessionBuffer:
 
     def test_mark_consolidated_debug_archives(self, tmp_path):
         """With debug=True + retention_dir supplied, mark_consolidated moves the JSONL."""
-        buffer = SessionBuffer(tmp_path / "sessions", debug=True)
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=True)
         buffer.append("conv1", "user", "Hello")
 
         retention = tmp_path / "archive"
@@ -173,18 +173,18 @@ class TestSessionBuffer:
         assert not (tmp_path / "sessions" / "conv1.jsonl").exists()
 
     def test_pending_count(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         assert buffer.pending_count == 0
 
         buffer.append("conv1", "user", "Hello")
         assert buffer.pending_count == 1
 
     def test_empty_buffer(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         assert buffer.get_pending() == []
 
     def test_turn_timestamps(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions", debug=True)
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=True)
         buffer.append("conv1", "user", "Hello")
 
         path = tmp_path / "sessions" / "conv1.jsonl"
@@ -198,7 +198,7 @@ class TestSessionBuffer:
         """Pending sessions persist on disk even without debug
         (2026-05-14 invariant — survives restarts until consolidation
         consumes them)."""
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buffer.append("conv1", "user", "Hello")
 
         assert (tmp_path / "sessions" / "conv1.jsonl").exists()
@@ -206,7 +206,9 @@ class TestSessionBuffer:
         assert len(buffer.get_pending()) == 1
 
     def test_retain_sessions_false_deletes(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions", retain_sessions=False, debug=True)
+        buffer = SessionBuffer(
+            tmp_path / "sessions", state_dir=tmp_path / "state", retain_sessions=False, debug=True
+        )
         buffer.append("conv1", "user", "Hello")
         assert (tmp_path / "sessions" / "conv1.jsonl").exists()
 
@@ -218,7 +220,9 @@ class TestSessionBuffer:
 
     def test_retain_sessions_true_archives(self, tmp_path):
         """With retain_sessions=True + retention_dir, mark_consolidated moves the JSONL."""
-        buffer = SessionBuffer(tmp_path / "sessions", retain_sessions=True, debug=True)
+        buffer = SessionBuffer(
+            tmp_path / "sessions", state_dir=tmp_path / "state", retain_sessions=True, debug=True
+        )
         buffer.append("conv1", "user", "Hello")
 
         retention = tmp_path / "archive"
@@ -228,7 +232,7 @@ class TestSessionBuffer:
         assert (retention / "conv1.jsonl").exists()
 
     def test_speaker_tracking(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         assert buffer.get_session_state("conv1") == "new"
         assert buffer.get_speaker("conv1") is None
         assert buffer.get_speaker_id("conv1") is None
@@ -239,7 +243,7 @@ class TestSessionBuffer:
         assert buffer.get_session_state("conv1") == "identified"
 
     def test_speaker_in_transcript(self, tmp_path):
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buffer.set_speaker("conv1", "spk_abc", "Alex")
         buffer.append("conv1", "user", "I live in Amsterdam")
 
@@ -270,7 +274,7 @@ class TestSessionBuffer:
     def test_snapshot_save_and_restore(self, tmp_path, monkeypatch):
         self._setup_daily(tmp_path, monkeypatch)
 
-        buf1 = SessionBuffer(tmp_path / "sessions")
+        buf1 = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buf1.set_speaker("conv1", "spk_abc", "Alex")
         buf1.append("conv1", "user", "I live in Amsterdam")
         buf1.append("conv1", "assistant", "That's nice!")
@@ -286,7 +290,7 @@ class TestSessionBuffer:
         )
 
         # Restore into a fresh buffer.
-        buf2 = SessionBuffer(tmp_path / "sessions")
+        buf2 = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         assert buf2.load_snapshot()
         assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
 
@@ -300,7 +304,7 @@ class TestSessionBuffer:
         """Tampered snapshot → DecryptError caught → file unlinked, buffer empty."""
         self._setup_daily(tmp_path, monkeypatch)
 
-        buf1 = SessionBuffer(tmp_path / "sessions")
+        buf1 = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buf1.append("conv1", "user", "Secret data")
         buf1.save_snapshot()
 
@@ -309,7 +313,7 @@ class TestSessionBuffer:
         raw = snap_path.read_bytes()
         snap_path.write_bytes(raw[:80] + bytes(len(raw) - 80))
 
-        buf2 = SessionBuffer(tmp_path / "sessions")
+        buf2 = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         assert not buf2.load_snapshot()
         assert not snap_path.exists(), "corrupted snapshot must be unlinked on load failure"
         assert buf2.pending_count == 0
@@ -317,19 +321,19 @@ class TestSessionBuffer:
     def test_snapshot_deleted_on_successful_restore(self, tmp_path, monkeypatch):
         self._setup_daily(tmp_path, monkeypatch)
 
-        buf1 = SessionBuffer(tmp_path / "sessions")
+        buf1 = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buf1.append("conv1", "user", "Hello")
         buf1.save_snapshot()
         assert (tmp_path / "sessions" / "session_snapshot.enc").exists()
 
-        buf2 = SessionBuffer(tmp_path / "sessions")
+        buf2 = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buf2.load_snapshot()
         assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
 
     def test_snapshot_empty_buffer_no_file(self, tmp_path, monkeypatch):
         self._setup_daily(tmp_path, monkeypatch)
 
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         assert buffer.save_snapshot()
         assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
 
@@ -343,7 +347,7 @@ class TestSessionBuffer:
             tmp_path / "absent.age",
         )
 
-        buffer = SessionBuffer(tmp_path / "sessions")
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buffer.append("conv1", "user", "state that would have been saved")
         assert buffer.save_snapshot() is False
         assert not (tmp_path / "sessions" / "session_snapshot.enc").exists()
@@ -355,7 +359,7 @@ class TestSessionBuffer:
 
         # First, write a snapshot with keys loaded.
         self._setup_daily(tmp_path, monkeypatch)
-        buf1 = SessionBuffer(tmp_path / "sessions")
+        buf1 = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buf1.append("conv1", "user", "important mid-turn state")
         buf1.save_snapshot()
         snap_path = tmp_path / "sessions" / "session_snapshot.enc"
@@ -371,7 +375,7 @@ class TestSessionBuffer:
         )
         _clear_daily_identity_cache()
 
-        buf2 = SessionBuffer(tmp_path / "sessions")
+        buf2 = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         with caplog.at_level(logging.WARNING, logger="paramem.server.session_buffer"):
             assert buf2.load_snapshot() is False
         # File must still be there — operator's chance to recover it.

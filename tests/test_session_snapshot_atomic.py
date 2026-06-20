@@ -18,7 +18,7 @@ def _make_buffer_with_turn(session_dir: Path) -> SessionBuffer:
 
     Does NOT write anything to disk — only in-memory state is set up.
     """
-    buf = SessionBuffer(session_dir)
+    buf = SessionBuffer(session_dir, state_dir=session_dir.parent / "state")
     buf.append("conv1", "user", "I live in Amsterdam")
     return buf
 

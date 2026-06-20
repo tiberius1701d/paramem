@@ -4881,14 +4881,20 @@ def _build_config_derived_state(
 
         _state["session_buffer"] = SessionBuffer(
             config.session_dir,
+            state_dir=config.paths.data / "state",
             retain_sessions=config.consolidation.retain_sessions,
             debug=config.debug,
-            recall_retry_cap=config.consolidation.recall_retry_cap,
+            consolidation_retry_cap=config.consolidation.consolidation_retry_cap,
         )
         # Cold-start: rehydrate pending JSONL into memory before loading the
         # encrypted snapshot (snapshot carries mid-turn _sessions state only).
         _state["session_buffer"].rehydrate_from_disk()
         _state["session_buffer"].load_snapshot()
+        # Seed in-memory retry counts from the durable store.  Runs after
+        # load_snapshot so the durable file overwrites any snapshot-carried
+        # values — the durable store survives ungraceful restarts; the
+        # snapshot does not.
+        _state["session_buffer"].hydrate_retry_counts()
 
     if full_rebuild:
         # ── 2. speaker_store ─────────────────────────────────────────────────
@@ -12788,49 +12794,116 @@ def _extract_and_start_training():
             len(result.get("new_keys", [])),
         )
 
-        # Keep recall-failed sessions pending with bounded retry.
+        # Keep sessions pending when their facts were NOT successfully encoded,
+        # with a bounded per-session durable retry counter.  Three sources feed
+        # the unified failure set (in priority order):
+        #   1. recall_failed_session_ids — the recall gate fired after training.
+        #   2. DEGENERATE mode — adapter degenerated; triples re-queued to RAM
+        #      only; weights unchanged.  Facts not encoded → count increments.
+        #   3. ABORT mode — training yielded to an inference request; no encoding
+        #      attempt was made.  Sessions stay pending but count does NOT increment
+        #      (abort = yield-to-inference, not a failure).
         # In the SUCCESS path (cycle returned normally) — NOT inside the try that
         # wraps run_consolidation_cycle (crash ≠ recall failure — the failed-session
         # set is populated only on a successful cycle return).
         # The simulate callsite never produces a non-empty failed set because
         # _epi_passing is None in simulate mode, so this code is a no-op there.
-        _cycle_failed_sids = result.get("recall_failed_session_ids", [])
-        if _cycle_failed_sids:
-            failed_session_ids.update(_cycle_failed_sids)
-            # Increment per-session retry counter; release sessions that hit the cap.
-            _released_sids = session_buffer.bump_retry_and_release(set(_cycle_failed_sids))
-            if _released_sids:
-                # Remove capped sessions from failed_session_ids so they retire
-                # this cycle (un-pinned; the un-encodable fact is logged + incident-recorded).
-                failed_session_ids.difference_update(_released_sids)
-                _interim_state_dir_b7 = _state["config"].paths.data / "state"
-                for _capped_sid in _released_sids:
-                    try:
-                        record_incident(
-                            _interim_state_dir_b7,
-                            type="consolidation_recall_failure",
-                            key=_capped_sid,
-                            severity="warning",
-                            summary=(
-                                f"Session {_capped_sid}: facts could not be encoded "
-                                f"after {session_buffer._recall_retry_cap} cycle(s)"
-                            ),
-                            detail={
-                                "session_id": _capped_sid,
-                                "recall_retry_cap": session_buffer._recall_retry_cap,
-                            },
-                        )
-                    except Exception:
-                        logger.exception(
-                            "_run_interim_training: failed to record recall_failure incident "
-                            "for session %s (non-fatal)",
-                            _capped_sid,
-                        )
-                logger.warning(
-                    "_run_interim_training: %d session(s) hit recall-retry cap "
-                    "— releasing; facts could not be encoded",
-                    len(_released_sids),
+        _cycle_mode = result.get("mode", "trained")
+        _recall_failed = result.get("recall_failed_session_ids", [])
+        # Build the set of sessions to pin (keep pending) this cycle.
+        # All three failure sources pin; only recall + degenerate increment.
+        _pin_sids: set[str] = set(_recall_failed)
+        _count_sids: set[str] = set(_recall_failed)  # sessions whose counter increments
+        if _cycle_mode in {"aborted", "degenerated"}:
+            # Contributing sessions = those that passed extraction but whose
+            # results were not committed.  OOM-skipped chunks are already in
+            # failed_session_ids; exclude them to avoid double-counting.
+            _contributing = {sid for sid in session_ids if sid not in failed_session_ids}
+            _pin_sids.update(_contributing)
+            if _cycle_mode == "degenerated":
+                # Degenerate = encoding attempted but adapter degenerated → count.
+                _count_sids.update(_contributing)
+            # ABORT: pin without incrementing — yield-to-inference is not
+            # a fact-encoding failure and must not consume the retry budget.
+        _released_sids: list[str] = []
+        if _pin_sids:
+            failed_session_ids.update(_pin_sids)
+        if _count_sids:
+            # Durable increment — survives ungraceful restarts.  One call covers
+            # all sessions for this cycle; set ensures one-per-session-per-cycle.
+            # Raises RetryStateCapacityError on ENOSPC/EDQUOT.
+            from paramem.server.retry_state import RetryStateCapacityError
+
+            try:
+                _released_sids = session_buffer.bump_retry_and_release(_count_sids)
+            except RetryStateCapacityError as exc:
+                logger.error(
+                    "_run_interim_training: disk full writing retry state — "
+                    "leaving %d session(s) pending, no retry spin: %s",
+                    len(_count_sids),
+                    exc,
                 )
+                try:
+                    record_incident(
+                        _state["config"].paths.data / "state",
+                        type="storage_capacity_reached",
+                        key="consolidation_retry",
+                        severity="failed",
+                        summary="Disk full — consolidation retry state cannot persist",
+                        detail={"errno": getattr(exc.__cause__, "errno", None)},
+                    )
+                except Exception:
+                    logger.exception(
+                        "_run_interim_training: also failed to record "
+                        "storage_capacity_reached incident (disk is full)"
+                    )
+                # Hard stop: sessions stay pending, no release, no spin.
+                # Fall through to bookkeeping with _released_sids empty.
+        if _released_sids:
+            # Remove capped sessions from failed_session_ids so they retire
+            # this cycle (un-pinned; the un-encodable fact is logged + incident).
+            failed_session_ids.difference_update(_released_sids)
+            _interim_state_dir_b8 = _state["config"].paths.data / "state"
+            for _capped_sid in _released_sids:
+                try:
+                    record_incident(
+                        _interim_state_dir_b8,
+                        type="consolidation_retry_exhausted",
+                        key=_capped_sid,
+                        severity="warning",
+                        summary=(
+                            f"Session {_capped_sid}: facts could not be encoded "
+                            f"after {session_buffer._consolidation_retry_cap} cycle(s)"
+                        ),
+                        detail={
+                            "session_id": _capped_sid,
+                            "consolidation_retry_cap": session_buffer._consolidation_retry_cap,
+                            "cycle_mode": _cycle_mode,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "_run_interim_training: failed to record retry_exhausted incident "
+                        "for session %s (non-fatal)",
+                        _capped_sid,
+                    )
+            logger.warning(
+                "_run_interim_training: %d session(s) hit consolidation-retry cap "
+                "— releasing; facts could not be encoded",
+                len(_released_sids),
+            )
+        # Reset-on-recall-success: for sessions that were previously counted
+        # (had a durable retry entry) but passed recall cleanly this cycle,
+        # clear their durable count so only consecutive failures accrue toward
+        # the cap.  A session passes recall if it is in session_ids, NOT in the
+        # current _count_sids (i.e. was not a failure this cycle), and has an
+        # existing durable count entry.
+        if _cycle_mode not in {"aborted", "degenerated"}:
+            for _sid in session_ids:
+                if _sid not in _pin_sids and _sid in session_buffer._sessions:
+                    _existing = session_buffer._sessions[_sid].get("recall_retry_count", 0)
+                    if _existing > 0:
+                        session_buffer.reset_retry_count_for(_sid)
 
         # Disk I/O — safe from any thread.  Key-metadata persistence mirrors the
         # previous main-write callback; the interim helper already handled the
@@ -12888,12 +12961,18 @@ def _extract_and_start_training():
                 _interim_state_dir = _state["config"].paths.data / "state"
                 resolve_incidents_by_type(_interim_state_dir, "training_crash")
                 resolve_incidents_by_type(_interim_state_dir, "vram_exhausted")
-                # Resolve consolidation_recall_failure ONLY when ZERO keys failed
-                # this cycle.  When the failed set is non-empty, the bump-and-record
-                # block above already logged per-session incidents; resolving here
-                # would wipe the just-recorded incident from the same cycle.
-                if not result.get("recall_failed_session_ids", []):
-                    resolve_incidents_by_type(_interim_state_dir, "consolidation_recall_failure")
+                # Resolve consolidation_retry_exhausted ONLY on a genuine clean
+                # success — no recall failures, cycle was not aborted/degenerated,
+                # and no sessions were cap-released this cycle.  An abort/degenerate
+                # cycle carries no recall_failed_session_ids but is NOT a success;
+                # resolving here would wipe an incident recorded by the same cycle.
+                _is_clean_success = (
+                    not result.get("recall_failed_session_ids", [])
+                    and _cycle_mode not in {"aborted", "degenerated"}
+                    and not _released_sids
+                )
+                if _is_clean_success:
+                    resolve_incidents_by_type(_interim_state_dir, "consolidation_retry_exhausted")
             except Exception:
                 logger.exception("Post-interim run-status/incident bookkeeping failed (non-fatal)")
             _state["consolidating"] = False
@@ -13237,10 +13316,12 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 resolve_incidents_by_type(_full_state_dir, "vram_exhausted")
                 resolve_incidents_by_type(_full_state_dir, "extraction_failed")
                 # Full-cycle path mirrors the interim path — resolve
-                # consolidation_recall_failure only when the cycle returned zero
-                # recall-failed session ids.
-                if not result.get("recall_failed_session_ids", []):
-                    resolve_incidents_by_type(_full_state_dir, "consolidation_recall_failure")
+                # consolidation_retry_exhausted only when the cycle returned zero
+                # recall-failed session ids and was not itself aborted/degenerated.
+                if not result.get("recall_failed_session_ids", []) and result.get(
+                    "mode", "full_trained"
+                ) not in {"aborted", "degenerated"}:
+                    resolve_incidents_by_type(_full_state_dir, "consolidation_retry_exhausted")
             except Exception:
                 logger.exception(
                     "Post-full-cycle run-status/incident bookkeeping failed (non-fatal)"

@@ -12,8 +12,8 @@ Covers:
 - T16  VramExhausted callback → record_incident called, NOT RAM write
 - T16b success branch (trained) → record_last_run called, NOT record_incident
 - T17  auto-resolve: vram_exhausted incident resolves after _finalize_interim
-- T17b S-4 ordering: consolidation_recall_failure NOT resolved by Pass B success
-        (B7 owns that conditional resolve — Pass B must NOT touch it)
+- T17b S-4 ordering: consolidation_retry_exhausted NOT resolved by Pass B success
+        (M1 guard owns that conditional resolve — Pass B must NOT touch it)
 - T18  resolve_incident idempotency fix: already-resolved returns False
 - T4b  (ack endpoint) acknowledged incident omitted from attention items
 """
@@ -578,21 +578,21 @@ class TestAutoResolve:
 
 
 # ---------------------------------------------------------------------------
-# T17b — S-4 ordering: consolidation_recall_failure NOT resolved by Pass B
+# T17b — S-4 ordering: consolidation_retry_exhausted NOT resolved by Pass B
 # ---------------------------------------------------------------------------
 
 
 class TestS4Ordering:
     def test_recall_failure_incident_not_resolved_by_pass_b_success_paths(self, tmp_path):
-        """consolidation_recall_failure type is not in Pass B's resolve-by-type calls.
+        """consolidation_retry_exhausted type is not in Pass B's resolve-by-type calls.
 
-        B7 owns the conditional resolve for consolidation_recall_failure.  Pass B
-        must NOT resolve it — only by_type resolution of the types Pass B owns
-        (vram_exhausted, training_crash, consolidation_crash, extraction_failed,
+        The M1 guard owns the conditional resolve for consolidation_retry_exhausted.
+        Pass B must NOT resolve it — only by_type resolution of the types Pass B
+        owns (vram_exhausted, training_crash, consolidation_crash, extraction_failed,
         migration_error, migration_phase_failed).
         """
         state_dir = tmp_path / "state"
-        _record(state_dir, type="consolidation_recall_failure", key="session_abc")
+        _record(state_dir, type="consolidation_retry_exhausted", key="session_abc")
 
         # Simulate Pass B success paths (resolve all Pass-B-owned types).
         for t in (
@@ -605,13 +605,13 @@ class TestS4Ordering:
         ):
             resolve_incidents_by_type(state_dir, t)
 
-        # The recall_failure incident must remain ACTIVE.
+        # The retry_exhausted incident must remain ACTIVE.
         incidents = read_incidents(state_dir)
-        recall_failures = [i for i in incidents if i.type == "consolidation_recall_failure"]
+        recall_failures = [i for i in incidents if i.type == "consolidation_retry_exhausted"]
         assert len(recall_failures) == 1
         assert recall_failures[0].status == "active", (
-            "consolidation_recall_failure must remain active — "
-            "B7 owns its conditional resolve (S-4 ordering hazard)"
+            "consolidation_retry_exhausted must remain active — "
+            "M1 guard owns its conditional resolve (S-4 ordering hazard)"
         )
 
 

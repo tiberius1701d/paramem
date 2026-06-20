@@ -1036,7 +1036,9 @@ class TestSimulateModePromptIteration:
 
         model, tokenizer = model_and_tokenizer
 
-        buffer = SessionBuffer(session_dir=cfg.paths.sessions, debug=False)
+        buffer = SessionBuffer(
+            session_dir=cfg.paths.sessions, state_dir=cfg.paths.data / "state", debug=False
+        )
         buffer.set_speaker("sim-test-001", "Speaker0", "Alex")
         chunk_text = (
             "Alex is an Engineering Leader Software at Acme Corp in Germany. "

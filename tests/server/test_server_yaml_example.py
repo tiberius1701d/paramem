@@ -176,19 +176,25 @@ def test_consolidation_period_derived(example_config):
     "config_path",
     ["configs/server.yaml.example", "tests/fixtures/server.yaml"],
 )
-def test_recall_retry_cap_loads_from_consolidation_section(config_path):
-    """Regression: ``recall_retry_cap`` belongs on ``ConsolidationScheduleConfig``,
+def test_consolidation_retry_cap_loads_from_consolidation_section(config_path):
+    """Regression: ``consolidation_retry_cap`` belongs on ``ConsolidationScheduleConfig``,
     not ``ConsolidationConfig``.
 
     The YAML ``consolidation:`` section is parsed into
     ``ConsolidationScheduleConfig``, and the runtime reads
-    ``config.consolidation.recall_retry_cap`` at SessionBuffer construction
+    ``config.consolidation.consolidation_retry_cap`` at SessionBuffer construction
     (app.py). If the field is ever moved back onto the wrong config class,
     ``load_server_config`` raises ``TypeError`` on the unexpected kwarg and
     every server-config load fails. This guards both tracked config files.
+    Also verifies the old name ``recall_retry_cap`` raises ``TypeError``
+    (clean rename, no backward-compat alias).
     """
     cfg = load_server_config(config_path)
-    assert cfg.consolidation.recall_retry_cap == 3
+    assert cfg.consolidation.consolidation_retry_cap == 3
+    assert not hasattr(cfg.consolidation, "recall_retry_cap"), (
+        "recall_retry_cap must not exist on ConsolidationScheduleConfig — "
+        "clean rename to consolidation_retry_cap with no alias"
+    )
 
 
 def test_voice_prompt_loads(example_config):

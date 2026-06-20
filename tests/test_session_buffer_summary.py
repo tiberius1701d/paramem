@@ -7,12 +7,16 @@ from paramem.server.session_buffer import SessionBuffer
 
 @pytest.fixture
 def buf(tmp_path):
-    return SessionBuffer(session_dir=tmp_path / "sessions", debug=False)
+    return SessionBuffer(
+        session_dir=tmp_path / "sessions", state_dir=tmp_path / "state", debug=False
+    )
 
 
 @pytest.fixture
 def buf_debug(tmp_path):
-    return SessionBuffer(session_dir=tmp_path / "sessions", debug=True)
+    return SessionBuffer(
+        session_dir=tmp_path / "sessions", state_dir=tmp_path / "state", debug=True
+    )
 
 
 def test_summary_empty(buf):
@@ -375,7 +379,12 @@ class TestMarkConsolidatedDocGroups:
         land under the same doc_id subdirectory.
         """
         sessions_dir = tmp_path / "sessions"
-        buf = SessionBuffer(session_dir=sessions_dir, retain_sessions=True, debug=False)
+        buf = SessionBuffer(
+            session_dir=sessions_dir,
+            state_dir=sessions_dir.parent / "state",
+            retain_sessions=True,
+            debug=False,
+        )
 
         doc_id = "doc-retain1"
         chunk_sid = f"{doc_id}-c000"
@@ -402,7 +411,12 @@ class TestMarkConsolidatedDocGroups:
     def test_delete_removes_chunks_and_origdoc(self, tmp_path):
         """In privacy mode (retain=False, debug=False), both chunk JSONLs and origdoc deleted."""
         sessions_dir = tmp_path / "sessions"
-        buf = SessionBuffer(session_dir=sessions_dir, retain_sessions=False, debug=False)
+        buf = SessionBuffer(
+            session_dir=sessions_dir,
+            state_dir=sessions_dir.parent / "state",
+            retain_sessions=False,
+            debug=False,
+        )
 
         doc_id = "doc-delete1"
         self._add_doc_chunk(buf, f"{doc_id}-c000", doc_id, chunk_count=1)
@@ -416,7 +430,12 @@ class TestMarkConsolidatedDocGroups:
     def test_transcript_sessions_use_flat_layout(self, tmp_path):
         """Transcript sessions are archived flat under retention_dir (unchanged)."""
         sessions_dir = tmp_path / "sessions"
-        buf = SessionBuffer(session_dir=sessions_dir, retain_sessions=True, debug=False)
+        buf = SessionBuffer(
+            session_dir=sessions_dir,
+            state_dir=sessions_dir.parent / "state",
+            retain_sessions=True,
+            debug=False,
+        )
         buf.append("conv-t1", "user", "hello")
 
         retention_dir = tmp_path / "retention"

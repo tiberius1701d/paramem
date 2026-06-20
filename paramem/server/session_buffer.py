@@ -32,6 +32,7 @@ from paramem.backup.encryption import (
     envelope_decrypt_bytes,
     envelope_encrypt_bytes,
 )
+from paramem.server import retry_state as _retry_state
 
 logger = logging.getLogger(__name__)
 
@@ -70,15 +71,18 @@ class SessionBuffer:
     def __init__(
         self,
         session_dir: Path,
+        state_dir: Path,
         retain_sessions: bool = True,
         debug: bool = False,
-        recall_retry_cap: int = 3,
+        consolidation_retry_cap: int = 3,
     ):
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        self._state_dir = Path(state_dir)
+        self._state_dir.mkdir(parents=True, exist_ok=True)
         self.retain_sessions = retain_sessions
         self.debug = debug
-        self._recall_retry_cap = recall_retry_cap
+        self._consolidation_retry_cap = consolidation_retry_cap
         self._snapshot_path = self.session_dir / "session_snapshot.enc"
 
         if _snapshots_enabled():
@@ -615,6 +619,20 @@ class SessionBuffer:
                 origdoc.unlink()
                 logger.info("Deleted origdoc: %s", doc_id)
 
+        # Clear durable retry-count rows for all retired sessions so stale
+        # entries do not accumulate and do not mis-count a future session that
+        # reuses an id.  Non-fatal: a failed clear is logged but does not roll
+        # back the retirement (the session is gone from _sessions/_turns already).
+        if session_ids:
+            try:
+                _retry_state.clear_retry_counts(self._state_dir, list(session_ids))
+            except Exception:
+                logger.exception(
+                    "SessionBuffer.mark_consolidated: failed to clear durable retry counts "
+                    "for %d session(s) (non-fatal)",
+                    len(session_ids),
+                )
+
     def discard_sessions(self, session_ids: list[str]) -> None:
         """Drop named sessions from the in-memory queue and disk state.
 
@@ -663,17 +681,64 @@ class SessionBuffer:
                 origdoc.unlink()
                 logger.info("Deleted origdoc for discarded doc: %s", doc_id)
 
+        # Clear durable retry-count rows for discarded sessions (same R3-guard
+        # as mark_consolidated; stale rows must not accumulate or mis-count).
+        if session_ids:
+            try:
+                _retry_state.clear_retry_counts(self._state_dir, list(session_ids))
+            except Exception:
+                logger.exception(
+                    "SessionBuffer.discard_sessions: failed to clear durable retry counts "
+                    "for %d session(s) (non-fatal)",
+                    len(session_ids),
+                )
+
+    def hydrate_retry_counts(self) -> None:
+        """Seed in-memory retry counts from the durable ``consolidation_retry.json``.
+
+        Called at boot after :meth:`load_snapshot` so the durable store is the
+        authoritative source of truth.  Overwrites any ``recall_retry_count``
+        values that :meth:`load_snapshot` restored from the encrypted snapshot
+        — the durable file wins because it survives ungraceful restarts whereas
+        the encrypted snapshot does not.
+
+        Sessions that are in the durable file but not (yet) in ``_sessions`` are
+        silently skipped; they will be reconciled when their JSONL is rehydrated.
+
+        Non-fatal: a schema or I/O error is logged and hydration is skipped so
+        the server still starts.  A subsequent :meth:`bump_retry_and_release` call
+        on those sessions will re-read from disk atomically.
+        """
+        try:
+            durable = _retry_state.read_retry_counts(self._state_dir)
+        except Exception:
+            logger.exception(
+                "SessionBuffer.hydrate_retry_counts: failed to read durable retry counts "
+                "(non-fatal; counts will be re-read on next bump)"
+            )
+            return
+        for sid, count in durable.items():
+            if sid in self._sessions:
+                self._sessions[sid]["recall_retry_count"] = count
+
     def bump_retry_and_release(self, failed_ids: set[str]) -> list[str]:
-        """Increment the recall-retry counter for each failed session; release capped ones.
+        """Increment the durable retry counter for each failed session; release capped ones.
 
-        Called from the interim-training success path (``app.py
-        _run_interim_training``) after ``run_consolidation_cycle`` returns with
-        a non-empty ``recall_failed_session_ids`` set.  For each session id in
-        *failed_ids* that is currently buffered:
+        Called from ``_run_interim_training`` (``app.py``) after
+        ``run_consolidation_cycle`` returns for sessions whose facts were NOT
+        successfully encoded into adapter weights this cycle.  Each call covers
+        exactly the sessions from one cycle, so one-per-cycle cadence is
+        structural.
 
-        - Increment ``recall_retry_count`` (defaulting to 0 if absent).
-        - If the new count reaches :attr:`_recall_retry_cap`, add the session
-          id to the returned release list.
+        For each session id in *failed_ids* that is currently buffered:
+
+        - Atomically increment the durable ``recall_retry_count`` via
+          ``retry_state.bump_retry_count`` (crash-safe: count is on disk before
+          this method returns).
+        - Mirror the returned count into ``self._sessions[sid]["recall_retry_count"]``
+          so in-memory state stays consistent with the durable store.
+        - If the new count reaches :attr:`_consolidation_retry_cap`, add the
+          session id to the returned release list.
 
         Released sessions are removed from the caller's ``failed_session_ids``
         set so ``_completed_session_ids()`` retires them on the current cycle
@@ -682,22 +747,28 @@ class SessionBuffer:
         caller owns the per-session ``key`` for dedup.
 
         Session ids absent from :attr:`_sessions` are silently skipped (R3
-        guard: synthetic-id leakage protection — synthetic ids are never
-        present in the buffer).
+        guard: synthetic-id leakage protection — synthetic ids are never present
+        in the buffer).
 
-        Reset-on-success: when a session is eventually retired via
-        :meth:`mark_consolidated`, its :attr:`_sessions` entry is popped,
-        clearing the counter naturally — no explicit reset needed.
+        Reset-on-recall-success: when a previously-counted session passes recall
+        in a cycle, the caller calls :meth:`reset_retry_count_for` before
+        marking it consolidated, clearing the durable count so only consecutive
+        failures accrue toward the cap.
 
-        Restart semantics: the counter is snapshotted only on graceful exit
-        (via :meth:`save_snapshot`); an ungraceful restart resets the budget to
-        0.  This is the correct safe default — a flapping fact can retry more
-        than ``recall_retry_cap`` times across crashes but is never stranded.
+        Restart semantics: the counter is durable — written atomically to
+        ``data/state/consolidation_retry.json`` on every increment via
+        ``fcntl.flock``-guarded RMW.  An ungraceful restart (TDR / host crash)
+        does NOT reset the budget.  On boot, :meth:`hydrate_retry_counts` seeds
+        in-memory counts from this durable file.
+
+        Raises:
+            retry_state.RetryStateCapacityError: when disk is full (ENOSPC /
+                EDQUOT) during the durable write.  The caller must record a
+                ``storage_capacity_reached`` incident and stop — do NOT retry or
+                spin.
 
         Args:
-            failed_ids: Session ids that contributed a recall-failed key this
-                cycle.  Typically derived from
-                ``result.get("recall_failed_session_ids", [])`` in the caller.
+            failed_ids: Session ids whose facts were not encoded this cycle.
 
         Returns:
             List of session ids whose retry count reached the cap.  The caller
@@ -709,18 +780,43 @@ class SessionBuffer:
                 # R3: not a buffered session (already retired or a synthetic id
                 # that slipped through).  Skip silently — do not mutate state.
                 continue
-            session = self._sessions[sid]
-            new_count = session.get("recall_retry_count", 0) + 1
-            session["recall_retry_count"] = new_count
-            if new_count >= self._recall_retry_cap:
+            new_count = _retry_state.bump_retry_count(self._state_dir, sid)
+            self._sessions[sid]["recall_retry_count"] = new_count
+            if new_count >= self._consolidation_retry_cap:
                 logger.warning(
                     "SessionBuffer.bump_retry_and_release: session %s hit "
-                    "recall-retry cap (%d) — releasing; facts could not be encoded",
+                    "consolidation-retry cap (%d) — releasing; facts could not be encoded",
                     sid,
-                    self._recall_retry_cap,
+                    self._consolidation_retry_cap,
                 )
                 released.append(sid)
         return released
+
+    def reset_retry_count_for(self, session_id: str) -> None:
+        """Clear the durable retry count for a session that passed recall.
+
+        Called when a previously-counted session produces a clean recall result
+        in a cycle (reset-on-recall-success).  Clears both the durable store
+        entry and the in-memory cache so the session re-enters the retry budget
+        at 0 — only consecutive failures accrue toward the cap.
+
+        Idempotent: a no-op when the session has no durable entry.
+
+        Non-fatal: a failed reset is logged but does not block the caller.
+
+        Args:
+            session_id: Session identifier whose retry count should be cleared.
+        """
+        try:
+            _retry_state.reset_retry_count(self._state_dir, session_id)
+        except Exception:
+            logger.exception(
+                "SessionBuffer.reset_retry_count_for: failed to reset durable retry count "
+                "for session %s (non-fatal)",
+                session_id,
+            )
+        if session_id in self._sessions:
+            self._sessions[session_id].pop("recall_retry_count", None)
 
     def get_session_turns(self, conversation_id: str) -> list[dict]:
         """Read all turns from a session."""

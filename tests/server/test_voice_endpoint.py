@@ -135,7 +135,7 @@ def _make_state(
     cfg = _make_config(pwa_enabled)
     sessions = tmp_path / "sessions"
     sessions.mkdir(parents=True, exist_ok=True)
-    buffer = SessionBuffer(session_dir=sessions, debug=False)
+    buffer = SessionBuffer(session_dir=sessions, state_dir=sessions.parent / "state", debug=False)
 
     return {
         "config": cfg,
