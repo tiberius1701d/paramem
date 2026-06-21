@@ -10910,6 +10910,20 @@ class TestInterimOverflowSlackConfig:
         cfg = ConsolidationScheduleConfig(max_interim_count=7, interim_overflow_slack=3)
         assert cfg.interim_overflow_slack == 3
 
+    def test_max_interim_count_zero_raises_value_error(self):
+        """max_interim_count=0 must raise ValueError at config creation."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="max_interim_count"):
+            ConsolidationScheduleConfig(max_interim_count=0)
+
+    def test_max_interim_count_negative_raises_value_error(self):
+        """max_interim_count=-1 must raise ValueError at config creation."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="max_interim_count"):
+            ConsolidationScheduleConfig(max_interim_count=-1)
+
 
 class TestOldestInterimStamp:
     """_oldest_interim_stamp returns the oldest stamp with no age gate."""

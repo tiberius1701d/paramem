@@ -1287,7 +1287,7 @@ class ConsolidationLoop:
 
         Delegates to :meth:`run_consolidation_cycle` (unified episodic +
         procedural pipeline) so experiment scripts exercise the same code path
-        as the production post-session training hook.  After the cycle, calls
+        as the scheduled interim training path.  After the cycle, calls
         :meth:`consolidate_interim_adapters` to fold the freshly-trained interim
         slot into the main ``"episodic"`` adapter so callers that probe
         ``model.set_adapter("episodic")`` read the trained weights, not the
@@ -1859,8 +1859,7 @@ class ConsolidationLoop:
           ``save_cycle_snapshots`` is on; written by
           :meth:`DebugSnapshotWriter.on_main_adapters_saved`).
 
-        Atomic save ordering — registry written last as the commit signal
-        (mirrors ``post_session_train`` step 7):
+        Atomic save ordering — registry written last as the commit signal:
           1. ``save_bytes`` → in-memory registry bytes (no disk write).
           2. ``sha256`` the bytes so the manifest can stamp them pre-write.
           3. Build manifest with ``registry_sha256_override=hash`` for each adapter.
@@ -2144,107 +2143,6 @@ class ConsolidationLoop:
         # stamp as the scope; full cycles use cycle_<N>.
         scope = f"interim_{resolved_stamp}" if resolved_stamp else f"cycle_{self.cycle_count}"
         return self.output_dir / adapter_name / scope
-
-    def post_session_train(
-        self,
-        session_transcript: str,
-        session_id: str,
-        *,
-        speaker_id: str,
-        speaker_name: str | None = None,
-        ha_context: dict | None = None,
-        schedule: str = "",
-        max_interim_count: int = 7,
-        stamp: str | None = None,
-        recall_sanity_threshold: "float | None" = None,
-    ) -> dict:
-        """Extract one conversation, train onto the current interim adapter, register on success.
-
-        This is the post-conversation training hook for multi-adapter interim routing.
-        "Session" here means one conversation (the existing meaning in the codebase),
-        not the adapter tier.  The adapter it trains into is the interim adapter
-        (``episodic_interim_YYYYMMDDTHHMM``).
-
-        Failure-safe ordering: register keys **only after** training returns
-        successfully so that extraction or training failures never leave
-        orphaned keys in the registry.
-
-        Procedural relations extracted from the same transcript are trained onto
-        the stable ``procedural`` main adapter (no interim tier for procedural —
-        preferences are small-volume and slow-changing).  This pass runs inline,
-        immediately after the episodic training pass and before any registry
-        writes, so a failure in either pass leaves the registry clean.
-
-        Registry write ordering (atomic: registry written last as commit signal):
-        1. ``save_bytes()`` — serialise registry to bytes without writing.
-        2. ``sha256(payload)`` — hash for manifest pre-stamp.
-        3. Build manifest with ``registry_sha256_override``.
-        4. ``save_adapter(..., manifest=manifest)`` — adapter + manifest on disk.
-        5. ``save_from_bytes(payload, path)`` — flush registry bytes to
-           ``<adapter_dir>/<tier>/indexed_key_registry.json`` (LAST, with
-           unified simhash map embedded under the ``"simhash"`` key).
-
-        The registry is the commit signal: its presence on disk means every
-        preceding file is complete.  On restart, the lifespan consistency check
-        scans the registry and drops any entry whose adapter slot is missing,
-        recovering from a crash between steps 4 and 6.
-
-        Args:
-            session_transcript: Raw transcript text for this conversation.
-            session_id: Unique conversation identifier (used by the extraction pipeline).
-            speaker_id: Speaker identifier for key ownership and preference scoping.
-                Required — callers must always supply a real speaker ID.
-            speaker_name: Human-readable speaker name for extraction personalisation.
-            ha_context: Optional Home Assistant context dict for location validation.
-            schedule: Consolidation schedule string (e.g. ``"every 2h"``, ``"03:00"``).
-                Used together with *max_interim_count* to compute the sub-interval stamp.
-            max_interim_count: Number of sub-intervals per consolidation period.
-                Must be ≥ 1 (rejected at config load if < 1).
-            stamp: Override the computed sub-interval stamp.  Injected by tests so the
-                flooring logic can be exercised without mocking ``datetime.now()``.
-
-        Returns:
-            Result dict with at minimum::
-
-                {
-                    "triples_extracted": int,
-                    "new_keys": list[str],
-                    "adapter_name": str | None,   # None if cap_pending or noop
-                    "mode": "trained" | "cap_pending" | "noop",
-                    "overflow_slot": bool,         # True only on overflow mint
-                    "error": str | None,
-                }
-
-            ``overflow_slot`` is present and ``True`` only when an overflow
-            slot was minted (``N <= c < N + interim_overflow_slack``); absent
-            or ``False`` on normal mint, noop, and cap_pending.
-        """
-        # --- 1. Extract ---
-        episodic_rels, procedural_rels = self.extract_session(
-            session_transcript,
-            session_id,
-            speaker_id=speaker_id,
-            speaker_name=speaker_name,
-            ha_context=ha_context,
-        )
-
-        logger.info(
-            "post_session_train: session=%s extracted %d episodic relations",
-            session_id,
-            len(episodic_rels),
-        )
-
-        return self.run_consolidation_cycle(
-            episodic_rels,
-            procedural_rels,
-            speaker_id=speaker_id,
-            mode="train",
-            run_label=session_id,
-            schedule=schedule,
-            max_interim_count=max_interim_count,
-            stamp=stamp,
-            recall_sanity_threshold=recall_sanity_threshold,
-        )
 
     def run_consolidation_cycle(
         self,
@@ -5918,7 +5816,7 @@ class ConsolidationLoop:
                 ``1.0`` (nothing to prove → healthy by default).
             max_probe: Cap on probe size.  100 is chosen to keep the
                 probe cheap enough to run inline even inside the
-                post-session training path.
+                interim training path.
             debug_phase: When not ``None``, the per-key verdict (including
                 ``raw_output``) is persisted to the debug snapshot via
                 :meth:`~paramem.training.debug_snapshot.DebugSnapshotWriter.on_recall_probe`

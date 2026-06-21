@@ -25,7 +25,6 @@ callers own the SOTA fallback.
 
 import json
 import logging
-import time
 from dataclasses import dataclass, field
 
 from paramem.evaluation.recall import generate_answer
@@ -40,118 +39,6 @@ from paramem.server.tools.ha_client import HAClient
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_TURNS = 10
-
-
-def enqueue_post_session_train(
-    conversation_id: str,
-    transcript: str,
-    speaker_id: str,
-    speaker_name: str | None,
-    loop,
-    background_trainer,
-    config: "ServerConfig",
-    state: dict,
-    post_session_queue=None,
-) -> None:
-    """Enqueue a post-conversation training job on the BackgroundTrainer.
-
-    Submits a callable wrapping ``loop.post_session_train`` to
-    ``BackgroundTrainer.submit()``.  The single-slot worker thread holds the
-    GPU lock for the duration of each job, so jobs from concurrent ``/chat``
-    turns queue behind one another and execute serially.  This eliminates
-    concurrent-turn races on shared ``ConsolidationLoop`` state
-    (``_indexed_next_index``).
-
-    ``inference_fallback_adapter`` is set to ``"episodic"`` (the stable main
-    adapter) so that inference during a paused training job reads committed
-    weights rather than mid-training staging state.
-
-    After ``post_session_train`` returns, ``state["model"]`` is updated with
-    ``loop.model`` to pick up any PeftModel handle rebinding that
-    ``create_interim_adapter`` may have performed.
-
-    This function is intentionally side-effect free on the conversation path —
-    it never blocks the response being returned to the caller.
-
-    When *post_session_queue* is provided the entry for *conversation_id* is
-    removed from the persistent queue on successful completion of
-    ``post_session_train``.  The caller is responsible for calling
-    ``post_session_queue.enqueue(...)`` **before** calling this function so
-    that a crash between enqueue and training-start is recoverable on the next
-    server restart.
-
-    Args:
-        conversation_id: The conversation identifier (used as ``session_id``).
-        transcript: The full conversation transcript text (all turns joined).
-        speaker_id: Speaker identifier for key ownership scoping.
-        speaker_name: Human-readable speaker name for extraction personalisation.
-        loop: The live ``ConsolidationLoop`` instance (``_state["consolidation_loop"]``).
-        background_trainer: The live ``BackgroundTrainer`` instance
-            (``_state["background_trainer"]``).  Must not be ``None`` — callers
-            should guard with ``background_trainer is not None`` before calling.
-        config: Server config for ``schedule`` and ``max_interim_count``.
-        state: Global ``_state`` dict; ``state["model"]`` is updated after
-            training completes.
-        post_session_queue: Optional :class:`~paramem.server.post_session_queue.PostSessionQueue`
-            instance.  When provided, a successful training run removes
-            *conversation_id* from the queue so it is not replayed on the next
-            server restart.
-    """
-    if loop is None or background_trainer is None:
-        return
-
-    debounce_s = config.consolidation.training_idle_debounce_s
-    last_chat = state.get("last_chat_monotonic") if state is not None else None
-    # `last_chat is not None` first: migration tests pass a MagicMock config whose
-    # debounce_s is itself a MagicMock and would raise TypeError on `> 0`. The
-    # None short-circuit spares them. Mirrors the scheduler gate ordering.
-    if last_chat is not None and debounce_s > 0 and (time.monotonic() - last_chat) < debounce_s:
-        logger.info(
-            "post_session_train deferred: chat %.1fs ago < debounce %ds",
-            time.monotonic() - last_chat,
-            debounce_s,
-        )
-        # post_session_queue entry persists on disk (caller enqueued before this
-        # call); next scheduler tick drains via session_buffer, OR startup-replay
-        # picks it up after restart. No async wake-up needed here.
-        return
-
-    schedule = config.consolidation.refresh_cadence
-    max_interim_count = config.consolidation.max_interim_count
-
-    def _run_post_session_train() -> None:
-        """Execute post_session_train and update state. Runs in BackgroundTrainer worker."""
-        try:
-            result = loop.post_session_train(
-                session_transcript=transcript,
-                session_id=conversation_id,
-                speaker_id=speaker_id,
-                speaker_name=speaker_name,
-                schedule=schedule,
-                max_interim_count=max_interim_count,
-            )
-            # After post_session_train returns, update global model handle in case
-            # create_interim_adapter rebound the PeftModel wrapper.
-            state["model"] = loop.model
-            logger.info(
-                "post_session_train complete: mode=%s, adapter=%s, new_keys=%d",
-                result.get("mode"),
-                result.get("adapter_name"),
-                len(result.get("new_keys", [])),
-            )
-            # Remove the entry from the persistent queue on success so it is
-            # not replayed on the next server restart.
-            if post_session_queue is not None:
-                post_session_queue.remove(conversation_id)
-        except Exception:
-            logger.exception("post_session_train failed for conversation %s", conversation_id)
-            # Entry intentionally left in queue on failure so a future restart
-            # can retry.
-
-    background_trainer.submit(
-        _run_post_session_train,
-        inference_fallback_adapter="episodic",
-    )
 
 
 def _language_instruction(language: str | None, config: ServerConfig | None = None) -> str:

@@ -187,7 +187,7 @@ class ConsolidationConfig:
     # Minimum recall fraction (0, 1] that every recall gate must reach before the
     # adapter fold is accepted.  Applied to: post-save disk-integrity probes
     # (_verify_saved_adapter_from_disk), interim-cycle training
-    # (run_consolidation_cycle / post_session_train), full-fold training
+    # (run_consolidation_cycle), full-fold training
     # (consolidate_interim_adapters), housekeeping re-train (run_housekeeping),
     # and simulate→train migration (_migrate_tier_simulate_to_train).
     # 1.0 = sharp recall (all keys must be recalled, no tolerance); lower only with

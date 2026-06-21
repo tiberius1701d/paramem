@@ -1661,7 +1661,7 @@ def restore_bundle(
         #     slot dir and indexed_key_registry.json.
         #  5. Removing any other top-level entry under adapters/ (legacy flat
         #     episodic_interim_* dirs at the adapters root, stray files), EXCEPT
-        #     durable infra files at the adapters root (e.g. post_session_queue.json).
+        #     durable infra files at the adapters root (see infra_paths()).
         #
         # Critical: never delete a slot that step 5a just wrote — every rmtree/unlink
         # is guarded against the tracked paths in restored_main_slots /
@@ -1677,10 +1677,9 @@ def restore_bundle(
         from paramem.backup.encryption import infra_paths  # noqa: PLC0415
         from paramem.training.key_registry import KeyRegistry  # noqa: PLC0415 — local import guard
 
-        # Infra files that live directly at the adapters root — these are durable,
-        # restart-replayed files that must never be removed by the sweep.
-        # post_session_queue.json is the canonical example: it is NOT captured by
-        # the step-4 safety bundle, so deleting it is irreversible data loss.
+        # Infra files that live directly at the adapters root — these are durable
+        # files that must never be removed by the sweep (not captured by the
+        # step-4 safety bundle, so deleting them is irreversible data loss).
         # Reuse infra_paths() — single source of truth; future additions are
         # auto-protected without touching this code.
         adapters_root_infra = {p for p in infra_paths(data_dir) if p.parent == adapters_base}
@@ -1859,9 +1858,9 @@ def restore_bundle(
                     # captures these paths and they must not be mounted at boot.
                     #
                     # Exception: durable infra files at the adapters root
-                    # (e.g. post_session_queue.json) are restart-replayed and are NOT
-                    # captured by the step-4 safety bundle.  Skip them — deleting them
-                    # would be irreversible data loss of queued sessions.
+                    # (see infra_paths()) are NOT captured by the step-4 safety
+                    # bundle.  Skip them — deleting them would be irreversible
+                    # data loss.
                     if top_entry in adapters_root_infra:
                         continue
                     if top_entry.is_dir():

@@ -289,14 +289,6 @@ consolidation:
   # slots before keep-pending (each its own ordered adapter; VRAM budget proven
   # at startup using max_interim_count + interim_overflow_slack).
   interim_overflow_slack: 0
-  # Post-session (inline) training: extract and train facts immediately after
-  # each assistant response.  Default is false — facts accumulate via the
-  # scheduled consolidation cycle instead, which is lower-overhead and avoids
-  # continuous GPU use during conversations.  Set to true only if you need
-  # sub-cycle recall latency and your GPU budget allows continuous training.
-  # Missed triggers (server crash between session end and training start) are
-  # recovered automatically at the next startup via post_session_queue.json.
-  post_session_train_enabled: false
   # Thermal throttle: keeps the machine silent during background training.
   # Training pauses when GPU temp exceeds the limit and resumes when it cools.
   # Set to 0 to disable. Adjust to match your fan ramp-up threshold.

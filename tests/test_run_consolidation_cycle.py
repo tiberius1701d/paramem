@@ -1,17 +1,16 @@
-"""Unit tests for ConsolidationLoop.post_session_train.
+"""Unit tests for ConsolidationLoop.run_consolidation_cycle and related utilities.
 
 Pure-Python, no GPU required.  All heavy dependencies (extraction, training,
 adapter creation) are replaced with MagicMock objects so each test executes in
-milliseconds and verifies only the orchestration logic of post_session_train.
+milliseconds and verifies only the orchestration logic.
 
-Tests cover the post_session_train orchestration logic:
-  1. First call creates the interim adapter and returns mode="trained".
-  2. Second call within the same sub-interval reuses the adapter.
-  3. Stamp rollover creates a new adapter without touching the previous one.
-  4. Zero facts extracted → mode="noop", no adapter created.
-  5. Training failure → registry unchanged, no adapter saved.
-  6. max_interim_count=0 → config-rejected (ValueError from ConsolidationScheduleConfig).
-  7. Keys registered only AFTER training returns, not before.
+Tests cover:
+  1. Registry-last write order: adapter saved before registry.
+  2. save_from_bytes guard (raises when called outside consolidation window).
+  3. meta.json (manifest) written in the interim adapter slot.
+  4. Inter-tier commit recoverability: crash during commit leaves session pending.
+  5. session_ids provenance carry through _build_all_edge_entries_into.
+  6. Recall-failed sessions stay pending, bounded retry, incident recording.
 """
 
 from __future__ import annotations
@@ -145,8 +144,9 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
 
     # Stub out the recall probe so tests with a MagicMock model do not
     # feed it into re.sub (which raises TypeError on non-string input).
-    # These tests verify post_session_train orchestration, not recall gating;
-    # the probe is covered separately in test_consolidation_recall_early_stop.py.
+    # These tests verify run_consolidation_cycle orchestration, not recall
+    # gating; the probe is covered separately in
+    # test_consolidation_recall_early_stop.py.
     loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
 
     # Stub out _materialize_consolidation_graph so the B1 materialize step
@@ -173,444 +173,18 @@ def _fake_qa(n: int = 2) -> list[dict]:
     ]
 
 
-# ---------------------------------------------------------------------------
-# Test 1 — First call creates interim adapter and returns mode="trained"
-# ---------------------------------------------------------------------------
+def _make_mock_loop_with_procedural(tmp_path: Path):
+    """Like _make_mock_loop but with procedural_config set (enables procedural-routing)."""
+    from paramem.utils.config import AdapterConfig
 
-
-class TestFirstCallCreatesInterimAdapter:
-    def test_first_fact_creates_interim_adapter_and_returns_trained(self, tmp_path: Path) -> None:
-        """First call of the sub-interval creates the adapter, mode='trained'."""
-        loop = _make_mock_loop(tmp_path)
-        stamp = "20260418T1430"
-        adapter_name = f"episodic_interim_{stamp}"
-
-        def _create_side_effect(m, cfg, s):  # noqa: ANN001
-            m.peft_config[f"episodic_interim_{s}"] = MagicMock()
-            return m
-
-        with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                side_effect=_create_side_effect,
-            ),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-        ):
-            result = loop.post_session_train(
-                "Hello world transcript",
-                "conv-001",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        assert result["mode"] == "trained"
-        assert result["adapter_name"] == adapter_name
-        assert result["error"] is None
-        assert result["triples_extracted"] == 2
-
-    def test_first_call_creates_adapter_in_peft_config(self, tmp_path: Path) -> None:
-        """After first call the interim adapter name appears in model.peft_config."""
-        loop = _make_mock_loop(tmp_path)
-        stamp = "20260418T1430"
-
-        def _create_side_effect(m, cfg, s):  # noqa: ANN001
-            m.peft_config[f"episodic_interim_{s}"] = MagicMock()
-            return m
-
-        with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                side_effect=_create_side_effect,
-            ),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-        ):
-            loop.post_session_train(
-                "Transcript",
-                "conv-001",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        assert f"episodic_interim_{stamp}" in loop.model.peft_config
-
-
-# ---------------------------------------------------------------------------
-# Test 2 — Second call within the same sub-interval reuses adapter
-# ---------------------------------------------------------------------------
-
-
-class TestSecondCallReusesAdapter:
-    def test_second_call_does_not_call_create_interim_adapter_again(self, tmp_path: Path) -> None:
-        """create_interim_adapter is only called once per sub-interval."""
-        loop = _make_mock_loop(tmp_path)
-        stamp = "20260418T1430"
-
-        # Pre-populate peft_config to simulate first-call having already created it.
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-
-        with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
-            patch("paramem.memory.interim_adapter.create_interim_adapter") as mock_create,
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-        ):
-            loop.post_session_train(
-                "Second conversation",
-                "conv-002",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        mock_create.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Test 3 — Stamp rollover creates a new adapter
-# ---------------------------------------------------------------------------
-
-
-class TestStampRolloverCreatesNewAdapter:
-    def test_different_stamp_creates_new_adapter(self, tmp_path: Path) -> None:
-        """When the stamp rolls over, a new adapter is created without touching the old one."""
-        loop = _make_mock_loop(tmp_path)
-        old_stamp = "20260418T1400"
-        new_stamp = "20260418T1430"
-
-        # Simulate the old adapter already existing.
-        loop.model.peft_config[f"episodic_interim_{old_stamp}"] = MagicMock()
-
-        created_adapters = []
-
-        def _create_side_effect(m, cfg, s):  # noqa: ANN001
-            m.peft_config[f"episodic_interim_{s}"] = MagicMock()
-            created_adapters.append(s)
-            return m
-
-        with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                side_effect=_create_side_effect,
-            ) as mock_create,
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-        ):
-            result = loop.post_session_train(
-                "Rollover transcript",
-                "conv-003",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=new_stamp,
-            )
-
-        # Only the new adapter was created.
-        assert mock_create.call_count == 1
-        assert created_adapters == [new_stamp]
-        assert result["adapter_name"] == f"episodic_interim_{new_stamp}"
-        # Old adapter is untouched.
-        assert f"episodic_interim_{old_stamp}" in loop.model.peft_config
-
-
-# ---------------------------------------------------------------------------
-# Test 4 — Zero facts extracted is a noop
-# ---------------------------------------------------------------------------
-
-
-class TestZeroFactsIsNoop:
-    def test_zero_facts_returns_noop(self, tmp_path: Path) -> None:
-        """When extraction returns 0 QA pairs, mode='noop' with no side effects."""
-        loop = _make_mock_loop(tmp_path)
-
-        with (
-            patch.object(loop, "extract_session", return_value=([], [])),
-            patch("paramem.memory.interim_adapter.create_interim_adapter") as mock_create,
-        ):
-            result = loop.post_session_train(
-                "Empty transcript",
-                "conv-004",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp="20260418T1430",
-            )
-
-        assert result["mode"] == "noop"
-        assert result["triples_extracted"] == 0
-        assert result["new_keys"] == []
-        assert result["adapter_name"] is None
-        mock_create.assert_not_called()
-
-    def test_zero_facts_does_not_mutate_registry(self, tmp_path: Path) -> None:
-        """Registry is untouched when no facts are extracted."""
-        loop = _make_mock_loop(tmp_path)
-        initial_len = _count_registry_keys(loop)
-
-        with patch.object(loop, "extract_session", return_value=([], [])):
-            loop.post_session_train(
-                "Empty",
-                "conv-005",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp="20260418T1430",
-            )
-
-        assert _count_registry_keys(loop) == initial_len
-
-
-# ---------------------------------------------------------------------------
-# Test 5 — Training failure keeps registry clean
-# ---------------------------------------------------------------------------
-
-
-class TestTrainingFailureKeepsRegistryClean:
-    def test_training_exception_does_not_mutate_registry(self, tmp_path: Path) -> None:
-        """When train_adapter raises, no keys are added to the registry."""
-        loop = _make_mock_loop(tmp_path)
-        stamp = "20260418T1430"
-
-        def _raise(*args, **kwargs):
-            raise RuntimeError("Simulated training failure")
-
-        with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                side_effect=lambda m, cfg, s: m,
-            ),
-            patch("paramem.training.trainer.train_adapter", side_effect=_raise),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-        ):
-            loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-            with pytest.raises(RuntimeError, match="Simulated training failure"):
-                loop.post_session_train(
-                    "Transcript",
-                    "conv-006",
-                    speaker_id="Speaker0",
-                    schedule="every 2h",
-                    max_interim_count=4,
-                    stamp=stamp,
-                )
-
-        # Registry must be unchanged after the training error.
-        assert _count_registry_keys(loop) == 0
-
-    def test_training_failure_does_not_save_registry_to_disk(self, tmp_path: Path) -> None:
-        """On training failure, no registry file is written to disk."""
-        loop = _make_mock_loop(tmp_path)
-        stamp = "20260418T1430"
-        registry_path = tmp_path / "indexed_key_registry.json"
-
-        def _raise(*args, **kwargs):
-            raise RuntimeError("boom")
-
-        with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                side_effect=lambda m, cfg, s: m,
-            ),
-            patch("paramem.training.trainer.train_adapter", side_effect=_raise),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-        ):
-            loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-            with pytest.raises(RuntimeError):
-                loop.post_session_train(
-                    "Transcript",
-                    "conv-007",
-                    speaker_id="Speaker0",
-                    schedule="every 2h",
-                    max_interim_count=4,
-                    stamp=stamp,
-                )
-
-        assert not registry_path.exists()
-
-
-# ---------------------------------------------------------------------------
-# Test 6 — max_interim_count == 0 → config-rejected
-# ---------------------------------------------------------------------------
-
-
-class TestMaxInterimCountZeroQueues:
-    def test_zero_count_config_rejected(self) -> None:
-        """max_interim_count=0 is rejected by ConsolidationScheduleConfig.__post_init__.
-
-        The queue-until-consolidation path (count==0) has been removed.
-        The config validator prevents this misconfiguration at startup.
-        """
-        from paramem.server.config import ConsolidationScheduleConfig
-
-        with pytest.raises(ValueError, match="max_interim_count must be >= 1"):
-            ConsolidationScheduleConfig(max_interim_count=0)
-
-
-# ---------------------------------------------------------------------------
-# Registry update happens AFTER training, not before
-# ---------------------------------------------------------------------------
-
-
-class TestRegisterAfterSuccessNotBefore:
-    def test_registry_empty_until_training_completes(self, tmp_path: Path) -> None:
-        """Keys are added to the registry only after train_adapter returns."""
-        loop = _make_mock_loop(tmp_path)
-        stamp = "20260418T1430"
-        registry_before_training = []
-
-        def _capture_registry_state(*args, **kwargs):
-            """Record registry length at the moment training is called."""
-            registry_before_training.append(_count_registry_keys(loop))
-
-        with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                side_effect=lambda m, cfg, s: m,
-            ),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                side_effect=_capture_registry_state,
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-        ):
-            loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-            loop.post_session_train(
-                "Transcript",
-                "conv-011",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        # Registry must have been empty when train_adapter was called.
-        assert registry_before_training == [0], (
-            f"Expected 0 keys before training, got: {registry_before_training}"
-        )
-
-    def test_registry_populated_after_training_succeeds(self, tmp_path: Path) -> None:
-        """After successful training, newly extracted keys appear in the registry."""
-        loop = _make_mock_loop(tmp_path)
-        stamp = "20260418T1430"
-
-        with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                side_effect=lambda m, cfg, s: m,
-            ),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-        ):
-            loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-            result = loop.post_session_train(
-                "Transcript",
-                "conv-012",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        # Two facts extracted → two keys registered.
-        # With per-tier dict API: each new key lives in the interim tier entry.
-        interim_tier = f"episodic_interim_{stamp}"
-        assert len(result["new_keys"]) == 2
-        for k in result["new_keys"]:
-            # Key must be in the interim tier's registry (tier = dict key).
-            assert interim_tier in loop.indexed_key_registry, (
-                f"Interim tier {interim_tier!r} missing from registry dict"
-            )
-            assert k in loop.store.registry(interim_tier), (
-                f"Key {k!r} not found in interim tier {interim_tier!r}"
-            )
-
-
-# ---------------------------------------------------------------------------
-# Helpers for call-order, cleanup, and roundtrip tests
-# ---------------------------------------------------------------------------
+    loop = _make_mock_loop(tmp_path)
+    proc_cfg = AdapterConfig(rank=4, alpha=8, learning_rate=1e-4, target_modules=["q_proj"])
+    loop.procedural_config = proc_cfg
+    return loop
 
 
 def _fake_proc_rels(n: int = 2) -> list[dict]:
-    """Return n synthetic procedural-relation dicts (as returned by extract_session)."""
+    """Return n synthetic procedural-relation dicts."""
     return [
         {
             "subject": f"Subject{i}",
@@ -622,407 +196,13 @@ def _fake_proc_rels(n: int = 2) -> list[dict]:
     ]
 
 
-def _make_mock_loop_with_procedural(tmp_path: Path):
-    """Like _make_mock_loop but with procedural_config set (enables procedural-routing)."""
-    from paramem.utils.config import AdapterConfig
-
-    loop = _make_mock_loop(tmp_path)
-    proc_cfg = AdapterConfig(rank=4, alpha=8, learning_rate=1e-4, target_modules=["q_proj"])
-    loop.procedural_config = proc_cfg
-    return loop
-
-
-# Shared patch list for a successful post_session_train call (no procedural).
-_COMMON_PATCHES = [
-    "paramem.memory.interim_adapter.create_interim_adapter",
-    "paramem.training.trainer.train_adapter",
-    "paramem.training.consolidation.format_entry_training",
-    "paramem.models.loader.switch_adapter",
-    "paramem.training.consolidation.build_registry",
-    "paramem.models.loader.save_adapter",
-]
-
-
 # ---------------------------------------------------------------------------
-# Test 9 — procedural_rels are routed to the procedural adapter
-# ---------------------------------------------------------------------------
-
-
-class TestProceduralRelsRoutedToProceduralAdapter:
-    """Procedural relations must reach the interim training set, not be silently dropped.
-
-    B5: procedural-typed edges flow into the same interim slot as episodic facts.
-    The per-cycle ``_run_indexed_key_procedural`` helper is deleted; proc facts
-    reach the training set via ``merger.graph`` (merged by ``extract_session`` /
-    ``run_cycle``).  Tests here verify the pass-through contract at the
-    ``run_consolidation_cycle`` boundary.
-    """
-
-    def test_procedural_rels_passed_to_run_consolidation_cycle(self, tmp_path: Path) -> None:
-        """post_session_train forwards procedural_rels to run_consolidation_cycle.
-
-        B5: proc_rels are still forwarded as the second positional argument so
-        the "no-relations" guard fires correctly.  The actual proc-fact training
-        happens via merger.graph (merged inside the real extract_session), not via
-        a separate per-cycle training call.
-        """
-        loop = _make_mock_loop_with_procedural(tmp_path)
-        stamp = "20260418T1430"
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-
-        captured_proc_rels: list = []
-
-        def _capture_cycle(episodic_rels, procedural_rels, **kwargs):
-            captured_proc_rels.extend(procedural_rels)
-            return {"mode": "trained", "new_keys": [], "adapter_name": None}
-
-        with (
-            patch.object(
-                loop,
-                "extract_session",
-                return_value=(_fake_qa(2), _fake_proc_rels(1)),
-            ),
-            patch.object(loop, "run_consolidation_cycle", side_effect=_capture_cycle),
-        ):
-            loop.post_session_train(
-                "Transcript with prefs",
-                "conv-p-001",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        assert len(captured_proc_rels) == 1, (
-            f"Expected 1 procedural rel forwarded to run_consolidation_cycle; "
-            f"got {captured_proc_rels}"
-        )
-
-    def test_empty_proc_rels_forwarded_to_cycle(self, tmp_path: Path) -> None:
-        """post_session_train forwards empty procedural_rels when extract returns none."""
-        loop = _make_mock_loop_with_procedural(tmp_path)
-        stamp = "20260418T1430"
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-
-        captured_proc_rels: list = []
-
-        def _capture_cycle(episodic_rels, procedural_rels, **kwargs):
-            captured_proc_rels.extend(procedural_rels)
-            return {"mode": "trained", "new_keys": [], "adapter_name": None}
-
-        with (
-            patch.object(
-                loop,
-                "extract_session",
-                return_value=(_fake_qa(2), []),  # empty procedural_rels
-            ),
-            patch.object(loop, "run_consolidation_cycle", side_effect=_capture_cycle),
-        ):
-            loop.post_session_train(
-                "Transcript no prefs",
-                "conv-p-002",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        assert captured_proc_rels == [], (
-            f"Empty procedural_rels must be forwarded as-is; got {captured_proc_rels}"
-        )
-
-    def test_procedural_config_none_does_not_raise(self, tmp_path: Path) -> None:
-        """post_session_train completes normally when procedural_config is None.
-
-        B5: procedural-config=None means partition_relations classifies ALL
-        edges as episodic.  No procedural keys are minted; the cycle still
-        trains on the episodic-only set.
-        """
-        loop = _make_mock_loop(tmp_path)  # procedural_config=None by default
-        stamp = "20260418T1430"
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-
-        def _capture_cycle(episodic_rels, procedural_rels, **kwargs):
-            return {"mode": "trained", "new_keys": [], "adapter_name": None}
-
-        with (
-            patch.object(
-                loop,
-                "extract_session",
-                return_value=(_fake_qa(2), _fake_proc_rels(2)),
-            ),
-            patch.object(loop, "run_consolidation_cycle", side_effect=_capture_cycle),
-        ):
-            result = loop.post_session_train(
-                "Transcript",
-                "conv-p-003",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        # No exception; mode reflects what the cycle returned.
-        assert result.get("mode") == "trained"
-
-    def test_training_abort_leaves_registry_clean(self, tmp_path: Path) -> None:
-        """train_adapter returning aborted=True leaves the registry unchanged.
-
-        B5: there is ONE unified interim training pass covering both episodic
-        and procedural entries.  When training aborts, the deferred-flush block
-        is skipped and no new keys are registered.
-
-        Pre-conditions
-        --------------
-        - One old procedural key ``proc0`` exists in the store.
-
-        Post-conditions after abort
-        ---------------------------
-        - ``indexed_key_registry`` contains only the pre-existing entry.
-        - No new proc- or graph-prefixed keys were added.
-        """
-        loop = _make_mock_loop_with_procedural(tmp_path)
-        stamp = "20260418T1430"
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-
-        old_proc_key = "proc0"
-        loop.store.put_simhash("procedural", old_proc_key, 0xDEADBEEF)
-        loop.store.put(
-            "procedural",
-            old_proc_key,
-            {
-                "key": old_proc_key,
-                "subject": "Subject1",
-                "predicate": "prefers",
-                "object": "OldThing",
-                "speaker_id": "",
-                "first_seen_cycle": 1,
-            },
-        )
-
-        with (
-            patch.object(
-                loop,
-                "extract_session",
-                return_value=(_fake_qa(2), _fake_proc_rels(1)),
-            ),
-            patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"train_loss": 0.5, "aborted": True},
-            ),
-            patch(
-                "paramem.training.consolidation.format_entry_training",
-                return_value=[{}],
-            ),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch(
-                "paramem.training.consolidation.build_registry",
-                return_value={},
-            ),
-        ):
-            result = loop.run_consolidation_cycle(
-                _fake_qa(2),
-                _fake_proc_rels(1),
-                speaker_id="Speaker0",
-                mode="train",
-                run_label="conv-p-004",
-                stamp=stamp,
-            )
-
-        assert result.get("mode") == "aborted", (
-            f"Expected mode='aborted' after train_adapter returns aborted=True; got {result}"
-        )
-
-        # Only the pre-existing proc0 is in the store — no new keys.
-        proc_keys = list(loop.store.active_keys_in_tier("procedural"))
-        assert proc_keys == [old_proc_key], (
-            f"Only pre-existing procedural key '{old_proc_key}' must survive abort; "
-            f"found: {proc_keys}"
-        )
-        # Old key simhash must be intact.
-        assert old_proc_key in loop.store.tier_simhashes("procedural", include_stale=False), (
-            "Old procedural key simhash must be untouched after abort."
-        )
-
-    def test_post_session_train_propagates_extract_error(self, tmp_path: Path) -> None:
-        """An error raised by extract_session propagates out of post_session_train.
-
-        B5 removed the ``_current_interim_stamp`` finally-guard on the procedural
-        path.  Errors from extract_session now propagate normally without any
-        per-cycle stamp cleanup (there is nothing to clean up at the cycle level).
-        """
-        loop = _make_mock_loop_with_procedural(tmp_path)
-        stamp = "20260418T1430"
-
-        with (
-            patch.object(
-                loop,
-                "extract_session",
-                side_effect=RuntimeError("extraction failed"),
-            ),
-        ):
-            with pytest.raises(RuntimeError, match="extraction failed"):
-                loop.post_session_train(
-                    "Transcript",
-                    "conv-p-005",
-                    speaker_id="Speaker0",
-                    schedule="every 2h",
-                    max_interim_count=4,
-                    stamp=stamp,
-                )
-
-
-# ---------------------------------------------------------------------------
-# Test 10 — output directory uniqueness across stamps and calls
-# ---------------------------------------------------------------------------
-
-
-class TestTrainingOutputDirUniqueness:
-    """Consecutive post_session_train calls must not share an output directory."""
-
-    def _run_and_capture_output_dirs(self, loop, *, stamp: str, session_id: str) -> list[str]:
-        """Run post_session_train and return all output_dir paths passed to train_adapter."""
-        captured: list[str] = []
-
-        def _capture_train(*args, **kwargs):
-            captured.append(str(kwargs.get("output_dir", "")))
-
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-
-        with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
-            patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch("paramem.training.trainer.train_adapter", side_effect=_capture_train),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-        ):
-            loop.post_session_train(
-                "Transcript",
-                session_id,
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        return captured
-
-    def test_output_dir_contains_interim_stamp(self, tmp_path: Path) -> None:
-        """Training output dir must include the interim stamp, not cycle_count."""
-        loop = _make_mock_loop(tmp_path)
-        stamp = "20260418T1430"
-
-        dirs = self._run_and_capture_output_dirs(loop, stamp=stamp, session_id="conv-d-001")
-
-        assert len(dirs) == 1
-        assert f"interim_{stamp}" in dirs[0], f"Expected interim_{stamp} in '{dirs[0]}'"
-        # Must NOT contain cycle_0 (the initial cycle_count value).
-        assert "cycle_0" not in dirs[0]
-
-    def test_two_calls_same_stamp_use_same_dir(self, tmp_path: Path) -> None:
-        """Two calls with the same stamp land in the same output directory.
-
-        This is correct — within a sub-interval the adapter accumulates facts.
-        Both calls write to interim_<stamp>/<adapter_name>/.
-        """
-        loop = _make_mock_loop(tmp_path)
-        stamp = "20260418T1430"
-
-        dirs_first = self._run_and_capture_output_dirs(loop, stamp=stamp, session_id="conv-d-002a")
-        # Need to add the adapter to peft_config again (cleared between calls in the helper).
-        dirs_second = self._run_and_capture_output_dirs(loop, stamp=stamp, session_id="conv-d-002b")
-
-        assert dirs_first == dirs_second, (
-            f"Same stamp must produce same output dir: {dirs_first} vs {dirs_second}"
-        )
-
-    def test_two_calls_different_stamps_use_different_dirs(self, tmp_path: Path) -> None:
-        """Two calls with different stamps must produce different output directories."""
-        loop = _make_mock_loop(tmp_path)
-        stamp_a = "20260418T1400"
-        stamp_b = "20260418T1430"
-
-        dirs_a = self._run_and_capture_output_dirs(loop, stamp=stamp_a, session_id="conv-d-003a")
-        dirs_b = self._run_and_capture_output_dirs(loop, stamp=stamp_b, session_id="conv-d-003b")
-
-        assert dirs_a != dirs_b, (
-            f"Different stamps must produce different output dirs: {dirs_a} vs {dirs_b}"
-        )
-        assert f"interim_{stamp_a}" in dirs_a[0]
-        assert f"interim_{stamp_b}" in dirs_b[0]
-
-    def test_interim_slot_output_dir_uses_stamp(self, tmp_path: Path) -> None:
-        """Training output dir uses the interim stamp (B5: single unified slot for all facts).
-
-        B5: procedural and episodic entries now train in the SAME interim slot.
-        There is exactly ONE train_adapter call per cycle; its output_dir must
-        contain the stamp so checkpoints are namespace-isolated per sub-interval.
-        """
-        loop = _make_mock_loop_with_procedural(tmp_path)
-        stamp = "20260418T1430"
-        loop.model.peft_config[f"episodic_interim_{stamp}"] = MagicMock()
-
-        captured_dirs: list[str] = []
-
-        def _capture_train(*args, **kwargs):
-            captured_dirs.append(str(kwargs.get("output_dir", "")))
-            return {"train_loss": 0.1, "aborted": False}
-
-        with (
-            patch.object(
-                loop,
-                "extract_session",
-                return_value=(_fake_qa(2), _fake_proc_rels(1)),
-            ),
-            patch("paramem.memory.interim_adapter.create_interim_adapter"),
-            patch("paramem.training.trainer.train_adapter", side_effect=_capture_train),
-            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
-            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
-            patch.object(loop, "_make_training_config", return_value=MagicMock()),
-            patch.object(loop, "_disable_gradient_checkpointing"),
-            patch.object(loop, "_enable_gradient_checkpointing"),
-            patch("paramem.models.loader.switch_adapter"),
-            patch("paramem.training.consolidation.build_registry", return_value={}),
-            patch("paramem.models.loader.save_adapter"),
-            patch("paramem.memory.persistence.commit_tier_slot"),
-        ):
-            loop.post_session_train(
-                "Transcript with prefs",
-                "conv-d-004",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=4,
-                stamp=stamp,
-            )
-
-        assert len(captured_dirs) == 1, (
-            f"B5: expected exactly ONE train_adapter call (unified interim slot); "
-            f"got {len(captured_dirs)} with dirs: {captured_dirs}"
-        )
-        assert f"interim_{stamp}" in captured_dirs[0], (
-            f"Unified interim training output dir must contain stamp {stamp!r}; "
-            f"got {captured_dirs[0]!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test 11 — registry-last write order and restart-time consistency
+# Test 1 — registry-last write order and restart-time consistency
 # ---------------------------------------------------------------------------
 
 
 class TestRegistryLastWriteOrder:
-    """Registry save must be the LAST disk write in post_session_train;
+    """Registry save must be the LAST disk write in run_consolidation_cycle;
     adapter-save failure must leave no registry entry on disk.
     """
 
@@ -1050,7 +230,6 @@ class TestRegistryLastWriteOrder:
             call_order.append("save_from_bytes")
 
         with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch(
                 "paramem.training.trainer.train_adapter",
@@ -1070,10 +249,12 @@ class TestRegistryLastWriteOrder:
             ),
             patch.object(KeyRegistry, "save_from_bytes", side_effect=_record_save_from_bytes),
         ):
-            loop.post_session_train(
-                "Transcript",
-                "conv-i5-001",
+            loop.run_consolidation_cycle(
+                _fake_qa(2),
+                [],
                 speaker_id="Speaker0",
+                mode="train",
+                run_label="conv-i5-001",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=stamp,
@@ -1105,7 +286,6 @@ class TestRegistryLastWriteOrder:
             raise OSError("disk full")
 
         with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(1), [])),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch(
                 "paramem.training.trainer.train_adapter",
@@ -1122,10 +302,12 @@ class TestRegistryLastWriteOrder:
             patch("paramem.models.loader.save_adapter", side_effect=_fail_save_adapter),
         ):
             with pytest.raises(OSError, match="disk full"):
-                loop.post_session_train(
-                    "Transcript",
-                    "conv-i5-002",
+                loop.run_consolidation_cycle(
+                    _fake_qa(1),
+                    [],
                     speaker_id="Speaker0",
+                    mode="train",
+                    run_label="conv-i5-002",
                     schedule="every 2h",
                     max_interim_count=4,
                     stamp=stamp,
@@ -1337,7 +519,7 @@ class TestRegistryLastWriteOrder:
 
 
 # ---------------------------------------------------------------------------
-# Test 12 — save_from_bytes guard (raises when called outside consolidation window)
+# Test 2 — save_from_bytes guard (raises when called outside consolidation window)
 # ---------------------------------------------------------------------------
 
 
@@ -1416,12 +598,12 @@ class TestSaveFromBytesGuard:
 
 
 # ---------------------------------------------------------------------------
-# Test 13 — meta.json written inside post_session_train slot
+# Test 3 — meta.json written inside the interim adapter slot
 # ---------------------------------------------------------------------------
 
 
-class TestManifestWrittenPostSession:
-    """post_session_train must embed meta.json in the interim adapter slot.
+class TestManifestWritten:
+    """run_consolidation_cycle must embed meta.json in the interim adapter slot.
 
     Verifies that build_manifest_for is called and atomic_save_adapter
     writes meta.json alongside the adapter weights.  Uses a real
@@ -1430,7 +612,7 @@ class TestManifestWrittenPostSession:
     """
 
     def test_meta_json_written_in_interim_slot(self, tmp_path: Path) -> None:
-        """meta.json must be present in the timestamped slot after post_session_train."""
+        """meta.json must be present in the timestamped slot after run_consolidation_cycle."""
         from paramem.adapters.manifest import AdapterManifest, read_manifest
 
         loop = _make_mock_loop(tmp_path)
@@ -1468,7 +650,6 @@ class TestManifestWrittenPostSession:
         loop.model.peft_config[adapter_name] = lora_cfg
 
         with (
-            patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch(
                 "paramem.training.trainer.train_adapter",
@@ -1482,10 +663,12 @@ class TestManifestWrittenPostSession:
             patch("paramem.models.loader.switch_adapter"),
             patch("paramem.training.consolidation.build_registry", return_value={}),
         ):
-            result = loop.post_session_train(
-                "Transcript",
-                "conv-manifest-001",
+            result = loop.run_consolidation_cycle(
+                _fake_qa(2),
+                [],
                 speaker_id="Speaker0",
+                mode="train",
+                run_label="conv-manifest-001",
                 schedule="every 2h",
                 max_interim_count=4,
                 stamp=stamp,
@@ -1520,8 +703,7 @@ class TestInterTierCommitRecoverable:
     B5: the unified interim slot now covers both episodic and procedural entries
     in a SINGLE ``commit_tier_slot`` call (step 12 of run_consolidation_cycle).
     If that commit crashes, the session is NOT marked consolidated — the production
-    caller (``app.py`` post-session tick) calls ``session_buffer.mark_consolidated``
-    ONLY after the cycle returns successfully.
+    caller marks ``mark_consolidated`` ONLY after the cycle returns successfully.
 
     Reference: ``run_consolidation_cycle`` (consolidation.py step 12) commits the
     single interim slot; the production caller marks consolidated ONLY after return.
@@ -1548,11 +730,6 @@ class TestInterTierCommitRecoverable:
             session_marked_consolidated.append(session_id)
 
         with (
-            patch.object(
-                loop,
-                "extract_session",
-                return_value=(_fake_qa(2), _fake_proc_rels(1)),
-            ),
             patch("paramem.memory.interim_adapter.create_interim_adapter"),
             patch(
                 "paramem.training.trainer.train_adapter",
@@ -1571,10 +748,12 @@ class TestInterTierCommitRecoverable:
             ),
         ):
             try:
-                loop.post_session_train(
-                    "Transcript with prefs",
-                    "conv-recover-001",
+                loop.run_consolidation_cycle(
+                    _fake_qa(2),
+                    _fake_proc_rels(1),
                     speaker_id="Speaker0",
+                    mode="train",
+                    run_label="conv-recover-001",
                     schedule="every 2h",
                     max_interim_count=4,
                     stamp=stamp,
@@ -1775,8 +954,8 @@ class TestRecallFailedSessionStaysPending:
     §3, S-4) is validated without GPU or model weights.
 
     Test strategy:
-    - Call run_consolidation_cycle directly (not post_session_train) so we
-      can control the graph and probe stub precisely.
+    - Call run_consolidation_cycle directly so we can control the graph and
+      probe stub precisely.
     - Set up the merger graph with an edge tagged with a real session id so
       rec["session_ids"] carries it through the harvest path (B7-A).
     - Override _probe_passing_keys to exclude one key, triggering the drop

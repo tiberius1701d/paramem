@@ -251,15 +251,15 @@ class TestAbortForInference:
 
 
 # ---------------------------------------------------------------------------
-# Test 10 — submit() serialises concurrent post-session jobs
+# Test 10 — submit() serialises concurrent BG-trainer jobs
 # ---------------------------------------------------------------------------
 
 
 class TestSubmitSerialises:
-    """Blocker B2/B4 fix: submit() routes through BackgroundTrainer's single worker.
+    """submit() routes all jobs through BackgroundTrainer's single worker thread.
 
-    Two concurrent /chat responses both call enqueue_post_session_train, which
-    calls BackgroundTrainer.submit().  Jobs must run serially — the second waits
+    Two concurrent /chat responses both submit consolidation jobs via
+    BackgroundTrainer.submit().  Jobs must run serially — the second waits
     for the first to complete — and shared ConsolidationLoop state
     (_indexed_next_index) must advance by exactly the combined triple count with
     no interleaving.
@@ -268,7 +268,7 @@ class TestSubmitSerialises:
     def test_two_jobs_run_serially_no_registry_collision(self) -> None:
         """Two submitted jobs run serially; _indexed_next_index advances by combined count.
 
-        Simulates two /chat responses each submitting a post_session_train job
+        Simulates two /chat responses each submitting a consolidation job
         that increments a shared counter by a known amount.  Asserts:
         1. Both jobs execute (execution order is enforced by queue drain).
         2. The counter equals start + increment_A + increment_B (no lost updates,

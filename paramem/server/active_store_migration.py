@@ -525,7 +525,7 @@ def _migrate_tier_simulate_to_train(
        then ``switch_adapter`` so training writes into this adapter.
     4. ``format_entry_training`` + ``_indexed_dataset`` to build the
        HF dataset; gradient checkpointing toggled around the format call
-       to mirror the existing post_session_train pattern.
+       to mirror the run_consolidation_cycle pattern.
     5. ``train_adapter`` with the resolved adapter config and the loop's
        configured num_epochs.
     6. Recall probe via ``loop._run_recall_sanity_probe(name, entries)``
@@ -590,8 +590,7 @@ def _migrate_tier_simulate_to_train(
     switch_adapter(loop.model, name)
 
     # Step 4: build training dataset. Disable gradient checkpointing for the
-    # tokenizer call (matches the post_session_train pattern at
-    # consolidation.py:2692-2696); re-enable before training.
+    # tokenizer call (matches run_consolidation_cycle pattern); re-enable before training.
     loop._disable_gradient_checkpointing()
     examples = _format_training(entries, loop.tokenizer, max_length=1024)
     if not examples:

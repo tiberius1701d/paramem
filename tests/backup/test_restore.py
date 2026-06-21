@@ -1682,42 +1682,6 @@ class TestOrphanInterimPruning:
             "episodic tier dir survives (it hosts interims); must not appear in pruned_orphans"
         )
 
-    # ----- NEW scenario 6: total-tree assertion ------------------------------
-
-    def test_post_session_queue_survives_restore(self, tmp_path) -> None:
-        """adapters/post_session_queue.json is NOT deleted by the clean-slate sweep.
-
-        This file is a durable, restart-replayed infra file (listed in
-        infra_paths()) that lives at the adapters root.  It is NOT captured by
-        the step-4 safety bundle, so the sweep must skip it — deleting it would
-        be irreversible data loss of queued sessions.
-
-        Guards fix B1.
-        """
-        bundle_slot, src = _build_bundle(tmp_path)
-        scratch = tmp_path / "scratch"
-        scratch.mkdir()
-        config_path = scratch / "server.yaml"
-        config_path.write_bytes(b"model: mistral\n")
-
-        # Plant a post_session_queue.json at adapters/ root before restore.
-        adapters_root = scratch / "adapters"
-        adapters_root.mkdir(parents=True, exist_ok=True)
-        queue_path = adapters_root / "post_session_queue.json"
-        queue_content = b'[{"session_id": "abc123", "speaker_id": "spk1"}]'
-        queue_path.write_bytes(queue_content)
-
-        result = restore_bundle(bundle_slot, data_dir=scratch, config_path=config_path)
-
-        assert isinstance(result, RestoreResult)
-        assert queue_path.exists(), (
-            "adapters/post_session_queue.json must NOT be deleted by restore_bundle sweep; "
-            "it is a durable infra file not captured by the safety bundle"
-        )
-        assert queue_path.read_bytes() == queue_content, (
-            "post_session_queue.json bytes must be unmodified after restore"
-        )
-
     def test_combined_main_and_interim_same_tier(self, tmp_path) -> None:
         """Tier with both a finalized main slot AND a bundle interim family: both survive.
 

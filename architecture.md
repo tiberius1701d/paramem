@@ -208,7 +208,7 @@ These constraints are encoded as defaults in the training config, overridable pe
 
 ### AD-20: Staging+Promote Adapter Contract (Phase 5)
 
-Every adapter training event — consolidation cycle, post-session train, interim mint, base-swap Phase B — runs through a two-slot **staging+promote** contract, not directly on the production tier. The contract has one entry point (`paramem/training/trainer.py::train_adapter`) and one staging slot per process (`in_training`).
+Every adapter training event — consolidation cycle, interim mint, base-swap Phase B — runs through a two-slot **staging+promote** contract, not directly on the production tier. The contract has one entry point (`paramem/training/trainer.py::train_adapter`) and one staging slot per process (`in_training`).
 
 **Two-slot rationale.** Mutating production weights in place is unsafe across two failure modes: (1) crash mid-training would leave the production slot in a half-trained state with no rollback path; (2) the recall sanity gate can reject the trained adapter (recall < 1.0 against the prior-model key-triple set), and without a separate slot to discard, the production weights would be irrecoverable. Production stays byte-identical to the last committed state until training completes, the recall gate passes at 1.0, and the new weights have been promoted by an explicit `copy_adapter_weights(staging → production)` step.
 

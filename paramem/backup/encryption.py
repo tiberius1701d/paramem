@@ -307,7 +307,6 @@ def infra_paths(data_dir: Path) -> list[Path]:
         # endpoint registrations.
         data_dir / "vapid_keys.json",
         data_dir / "push_subscriptions.json",
-        data_dir / "adapters" / "post_session_queue.json",
     ]
     # Per-tier adapter registry + graph (unified layout:
     # <adapters>/<tier>/<file> for main slots;

@@ -60,10 +60,8 @@ from paramem.server.incidents import (
 from paramem.server.inference import (
     ChatResult,
     _escalate_to_sota,
-    enqueue_post_session_train,
     handle_chat,
 )
-from paramem.server.post_session_queue import PostSessionQueue
 from paramem.server.router import QueryRouter
 from paramem.server.run_status import read_last_runs, record_last_run
 from paramem.server.session_buffer import SessionBuffer  # "session" here = conversation
@@ -155,7 +153,6 @@ _state = {
     "reclaim_task": None,
     "config_path": None,
     "config_drift_task": None,
-    "post_session_queue": None,  # PostSessionQueue instance (local mode only)
     "mode": "local",  # "local" or "cloud-only"
     "cloud_only_reason": None,  # "explicit", "training", "gpu_conflict", or None
     "cloud_only_startup": False,  # set by --cloud-only CLI flag before app start
@@ -334,8 +331,7 @@ class StatusResponse(BaseModel):
     max_interim_count: int = 0
     mode_config: str = ""  # "train" or "simulate"
     next_run_seconds: int | None = None  # seconds until next FULL consolidation
-    # Seconds until the next interim cadence boundary (post_session_train
-    # rolls over to a new stamp at every such boundary). None when refresh
+    # Seconds until the next interim cadence boundary. None when refresh
     # cadence is disabled.
     next_interim_seconds: int | None = None
     orphaned_pending: int = 0  # pending sessions without speaker_id
@@ -2265,6 +2261,12 @@ async def lifespan(app: FastAPI):
     # the marker.  The config was already renamed in Phase A, so candidate_path_str
     # can be any sentinel (unused when candidate file is gone); live_config_path
     # is the current config path.
+    # Ensure the local-mode adapter directory exists before the first root-level
+    # write. Boot-time readers (iter_interim_dirs, registry preload) already
+    # tolerate a missing directory; this guarantees it for writes.
+    if not cloud_only:
+        config.adapter_dir.mkdir(parents=True, exist_ok=True)
+
     _bs_resume = _state.pop("_base_swap_resume_marker", None)
     if _bs_resume is not None and not cloud_only:
         _bs_live_cfg = (
@@ -2293,68 +2295,6 @@ async def lifespan(app: FastAPI):
             _bs_resume.old_model,
             _bs_resume.new_model,
         )
-
-    # --- Post-session queue: persistent queue for missed training triggers ---
-    # Instantiate the queue in local mode so the chat handler can use it.
-    # In cloud-only mode there is no model to train — skip.
-    if not cloud_only:
-        _queue_path = config.adapter_dir / "post_session_queue.json"
-        # Ensure the adapter directory exists (may not exist on fresh install).
-        config.adapter_dir.mkdir(parents=True, exist_ok=True)
-        _state["post_session_queue"] = PostSessionQueue(_queue_path)
-
-        # Replay any entries that were enqueued before a previous restart.
-        # We need the ConsolidationLoop + BackgroundTrainer to replay — create
-        # them lazily here only when there are entries to process.
-        if config.consolidation.post_session_train_enabled:
-            _pending = _state["post_session_queue"].peek()
-            if _pending:
-                logger.info(
-                    "post_session_queue: %d pending entry(s) from previous run — replaying",
-                    len(_pending),
-                )
-                from paramem.server.consolidation import create_consolidation_loop
-
-                if _state.get("consolidation_loop") is None:
-                    _replay_loop = create_consolidation_loop(
-                        _state["model"],
-                        _state["tokenizer"],
-                        config,
-                        _state["memory_store"],
-                        state_provider=lambda: _state,
-                    )
-                    _state["consolidation_loop"] = _replay_loop
-                    _state["model"] = _replay_loop.model
-
-                _replay_bt = _active_bg_trainer(config)
-
-                # Wire the BG trainer into the consolidation loop so its abort
-                # event is included in the training hooks shutdown predicate.
-                _state["consolidation_loop"]._bg_trainer = _replay_bt
-
-                # Drain and replay — entries are removed individually upon
-                # successful completion inside enqueue_post_session_train's
-                # wrapper (same pattern as the chat handler path).
-                _replay_entries = _state["post_session_queue"].drain()
-                for _entry in _replay_entries:
-                    # Re-enqueue via the same path as the chat handler uses.
-                    # The queue.remove() call on success is handled inside the
-                    # _run_post_session_train wrapper added below for the chat
-                    # handler path.  For replay we enqueue again so the
-                    # enqueue→train→remove pattern is preserved.
-                    _state["post_session_queue"].enqueue(_entry)
-                    enqueue_post_session_train(
-                        conversation_id=_entry["session_id"],
-                        transcript=_entry["transcript"],
-                        speaker_id=_entry["speaker_id"],
-                        speaker_name=_entry.get("speaker_name"),
-                        loop=_state["consolidation_loop"],
-                        background_trainer=_state["background_trainer"],
-                        config=config,
-                        state=_state,
-                    )
-    else:
-        _state["post_session_queue"] = None
 
     # Trim the ~390 MiB of allocator-pool slack accumulated during
     # startup (model + adapter mount + STT/TTS load) — but ONLY when
@@ -2938,7 +2878,7 @@ async def _run_chat_turn(
 
     Encapsulates the post-speaker-resolution orchestration that is identical
     for text and voice turns: the scheduler debounce stamps, training-abort,
-    cloud-only vs local routing, session buffer appends, post-session training
+    cloud-only vs local routing, session buffer appends, scheduled-training
     enqueue, and greeting prefix application.
 
     Both ``/chat`` and ``/voice`` callers are responsible for resolving
@@ -3076,50 +3016,6 @@ async def _run_chat_turn(
         speaker_id=speaker_id,
         speaker=speaker,
     )
-
-    # Post-conversation training: after each assistant response, enqueue a
-    # background job to extract and train onto the current interim adapter.
-    # Only fires when:
-    #   - a speaker is identified (speaker_id is required for key ownership)
-    #   - post_session_train_enabled is True in the consolidation config
-    #   - the consolidation loop exists (initialised at startup or by first
-    #     consolidation run)
-    # The job runs in a daemon thread — it never blocks the response path.
-    # model handle is updated inside enqueue_post_session_train after training.
-    if (
-        speaker_id is not None
-        and _state.get("consolidation_loop") is not None
-        and _state["config"].consolidation.post_session_train_enabled
-    ):
-        transcript_turns = buffer.get_session_turns(conversation_id)
-        if transcript_turns:
-            transcript_text = "\n".join(
-                f"{t.get('role', 'user')}: {t.get('text', '')}" for t in transcript_turns
-            )
-            # Persist the job to the queue BEFORE submitting to the trainer.
-            # If the server crashes between here and the training completing,
-            # the entry will be replayed on the next startup.
-            _psq = _state.get("post_session_queue")
-            if _psq is not None:
-                _psq.enqueue(
-                    {
-                        "session_id": conversation_id,
-                        "transcript": transcript_text,
-                        "speaker_id": speaker_id,
-                        "speaker_name": speaker,
-                    }
-                )
-            enqueue_post_session_train(
-                conversation_id=conversation_id,
-                transcript=transcript_text,
-                speaker_id=speaker_id,
-                speaker_name=speaker,
-                loop=_state["consolidation_loop"],
-                background_trainer=_state.get("background_trainer"),
-                config=_state["config"],
-                state=_state,
-                post_session_queue=_psq,
-            )
 
     # Training was aborted (not paused) — the next job submission will resume
     # from the checkpoint automatically via the resume_state.json path.
@@ -3834,8 +3730,8 @@ async def status():
         if next_epoch - time.time() < 3.15e9:  # < ~100 years ahead
             next_run_seconds = max(0, int(next_epoch - time.time()))
 
-    # Next interim bucket boundary: post_session_train floors its stamp to
-    # the refresh_cadence boundary measured from midnight, so the next
+    # Next interim bucket boundary: stamps are floored to the
+    # refresh_cadence boundary measured from midnight, so the next
     # boundary is fully deterministic from the clock. None when cadence is
     # disabled (manual-only mode).
     from paramem.memory.interim_adapter import compute_schedule_period_seconds
@@ -12778,7 +12674,7 @@ def _extract_and_start_training():
 
     if config.consolidation.mode == "simulate":
         primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
-        # Callsite 3: post-session simulate.  The caller does NOT hold the GPU
+        # Callsite 3: scheduled-tick simulate.  The caller does NOT hold the GPU
         # lock at this point (the old ``with gpu_lock_sync()`` wrapper is
         # dropped — the BG worker thread acquires the lock internally via
         # ``_run_callable_queue``).  ``_await_bg_cycle`` submits the cycle and
@@ -12897,7 +12793,7 @@ def _extract_and_start_training():
         session marking, router reload, state updates) after each cycle.
         """
         try:
-            # Callsite 4: post-session async-train.  Runs inside the BG worker
+            # Callsite 4: BG-worker interim train.  Runs inside the BG worker
             # thread under ``gpu_lock_sync()`` (acquired by
             # ``_run_callable_queue``).  The surrounding BG-trainer construction
             # and closure pattern are unchanged; only the deleted

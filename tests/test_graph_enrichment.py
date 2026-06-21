@@ -914,10 +914,10 @@ class TestGraphEnrichWithSotaUnit:
 
 
 class TestInterimEnrichmentHook:
-    """Rollover mini-enrichment inside post_session_train.
+    """Rollover mini-enrichment inside run_consolidation_cycle.
 
     The rollover hook fires inside the 'normal fresh-interim' branch of
-    post_session_train, i.e. when a new sub-interval stamp opens.  It
+    run_consolidation_cycle, i.e. when a new sub-interval stamp opens.  It
     reuses `_run_graph_enrichment`, so these tests only verify the
     gating logic and the accumulator lifecycle.  The full enrichment
     path is covered by TestRunGraphEnrichment.
@@ -965,20 +965,16 @@ class TestInterimEnrichmentHook:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        loop.extract_session = MagicMock(
-            return_value=(
-                [
-                    {
-                        "question": "q",
-                        "answer": "a",
-                        "subject": "S",
-                        "predicate": "p",
-                        "object": "O",
-                    }
-                ],
-                [],
-            )
-        )
+        _ep = [
+            {
+                "question": "q",
+                "answer": "a",
+                "subject": "S",
+                "predicate": "p",
+                "object": "O",
+            }
+        ]
+        loop.extract_session = MagicMock(return_value=(_ep, []))
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": False})
 
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
@@ -991,10 +987,13 @@ class TestInterimEnrichmentHook:
             patch("paramem.models.loader.save_adapter"),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
-            loop.post_session_train(
-                session_transcript="t",
-                session_id="s1",
+            eps, proc = loop.extract_session("t", "s1", "Speaker0")
+            loop.run_consolidation_cycle(
+                eps,
+                proc,
                 speaker_id="Speaker0",
+                mode="train",
+                run_label="s1",
                 schedule="12h",
                 max_interim_count=7,
                 stamp="20260420T1200",
@@ -1015,20 +1014,16 @@ class TestInterimEnrichmentHook:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        loop.extract_session = MagicMock(
-            return_value=(
-                [
-                    {
-                        "question": "q",
-                        "answer": "a",
-                        "subject": "S",
-                        "predicate": "p",
-                        "object": "O",
-                    }
-                ],
-                [],
-            )
-        )
+        _ep = [
+            {
+                "question": "q",
+                "answer": "a",
+                "subject": "S",
+                "predicate": "p",
+                "object": "O",
+            }
+        ]
+        loop.extract_session = MagicMock(return_value=(_ep, []))
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
 
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
@@ -1041,10 +1036,13 @@ class TestInterimEnrichmentHook:
             patch("paramem.models.loader.save_adapter"),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
-            loop.post_session_train(
-                session_transcript="t",
-                session_id="s1",
+            eps, proc = loop.extract_session("t", "s1", "Speaker0")
+            loop.run_consolidation_cycle(
+                eps,
+                proc,
                 speaker_id="Speaker0",
+                mode="train",
+                run_label="s1",
                 schedule="12h",
                 max_interim_count=7,
                 stamp="20260420T1200",
@@ -1064,20 +1062,16 @@ class TestInterimEnrichmentHook:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        loop.extract_session = MagicMock(
-            return_value=(
-                [
-                    {
-                        "question": "q",
-                        "answer": "a",
-                        "subject": "S",
-                        "predicate": "p",
-                        "object": "O",
-                    }
-                ],
-                [],
-            )
-        )
+        _ep = [
+            {
+                "question": "q",
+                "answer": "a",
+                "subject": "S",
+                "predicate": "p",
+                "object": "O",
+            }
+        ]
+        loop.extract_session = MagicMock(return_value=(_ep, []))
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
 
         loop.model.peft_config = {"episodic": MagicMock(), "semantic": MagicMock()}
@@ -1090,10 +1084,13 @@ class TestInterimEnrichmentHook:
             patch("paramem.models.loader.save_adapter"),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
-            loop.post_session_train(
-                session_transcript="t",
-                session_id="s1",
+            eps, proc = loop.extract_session("t", "s1", "Speaker0")
+            loop.run_consolidation_cycle(
+                eps,
+                proc,
                 speaker_id="Speaker0",
+                mode="train",
+                run_label="s1",
                 schedule="12h",
                 max_interim_count=7,
                 stamp="20260420T1200",
@@ -1113,20 +1110,16 @@ class TestInterimEnrichmentHook:
         # and execution reaches the ring-full detection.
         loop = _make_loop(tmp_path, replay_enabled=True)
 
-        loop.extract_session = MagicMock(
-            return_value=(
-                [
-                    {
-                        "question": "q",
-                        "answer": "a",
-                        "subject": "S",
-                        "predicate": "p",
-                        "object": "O",
-                    }
-                ],
-                [],
-            )
-        )
+        _ep = [
+            {
+                "question": "q",
+                "answer": "a",
+                "subject": "S",
+                "predicate": "p",
+                "object": "O",
+            }
+        ]
+        loop.extract_session = MagicMock(return_value=(_ep, []))
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": False})
 
         existing_stamp = "20260419T1200"
@@ -1140,10 +1133,13 @@ class TestInterimEnrichmentHook:
             existing_name: MagicMock(),
         }
 
-        result = loop.post_session_train(
-            session_transcript="t",
-            session_id="s1",
+        eps, proc = loop.extract_session("t", "s1", "Speaker0")
+        result = loop.run_consolidation_cycle(
+            eps,
+            proc,
             speaker_id="Speaker0",
+            mode="train",
+            run_label="s1",
             schedule="12h",
             max_interim_count=1,
             stamp=current_stamp,

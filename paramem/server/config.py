@@ -1032,15 +1032,6 @@ class ConsolidationScheduleConfig:
     # server starts.  At 0 (default) overflow slots are never minted — cap_pending
     # fires immediately when the ring is full (identical to S4 behavior).
     interim_overflow_slack: int = 0
-    # Enable post-session (inline) training after each conversation turn.
-    # When True, a background job extracts facts from the session transcript and
-    # trains them onto the current interim adapter immediately after the
-    # assistant response is returned.  When False (default) post-session training
-    # is suppressed; facts accumulate only via the scheduled full-consolidation
-    # cycle.  Setting this True does NOT require changing ``mode`` — it is an
-    # independent gate so operators can enable inline training while keeping the
-    # full cycle in any mode.
-    post_session_train_enabled: bool = False
     # entity_similarity_threshold mirrors GraphConfig (paramem/utils/config.py);
     # bridged into GraphMerger construction via ServerConfig.graph_config.
     entity_similarity_threshold: float = 85.0
@@ -1075,12 +1066,9 @@ class ConsolidationScheduleConfig:
     # slot lineage and disk is cheap.
     training_keep_prior_slots: int = 3
     # Skip new training submissions while /chat has fired within this window.
-    # A scheduled-tick or post-session enqueue arriving sooner records a
-    # "deferred_idle" status (scheduler) or silently returns (post-session
-    # enqueue — the post_session_queue.json entry persists, the next tick or
-    # next /chat redrives the same path). Measured against
-    # _state["last_chat_monotonic"] via time.monotonic() so a wall-clock NTP
-    # step does not break the predicate. Set to 0 to disable the gate.
+    # A scheduled-tick arriving sooner records a "deferred_idle" status.
+    # Measured against _state["last_chat_monotonic"] via time.monotonic() so
+    # a wall-clock NTP step does not break the predicate. Set to 0 to disable.
     training_idle_debounce_s: int = 30
     # Time /chat waits for the BG trainer to abort at the next step boundary
     # before falling back to setting _shutdown_requested directly. At step

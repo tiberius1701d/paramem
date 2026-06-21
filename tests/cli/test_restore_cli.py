@@ -50,13 +50,13 @@ def _seed_age_store(data_dir: Path, recovery: x25519.Identity) -> list[tuple[Pat
     """
     lost_daily = x25519.Identity.generate()
     data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / "adapters").mkdir(parents=True, exist_ok=True)
+    (data_dir / "adapters" / "episodic").mkdir(parents=True, exist_ok=True)
     recipients = [lost_daily.to_public(), recovery.to_public()]
     seeded = []
     for rel, content in [
         (Path("registry.json"), b'{"a": 1}'),
         (Path("speaker_profiles.json"), b'{"s": 2}'),
-        (Path("adapters/post_session_queue.json"), b'{"q": 3}'),
+        (Path("adapters/episodic/indexed_key_registry.json"), b'{"keys": []}'),
     ]:
         p = data_dir / rel
         p.write_bytes(age_encrypt_bytes(content, recipients))

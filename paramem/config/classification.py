@@ -100,7 +100,6 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.indexed_key_replay": Tier.PIPELINE_ALTERING,
     "consolidation.decay_window": Tier.PIPELINE_ALTERING,
     "consolidation.max_interim_count": Tier.PIPELINE_ALTERING,
-    "consolidation.post_session_train_enabled": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_max_tokens": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_stt_correction": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_ha_validation": Tier.PIPELINE_ALTERING,

@@ -100,7 +100,6 @@ def _make_state(tmp_path: Path) -> dict:
         "consolidating": False,
         "last_consolidation": None,
         "background_trainer": None,
-        "post_session_queue": None,
         "mode": "local",
         "cloud_only_reason": None,
         "tts_manager": None,

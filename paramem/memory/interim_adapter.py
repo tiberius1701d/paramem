@@ -16,7 +16,8 @@ It also provides timestamp and schedule helpers:
       period in seconds for a schedule string.
 
 Callers (wiring schedule):
-  Post-session routing — calls create_interim_adapter after each conversation is processed.
+  Scheduled consolidation path — calls create_interim_adapter when run_consolidation_cycle
+      mints a new interim adapter slot during an interim training tick.
   consolidate_interim_adapters — calls unload_interim_adapters as phase 3 of the
             atomic finalize sequence.
 
