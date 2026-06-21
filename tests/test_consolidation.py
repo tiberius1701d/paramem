@@ -1630,10 +1630,13 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
 class TestFullCycleGateHelpers:
     """Helpers that decide whether the scheduled tick should run a full cycle.
 
-    The gate compares the manifest-recorded ``window_stamp`` on the most
-    recent main episodic slot against ``current_full_consolidation_stamp()``.
-    Both values are produced by the same flooring primitive, so identity
-    comparison is exact and idempotent within a window.
+    ``_last_full_consolidation_window`` tests exercise the manifest-reader
+    helper (retained; still used by ``_save_adapters`` / ``run_housekeeping``).
+
+    ``_is_full_cycle_due`` tests exercise the new count/phase primary +
+    oldest-interim-age deadline gate (S2).  The gate no longer reads
+    window_stamps; it counts on-disk ``episodic/interim_*`` dirs and
+    compares the oldest dir's age to ``consolidation_period_seconds``.
     """
 
     def _write_meta(self, slot_dir, *, window_stamp="", trained_at="2026-04-27T07:29:40Z"):
@@ -1642,6 +1645,14 @@ class TestFullCycleGateHelpers:
         slot_dir.mkdir(parents=True, exist_ok=True)
         payload = {"trained_at": trained_at, "window_stamp": window_stamp}
         (slot_dir / "meta.json").write_text(_json.dumps(payload))
+
+    def _make_interim_dir(self, adapter_dir, stamp: str) -> None:
+        """Create a bare on-disk interim dir at ``episodic/interim_<stamp>/``.
+
+        The dir needs to exist and match the ``INTERIM_DIR_PREFIX`` pattern so
+        ``iter_interim_dirs`` picks it up.  No content is needed for gate tests.
+        """
+        (adapter_dir / "episodic" / f"interim_{stamp}").mkdir(parents=True, exist_ok=True)
 
     def test_last_full_consolidation_window_returns_none_when_no_episodic_dir(self, tmp_path):
         from paramem.server.app import _last_full_consolidation_window
@@ -1688,63 +1699,115 @@ class TestFullCycleGateHelpers:
 
         assert _last_full_consolidation_window(tmp_path) == "20260427T0000"
 
-    def _make_config(self, period_string, adapter_dir):
+    def _make_config(
+        self, adapter_dir, *, max_interim_count: int = 7, period_seconds: "int | None" = 302400
+    ):
+        """Build a minimal config mock for ``_is_full_cycle_due`` tests.
+
+        Args:
+            adapter_dir: Path passed as ``config.adapter_dir``.
+            max_interim_count: Value of ``config.consolidation.max_interim_count``
+                (N).  Default 7 matches server.yaml default.
+            period_seconds: Value of ``config.consolidation.consolidation_period_seconds``
+                (= refresh_cadence_seconds × N).  Default 302400 = 12h × 7 × 3600.
+                Pass ``None`` to simulate a disabled (manual-only) cadence.
+        """
         cfg = MagicMock()
         cfg.adapter_dir = adapter_dir
-        cfg.consolidation.consolidation_period_string = period_string
+        cfg.consolidation.max_interim_count = max_interim_count
+        cfg.consolidation.consolidation_period_seconds = period_seconds
         return cfg
 
-    def test_is_full_cycle_due_disabled_cadence_returns_false(self, tmp_path):
-        """When refresh_cadence is ""/"off", period_string is empty → never auto-due."""
+    def test_is_full_cycle_due_zero_count_returns_false(self, tmp_path):
+        """N==0 guard: (n-1) % 0 would be ZeroDivisionError; gate returns False."""
         from paramem.server.app import _is_full_cycle_due
 
-        cfg = self._make_config("", tmp_path)
+        # Populate N+1=1 interim dirs — would fire if N=0 were not guarded.
+        self._make_interim_dir(tmp_path, "20260620T0000")
+        cfg = self._make_config(tmp_path, max_interim_count=0)
         assert _is_full_cycle_due(cfg) is False
 
-    def test_is_full_cycle_due_no_prior_full_returns_false(self, tmp_path):
-        """Fresh install (no main slot) → defer to interim cycle, NOT full.
-
-        The full cycle (consolidate_interim_adapters) operates by collapsing
-        existing interim adapters into main; with none on disk it is a
-        no-op. Returning True here previously caused /consolidate to route
-        to a no-op full cycle instead of the interim path that actually
-        extracts pending sessions on a fresh store.
-        """
+    def test_is_full_cycle_due_no_interims_returns_false(self, tmp_path):
+        """Empty interim store (n=0): gate always returns False regardless of config."""
         from paramem.server.app import _is_full_cycle_due
 
-        cfg = self._make_config("every 84h", tmp_path)
+        (tmp_path / "episodic").mkdir()
+        cfg = self._make_config(tmp_path)
         assert _is_full_cycle_due(cfg) is False
 
-    def test_is_full_cycle_due_legacy_v1_treated_as_no_main_slot(self, tmp_path):
-        """A v1 manifest (empty window_stamp) is treated like no main slot
-        — defer to the interim path until the slot has been re-stamped by
-        a real full cycle.
-        """
+    def test_is_full_cycle_due_n_interims_returns_false(self, tmp_path):
+        """Exactly N interims present (n==N): primary boundary not yet reached."""
         from paramem.server.app import _is_full_cycle_due
 
-        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp="")
-        cfg = self._make_config("every 84h", tmp_path)
+        N = 3
+        for i in range(N):
+            self._make_interim_dir(tmp_path, f"20260620T{i * 12:04d}")
+        # period large enough that the deadline backstop doesn't fire.
+        cfg = self._make_config(tmp_path, max_interim_count=N, period_seconds=10 * 365 * 86400)
         assert _is_full_cycle_due(cfg) is False
 
-    def test_is_full_cycle_due_same_window_returns_false(self, tmp_path):
-        """Last full's window_stamp matches current → already consolidated."""
-        from paramem.memory.interim_adapter import current_full_consolidation_stamp
+    def test_is_full_cycle_due_n_plus_one_interims_returns_true(self, tmp_path):
+        """N+1 interims on disk: count/phase primary fires (first slot of next cycle)."""
         from paramem.server.app import _is_full_cycle_due
 
-        period = "every 84h"
-        current_stamp = current_full_consolidation_stamp(period)
-        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp=current_stamp)
-        cfg = self._make_config(period, tmp_path)
-        assert _is_full_cycle_due(cfg) is False
-
-    def test_is_full_cycle_due_different_window_returns_true(self, tmp_path):
-        """Last full's window_stamp differs from current → due."""
-        from paramem.server.app import _is_full_cycle_due
-
-        # A stamp from a clearly prior window — distant past.
-        self._write_meta(tmp_path / "episodic" / "20260420-000000", window_stamp="20260101T0000")
-        cfg = self._make_config("every 84h", tmp_path)
+        N = 3
+        for i in range(N + 1):
+            self._make_interim_dir(tmp_path, f"20260620T{i * 12:04d}")
+        # Large period so only count signal fires, not deadline.
+        cfg = self._make_config(tmp_path, max_interim_count=N, period_seconds=10 * 365 * 86400)
         assert _is_full_cycle_due(cfg) is True
+
+    def test_is_full_cycle_due_n_minus_1_interims_returns_false(self, tmp_path):
+        """Fewer than N interims (n < N): neither primary nor deadline fires."""
+        from paramem.server.app import _is_full_cycle_due
+
+        N = 7
+        for i in range(N - 1):
+            self._make_interim_dir(tmp_path, f"20260620T{i * 12:04d}")
+        cfg = self._make_config(tmp_path, max_interim_count=N, period_seconds=10 * 365 * 86400)
+        assert _is_full_cycle_due(cfg) is False
+
+    def test_is_full_cycle_due_manual_only_no_deadline_returns_false(self, tmp_path):
+        """refresh_cadence disabled (period_seconds=None): backstop never fires.
+
+        Even with an aged interim, the deadline backstop must return False when
+        the schedule is manual-only — there is no intended full period to anchor
+        the deadline to.
+        """
+        from paramem.server.app import _is_full_cycle_due
+
+        # 1 interim, very old stamp — would trigger the deadline if enabled.
+        self._make_interim_dir(tmp_path, "20200101T0000")
+        cfg = self._make_config(tmp_path, period_seconds=None)
+        assert _is_full_cycle_due(cfg) is False
+
+    def test_is_full_cycle_due_sparse_deadline_fires(self, tmp_path):
+        """Deadline backstop: n < N+1 but oldest interim aged ≥ full_period → True.
+
+        Covers the sparse/broken-chain case where count never reaches N+1 but
+        facts have been sitting un-folded beyond one full intended interval.
+        """
+        from paramem.server.app import _is_full_cycle_due
+
+        # 1 interim with a stamp far in the past — definitely older than any
+        # reasonable full period.
+        self._make_interim_dir(tmp_path, "20200101T0000")
+        # full_period is 1 second so the 2020 stamp is astronomically over it.
+        cfg = self._make_config(tmp_path, max_interim_count=7, period_seconds=1)
+        assert _is_full_cycle_due(cfg) is True
+
+    def test_is_full_cycle_due_post_fold_n_zero_returns_false(self, tmp_path):
+        """After a successful fold, all interim dirs are rmtree'd (n=0) → False.
+
+        Verifies the gate cannot re-fire on the same tick after the fold clears
+        the interim ring.
+        """
+        from paramem.server.app import _is_full_cycle_due
+
+        # No interim dirs — simulates post-fold state.
+        (tmp_path / "episodic").mkdir()
+        cfg = self._make_config(tmp_path)
+        assert _is_full_cycle_due(cfg) is False
 
     # --- interim-only / catch-up gate tests ---
 
@@ -1782,80 +1845,69 @@ class TestFullCycleGateHelpers:
 
         assert _last_full_consolidation_window(tmp_path) == main_stamp
 
-    def test_is_full_cycle_due_interim_only_no_main_returns_true(self, tmp_path):
-        """Interim-only / no-main state must fire the fold (the production bug).
+    def test_is_full_cycle_due_interim_only_no_main_single_interim_deadline_fires(self, tmp_path):
+        """Interim-only store with one very old interim: deadline backstop fires.
 
-        Layout: episodic/interim_<stamp>/<ts>/meta.json — no top-level main
-        slot.  Before the fix, ``_last_full_consolidation_window`` saw the
-        interim dir as a candidate, failed to find a top-level meta.json,
-        returned None, and ``_is_full_cycle_due`` returned False, stranding
-        interim keys out of the main tiers indefinitely.
-
-        After the fix:
-        - ``_last_full_consolidation_window`` skips interim dirs → returns None.
-        - ``_is_full_cycle_due`` detects interims on disk → returns True.
+        The new gate does not consult window_stamps; it counts on-disk interims
+        and checks the oldest dir's age.  A single interim (n=1) cannot satisfy
+        the count/phase primary (needs n>1 and (n-1)%N==0), but the deadline
+        backstop fires when the interim is older than ``full_period_seconds``.
+        ``_last_full_consolidation_window`` is NOT called from the gate; we also
+        confirm it correctly returns None for this layout (helper still live for
+        housekeeping).
         """
         from paramem.server.app import _is_full_cycle_due, _last_full_consolidation_window
 
-        interim_ts = "20260524T0000"
-        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
-        self._write_meta(inner_slot, window_stamp=interim_ts)
+        # Create an interim dir whose stamp is in the distant past.
+        self._make_interim_dir(tmp_path, "20200101T0000")
 
         assert _last_full_consolidation_window(tmp_path) is None
-        cfg = self._make_config("every 84h", tmp_path)
+        # period_seconds=1 so a 2020 stamp is astronomically over the deadline.
+        cfg = self._make_config(tmp_path, period_seconds=1)
         assert _is_full_cycle_due(cfg) is True
 
     def test_is_full_cycle_due_fresh_install_no_interim_returns_false(self, tmp_path):
-        """Fresh install: no main slot AND no interim → gate stays False.
+        """Fresh install: no interim dirs (n=0) → gate stays False.
 
         The full cycle (consolidate_interim_adapters) would be a no-op with
-        nothing to fold.  Returning True would cause re-fire on every tick
-        with the main slot never being created.  The correct path is the
-        interim cycle (which extracts pending sessions first).
+        nothing to fold.  Returning False keeps the dispatcher on the interim
+        path (which extracts pending sessions into the first interim slot).
         """
         from paramem.server.app import _is_full_cycle_due
 
-        # Empty episodic dir — no main slot, no interim dirs.
         (tmp_path / "episodic").mkdir()
-        cfg = self._make_config("every 84h", tmp_path)
+        cfg = self._make_config(tmp_path)
         assert _is_full_cycle_due(cfg) is False
 
-    def test_is_full_cycle_due_main_slot_current_with_interim_returns_false(self, tmp_path):
-        """Main slot present and up-to-date → False even when interims exist.
+    def test_is_full_cycle_due_single_interim_young_returns_false(self, tmp_path):
+        """Single interim (n=1) that is NOT aged beyond the full period: False.
 
-        The interims will be folded on the NEXT window tick when current !=
-        last.  As long as the main slot's window_stamp matches the current
-        window, the fold has already run this window.
-        """
-        from paramem.memory.interim_adapter import current_full_consolidation_stamp
-        from paramem.server.app import _is_full_cycle_due
-
-        period = "every 84h"
-        current_stamp = current_full_consolidation_stamp(period)
-        # Main slot stamped at the current window.
-        self._write_meta(tmp_path / "episodic" / "20260520-080000", window_stamp=current_stamp)
-        # Interim slot also present.
-        interim_ts = "20260524T0000"
-        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
-        self._write_meta(inner_slot, window_stamp=interim_ts)
-
-        cfg = self._make_config(period, tmp_path)
-        assert _is_full_cycle_due(cfg) is False
-
-    def test_is_full_cycle_due_main_slot_old_with_interim_returns_true(self, tmp_path):
-        """Main slot present but from a prior window → True (due-ness follows
-        main stamp, not interims).
+        The count/phase primary requires n>1; the deadline backstop requires
+        age ≥ full_period.  A recent single interim satisfies neither.
         """
         from paramem.server.app import _is_full_cycle_due
 
-        old_stamp = "20260101T0000"
-        self._write_meta(tmp_path / "episodic" / "20260420-000000", window_stamp=old_stamp)
-        # Interim slot also present — should not change the outcome.
-        interim_ts = "20260524T0000"
-        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
-        self._write_meta(inner_slot, window_stamp=interim_ts)
+        self._make_interim_dir(tmp_path, "20260620T1200")
+        # Large period so the current-day stamp is nowhere near the deadline.
+        cfg = self._make_config(tmp_path, period_seconds=10 * 365 * 86400)
+        assert _is_full_cycle_due(cfg) is False
 
-        cfg = self._make_config("every 84h", tmp_path)
+    def test_is_full_cycle_due_main_slot_does_not_affect_gate(self, tmp_path):
+        """Main slot presence / window_stamp does NOT influence the new gate.
+
+        The gate counts interim dirs, not main slots.  Even if a main slot is
+        present and current, the gate fires when the interim count hits N+1.
+        This test verifies that the gate ignores main-slot state entirely.
+        """
+        from paramem.server.app import _is_full_cycle_due
+
+        N = 2
+        # Write a main slot (up-to-date, as if a fold just ran).
+        self._write_meta(tmp_path / "episodic" / "20260620-080000", window_stamp="20260620T0000")
+        # Add N+1 interims — the count/phase primary must fire.
+        for i in range(N + 1):
+            self._make_interim_dir(tmp_path, f"20260620T{i:04d}")
+        cfg = self._make_config(tmp_path, max_interim_count=N, period_seconds=10 * 365 * 86400)
         assert _is_full_cycle_due(cfg) is True
 
 

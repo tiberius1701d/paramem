@@ -2129,25 +2129,27 @@ async def lifespan(app: FastAPI):
             )
             logger.info("Wyoming TTS server listening on port %d", config.tts.port)
 
-    # Reconcile the systemd user timer with the DERIVED full consolidation
-    # period (= refresh_cadence × max_interim_count). The yaml exposes only
-    # refresh_cadence; the timer sees the full cycle via the derived
-    # ``consolidation_period_string`` property. Timer fires POST /scheduled-tick
-    # on that cadence regardless of mode; the tick handler defers when GPU is
-    # busy rather than skipping silently. Timer survives server restart.
+    # Reconcile the systemd user timer with the INTERIM cadence
+    # (= refresh_cadence, e.g. "12h").  The timer fires POST /scheduled-tick
+    # at every interim boundary; the tick handler decides whether this tick
+    # is an interim train or a full fold via _is_full_cycle_due.  The full
+    # period (refresh_cadence × max_interim_count, e.g. 84h) is still derived
+    # for logging and for the deadline backstop in _is_full_cycle_due.
+    # Timer survives server restart.
     from paramem.server import systemd_timer
 
-    derived_period = config.consolidation.consolidation_period_string
+    interim_cadence = config.consolidation.refresh_cadence or ""
+    full_period = config.consolidation.consolidation_period_string
     logger.info(
-        "Consolidation cadence — refresh every %s, max_interim_count=%d, "
+        "Consolidation cadence — interim every %s, max_interim_count=%d, "
         "derived full-consolidation period=%s",
-        config.consolidation.refresh_cadence or "<disabled>",
+        interim_cadence or "<disabled>",
         config.consolidation.max_interim_count,
-        derived_period or "<manual only>",
+        full_period or "<manual only>",
     )
     try:
         msg = systemd_timer.reconcile(
-            derived_period,
+            interim_cadence,
             project_root=str(Path(__file__).resolve().parent.parent.parent),
         )
         logger.info("%s", msg)
@@ -11388,52 +11390,71 @@ def _last_full_consolidation_window(adapter_dir: Path) -> "str | None":
 
 
 def _is_full_cycle_due(config) -> bool:
-    """Window-stamp gate: has the current full-consolidation window already
-    been consolidated?
+    """Count/phase primary gate + oldest-interim-age deadline backstop.
 
-    Compares two stamps produced by the same flooring primitive
-    (``current_full_consolidation_stamp``):
-      * ``current``: ``floor(now, full_cycle_period)``.
-      * ``last``: the ``window_stamp`` recorded on the lex-max main
-        ``episodic/<ts>/meta.json`` at save time.
+    Replaces the window-stamp identity gate with a content-driven signal that
+    is robust to skipped ticks, restarts, and the ≥24h stamp-collapse bug (D2):
 
-    Identity check — no wall-clock-elapsed math, no derived-at-read flooring.
-    Two ticks inside the same window agree on ``current`` so re-firing is
-    idempotent. The first tick of a new window returns ``current != last``
-    and dispatches the full cycle.
+    **Primary (count/phase):** the full fold is due when the on-disk interim
+    count ``n`` equals ``N + 1`` (first slot of the next cycle), where
+    ``N = max_interim_count``.  Reads ``iter_interim_dirs`` on-disk so the
+    count is restart-safe and derived from durable state.  The boundary
+    ``(n - 1) % N == 0`` detects the (N+1)-th slot; ``n > 1`` ensures there is
+    at least one completed interim cycle before triggering.
 
-    Returns ``False`` when ``refresh_cadence`` is disabled (period string is
-    empty → manual-only operation).
+    **Backstop (deadline):** even if count never reaches N+1 (sparse / broken
+    chain), the fold is also due when the **oldest un-folded interim tier's
+    age** ≥ the full consolidation period (``N × refresh_cadence`` seconds).
+    Anchored to the oldest interim, not to wall-clock since last fold.
 
-    ``last is None`` (no main slot on disk) has two sub-cases:
+    Both signals are gated on ``n ≥ 1`` (un-folded interims must exist).
+    An empty store returns ``False`` and stays on the interim path.
 
-    * **Interim-only / no-main** (the production catch-up state): at least one
-      ``episodic/interim_<stamp>/`` directory exists. The fold
-      (``consolidate_interim_adapters``) has real content to work with, so
-      return ``True`` to trigger it. Once the fold completes it writes the
-      main slot, making ``last`` non-``None`` on the next tick — no re-fire
-      risk.
+    **N > 0 guard is mandatory**: ``(n - 1) % 0`` is a ``ZeroDivisionError``.
+    ``max_interim_count == 0`` is config-rejected (S4 validator); this guard
+    is the defensive belt.
 
-    * **Fresh install / no interim**: the episodic tree is empty or absent.
-      The full cycle would be a no-op with no main slot written, so the gate
-      would re-fire forever. Return ``False`` to stay on the interim path
-      (which extracts pending sessions first).
+    Timestamps are in LOCAL time throughout, consistent with
+    ``current_interim_stamp``'s ``datetime.now()`` basis.
+
+    ``current_full_consolidation_stamp`` and ``_last_full_consolidation_window``
+    are NOT used here (trigger use deleted per §3.6 of the design).  They remain
+    live: ``_save_adapters`` still stamps ``window_stamp`` via
+    ``current_full_consolidation_stamp``, and ``run_housekeeping`` reads the
+    stamp via ``_last_full_consolidation_window``.
     """
-    from paramem.memory.interim_adapter import (
-        current_full_consolidation_stamp,
-        iter_interim_dirs,
-    )
+    from datetime import datetime
 
-    period = config.consolidation.consolidation_period_string
-    if not period:
+    from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
+
+    N = config.consolidation.max_interim_count
+    # N > 0 guard: (n-1) % 0 is ZeroDivisionError; also N<=0 is misconfigured.
+    if N <= 0:
         return False
-    current = current_full_consolidation_stamp(period)
-    if not current:
+
+    dirs = list(iter_interim_dirs(config.adapter_dir))
+    n = len(dirs)
+    if n == 0:
         return False
-    last = _last_full_consolidation_window(config.adapter_dir)
-    if last is None:
-        return any(iter_interim_dirs(config.adapter_dir))
-    return current != last
+
+    # Primary: due on the (N+1)-th interim slot — first slot of the new cycle.
+    if n > 1 and (n - 1) % N == 0:
+        return True
+
+    # Deadline backstop: no interim tier may age beyond one full intended interval
+    # without being folded.  Parse the oldest dir's stamp (lexical sort of
+    # "interim_YYYYMMDDTHHMM" dirs is chronological; first = oldest).
+    full_period_seconds = config.consolidation.consolidation_period_seconds
+    if full_period_seconds is None:
+        # refresh_cadence disabled (manual-only) — no auto full fold.
+        return False
+
+    oldest_name, _ = dirs[0]  # iter_interim_dirs yields (adapter_name, path)
+    oldest_stamp = interim_stamp_from_name(oldest_name)
+    # Local time throughout — consistent with current_interim_stamp's datetime.now().
+    oldest_dt = datetime.strptime(oldest_stamp, "%Y%m%dT%H%M")
+    age_seconds = (datetime.now() - oldest_dt).total_seconds()
+    return age_seconds >= full_period_seconds
 
 
 def _consolidation_dispatch_guards() -> "str | None":

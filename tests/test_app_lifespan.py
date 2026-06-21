@@ -463,7 +463,10 @@ def _make_scheduler_state(last_chat_monotonic=None, debounce_s: int = 30) -> tup
     """Return (state_patch_dict, config_mock) for scheduler debounce tests."""
     cfg = MagicMock()
     cfg.consolidation.training_idle_debounce_s = debounce_s
-    cfg.consolidation.consolidation_period_string = ""
+    # max_interim_count=0 makes _is_full_cycle_due return False immediately
+    # (N<=0 guard), keeping these tests focused on the debounce gate.
+    cfg.consolidation.max_interim_count = 0
+    cfg.consolidation.consolidation_period_seconds = None
     cfg.adapter_dir = Path("/tmp/fake")
 
     state_patch = {
