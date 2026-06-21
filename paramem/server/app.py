@@ -3705,6 +3705,7 @@ def _derive_consolidation_status_fields(
             "training_crash",
             "migration_phase_failed",
             "migration_error",
+            "full_consolidation_overdue",
         }
     )
     try:
@@ -11457,6 +11458,47 @@ def _is_full_cycle_due(config) -> bool:
     return age_seconds >= full_period_seconds
 
 
+def _full_consolidation_overdue_key(config) -> "str | None":
+    """Return the oldest un-folded interim stamp when the full fold missed its runway.
+
+    The full fold is dispatched when due (oldest interim ≈ 1× full_period via the
+    deadline backstop) and has one full period of runway before its next cycle
+    boundary.  If the oldest interim reaches 2× full_period and has still not been
+    drained, the fold missed its runway — that is severely wrong.
+
+    Returns the oldest interim stamp (used as the per-cycle dedup key for
+    ``record_incident``) when the overdue condition is met, otherwise ``None``.
+
+    Cycle-key semantics: the oldest un-folded interim stamp is stable for the
+    entire time that cycle's interims are un-folded.  It changes only when a new
+    cycle's interims become the oldest — so one incident fires per stuck cycle and
+    reopens on a new cycle's failure.
+
+    Timestamps are in LOCAL time throughout, consistent with
+    ``current_interim_stamp``'s ``datetime.now()`` basis.
+    A malformed internal stamp raises ``ValueError`` (no defensive try/except —
+    a corrupt internal stamp should surface, not be silenced).
+    """
+    from datetime import datetime
+
+    from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
+
+    N = config.consolidation.max_interim_count
+    if N <= 0:
+        return None
+    period = config.consolidation.consolidation_period_seconds
+    if period is None:
+        # manual-only: no deadline, no overdue concept.
+        return None
+    dirs = list(iter_interim_dirs(config.adapter_dir))
+    if not dirs:
+        return None
+    oldest_name, _ = dirs[0]  # sorted ascending; [0] is oldest
+    oldest_stamp = interim_stamp_from_name(oldest_name)
+    age = (datetime.now() - datetime.strptime(oldest_stamp, "%Y%m%dT%H%M")).total_seconds()
+    return oldest_stamp if age >= 2 * period else None
+
+
 def _consolidation_dispatch_guards() -> "str | None":
     """Shared pre-dispatch guard for consolidation dispatchers.
 
@@ -11599,6 +11641,32 @@ def _maybe_trigger_scheduled_consolidation() -> str:
         # Do NOT clear last_consolidation_error here.  A failure row stays visible
         # until the next op of that type SUCCEEDS (auto-resolved in the success paths
         # below).  Clear-on-attempt hid still-failing conditions.
+
+        # Overdue check: fire a loud incident when the prior cycle's full fold
+        # missed its runway (oldest interim aged ≥ 2× the full period).  This is
+        # purely informational — the fold still dispatches.  Deduped by the oldest
+        # interim stamp (stable per stuck cycle; reopens on a new cycle's failure).
+        # NOT a scheduling state — does NOT bump per-session retry counters.
+        _overdue_key = _full_consolidation_overdue_key(config)
+        if _overdue_key is not None:
+            logger.warning(
+                "Scheduler tick: full consolidation OVERDUE — oldest interim %s "
+                "has aged ≥ 2× the full period without being folded",
+                _overdue_key,
+            )
+            _state_dir_for_incident = config.paths.data / "state"
+            record_incident(
+                _state_dir_for_incident,
+                type="full_consolidation_overdue",
+                key=_overdue_key,
+                severity="failed",
+                summary="Full consolidation overdue — fold has not completed within its runway",
+                detail={
+                    "oldest_interim_stamp": _overdue_key,
+                    "type": "full_consolidation_overdue",
+                },
+            )
+
         _state["consolidating"] = True
         event_loop = asyncio.get_running_loop()
         future = event_loop.run_in_executor(None, _run_full_consolidation_sync)
@@ -13343,6 +13411,9 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                     "mode", "full_trained"
                 ) not in {"aborted", "degenerated"}:
                     resolve_incidents_by_type(_full_state_dir, "consolidation_retry_exhausted")
+                # A completed fold drains the interim ring — the overdue condition
+                # is resolved regardless of recall outcome.
+                resolve_incidents_by_type(_full_state_dir, "full_consolidation_overdue")
             except Exception:
                 logger.exception(
                     "Post-full-cycle run-status/incident bookkeeping failed (non-fatal)"

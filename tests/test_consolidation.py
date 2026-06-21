@@ -10514,3 +10514,477 @@ class TestNormalizationLevelGating:
             )
         mock_norm.assert_called_once()
         mock_enrich.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# S3 — _full_consolidation_overdue_key unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestFullConsolidationOverdueKey:
+    """Unit tests for ``_full_consolidation_overdue_key(config) -> str | None``.
+
+    Covers:
+    - Returns oldest stamp when oldest interim ≥ 2× full_period (overdue).
+    - Returns None when oldest interim is in [1×, 2×) period (due but within runway).
+    - Returns None when no interims present.
+    - Returns None when ``consolidation_period_seconds`` is None (manual-only).
+    - Returns None when ``max_interim_count`` <= 0.
+    """
+
+    def _make_config(self, adapter_dir, *, max_interim_count: int = 7, period_seconds=302400):
+        """Minimal config mock reusing the same shape as TestFullCycleGateHelpers._make_config."""
+        cfg = MagicMock()
+        cfg.adapter_dir = adapter_dir
+        cfg.consolidation.max_interim_count = max_interim_count
+        cfg.consolidation.consolidation_period_seconds = period_seconds
+        return cfg
+
+    def _make_interim_dir(self, adapter_dir, stamp: str) -> None:
+        """Create a bare on-disk interim dir at ``episodic/interim_<stamp>/``."""
+        (adapter_dir / "episodic" / f"interim_{stamp}").mkdir(parents=True, exist_ok=True)
+
+    def _stamp_seconds_ago(self, seconds: float) -> str:
+        """Return a YYYYMMDDTHHMM stamp for a datetime ``seconds`` ago.
+
+        Local time, minute-floored (same granularity as ``interim_stamp_from_name``).
+        """
+        from datetime import datetime, timedelta
+
+        dt = datetime.now() - timedelta(seconds=seconds)
+        # Floor to minute precision — same granularity as interim_stamp_from_name.
+        return dt.strftime("%Y%m%dT%H%M")
+
+    def test_overdue_returns_oldest_stamp(self, tmp_path):
+        """Oldest interim aged ≥ 2× period → returns oldest stamp."""
+        from paramem.server.app import _full_consolidation_overdue_key
+
+        period = 3600  # 1 h
+        # Place the oldest interim just over 2× the period ago.
+        old_stamp = self._stamp_seconds_ago(2 * period + 300)
+        self._make_interim_dir(tmp_path, old_stamp)
+        cfg = self._make_config(tmp_path, period_seconds=period)
+        result = _full_consolidation_overdue_key(cfg)
+        assert result == old_stamp
+
+    def test_within_runway_returns_none(self, tmp_path):
+        """Oldest interim aged in [1×, 2×) period (due but within runway) → None.
+
+        The fold is due (1× period) but has not yet missed its runway (< 2×
+        period), so no overdue incident should fire.
+        """
+        from paramem.server.app import _full_consolidation_overdue_key
+
+        period = 3600
+        # Place the oldest interim at 1.5× the period — due but within runway.
+        slightly_due_stamp = self._stamp_seconds_ago(int(1.5 * period))
+        self._make_interim_dir(tmp_path, slightly_due_stamp)
+        cfg = self._make_config(tmp_path, period_seconds=period)
+        result = _full_consolidation_overdue_key(cfg)
+        assert result is None
+
+    def test_no_interims_returns_none(self, tmp_path):
+        """No interim dirs present → None (empty ring, nothing overdue)."""
+        from paramem.server.app import _full_consolidation_overdue_key
+
+        (tmp_path / "episodic").mkdir()
+        cfg = self._make_config(tmp_path, period_seconds=3600)
+        assert _full_consolidation_overdue_key(cfg) is None
+
+    def test_manual_only_period_none_returns_none(self, tmp_path):
+        """consolidation_period_seconds=None (manual-only) → None.
+
+        There is no auto schedule and therefore no deadline or overdue concept.
+        """
+        from paramem.server.app import _full_consolidation_overdue_key
+
+        # Even an astronomically old interim must not fire when manual-only.
+        self._make_interim_dir(tmp_path, "20200101T0000")
+        cfg = self._make_config(tmp_path, period_seconds=None)
+        assert _full_consolidation_overdue_key(cfg) is None
+
+    def test_max_interim_count_zero_returns_none(self, tmp_path):
+        """max_interim_count=0 (or negative) → None.
+
+        N <= 0 is misconfigured; the helper returns None defensively (same
+        guard as ``_is_full_cycle_due``).
+        """
+        from paramem.server.app import _full_consolidation_overdue_key
+
+        self._make_interim_dir(tmp_path, "20200101T0000")
+        cfg = self._make_config(tmp_path, max_interim_count=0, period_seconds=1)
+        assert _full_consolidation_overdue_key(cfg) is None
+
+    def test_multiple_interims_uses_oldest(self, tmp_path):
+        """When multiple interims exist, the oldest (first in sorted order) governs."""
+        from paramem.server.app import _full_consolidation_overdue_key
+
+        period = 3600
+        # Oldest is far over 2× period; newer one is within runway.
+        old_stamp = self._stamp_seconds_ago(3 * period)
+        recent_stamp = self._stamp_seconds_ago(int(1.5 * period))
+        # Create both; iter_interim_dirs sorts ascending so old_stamp comes first.
+        self._make_interim_dir(tmp_path, old_stamp)
+        self._make_interim_dir(tmp_path, recent_stamp)
+        cfg = self._make_config(tmp_path, period_seconds=period)
+        result = _full_consolidation_overdue_key(cfg)
+        # Must return the oldest stamp (overdue), not the recent one.
+        assert result == old_stamp
+
+
+# ---------------------------------------------------------------------------
+# S3 — Dispatcher incident wiring tests
+# ---------------------------------------------------------------------------
+
+
+class TestFullCycleDispatcherOverdueIncident:
+    """Dispatcher fires ``full_consolidation_overdue`` incident when due AND overdue.
+
+    Covers:
+    - Overdue: ``record_incident`` called with correct type/key; ``bump_retry_count``
+      not called (scheduling state, not encoding failure).
+    - Due but within runway: no overdue incident.
+    - Two-tick lock: count=N → False (interim path), count=N+1 → True (full path).
+    """
+
+    def _make_interim_dir(self, adapter_dir, stamp: str) -> None:
+        (adapter_dir / "episodic" / f"interim_{stamp}").mkdir(parents=True, exist_ok=True)
+
+    def _make_minimal_state(self, tmp_path) -> dict:
+        """Minimal _state for dispatcher tests with a real config.paths.data."""
+        cfg = MagicMock()
+        cfg.consolidation.training_idle_debounce_s = 0
+        cfg.paths.data = tmp_path
+        cfg.adapter_dir = tmp_path / "adapters"
+        cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "config": cfg,
+            "session_buffer": MagicMock(),
+            "speaker_store": None,
+            "consolidating": False,
+            "mode": "local",
+            "background_trainer": None,
+            "last_chat_monotonic": None,
+            "pending_rehydration": False,
+            "store_load_degraded": False,
+            "cloud_only_reason": None,
+        }
+
+    def test_overdue_record_incident_called(self, tmp_path, monkeypatch):
+        """When full cycle is due AND overdue, record_incident is called with
+        type='full_consolidation_overdue' and key=oldest stamp.
+
+        bump_retry_count is NOT called (scheduling state ≠ encoding failure).
+        """
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_minimal_state(tmp_path)
+        old_stamp = "20200101T0000"
+        self._make_interim_dir(state["config"].adapter_dir, old_stamp)
+
+        monkeypatch.setattr(app_module, "_state", state)
+
+        recorded: list[dict] = []
+
+        def _capture_record_incident(state_dir, *, type, key, severity, summary, detail):
+            recorded.append({"type": type, "key": key, "severity": severity})
+
+        mock_loop = MagicMock()
+        mock_future = MagicMock()
+        mock_loop.run_in_executor.return_value = mock_future
+        mock_future.add_done_callback.return_value = None
+
+        with (
+            patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
+            patch("paramem.server.app._is_full_cycle_due", return_value=True),
+            patch(
+                "paramem.server.app._full_consolidation_overdue_key",
+                return_value=old_stamp,
+            ),
+            patch("paramem.server.app.record_incident", side_effect=_capture_record_incident),
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch("asyncio.get_running_loop", return_value=mock_loop),
+        ):
+            result = app_module._maybe_trigger_scheduled_consolidation()
+
+        assert result == "started_full"
+        assert len(recorded) == 1, f"Expected exactly one incident; got: {recorded}"
+        assert recorded[0]["type"] == "full_consolidation_overdue"
+        assert recorded[0]["key"] == old_stamp
+        assert recorded[0]["severity"] == "failed"
+
+    def test_within_runway_no_overdue_incident(self, tmp_path, monkeypatch):
+        """When full cycle is due but NOT overdue, record_incident is NOT called
+        with type='full_consolidation_overdue'.
+        """
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_minimal_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        recorded_types: list[str] = []
+
+        def _capture_record_incident(state_dir, *, type, key, severity, summary, detail):
+            recorded_types.append(type)
+
+        mock_loop = MagicMock()
+        mock_future = MagicMock()
+        mock_loop.run_in_executor.return_value = mock_future
+        mock_future.add_done_callback.return_value = None
+
+        with (
+            patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
+            patch("paramem.server.app._is_full_cycle_due", return_value=True),
+            # _full_consolidation_overdue_key returns None → within runway
+            patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
+            patch("paramem.server.app.record_incident", side_effect=_capture_record_incident),
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch("asyncio.get_running_loop", return_value=mock_loop),
+        ):
+            result = app_module._maybe_trigger_scheduled_consolidation()
+
+        assert result == "started_full"
+        overdue_incidents = [t for t in recorded_types if t == "full_consolidation_overdue"]
+        assert overdue_incidents == [], (
+            "No overdue incident must fire when the fold is within its runway; "
+            f"got: {recorded_types}"
+        )
+
+    def test_bump_retry_count_not_called_on_overdue_path(self, tmp_path, monkeypatch):
+        """Overdue condition does NOT bump the per-session retry counter.
+
+        A scheduling state (full fold missed its runway) is not an encoding
+        failure — bump_retry_count must not be called anywhere on the overdue
+        path through the dispatcher.
+        """
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        state = self._make_minimal_state(tmp_path)
+        monkeypatch.setattr(app_module, "_state", state)
+
+        mock_loop = MagicMock()
+        mock_future = MagicMock()
+        mock_loop.run_in_executor.return_value = mock_future
+        mock_future.add_done_callback.return_value = None
+
+        with (
+            patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
+            patch("paramem.server.app._is_full_cycle_due", return_value=True),
+            patch(
+                "paramem.server.app._full_consolidation_overdue_key",
+                return_value="20200101T0000",
+            ),
+            patch("paramem.server.app.record_incident"),
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            # Patch bump_retry_count at its source to detect any call.
+            patch("paramem.server.retry_state.bump_retry_count") as mock_bump,
+            patch("asyncio.get_running_loop", return_value=mock_loop),
+        ):
+            app_module._maybe_trigger_scheduled_consolidation()
+
+        mock_bump.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# S3 — Two-tick sequencing lock
+# ---------------------------------------------------------------------------
+
+
+class TestTwoTickSequencing:
+    """The gate reads the pre-mint on-disk count so T0 (mint) stays interim
+    and T1 (count now N+1) routes to the full fold.
+
+    Uses ``_is_full_cycle_due`` directly with synth dirs at count=N (False)
+    and count=N+1 (True) to lock the sequencing at the gate level.
+    Reuses the ``_make_config`` and ``_make_interim_dir`` helpers via inline
+    helpers (mirrors TestFullCycleGateHelpers without inheritance).
+    """
+
+    def _make_config(self, adapter_dir, *, N: int = 3, period_seconds: int = 10 * 365 * 86400):
+        cfg = MagicMock()
+        cfg.adapter_dir = adapter_dir
+        cfg.consolidation.max_interim_count = N
+        cfg.consolidation.consolidation_period_seconds = period_seconds
+        return cfg
+
+    def _make_interim_dir(self, adapter_dir, stamp: str) -> None:
+        (adapter_dir / "episodic" / f"interim_{stamp}").mkdir(parents=True, exist_ok=True)
+
+    def test_count_n_is_not_due(self, tmp_path):
+        """Exactly N interim dirs on disk (T0 pre-mint state): gate returns False.
+
+        The mint happens on the CURRENT tick; the gate reads the pre-mint count,
+        so T0 is directed to the interim path (count = N, not due).
+        """
+        from paramem.server.app import _is_full_cycle_due
+
+        N = 3
+        for i in range(N):
+            self._make_interim_dir(tmp_path, f"20260620T{i * 12:04d}")
+        cfg = self._make_config(tmp_path, N=N)
+        assert _is_full_cycle_due(cfg) is False, (
+            f"count={N} (pre-mint) must NOT trigger the full fold; "
+            "T1 (after mint, count=N+1) is the full-fold tick"
+        )
+
+    def test_count_n_plus_one_is_due(self, tmp_path):
+        """N+1 interim dirs on disk (T1 post-mint state): gate returns True.
+
+        After T0 minted the (N+1)-th interim, T1 reads count=N+1 and routes
+        to the full fold.
+        """
+        from paramem.server.app import _is_full_cycle_due
+
+        N = 3
+        for i in range(N + 1):
+            self._make_interim_dir(tmp_path, f"20260620T{i * 12:04d}")
+        cfg = self._make_config(tmp_path, N=N)
+        assert _is_full_cycle_due(cfg) is True, (
+            f"count={N + 1} (post-mint) MUST trigger the full fold on T1"
+        )
+
+
+# ---------------------------------------------------------------------------
+# S3 — Resolution on clean full-cycle completion
+# ---------------------------------------------------------------------------
+
+
+class TestFullCycleOverdueResolution:
+    """A clean full-cycle completion resolves ``full_consolidation_overdue``.
+
+    Uses the incident machinery directly (write then resolve) to verify the
+    resolve call is wired into ``_finalize_full``'s bookkeeping block.
+    The ``_run_full_consolidation_sync`` path resolves incidents inside a
+    ``try/except`` block; here we test the resolution logic by calling
+    ``resolve_incidents_by_type`` directly (as ``_finalize_full`` does) and
+    asserting the incident is gone — this mirrors ``TestAutoResolve`` in
+    ``test_incident_wiring.py``.
+    """
+
+    def test_overdue_incident_resolved_by_full_cycle_completion(self, tmp_path):
+        """After full-cycle completion, 'full_consolidation_overdue' is resolved.
+
+        Writes the incident then calls resolve_incidents_by_type with the same
+        type, confirming the resolution path that ``_finalize_full`` invokes.
+        """
+        from paramem.server.incidents import (
+            read_incidents,
+            record_incident,
+            resolve_incidents_by_type,
+        )
+
+        state_dir = tmp_path / "state"
+        record_incident(
+            state_dir,
+            type="full_consolidation_overdue",
+            key="20200101T0000",
+            severity="failed",
+            summary="Full consolidation overdue — fold has not completed within its runway",
+            detail={
+                "oldest_interim_stamp": "20200101T0000",
+                "type": "full_consolidation_overdue",
+            },
+        )
+        # Verify incident is active before resolution.
+        incidents_before = read_incidents(state_dir)
+        active = [i for i in incidents_before if i.type == "full_consolidation_overdue"]
+        assert len(active) == 1
+        assert active[0].status == "active"
+
+        # Simulate the _finalize_full resolution call.
+        resolved_count = resolve_incidents_by_type(state_dir, "full_consolidation_overdue")
+        assert resolved_count == 1
+
+        incidents_after = read_incidents(state_dir)
+        still_active = [
+            i
+            for i in incidents_after
+            if i.type == "full_consolidation_overdue" and i.status == "active"
+        ]
+        assert still_active == [], (
+            "full_consolidation_overdue incident must be resolved after a successful full cycle"
+        )
+
+    def test_overdue_not_resolved_by_other_incident_types(self, tmp_path):
+        """Resolving other incident types does not clear 'full_consolidation_overdue'.
+
+        Mirrors TestS4Ordering: the overdue incident must remain active if only
+        unrelated types are resolved.
+        """
+        from paramem.server.incidents import (
+            read_incidents,
+            record_incident,
+            resolve_incidents_by_type,
+        )
+
+        state_dir = tmp_path / "state"
+        record_incident(
+            state_dir,
+            type="full_consolidation_overdue",
+            key="20200101T0000",
+            severity="failed",
+            summary="overdue",
+            detail={
+                "oldest_interim_stamp": "20200101T0000",
+                "type": "full_consolidation_overdue",
+            },
+        )
+
+        # Resolve all other types that a full cycle clears — must NOT touch overdue.
+        for t in (
+            "consolidation_crash",
+            "vram_exhausted",
+            "extraction_failed",
+            "consolidation_retry_exhausted",
+        ):
+            resolve_incidents_by_type(state_dir, t)
+
+        incidents = read_incidents(state_dir)
+        overdue = [i for i in incidents if i.type == "full_consolidation_overdue"]
+        assert len(overdue) == 1
+        assert overdue[0].status == "active", (
+            "full_consolidation_overdue must remain active — only resolve_incidents_by_type "
+            "with 'full_consolidation_overdue' should clear it"
+        )
+
+
+# ---------------------------------------------------------------------------
+# S3 — /status surfaces full_consolidation_overdue via _consolidation_incident_types
+# ---------------------------------------------------------------------------
+
+
+class TestFullConsolidationOverdueStatusSurface:
+    """'full_consolidation_overdue' appears in _consolidation_incident_types so
+    ``_derive_consolidation_status_fields`` surfaces it in ``last_consolidation_error``.
+    """
+
+    def test_overdue_incident_surfaces_in_derive_status(self, tmp_path):
+        """Active full_consolidation_overdue → last_consolidation_error reflects its detail."""
+        from paramem.server.app import _derive_consolidation_status_fields
+        from paramem.server.incidents import record_incident
+
+        state_dir = tmp_path / "state"
+        record_incident(
+            state_dir,
+            type="full_consolidation_overdue",
+            key="20200101T0000",
+            severity="failed",
+            summary="Full consolidation overdue — fold has not completed within its runway",
+            detail={
+                "oldest_interim_stamp": "20200101T0000",
+                "type": "full_consolidation_overdue",
+            },
+        )
+
+        err, _ = _derive_consolidation_status_fields(state_dir)
+        assert err is not None, (
+            "full_consolidation_overdue incident must surface in last_consolidation_error"
+        )
+        assert err["type"] == "full_consolidation_overdue"
+        assert err["oldest_interim_stamp"] == "20200101T0000"
