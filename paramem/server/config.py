@@ -1157,6 +1157,15 @@ class ConsolidationScheduleConfig:
                 f"got {self.consolidation_retry_cap!r}"
             )
 
+        # B8a-5: relax when consume-pending full-fold mode lands (count==0 → full-fold-only).
+        if self.max_interim_count < 1:
+            raise ValueError(
+                f"consolidation.max_interim_count must be >= 1; "
+                f"got {self.max_interim_count!r}. "
+                f"Queue-until-consolidation (count=0) is not supported; "
+                f"use max_interim_count >= 1."
+            )
+
         # orphan_retirement: validate the schedule string early so the operator
         # sees a clear error at startup, not at the first tick.
         try:

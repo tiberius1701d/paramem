@@ -1101,16 +1101,17 @@ class TestInterimEnrichmentHook:
 
         loop._run_graph_enrichment.assert_not_called()
 
-    def test_rollover_hook_skipped_on_cap_reached_absorb(self, tmp_path):
-        """Cap-reached absorb path (degenerated early-return) does NOT fire the hook.
+    def test_rollover_hook_skipped_on_ring_full(self, tmp_path):
+        """Ring-full (cap_pending) short-circuit does NOT fire the enrichment hook.
 
-        Rather than driving the full cap-reached retrain (which pulls in
-        every heavy training dependency), we trip the degenerated health
-        gate which short-circuits the absorb branch before any lazy
-        imports — still proving the rollover hook is structurally bound
-        to the normal-branch else, not the cap-reached if.
+        When the interim ring is at max_interim_count and the target slot is new
+        (train mode), run_consolidation_cycle returns mode="cap_pending" before
+        any graph extraction or enrichment occurs.  The rollover hook is bound
+        to the normal-branch pipeline, not the cap_pending early-return.
         """
-        loop = _make_loop(tmp_path)
+        # replay_enabled=True is required so the "no registry" guard passes
+        # and execution reaches the ring-full detection.
+        loop = _make_loop(tmp_path, replay_enabled=True)
 
         loop.extract_session = MagicMock(
             return_value=(
@@ -1130,27 +1131,13 @@ class TestInterimEnrichmentHook:
 
         existing_stamp = "20260419T1200"
         current_stamp = "20260420T1200"
-        newest_name = f"episodic_interim_{existing_stamp}"
+        existing_name = f"episodic_interim_{existing_stamp}"
+        # Pre-fill the ring to max_interim_count=1 with a different stamp so
+        # the target slot (current_stamp) is new and ring_full fires.
         loop.model.peft_config = {
             "episodic": MagicMock(),
             "semantic": MagicMock(),
-            newest_name: MagicMock(),
-        }
-
-        # Mark the newest interim degenerated → post_session_train returns
-        # early with mode="degenerated" before any imports or training.
-        # indexed_key_registry is now dict[str, KeyRegistry]; the newest interim
-        # tier entry must have is_healthy() == False.
-        from paramem.training.key_registry import ADAPTER_HEALTH_DEGENERATED
-        from paramem.training.key_registry import KeyRegistry as _KeyRegistry
-
-        _interim_reg = _KeyRegistry()
-        _interim_reg.set_health(ADAPTER_HEALTH_DEGENERATED, reason="test-degenerated")
-        loop.indexed_key_registry = {
-            "episodic": _KeyRegistry(),
-            "semantic": _KeyRegistry(),
-            "procedural": _KeyRegistry(),
-            newest_name: _interim_reg,
+            existing_name: MagicMock(),
         }
 
         result = loop.post_session_train(
@@ -1162,7 +1149,7 @@ class TestInterimEnrichmentHook:
             stamp=current_stamp,
         )
 
-        assert result["mode"] == "degenerated"
+        assert result["mode"] == "cap_pending"
         loop._run_graph_enrichment.assert_not_called()
 
 

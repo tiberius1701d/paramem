@@ -12900,20 +12900,21 @@ def _extract_and_start_training():
         _cycle_mode = result.get("mode", "trained")
         _recall_failed = result.get("recall_failed_session_ids", [])
         # Build the set of sessions to pin (keep pending) this cycle.
-        # All three failure sources pin; only recall + degenerate increment.
+        # recall_failed: pin + count (encoding attempted but recall gate failed).
+        # aborted: pin only (yield-to-inference, not an encoding failure).
+        # cap_pending: pin only (ring full — scheduling condition, full fold drains ring).
         _pin_sids: set[str] = set(_recall_failed)
         _count_sids: set[str] = set(_recall_failed)  # sessions whose counter increments
-        if _cycle_mode in {"aborted", "degenerated"}:
+        if _cycle_mode in {"aborted", "cap_pending"}:
             # Contributing sessions = those that passed extraction but whose
             # results were not committed.  OOM-skipped chunks are already in
             # failed_session_ids; exclude them to avoid double-counting.
             _contributing = {sid for sid in session_ids if sid not in failed_session_ids}
             _pin_sids.update(_contributing)
-            if _cycle_mode == "degenerated":
-                # Degenerate = encoding attempted but adapter degenerated → count.
-                _count_sids.update(_contributing)
-            # ABORT: pin without incrementing — yield-to-inference is not
-            # a fact-encoding failure and must not consume the retry budget.
+            # ABORT: pin without incrementing — yield-to-inference is not a
+            # fact-encoding failure and must not consume the retry budget.
+            # CAP_PENDING: pin without incrementing — scheduling backpressure
+            # is not an encoding failure (full fold drains the ring).
         _released_sids: list[str] = []
         if _pin_sids:
             failed_session_ids.update(_pin_sids)
@@ -12987,7 +12988,7 @@ def _extract_and_start_training():
         # the cap.  A session passes recall if it is in session_ids, NOT in the
         # current _count_sids (i.e. was not a failure this cycle), and has an
         # existing durable count entry.
-        if _cycle_mode not in {"aborted", "degenerated"}:
+        if _cycle_mode not in {"aborted", "cap_pending"}:
             for _sid in session_ids:
                 if _sid not in _pin_sids and _sid in session_buffer._sessions:
                     _existing = session_buffer._sessions[_sid].get("recall_retry_count", 0)
@@ -13057,7 +13058,7 @@ def _extract_and_start_training():
                 # resolving here would wipe an incident recorded by the same cycle.
                 _is_clean_success = (
                     not result.get("recall_failed_session_ids", [])
-                    and _cycle_mode not in {"aborted", "degenerated"}
+                    and _cycle_mode not in {"aborted", "cap_pending"}
                     and not _released_sids
                 )
                 if _is_clean_success:
@@ -13406,10 +13407,10 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 resolve_incidents_by_type(_full_state_dir, "extraction_failed")
                 # Full-cycle path mirrors the interim path — resolve
                 # consolidation_retry_exhausted only when the cycle returned zero
-                # recall-failed session ids and was not itself aborted/degenerated.
+                # recall-failed session ids and was not itself aborted.
                 if not result.get("recall_failed_session_ids", []) and result.get(
                     "mode", "full_trained"
-                ) not in {"aborted", "degenerated"}:
+                ) not in {"aborted"}:
                     resolve_incidents_by_type(_full_state_dir, "consolidation_retry_exhausted")
                 # A completed fold drains the interim ring — the overdue condition
                 # is resolved regardless of recall outcome.

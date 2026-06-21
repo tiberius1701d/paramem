@@ -119,7 +119,6 @@ def _make_minimal_loop(tmp_path):
     loop._indexed_ep_interim = {}
     loop.episodic_replay_pool = []
     loop.curriculum_sampler = None
-    loop.pending_interim_triples = []
     return loop
 
 
@@ -139,7 +138,7 @@ def _common_patches(loop):
         patch.object(
             ConsolidationLoop,
             "_resolve_target_slot",
-            return_value=("episodic_interim_t001", False, False, False),
+            return_value="episodic_interim_t001",
         ),
         patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
         patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
@@ -306,7 +305,7 @@ class TestSimulateModeRegistersProceduralKeys:
             patch.object(
                 ConsolidationLoop,
                 "_resolve_target_slot",
-                return_value=("episodic_interim_t001", False, False, False),
+                return_value="episodic_interim_t001",
             ),
             patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),

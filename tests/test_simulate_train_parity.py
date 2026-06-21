@@ -185,7 +185,6 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     loop._indexed_next_index = 1
     loop._procedural_next_index = 1
     loop.promoted_keys: set = set()
-    loop.pending_interim_triples: list = []
     loop.fingerprint_cache = None
 
     # Stub out the recall probe so tests with a MagicMock model do not
@@ -216,11 +215,8 @@ def _patches_for_train_mode():
     - ``paramem.models.loader.save_adapter`` → no-op (avoids PEFT I/O).
     - ``paramem.adapters.manifest.build_manifest_for`` → returns None.
     - ``paramem.memory.interim_adapter.create_interim_adapter`` → populates
-      peft_config[adapter_name] so _resolve_target_slot's peft_config check
+      peft_config[adapter_name] so the ring-full check in run_consolidation_cycle
       works; returns the model unchanged.
-    - ``paramem.training.consolidation.probe_entries`` → yields None recalled so
-      existing-key reconstruction falls through to the store cache (unit-test
-      mode; real inference requires a loaded GPU model).
     """
 
     def _fake_create_interim(model, cfg, stamp):
@@ -228,11 +224,6 @@ def _patches_for_train_mode():
         adapter_name = f"episodic_interim_{stamp}"
         model.peft_config[adapter_name] = MagicMock()
         return model
-
-    def _fake_probe_entries(model, tokenizer, entries, **kw):
-        """Yield (entry, None) so reconstruction falls through to the store cache."""
-        for e in entries:
-            yield e, None
 
     return [
         patch(
@@ -244,10 +235,6 @@ def _patches_for_train_mode():
         patch(
             "paramem.memory.interim_adapter.create_interim_adapter",
             side_effect=_fake_create_interim,
-        ),
-        patch(
-            "paramem.training.consolidation.probe_entries",
-            side_effect=_fake_probe_entries,
         ),
     ]
 
@@ -298,7 +285,7 @@ class TestSimulateTrainParity:
     def _run_train(self, loop: ConsolidationLoop) -> dict:
         """Run one train cycle with the deterministic fixture relations."""
         patches = _patches_for_train_mode()
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], patches[3]:
             return loop.run_consolidation_cycle(
                 list(_EPISODIC_RELS),
                 list(_PROCEDURAL_RELS),
@@ -371,9 +358,8 @@ class TestSimulateTrainParity:
 
         Run the same fixture twice on each loop using the SAME stamp so that
         _resolve_target_slot returns the same adapter slot and
-        _prepare_episodic_keys_for_tier enters the existing-key reconstruction
-        branch.  Entries from cycle 1 must keep first_seen_cycle=1 after
-        cycle 2.
+        _run_fold enters the existing-key reconstruction branch.
+        Entries from cycle 1 must keep first_seen_cycle=1 after cycle 2.
 
         Using the same stamp is deliberate: this exercises the preservation
         branch (not just the fresh-slot path) that retains first_seen_cycle.
@@ -394,7 +380,7 @@ class TestSimulateTrainParity:
         train_keys_1 = set(key for _tier, key, _entry in loop_train.store.iter_entries())
 
         # Run again with the SAME stamp to exercise the existing-key reconstruction
-        # branch in _prepare_episodic_keys_for_tier.
+        # branch in _run_fold (same adapter slot, existing keys reconstructed).
         loop_sim.run_consolidation_cycle(
             list(_EPISODIC_RELS),
             list(_PROCEDURAL_RELS),
@@ -404,7 +390,7 @@ class TestSimulateTrainParity:
             stamp=_STAMP,  # same stamp as cycle 1
         )
         patches = _patches_for_train_mode()
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], patches[3]:
             loop_train.run_consolidation_cycle(
                 list(_EPISODIC_RELS),
                 list(_PROCEDURAL_RELS),
@@ -653,7 +639,7 @@ class TestSimulateTrainParity:
         # set_adapter was called with adapter_name at step 9
         # (switch_adapter before training).
         patches = _patches_for_train_mode()
-        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        with patches[0], patches[1], patches[2], patches[3]:
             loop_train.run_consolidation_cycle(
                 list(_EPISODIC_RELS),
                 list(_PROCEDURAL_RELS),
@@ -2013,44 +1999,46 @@ class TestDebugSnapshotIntegration:
         assert summary["venue"] == "simulate"
         assert summary["error"] is None
 
-    def test_queue_only_branch_emits_summary_but_skips_graph_dump(self, tmp_path):
-        """Queue-only short-circuit (``max_interim_count=0``) emits only the
-        cycle summary — no cumulative-graph or relation dumps (locked
-        decision #1).
+    def test_cap_pending_branch_emits_summary_but_skips_graph_dump(self, tmp_path):
+        """Ring-full short-circuit (``cap_pending``) emits only the cycle summary.
+
+        When the interim ring is at ``max_interim_count`` and the target slot is
+        new (train mode), run_consolidation_cycle returns ``mode="cap_pending"``
+        immediately — no graph dump, no training.
         """
         loop = _build_loop(tmp_path / "loop")
         debug_base = tmp_path / "debug"
         self._enable_debug(loop, debug_base)
 
+        # Pre-fill the PEFT ring to max_interim_count=1 with an existing stamp,
+        # then call with a NEW stamp so the target slot is absent from peft_config
+        # and ring_full fires (existing count >= max_interim_count).
+        _existing_stamp = "20260101T0000"
+        _new_stamp = "20260601T1200"
+        loop.model.peft_config[f"episodic_interim_{_existing_stamp}"] = MagicMock()
+
         result = loop.run_consolidation_cycle(
             list(_EPISODIC_RELS),
             list(_PROCEDURAL_RELS),
             speaker_id=_SPEAKER_ID,
-            mode="simulate",
-            run_label="integration-queue",
-            stamp=_STAMP,
-            max_interim_count=0,
+            mode="train",
+            run_label="integration-cap",
+            stamp=_new_stamp,
+            max_interim_count=1,
         )
-        assert result["mode"] == "queued"
+        assert result["mode"] == "cap_pending"
+        assert result["adapter_name"] is None
 
-        cycle_dir = loop.snapshot_dir_for(interim_stamp=_STAMP)
+        cycle_dir = loop.snapshot_dir_for(interim_stamp=_new_stamp)
         assert cycle_dir is not None
         assert (cycle_dir / "cycle_summary_snapshot.json").exists()
         assert not (cycle_dir / "graph_snapshot.json").exists()
         assert not (cycle_dir / "graph_merged_snapshot.json").exists()
         assert not (cycle_dir / "episodic_rels_snapshot.json").exists()
         assert not (cycle_dir / "procedural_rels_snapshot.json").exists()
-        # merger.save_graph must NOT have been called for any graph dump path
-        # (queue-only exits before the refine stage / on_fold_graph).
-        for call in loop.merger.save_graph.call_args_list:
-            assert call.args[0].name not in (
-                "graph_snapshot.json",
-                "graph_merged_snapshot.json",
-                "graph_enriched_snapshot.json",
-            )
 
         summary = json.loads((cycle_dir / "cycle_summary_snapshot.json").read_text())
-        assert summary["mode"] == "queued"
+        assert summary["mode"] == "cap_pending"
         assert summary["adapter_name"] is None
 
 

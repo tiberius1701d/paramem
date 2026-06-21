@@ -42,7 +42,6 @@ from paramem.models.loader import atomic_save_adapter, switch_adapter
 from paramem.server.vram_guard import safe_empty_cache
 from paramem.training.curriculum import CurriculumSampler
 from paramem.training.key_registry import KeyRegistry
-from paramem.training.recall_eval import probe_entries
 from paramem.training.replay import MixedReplayDataset, SyntheticQADataset
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.training.trainer import TrainingHooks, train_adapter
@@ -448,15 +447,6 @@ class ConsolidationLoop:
         # Keys already promoted (prevent re-promotion after restart)
         self.promoted_keys: set[str] = set()
 
-        # RAM-only queue for max_interim_count==0 (queue-until-consolidation).
-        # Facts extracted when no interim adapter is configured accumulate here
-        # until the next full consolidation fold (consolidate_interim_adapters)
-        # folds them into the mains.
-        # Privacy invariant: this list is never written to disk — what isn't
-        # trained doesn't exist.  Snapshot persistence is deferred to the fold.
-        # TODO: consume pending_interim_triples at the start of
-        # consolidate_interim_adapters() before training the full key set.
-        self.pending_interim_triples: list[dict] = []
         # BackgroundTrainer reference — wired after construction by the server
         # lifespan or create_consolidation_loop caller.  When set,
         # _build_training_hooks routes through bt.training_hooks_for_job so
@@ -1399,66 +1389,21 @@ class ConsolidationLoop:
     def _resolve_target_slot(
         self,
         stamp: str,
-        max_interim_count: int,
-        *,
-        mode: "Literal['simulate', 'train']",
-    ) -> "tuple[str, bool, bool, bool]":
-        """Compute the target interim adapter name and control-flow flags.
+    ) -> str:
+        """Compute the target interim adapter name for this sub-interval.
 
-        Returns a 4-tuple ``(adapter_name, cap_reached_absorb, queue_only,
-        degenerated_skip)``:
-
-        - ``adapter_name``: The PEFT adapter name for this sub-interval
-          (``episodic_interim_<stamp>``).
-        - ``cap_reached_absorb``: When ``True``, the cap was reached and the
-          new facts should be absorbed into the newest existing interim adapter
-          via a full retrain.  **Train mode only** — always ``False`` in
-          simulate mode (no PEFT slots to count).
-        - ``queue_only``: When ``True``, the caller passed
-          ``max_interim_count == 0`` and facts should be queued without
-          creating an adapter.  Mode-agnostic.
-        - ``degenerated_skip``: When ``True``, the newest interim adapter is
-          marked degenerated and new facts should be queued.  **Train mode
-          only** — always ``False`` in simulate mode.
-
-        In simulate mode the slot is always freshly minted (no PEFT config to
-        consult) so ``cap_reached_absorb`` and ``degenerated_skip`` are both
-        ``False``.
+        Pure name-minting helper: returns ``"episodic_interim_<stamp>"``.
+        Ring-full detection and cap-pending routing live in
+        ``run_consolidation_cycle``, which inspects PEFT config before deciding
+        whether to delegate to ``_run_fold``.
 
         Args:
             stamp: The sub-interval stamp (``YYYYMMDDTHHMM``).
-            max_interim_count: Cap on concurrent interim adapters.
-                ``0`` → queue-only branch.
-            mode: ``"train"`` or ``"simulate"``.
 
         Returns:
-            ``(adapter_name, cap_reached_absorb, queue_only, degenerated_skip)``
+            Adapter name string ``f"episodic_interim_{stamp}"``.
         """
-        adapter_name = f"episodic_interim_{stamp}"
-
-        if max_interim_count == 0:
-            return adapter_name, False, True, False
-
-        if mode == "simulate":
-            # Simulate never touches PEFT config — fresh slot by definition.
-            return adapter_name, False, False, False
-
-        # Train mode: check PEFT config for cap-reached / degenerated conditions.
-        if adapter_name not in self.model.peft_config:
-            existing_interim = sorted(
-                a for a in self.model.peft_config if a.startswith("episodic_interim_")
-            )
-            if self.store.replay_enabled and len(existing_interim) >= max_interim_count:
-                newest = existing_interim[-1]
-                _newest_reg = (
-                    self.store.registry(newest) if self.store.has_registry(newest) else None
-                )
-                if _newest_reg is None or not _newest_reg.is_healthy():
-                    return adapter_name, False, False, True
-                # Cap reached and newest is healthy — absorb into newest.
-                return newest, True, False, False
-
-        return adapter_name, False, False, False
+        return f"episodic_interim_{stamp}"
 
     def _mint_keyed_entries(
         self,
@@ -1529,152 +1474,6 @@ class ConsolidationLoop:
                 entry["_new"] = True
             minted.append(entry)
         return minted
-
-    def _prepare_episodic_keys_for_tier(
-        self,
-        adapter_name: str,
-        rels: list[dict],
-        speaker_id: str,
-        *,
-        mode: "Literal['simulate', 'train']",
-    ) -> list[dict]:
-        """Assign new keys and gather existing keys for the target interim tier.
-
-        Unified replacement for ``_simulate_indexed_key_episodic``,
-        ``_run_indexed_key_episodic`` (key-prep body), and the
-        ``_train_extracted_into_interim`` key-prep block (lines 2864-2901 of
-        the original file).
-
-        Tier scope: ``self.store.active_keys_in_tier(adapter_name)`` — per-tier
-        only.  Cross-tier scoping (``_all_active_keys()``) is NOT used here;
-        each interim slot manages its own membership.
-
-        First-seen preservation: existing entries retain their original
-        ``first_seen_cycle`` rather than being stamped with the current cycle.
-
-        Speaker-ID default: each new keyed pair receives
-        ``kp.get("speaker_id", speaker_id)`` — the caller's id, never ``""``.
-
-        Reconstruction policy (TRAIN mode only):
-            Calls ``probe_entries`` on each existing key and uses the adapter
-            weights as the authoritative source.  Falls back to
-            ``_safe_kp_from_cache`` when probe fails.
-
-        Simulate policy:
-            Reads existing entries from ``self.store.get(key)`` — no
-            ``model.generate`` calls.
-
-        DOES NOT train.  DOES NOT update simhash registries.  DOES NOT call
-        ``store.put`` or advance ``self._indexed_next_index`` — callers own that
-        mutation and must apply it at the correct point in their failure-safety
-        boundary (after ``train_adapter`` for the interim path, immediately for
-        the full-train paths where failure rolls back the whole cycle).
-
-        New entries are returned with ``"_new": True`` so callers can identify
-        them for deferred store.put / index-counter advancement.  Existing
-        entries never carry ``"_new"``.
-
-        Args:
-            adapter_name: Target tier name (e.g. ``"episodic_interim_YYYYMMDDTHHMM"``
-                or ``"episodic"``).  Determines which per-tier key set is used for
-                existing-key reconstruction.
-            rels: Pre-extracted episodic relation dicts, already tagged with
-                ``speaker_id`` by ``_tag_speaker_id_defaults``.
-            speaker_id: Fallback speaker tag for new keys missing one.
-            mode: ``"train"`` probes adapter weights; ``"simulate"`` reads cache.
-
-        Returns:
-            Full keyed-pair list (new + existing) ready for training (train) or
-            registry rebuild (simulate).  Each entry has
-            ``{key, subject, predicate, object, speaker_id, first_seen_cycle}``.
-            New entries additionally carry ``"_new": True``.
-        """
-        # Assign new keys from the incoming relations via the shared minting helper.
-        # store.put and _indexed_next_index advancement are intentionally deferred to
-        # the caller — see _mint_keyed_entries docstring and this method's docstring.
-        new_keyed = self._mint_keyed_entries(
-            rels,
-            prefix="graph",
-            start_index=self._indexed_next_index,
-            speaker_id=speaker_id,
-            tag_new=True,
-        )
-
-        # Gather existing keys for the target tier (full-replay anti-forgetting).
-        new_key_set = {kp["key"] for kp in new_keyed}
-        existing_tier_keys = [
-            k for k in self.store.active_keys_in_tier(adapter_name) if k not in new_key_set
-        ]
-
-        existing_keyed: list[dict] = []
-        if mode == "train":
-            # TRAIN: reconstruct from adapter weights.
-            # Keys with no simhash fingerprint cannot be verified by probe_entries
-            # (no reference hash to compute confidence against) — fall back to
-            # cache immediately for those keys and only probe the rest.
-            self._disable_gradient_checkpointing()
-            tier_simhash = self.store.tier_simhashes(adapter_name, include_stale=False)
-            keys_with_hash = [k for k in existing_tier_keys if k in tier_simhash]
-            keys_without_hash = [k for k in existing_tier_keys if k not in tier_simhash]
-            reconstructed: dict[str, dict] = {}
-            entries = [{"key": k} for k in keys_with_hash]
-            for entry, recalled in probe_entries(
-                self.model,
-                self.tokenizer,
-                entries,
-                registry=tier_simhash,
-                batch_size=self.training_config.recall_probe_batch_size,
-                confidence_threshold=0.5,
-            ):
-                key = entry["key"]
-                if recalled is not None and "failure_reason" not in recalled:
-                    bk = self.store.bookkeeping_for_key(key) or {}
-                    first_seen = bk.get("first_seen_cycle", self.cycle_count)
-                    reconstructed[key] = {
-                        "key": key,
-                        "subject": recalled["subject"],
-                        "predicate": recalled["predicate"],
-                        "object": recalled["object"],
-                        "speaker_id": bk.get("speaker_id", speaker_id),
-                        "first_seen_cycle": first_seen,
-                    }
-            logger.info(
-                "_prepare_episodic_keys_for_tier: reconstruction %d/%d (adapter=%s)",
-                len(reconstructed),
-                len(keys_with_hash),
-                adapter_name,
-            )
-            for key in keys_with_hash:
-                if key in reconstructed:
-                    existing_keyed.append(reconstructed[key])
-                    continue
-                kp = self._safe_kp_from_cache(key)
-                if kp is not None:
-                    existing_keyed.append(kp)
-            for key in keys_without_hash:
-                # No simhash — cannot probe; use cache as ground truth.
-                kp = self._safe_kp_from_cache(key)
-                if kp is not None:
-                    existing_keyed.append(kp)
-        else:
-            # SIMULATE: read SPO from cache; bookkeeping from _bookkeeping.
-            for key in existing_tier_keys:
-                qa = self.store.get(key)
-                if qa is not None:
-                    bk = self.store.bookkeeping_for_key(key) or {}
-                    first_seen = bk.get("first_seen_cycle", self.cycle_count)
-                    existing_keyed.append(
-                        {
-                            "key": key,
-                            "subject": qa["subject"],
-                            "predicate": qa["predicate"],
-                            "object": qa["object"],
-                            "speaker_id": bk.get("speaker_id", speaker_id),
-                            "first_seen_cycle": first_seen,
-                        }
-                    )
-
-        return existing_keyed + new_keyed
 
     def finalize_training(self) -> None:
         """Save adapters and registries after background training completes."""
@@ -2370,12 +2169,6 @@ class ConsolidationLoop:
         successfully so that extraction or training failures never leave
         orphaned keys in the registry.
 
-        If ``max_interim_count == 0``, new facts are appended to
-        ``self.pending_interim_triples`` (RAM-only) without training.  The pending
-        queue is consumed by the next full consolidation fold
-        (``consolidate_interim_adapters``).  What is not trained does not exist on
-        disk — this upholds the privacy invariant.
-
         Procedural relations extracted from the same transcript are trained onto
         the stable ``procedural`` main adapter (no interim tier for procedural —
         preferences are small-volume and slow-changing).  This pass runs inline,
@@ -2406,7 +2199,7 @@ class ConsolidationLoop:
             schedule: Consolidation schedule string (e.g. ``"every 2h"``, ``"03:00"``).
                 Used together with *max_interim_count* to compute the sub-interval stamp.
             max_interim_count: Number of sub-intervals per consolidation period.
-                ``0`` → queue-until-consolidation branch (no interim adapter created).
+                Must be ≥ 1 (rejected at config load if < 1).
             stamp: Override the computed sub-interval stamp.  Injected by tests so the
                 flooring logic can be exercised without mocking ``datetime.now()``.
 
@@ -2416,8 +2209,8 @@ class ConsolidationLoop:
                 {
                     "triples_extracted": int,
                     "new_keys": list[str],
-                    "adapter_name": str | None,   # None if queued or noop
-                    "mode": "trained" | "queued" | "noop",
+                    "adapter_name": str | None,   # None if cap_pending or noop
+                    "mode": "trained" | "cap_pending" | "noop",
                     "error": str | None,
                 }
         """
@@ -2468,10 +2261,6 @@ class ConsolidationLoop:
         ``simulated_training`` (simulate) methods.  Both modes execute the same
         pipeline — the ONLY mode-conditional code is:
 
-        * :meth:`_resolve_target_slot` — slot-selection / cap logic (train-mode
-          only; simulate always mints fresh).
-        * :meth:`_prepare_episodic_keys_for_tier` — reconstruction source (probe
-          weights in train; read cache in simulate).
         * :func:`paramem.memory.persistence.commit_tier_slot` — venue
           write (train: save adapter weights; simulate: write sidecar JSON).
 
@@ -2486,9 +2275,11 @@ class ConsolidationLoop:
         3. Guard: no relations → early return ``{"status": "noop", ...}``.
         4. Tag relations with caller's ``speaker_id`` as default.
         5. Compute stamp (when not provided) and call ``_resolve_target_slot``
-           to obtain ``(adapter_name, cap_reached_absorb, queue_only,
-           degenerated_skip)``.
-        6. Handle control-flow branches: queue-only and degenerated-skip.
+           to obtain ``adapter_name``.
+        6. Ring-full detection (train mode only): when the interim ring is at
+           ``max_interim_count`` and the target slot is new, return
+           ``mode="cap_pending"`` immediately — sessions stay in the session
+           buffer and re-extract on the next tick.
         7. Mint PEFT slot (train only).
         8. Materialize: call :meth:`_materialize_consolidation_graph` scoped
            to the current slot for the recall-miss diagnostic and to rebuild the
@@ -2527,8 +2318,11 @@ class ConsolidationLoop:
                 ``"tick-<stamp>"`` for batch calls from the scheduled tick.
             schedule: Consolidation refresh-cadence string used to compute the
                 sub-interval stamp when *stamp* is not provided.
-            max_interim_count: Cap on concurrent interim adapters.
-                ``0`` → queue-until-consolidation branch (RAM-only, no training).
+            max_interim_count: Cap on concurrent interim adapters.  When the
+                ring is full (train mode only), sessions are kept pending and
+                the method returns ``mode="cap_pending"`` without minting or
+                training.  ``max_interim_count < 1`` is rejected by the config
+                validator.
             stamp: Override the computed sub-interval stamp (test injection).
             recall_sanity_threshold: Accepted for caller override compatibility;
                 the active threshold is read from ``self.config.recall_sanity_threshold``
@@ -2544,9 +2338,9 @@ class ConsolidationLoop:
         Returns:
             Result dict with keys ``{"triples_extracted", "new_keys",
             "adapter_name", "mode", "venue", "error"}``.  ``mode`` is the
-            outcome (``"trained"``, ``"simulated"``, ``"queued"``,
-            ``"degenerated"``, or ``"noop"``); ``venue`` is the training
-            medium (``"train"`` or ``"simulate"``).
+            outcome (``"trained"``, ``"simulated"``, ``"cap_pending"``,
+            or ``"noop"``); ``venue`` is the training medium (``"train"`` or
+            ``"simulate"``).
         """
         # Resolve threshold from config when the caller did not supply an override.
         if recall_sanity_threshold is None:
@@ -2590,49 +2384,43 @@ class ConsolidationLoop:
 
             stamp = _cis(schedule)
 
-        adapter_name, cap_reached_absorb, queue_only, degenerated_skip = self._resolve_target_slot(
-            stamp, max_interim_count, mode=mode
-        )
+        adapter_name = self._resolve_target_slot(stamp)
 
-        # --- 6a. Queue-only branch ---
-        if queue_only:
-            self.pending_interim_triples.extend(episodic_rels)
-            logger.info(
-                "run_consolidation_cycle: max_interim_count=0 — queued %d triples "
-                "(total pending: %d)",
+        # --- 6. Ring-full detection (train mode only) ---
+        # When the ring is at capacity and the target slot is new, keep sessions
+        # pending — no mint, no train, no RAM sink.  Sessions re-extract on the
+        # next tick (lossless via session_buffer).  The full fold drains the ring.
+        # S5 will add bounded overflow (interim_overflow_slack) before this path.
+        # Count source: PEFT-resident adapters (what the VRAM ceiling constrains).
+        existing_interim_count = len(
+            [a for a in self.model.peft_config if a.startswith("episodic_interim_")]
+        )
+        # Ring-full: train-mode only (simulate has no PEFT slots; count is
+        # meaningless against a PEFT config that simulate never populates).
+        ring_full = (
+            mode != "simulate"
+            and adapter_name not in self.model.peft_config
+            and self.store.replay_enabled
+            and existing_interim_count >= max_interim_count
+        )
+        if ring_full:
+            logger.warning(
+                "run_consolidation_cycle: interim ring full (%d/%d slots) — "
+                "keeping %d triples pending until next full fold",
+                existing_interim_count,
+                max_interim_count,
                 len(episodic_rels),
-                len(self.pending_interim_triples),
             )
-            queued_summary = {
+            cap_pending_summary = {
                 "triples_extracted": triples_extracted,
                 "new_keys": [],
                 "adapter_name": None,
-                "mode": "queued",
+                "mode": "cap_pending",
                 "venue": mode,
                 "error": None,
             }
-            self._debug_writer.on_cycle_end(queued_summary, interim_stamp=stamp)
-            return queued_summary
-
-        # --- 6b. Degenerated-skip branch (train mode only) ---
-        if degenerated_skip:
-            self.pending_interim_triples.extend(episodic_rels)
-            logger.warning(
-                "run_consolidation_cycle: target adapter degenerated — "
-                "queued %d triples (pending: %d)",
-                len(episodic_rels),
-                len(self.pending_interim_triples),
-            )
-            degenerated_summary = {
-                "triples_extracted": triples_extracted,
-                "new_keys": [],
-                "adapter_name": adapter_name,
-                "mode": "degenerated",
-                "venue": mode,
-                "error": "target_adapter_degenerated",
-            }
-            self._debug_writer.on_cycle_end(degenerated_summary, interim_stamp=stamp)
-            return degenerated_summary
+            self._debug_writer.on_cycle_end(cap_pending_summary, interim_stamp=stamp)
+            return cap_pending_summary
 
         # --- 7. Delegate pipeline to _run_fold (interim_slot scope) ---
         # source is derived from mode: "weights" for train, "disk" for simulate.
@@ -2660,7 +2448,6 @@ class ConsolidationLoop:
             stamp=stamp,
             speaker_id=speaker_id,
             new_promotions=new_promotions,
-            cap_reached_absorb=cap_reached_absorb,
             run_label=run_label,
             triples_extracted=triples_extracted,
             episodic_rels=episodic_rels,
@@ -3552,7 +3339,6 @@ class ConsolidationLoop:
         stamp: "str | None" = None,
         speaker_id: str,
         new_promotions: "list[str] | None" = None,
-        cap_reached_absorb: bool = False,
         run_label: str = "",
         triples_extracted: int = 0,
         episodic_rels: "list[dict] | None" = None,
@@ -3622,8 +3408,6 @@ class ConsolidationLoop:
                 before training (``interim_slot`` / ``source="weights"`` path only).
                 WARN-5 (B8a-2): retained explicitly so the semantic-transfer block is
                 not lost when ``run_consolidation_cycle`` becomes a thin wrapper.
-            cap_reached_absorb: Whether the interim slot was absorb-reset to LoRA zeros
-                (``interim_slot`` / ``source="weights"`` path only).
             run_label: Tag woven into the wandb ``run_name`` for traceability
                 (``interim_slot`` path only).
             triples_extracted: Number of episodic relations extracted this cycle
@@ -3826,17 +3610,8 @@ class ConsolidationLoop:
                 # --- Mint PEFT slot (weights source only) ---
                 if scope.source == "weights":
                     from paramem.memory.interim_adapter import create_interim_adapter
-                    from paramem.models.loader import create_adapter as _create_adapter
 
-                    if cap_reached_absorb:
-                        # Reset absorb target to LoRA zeros for a clean retrain.
-                        self.model.delete_adapter(adapter_name)
-                        self.model = _create_adapter(self.model, self.episodic_config, adapter_name)
-                        logger.info(
-                            "_run_fold[interim]: cap-reached — reset %s to LoRA zeros",
-                            adapter_name,
-                        )
-                    elif adapter_name not in self.model.peft_config:
+                    if adapter_name not in self.model.peft_config:
                         self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
                         logger.info("_run_fold[interim]: created interim adapter %s", adapter_name)
 

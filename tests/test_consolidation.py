@@ -2896,7 +2896,6 @@ class TestAbortSkipsCommit:
         loop._indexed_ep_interim = {}
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
-        loop.pending_interim_triples = []
         return loop
 
     def test_run_consolidation_cycle_returns_aborted_on_abort(self, monkeypatch, tmp_path):
@@ -2904,10 +2903,10 @@ class TestAbortSkipsCommit:
         returns {'mode': 'aborted'} without updating simhashes or committing
         the tier slot.
 
-        B3: key generation now uses the graph-walk (merger.graph) rather than
-        _prepare_episodic_keys_for_tier.  Set up a real NetworkX graph with one
-        keyless episodic edge so the graph-walk produces a non-empty training set
-        and triggers the train_adapter call.
+        B3: key generation uses the graph-walk (merger.graph) via _run_fold.
+        Set up a real NetworkX graph with one keyless episodic edge so the
+        graph-walk produces a non-empty training set and triggers the
+        train_adapter call.
         """
         from unittest.mock import patch
 
@@ -2951,7 +2950,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop,
                 "_resolve_target_slot",
-                return_value=("episodic_interim_t001", False, False, False),
+                return_value="episodic_interim_t001",
             ),
             patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
@@ -3052,7 +3051,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop,
                 "_resolve_target_slot",
-                return_value=("episodic_interim_t001", False, False, False),
+                return_value="episodic_interim_t001",
             ),
             patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
             patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
@@ -3302,7 +3301,6 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop._indexed_ep_interim = {}
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
-        loop.pending_interim_triples = []
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.graph_enrichment_neighborhood_hops = 2
         return loop
@@ -7551,7 +7549,6 @@ class TestHarvestKeylessEdgesSpeakerId:
         loop._indexed_ep_interim = {}
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
-        loop.pending_interim_triples = []
         loop._bg_trainer = None
         loop.shutdown_requested = False
         loop._early_stop_callback = None
@@ -7679,7 +7676,6 @@ class TestCollectKeyedEdgesInto:
         loop._indexed_ep_interim = {}
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
-        loop.pending_interim_triples = []
         merger = MagicMock()
         merger.graph = nx.MultiDiGraph()
         loop.merger = merger
@@ -8043,7 +8039,7 @@ class TestMaterializeInterimB1:
           store.all_active_keys() BEFORE the reset — unregistered relations are
           invisible to the miss set.
     B1-4. dcf4189 speaker_id invariant: a minted interim key inherits speaker_id
-          from the relation dict through _prepare_episodic_keys_for_tier — the
+          from the relation dict through the graph-walk keying step — the
           B1 materialize step does not disrupt this flow.
     """
 
@@ -8104,7 +8100,6 @@ class TestMaterializeInterimB1:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.pending_interim_triples = []
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
@@ -8339,14 +8334,14 @@ class TestMaterializeInterimB1:
         """Minted interim keys inherit speaker_id from episodic_rels through the
         new materialize path.
 
-        B1 inserts _materialize_consolidation_graph BEFORE _prepare_episodic_keys_for_tier.
-        The key-prep still reads speaker_id from episodic_rels (via _mint_keyed_entries),
+        B1 inserts _materialize_consolidation_graph BEFORE the graph-walk keying step.
+        The key-prep reads speaker_id from episodic_rels (via _mint_keyed_entries),
         NOT from graph nodes.  This test verifies that adding the materialize step
         does not corrupt speaker_id in minted keys (dcf4189 invariant).
 
         Strategy: run a simulate cycle with episodic_rels carrying explicit
-        speaker_ids, mock reconstruct_graph + _prepare_episodic_keys_for_tier-level
-        internals, and assert the minted entries carry the correct speaker_id.
+        speaker_ids, mock reconstruct_graph internals, and assert the minted
+        entries carry the correct speaker_id.
         """
         from unittest.mock import patch
 
@@ -8415,9 +8410,8 @@ class TestMaterializeInterimB1:
         (a) It is called exactly once per cycle.
         (b) It is called with tier=adapter_name and the slot's active keys.
 
-        B3 note: key generation now uses the unified graph-walk
-        (_build_all_edge_entries_into, defer=True) rather than
-        _prepare_episodic_keys_for_tier.  When the materialize stub returns
+        B3 note: key generation uses the unified graph-walk
+        (_build_all_edge_entries_into, defer=True).  When the materialize stub returns
         (set(), []) and the merger graph is empty, the walk produces zero keys
         — the store's tier is empty after the cycle (expected here).
         Tests that verify key minting (dcf4189, speaker_id) are in
@@ -8481,8 +8475,8 @@ class TestInterimKeyedWalkB3:
           correct speaker_ids — they must NOT collapse to a single default.
 
     B3-2. Training-set equivalence: the keyed-walk (harvest+apply) produces the
-          same (subject, predicate, object) content set as the legacy
-          _prepare_episodic_keys_for_tier for the same fixed episodic input.
+          same (subject, predicate, object) content set as the episodic relation
+          input for the same fixed input.
     """
 
     @staticmethod
@@ -8539,7 +8533,6 @@ class TestInterimKeyedWalkB3:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.pending_interim_triples = []
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
@@ -8664,105 +8657,6 @@ class TestInterimKeyedWalkB3:
             "dcf4189 regression: speaker_id not stamped by entity synthesis."
         )
 
-    # ------------------------------------------------------------------
-    # B3-2: keyed-walk vs _prepare_episodic_keys_for_tier SPO-content parity
-    # ------------------------------------------------------------------
-
-    def test_graph_walk_spo_content_equals_flat_prepare(self, tmp_path):
-        """The keyed-walk produces the same SPO content set as _prepare_episodic_keys_for_tier.
-
-        For a fixed episodic input with no pre-existing tier keys:
-        - Graph-walk path: populate merger.graph, call _build_all_edge_entries_into.
-        - Flat path: call _prepare_episodic_keys_for_tier(simulate mode).
-
-        Expected: both paths yield identical (subject, predicate, object) triples.
-        Key-set identity is also expected here because the input has no duplicate
-        edges and the walk processes each edge once.
-
-        If this surfaces a real divergence — the graph-walk drops or adds facts
-        vs the flat path — that is a B3 bug and must be reported, not masked.
-
-        Dedup note: _build_all_edge_entries_into skips edges that already carry
-        _IK_KEY_ATTR (via the keyed branch, not minting). _prepare_episodic_keys_for_tier
-        deduplicates by existing tier membership. With a clean (empty) graph and no
-        pre-existing keys both paths process all input relations; any difference in
-        the SPO content set is a genuine divergence.
-        """
-        # Fixed episodic input: two distinct SPO triples with explicit display names.
-        # subject == display name (node key = canonical, attributes.name = display).
-        # Using title-case names so the display surface matches rels[]["subject"] exactly.
-        episodic_rels = [
-            {
-                "subject": "Alice",
-                "predicate": "lives in",
-                "object": "Berlin",
-                "relation_type": "factual",
-                "speaker_id": "Speaker0",
-            },
-            {
-                "subject": "Alice",
-                "predicate": "works at",
-                "object": "Acme Corp",
-                "relation_type": "factual",
-                "speaker_id": "Speaker0",
-            },
-        ]
-
-        # ---- Graph-walk path ----
-        # Build a MultiDiGraph whose node display-names match rels["subject"]/["object"]
-        # so the walk emits the same SPO strings as the flat path.
-        loop_gw = self._make_loop(tmp_path / "gw")
-        g = loop_gw.merger.graph
-
-        for rel in episodic_rels:
-            subj_canon = rel["subject"].lower().replace(" ", "_")
-            obj_canon = rel["object"].lower().replace(" ", "_")
-            g.add_node(subj_canon, attributes={"name": rel["subject"]})
-            g.add_node(obj_canon, attributes={"name": rel["object"]})
-            g.add_edge(
-                subj_canon,
-                obj_canon,
-                predicate=rel["predicate"],
-                relation_type=rel["relation_type"],
-            )
-
-        tier_keyed: dict = {"episodic": [], "procedural": []}
-        loop_gw._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
-        gw_entries = tier_keyed["episodic"]
-
-        # ---- Flat path: _prepare_episodic_keys_for_tier (simulate) ----
-        # Fresh loop — no shared state with the graph-walk loop.
-        loop_flat = self._make_loop(tmp_path / "flat")
-        _adapter = "episodic_interim_20260101T0000"
-        from paramem.training.key_registry import KeyRegistry
-
-        loop_flat.store.load_registry(_adapter, KeyRegistry())
-
-        flat_entries = loop_flat._prepare_episodic_keys_for_tier(
-            _adapter,
-            episodic_rels,
-            speaker_id="Speaker0",
-            mode="simulate",
-        )
-        # Filter to new entries only (_new=True); existing-key replay is empty
-        # because the tier is fresh, so all entries are new.
-        flat_new = [e for e in flat_entries if e.get("_new")]
-
-        # ---- Compare SPO content sets ----
-        def _spo_set(entries):
-            return {(e["subject"], e["predicate"], e["object"]) for e in entries}
-
-        gw_spo = _spo_set(gw_entries)
-        flat_spo = _spo_set(flat_new)
-
-        assert gw_spo == flat_spo, (
-            f"Keyed-walk and flat-path SPO content sets diverge.\n"
-            f"  Graph-walk SPO: {sorted(gw_spo)}\n"
-            f"  Flat-path SPO:  {sorted(flat_spo)}\n"
-            "This is a B3 production divergence — graph-walk drops or adds facts "
-            "vs _prepare_episodic_keys_for_tier."
-        )
-
 
 class TestMergeRegistryRelationsUnification:
     """Regression tests for the _merge_registry_relations unification.
@@ -8834,7 +8728,6 @@ class TestMergeRegistryRelationsUnification:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.pending_interim_triples = []
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
@@ -9096,7 +8989,6 @@ class TestSubtractiveRemovalsHelperInterim:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.pending_interim_triples = []
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
@@ -9391,7 +9283,6 @@ class TestSubtractiveRemovalsHelperFold:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.pending_interim_triples = []
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
@@ -9644,7 +9535,6 @@ class TestRunGraphNormalizationApply:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.pending_interim_triples = []
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
@@ -10136,7 +10026,6 @@ class TestSubtractiveRemovalsDuplicateMerge:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.pending_interim_triples = []
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
@@ -10345,7 +10234,6 @@ class TestNormalizationLevelGating:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.pending_interim_triples = []
         loop.episodic_replay_pool = []
         loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False

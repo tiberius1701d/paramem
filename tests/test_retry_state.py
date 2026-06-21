@@ -396,22 +396,22 @@ class TestEnospcShortCircuit:
 
 
 # ---------------------------------------------------------------------------
-# M1 regression: abort/degenerate cycle must NOT auto-resolve an incident
+# M1 regression: abort/cap_pending cycle must NOT auto-resolve an incident
 # ---------------------------------------------------------------------------
 
 
 class TestM1AutoResolveGuard:
-    """Regression: an abort/degenerate cycle must not resolve a
+    """Regression: an abort or cap_pending cycle must not resolve a
     consolidation_retry_exhausted incident that was just recorded.
 
     The guard in _finalize_interim checks:
       _is_clean_success = (
           not recall_failed_session_ids
-          AND _cycle_mode not in {"aborted","degenerated"}
+          AND _cycle_mode not in {"aborted","cap_pending"}
           AND not _released_sids
       )
     We test the logic independently by verifying the condition evaluates False
-    for abort/degenerate modes and True only for a genuine clean cycle.
+    for abort/cap_pending modes and True only for a genuine clean cycle.
     """
 
     def _is_clean_success(
@@ -423,7 +423,7 @@ class TestM1AutoResolveGuard:
         """Mirror of the _finalize_interim clean-success guard."""
         return (
             not result.get("recall_failed_session_ids", [])
-            and cycle_mode not in {"aborted", "degenerated"}
+            and cycle_mode not in {"aborted", "cap_pending"}
             and not released_sids
         )
 
@@ -432,10 +432,14 @@ class TestM1AutoResolveGuard:
         result = {"mode": "aborted", "adapter_name": "episodic"}
         assert not self._is_clean_success(result, "aborted", [])
 
-    def test_degenerate_result_is_not_clean_success(self) -> None:
-        """DEGENERATE mode must evaluate to not-clean-success."""
-        result = {"mode": "degenerated", "adapter_name": "episodic", "new_keys": []}
-        assert not self._is_clean_success(result, "degenerated", [])
+    def test_cap_pending_result_is_not_clean_success(self) -> None:
+        """CAP_PENDING mode must evaluate to not-clean-success.
+
+        Ring full (scheduling backpressure) is not a clean encode — the session
+        stays pending and no incident should be auto-resolved.
+        """
+        result = {"mode": "cap_pending", "adapter_name": None, "new_keys": []}
+        assert not self._is_clean_success(result, "cap_pending", [])
 
     def test_recall_failure_is_not_clean_success(self) -> None:
         """A result with recall_failed_session_ids is not clean success."""

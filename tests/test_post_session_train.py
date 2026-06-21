@@ -10,9 +10,8 @@ Tests cover the post_session_train orchestration logic:
   3. Stamp rollover creates a new adapter without touching the previous one.
   4. Zero facts extracted → mode="noop", no adapter created.
   5. Training failure → registry unchanged, no adapter saved.
-  6. max_interim_count=0 → mode="queued", triples in pending_interim_triples.
-  7. Queued facts are present in pending_interim_triples.
-  8. Keys registered only AFTER training returns, not before.
+  6. max_interim_count=0 → config-rejected (ValueError from ConsolidationScheduleConfig).
+  7. Keys registered only AFTER training returns, not before.
 """
 
 from __future__ import annotations
@@ -122,7 +121,6 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.store.replace_simhashes_in_tier("procedural", {})
     loop.cycle_count = 0
     loop.promoted_keys = set()
-    loop.pending_interim_triples = []
     loop.shutdown_requested = False
     loop._thermal_policy = None
     loop.merger = MagicMock()
@@ -491,77 +489,21 @@ class TestTrainingFailureKeepsRegistryClean:
 
 
 # ---------------------------------------------------------------------------
-# Test 6 — max_interim_count == 0 → queue-until-consolidation
+# Test 6 — max_interim_count == 0 → config-rejected
 # ---------------------------------------------------------------------------
 
 
 class TestMaxInterimCountZeroQueues:
-    def test_zero_count_queues_triples_not_trains(self, tmp_path: Path) -> None:
-        """max_interim_count=0 → triples land in pending_interim_triples, no training."""
-        loop = _make_mock_loop(tmp_path)
-        qa = _fake_qa(3)
+    def test_zero_count_config_rejected(self) -> None:
+        """max_interim_count=0 is rejected by ConsolidationScheduleConfig.__post_init__.
 
-        with (
-            patch.object(loop, "extract_session", return_value=(qa, [])),
-            patch("paramem.memory.interim_adapter.create_interim_adapter") as mock_create,
-            patch(
-                "paramem.training.trainer.train_adapter",
-                return_value={"aborted": False},
-            ) as mock_train,
-        ):
-            result = loop.post_session_train(
-                "Transcript",
-                "conv-008",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=0,
-            )
+        The queue-until-consolidation path (count==0) has been removed.
+        The config validator prevents this misconfiguration at startup.
+        """
+        from paramem.server.config import ConsolidationScheduleConfig
 
-        assert result["mode"] == "queued"
-        assert result["triples_extracted"] == 3
-        assert result["new_keys"] == []
-        assert result["adapter_name"] is None
-        mock_create.assert_not_called()
-        mock_train.assert_not_called()
-
-    def test_zero_count_triples_in_pending_queue(self, tmp_path: Path) -> None:
-        """Extracted triples accumulate in pending_interim_triples."""
-        loop = _make_mock_loop(tmp_path)
-        qa = _fake_qa(2)
-
-        with patch.object(loop, "extract_session", return_value=(qa, [])):
-            loop.post_session_train(
-                "Transcript A",
-                "conv-009a",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=0,
-            )
-            loop.post_session_train(
-                "Transcript B",
-                "conv-009b",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=0,
-            )
-
-        # Both extractions accumulated.
-        assert len(loop.pending_interim_triples) == 4
-
-    def test_zero_count_does_not_mutate_registry(self, tmp_path: Path) -> None:
-        """max_interim_count=0 leaves the key registry untouched."""
-        loop = _make_mock_loop(tmp_path)
-
-        with patch.object(loop, "extract_session", return_value=(_fake_qa(2), [])):
-            loop.post_session_train(
-                "Transcript",
-                "conv-010",
-                speaker_id="Speaker0",
-                schedule="every 2h",
-                max_interim_count=0,
-            )
-
-        assert _count_registry_keys(loop) == 0
+        with pytest.raises(ValueError, match="max_interim_count must be >= 1"):
+            ConsolidationScheduleConfig(max_interim_count=0)
 
 
 # ---------------------------------------------------------------------------
