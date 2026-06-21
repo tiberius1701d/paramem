@@ -847,3 +847,205 @@ def test_lifespan_budget_includes_gpu_voice_bytes_under_default_local():
             )
             > 0
         )
+
+
+# ---------------------------------------------------------------------------
+# S5 — interim_overflow_slack in required_working_set_bytes / assess_topology
+# ---------------------------------------------------------------------------
+
+
+def test_required_working_set_bytes_slack_zero_is_identical_to_pre_s5():
+    """slack=0 (default) must produce the same total as the pre-S5 formula.
+
+    Pre-S5: (main + N + 1) * adapter_bytes.
+    S5 at slack=0: (main + N + 0 + 1) * adapter_bytes — identical.
+    """
+    adapter_bytes = _adapter_bytes()
+    without_slack = required_working_set_bytes(
+        base_model_bytes=_BASE_MODEL_BYTES,
+        adapter_bytes=adapter_bytes,
+        main_adapter_count=3,
+        max_interim_count=7,
+        headroom_bytes=int(1.0 * _GiB),
+    )
+    with_slack_zero = required_working_set_bytes(
+        base_model_bytes=_BASE_MODEL_BYTES,
+        adapter_bytes=adapter_bytes,
+        main_adapter_count=3,
+        max_interim_count=7,
+        headroom_bytes=int(1.0 * _GiB),
+        interim_overflow_slack=0,
+    )
+    assert without_slack == with_slack_zero, (
+        "interim_overflow_slack=0 must produce the same result as omitting the param"
+    )
+
+
+def test_required_working_set_bytes_slack_grows_by_slack_times_adapter_bytes():
+    """slack > 0 must add exactly slack * adapter_bytes to the total.
+
+    Guards that the slack term is included in the formula:
+    (main + N + slack + 1) * adapter_bytes.
+    """
+    adapter_bytes = _adapter_bytes()
+    base = required_working_set_bytes(
+        base_model_bytes=_BASE_MODEL_BYTES,
+        adapter_bytes=adapter_bytes,
+        main_adapter_count=3,
+        max_interim_count=7,
+        headroom_bytes=int(1.0 * _GiB),
+        interim_overflow_slack=0,
+    )
+    with_slack_2 = required_working_set_bytes(
+        base_model_bytes=_BASE_MODEL_BYTES,
+        adapter_bytes=adapter_bytes,
+        main_adapter_count=3,
+        max_interim_count=7,
+        headroom_bytes=int(1.0 * _GiB),
+        interim_overflow_slack=2,
+    )
+    assert with_slack_2 - base == 2 * adapter_bytes, (
+        f"slack=2 should add exactly 2*adapter_bytes={2 * adapter_bytes} bytes; "
+        f"got diff={with_slack_2 - base}"
+    )
+
+
+def test_assess_topology_slack_zero_matches_no_slack_call():
+    """assess_topology with interim_overflow_slack=0 must match a call without the param."""
+    kwargs = dict(
+        max_interim_count=7,
+        base_bytes=_BASE_MODEL_BYTES,
+        hidden_size=_HIDDEN,
+        num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
+    )
+    without = assess_topology(_MISTRAL_ADAPTER, **kwargs)
+    with_zero = assess_topology(_MISTRAL_ADAPTER, interim_overflow_slack=0, **kwargs)
+    assert without.required_bytes == with_zero.required_bytes, (
+        "assess_topology with slack=0 must give identical required_bytes to no-slack call"
+    )
+
+
+def test_assess_topology_slack_overflows_baseline():
+    """A large interim_overflow_slack that exceeds the baseline must mark fits_baseline=False."""
+    result = assess_topology(
+        _MISTRAL_ADAPTER,
+        max_interim_count=7,
+        interim_overflow_slack=300,
+        base_bytes=_BASE_MODEL_BYTES,
+        hidden_size=_HIDDEN,
+        num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
+    )
+    assert not result.fits_baseline, "interim_overflow_slack=300 must overflow the 8 GiB baseline"
+    assert result.margin_bytes < 0
+
+
+# ---------------------------------------------------------------------------
+# S5 FIX-4 — _format_breakdown interim row includes slack
+# ---------------------------------------------------------------------------
+
+
+def test_breakdown_slack_zero_unchanged():
+    """_format_breakdown with slack=0 must produce the same interim row as before FIX-4."""
+    from paramem.server.vram_validator import _format_breakdown
+
+    adapter_bytes = _adapter_bytes()
+    max_interim = 7
+    result = _format_breakdown(
+        model_id="test/model",
+        quant_label="nf4",
+        base_bytes=_BASE_MODEL_BYTES,
+        main_adapter_count=3,
+        adapter_bytes=adapter_bytes,
+        max_interim_count=max_interim,
+        num_modules=8,
+        rank=8,
+        headroom_bytes=int(1.0 * _GiB),
+        total_required_bytes=0,
+        total_with_margin_bytes=0,
+        available_bytes=0,
+        suppress_available_row=True,
+        interim_overflow_slack=0,
+    )
+    expected_label = f"{max_interim} interim adapters (max_interim_count={max_interim})"
+    assert expected_label in result, (
+        f"slack=0 breakdown must contain original label '{expected_label}'"
+    )
+    # The MiB value must reflect exactly max_interim * adapter_bytes.
+    _MiB = 1024 * 1024
+    expected_mib = f"{max_interim * adapter_bytes // _MiB:>6,} MiB"
+    assert expected_mib in result, (
+        f"slack=0 interim row must show {expected_mib!r} (== max_interim * adapter_bytes)"
+    )
+
+
+def test_breakdown_slack_nonzero_shows_expanded_count():
+    """_format_breakdown with slack=2 must show (max_interim + slack) adapters
+    in the interim row and the correct MiB total for that expanded count.
+
+    Guards FIX-4: at slack>0 the itemization previously under-summed the total
+    by slack*adapter_bytes.
+    """
+    from paramem.server.vram_validator import _format_breakdown
+
+    adapter_bytes = _adapter_bytes()
+    max_interim = 7
+    slack = 2
+    total_interim = max_interim + slack
+    result = _format_breakdown(
+        model_id="test/model",
+        quant_label="nf4",
+        base_bytes=_BASE_MODEL_BYTES,
+        main_adapter_count=3,
+        adapter_bytes=adapter_bytes,
+        max_interim_count=max_interim,
+        num_modules=8,
+        rank=8,
+        headroom_bytes=int(1.0 * _GiB),
+        total_required_bytes=0,
+        total_with_margin_bytes=0,
+        available_bytes=0,
+        suppress_available_row=True,
+        interim_overflow_slack=slack,
+    )
+    expected_label = (
+        f"{total_interim} interim adapters (max_interim_count={max_interim}+{slack} overflow)"
+    )
+    assert expected_label in result, (
+        f"slack={slack} breakdown must contain label '{expected_label}', got:\n{result}"
+    )
+    # The MiB value must reflect (max_interim + slack) * adapter_bytes.
+    _MiB = 1024 * 1024
+    expected_mib = f"{total_interim * adapter_bytes // _MiB:>6,} MiB"
+    assert expected_mib in result, (
+        f"slack={slack} interim row must show {expected_mib!r} "
+        f"(== {total_interim} * adapter_bytes), got:\n{result}"
+    )
+
+
+def test_breakdown_slack_assess_topology_label_matches():
+    """assess_topology with slack>0 must propagate the slack into the breakdown string."""
+    slack = 3
+    max_interim = 7
+    result = assess_topology(
+        _MISTRAL_ADAPTER,
+        max_interim_count=max_interim,
+        interim_overflow_slack=slack,
+        base_bytes=_BASE_MODEL_BYTES,
+        hidden_size=_HIDDEN,
+        num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
+    )
+    expected_label = (
+        f"{max_interim + slack} interim adapters (max_interim_count={max_interim}+{slack} overflow)"
+    )
+    assert expected_label in result.breakdown, (
+        f"assess_topology slack={slack} breakdown must contain '{expected_label}'"
+    )

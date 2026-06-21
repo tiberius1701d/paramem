@@ -1630,6 +1630,7 @@ def _compute_topology_assessment(config, base_pred: int | None):
     assessment = assess_topology(
         config.episodic_adapter_config,
         max_interim_count=config.consolidation.max_interim_count,
+        interim_overflow_slack=config.consolidation.interim_overflow_slack,
         base_bytes=base_pred,
         hidden_size=hidden_size,
         num_layers=num_layers,
@@ -3706,6 +3707,8 @@ def _derive_consolidation_status_fields(
             "migration_phase_failed",
             "migration_error",
             "full_consolidation_overdue",
+            "interim_cap_reached",
+            "interim_overflow_pending",
         }
     )
     try:
@@ -11458,6 +11461,66 @@ def _is_full_cycle_due(config) -> bool:
     return age_seconds >= full_period_seconds
 
 
+def _oldest_interim_stamp(config) -> "str | None":
+    """Return the oldest un-folded interim stamp, or ``None`` when none exist.
+
+    Reads ``iter_interim_dirs(config.adapter_dir)``, sorted ascending (oldest
+    first), and extracts the timestamp from the directory name via
+    ``interim_stamp_from_name``.  No age gate — returns the stamp regardless
+    of how old it is.
+
+    Used as the per-cycle dedup key for ``record_incident`` calls that fire
+    when the ring is full (``interim_cap_reached``, ``interim_overflow_pending``)
+    or when the full fold has missed its runway (``full_consolidation_overdue``).
+    The stamp is stable for the entire time that cycle's interims remain
+    un-folded; it changes when a new cycle's interims become the oldest, so one
+    incident fires per stuck cycle and reopens on a new cycle's failure.
+
+    Timestamps are in LOCAL time throughout, consistent with
+    ``current_interim_stamp``'s ``datetime.now()`` basis.
+    A malformed internal stamp raises ``ValueError`` (no defensive try/except —
+    a corrupt internal stamp should surface, not be silenced).
+
+    Returns ``None`` when no interim directories exist (store is empty or the
+    ring was just drained by the full fold).
+    """
+    from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
+
+    dirs = list(iter_interim_dirs(config.adapter_dir))
+    if not dirs:
+        return None
+    oldest_name, _ = dirs[0]  # sorted ascending; [0] is oldest
+    return interim_stamp_from_name(oldest_name)
+
+
+def _overflow_incident_for(cycle_mode: str, overflow_slot: bool) -> "tuple[str, str] | None":
+    """Return ``(incident_type, severity)`` for ring-cap states, or ``None``.
+
+    Pure mapping with no I/O — single source of truth for the two emission
+    sites in ``_extract_and_start_training`` that fire loud incidents when
+    the interim ring reaches capacity.
+
+    Args:
+        cycle_mode: The ``"mode"`` value from ``run_consolidation_cycle``'s
+            return dict (e.g. ``"cap_pending"``, ``"trained"``, ``"noop"``).
+        overflow_slot: Whether the cycle minted an overflow slot
+            (``result.get("overflow_slot", False)``).  Meaningful only when
+            ``cycle_mode == "trained"``.
+
+    Returns:
+        ``("interim_overflow_pending", "failed")`` when the ring AND overflow
+        are both exhausted (``cap_pending``).
+        ``("interim_cap_reached", "warning")`` when an overflow slot was
+        minted (ring full, but slack permitted one more adapter).
+        ``None`` for all other outcomes (normal mint, noop, aborted).
+    """
+    if cycle_mode == "cap_pending":
+        return ("interim_overflow_pending", "failed")
+    if overflow_slot:
+        return ("interim_cap_reached", "warning")
+    return None
+
+
 def _full_consolidation_overdue_key(config) -> "str | None":
     """Return the oldest un-folded interim stamp when the full fold missed its runway.
 
@@ -11481,8 +11544,6 @@ def _full_consolidation_overdue_key(config) -> "str | None":
     """
     from datetime import datetime
 
-    from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
-
     N = config.consolidation.max_interim_count
     if N <= 0:
         return None
@@ -11490,11 +11551,9 @@ def _full_consolidation_overdue_key(config) -> "str | None":
     if period is None:
         # manual-only: no deadline, no overdue concept.
         return None
-    dirs = list(iter_interim_dirs(config.adapter_dir))
-    if not dirs:
+    oldest_stamp = _oldest_interim_stamp(config)
+    if oldest_stamp is None:
         return None
-    oldest_name, _ = dirs[0]  # sorted ascending; [0] is oldest
-    oldest_stamp = interim_stamp_from_name(oldest_name)
     age = (datetime.now() - datetime.strptime(oldest_stamp, "%Y%m%dT%H%M")).total_seconds()
     return oldest_stamp if age >= 2 * period else None
 
@@ -12820,6 +12879,7 @@ def _extract_and_start_training():
     primary_speaker = speaker_ids[-1] if speaker_ids else ""
     schedule = config.consolidation.refresh_cadence
     max_interim_count = config.consolidation.max_interim_count
+    interim_overflow_slack = config.consolidation.interim_overflow_slack
 
     # Fetch (or create) the process-lifetime singleton BG trainer so the worker
     # thread holds the GPU lock for the duration of the callable and concurrent
@@ -12852,6 +12912,7 @@ def _extract_and_start_training():
                 run_label=f"tick-{primary_speaker or 'anon'}",
                 schedule=schedule,
                 max_interim_count=max_interim_count,
+                interim_overflow_slack=interim_overflow_slack,
             )
         except Exception:
             logger.exception(
@@ -12898,6 +12959,41 @@ def _extract_and_start_training():
         # The simulate callsite never produces a non-empty failed set because
         # _epi_passing is None in simulate mode, so this code is a no-op there.
         _cycle_mode = result.get("mode", "trained")
+
+        # --- Loud incidents for ring-cap states ---
+        # Neither bumps the retry counter — scheduling backpressure is not an
+        # encoding failure; retry budget is for sessions that failed to encode.
+        # Both are deduped by the oldest-interim stamp so one incident fires per
+        # stuck cycle and reopens only when a new cycle's interims become oldest.
+        _interim_incident_state_dir = _state["config"].paths.data / "state"
+        _overflow_inc = _overflow_incident_for(_cycle_mode, result.get("overflow_slot", False))
+        if _overflow_inc is not None:
+            _inc_type, _inc_severity = _overflow_inc
+            _inc_key = _oldest_interim_stamp(config) or "unknown"
+            _inc_summaries = {
+                "interim_overflow_pending": (
+                    "Interim ring and overflow both full — sessions kept pending "
+                    "until the full fold drains the ring"
+                ),
+                "interim_cap_reached": (
+                    "Interim ring full — overflow slot minted; full fold is overdue"
+                ),
+            }
+            try:
+                record_incident(
+                    _interim_incident_state_dir,
+                    type=_inc_type,
+                    key=_inc_key,
+                    severity=_inc_severity,
+                    summary=_inc_summaries[_inc_type],
+                    detail={
+                        "oldest_interim_stamp": _inc_key,
+                        "type": _inc_type,
+                    },
+                )
+            except Exception:
+                logger.exception("_run_interim_training: failed to record %s incident", _inc_type)
+
         _recall_failed = result.get("recall_failed_session_ids", [])
         # Build the set of sessions to pin (keep pending) this cycle.
         # recall_failed: pin + count (encoding attempted but recall gate failed).
@@ -13412,9 +13508,11 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                     "mode", "full_trained"
                 ) not in {"aborted"}:
                     resolve_incidents_by_type(_full_state_dir, "consolidation_retry_exhausted")
-                # A completed fold drains the interim ring — the overdue condition
-                # is resolved regardless of recall outcome.
+                # A completed fold drains the interim ring — overdue and ring-cap
+                # incidents are all resolved regardless of recall outcome.
                 resolve_incidents_by_type(_full_state_dir, "full_consolidation_overdue")
+                resolve_incidents_by_type(_full_state_dir, "interim_cap_reached")
+                resolve_incidents_by_type(_full_state_dir, "interim_overflow_pending")
             except Exception:
                 logger.exception(
                     "Post-full-cycle run-status/incident bookkeeping failed (non-fatal)"

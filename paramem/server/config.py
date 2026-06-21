@@ -1023,6 +1023,15 @@ class ConsolidationScheduleConfig:
     # episodic_interim_YYYYMMDDTHHMM adapters resident in VRAM at any one time.
     # Must be proven to fit by the startup VRAM validator before the server starts.
     max_interim_count: int = 7
+    # Bounded temporary extension of the interim ring beyond max_interim_count.
+    # When the ring is full (c >= max_interim_count) but c < max_interim_count +
+    # interim_overflow_slack, a new later-stamped overflow slot is minted instead
+    # of keeping sessions pending.  Each overflow slot gets its own adapter,
+    # preserving temporal order.  The slack is included in the boot-time VRAM
+    # budget (vram_validator.py) so the extension is proven to fit before the
+    # server starts.  At 0 (default) overflow slots are never minted — cap_pending
+    # fires immediately when the ring is full (identical to S4 behavior).
+    interim_overflow_slack: int = 0
     # Enable post-session (inline) training after each conversation turn.
     # When True, a background job extracts facts from the session transcript and
     # trains them onto the current interim adapter immediately after the
@@ -1164,6 +1173,15 @@ class ConsolidationScheduleConfig:
                 f"got {self.max_interim_count!r}. "
                 f"Queue-until-consolidation (count=0) is not supported; "
                 f"use max_interim_count >= 1."
+            )
+
+        if self.interim_overflow_slack < 0:
+            raise ValueError(
+                f"consolidation.interim_overflow_slack must be >= 0; "
+                f"got {self.interim_overflow_slack!r}. "
+                f"Use 0 (default) to disable overflow slots entirely, "
+                f"or a positive integer to allow that many extra adapters "
+                f"beyond max_interim_count before keep-pending kicks in."
             )
 
         # orphan_retirement: validate the schedule string early so the operator

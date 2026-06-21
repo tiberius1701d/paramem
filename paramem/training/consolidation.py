@@ -2211,8 +2211,13 @@ class ConsolidationLoop:
                     "new_keys": list[str],
                     "adapter_name": str | None,   # None if cap_pending or noop
                     "mode": "trained" | "cap_pending" | "noop",
+                    "overflow_slot": bool,         # True only on overflow mint
                     "error": str | None,
                 }
+
+            ``overflow_slot`` is present and ``True`` only when an overflow
+            slot was minted (``N <= c < N + interim_overflow_slack``); absent
+            or ``False`` on normal mint, noop, and cap_pending.
         """
         # --- 1. Extract ---
         episodic_rels, procedural_rels = self.extract_session(
@@ -2251,6 +2256,7 @@ class ConsolidationLoop:
         run_label: str,
         schedule: str = "",
         max_interim_count: int = 7,
+        interim_overflow_slack: int = 0,
         stamp: str | None = None,
         recall_sanity_threshold: "float | None" = None,
         new_promotions: "list[str] | None" = None,
@@ -2319,10 +2325,18 @@ class ConsolidationLoop:
             schedule: Consolidation refresh-cadence string used to compute the
                 sub-interval stamp when *stamp* is not provided.
             max_interim_count: Cap on concurrent interim adapters.  When the
-                ring is full (train mode only), sessions are kept pending and
-                the method returns ``mode="cap_pending"`` without minting or
-                training.  ``max_interim_count < 1`` is rejected by the config
-                validator.
+                ring is at or beyond capacity (train mode only), the 3-way gate
+                below determines the outcome.  ``max_interim_count < 1`` is
+                rejected by the config validator.
+            interim_overflow_slack: Number of extra overflow slots allowed
+                beyond ``max_interim_count`` before keep-pending kicks in.
+                At 0 (default), cap_pending fires immediately when ``c >= N``
+                (identical to S4 behavior).  At slack > 0, the gate is:
+                    c < N           → normal mint (unchanged)
+                    N <= c < N+slack → overflow mint; result["overflow_slot"]=True
+                    c >= N+slack    → cap_pending (keep sessions pending)
+                Counted against PEFT-resident adapters; the slack is proven
+                to fit VRAM at boot via ``required_working_set_bytes``.
             stamp: Override the computed sub-interval stamp (test injection).
             recall_sanity_threshold: Accepted for caller override compatibility;
                 the active threshold is read from ``self.config.recall_sanity_threshold``
@@ -2386,41 +2400,63 @@ class ConsolidationLoop:
 
         adapter_name = self._resolve_target_slot(stamp)
 
-        # --- 6. Ring-full detection (train mode only) ---
-        # When the ring is at capacity and the target slot is new, keep sessions
-        # pending — no mint, no train, no RAM sink.  Sessions re-extract on the
-        # next tick (lossless via session_buffer).  The full fold drains the ring.
-        # S5 will add bounded overflow (interim_overflow_slack) before this path.
-        # Count source: PEFT-resident adapters (what the VRAM ceiling constrains).
+        # --- 6. 3-way gate (train mode only) ---
+        # Count source: PEFT-resident adapters (what the VRAM ceiling constrains;
+        # see SF-9: on-disk count and PEFT count measure different things and
+        # converge only at tick boundaries).
+        # Gate terms apply only when: train mode AND target slot is new AND
+        # registry is live.  Simulate has no PEFT slots so the count is
+        # meaningless; simulate always falls through to _run_fold.
         existing_interim_count = len(
             [a for a in self.model.peft_config if a.startswith("episodic_interim_")]
         )
-        # Ring-full: train-mode only (simulate has no PEFT slots; count is
-        # meaningless against a PEFT config that simulate never populates).
-        ring_full = (
+        _gate_active = (
             mode != "simulate"
             and adapter_name not in self.model.peft_config
             and self.store.replay_enabled
-            and existing_interim_count >= max_interim_count
         )
-        if ring_full:
-            logger.warning(
-                "run_consolidation_cycle: interim ring full (%d/%d slots) — "
-                "keeping %d triples pending until next full fold",
-                existing_interim_count,
-                max_interim_count,
-                len(episodic_rels),
-            )
-            cap_pending_summary = {
-                "triples_extracted": triples_extracted,
-                "new_keys": [],
-                "adapter_name": None,
-                "mode": "cap_pending",
-                "venue": mode,
-                "error": None,
-            }
-            self._debug_writer.on_cycle_end(cap_pending_summary, interim_stamp=stamp)
-            return cap_pending_summary
+        is_overflow = False
+        if _gate_active:
+            c = existing_interim_count
+            N = max_interim_count
+            slack = interim_overflow_slack
+            if c >= N + slack:
+                # cap_pending: ring + overflow both exhausted — keep sessions
+                # pending until the full fold drains the ring (lossless).
+                logger.warning(
+                    "run_consolidation_cycle: interim ring full (%d/%d+%d slots) — "
+                    "keeping %d triples pending until next full fold",
+                    c,
+                    N,
+                    slack,
+                    len(episodic_rels),
+                )
+                cap_pending_summary = {
+                    "triples_extracted": triples_extracted,
+                    "new_keys": [],
+                    "adapter_name": None,
+                    "mode": "cap_pending",
+                    "venue": mode,
+                    "error": None,
+                }
+                self._debug_writer.on_cycle_end(cap_pending_summary, interim_stamp=stamp)
+                return cap_pending_summary
+            elif c >= N:
+                # overflow mint: ring is full but slack allows a later-stamped
+                # overflow slot.  Fall through to the single _run_fold delegation
+                # below; tag the result so the caller can fire the
+                # interim_cap_reached incident (only on a real "trained" mint).
+                logger.warning(
+                    "run_consolidation_cycle: interim ring full (%d/%d slots), "
+                    "minting overflow slot %d/%d+%d — full fold is overdue",
+                    c,
+                    N,
+                    c - N + 1,
+                    N,
+                    slack,
+                )
+                is_overflow = True
+            # else: c < N — normal mint, fall through to _run_fold below.
 
         # --- 7. Delegate pipeline to _run_fold (interim_slot scope) ---
         # source is derived from mode: "weights" for train, "disk" for simulate.
@@ -2430,7 +2466,7 @@ class ConsolidationLoop:
         # the semantic-transfer block scope-gated on source=="weights" && new_promotions.
         # Map the caller's mode Literal to the FoldScope source axis without a mode== fork.
         _interim_source = {"train": "weights", "simulate": "disk"}[mode]
-        return self._run_fold(
+        result = self._run_fold(
             FoldScope(
                 name="interim",
                 source=_interim_source,
@@ -2453,6 +2489,11 @@ class ConsolidationLoop:
             episodic_rels=episodic_rels,
             procedural_rels=procedural_rels,
         )
+        # Only tag a real mint: an aborted overflow fold must not trigger
+        # the interim_cap_reached incident on the app.py consumer side.
+        if is_overflow and result.get("mode") == "trained":
+            result["overflow_slot"] = True
+        return result
 
     def _apply_subtractive_removals_to_store(
         self,

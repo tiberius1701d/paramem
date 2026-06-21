@@ -204,6 +204,7 @@ def required_working_set_bytes(
     headroom_bytes: int,
     stt_bytes: int = 0,
     tts_bytes: int = 0,
+    interim_overflow_slack: int = 0,
 ) -> int:
     """Compute the worst-case GPU working set for the full week of operation.
 
@@ -211,16 +212,20 @@ def required_working_set_bytes(
 
         working_set_bytes =
               base_model_bytes
-            + main_adapter_count × adapter_bytes   # e.g. episodic, semantic, procedural
-            + max_interim_count  × adapter_bytes   # rolling interim adapters
-            + 1                  × adapter_bytes   # in_training staging slot (always present)
-            + stt_bytes                            # Whisper (0 if CPU/disabled)
-            + tts_bytes                            # TTS voices on GPU (0 if CPU/disabled)
-            + headroom_bytes                       # KV cache + activation headroom
+            + main_adapter_count * adapter_bytes             # main adapters
+            + (max_interim_count + interim_overflow_slack)
+              * adapter_bytes                                # rolling + overflow interim
+            + 1 * adapter_bytes                             # in_training staging slot
+            + stt_bytes                                     # Whisper (0 if CPU/disabled)
+            + tts_bytes                                     # TTS voices on GPU (0 if CPU)
+            + headroom_bytes                                # KV cache + activation headroom
 
     Note: adapter byte count assumes inference-only LoRA (no optimizer state).
     Training reuses the ``in_training`` staging slot, accounted separately as
-    the ``+1 × adapter_bytes`` term.
+    the ``+1 × adapter_bytes`` term.  ``interim_overflow_slack`` reserves
+    capacity for overflow slots that may be minted when the ring is full but
+    the full fold has not yet drained it; at 0 (default) the total is
+    identical to the pre-S5 formula.
 
     Args:
         base_model_bytes: GPU footprint of the quantized base model.
@@ -231,13 +236,17 @@ def required_working_set_bytes(
         headroom_bytes: Reserved bytes for KV cache, activations, and CUDA overhead.
         stt_bytes: Estimated Whisper VRAM footprint. 0 if STT is CPU-bound or disabled.
         tts_bytes: Estimated TTS VRAM footprint across all GPU voices. 0 if CPU-bound.
+        interim_overflow_slack: Extra overflow adapter slots beyond ``max_interim_count``
+            to reserve in the budget.  Mirrors
+            ``consolidation.interim_overflow_slack`` from the server config.
+            At 0 (default) no extra slots are reserved.
 
     Returns:
         Total required bytes for the worst-case working set.
     """
     return (
         base_model_bytes
-        + (main_adapter_count + max_interim_count + 1) * adapter_bytes
+        + (main_adapter_count + max_interim_count + interim_overflow_slack + 1) * adapter_bytes
         + stt_bytes
         + tts_bytes
         + headroom_bytes
@@ -291,6 +300,7 @@ def assess_topology(
     headroom_gib: float = _DEFAULT_HEADROOM_GIB,
     stt_bytes: int = 0,
     tts_bytes: int = 0,
+    interim_overflow_slack: int = 0,
 ) -> TopologyAssessment:
     """Compute the topology working set and fit verdict against the baseline.
 
@@ -318,6 +328,10 @@ def assess_topology(
         headroom_gib: KV cache + activation headroom.
         stt_bytes: Whisper STT footprint (0 if CPU/disabled).
         tts_bytes: TTS footprint (0 if CPU/disabled).
+        interim_overflow_slack: Extra overflow adapter slots beyond
+            ``max_interim_count`` to include in the budget.  Mirrors
+            ``consolidation.interim_overflow_slack`` from the server config.
+            At 0 (default) no extra slots are reserved (identical to pre-S5).
 
     Returns:
         :class:`TopologyAssessment` — pure data, no side effects.
@@ -338,6 +352,7 @@ def assess_topology(
         headroom_bytes=headroom_bytes,
         stt_bytes=stt_bytes,
         tts_bytes=tts_bytes,
+        interim_overflow_slack=interim_overflow_slack,
     )
     total_with_margin = total_required + _SAFETY_MARGIN_BYTES
 
@@ -361,6 +376,7 @@ def assess_topology(
         stt_bytes=stt_bytes,
         tts_bytes=tts_bytes,
         suppress_available_row=True,
+        interim_overflow_slack=interim_overflow_slack,
     )
 
     return TopologyAssessment(
@@ -450,6 +466,7 @@ def _format_breakdown(
     stt_label: str = "STT (Whisper)",
     tts_label: str = "TTS voices on GPU",
     suppress_available_row: bool = False,
+    interim_overflow_slack: int = 0,
 ) -> str:
     """Return a multi-line VRAM working set breakdown table.
 
@@ -470,6 +487,9 @@ def _format_breakdown(
         total_required_bytes: Sum of all components (excluding safety margin).
         total_with_margin_bytes: ``total_required_bytes + _SAFETY_MARGIN_BYTES``.
         available_bytes: Free VRAM bytes available at startup.
+        interim_overflow_slack: Extra overflow slots beyond ``max_interim_count``
+            reserved in the budget (mirrors ``consolidation.interim_overflow_slack``).
+            At 0 (default) the interim row is identical to the pre-S5 output.
 
     Returns:
         Formatted breakdown string (no trailing newline).
@@ -491,14 +511,23 @@ def _format_breakdown(
 
     base_label = f"base model ({model_id}, {quant_label})"
     main_label = f"{main_adapter_count} main adapters (rank={rank}, modules={num_modules})"
-    session_label = f"{max_interim_count} interim adapters (max_interim_count={max_interim_count})"
+    _total_interim = max_interim_count + interim_overflow_slack
+    if interim_overflow_slack > 0:
+        session_label = (
+            f"{_total_interim} interim adapters "
+            f"(max_interim_count={max_interim_count}+{interim_overflow_slack} overflow)"
+        )
+    else:
+        session_label = (
+            f"{max_interim_count} interim adapters (max_interim_count={max_interim_count})"
+        )
     margin_val = f"{margin_sign}{margin // _MiB:>5,} MiB"
 
     lines = [
         "VRAM Working Set Breakdown",
         _row(base_label, _mib(base_bytes)),
         _row(main_label, _mib(main_adapter_count * adapter_bytes)),
-        _row(session_label, _mib(max_interim_count * adapter_bytes)),
+        _row(session_label, _mib(_total_interim * adapter_bytes)),
         _row("in_training staging slot", _mib(adapter_bytes)),
     ]
     if stt_bytes > 0:
