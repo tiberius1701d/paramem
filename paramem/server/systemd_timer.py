@@ -270,7 +270,11 @@ def reconcile(
     Parameters
     ----------
     schedule:
-        The derived consolidation period string (e.g. ``"every 12h"``).
+        The interim refresh cadence string (``consolidation.refresh_cadence``,
+        e.g. ``"every 12h"`` / ``"12h"`` / ``"HH:MM"`` / ``"daily"``). The timer
+        fires at this cadence; whether a given tick runs a full consolidation
+        is decided per-tick by ``_is_full_cycle_due`` (interim accumulation plus
+        an oldest-interim deadline), not by a separate derived-period timer.
     endpoint:
         URL the timer curls.  Defaults to
         ``http://127.0.0.1:8420/scheduled-tick``.
@@ -285,9 +289,9 @@ def reconcile(
     spec = parse_schedule(schedule)
     if spec is None:
         logger.error(
-            "Invalid derived consolidation period: %r — expected '', 'off', "
-            "'HH:MM', 'every Nh', or 'every Nm'. This is derived from "
-            "consolidation.refresh_cadence × max_interim_count; check those in "
+            "Invalid consolidation refresh cadence: %r — expected '', 'off', "
+            "'HH:MM', 'every Nh', or 'every Nm'. This is "
+            "consolidation.refresh_cadence; check it in "
             "server.yaml. Timer will be disabled.",
             schedule,
         )

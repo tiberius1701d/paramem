@@ -2141,7 +2141,7 @@ async def lifespan(app: FastAPI):
     interim_cadence = config.consolidation.refresh_cadence or ""
     full_period = config.consolidation.consolidation_period_string
     logger.info(
-        "Consolidation cadence — interim every %s, max_interim_count=%d, "
+        "Consolidation cadence — interim cadence %s, max_interim_count=%d, "
         "derived full-consolidation period=%s",
         interim_cadence or "<disabled>",
         config.consolidation.max_interim_count,
