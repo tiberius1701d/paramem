@@ -15,6 +15,7 @@ on real hardware.  This module specifically covers the public
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -598,3 +599,488 @@ class TestFingerprintDatasetContentStable:
 
         assert isinstance(fp1, str) and len(fp1) == 64  # 32 bytes → 64 hex chars
         assert fp1 == fp2
+
+
+# ---------------------------------------------------------------------------
+# Slice 2a — on_save records output_dir/checkpoint-* in default epoch-save mode
+# ---------------------------------------------------------------------------
+
+
+class TestStagingResumeCallbackOnSave:
+    """Verify ``_StagingResumeCallback.on_save`` records the correct checkpoint path.
+
+    Three scenarios:
+    1. Default epoch-save mode (``save_steps_ram==0``): HF Trainer writes
+       ``checkpoint-N`` directly under ``output_dir``; ``on_save`` must record
+       that as ``disk_checkpoint_path`` and ``_resolve_resume_checkpoint`` must
+       return it on a fresh-process simulation with matching fingerprints.
+    2. When ``bg_checkpoint_epoch/`` exists (RAM copy-back mode), that dir is
+       preferred over ``output_dir/checkpoint-*`` (existing behaviour preserved).
+    3. A dir recorded by ``on_save`` that was subsequently deleted (cleaned) must
+       cause ``_resolve_resume_checkpoint`` to return ``None``.
+
+    All tests are no-GPU; no real HF Trainer is invoked.
+    """
+
+    def _write_resume(self, path: Path, state: dict) -> None:
+        """Write plaintext staging_resume.json (Security OFF posture)."""
+        path.write_bytes(json.dumps(state, indent=2).encode())
+
+    def _read_resume(self, path: Path) -> dict:
+        return json.loads(path.read_bytes())
+
+    def _base_state(self, fp_dataset: str, fp_config: str) -> dict:
+        return {
+            "adapter_name": "episodic",
+            "dataset_fingerprint": fp_dataset,
+            "training_config_fingerprint": fp_config,
+            "ram_checkpoint_path": "",
+            "disk_checkpoint_path": "",
+            "checkpoint_path": "",
+            "started_at": "2026-06-21T00:00:00+00:00",
+            "updated_at": "2026-06-21T00:00:00+00:00",
+        }
+
+    def _invoke_on_save(self, cb):
+        """Fire the on_save callback with encryption patched to plaintext."""
+        write_plain = lambda p, d: Path(p).write_bytes(d)  # noqa: E731
+        with patch("paramem.backup.encryption.write_infra_bytes", side_effect=write_plain):
+            cb.on_save(args=MagicMock(), state=MagicMock(), control=MagicMock())
+
+    def _read_resume_plain(self, scratch_path):
+        """Read staging_resume.json with encryption patched to plaintext."""
+        from paramem.training.trainer import _read_staging_resume
+
+        read_plain = lambda p: Path(p).read_bytes()  # noqa: E731
+        with patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain):
+            return _read_staging_resume(scratch_path)
+
+    def test_on_save_records_output_dir_checkpoint_when_no_epoch_mirror(self, tmp_path):
+        """Default epoch-save mode: on_save sets disk_checkpoint_path to output_dir/checkpoint-N.
+
+        Simulates the consolidation fold's save mode where save_steps_ram==0 and
+        HF Trainer writes checkpoint-N directly under output_dir (no bg_checkpoint_epoch/).
+        """
+        from paramem.training.trainer import _StagingResumeCallback
+
+        output_dir = tmp_path / "consolidation_refresh" / "episodic"
+        output_dir.mkdir(parents=True)
+
+        # HF Trainer writes checkpoint-5 directly under output_dir.
+        ckpt_dir = output_dir / "checkpoint-5"
+        ckpt_dir.mkdir()
+
+        fp_dataset = "aabbccdd" * 8
+        fp_config = "11223344" * 8
+        scratch_path = output_dir / "staging_resume.json"
+        base_state = self._base_state(fp_dataset, fp_config)
+        self._write_resume(scratch_path, base_state)
+
+        cb = _StagingResumeCallback(
+            scratch_path=scratch_path,
+            ram_dir=None,
+            output_dir=output_dir,
+            base_state=base_state,
+        )
+        self._invoke_on_save(cb)
+
+        state = self._read_resume_plain(scratch_path)
+        assert state is not None
+        assert state["disk_checkpoint_path"].endswith("checkpoint-5"), (
+            f"Expected disk_checkpoint_path to end with 'checkpoint-5', "
+            f"got {state['disk_checkpoint_path']!r}"
+        )
+
+    def test_on_save_resolves_output_dir_checkpoint_on_restart(self, tmp_path):
+        """Simulates a fresh-process restart after crash in default epoch-save mode.
+
+        Writes a staging_resume.json with disk_checkpoint_path set to
+        output_dir/checkpoint-5 (as on_save would record), then verifies
+        _resolve_resume_checkpoint returns that path on a restart with
+        matching fingerprints.
+        """
+        import torch
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.trainer import _fingerprint_dataset, _resolve_resume_checkpoint
+
+        output_dir = tmp_path / "consolidation_refresh" / "episodic"
+        output_dir.mkdir(parents=True)
+
+        items_tensored = [
+            {
+                k: torch.tensor(v)
+                for k, v in {"input_ids": [1, 2, 3], "labels": [-100, 2, 3]}.items()
+            }
+        ]
+        ds = ConsolidationLoop._indexed_dataset(items_tensored)
+        fp_dataset = _fingerprint_dataset(ds)
+        fp_config = "aabbccdd" * 8
+
+        # Create the checkpoint dir (as HF Trainer would write it).
+        ckpt_dir = output_dir / "checkpoint-5"
+        ckpt_dir.mkdir()
+
+        scratch_path = output_dir / "staging_resume.json"
+        state = {
+            "adapter_name": "episodic",
+            "dataset_fingerprint": fp_dataset,
+            "training_config_fingerprint": fp_config,
+            "ram_checkpoint_path": "",
+            "disk_checkpoint_path": str(ckpt_dir),
+            "checkpoint_path": "",
+            "started_at": "2026-06-21T00:00:00+00:00",
+            "updated_at": "2026-06-21T00:00:00+00:00",
+        }
+        scratch_path.write_bytes(json.dumps(state, indent=2).encode())
+
+        # Simulate restart: fresh identical-content dataset.
+        ds_fresh = ConsolidationLoop._indexed_dataset(items_tensored)
+        fingerprints = {
+            "dataset": _fingerprint_dataset(ds_fresh),
+            "config": fp_config,
+        }
+
+        read_plain = lambda p: Path(p).read_bytes()  # noqa: E731
+        with (
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain),
+        ):
+            result = _resolve_resume_checkpoint(scratch_path, fingerprints)
+
+        assert result == str(ckpt_dir), (
+            f"Expected {ckpt_dir!s}, got {result!r}. "
+            "on_save fix must make _resolve_resume_checkpoint find output_dir/checkpoint-N."
+        )
+
+    def test_on_save_none_when_checkpoint_dir_cleaned(self, tmp_path):
+        """_resolve_resume_checkpoint returns None when the recorded checkpoint was deleted.
+
+        The is_dir() gate in _resolve_resume_checkpoint must reject a path whose
+        directory no longer exists (cleaned by _clean_scratch on a prior success).
+        """
+        from paramem.training.trainer import _resolve_resume_checkpoint
+
+        output_dir = tmp_path / "consolidation_refresh" / "episodic"
+        output_dir.mkdir(parents=True)
+
+        fp_dataset = "aabbccdd" * 8
+        fp_config = "11223344" * 8
+
+        scratch_path = output_dir / "staging_resume.json"
+        # Record a checkpoint path pointing to a dir that does NOT exist.
+        state = {
+            "adapter_name": "episodic",
+            "dataset_fingerprint": fp_dataset,
+            "training_config_fingerprint": fp_config,
+            "ram_checkpoint_path": "",
+            "disk_checkpoint_path": str(output_dir / "checkpoint-5"),  # dir absent
+            "checkpoint_path": "",
+            "started_at": "2026-06-21T00:00:00+00:00",
+            "updated_at": "2026-06-21T00:00:00+00:00",
+        }
+        scratch_path.write_bytes(json.dumps(state, indent=2).encode())
+
+        fingerprints = {"dataset": fp_dataset, "config": fp_config}
+
+        read_plain = lambda p: Path(p).read_bytes()  # noqa: E731
+        with (
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain),
+        ):
+            result = _resolve_resume_checkpoint(scratch_path, fingerprints)
+
+        assert result is None, f"Expected None when checkpoint dir was cleaned; got {result!r}"
+
+    def test_on_save_epoch_mirror_takes_precedence_over_output_dir_checkpoint(self, tmp_path):
+        """When bg_checkpoint_epoch/ exists, it is preferred over output_dir/checkpoint-*.
+
+        This is the existing RAM copy-back mode behaviour; the new else-branch
+        must not activate when the epoch mirror dir is present.
+        """
+        from paramem.training.trainer import _StagingResumeCallback
+
+        output_dir = tmp_path / "adapter"
+        output_dir.mkdir(parents=True)
+
+        # Both bg_checkpoint_epoch/ and a plain checkpoint-N exist.
+        epoch_mirror = output_dir / "bg_checkpoint_epoch"
+        epoch_mirror.mkdir()
+        (epoch_mirror / "checkpoint-10").mkdir()
+        (output_dir / "checkpoint-5").mkdir()
+
+        fp_dataset = "aabbccdd" * 8
+        fp_config = "11223344" * 8
+        scratch_path = output_dir / "staging_resume.json"
+        base_state = self._base_state(fp_dataset, fp_config)
+        self._write_resume(scratch_path, base_state)
+
+        cb = _StagingResumeCallback(
+            scratch_path=scratch_path,
+            ram_dir=None,
+            output_dir=output_dir,
+            base_state=base_state,
+        )
+        self._invoke_on_save(cb)
+
+        state = self._read_resume_plain(scratch_path)
+        assert state is not None
+        recorded = state["disk_checkpoint_path"]
+        assert "bg_checkpoint_epoch" in recorded, (
+            f"Expected bg_checkpoint_epoch to be preferred; got {recorded!r}"
+        )
+        assert "checkpoint-10" in recorded, (
+            f"Expected checkpoint-10 from epoch mirror; got {recorded!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Slice 2a (fresh-start purge) — stale checkpoint-N purged on fingerprint mismatch
+# ---------------------------------------------------------------------------
+
+
+class TestFreshStartStaleCheckpointPurge:
+    """Verify that ``train_adapter`` purges stale ``checkpoint-*`` dirs on the
+    fresh-start branch (fingerprint mismatch or first run) and does NOT purge
+    them on the resume branch (matching fingerprints + valid checkpoint).
+
+    Both tests are no-GPU; the HF Trainer is mocked throughout.
+
+    The crash scenario: a fold crashes mid-tier leaving an age-encrypted
+    ``checkpoint-N/README.md``.  The next cycle has DIFFERENT content (new
+    sessions) so fingerprints mismatch → fresh-start branch.  PEFT's
+    ``save_pretrained`` calls ``ModelCard.load(checkpoint-N/README.md)`` which
+    opens the file as UTF-8 and crashes on the age magic bytes.  The fix calls
+    ``_clean_scratch(output_dir, ram_dir=None)`` at the TOP of the fresh-start
+    block, before ``_write_staging_resume``.
+    """
+
+    # AGE file magic: first 4 bytes of a typical age-encrypted file.
+    _AGE_MAGIC = b"\x61\x67\x65\x2d\xa6\xf4\x88\xff"
+
+    @pytest.fixture()
+    def _mocks(self, tmp_path):
+        """Patch TrainingArguments and Trainer to avoid GPU / real HF objects."""
+        with (
+            patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
+            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
+        ):
+            mock_args_cls.return_value = MagicMock()
+            yield tmp_path
+
+    def _seed_stale_checkpoint(self, output_dir: Path) -> Path:
+        """Create a stale ``checkpoint-8/`` with a binary (age-like) README.md.
+
+        This simulates the exact crash scenario: a prior fold wrote an
+        age-encrypted checkpoint and then crashed before cleaning up.
+        """
+        ckpt = output_dir / "checkpoint-8"
+        ckpt.mkdir(parents=True, exist_ok=True)
+        (ckpt / "README.md").write_bytes(self._AGE_MAGIC + b"\x00" * 32)
+        return ckpt
+
+    def _seed_stale_staging_resume(self, output_dir: Path, fp_dataset: str, fp_config: str) -> Path:
+        """Write a ``staging_resume.json`` whose fingerprints do NOT match the run.
+
+        Forces the fresh-start branch in ``train_adapter``.
+        """
+        stale_state = {
+            "adapter_name": "episodic",
+            "dataset_fingerprint": fp_dataset + "_STALE",
+            "training_config_fingerprint": fp_config + "_STALE",
+            "ram_checkpoint_path": "",
+            "disk_checkpoint_path": "",
+            "checkpoint_path": "",
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+        scratch = output_dir / "staging_resume.json"
+        scratch.write_bytes(json.dumps(stale_state, indent=2).encode())
+        return scratch
+
+    def test_fresh_start_purges_stale_checkpoint_and_writes_new_marker(self, _mocks, tmp_path):
+        """Fingerprint mismatch triggers fresh-start → stale checkpoint-8 removed.
+
+        Assertions:
+        1. No exception raised (the age-binary README.md does not crash PEFT).
+        2. The stale ``checkpoint-8/`` dir is deleted before training begins.
+        3. A fresh ``staging_resume.json`` was written with the current fingerprints
+           (verified by a trainer that reads and records its content during train()).
+
+        ``staging_resume.json`` is deleted post-success by ``scratch_path.unlink``,
+        so assertion 3 captures the marker state DURING training via a capturing
+        trainer subclass.
+        """
+        _CapturingTrainer.captured_train_kwargs.clear()
+        tmp_path = _mocks
+
+        from paramem.training.trainer import _fingerprint_dataset, _fingerprint_training_config
+
+        output_dir = tmp_path / "consolidation_refresh" / "episodic"
+        output_dir.mkdir(parents=True)
+
+        model = _make_peft_model()
+        tokenizer = _make_tokenizer()
+        dataset = _make_dataset()
+        tc = _minimal_training_config()
+        ac = _minimal_adapter_config()
+
+        # Compute the real fingerprints the run will use.
+        from paramem.training.consolidation import ConsolidationLoop
+
+        indexed_ds = ConsolidationLoop._indexed_dataset(dataset)
+        fp_dataset = _fingerprint_dataset(indexed_ds)
+        fp_config = _fingerprint_training_config(tc, ac)
+
+        # Pre-seed: stale checkpoint with binary content + mismatched marker.
+        stale_ckpt = self._seed_stale_checkpoint(output_dir)
+        self._seed_stale_staging_resume(output_dir, fp_dataset, fp_config)
+
+        # Verify precondition: the stale checkpoint exists before the call.
+        assert stale_ckpt.is_dir(), "Precondition: stale checkpoint-8 must exist"
+
+        # Trainer that records the staging_resume.json content during train().
+        # The marker is written before train() is called and deleted post-success,
+        # so this is the only window to observe it.
+        marker_state_during_train: list[dict] = []
+
+        class _MarkerCapturingTrainer(_CapturingTrainer):
+            def train(self, resume_from_checkpoint=None):
+                scratch = output_dir / "staging_resume.json"
+                if scratch.exists():
+                    try:
+                        marker_state_during_train.append(json.loads(scratch.read_bytes()))
+                    except Exception:
+                        pass
+                return super().train(resume_from_checkpoint=resume_from_checkpoint)
+
+        # Run train_adapter; must not raise even though README.md has binary bytes.
+        read_plain = lambda p: Path(p).read_bytes()  # noqa: E731
+        write_plain = lambda p, d: Path(p).write_bytes(d)  # noqa: E731
+        with (
+            patch("paramem.training.trainer.Trainer", new=_MarkerCapturingTrainer),
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain),
+            patch("paramem.backup.encryption.write_infra_bytes", side_effect=write_plain),
+        ):
+            train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=dataset,
+                adapter_name="episodic",
+                training_config=tc,
+                adapter_config=ac,
+                output_dir=output_dir,
+            )
+
+        # Assertion 1: stale checkpoint-8 was removed before training.
+        assert not stale_ckpt.exists(), (
+            "stale checkpoint-8 must be purged on the fresh-start branch; "
+            "leftover encrypted dirs cause PEFT UnicodeDecodeError on save_pretrained"
+        )
+
+        # Assertion 2: a fresh staging_resume.json was written with correct fingerprints.
+        assert marker_state_during_train, (
+            "staging_resume.json must exist and be readable during train() — "
+            "the fresh-start branch must write it before calling Trainer"
+        )
+        written = marker_state_during_train[0]
+        assert written["dataset_fingerprint"] == fp_dataset, (
+            f"Fresh staging_resume.json must carry the current dataset fingerprint; "
+            f"got {written['dataset_fingerprint']!r}"
+        )
+
+    def test_resume_branch_does_not_purge_valid_checkpoint(self, _mocks, tmp_path):
+        """Matching fingerprints + existing checkpoint dir → resume branch, no purge.
+
+        Scoping lock: the purge must NEVER run on the resume branch, or it would
+        delete the checkpoint we are about to resume from.
+
+        This test verifies that when the resume branch is taken, ``trainer.train()``
+        is called with ``resume_from_checkpoint`` pointing to the valid checkpoint
+        (proving the checkpoint was present at training time, not purged).  The
+        post-success ``_clean_scratch`` call legitimately removes all checkpoint-*
+        dirs after a normal completion — the assertion window is therefore DURING
+        training, captured via a trainer subclass.
+        """
+        _CapturingTrainer.captured_train_kwargs.clear()
+        tmp_path = _mocks
+
+        from paramem.training.trainer import _fingerprint_dataset, _fingerprint_training_config
+
+        output_dir = tmp_path / "consolidation_refresh" / "episodic"
+        output_dir.mkdir(parents=True)
+
+        model = _make_peft_model()
+        tokenizer = _make_tokenizer()
+        dataset = _make_dataset()
+        tc = _minimal_training_config()
+        ac = _minimal_adapter_config()
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        indexed_ds = ConsolidationLoop._indexed_dataset(dataset)
+        fp_dataset = _fingerprint_dataset(indexed_ds)
+        fp_config = _fingerprint_training_config(tc, ac)
+
+        # Create a valid (plaintext) checkpoint directory.
+        valid_ckpt = output_dir / "checkpoint-8"
+        valid_ckpt.mkdir(parents=True)
+        (valid_ckpt / "README.md").write_bytes(b"valid plaintext content")
+
+        # Write a staging_resume.json with MATCHING fingerprints + the checkpoint path.
+        matching_state = {
+            "adapter_name": "episodic",
+            "dataset_fingerprint": fp_dataset,
+            "training_config_fingerprint": fp_config,
+            "ram_checkpoint_path": "",
+            "disk_checkpoint_path": str(valid_ckpt),
+            "checkpoint_path": "",
+            "started_at": "2026-06-21T00:00:00+00:00",
+            "updated_at": "2026-06-21T00:00:00+00:00",
+        }
+        scratch = output_dir / "staging_resume.json"
+        scratch.write_bytes(json.dumps(matching_state, indent=2).encode())
+
+        # Trainer that records whether the checkpoint existed at train() time.
+        ckpt_present_during_train: list[bool] = []
+
+        class _ExistenceCapturingTrainer(_CapturingTrainer):
+            def train(self, resume_from_checkpoint=None):
+                ckpt_present_during_train.append(valid_ckpt.is_dir())
+                return super().train(resume_from_checkpoint=resume_from_checkpoint)
+
+        read_plain = lambda p: Path(p).read_bytes()  # noqa: E731
+        write_plain = lambda p, d: Path(p).write_bytes(d)  # noqa: E731
+        with (
+            patch("paramem.training.trainer.Trainer", new=_ExistenceCapturingTrainer),
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain),
+            patch("paramem.backup.encryption.write_infra_bytes", side_effect=write_plain),
+        ):
+            train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=dataset,
+                adapter_name="episodic",
+                training_config=tc,
+                adapter_config=ac,
+                output_dir=output_dir,
+            )
+
+        # The checkpoint must have been present when train() was called — it was NOT
+        # purged by the fresh-start branch (which only runs when _effective_resume is None).
+        assert ckpt_present_during_train, "trainer.train() must have been called"
+        assert ckpt_present_during_train[0], (
+            "valid checkpoint-8 must be present at train() time on the resume branch; "
+            "the purge runs ONLY on the fresh-start branch (_effective_resume is None)"
+        )
+
+        # Verify resume_from_checkpoint was forwarded (confirms resume branch, not fresh-start).
+        assert len(_CapturingTrainer.captured_train_kwargs) == 1
+        forwarded = _CapturingTrainer.captured_train_kwargs[0]["resume_from_checkpoint"]
+        assert forwarded == str(valid_ckpt), (
+            f"On the resume branch, trainer.train() must receive the checkpoint path; "
+            f"got {forwarded!r} — if None, the fresh-start branch ran (purge is a bug here)"
+        )

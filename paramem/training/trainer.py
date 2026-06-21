@@ -442,13 +442,17 @@ def _resolve_resume_checkpoint(
     1. ``ram_checkpoint_path`` under ``/dev/shm`` — present only when
        ``save_steps_ram > 0`` and the process has NOT restarted since the
        interrupted run.
-    2. ``disk_checkpoint_path`` under ``<output_dir>/bg_checkpoint_epoch/``
-       — the durable epoch-mirror written by ``_RamEpochCopyCallback``; survives
-       WSL reboot.
+    2. ``disk_checkpoint_path`` — either the epoch-mirror written by
+       ``_RamEpochCopyCallback`` under ``<output_dir>/bg_checkpoint_epoch/``, or
+       the ``checkpoint-N`` dir written directly under ``output_dir`` by HF
+       Trainer in the default ``save_steps_ram==0`` epoch-save mode.
+       ``_StagingResumeCallback.on_save`` records whichever is present.
     3. ``checkpoint_path`` — back-compat field for pre-existing files.
 
     Returns ``None`` when the file is absent, fingerprints mismatch, or no
-    valid checkpoint directory is found.
+    valid checkpoint directory is found.  A previously-recorded dir that was
+    cleaned by ``_clean_scratch`` fails the ``is_dir()`` check and returns
+    ``None`` — crash-resume is correctly inert for an already-cleaned run.
 
     Args:
         scratch_path: Path to ``staging_resume.json``.
@@ -538,6 +542,7 @@ class _StagingResumeCallback(TrainerCallback):
     ) -> None:
         self._scratch_path = scratch_path
         self._ram_dir = ram_dir
+        self._output_dir = output_dir
         self._epoch_dir = output_dir / "bg_checkpoint_epoch"
         self._base_state = base_state
 
@@ -550,7 +555,21 @@ class _StagingResumeCallback(TrainerCallback):
         return str(checkpoints[-1]) if checkpoints else ""
 
     def on_save(self, args, state, control, **kwargs) -> None:
-        """Update scratch state whenever HF Trainer writes a checkpoint."""
+        """Update scratch state whenever HF Trainer writes a checkpoint.
+
+        Records the latest checkpoint path in the staging resume marker so that
+        a subsequent crash-resume invocation can locate it.  Priority:
+
+        1. ``ram_checkpoint_path`` — set when ``save_steps_ram > 0`` and the
+           RAM dir exists (RAM-mode; unchanged behaviour).
+        2. ``disk_checkpoint_path`` — set from ``bg_checkpoint_epoch/`` when that
+           epoch-mirror dir exists (RAM-copy-back path; unchanged behaviour).
+           Otherwise set from ``output_dir/checkpoint-*`` directly, which is
+           where HF Trainer writes checkpoints in the default ``save_steps_ram==0``
+           epoch-save mode used by the consolidation fold.  Without this branch
+           the fold's epoch checkpoints were never recorded and crash-resume was
+           always inert in that mode.
+        """
         updated = dict(self._base_state)
         updated["updated_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -558,6 +577,11 @@ class _StagingResumeCallback(TrainerCallback):
             updated["ram_checkpoint_path"] = self._latest_checkpoint(self._ram_dir)
         if self._epoch_dir.is_dir():
             updated["disk_checkpoint_path"] = self._latest_checkpoint(self._epoch_dir)
+        else:
+            # Default epoch-save mode (save_steps_ram==0): HF Trainer writes
+            # checkpoint-N directly under output_dir.  Record the latest so
+            # _resolve_resume_checkpoint can find it on a crash-resume.
+            updated["disk_checkpoint_path"] = self._latest_checkpoint(self._output_dir)
 
         try:
             _write_staging_resume(self._scratch_path, updated)
@@ -581,6 +605,7 @@ def train_adapter(
     resume_from_checkpoint: Optional[str | Path] = None,
     thermal_policy: Optional[ThermalPolicy] = None,
     hooks: Optional[TrainingHooks] = None,
+    retain_scratch_until_external_commit: bool = False,
 ) -> dict:
     """Train a LoRA adapter on the given dataset with staging+promote contract.
 
@@ -666,6 +691,16 @@ def train_adapter(
         hooks: Caller-supplied ``TrainingHooks`` (inference yielding, epoch
             persist, shutdown predicate).  Installed before the thermal throttle
             so yielding pre-empts throttle waits.
+        retain_scratch_until_external_commit: When ``True``, the success path
+            (Step 6a) skips ``_clean_scratch`` and ``scratch_path.unlink`` so
+            the durable ``checkpoint-N`` directory under *output_dir* and the
+            ``staging_resume.json`` marker survive after training completes.
+            The caller is then responsible for deleting these scratch artefacts
+            after its own external commit (e.g. the fold's ``_save_adapters``).
+            The in-VRAM staging→production promotion and the ``in_training``
+            slot deletion happen regardless.  Default ``False`` preserves the
+            existing clean-on-success behaviour for all current callers (BG
+            trainer, replay, migration, interim).
 
     Returns:
         Training metrics dict with the following keys:
@@ -772,6 +807,13 @@ def train_adapter(
         _fingerprints = None  # compose-training path; no scratch marker written
 
     if _use_staging and _fingerprints is not None and _effective_resume is None:
+        # Purge stale checkpoints from a prior crashed or fingerprint-mismatched
+        # run before starting fresh.  A leftover age-encrypted checkpoint-N dir
+        # causes PEFT's ModelCard.load (called from save_pretrained) to crash with
+        # UnicodeDecodeError when it tries to read the binary age header as UTF-8.
+        # ram_dir is not allocated yet at this point, so pass None.
+        logger.info("Fresh start: purging stale checkpoints from %s", output_dir)
+        _clean_scratch(output_dir, ram_dir=None)
         # No prior checkpoint found; write a fresh staging_resume.json so a
         # crash during this run leaves a marker for the next invocation.
         _scratch_state: dict = {
@@ -1006,9 +1048,18 @@ def train_adapter(
                 copy_adapter_weights(model, src=_STAGING_ADAPTER, dst=adapter_name)
                 switch_adapter(model, adapter_name)
                 logger.info("Staging: promoted %s → %s (VRAM)", _STAGING_ADAPTER, adapter_name)
-                # Clean scratch on success.
-                _clean_scratch(output_dir, ram_dir)
-                scratch_path.unlink(missing_ok=True)
+                # Clean scratch on success unless the caller owns cleanup.
+                # When retain_scratch_until_external_commit=True the caller (e.g.
+                # the fold's _run_fold) keeps the durable checkpoint-N dir and
+                # staging_resume.json alive until its own external commit
+                # (_save_adapters) succeeds, enabling completed-tier reload on
+                # crash-resume.  Default False: clean immediately (existing
+                # behaviour for BG, replay, migration, and interim callers).
+                if not retain_scratch_until_external_commit:
+                    _clean_scratch(output_dir, ram_dir)
+                    scratch_path.unlink(missing_ok=True)
+                else:
+                    logger.debug("Staging: scratch retained for external commit at %s", output_dir)
                 # Delete the staging slot now that promote is done.
                 # The staging slot is transient — exists only during this training
                 # event.  Crash-safety + rollback rationale no longer applies: the

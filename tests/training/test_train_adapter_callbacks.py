@@ -406,6 +406,28 @@ class _RaisingTrainer(_NullTrainer):
         raise RuntimeError("simulated crash")
 
 
+def _make_checkpoint_writing_trainer(out_dir: Path):
+    """Return a Trainer subclass that writes checkpoint-10 during train().
+
+    Models what HF Trainer does in practice: it writes checkpoint dirs to
+    output_dir DURING training, not before.  Used by TestRetainScratchFlag
+    so that the pre-training fresh-start purge never sees a stale checkpoint,
+    and the post-training retain flag operates on a checkpoint written during
+    the current run.
+
+    Args:
+        out_dir: The ``output_dir`` passed to ``train_adapter``.  The trainer
+            writes ``out_dir / "checkpoint-10"`` during ``train()``.
+    """
+
+    class _CheckpointWritingTrainer(_NullTrainer):
+        def train(self, resume_from_checkpoint=None):
+            (out_dir / "checkpoint-10").mkdir(parents=True, exist_ok=True)
+            return super().train(resume_from_checkpoint=resume_from_checkpoint)
+
+    return _CheckpointWritingTrainer
+
+
 def _staging_patches(tmp_path, *, trainer_cls=_NullTrainer, abort_shutdown=False):
     """Return a context-manager stack of patches for staging+promote tests.
 
@@ -950,4 +972,146 @@ class TestStagingPromoteContract:
         assert not scratch.exists(), "staging_resume.json must be deleted on abort"
         assert not (out_dir / "bg_checkpoint_epoch").exists(), (
             "bg_checkpoint_epoch must be deleted on abort"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Slice 2a — retain_scratch_until_external_commit flag
+# ---------------------------------------------------------------------------
+
+
+class TestRetainScratchFlag:
+    """Verify ``retain_scratch_until_external_commit`` semantics.
+
+    When True on NORMAL completion (Step 6a):
+    - ``checkpoint-N`` dir under ``output_dir`` survives.
+    - ``staging_resume.json`` survives.
+    - Staging→production VRAM promote still happens (copy_adapter_weights called).
+    - ``in_training`` slot still deleted (staging lifecycle invariant upheld).
+
+    When False (default), behaviour is identical to today: both are cleaned.
+    The abort branch is NOT changed by this flag (Slice 3 scope).
+    """
+
+    def _run_train(self, tmp_path, *, retain: bool, trainer_cls=None) -> dict:
+        """Helper: run train_adapter with controlled staging patches and return metrics.
+
+        The Trainer writes ``checkpoint-10`` during ``train()`` (not before), so
+        that the fresh-start purge (which runs at the top of the fresh-start
+        branch, before training) never sees it as a stale checkpoint from a prior
+        crashed run.  This accurately models the production flow: HF Trainer
+        creates checkpoint dirs DURING training; the retain flag governs whether
+        they survive the post-training ``_clean_scratch`` call.
+        """
+        model = _make_staging_model(has_staging=False)
+        out_dir = tmp_path / "adapter"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if trainer_cls is None:
+            trainer_cls = _make_checkpoint_writing_trainer(out_dir)
+
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(
+            tmp_path, trainer_cls=trainer_cls
+        )
+        with stack:
+            metrics = train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=out_dir,
+                retain_scratch_until_external_commit=retain,
+            )
+        return metrics, out_dir, model, mock_copy, mock_switch
+
+    def test_retain_false_default_cleans_checkpoint_and_scratch(self, tmp_path):
+        """Default (retain=False): checkpoint-N and staging_resume.json are deleted on success."""
+        metrics, out_dir, model, mock_copy, mock_switch = self._run_train(tmp_path, retain=False)
+
+        assert not metrics.get("aborted"), f"Expected success; got {metrics}"
+        assert not (out_dir / "checkpoint-10").exists(), (
+            "checkpoint-10 must be deleted on success with retain=False (default)"
+        )
+        assert not (out_dir / "staging_resume.json").exists(), (
+            "staging_resume.json must be deleted on success with retain=False (default)"
+        )
+
+    def test_retain_true_keeps_checkpoint_and_scratch(self, tmp_path):
+        """retain=True: checkpoint-N and staging_resume.json survive a successful train_adapter."""
+        metrics, out_dir, model, mock_copy, mock_switch = self._run_train(tmp_path, retain=True)
+
+        assert not metrics.get("aborted"), f"Expected success; got {metrics}"
+        assert (out_dir / "checkpoint-10").exists(), (
+            "checkpoint-10 must survive when retain_scratch_until_external_commit=True"
+        )
+        assert (out_dir / "staging_resume.json").exists(), (
+            "staging_resume.json must survive when retain_scratch_until_external_commit=True"
+        )
+
+    def test_retain_true_still_promotes_staging_to_production(self, tmp_path):
+        """retain=True must not skip the VRAM promote: copy_adapter_weights called for promote."""
+        metrics, out_dir, model, mock_copy, mock_switch = self._run_train(tmp_path, retain=True)
+
+        from unittest.mock import call
+
+        promote_copy = call(model, src="in_training", dst="episodic")
+        assert promote_copy in mock_copy.call_args_list, (
+            "Staging → production promote must still happen with retain=True; "
+            f"calls: {mock_copy.call_args_list}"
+        )
+        mock_switch.assert_called_with(model, "episodic")
+
+    def test_retain_true_still_deletes_staging_slot(self, tmp_path):
+        """retain=True must not skip the in_training slot deletion (lifecycle invariant)."""
+        metrics, out_dir, model, mock_copy, mock_switch = self._run_train(tmp_path, retain=True)
+
+        model.delete_adapter.assert_called_with("in_training")
+
+    def test_abort_always_cleans_regardless_of_retain(self, tmp_path):
+        """The abort branch (Step 6b) is NOT changed by the retain flag — always cleans.
+
+        Slice 3 owns the abort branch. Slice 2 must not change it.
+
+        The aborting trainer writes checkpoint-10 during train() so the checkpoint
+        is created AFTER the fresh-start purge.  The abort branch then removes it,
+        proving that retain=True does not protect checkpoints on abort.
+        """
+        model = _make_staging_model(has_staging=False)
+        out_dir = tmp_path / "adapter_abort"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write checkpoint-10 DURING training (not before) so the fresh-start
+        # purge does not remove it before the abort branch can be exercised.
+        class _AbortAndWriteTrainer(_AbortingTrainer):
+            def train(self, resume_from_checkpoint=None):
+                (out_dir / "checkpoint-10").mkdir(parents=True, exist_ok=True)
+                return super().train(resume_from_checkpoint=resume_from_checkpoint)
+
+        stack, mock_create, mock_copy, mock_switch = _staging_patches(
+            tmp_path, trainer_cls=_AbortAndWriteTrainer
+        )
+        hooks = TrainingHooks(on_shutdown_check=lambda: True)
+        with stack:
+            metrics = train_adapter(
+                model=model,
+                tokenizer=MagicMock(),
+                train_dataset=_minimal_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_tc(),
+                adapter_config=_minimal_ac(),
+                output_dir=out_dir,
+                hooks=hooks,
+                retain_scratch_until_external_commit=True,
+            )
+
+        assert metrics.get("aborted") is True
+        # Abort branch must clean regardless of the retain flag.
+        assert not (out_dir / "checkpoint-10").exists(), (
+            "checkpoint-10 must be deleted on abort even with retain=True"
+        )
+        scratch = out_dir / "staging_resume.json"
+        assert not scratch.exists(), (
+            "staging_resume.json must be deleted on abort even with retain=True"
         )
