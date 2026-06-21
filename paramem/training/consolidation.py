@@ -2073,6 +2073,247 @@ class ConsolidationLoop:
                 keep=self._keep_prior_slots,
             )
 
+    # ------------------------------------------------------------------
+    # Fold-resume durable marker helpers
+    # ------------------------------------------------------------------
+    # ``fold_resume.json`` lives under ``output_dir.parent / "state"``
+    # (same dir as ``consolidation_retry.json``).  It is age-wrapped via
+    # ``write_infra_bytes`` when a daily identity is loaded — the marker
+    # carries train_assignment SPO fact content.  Single-writer (only the
+    # consolidation loop thread inside ``_run_fold`` writes it), so no
+    # flock is needed.
+    # Schema version: 1.
+    # NOT in infra_paths() — control-plane only, never served.
+
+    _FOLD_RESUME_VERSION: int = 1
+    _FOLD_RESUME_FILENAME: str = "fold_resume.json"
+
+    @property
+    def _fold_state_dir(self) -> Path:
+        """Parent state directory for ``fold_resume.json``.
+
+        Derived as ``output_dir.parent / "state"`` to match the production
+        layout (``config.paths.data / "state"``).  For experiment callers
+        with ``output_dir="outputs/phase3"`` this yields ``outputs/state``,
+        which is self-contained and harmless.
+        """
+        d = self.output_dir.parent / "state"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _compute_fold_stamp(self, *, tier: "str | None" = None) -> str:
+        """SHA-256 over the active registry-true SPO keyset at ``_run_fold`` entry.
+
+        Stable across process restarts because (1) the on-disk registries (key
+        set + simhash) are not rewritten until the fold finalizes
+        (``_reset_main_tier_registries_and_simhashes`` at ``:4392``), and
+        (2) ``preload_cache`` deterministically reconstructs identical SPO from
+        the unchanged adapter weights — the weights are not retrained on a
+        crash-resume.  The registries carry keys + simhash only, not SPO
+        (``store.py:1170``); SPO comes from the weight probe.  If reconstruction
+        yields different SPO than pre-crash the stamp diverges and the fold
+        safely re-runs fresh rather than resuming on a stale stamp.
+
+        Args:
+            tier: When set, scope the stamp to
+                ``store.active_keys_in_tier(tier)`` (PATH B interim slot).
+                When ``None``, use all active keys across all tiers (PATH C).
+
+        Returns:
+            Hex-encoded SHA-256 digest of the sorted ``(key, subject, predicate,
+            object)`` tuples for the active keyset.
+        """
+        import hashlib
+        import json as _json
+
+        h = hashlib.sha256()
+        if tier is not None:
+            keys = list(self.store.active_keys_in_tier(tier))
+        else:
+            keys = list(self.store.all_active_keys())
+
+        tuples = []
+        for k in keys:
+            entry = self.store.get(k)
+            if entry is None:
+                tuples.append((k, "", "", ""))
+            else:
+                tuples.append(
+                    (
+                        k,
+                        entry.get("subject", ""),
+                        entry.get("predicate", ""),
+                        entry.get("object", ""),
+                    )
+                )
+        tuples.sort()
+        for t in tuples:
+            h.update(_json.dumps(t, sort_keys=True).encode("utf-8"))
+        return h.hexdigest()
+
+    def _write_fold_resume(self, state: dict) -> None:
+        """Atomically write *state* to ``fold_resume.json`` via ``write_infra_bytes``.
+
+        The file is age-encrypted when a daily identity is loaded; plaintext
+        otherwise.  On ``OSError`` (e.g. ENOSPC), logs a loud warning and
+        continues — crash-resume degrades to fresh-restart for that fold,
+        which is the pre-Slice-2 behaviour.  Non-IO exceptions propagate.
+
+        Args:
+            state: JSON-serialisable dict representing the full marker state.
+        """
+        import json as _json
+
+        from paramem.backup.encryption import write_infra_bytes
+
+        path = self._fold_state_dir / self._FOLD_RESUME_FILENAME
+        payload = _json.dumps(state, indent=2).encode("utf-8")
+        try:
+            write_infra_bytes(path, payload)
+        except OSError:  # boundary: ENOSPC / filesystem error
+            logger.warning(
+                "_write_fold_resume: failed to write %s — crash-resume degraded "
+                "to fresh-restart for this fold",
+                path,
+                exc_info=True,
+            )
+
+    def _read_fold_resume(self) -> "dict | None":
+        """Read and parse ``fold_resume.json``, returning ``None`` on absence or error.
+
+        Boundary read: any ``OSError`` or parse error returns ``None`` so
+        callers always fall through to the fresh-fold path.
+
+        Returns:
+            Parsed dict on success, ``None`` when the file is absent,
+            unreadable, or malformed.
+        """
+        import json as _json
+
+        from paramem.backup.encryption import read_maybe_encrypted
+
+        path = self._fold_state_dir / self._FOLD_RESUME_FILENAME
+        if not path.exists():
+            return None
+        try:
+            raw = read_maybe_encrypted(path)
+            return _json.loads(raw.decode("utf-8"))
+        except Exception:  # noqa: BLE001  # boundary: external-file read
+            logger.debug(
+                "_read_fold_resume: %s unreadable — treating as absent", path, exc_info=True
+            )
+            return None
+
+    def _persist_fold_assignment(
+        self,
+        scope_name: str,
+        fold_stamp: str,
+        train_assignment: "dict[str, list[dict]]",
+        dataset_fingerprints: "dict[str, str]",
+    ) -> None:
+        """Write the initial ``fold_resume.json`` marker once the assignment is finalized.
+
+        Called on the TRAINING path, AFTER the whole-fold accumulate guard,
+        so an accumulating early-return never leaves a stale marker.
+
+        ``completed_tiers`` starts empty; the first ``in_flight_tier`` is the
+        first tier that has training entries.
+
+        Args:
+            scope_name: ``"main_tiers"`` (PATH C) or ``"interim_slot"`` (PATH B).
+            fold_stamp: SHA-256 from ``_compute_fold_stamp`` (pre-mutation).
+            train_assignment: Per-tier lists of entry dicts
+                (``key/subject/predicate/object/speaker_id``).
+            dataset_fingerprints: Per-tier ``_fingerprint_dataset`` hexdigest.
+        """
+        non_empty_tiers = [t for t in train_assignment if train_assignment[t]]
+        in_flight = non_empty_tiers[0] if non_empty_tiers else None
+        state: dict = {
+            "version": self._FOLD_RESUME_VERSION,
+            "scope": scope_name,
+            "fold_stamp": fold_stamp,
+            "completed_tiers": [],
+            "tier_checkpoints": {},
+            "in_flight_tier": in_flight,
+            "train_assignment": train_assignment,
+            "dataset_fingerprint": dataset_fingerprints,
+        }
+        self._write_fold_resume(state)
+        logger.debug(
+            "_persist_fold_assignment: wrote fold_resume.json scope=%s in_flight=%s",
+            scope_name,
+            in_flight,
+        )
+
+    def _mark_tier_complete(self, tier: str, checkpoint_path: "str | None") -> None:
+        """Append *tier* to ``completed_tiers`` in ``fold_resume.json``.
+
+        Also updates ``tier_checkpoints`` and advances ``in_flight_tier`` to the
+        next tier with training entries (or ``None``).
+
+        Safe when the file is absent (logs a warning and no-ops).  On write
+        failure the error is absorbed — the marker is advisory; a
+        corrupt/missing marker degrades to fresh-restart, which is safe.
+
+        Args:
+            tier: The tier name that just completed training (``"episodic"``,
+                ``"semantic"``, or ``"procedural"``).
+            checkpoint_path: Path to the retained ``checkpoint-N`` directory for
+                this tier, or ``None`` when the tier was a fast-start graduation
+                (no checkpoint dir exists; reload comes from the production slot).
+        """
+        state = self._read_fold_resume()
+        if state is None:
+            logger.warning(
+                "_mark_tier_complete: fold_resume.json absent when marking %s complete — skipping",
+                tier,
+            )
+            return
+        completed: list = state.get("completed_tiers", [])
+        if tier not in completed:
+            completed.append(tier)
+        state["completed_tiers"] = completed
+        if checkpoint_path is not None:
+            checkpoints: dict = state.get("tier_checkpoints", {})
+            checkpoints[tier] = checkpoint_path
+            state["tier_checkpoints"] = checkpoints
+        # Advance in_flight_tier to the next non-empty, non-completed tier.
+        _ta: dict = state.get("train_assignment", {})
+        _completed_set = set(completed)
+        next_in_flight = None
+        for _t in ("episodic", "semantic", "procedural"):
+            if _t not in _completed_set and _ta.get(_t):
+                next_in_flight = _t
+                break
+        state["in_flight_tier"] = next_in_flight
+        self._write_fold_resume(state)
+        logger.debug("_mark_tier_complete: tier=%s next_in_flight=%s", tier, next_in_flight)
+
+    def _clear_fold_resume(self) -> None:
+        """Remove ``fold_resume.json`` on clean fold completion.
+
+        Idempotent: a no-op when the file is absent.
+        """
+        path = self._fold_state_dir / self._FOLD_RESUME_FILENAME
+        path.unlink(missing_ok=True)
+        logger.debug("_clear_fold_resume: removed %s", path)
+
+    @staticmethod
+    def _latest_checkpoint_in_dir(directory: Path) -> "str | None":
+        """Return the path of the highest-numbered ``checkpoint-*`` dir under *directory*.
+
+        Returns ``None`` when no matching directory is found.  Used to locate
+        the durable epoch checkpoint for ``_mark_tier_complete``.
+        """
+        checkpoints = sorted(
+            directory.glob("checkpoint-*"),
+            key=lambda p: int(p.name.split("-")[1]) if p.name.split("-")[1].isdigit() else -1,
+        )
+        for ckpt in reversed(checkpoints):
+            if ckpt.is_dir():
+                return str(ckpt)
+        return None
+
     def _training_output_dir(self, adapter_name: str, *, interim_stamp: str | None = None) -> Path:
         """Path passed to HuggingFace ``TrainingArguments(output_dir=...)``.
 
@@ -3537,6 +3778,10 @@ class ConsolidationLoop:
         if scope.persist == "interim_slot":
             from paramem.memory.persistence import commit_tier_slot
 
+            # --- PATH B fold-stamp (minted before any store mutation) ---
+            # scope.tier gives the logical tier; adapter_name is the PEFT slot name.
+            _fold_stamp_b = self._compute_fold_stamp(tier=adapter_name or scope.tier)
+
             # _run_fold always controls the merger.graph lifecycle for the interim path.
             try:
                 # --- End-of-extraction debug dump (interim only) ---
@@ -3676,6 +3921,19 @@ class ConsolidationLoop:
                         kp for kp in all_interim_keyed if kp["key"] not in promoted_key_set
                     ]
 
+                # --- PATH B: write single-entry fold_resume.json marker ---
+                # Written AFTER all_interim_keyed is fully finalized (promotion
+                # filter above may shrink it).  Per W1: not "at PATH B entry".
+                # On crash, the marker enables epoch-resume via _resolve_resume_checkpoint
+                # (Slice 1 + §3.A already wired epoch checkpoint path).
+                # Interim does NOT pass retain_scratch_until_external_commit (§6 of
+                # plan): commit_tier_slot is an inline durable write right after training,
+                # so there is no multi-tier window where a completed-but-uncommitted
+                # tier can be lost.
+                if scope.source == "weights":
+                    _b_assignment = {adapter_name: list(all_interim_keyed)}
+                    self._persist_fold_assignment("interim_slot", _fold_stamp_b, _b_assignment, {})
+
                 # --- Train (weights source) or skip (disk source) ---
                 epi_train_loss: "float | None" = None
                 if scope.source == "weights" and all_interim_keyed:
@@ -3769,6 +4027,8 @@ class ConsolidationLoop:
                     all_keyed=all_interim_keyed,
                     output_dir=self.output_dir,
                 )
+                # Clear the PATH B fold_resume.json marker on clean commit.
+                self._clear_fold_resume()
 
                 # --- Restore episodic as active adapter ---
                 if "episodic" in self.model.peft_config:
@@ -3829,335 +4089,447 @@ class ConsolidationLoop:
         from paramem.memory.interim_adapter import unload_interim_adapters
         from paramem.models.loader import create_adapter
 
-        try:
-            recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
-                source=scope.source,
-                resolve_contradictions_recon=False,
-                resolve_contradictions_extra=False,
-            )
-            self._refine_consolidation_graph(
-                recon_relations,
-                normalize=(scope.level != "off"),
-                enrich=(scope.level == "full"),
-            )
+        # --- Fold-stamp + crash-resume marker (PATH C) ---
+        # Mint fold_stamp BEFORE any store mutation (promote/tier-floor/
+        # _build_all_edge_entries_into all mutate the store; the stamp must
+        # reflect the pristine on-disk registry so it is byte-identical on
+        # re-entry after a crash).
+        _fold_stamp_c = self._compute_fold_stamp(tier=None)
+        _resume_marker = self._read_fold_resume()
+        _resume_c = (
+            _resume_marker is not None
+            and _resume_marker.get("fold_stamp") == _fold_stamp_c
+            and _resume_marker.get("scope") == "main_tiers"
+        )
+        if _resume_marker is not None and not _resume_c:
+            # Stale marker (different fold inputs or scope): clear it and
+            # delete any retained checkpoint scratch from that stale fold.
+            import shutil as _shutil
 
-            # --- Inline promotion (scope-gated) ---
-            if scope.promote:
-                _inline_promoted = self._promote_mature_keys_inline()
-                if _inline_promoted:
-                    logger.info(
-                        "_run_fold[main_tiers]: %d key(s) promoted to semantic "
-                        "before tier assignment",
-                        len(_inline_promoted),
-                    )
-
-            tier_keyed: dict[str, list[dict]] = {
-                "episodic": [],
-                "semantic": [],
-                "procedural": [],
-            }
-
-            minted_by_tier, _ = self._build_all_edge_entries_into(
-                tier_keyed,
-                default_speaker_id="",
-                defer=scope.defer,
-                tag_new=scope.tag_new,
-            )
-
-            if recall_miss_keys:
+            _stale_refresh = self.output_dir / "consolidation_refresh"
+            if _stale_refresh.exists():
+                _shutil.rmtree(_stale_refresh, ignore_errors=True)
                 logger.info(
-                    "_run_fold[main_tiers]: %d key(s) in recall-miss set "
-                    "(retrained with registry-true content — not dropped): %s",
-                    len(recall_miss_keys),
-                    sorted(recall_miss_keys),
+                    "_run_fold[main_tiers]: removed stale consolidation_refresh tree"
+                    " from prior mismatched fold"
                 )
-
-            self._debug_writer.on_fold_graph(self.merger, label="keyed")
-
-            # --- Per-tier floor gate (scope-gated) ---
-            _floor = self.config.min_tier_key_floor
-            _fast_start_graduating: set[str] = set()
-
-            def _tier_has_disk_slot(tier_name: str) -> bool:
-                from paramem.adapters.manifest import is_slot_name as _isn
-
-                tier_dir = self.output_dir / tier_name
-                if not tier_dir.is_dir():
-                    return False
-                return any(entry.is_dir() and _isn(entry.name) for entry in tier_dir.iterdir())
-
-            if scope.tier_floor:
-                for _pt in ("semantic", "procedural"):
-                    _pt_entries = tier_keyed[_pt]
-                    if not _pt_entries:
-                        continue
-                    if len(_pt_entries) < _floor:
-                        logger.info(
-                            "_run_fold[main_tiers]: tier %s has %d key(s) < floor %d"
-                            " — parking in episodic until floor reached",
-                            _pt,
-                            len(_pt_entries),
-                            _floor,
-                        )
-                        for _pe in _pt_entries:
-                            tier_keyed["episodic"].append(_pe)
-                            _cur = self.store.tier_for_active_key(_pe["key"])
-                            if _cur is not None and _cur != "episodic":
-                                self.store.move(_pe["key"], "episodic")
-                            self.promoted_keys.discard(_pe["key"])
-                        tier_keyed[_pt] = []
-                    else:
-                        _tier_is_live = _tier_has_disk_slot(_pt)
-                        if not _tier_is_live:
-                            if self.config.tier_fast_start:
-                                logger.info(
-                                    "_run_fold[main_tiers]: tier %s graduating (fast-start)"
-                                    " — %d key(s) >= floor %d; will copy episodic weights",
-                                    _pt,
-                                    len(_pt_entries),
-                                    _floor,
-                                )
-                                _fast_start_graduating.add(_pt)
-                            else:
-                                logger.info(
-                                    "_run_fold[main_tiers]: tier %s graduating"
-                                    " (train-from-scratch) — %d key(s) >= floor %d",
-                                    _pt,
-                                    len(_pt_entries),
-                                    _floor,
-                                )
-                                for _pe in _pt_entries:
-                                    self.store.move(_pe["key"], _pt)
-
-            serve_assignment = tier_keyed
-
-            train_assignment: dict[str, list[dict]] = {
-                t: list(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
-            }
-            for _fst in _fast_start_graduating:
-                _ep_union: dict[str, dict] = {e["key"]: e for e in train_assignment["episodic"]}
-                for _fse in serve_assignment[_fst]:
-                    _ep_union.setdefault(_fse["key"], _fse)
-                train_assignment["episodic"] = list(_ep_union.values())
-                train_assignment[_fst] = []
-
-            self._debug_writer.on_fold_assignments(serve_assignment, train_assignment)
-
-            _train_active_before: dict[str, int] = {
-                t: len(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
-            }
-
-            # --- Whole-fold accumulate guard ---
-            _total_trainable = sum(len(v) for v in serve_assignment.values())
-            if not housekeeping and _total_trainable < _floor:
-                logger.info(
-                    "_run_fold[main_tiers]: total trainable keys %d < floor %d"
-                    " — returning accumulating (sessions stay pending)",
-                    _total_trainable,
-                    _floor,
-                )
-                _acc_parked = {
-                    t: len(serve_assignment[t])
-                    for t in ("semantic", "procedural")
-                    if len(serve_assignment[t]) > 0
-                }
-                for _bname in (
-                    "episodic_backup",
-                    "semantic_backup",
-                    "procedural_backup",
-                ):
-                    if _bname in self.model.peft_config:
-                        self.model.delete_adapter(_bname)
-                        logger.debug(
-                            "_run_fold[main_tiers]: cleaned up stale backup %s"
-                            " (left by prior aborted fold) on accumulating return",
-                            _bname,
-                        )
-                self._current_interim_stamp = None  # type: ignore[assignment]
-                return {
-                    "status": "accumulating",
-                    "accumulating_reason": {
-                        "floor": _floor,
-                        "parked": _acc_parked,
-                        "episodic": len(serve_assignment["episodic"]),
-                    },
-                    "tiers_rebuilt": [],
-                    "graph_drift_count": 0,
-                    "drift_deduplicated": 0,
-                    "drift_orphan": 0,
-                    "drift_genuine_loss": 0,
-                    "drift_intended_removal": 0,
-                    "drift_intended_removal_by_reason": {},
-                    "recall_miss_keys": [],
-                    "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
-                    "tier_keyed": serve_assignment,
-                    "recall_per_tier": {},
-                    "rolled_back": False,
-                    "rollback_tier": None,
-                }
-
-            # --- Drift partition ---
-            _all_keyed = {e["key"] for tier_list in serve_assignment.values() for e in tier_list}
-
-            for _surviving_key in _all_keyed:
-                _sbk = self.store.bookkeeping_for_key(_surviving_key)
-                if _sbk is not None:
-                    _sbk["last_seen_cycle"] = self.cycle_count
-
-            _subtractive_stale_by_tier = self._apply_subtractive_removals_to_store(
-                scope=scope.subtractive_scope
-            )
-
-            active_keys = self.store.all_active_keys()
-            _drift_keys = [k for k in active_keys if k not in _all_keyed]
-
-            _collapsed_set: set[str] = set(getattr(self.merger, "collapsed", []))
-            _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
-
-            drift_deduplicated: list[str] = []
-            drift_orphan: list[str] = []
-            drift_genuine_loss: list[str] = []
-            drift_intended_removal: list[str] = []
-            drift_intended_removal_by_reason: dict[str, int] = {}
-
-            soft_stale_by_tier: dict[str, dict[str, dict]] = {
-                tier: dict(entries) for tier, entries in _subtractive_stale_by_tier.items()
-            }
-
-            for _dk in _drift_keys:
-                if _dk in _collapsed_set:
-                    drift_deduplicated.append(_dk)
-                    _dk_tier = self.store.tier_for_active_key(_dk)
-                    _dk_simhash: "int | None" = None
-                    if _dk_tier is not None:
-                        _dk_simhash = self.store.simhash(_dk_tier, _dk)
-                    self.store.discard_keys([_dk], mode="stale")
-                    if _dk_tier is not None:
-                        _stale_rec = {"stale_cycles": 0}
-                        if _dk_simhash is not None:
-                            _stale_rec["simhash"] = _dk_simhash
-                        soft_stale_by_tier.setdefault(_dk_tier, {})[_dk] = _stale_rec
-                elif _dk in _ledger:
-                    drift_intended_removal.append(_dk)
-                    _r = _ledger[_dk]["reason"]
-                    drift_intended_removal_by_reason[_r] = (
-                        drift_intended_removal_by_reason.get(_r, 0) + 1
-                    )
-                else:
-                    _dk_bk = self.store.bookkeeping_for_key(_dk)
-                    _dk_entry = self.store.get(_dk)
-                    _entry_subj = (_dk_entry or {}).get("subject", "")
-                    _entry_pred = (_dk_entry or {}).get("predicate", "")
-                    _entry_obj = (_dk_entry or {}).get("object", "")
-                    _bk_subj = (_dk_bk or {}).get("subject", "")
-                    _bk_pred = (_dk_bk or {}).get("predicate", "")
-                    _bk_obj = (_dk_bk or {}).get("object", "")
-                    if not _entry_subj and not _entry_pred and not _entry_obj:
-                        if _bk_subj or _bk_pred or _bk_obj:
-                            drift_genuine_loss.append(_dk)
-                        else:
-                            drift_orphan.append(_dk)
-                    else:
-                        drift_genuine_loss.append(_dk)
-
-            graph_drift_count = len(_drift_keys)
-            drift_deduplicated_count = len(drift_deduplicated)
-            drift_orphan_count = len(drift_orphan)
-            drift_genuine_loss_count = len(drift_genuine_loss)
-            drift_intended_removal_count = len(drift_intended_removal)
-
-            _soft_stale_keys: set[str] = {
-                k for tier_stale in soft_stale_by_tier.values() for k in tier_stale
-            }
-            _stale_in_active = _soft_stale_keys & _all_keyed
-            if _stale_in_active:
-                logger.warning(
-                    "_run_fold[main_tiers]: R4 invariant violation — %d key(s) appear"
-                    " in both soft_stale_by_tier and _all_keyed (trained as active AND stale);"
-                    " this indicates tier_keyed was mutated after _all_keyed was built: %s",
-                    len(_stale_in_active),
-                    sorted(_stale_in_active),
-                )
-
-            for _dk in drift_deduplicated:
-                _dk_entry = self.store.get(_dk)
-                logger.info(
-                    "graph_drift_key key=%s bucket=deduplicated subject=%r predicate=%r object=%r"
-                    " (registry-true duplicate — soft-staled; record retained for stale-echo seam)",
-                    _dk,
-                    (_dk_entry or {}).get("subject", ""),
-                    (_dk_entry or {}).get("predicate", ""),
-                    (_dk_entry or {}).get("object", ""),
-                )
-            for _dk in drift_orphan:
-                logger.info(
-                    "graph_drift_key key=%s bucket=orphan (no subject/predicate/object content;"
-                    " correctly dropped)",
-                    _dk,
-                )
-            for _dk in drift_genuine_loss:
-                _dk_entry = self.store.get(_dk)
-                logger.info(
-                    "graph_drift_key key=%s bucket=genuine_loss subject=%r predicate=%r object=%r"
-                    " (reconstruction failure or hydration-miss — retrained with registry-true"
-                    " content; not a data loss)",
-                    _dk,
-                    (_dk_entry or {}).get("subject", ""),
-                    (_dk_entry or {}).get("predicate", ""),
-                    (_dk_entry or {}).get("object", ""),
-                )
-            for _dk in drift_intended_removal:
-                logger.info(
-                    "graph_drift_key key=%s bucket=intended_removal reason=%s"
-                    " (merger-recorded intentional removal — key retained, not staled)",
-                    _dk,
-                    (_ledger.get(_dk) or {}).get("reason", ""),
-                )
-
-            if drift_deduplicated_count:
-                logger.info(
-                    "_run_fold[main_tiers]: %d key(s) deduplicated (registry-true"
-                    " duplicate; soft-staled — record retained, excluded from training)",
-                    drift_deduplicated_count,
-                )
-            if drift_orphan_count:
-                logger.info(
-                    "_run_fold[main_tiers]: %d orphan key(s) dropped (no SPO content)",
-                    drift_orphan_count,
-                )
-            if drift_intended_removal_count:
-                logger.info(
-                    "_run_fold[main_tiers]: %d key(s) in intended_removal"
-                    " (merger-recorded removal: by_reason=%s)",
-                    drift_intended_removal_count,
-                    drift_intended_removal_by_reason,
-                )
-
-            if drift_genuine_loss_count > 0:
-                logger.warning(
-                    "_run_fold[main_tiers]: %d genuine reconstruction loss(es) — "
-                    "these keys had content but produced no merged edge (reconstruction"
-                    " failure or hydration-miss); they were retrained with registry-true"
-                    " content (should trend to ~0): %s",
-                    drift_genuine_loss_count,
-                    drift_genuine_loss,
-                )
-
+            self._clear_fold_resume()
             logger.info(
-                "_run_fold[main_tiers]: key distribution — episodic=%d semantic=%d "
-                "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d"
-                " intended_removal=%d)",
-                len(serve_assignment["episodic"]),
-                len(serve_assignment["semantic"]),
-                len(serve_assignment["procedural"]),
-                graph_drift_count,
-                drift_deduplicated_count,
-                drift_orphan_count,
-                drift_genuine_loss_count,
-                drift_intended_removal_count,
+                "_run_fold[main_tiers]: cleared stale fold_resume.json"
+                " (fold_stamp or scope mismatch) — proceeding as fresh fold"
             )
 
-            self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
+        try:
+            # -----------------------------------------------------------------
+            # RESUME FAST-PATH: skip derivation, rebuild from persisted marker.
+            # -----------------------------------------------------------------
+            if _resume_c:
+                logger.info(
+                    "_run_fold[main_tiers]: CRASH-RESUME — fold_stamp matches marker;"
+                    " rebuilding train_assignment from persisted data"
+                )
+                _marker_ta: "dict[str, list[dict]]" = _resume_marker.get(  # type: ignore[union-attr]
+                    "train_assignment", {}
+                )
+                train_assignment = {
+                    t: list(_marker_ta.get(t, [])) for t in ("episodic", "semantic", "procedural")
+                }
+                serve_assignment = train_assignment  # drift not re-derived on resume
+                recall_miss_keys: list[str] = []
+                minted_by_tier: dict = {}
+                _fast_start_graduating: set[str] = set()
+                _floor = self.config.min_tier_key_floor
+                _train_active_before: dict[str, int] = {
+                    t: len(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
+                }
+                # Drift counters zero on resume. Finalize never ran pre-crash, so drift
+                # soft-stale flips were NOT durably applied — they are intentionally skipped
+                # here (accepted divergence, affects only non-assigned duplicate/contradiction
+                # keys, never primary facts). Owner-acknowledged: plan §5.2 / Risk 2.
+                graph_drift_count = 0
+                drift_deduplicated_count = 0
+                drift_orphan_count = 0
+                drift_genuine_loss_count = 0
+                drift_intended_removal_count = 0
+                drift_intended_removal_by_reason: dict[str, int] = {}
+                soft_stale_by_tier: dict[str, dict] = {}
+                _soft_stale_keys: set[str] = set()
+                # Fingerprints come from the marker (already computed pre-crash).
+                _resume_fingerprints: "dict[str, str]" = _resume_marker.get(  # type: ignore[union-attr]
+                    "dataset_fingerprint", {}
+                )
+                _dataset_fingerprints = _resume_fingerprints
+            else:
+                # -----------------------------------------------------------------
+                # FRESH-DERIVATION PATH: reconstruct → promote → tier-floor → assign.
+                # -----------------------------------------------------------------
+                recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
+                    source=scope.source,
+                    resolve_contradictions_recon=False,
+                    resolve_contradictions_extra=False,
+                )
+                self._refine_consolidation_graph(
+                    recon_relations,
+                    normalize=(scope.level != "off"),
+                    enrich=(scope.level == "full"),
+                )
+
+                # --- Inline promotion (scope-gated) ---
+                if scope.promote:
+                    _inline_promoted = self._promote_mature_keys_inline()
+                    if _inline_promoted:
+                        logger.info(
+                            "_run_fold[main_tiers]: %d key(s) promoted to semantic "
+                            "before tier assignment",
+                            len(_inline_promoted),
+                        )
+
+                tier_keyed: dict[str, list[dict]] = {
+                    "episodic": [],
+                    "semantic": [],
+                    "procedural": [],
+                }
+
+                minted_by_tier, _ = self._build_all_edge_entries_into(
+                    tier_keyed,
+                    default_speaker_id="",
+                    defer=scope.defer,
+                    tag_new=scope.tag_new,
+                )
+
+                if recall_miss_keys:
+                    logger.info(
+                        "_run_fold[main_tiers]: %d key(s) in recall-miss set "
+                        "(retrained with registry-true content — not dropped): %s",
+                        len(recall_miss_keys),
+                        sorted(recall_miss_keys),
+                    )
+
+                self._debug_writer.on_fold_graph(self.merger, label="keyed")
+
+                # --- Per-tier floor gate (scope-gated) ---
+                _floor = self.config.min_tier_key_floor
+                _fast_start_graduating: set[str] = set()
+
+                def _tier_has_disk_slot(tier_name: str) -> bool:
+                    from paramem.adapters.manifest import is_slot_name as _isn
+
+                    tier_dir = self.output_dir / tier_name
+                    if not tier_dir.is_dir():
+                        return False
+                    return any(entry.is_dir() and _isn(entry.name) for entry in tier_dir.iterdir())
+
+                if scope.tier_floor:
+                    for _pt in ("semantic", "procedural"):
+                        _pt_entries = tier_keyed[_pt]
+                        if not _pt_entries:
+                            continue
+                        if len(_pt_entries) < _floor:
+                            logger.info(
+                                "_run_fold[main_tiers]: tier %s has %d key(s) < floor %d"
+                                " — parking in episodic until floor reached",
+                                _pt,
+                                len(_pt_entries),
+                                _floor,
+                            )
+                            for _pe in _pt_entries:
+                                tier_keyed["episodic"].append(_pe)
+                                _cur = self.store.tier_for_active_key(_pe["key"])
+                                if _cur is not None and _cur != "episodic":
+                                    self.store.move(_pe["key"], "episodic")
+                                self.promoted_keys.discard(_pe["key"])
+                            tier_keyed[_pt] = []
+                        else:
+                            _tier_is_live = _tier_has_disk_slot(_pt)
+                            if not _tier_is_live:
+                                if self.config.tier_fast_start:
+                                    logger.info(
+                                        "_run_fold[main_tiers]: tier %s graduating (fast-start)"
+                                        " — %d key(s) >= floor %d; will copy episodic weights",
+                                        _pt,
+                                        len(_pt_entries),
+                                        _floor,
+                                    )
+                                    _fast_start_graduating.add(_pt)
+                                else:
+                                    logger.info(
+                                        "_run_fold[main_tiers]: tier %s graduating"
+                                        " (train-from-scratch) — %d key(s) >= floor %d",
+                                        _pt,
+                                        len(_pt_entries),
+                                        _floor,
+                                    )
+                                    for _pe in _pt_entries:
+                                        self.store.move(_pe["key"], _pt)
+
+                serve_assignment = tier_keyed
+
+                train_assignment: dict[str, list[dict]] = {
+                    t: list(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
+                }
+                for _fst in _fast_start_graduating:
+                    _ep_union: dict[str, dict] = {e["key"]: e for e in train_assignment["episodic"]}
+                    for _fse in serve_assignment[_fst]:
+                        _ep_union.setdefault(_fse["key"], _fse)
+                    train_assignment["episodic"] = list(_ep_union.values())
+                    train_assignment[_fst] = []
+
+                self._debug_writer.on_fold_assignments(serve_assignment, train_assignment)
+
+                _train_active_before: dict[str, int] = {
+                    t: len(serve_assignment[t]) for t in ("episodic", "semantic", "procedural")
+                }
+
+                # --- Whole-fold accumulate guard ---
+                _total_trainable = sum(len(v) for v in serve_assignment.values())
+                if not housekeeping and _total_trainable < _floor:
+                    logger.info(
+                        "_run_fold[main_tiers]: total trainable keys %d < floor %d"
+                        " — returning accumulating (sessions stay pending)",
+                        _total_trainable,
+                        _floor,
+                    )
+                    _acc_parked = {
+                        t: len(serve_assignment[t])
+                        for t in ("semantic", "procedural")
+                        if len(serve_assignment[t]) > 0
+                    }
+                    for _bname in (
+                        "episodic_backup",
+                        "semantic_backup",
+                        "procedural_backup",
+                    ):
+                        if _bname in self.model.peft_config:
+                            self.model.delete_adapter(_bname)
+                            logger.debug(
+                                "_run_fold[main_tiers]: cleaned up stale backup %s"
+                                " (left by prior aborted fold) on accumulating return",
+                                _bname,
+                            )
+                    self._current_interim_stamp = None  # type: ignore[assignment]
+                    return {
+                        "status": "accumulating",
+                        "accumulating_reason": {
+                            "floor": _floor,
+                            "parked": _acc_parked,
+                            "episodic": len(serve_assignment["episodic"]),
+                        },
+                        "tiers_rebuilt": [],
+                        "graph_drift_count": 0,
+                        "drift_deduplicated": 0,
+                        "drift_orphan": 0,
+                        "drift_genuine_loss": 0,
+                        "drift_intended_removal": 0,
+                        "drift_intended_removal_by_reason": {},
+                        "recall_miss_keys": [],
+                        "keys_per_tier": {t: len(v) for t, v in serve_assignment.items()},
+                        "tier_keyed": serve_assignment,
+                        "recall_per_tier": {},
+                        "rolled_back": False,
+                        "rollback_tier": None,
+                    }
+                # end of fresh-derivation path.
+                # Compute dataset fingerprints and persist the fold assignment marker
+                # AFTER the accumulate guard (so accumulating returns never leave a
+                # stale marker — B1 binding correction).
+                # Fingerprint is over sorted SPO tuples, NOT tokenized examples.
+                # Calling format_entry_training here (before the per-tier loop) would
+                # interfere with per-tier format spy patterns in existing tests and is
+                # unnecessary — SPO identity is the only change-detection signal needed.
+                import hashlib as _hashlib
+
+                _dataset_fingerprints: dict[str, str] = {}
+                for _t in ("episodic", "semantic", "procedural"):
+                    _ta_entries = train_assignment[_t]
+                    if _ta_entries:
+                        _fp_h = _hashlib.sha256()
+                        for _spo in sorted(
+                            (
+                                e.get("key", ""),
+                                e.get("subject", ""),
+                                e.get("predicate", ""),
+                                e.get("object", ""),
+                            )
+                            for e in _ta_entries
+                        ):
+                            _fp_h.update(repr(_spo).encode("utf-8"))
+                        _dataset_fingerprints[_t] = _fp_h.hexdigest()
+                self._persist_fold_assignment(
+                    "main_tiers", _fold_stamp_c, train_assignment, _dataset_fingerprints
+                )
+
+            # --- Drift partition (fresh-fold only; skipped on crash-resume) ---
+            # On crash-resume, drift was already applied pre-crash and registries
+            # are pristine.  Re-running subtractive removals would double-apply.
+            # Counters are pre-zeroed in the resume fast-path above.
+            if not _resume_c:
+                _all_keyed = {
+                    e["key"] for tier_list in serve_assignment.values() for e in tier_list
+                }
+
+                for _surviving_key in _all_keyed:
+                    _sbk = self.store.bookkeeping_for_key(_surviving_key)
+                    if _sbk is not None:
+                        _sbk["last_seen_cycle"] = self.cycle_count
+
+                _subtractive_stale_by_tier = self._apply_subtractive_removals_to_store(
+                    scope=scope.subtractive_scope
+                )
+
+                active_keys = self.store.all_active_keys()
+                _drift_keys = [k for k in active_keys if k not in _all_keyed]
+
+                _collapsed_set: set[str] = set(getattr(self.merger, "collapsed", []))
+                _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
+
+                drift_deduplicated: list[str] = []
+                drift_orphan: list[str] = []
+                drift_genuine_loss: list[str] = []
+                drift_intended_removal: list[str] = []
+                drift_intended_removal_by_reason = {}
+
+                soft_stale_by_tier = {
+                    tier: dict(entries) for tier, entries in _subtractive_stale_by_tier.items()
+                }
+
+                for _dk in _drift_keys:
+                    if _dk in _collapsed_set:
+                        drift_deduplicated.append(_dk)
+                        _dk_tier = self.store.tier_for_active_key(_dk)
+                        _dk_simhash: "int | None" = None
+                        if _dk_tier is not None:
+                            _dk_simhash = self.store.simhash(_dk_tier, _dk)
+                        self.store.discard_keys([_dk], mode="stale")
+                        if _dk_tier is not None:
+                            _stale_rec = {"stale_cycles": 0}
+                            if _dk_simhash is not None:
+                                _stale_rec["simhash"] = _dk_simhash
+                            soft_stale_by_tier.setdefault(_dk_tier, {})[_dk] = _stale_rec
+                    elif _dk in _ledger:
+                        drift_intended_removal.append(_dk)
+                        _r = _ledger[_dk]["reason"]
+                        drift_intended_removal_by_reason[_r] = (
+                            drift_intended_removal_by_reason.get(_r, 0) + 1
+                        )
+                    else:
+                        _dk_bk = self.store.bookkeeping_for_key(_dk)
+                        _dk_entry = self.store.get(_dk)
+                        _entry_subj = (_dk_entry or {}).get("subject", "")
+                        _entry_pred = (_dk_entry or {}).get("predicate", "")
+                        _entry_obj = (_dk_entry or {}).get("object", "")
+                        _bk_subj = (_dk_bk or {}).get("subject", "")
+                        _bk_pred = (_dk_bk or {}).get("predicate", "")
+                        _bk_obj = (_dk_bk or {}).get("object", "")
+                        if not _entry_subj and not _entry_pred and not _entry_obj:
+                            if _bk_subj or _bk_pred or _bk_obj:
+                                drift_genuine_loss.append(_dk)
+                            else:
+                                drift_orphan.append(_dk)
+                        else:
+                            drift_genuine_loss.append(_dk)
+
+                graph_drift_count = len(_drift_keys)
+                drift_deduplicated_count = len(drift_deduplicated)
+                drift_orphan_count = len(drift_orphan)
+                drift_genuine_loss_count = len(drift_genuine_loss)
+                drift_intended_removal_count = len(drift_intended_removal)
+
+                _soft_stale_keys = {
+                    k for tier_stale in soft_stale_by_tier.values() for k in tier_stale
+                }
+                _stale_in_active = _soft_stale_keys & _all_keyed
+                if _stale_in_active:
+                    logger.warning(
+                        "_run_fold[main_tiers]: R4 invariant violation — %d key(s) appear"
+                        " in both soft_stale_by_tier and _all_keyed (trained as active AND"
+                        " stale); this indicates tier_keyed was mutated after _all_keyed"
+                        " was built: %s",
+                        len(_stale_in_active),
+                        sorted(_stale_in_active),
+                    )
+
+                for _dk in drift_deduplicated:
+                    _dk_entry = self.store.get(_dk)
+                    logger.info(
+                        "graph_drift_key key=%s bucket=deduplicated"
+                        " subject=%r predicate=%r object=%r"
+                        " (registry-true duplicate — soft-staled; record retained"
+                        " for stale-echo seam)",
+                        _dk,
+                        (_dk_entry or {}).get("subject", ""),
+                        (_dk_entry or {}).get("predicate", ""),
+                        (_dk_entry or {}).get("object", ""),
+                    )
+                for _dk in drift_orphan:
+                    logger.info(
+                        "graph_drift_key key=%s bucket=orphan"
+                        " (no subject/predicate/object content; correctly dropped)",
+                        _dk,
+                    )
+                for _dk in drift_genuine_loss:
+                    _dk_entry = self.store.get(_dk)
+                    logger.info(
+                        "graph_drift_key key=%s bucket=genuine_loss"
+                        " subject=%r predicate=%r object=%r"
+                        " (reconstruction failure or hydration-miss — retrained with"
+                        " registry-true content; not a data loss)",
+                        _dk,
+                        (_dk_entry or {}).get("subject", ""),
+                        (_dk_entry or {}).get("predicate", ""),
+                        (_dk_entry or {}).get("object", ""),
+                    )
+                for _dk in drift_intended_removal:
+                    logger.info(
+                        "graph_drift_key key=%s bucket=intended_removal reason=%s"
+                        " (merger-recorded intentional removal — key retained, not staled)",
+                        _dk,
+                        (_ledger.get(_dk) or {}).get("reason", ""),
+                    )
+
+                if drift_deduplicated_count:
+                    logger.info(
+                        "_run_fold[main_tiers]: %d key(s) deduplicated (registry-true"
+                        " duplicate; soft-staled — record retained, excluded from training)",
+                        drift_deduplicated_count,
+                    )
+                if drift_orphan_count:
+                    logger.info(
+                        "_run_fold[main_tiers]: %d orphan key(s) dropped (no SPO content)",
+                        drift_orphan_count,
+                    )
+                if drift_intended_removal_count:
+                    logger.info(
+                        "_run_fold[main_tiers]: %d key(s) in intended_removal"
+                        " (merger-recorded removal: by_reason=%s)",
+                        drift_intended_removal_count,
+                        drift_intended_removal_by_reason,
+                    )
+
+                if drift_genuine_loss_count > 0:
+                    logger.warning(
+                        "_run_fold[main_tiers]: %d genuine reconstruction loss(es) — "
+                        "these keys had content but produced no merged edge (reconstruction"
+                        " failure or hydration-miss); they were retrained with registry-true"
+                        " content (should trend to ~0): %s",
+                        drift_genuine_loss_count,
+                        drift_genuine_loss,
+                    )
+
+                logger.info(
+                    "_run_fold[main_tiers]: key distribution — episodic=%d semantic=%d "
+                    "procedural=%d drift=%d (deduplicated=%d orphan=%d genuine_loss=%d"
+                    " intended_removal=%d)",
+                    len(serve_assignment["episodic"]),
+                    len(serve_assignment["semantic"]),
+                    len(serve_assignment["procedural"]),
+                    graph_drift_count,
+                    drift_deduplicated_count,
+                    drift_orphan_count,
+                    drift_genuine_loss_count,
+                    drift_intended_removal_count,
+                )
+
+                self._debug_writer.on_removal_ledger(getattr(self.merger, "removal_ledger", {}))
 
             # --- Build per-tier TrainingJob objects ---
             from paramem.server.background_trainer import TrainingJob
@@ -4210,6 +4582,18 @@ class ConsolidationLoop:
             recall_per_tier: dict[str, float] = {}
             last_per_key_by_tier: dict[str, "list | None"] = {}
 
+            # Completed-tier set from resume marker (empty on fresh fold).
+            _completed_in_marker: set[str] = (
+                set(_resume_marker.get("completed_tiers", []))  # type: ignore[union-attr]
+                if _resume_c
+                else set()
+            )
+            _marker_checkpoints: dict[str, str] = (
+                _resume_marker.get("tier_checkpoints", {})  # type: ignore[union-attr]
+                if _resume_c
+                else {}
+            )
+
             for tier in ("episodic", "semantic", "procedural"):
                 backup_name = f"{tier}_backup"
                 job = jobs_by_tier[tier]
@@ -4218,6 +4602,96 @@ class ConsolidationLoop:
                     logger.info(
                         "_run_fold[main_tiers]: no keys for tier %s — skipping rebuild", tier
                     )
+                    continue
+
+                # --- Crash-resume: reload completed tiers from durable checkpoint ---
+                if _resume_c and tier in _completed_in_marker:
+                    # The checkpoint path stored in the marker (may be absent for
+                    # fast-start tiers, which have no checkpoint-N dir).
+                    _ckpt_path = _marker_checkpoints.get(tier)
+                    logger.info(
+                        "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading from"
+                        " durable checkpoint (no retrain); checkpoint=%s",
+                        tier,
+                        _ckpt_path or "production-slot",
+                    )
+                    # Delete the stale production slot (pre-crash _save_adapters never
+                    # ran — weights are stale) and reload from the checkpoint dir or the
+                    # existing production slot for fast-start tiers.
+                    # Per-tier backups created above (lines 4533-4551) mean the deleted
+                    # slot is never the last adapter on the PeftModel (no base-unwrap needed).
+                    if tier in self.model.peft_config:
+                        if backup_name in self.model.peft_config:
+                            from paramem.models.loader import switch_adapter as _sw_pre
+
+                            _sw_pre(self.model, backup_name)
+                        self.model.delete_adapter(tier)
+                        logger.debug(
+                            "_run_fold[main_tiers]: crash-resume deleted stale slot %s", tier
+                        )
+                    if _ckpt_path and Path(_ckpt_path).is_dir():
+                        # B2: checkpoint-N dir present — load the staged adapter
+                        # from it.  HF Trainer saves all PEFT adapters under
+                        # checkpoint-N/<adapter_name>/ (one subdir per adapter).
+                        # The training adapter staging slot is "in_training"
+                        # (trainer._STAGING_ADAPTER), so the weights live at
+                        # checkpoint-N/in_training/adapter_model.safetensors.
+                        # Decrypt into /dev/shm when security is ON (mirrors
+                        # trainer.py:962-976).
+                        from paramem.backup import key_store as _ks
+                        from paramem.training.trainer import _STAGING_ADAPTER as _STAGING_SLOT
+
+                        # Resolve to the staging-adapter subdir within the checkpoint.
+                        _ckpt_staging_path = Path(_ckpt_path) / _STAGING_SLOT
+                        _ckpt_effective = (
+                            str(_ckpt_staging_path) if _ckpt_staging_path.is_dir() else _ckpt_path
+                        )
+                        _ckpt_shm_dir = None
+                        if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+                            from paramem.backup.checkpoint_shard import (
+                                materialize_checkpoint_to_shm,
+                            )
+
+                            _ckpt_shm_dir = materialize_checkpoint_to_shm(Path(_ckpt_effective))
+                            _ckpt_load_path = str(_ckpt_shm_dir)
+                        else:
+                            _ckpt_load_path = _ckpt_effective
+                        try:
+                            self.model.load_adapter(_ckpt_load_path, adapter_name=tier)
+                            logger.info(
+                                "_run_fold[main_tiers]: crash-resume loaded %s from checkpoint %s"
+                                " (staging slot=%s)",
+                                tier,
+                                _ckpt_path,
+                                _STAGING_SLOT,
+                            )
+                        finally:
+                            if _ckpt_shm_dir is not None and Path(str(_ckpt_shm_dir)).exists():
+                                import shutil as _s
+
+                                _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
+                    else:
+                        # B2: no checkpoint dir (fast-start tier, or checkpoint missing).
+                        # Reload from the EXISTING production slot on disk — it was not
+                        # overwritten (final _save_adapters never ran on crash).
+                        from paramem.memory.interim_adapter import (
+                            adapter_slot_root_for_name as _asr_fn,
+                        )
+                        from paramem.models.loader import load_adapter as _la
+
+                        _prod_root = _asr_fn(self.output_dir, tier)
+                        _la(self.model, _prod_root.parent, tier)
+                        logger.info(
+                            "_run_fold[main_tiers]: crash-resume (fast-start/no-ckpt)"
+                            " loaded %s from production slot %s",
+                            tier,
+                            _prod_root.parent,
+                        )
+                    from paramem.models.loader import switch_adapter as _sw_resume
+
+                    _sw_resume(self.model, tier)
+                    last_per_key_by_tier[tier] = None
+                    tiers_rebuilt.append(tier)
                     continue
 
                 if backup_name in self.model.peft_config:
@@ -4286,6 +4760,10 @@ class ConsolidationLoop:
                             self.store.move(_fse["key"], tier)
                         last_per_key_by_tier[tier] = None
                         tiers_rebuilt.append(tier)
+                        # B2: mark fast-start tier complete (no checkpoint-N dir
+                        # exists; _mark_tier_complete stores None for reload-from-
+                        # production-slot on a subsequent crash-resume).
+                        self._mark_tier_complete(tier, None)
                         logger.info(
                             "_run_fold[main_tiers]: fast-start graduation accepted"
                             " for %s (%d keys rebooked)",
@@ -4332,6 +4810,7 @@ class ConsolidationLoop:
                         run_name=f"consolidate-{tier}",
                         phase_name=f"consolidate-{tier}",
                         num_epochs=refresh_epochs,
+                        retain_scratch_until_external_commit=True,
                     )
                     if _tier_metrics is not None:
                         if _tier_metrics.get("aborted"):
@@ -4372,6 +4851,15 @@ class ConsolidationLoop:
                         adapter_name=tier,
                     )
                 tiers_rebuilt.append(tier)
+                # Mark this tier complete in the fold_resume.json marker so that a
+                # crash AFTER training but BEFORE _save_adapters can reload it without
+                # retraining on the next re-entry.  Locate the retained checkpoint-N dir
+                # (retain_scratch_until_external_commit=True keeps it alive until
+                # _save_adapters below).
+                _tier_ckpt_path = self._latest_checkpoint_in_dir(
+                    self.output_dir / "consolidation_refresh" / tier
+                )
+                self._mark_tier_complete(tier, _tier_ckpt_path)
 
             if trainer is not None:
                 trainer._set_is_training(False)
@@ -4414,6 +4902,20 @@ class ConsolidationLoop:
                     self._current_interim_stamp = None  # type: ignore[assignment]
                     raise
                 logger.info("_run_fold[main_tiers]: merged main weights persisted+verified")
+                # Clean fold-resume marker + retained scratch checkpoints after
+                # _save_adapters succeeds.  On _save_adapters FAILURE (the except
+                # above re-raises) the marker is intentionally LEFT so a retry can
+                # resume completed tiers without retraining.
+                self._clear_fold_resume()
+                import shutil as _sh_fold
+
+                _refresh_root = self.output_dir / "consolidation_refresh"
+                if _refresh_root.exists():
+                    _sh_fold.rmtree(_refresh_root, ignore_errors=True)
+                    logger.debug(
+                        "_run_fold[main_tiers]: cleaned consolidation_refresh scratch"
+                        " after _save_adapters"
+                    )
 
             if self.store.replay_enabled and soft_stale_by_tier:
                 for _st_tier in ("episodic", "semantic", "procedural"):
@@ -5441,7 +5943,7 @@ class ConsolidationLoop:
         # recall_miss_keys: keys whose reconstruction failed OR whose reconstructed
         # SPO disagrees with registry-true SPO.  These are flagged for retrain but
         # their registry-true triple still enters the merge input (never dropped).
-        recall_miss_keys: set[str] = set(recon_result.failures)
+        recall_miss_keys: set[str] = {f["key"] for f in recon_result.failures}
         for _rh_key in self.store.all_active_keys():
             _rt_entry = self.store.get(_rh_key)
             _rt_subj = (_rt_entry or {}).get("subject", "") if _rt_entry else ""
@@ -6305,6 +6807,7 @@ class ConsolidationLoop:
         run_name: str,
         phase_name: str,
         num_epochs: "int | None" = None,
+        retain_scratch_until_external_commit: bool = False,
     ):
         """Format → dataset → recall callback → train_adapter for one tier.
 
@@ -6336,6 +6839,13 @@ class ConsolidationLoop:
                 the callback's forced final-epoch probe fires at the right
                 epoch.  ``None`` resolves to
                 ``self.training_config.num_epochs`` inside the callback helper.
+            retain_scratch_until_external_commit: Forwarded verbatim to
+                :func:`paramem.training.trainer.train_adapter`.  When ``True``,
+                the success path skips ``_clean_scratch`` / ``staging_resume.json``
+                deletion so the durable ``checkpoint-N`` directory survives until
+                the fold's own ``_save_adapters`` external commit.  Default
+                ``False`` preserves clean-on-success for all other callers (BG
+                trainer, replay, migration, interim).
 
         Returns:
             ``(metrics_dict, recall_state)`` on success; ``(None, None)`` if
@@ -6368,6 +6878,7 @@ class ConsolidationLoop:
             thermal_policy=self._thermal_policy,
             hooks=self._build_training_hooks(),
             callbacks_extra=[recall_cb] if recall_cb is not None else None,
+            retain_scratch_until_external_commit=retain_scratch_until_external_commit,
         )
         return metrics, recall_state
 

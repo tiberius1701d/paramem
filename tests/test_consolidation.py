@@ -11402,3 +11402,499 @@ class TestS5OverflowDoesNotLeakIntoClearSuccessCheck:
             "overflow_slot": False,
         }
         assert not self._is_clean_success(result, "cap_pending", [])
+
+
+# ---------------------------------------------------------------------------
+# Slice 2b — fold_resume.json crash-durable marker tests
+# ---------------------------------------------------------------------------
+
+
+class TestFoldResumeHelpers:
+    """Unit tests for ConsolidationLoop fold-resume marker helpers.
+
+    All tests run without GPU.  Security is OFF (no age identity loaded) so
+    markers are plaintext JSON — matching the existing test posture for all
+    other persistence helpers.
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path):
+        """Minimal ConsolidationLoop stub for fold-resume tests."""
+        from peft import PeftModel
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.model.peft_config = {}
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path / "adapters"
+        loop.output_dir.mkdir(parents=True, exist_ok=True)
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.merger = MagicMock()
+        loop.promoted_keys = set()
+        loop.cycle_count = 0
+        loop._procedural_next_index = 0
+        loop._procedural_tentative_next_index = 0
+        loop._indexed_next_index = 0
+        loop._bg_trainer = None
+        loop.shutdown_requested = False
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop._debug_base = None
+        loop.save_cycle_snapshots = False
+        loop.snapshot_dir = None
+        loop._indexed_ep_interim = {}
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.graph_enrichment_neighborhood_hops = 2
+        loop._debug_writer = MagicMock()
+        return loop
+
+    def test_marker_roundtrip_plaintext(self, tmp_path):
+        """_persist_fold_assignment → _read_fold_resume returns the same data."""
+        loop = self._make_loop(tmp_path)
+        ep_entry = {
+            "key": "k1",
+            "subject": "Alice",
+            "predicate": "likes",
+            "object": "cats",
+            "speaker_id": "",
+        }
+        assignment = {"episodic": [ep_entry], "semantic": [], "procedural": []}
+        fingerprints = {"episodic": "deadbeef"}
+        loop._persist_fold_assignment("main_tiers", "abc123", assignment, fingerprints)
+        state = loop._read_fold_resume()
+        assert state is not None
+        assert state["fold_stamp"] == "abc123"
+        assert state["scope"] == "main_tiers"
+        assert state["completed_tiers"] == []
+        assert state["train_assignment"] == assignment
+        assert state["dataset_fingerprint"] == fingerprints
+        assert state["in_flight_tier"] == "episodic"
+        assert state["version"] == 1
+
+    def test_mark_tier_complete_appends_and_advances(self, tmp_path):
+        """_mark_tier_complete appends tier to completed_tiers and advances in_flight_tier."""
+        loop = self._make_loop(tmp_path)
+        ep_entry = {
+            "key": "k1",
+            "subject": "Alice",
+            "predicate": "likes",
+            "object": "cats",
+            "speaker_id": "",
+        }
+        sem_entry = {
+            "key": "k2",
+            "subject": "Bob",
+            "predicate": "knows",
+            "object": "Alice",
+            "speaker_id": "",
+        }
+        assignment = {"episodic": [ep_entry], "semantic": [sem_entry], "procedural": []}
+        loop._persist_fold_assignment("main_tiers", "stamp1", assignment, {})
+        ckpt = "/tmp/consolidation_refresh/episodic/checkpoint-30"
+        loop._mark_tier_complete("episodic", ckpt)
+        state = loop._read_fold_resume()
+        assert state is not None
+        assert "episodic" in state["completed_tiers"]
+        assert state["in_flight_tier"] == "semantic"
+        assert state["tier_checkpoints"]["episodic"] == ckpt
+
+    def test_clear_fold_resume_removes_file(self, tmp_path):
+        """_clear_fold_resume removes fold_resume.json; idempotent on absent file."""
+        loop = self._make_loop(tmp_path)
+        loop._persist_fold_assignment(
+            "main_tiers", "s1", {"episodic": [], "semantic": [], "procedural": []}, {}
+        )
+        marker_path = loop._fold_state_dir / "fold_resume.json"
+        assert marker_path.exists()
+        loop._clear_fold_resume()
+        assert not marker_path.exists()
+        # Idempotent
+        loop._clear_fold_resume()
+
+    def test_read_fold_resume_absent_returns_none(self, tmp_path):
+        """_read_fold_resume returns None when the file does not exist."""
+        loop = self._make_loop(tmp_path)
+        assert loop._read_fold_resume() is None
+
+    def test_fold_stamp_stable_across_two_calls(self, tmp_path):
+        """_compute_fold_stamp returns the same value for the same active keyset."""
+        loop = self._make_loop(tmp_path)
+        loop.store.put(
+            "episodic",
+            "k1",
+            {"key": "k1", "subject": "Alice", "predicate": "likes", "object": "cats"},
+        )
+        stamp_a = loop._compute_fold_stamp()
+        stamp_b = loop._compute_fold_stamp()
+        assert stamp_a == stamp_b
+
+    def test_fold_stamp_changes_on_store_mutation(self, tmp_path):
+        """_compute_fold_stamp changes when the active keyset changes."""
+        loop = self._make_loop(tmp_path)
+        loop.store.put(
+            "episodic",
+            "k1",
+            {"key": "k1", "subject": "Alice", "predicate": "likes", "object": "cats"},
+        )
+        stamp_before = loop._compute_fold_stamp()
+        loop.store.put(
+            "episodic",
+            "k2",
+            {"key": "k2", "subject": "Bob", "predicate": "knows", "object": "Alice"},
+        )
+        stamp_after = loop._compute_fold_stamp()
+        assert stamp_before != stamp_after
+
+    def test_assignment_persist_and_dataset_fingerprint_match(self, tmp_path):
+        """Persisted dataset_fingerprint round-trips correctly through the marker.
+
+        _persist_fold_assignment stores arbitrary fingerprint strings keyed by tier;
+        _read_fold_resume must return them byte-identical so the resume path can
+        validate that the on-disk checkpoint matches the intended dataset.
+        """
+        loop = self._make_loop(tmp_path)
+        entries = [
+            {
+                "key": "k1",
+                "subject": "Alice",
+                "predicate": "likes",
+                "object": "cats",
+                "speaker_id": "",
+            },
+            {
+                "key": "k2",
+                "subject": "Bob",
+                "predicate": "knows",
+                "object": "Alice",
+                "speaker_id": "",
+            },
+        ]
+        # Simulate a fingerprint computed from a tokenised dataset (opaque hex string).
+        fp_original = "deadbeef0123456789abcdef"
+        assignment = {"episodic": entries, "semantic": [], "procedural": []}
+        loop._persist_fold_assignment("main_tiers", "s1", assignment, {"episodic": fp_original})
+        state = loop._read_fold_resume()
+        assert state is not None
+        # Fingerprint must survive the JSON round-trip intact.
+        assert state["dataset_fingerprint"]["episodic"] == fp_original
+        # Assignment entries must also survive intact.
+        assert state["train_assignment"]["episodic"] == entries
+
+    def test_b1_accumulating_return_does_not_write_marker(self, tmp_path):
+        """B1 binding: an accumulating return MUST NOT leave a fold_resume.json marker.
+
+        The accumulate guard fires when total trainable keys < min_tier_key_floor.
+        After the return no marker file must exist.
+        """
+        from unittest.mock import patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import ConsolidationConfig
+
+        loop = self._make_loop(tmp_path)
+        # Set a high floor so the empty store triggers the accumulating return.
+        loop.config = ConsolidationConfig(min_tier_key_floor=30, tier_fast_start=False)
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_maybe_make_recall_callback",
+                    return_value=(None, None),
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    MagicMock(return_value={"aborted": False}),
+                ),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert result.get("status") == "accumulating", f"Expected accumulating, got {result!r}"
+        # B1: no marker must have been written.
+        marker_path = loop._fold_state_dir / "fold_resume.json"
+        assert not marker_path.exists(), (
+            "fold_resume.json MUST NOT be written on an accumulating return (B1)"
+        )
+
+    def test_resume_on_entry_skips_completed_tier(self, tmp_path):
+        """Completed tiers in the marker are reloaded not retrained.
+
+        Pre-seed a matching marker with completed_tiers=['episodic'] and fold_stamp
+        equal to the store's current stamp.  Assert _train_tier_adapter is NOT called
+        for episodic but IS called for other tiers with entries.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import ConsolidationConfig
+
+        loop = self._make_loop(tmp_path)
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        # Seed two tiers above floor=0.
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.store.put(
+            "episodic",
+            "k1",
+            {"key": "k1", "subject": "Alice", "predicate": "likes", "object": "cats"},
+        )
+        loop.store.put(
+            "semantic",
+            "k2",
+            {"key": "k2", "subject": "Bob", "predicate": "knows", "object": "Alice"},
+        )
+
+        # Compute the stable fold_stamp so we can forge a matching marker.
+        fold_stamp = loop._compute_fold_stamp()
+
+        # Build the marker that matches this stamp.
+        assignment = {
+            "episodic": [
+                {
+                    "key": "k1",
+                    "subject": "Alice",
+                    "predicate": "likes",
+                    "object": "cats",
+                    "speaker_id": "",
+                }
+            ],
+            "semantic": [
+                {
+                    "key": "k2",
+                    "subject": "Bob",
+                    "predicate": "knows",
+                    "object": "Alice",
+                    "speaker_id": "",
+                }
+            ],
+            "procedural": [],
+        }
+        # Build a fake checkpoint dir for episodic.
+        fake_ckpt = tmp_path / "consolidation_refresh" / "episodic" / "checkpoint-10"
+        fake_ckpt.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            "version": 1,
+            "scope": "main_tiers",
+            "fold_stamp": fold_stamp,
+            "completed_tiers": ["episodic"],
+            "tier_checkpoints": {"episodic": str(fake_ckpt)},
+            "in_flight_tier": "semantic",
+            "train_assignment": assignment,
+            "dataset_fingerprint": {},
+        }
+        import json
+
+        from paramem.backup.encryption import write_infra_bytes
+
+        state_dir = loop._fold_state_dir
+        write_infra_bytes(
+            state_dir / "fold_resume.json",
+            json.dumps(state).encode("utf-8"),
+        )
+
+        # Track which tiers _train_tier_adapter was called for.
+        trained_tiers: list[str] = []
+
+        def _spy_train(_self, entries, *, adapter_name, **kwargs):
+            trained_tiers.append(adapter_name)
+            return {"aborted": False}, None
+
+        # Stub load_adapter and model.load_adapter for the reload branch.
+        loop.model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "procedural": MagicMock(),
+            "episodic_backup": MagicMock(),
+            "semantic_backup": MagicMock(),
+            "procedural_backup": MagicMock(),
+        }
+        loop.model.load_adapter = MagicMock()
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda a, e: {x["key"] for x in e},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_normalization",
+                    return_value={"skipped": True},
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+                patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+            ):
+                loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert "episodic" not in trained_tiers, (
+            f"episodic MUST NOT be retrained on crash-resume; trained_tiers={trained_tiers}"
+        )
+        assert "semantic" in trained_tiers, (
+            f"semantic MUST be trained on crash-resume; trained_tiers={trained_tiers}"
+        )
+
+    def test_stale_marker_is_never_resumed_on_stamp_mismatch(self, tmp_path):
+        """A fold_resume.json with a mismatched fold_stamp is cleared and NOT resumed.
+
+        The stale marker must be discarded immediately at PATH C entry.  The fresh fold
+        then proceeds with full derivation, writing a new marker with the correct stamp.
+        The key invariant: the stale assignment is NEVER used as a resume source.
+        """
+        loop = self._make_loop(tmp_path)
+
+        # Seed one key so the fold has something to derive.
+        loop.store.put(
+            "episodic",
+            "k1",
+            {"key": "k1", "subject": "Alice", "predicate": "likes", "object": "cats"},
+        )
+
+        # Write a marker whose stamp does NOT match the current store state.
+        _stale_entry = {
+            "key": "STALE",
+            "subject": "X",
+            "predicate": "y",
+            "object": "Z",
+            "speaker_id": "",
+        }
+        loop._persist_fold_assignment(
+            "main_tiers",
+            "stale_stamp_does_not_match",
+            # Stale assignment for a non-existent key.
+            {"episodic": [_stale_entry], "semantic": [], "procedural": []},
+            {},
+        )
+        marker_path = loop._fold_state_dir / "fold_resume.json"
+        assert marker_path.exists()
+
+        # The actual stamp (store has k1) differs from "stale_stamp_does_not_match".
+        actual_stamp = loop._compute_fold_stamp()
+        assert actual_stamp != "stale_stamp_does_not_match"
+
+        # Spy on what entries _train_tier_adapter receives — stale entries must NEVER
+        # reach it (they would contain key="STALE").
+        trained_entries: list[list] = []
+
+        def _spy_train(_self, entries, *, adapter_name, **kwargs):
+            trained_entries.append(list(entries))
+            return {"aborted": False}, None
+
+        from unittest.mock import patch
+
+        import networkx as nx
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+        from paramem.training.consolidation import ConsolidationLoop
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=__import__(
+                        "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
+                    ).ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_maybe_make_recall_callback",
+                    return_value=(None, None),
+                ),
+                patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda a, e: {x["key"] for x in e},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                loop.consolidate_interim_adapters(trainer=None, router=None)
+        finally:
+            _gpu_thread_lock.release()
+
+        # Primary invariant: no training call should ever receive the stale "STALE" entry.
+        all_trained_keys = [e["key"] for batch in trained_entries for e in batch]
+        assert "STALE" not in all_trained_keys, (
+            "Stale assignment entries must NEVER reach training;"
+            f" all_trained_keys={all_trained_keys}"
+        )
+        # Secondary: after a stale-marker mismatch, _resume_c is False so the fresh
+        # derivation path runs; the new marker (if any) carries the actual stamp.
+        if marker_path.exists():
+            import json
+
+            new_state = json.loads(marker_path.read_bytes())
+            assert new_state["fold_stamp"] != "stale_stamp_does_not_match", (
+                "fold_resume.json must carry the fresh stamp, not the stale one"
+            )
