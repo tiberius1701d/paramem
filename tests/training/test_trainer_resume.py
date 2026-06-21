@@ -461,3 +461,140 @@ class TestTrainAdapterSavePath:
         assert not tokenizer.save_pretrained.called, (
             "train_adapter must not write the tokenizer — that's the orchestrator's job"
         )
+
+
+# ---------------------------------------------------------------------------
+# Content-stable fingerprint tests
+# ---------------------------------------------------------------------------
+
+
+class TestFingerprintDatasetContentStable:
+    """Verify ``_fingerprint_dataset`` produces content-based, address-free digests.
+
+    All tests are no-GPU.  ``_IndexedDataset`` is obtained via
+    ``ConsolidationLoop._indexed_dataset`` (a staticmethod) so no
+    model/tokenizer is needed.  Security is OFF (no daily identity) so
+    plaintext JSON is written/read for the resume-match test.
+    """
+
+    def _make_items(self, label_value: int = 2) -> list[dict]:
+        """Two pre-tokenized examples with 1-D torch tensors as values."""
+        import torch
+
+        return [
+            {
+                "input_ids": torch.tensor([1, 2, 3]),
+                "labels": torch.tensor([-100, label_value, 3]),
+                "attention_mask": torch.tensor([1, 1, 1]),
+            },
+            {
+                "input_ids": torch.tensor([4, 5, 6]),
+                "labels": torch.tensor([-100, 5, 6]),
+                "attention_mask": torch.tensor([1, 1, 1]),
+            },
+        ]
+
+    def _indexed_dataset(self, items):
+        from paramem.training.consolidation import ConsolidationLoop
+
+        return ConsolidationLoop._indexed_dataset(items)
+
+    def test_address_independence(self):
+        """Two separately-constructed datasets with identical content hash equal.
+
+        This is the core regression: the old ``str(object)`` code embedded the
+        heap address, so two instances always differed.
+        """
+        from paramem.training.trainer import _fingerprint_dataset
+
+        items_a = self._make_items()
+        items_b = self._make_items()
+        ds_a = self._indexed_dataset(items_a)
+        ds_b = self._indexed_dataset(items_b)
+
+        # Confirm the two objects are distinct (different heap addresses)
+        assert ds_a is not ds_b
+
+        assert _fingerprint_dataset(ds_a) == _fingerprint_dataset(ds_b)
+
+    def test_content_sensitivity(self):
+        """Changing one token value produces a different fingerprint."""
+        from paramem.training.trainer import _fingerprint_dataset
+
+        ds_a = self._indexed_dataset(self._make_items(label_value=2))
+        ds_b = self._indexed_dataset(self._make_items(label_value=99))
+
+        assert _fingerprint_dataset(ds_a) != _fingerprint_dataset(ds_b)
+
+    def test_resolve_resume_checkpoint_matches_on_identical_content(self, tmp_path):
+        """Writing a staging_resume.json with a content fingerprint, then
+        resolving with a freshly-constructed identical-content dataset
+        (simulating a process restart) returns the checkpoint — not None.
+
+        Security is OFF (no daily identity) so the file is plaintext JSON.
+        ``_resolve_resume_checkpoint`` reads via ``read_maybe_encrypted`` which
+        transparently handles plaintext.
+        """
+        import json
+
+        from paramem.training.trainer import _fingerprint_dataset, _resolve_resume_checkpoint
+
+        # Build original dataset and fingerprint it
+        ds_original = self._indexed_dataset(self._make_items())
+        fp_dataset = _fingerprint_dataset(ds_original)
+        fp_config = "aabbccdd" * 8  # stable stand-in for config fingerprint
+
+        # Create a fake checkpoint directory that _resolve_resume_checkpoint will verify
+        ckpt_dir = tmp_path / "bg_checkpoint_epoch"
+        ckpt_dir.mkdir()
+
+        # Write staging_resume.json as plaintext (Security OFF — no daily identity)
+        resume_path = tmp_path / "staging_resume.json"
+        state = {
+            "dataset_fingerprint": fp_dataset,
+            "training_config_fingerprint": fp_config,
+            "disk_checkpoint_path": str(ckpt_dir),
+        }
+        resume_path.write_text(json.dumps(state))
+
+        # Simulate restart: fresh identical-content dataset
+        ds_fresh = self._indexed_dataset(self._make_items())
+
+        fingerprints = {
+            "dataset": _fingerprint_dataset(ds_fresh),
+            "config": fp_config,
+        }
+
+        with (
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+        ):
+            result = _resolve_resume_checkpoint(resume_path, fingerprints)
+
+        assert result == str(ckpt_dir), (
+            f"Expected checkpoint path {ckpt_dir!s}, got {result!r}. "
+            "Fingerprint mismatch — content-hash is not cross-restart stable."
+        )
+
+        # Negative: mutated content must NOT match
+        ds_mutated = self._indexed_dataset(self._make_items(label_value=99))
+        fingerprints_mutated = {
+            "dataset": _fingerprint_dataset(ds_mutated),
+            "config": fp_config,
+        }
+        with (
+            patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
+        ):
+            result_mutated = _resolve_resume_checkpoint(resume_path, fingerprints_mutated)
+
+        assert result_mutated is None
+
+    def test_empty_dataset_stable_fingerprint(self):
+        """An empty dataset produces a stable non-crashing fingerprint."""
+        from paramem.training.trainer import _fingerprint_dataset
+
+        ds_empty = self._indexed_dataset([])
+        fp1 = _fingerprint_dataset(ds_empty)
+        fp2 = _fingerprint_dataset(ds_empty)
+
+        assert isinstance(fp1, str) and len(fp1) == 64  # 32 bytes → 64 hex chars
+        assert fp1 == fp2

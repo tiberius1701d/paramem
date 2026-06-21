@@ -299,16 +299,42 @@ def _ensure_staging_slot(model: PeftModel, adapter_config: AdapterConfig) -> Non
     create_adapter(model, adapter_config, _STAGING_ADAPTER)
 
 
+def _to_jsonable(obj):
+    """JSON ``default`` serialiser that avoids truncated tensor representations.
+
+    ``json.dumps`` calls this for values that are not natively serialisable.
+    PyTorch tensors and NumPy arrays expose ``.tolist()`` which materialises
+    the full element list — no ``...`` ellipsis truncation and no heap-address
+    or dtype noise.  Anything else falls back to ``str()``.
+    """
+    if callable(getattr(obj, "tolist", None)):
+        return obj.tolist()
+    return str(obj)
+
+
 def _fingerprint_dataset(train_dataset) -> str:
     """SHA-256 fingerprint of the training dataset content.
 
-    When ``train_dataset`` is a ``list`` or ``tuple``, each element is
-    serialised as canonical JSON and hashed in order.  For other dataset
-    types (e.g. HF ``Dataset``), the fingerprint is derived from
-    ``str(train_dataset)`` — deterministic within a run but not across
-    library version changes.  The limitation is documented: callers using
-    non-list datasets may not benefit from crash-resume matching across
-    process restarts.
+    The fingerprint is a pure function of dataset content: identical across
+    independent constructions and across process restarts for datasets whose
+    items are content-stable (e.g. pre-tokenized ``_IndexedDataset``).
+
+    Serialisation uses :func:`_to_jsonable` so that torch tensor values (the
+    full element list, no truncation) are hashed rather than their ``str``
+    representation, which PyTorch truncates with ``...`` for long tensors.
+
+    Dispatch:
+
+    - ``list`` / ``tuple`` — items iterated directly.
+    - Map-style dataset (exposes ``__len__`` and ``__getitem__``) — items
+      accessed by index.
+    - Anything else — ``str(train_dataset)`` last-resort fallback (documented:
+      address-free only within a run for opaque datasets).
+
+    Note: for replay datasets (``SyntheticQADataset``, ``MixedReplayDataset``)
+    the fingerprint is address-free (no heap-address ``str``), but
+    cross-restart match is not achievable because replay content is
+    model-output-driven and regenerated on each run.
 
     Returns:
         Hex-encoded SHA-256 digest string.
@@ -316,7 +342,11 @@ def _fingerprint_dataset(train_dataset) -> str:
     h = hashlib.sha256()
     if isinstance(train_dataset, (list, tuple)):
         for item in train_dataset:
-            h.update(json.dumps(item, sort_keys=True, default=str).encode("utf-8"))
+            h.update(json.dumps(item, sort_keys=True, default=_to_jsonable).encode("utf-8"))
+    elif hasattr(train_dataset, "__len__") and hasattr(train_dataset, "__getitem__"):
+        for i in range(len(train_dataset)):
+            item = train_dataset[i]
+            h.update(json.dumps(item, sort_keys=True, default=_to_jsonable).encode("utf-8"))
     else:
         h.update(str(train_dataset).encode("utf-8"))
     return h.hexdigest()
