@@ -404,8 +404,8 @@ class TestWindowStampPreservation:
     ``meta.json`` and passes it as ``window_stamp_override`` to
     ``consolidate_interim_adapters``.  Without this, ``_save_adapters`` floors the
     stamp to the current period on every housekeeping run, which perturbs
-    ``_is_full_cycle_due``'s identity check and can trigger a duplicate scheduled
-    cycle immediately after a housekeeping run.
+    ``_is_full_cycle_due``'s content-driven due signal and can trigger a duplicate
+    scheduled cycle immediately after a housekeeping run.
     """
 
     def test_window_stamp_override_passed_to_consolidate(self, tmp_path: Path) -> None:

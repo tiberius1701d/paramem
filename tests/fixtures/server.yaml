@@ -175,18 +175,23 @@ adapters:
 #   BackgroundTrainer's pause/resume — it yields to inference and resumes
 #   when idle.
 #
-# INTERIM ADAPTER CAP — max_interim_count
+# INTERIM ADAPTER CAP — max_interim_count / interim_overflow_slack
 # - HARD CAP on concurrent interim adapters resident in VRAM.
-# - If extraction arrives after the cap is reached (full cycle late or
-#   skipped), the NEWEST interim adapter keeps absorbing new facts via a
-#   full 30-epoch retrain on (original indexed keys ∪ new QA). No rolling
-#   eviction of older adapters — that would silently discard temporal
-#   ordering. The adapter grows until the recall sanity check fails, at
-#   which point the snapshot is restored and that adapter is marked
-#   degenerated (no further learning until next full consolidation).
+# - Each interim adapter is its own independently-trained, temporally-
+#   ordered slot. No adapter ever absorbs another's facts; the full fold
+#   collapses all interim slots into the mains via replay, then deletes them.
+# - If more facts arrive after the ring is full (full cycle late or skipped):
+#   * With interim_overflow_slack > 0: up to max_interim_count + slack
+#     later-stamped overflow slots are minted — each its OWN ordered adapter;
+#     existing adapters are NEVER mutated or retrained. Emits a loud
+#     interim_cap_reached warning incident.
+#   * Beyond max_interim_count + slack (and at the default slack=0): new
+#     sessions are kept PENDING (losslessly re-extracted next cycle) until
+#     the next full consolidation drains the ring. Emits an
+#     interim_overflow_pending incident.
 # - Startup VRAM validator refuses to start if base + main adapters +
-#   max_interim_count + staging + KV cache exceeds the configured GPU
-#   budget.
+#   max_interim_count + interim_overflow_slack + staging + KV cache exceeds
+#   the configured GPU budget.
 #
 # ACTIVITY GATING
 # - At each interim tick, if no new session transcripts AND no queued
@@ -283,6 +288,12 @@ consolidation:
   # server refuses to start if base + mains + this + staging + KV exceeds
   # the configured GPU budget. Raise only after re-running the validator.
   max_interim_count: 7
+  # Overflow slots beyond the max_interim_count ring before keep-pending
+  # kicks in. Default 0 = sessions are kept pending immediately when the ring
+  # is full. > 0 = temporarily mint up to that many extra later-stamped overflow
+  # slots before keep-pending (each its own ordered adapter; VRAM budget proven
+  # at startup using max_interim_count + interim_overflow_slack).
+  interim_overflow_slack: 0
   # Post-session (inline) training: extract and train facts immediately after
   # each assistant response.  Default is false — facts accumulate via the
   # scheduled consolidation cycle instead, which is lower-overhead and avoids
