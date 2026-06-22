@@ -3504,6 +3504,63 @@ class ConsolidationLoop:
             active_before_count=active_before_count,
         )
 
+    def _capture_pending_relations(self) -> "list[Relation]":
+        """Snapshot current merger.graph edges into a list[Relation].
+
+        Called BEFORE :meth:`_materialize_consolidation_graph` resets the graph,
+        so the pending-session content survives the reset and re-enters the merge
+        via the ``extra_relations`` channel.
+
+        Shared by PATH B (interim fold) and PATH C (consume-pending full fold).
+        PATH B calls this when ``scope.extra_relations_source == "pending"``
+        (replacing the former inline capture block at 3808-3835).
+        PATH C calls this when ``scope.consume_pending`` is ``True`` (the
+        consume-pending full fold, where app.py has pre-populated
+        ``merger.graph`` with pending-session relations).
+
+        Returns an empty list when the graph is absent or has no edges; both
+        ``None`` and ``[]`` are valid no-ops for the ``if extra_relations`` check
+        inside :meth:`_materialize_consolidation_graph`.
+
+        Returns:
+            list[Relation]: Relation objects built from the current merger graph
+                edges.  Each edge contributes exactly one :class:`Relation` with:
+
+                - ``predicate`` taken from the edge ``"predicate"`` attribute
+                  (edges with an empty predicate are skipped);
+                - ``relation_type`` validated against :data:`_VALID_RTYPES`,
+                  falling back to :data:`_FALLBACK_RTYPE`;
+                - ``speaker_id`` inherited from the subject node's
+                  ``"speaker_id"`` attribute (empty string when absent);
+                - ``session_ids`` from the edge ``"sessions"`` attribute.
+        """
+        import networkx as _nx
+
+        _g = getattr(self.merger, "graph", None)
+        if not isinstance(_g, _nx.MultiDiGraph) or _g.number_of_edges() == 0:
+            return []
+        _result: list[Relation] = []
+        for _er_subj, _er_obj, _er_data in _g.edges(data=True):
+            _er_pred = _er_data.get("predicate", "")
+            if not _er_pred:
+                continue
+            _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
+            _er_rt: str = _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
+            _er_subj_node = _g.nodes.get(_er_subj, {})
+            _er_spk = _er_subj_node.get("speaker_id", "")
+            _result.append(
+                Relation(
+                    subject=_er_subj,
+                    predicate=_er_pred,
+                    object=_er_obj,
+                    relation_type=_er_rt,  # type: ignore[arg-type]
+                    confidence=_er_data.get("confidence", 1.0),
+                    speaker_id=_er_spk,
+                    session_ids=list(_er_data.get("sessions", [])),
+                )
+            )
+        return _result
+
     def _run_fold(
         self,
         scope: "FoldScope",
@@ -3805,34 +3862,11 @@ class ConsolidationLoop:
                 #   (a) registry-true relations for this slot
                 #   (b) the pending-session relations captured from merger.graph before the
                 #       reset (extra_relations), so they survive the graph reset.
-                _extra: "list[Relation] | None" = None
-                if scope.extra_relations_source == "pending":
-                    import networkx as _nx
-
-                    _g = getattr(self.merger, "graph", None)
-                    if isinstance(_g, _nx.MultiDiGraph) and _g.number_of_edges() > 0:
-                        _extra = []
-                        for _er_subj, _er_obj, _er_data in _g.edges(data=True):
-                            _er_pred = _er_data.get("predicate", "")
-                            if not _er_pred:
-                                continue
-                            _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
-                            _er_rt: str = (
-                                _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
-                            )
-                            _er_subj_node = _g.nodes.get(_er_subj, {})
-                            _er_spk = _er_subj_node.get("speaker_id", "")
-                            _extra.append(
-                                Relation(
-                                    subject=_er_subj,
-                                    predicate=_er_pred,
-                                    object=_er_obj,
-                                    relation_type=_er_rt,  # type: ignore[arg-type]
-                                    confidence=_er_data.get("confidence", 1.0),
-                                    speaker_id=_er_spk,
-                                    session_ids=list(_er_data.get("sessions", [])),
-                                )
-                            )
+                _extra: "list[Relation] | None" = (
+                    self._capture_pending_relations()
+                    if scope.extra_relations_source == "pending"
+                    else None
+                )
 
                 recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
                     tier=scope.tier,
@@ -4163,10 +4197,28 @@ class ConsolidationLoop:
                 # -----------------------------------------------------------------
                 # FRESH-DERIVATION PATH: reconstruct → promote → tier-floor → assign.
                 # -----------------------------------------------------------------
+                # Capture pending-session relations from merger.graph BEFORE
+                # _materialize_consolidation_graph resets the graph (MF-4 ordering:
+                # capture-before-reset, re-merge-after-reset via extra_relations).
+                # Only active when scope.consume_pending is True (the consume-pending
+                # full fold, where app.py has pre-populated merger.graph).
+                # The fast-path resume branch above intentionally has NO capture —
+                # the persisted fold_resume.json marker already carries the folded
+                # pending facts in its train_assignment.
+                _pending_extra: "list[Relation] | None" = None
+                if scope.consume_pending:
+                    _pending_extra = self._capture_pending_relations()
+                    logger.info(
+                        "_run_fold[main_tiers]: consume-pending — captured %d pending relation(s)",
+                        len(_pending_extra),
+                    )
                 recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
                     source=scope.source,
                     resolve_contradictions_recon=False,
-                    resolve_contradictions_extra=False,
+                    resolve_contradictions_extra=(
+                        self.config.contradiction_detection if scope.consume_pending else False
+                    ),
+                    extra_relations=_pending_extra,
                 )
                 self._refine_consolidation_graph(
                     recon_relations,
@@ -6141,6 +6193,7 @@ class ConsolidationLoop:
         recall_sanity_threshold: "float | None" = None,
         refresh_epochs: int = 30,
         *,
+        consume_pending: bool = False,
         housekeeping: bool = False,
         window_stamp_override: "str | None" = None,
     ) -> dict:
@@ -6202,6 +6255,15 @@ class ConsolidationLoop:
                 ``self.config.recall_sanity_threshold``.
             refresh_epochs: Number of training epochs for the full per-tier
                 rebuild (default 30; matches the per-key baseline from Tests 1-7b).
+            consume_pending: When ``True``, the fold captures pending-session
+                relations from ``merger.graph`` and injects them into the fold via
+                the ``extra_relations`` channel.  The full-fold :class:`FoldScope`
+                sets ``consume_pending=True`` and
+                ``extra_relations_source="pending"``.  When ``False`` (default),
+                the fold ignores pending-session relations (normal non-consume
+                behaviour).  The caller is responsible for translating
+                server-schedule config (e.g. ``config.consolidation.max_interim_count
+                == 0``) into this boolean decision before calling.
             housekeeping: When ``True``, bypass gate (d) (the whole-fold
                 ``_total_trainable < _floor`` accumulating early-return) and
                 proceed to retrain even when the total key count is below the
@@ -6268,13 +6330,14 @@ class ConsolidationLoop:
                 source="weights",
                 persist="main_tiers",
                 tier=None,
-                extra_relations_source="none",
+                extra_relations_source="pending" if consume_pending else "none",
                 defer=False,
                 tag_new=False,
                 level=self.config.fold_refinement,
                 promote=True,
                 tier_floor=True,
                 subtractive_scope="fold",
+                consume_pending=consume_pending,
             ),
             # Fold has no single-session speaker; per-key attribution is sourced
             # from bookkeeping, so the fold-venue speaker_id is the empty string.

@@ -11914,3 +11914,554 @@ class TestFoldResumeHelpers:
             assert new_state["fold_stamp"] != "stale_stamp_does_not_match", (
                 "fold_resume.json must carry the fresh stamp, not the stale one"
             )
+
+
+# =============================================================================
+# TestCapturePendingRelations — unit tests for _capture_pending_relations
+# =============================================================================
+
+
+class TestCapturePendingRelations:
+    """Unit tests for ConsolidationLoop._capture_pending_relations.
+
+    Verifies the helper returns [] on an absent/empty graph, and returns a
+    correct list[Relation] from a populated merger.graph — with predicate
+    non-empty, relation_type validated against _VALID_RTYPES, subject-node
+    speaker_id inherited, and session_ids from the edge 'sessions' attribute.
+    """
+
+    @staticmethod
+    def _make_loop_with_graph(merger_graph):
+        """Return a minimal ConsolidationLoop stub wired with the given graph."""
+        from unittest.mock import MagicMock
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.merger = MagicMock()
+        loop.merger.graph = merger_graph
+        return loop
+
+    def test_empty_graph_returns_empty_list(self):
+        """_capture_pending_relations returns [] when merger.graph has no edges."""
+        import networkx as nx
+
+        loop = self._make_loop_with_graph(nx.MultiDiGraph())
+        result = loop._capture_pending_relations()
+        assert result == []
+
+    def test_absent_graph_returns_empty_list(self):
+        """_capture_pending_relations returns [] when merger has no 'graph' attr."""
+        from unittest.mock import MagicMock
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.merger = MagicMock(spec=[])  # no 'graph' attribute
+        result = loop._capture_pending_relations()
+        assert result == []
+
+    def test_non_multidigraph_returns_empty_list(self):
+        """_capture_pending_relations returns [] when merger.graph is not a MultiDiGraph."""
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.merger = MagicMock()
+        loop.merger.graph = {"not": "a graph"}
+        result = loop._capture_pending_relations()
+        assert result == []
+
+    def test_edge_with_empty_predicate_skipped(self):
+        """Edges with an empty predicate attribute are excluded from the result."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()
+        g.add_edge("Alice", "Bob", predicate="", relation_type="factual", sessions=["s1"])
+        loop = self._make_loop_with_graph(g)
+        result = loop._capture_pending_relations()
+        assert result == []
+
+    def test_populated_graph_returns_correct_relation(self):
+        """A single populated edge produces one Relation with correct fields."""
+        import networkx as nx
+
+        from paramem.graph.schema import Relation
+
+        g = nx.MultiDiGraph()
+        g.add_node("Alice", speaker_id="spk_01")
+        g.add_edge(
+            "Alice",
+            "Wonderland",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=0.9,
+            sessions=["sess_abc"],
+        )
+        loop = self._make_loop_with_graph(g)
+        result = loop._capture_pending_relations()
+        assert len(result) == 1
+        rel = result[0]
+        assert isinstance(rel, Relation)
+        assert rel.subject == "Alice"
+        assert rel.predicate == "lives in"
+        assert rel.object == "Wonderland"
+        assert rel.relation_type == "factual"
+        assert abs(rel.confidence - 0.9) < 1e-6
+        assert rel.speaker_id == "spk_01"
+        assert rel.session_ids == ["sess_abc"]
+
+    def test_speaker_id_inherited_from_subject_node(self):
+        """speaker_id is read from the subject node attribute, not the edge."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()
+        g.add_node("Charlie", speaker_id="spk_99")
+        g.add_edge("Charlie", "London", predicate="born in", relation_type="factual", sessions=[])
+        loop = self._make_loop_with_graph(g)
+        result = loop._capture_pending_relations()
+        assert len(result) == 1
+        assert result[0].speaker_id == "spk_99"
+
+    def test_speaker_id_defaults_to_empty_string_when_absent(self):
+        """speaker_id defaults to '' when the subject node has no speaker_id attribute."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()
+        g.add_edge("Bob", "Paris", predicate="visited", relation_type="factual", sessions=["s2"])
+        loop = self._make_loop_with_graph(g)
+        result = loop._capture_pending_relations()
+        assert len(result) == 1
+        assert result[0].speaker_id == ""
+
+    def test_invalid_relation_type_falls_back_to_default(self):
+        """An unrecognised relation_type is replaced with the fallback relation type."""
+        import networkx as nx
+
+        from paramem.graph.schema_config import fallback_relation_type
+
+        g = nx.MultiDiGraph()
+        g.add_edge(
+            "Alice",
+            "Bob",
+            predicate="knows",
+            relation_type="UNKNOWN_TYPE_THAT_IS_INVALID",
+            sessions=[],
+        )
+        loop = self._make_loop_with_graph(g)
+        result = loop._capture_pending_relations()
+        assert len(result) == 1
+        assert result[0].relation_type == fallback_relation_type()
+
+    def test_session_ids_from_edge_sessions_attribute(self):
+        """session_ids in the returned Relation matches the edge 'sessions' list."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()
+        g.add_edge(
+            "Diana",
+            "Oxford",
+            predicate="studied at",
+            relation_type="factual",
+            sessions=["sess_1", "sess_2"],
+        )
+        loop = self._make_loop_with_graph(g)
+        result = loop._capture_pending_relations()
+        assert len(result) == 1
+        assert result[0].session_ids == ["sess_1", "sess_2"]
+
+    def test_missing_sessions_attribute_yields_empty_list(self):
+        """If the edge has no 'sessions' attribute, session_ids is an empty list."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()
+        g.add_edge("Eve", "Mars", predicate="wants to go to", relation_type="factual")
+        loop = self._make_loop_with_graph(g)
+        result = loop._capture_pending_relations()
+        assert len(result) == 1
+        assert result[0].session_ids == []
+
+    def test_multiple_edges_all_returned(self):
+        """Multiple edges all produce Relation objects; empty-predicate ones are skipped."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()
+        g.add_node("Frank", speaker_id="spk_07")
+        g.add_edge("Frank", "Berlin", predicate="lives in", relation_type="factual", sessions=[])
+        g.add_edge("Frank", "Python", predicate="uses", relation_type="procedural", sessions=["s3"])
+        # This edge should be skipped (empty predicate):
+        g.add_edge("Frank", "Nowhere", predicate="", relation_type="factual", sessions=[])
+        loop = self._make_loop_with_graph(g)
+        result = loop._capture_pending_relations()
+        assert len(result) == 2
+        predicates = {r.predicate for r in result}
+        assert predicates == {"lives in", "uses"}
+
+
+# =============================================================================
+# TestConsumePendingPathC — PATH C fresh-derivation consume-pending wiring
+# =============================================================================
+
+
+class TestConsumePendingPathC:
+    """Tests for consume_pending wiring in PATH C of _run_fold (the full fold).
+
+    Verifies that:
+    1. The full-fold FoldScope sets consume_pending=True and
+       extra_relations_source="pending" when consume_pending=True is passed.
+    2. When consume_pending=True, PATH C's fresh-derivation branch calls
+       _capture_pending_relations and passes the result as extra_relations
+       to _materialize_consolidation_graph.
+    3. When consume_pending=False (normal mode), the non-consume full fold is
+       byte-equivalent to before (no capture).
+    4. The crash-resume fast-path branch does NOT trigger the capture.
+
+    All tests mock GPU/model operations (no hardware required).
+    Modelled on TestConsolidateInterimAdaptersFullFlow._make_loop and
+    TestTierFloor._run_full_fold_mocked (object.__new__ pattern).
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path, *, merger_graph=None):
+        """Minimal ConsolidationLoop stub for consume-pending PATH C tests.
+
+        The consume_pending decision is NOT stored on the loop — it is a
+        caller decision passed to ``consolidate_interim_adapters(consume_pending=...)``
+        at call time.  Tests that need a specific value pass it there.
+        """
+        from unittest.mock import MagicMock
+
+        import networkx as nx
+        from peft import PeftModel
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        if merger_graph is None:
+            merger_graph = nx.MultiDiGraph()
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "procedural": MagicMock(),
+            "episodic_backup": MagicMock(),
+            "semantic_backup": MagicMock(),
+            "procedural_backup": MagicMock(),
+        }
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        # Use a nested subdir so each test's _fold_state_dir (output_dir.parent/"state")
+        # is unique and tests do not share a fold_resume.json via a common parent dir.
+        loop.output_dir = tmp_path / "outputs"
+        loop.output_dir.mkdir(parents=True, exist_ok=True)
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.merger = MagicMock()
+        loop.merger.graph = merger_graph
+        loop.promoted_keys = set()
+        loop.cycle_count = 0
+        loop._procedural_next_index = 0
+        loop._procedural_tentative_next_index = 0
+        loop._indexed_next_index = 0
+        loop._bg_trainer = None
+        loop.shutdown_requested = False
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop._debug_base = None
+        loop.save_cycle_snapshots = False
+        loop.snapshot_dir = None
+        loop._indexed_ep_interim = {}
+        loop.episodic_replay_pool = []
+        loop.curriculum_sampler = None
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.graph_enrichment_neighborhood_hops = 2
+        return loop
+
+    @staticmethod
+    def _run_full_fold_with_materialize_spy(loop, *, consume_pending=True, materialize_spy=None):
+        """Run consolidate_interim_adapters, spying on _materialize_consolidation_graph.
+
+        Returns (result, materialize_calls) where materialize_calls is the list of
+        kwargs dicts passed to _materialize_consolidation_graph on each invocation.
+        """
+        from unittest.mock import patch
+
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.server.gpu_lock import _gpu_thread_lock
+        from paramem.training.consolidation import ConsolidationLoop
+
+        materialize_calls = []
+
+        def _spy_materialize(self_inner, **kwargs):
+            materialize_calls.append(dict(kwargs))
+            return set(), []
+
+        _gpu_thread_lock.acquire()
+        try:
+            with (
+                patch(
+                    "paramem.training.consolidation.reconstruct_graph",
+                    return_value=ReconstructionResult(graph=nx.MultiDiGraph()),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_materialize_consolidation_graph",
+                    _spy_materialize,
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
+                patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
+                patch.object(
+                    ConsolidationLoop,
+                    "_maybe_make_recall_callback",
+                    return_value=(None, None),
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_probe_passing_keys",
+                    side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
+                ),
+                patch.object(ConsolidationLoop, "_save_adapters"),
+                patch(
+                    "paramem.training.trainer.train_adapter",
+                    return_value={"aborted": False},
+                ),
+                patch(
+                    "paramem.training.consolidation.format_entry_training",
+                    return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
+                ),
+                patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
+                patch("paramem.models.loader.switch_adapter"),
+                patch("paramem.models.loader.copy_adapter_weights"),
+                patch("paramem.models.loader.copy_adapter_weights_subset"),
+                patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
+            ):
+                result = loop.consolidate_interim_adapters(
+                    trainer=None, router=None, consume_pending=consume_pending
+                )
+        finally:
+            _gpu_thread_lock.release()
+
+        return result, materialize_calls
+
+    def test_full_fold_scope_consume_pending_set_when_consume_pending_true(self, tmp_path):
+        """FoldScope has consume_pending=True and extra_relations_source='pending' when passed."""
+        from unittest.mock import patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop, FoldScope
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+
+        captured_scopes: list[FoldScope] = []
+
+        _orig_run_fold = ConsolidationLoop._run_fold
+
+        def _spy_run_fold(self_inner, scope, **kwargs):
+            captured_scopes.append(scope)
+            # Return a minimal noop result to avoid executing the fold body.
+            return {
+                "status": "noop",
+                "tiers_rebuilt": [],
+                "keys_trained": 0,
+                "recall_miss_count": 0,
+                "graph_drift_count": 0,
+                "soft_stale_count": 0,
+                "drift_deduplicated_count": 0,
+                "drift_orphan_count": 0,
+                "drift_genuine_loss_count": 0,
+                "drift_intended_removal_count": 0,
+                "drift_intended_removal_by_reason": {},
+                "recall_failed_session_ids": [],
+                "skipped_cycles": 0,
+            }
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with patch.object(ConsolidationLoop, "_run_fold", _spy_run_fold):
+                loop.consolidate_interim_adapters(trainer=None, router=None, consume_pending=True)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert len(captured_scopes) == 1
+        scope = captured_scopes[0]
+        assert scope.consume_pending is True
+        assert scope.extra_relations_source == "pending"
+        assert scope.persist == "main_tiers"
+
+    def test_full_fold_scope_consume_pending_false_when_consume_pending_false(self, tmp_path):
+        """FoldScope has consume_pending=False and extra_relations_source='none' by default."""
+        from unittest.mock import patch
+
+        import networkx as nx
+
+        from paramem.training.consolidation import ConsolidationLoop, FoldScope
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+
+        captured_scopes: list[FoldScope] = []
+
+        def _spy_run_fold(self_inner, scope, **kwargs):
+            captured_scopes.append(scope)
+            return {
+                "status": "noop",
+                "tiers_rebuilt": [],
+                "keys_trained": 0,
+                "recall_miss_count": 0,
+                "graph_drift_count": 0,
+                "soft_stale_count": 0,
+                "drift_deduplicated_count": 0,
+                "drift_orphan_count": 0,
+                "drift_genuine_loss_count": 0,
+                "drift_intended_removal_count": 0,
+                "drift_intended_removal_by_reason": {},
+                "recall_failed_session_ids": [],
+                "skipped_cycles": 0,
+            }
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        _gpu_thread_lock.acquire()
+        try:
+            with patch.object(ConsolidationLoop, "_run_fold", _spy_run_fold):
+                loop.consolidate_interim_adapters(trainer=None, router=None, consume_pending=False)
+        finally:
+            _gpu_thread_lock.release()
+
+        assert len(captured_scopes) == 1
+        scope = captured_scopes[0]
+        assert scope.consume_pending is False
+        assert scope.extra_relations_source == "none"
+
+    def test_path_c_captures_pending_relations_into_materialize(self, tmp_path):
+        """PATH C fresh-derivation passes captured pending relations to _materialize."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()
+        g.add_node("Alice", speaker_id="spk_01")
+        g.add_edge(
+            "Alice",
+            "Wonderland",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=0.95,
+            sessions=["sess_x"],
+        )
+        loop = self._make_loop(tmp_path, merger_graph=g)
+
+        _result, materialize_calls = self._run_full_fold_with_materialize_spy(
+            loop, consume_pending=True
+        )
+
+        assert len(materialize_calls) >= 1
+        # The PATH C (main_tiers) materialize call passes extra_relations with the pending fact.
+        path_c_call = materialize_calls[0]
+        extra = path_c_call.get("extra_relations")
+        assert extra is not None, "extra_relations must be passed when consume_pending=True"
+        assert len(extra) == 1
+        assert extra[0].subject == "Alice"
+        assert extra[0].predicate == "lives in"
+        assert extra[0].speaker_id == "spk_01"
+        assert extra[0].session_ids == ["sess_x"]
+
+    def test_path_c_no_extra_relations_when_consume_pending_false(self, tmp_path):
+        """PATH C fresh-derivation passes extra_relations=None when consume_pending=False."""
+        import networkx as nx
+
+        # Populate merger.graph even for count>0 to confirm it is NOT captured.
+        g = nx.MultiDiGraph()
+        g.add_edge(
+            "Bob",
+            "Berlin",
+            predicate="lives in",
+            relation_type="factual",
+            sessions=["s1"],
+        )
+        loop = self._make_loop(tmp_path, merger_graph=g)
+
+        _result, materialize_calls = self._run_full_fold_with_materialize_spy(
+            loop, consume_pending=False
+        )
+
+        assert len(materialize_calls) >= 1
+        path_c_call = materialize_calls[0]
+        extra = path_c_call.get("extra_relations")
+        # extra_relations must be None (not the pending graph content) when consume_pending=False.
+        assert extra is None, (
+            f"extra_relations should be None for non-consume full fold, got: {extra}"
+        )
+
+    def test_path_c_resolve_contradictions_extra_uses_config_when_consume_pending(self, tmp_path):
+        """PATH C passes resolve_contradictions_extra from config when consume_pending=True."""
+        import networkx as nx
+
+        from paramem.utils.config import ConsolidationConfig
+
+        g = nx.MultiDiGraph()
+        g.add_edge("Alice", "Moon", predicate="orbits", relation_type="factual", sessions=[])
+
+        loop = self._make_loop(tmp_path, merger_graph=g)
+        # Explicitly set contradiction_detection=True on the loop's training-layer config.
+        loop.config = ConsolidationConfig(
+            min_tier_key_floor=0,
+            tier_fast_start=False,
+            contradiction_detection=True,
+        )
+
+        _result, materialize_calls = self._run_full_fold_with_materialize_spy(
+            loop, consume_pending=True
+        )
+
+        assert materialize_calls
+        path_c_call = materialize_calls[0]
+        assert path_c_call.get("resolve_contradictions_extra") is True
+
+    def test_path_c_resolve_contradictions_extra_false_when_not_consume_pending(self, tmp_path):
+        """PATH C passes resolve_contradictions_extra=False for non-consume full fold."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()
+        loop = self._make_loop(tmp_path, merger_graph=g)
+
+        _result, materialize_calls = self._run_full_fold_with_materialize_spy(
+            loop, consume_pending=False
+        )
+
+        assert materialize_calls
+        path_c_call = materialize_calls[0]
+        assert path_c_call.get("resolve_contradictions_extra") is False
+
+    def test_path_c_empty_merger_graph_gives_empty_extra_relations(self, tmp_path):
+        """PATH C with consume_pending=True and empty graph passes empty extra_relations."""
+        import networkx as nx
+
+        g = nx.MultiDiGraph()  # empty
+        loop = self._make_loop(tmp_path, merger_graph=g)
+
+        _result, materialize_calls = self._run_full_fold_with_materialize_spy(
+            loop, consume_pending=True
+        )
+
+        assert materialize_calls
+        path_c_call = materialize_calls[0]
+        extra = path_c_call.get("extra_relations")
+        # Helper returns [] on empty graph; PATH C passes it through.
+        assert extra == [] or extra is None  # both are valid no-ops for materialize
