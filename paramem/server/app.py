@@ -6830,7 +6830,13 @@ async def debug_dump():
     router has speaker provenance loaded from ``key_metadata.json``.
 
     Each entry dict is the entry payload as stored, with ``tier`` and
-    ``key`` fields added inline for flat consumption.
+    ``key`` fields added inline for flat consumption.  Per-key
+    ``speaker_id``, ``relation_type``, ``first_seen_cycle``,
+    ``last_seen_cycle``, and ``recurrence_count`` are sourced from
+    ``store.bookkeeping_for_key(key)`` (authoritative ``_bookkeeping``
+    dict) rather than the entry payload, which may be stale or absent.
+    When a key has no bookkeeping record the fields are omitted rather
+    than fabricated.
     """
     config = _state["config"]
     if not getattr(config, "debug", False):
@@ -6844,6 +6850,18 @@ async def debug_dump():
     tiers: dict[str, int] = {}
     for tier, key, entry in store.iter_entries():
         row = {"tier": tier, "key": key, **entry}
+        # Overlay per-key bookkeeping fields from the authoritative _bookkeeping
+        # dict.  The entry payload (_entries) may carry stale or absent
+        # speaker_id/relation_type — _bookkeeping is the single source of truth
+        # for those fields (store.py:53-58).  Use is None (not truthiness) —
+        # an empty bookkeeping record is valid.
+        bk = store.bookkeeping_for_key(key)
+        if bk is not None:
+            row["speaker_id"] = bk["speaker_id"]
+            row["relation_type"] = bk["relation_type"]
+            row["first_seen_cycle"] = bk["first_seen_cycle"]
+            row["last_seen_cycle"] = bk["last_seen_cycle"]
+            row["recurrence_count"] = bk["recurrence_count"]
         entries.append(row)
         tiers[tier] = tiers.get(tier, 0) + 1
 

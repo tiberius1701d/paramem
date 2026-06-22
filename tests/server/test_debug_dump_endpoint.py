@@ -6,6 +6,8 @@ Covers:
 - Empty store → returns empty list, total=0 (correct read, not an error).
 - Happy path: every (tier, key, entry) from iter_entries() flows into the response.
 - Tier counts aggregate correctly.
+- Per-key ``speaker_id``/``relation_type`` and other bookkeeping fields are sourced
+  from ``bookkeeping_for_key`` (authoritative ``_bookkeeping``), not the entry payload.
 
 Tests use FastAPI TestClient with monkeypatched ``_state``; no live server, no GPU.
 """
@@ -34,6 +36,10 @@ class _FakeStore:
 
     def iter_entries(self):
         yield from self._items
+
+    def bookkeeping_for_key(self, key: str) -> dict | None:
+        """Return the bookkeeping record for *key*, or ``None`` when absent."""
+        return self._bookkeeping.get(key)
 
     def bookkeeping_count(self) -> int:
         return len(self._bookkeeping)
@@ -125,3 +131,72 @@ class TestDebugDumpHappyPath:
         assert first["key"] == "graph1"
         assert first["subject"] == "Tobias"
         assert first["object"] == "Berlin"
+
+    def test_bookkeeping_fields_sourced_from_bookkeeping_for_key(self, tmp_path, monkeypatch):
+        """speaker_id and relation_type in the dump row come from bookkeeping_for_key,
+        not from the entry payload.
+
+        This is the B3c regression guard: the entry payload may carry stale or
+        absent bookkeeping fields (store.py:53-58), so the handler must overlay
+        the authoritative _bookkeeping values.
+        """
+        items = [
+            (
+                "episodic",
+                "graph1",
+                # Entry payload carries a stale/wrong speaker_id — the overlay
+                # must overwrite it with the bookkeeping value.
+                {
+                    "subject": "Tobias",
+                    "predicate": "lives_in",
+                    "object": "Berlin",
+                    "speaker_id": "stale_value",
+                    "relation_type": "stale_type",
+                },
+            ),
+        ]
+        bk = {
+            "graph1": {
+                "speaker_id": "alice",
+                "relation_type": "factual",
+                "first_seen_cycle": 3,
+                "last_seen_cycle": 5,
+                "recurrence_count": 2,
+            }
+        }
+        state = _make_state(tmp_path, store_items=items)
+        state["memory_store"] = _FakeStore(items, bookkeeping=bk)
+        client = _make_client(monkeypatch, state)
+        resp = client.get("/debug/dump")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["total"] == 1
+        row = body["entries"][0]
+        # Bookkeeping values must win over the stale entry payload values.
+        assert row["speaker_id"] == "alice", "speaker_id must come from bookkeeping_for_key"
+        assert row["relation_type"] == "factual", "relation_type must come from bookkeeping_for_key"
+        assert row["first_seen_cycle"] == 3
+        assert row["last_seen_cycle"] == 5
+        assert row["recurrence_count"] == 2
+
+    def test_bookkeeping_fields_absent_when_no_bookkeeping_record(self, tmp_path, monkeypatch):
+        """When a key has no bookkeeping record, the row omits bookkeeping fields
+        rather than carrying stale payload values.
+        """
+        items = [
+            (
+                "episodic",
+                "graph_no_bk",
+                {"subject": "X", "predicate": "p", "object": "Y"},
+            ),
+        ]
+        # No bookkeeping for the key.
+        state = _make_state(tmp_path, store_items=items)
+        state["memory_store"] = _FakeStore(items, bookkeeping={})
+        client = _make_client(monkeypatch, state)
+        resp = client.get("/debug/dump")
+        assert resp.status_code == 200, resp.text
+        row = resp.json()["entries"][0]
+        assert "speaker_id" not in row
+        assert "relation_type" not in row
+        assert "first_seen_cycle" not in row
