@@ -559,10 +559,9 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
     ``ConsolidationLoop.__init__`` must land on
     ``loop.extraction.config.<field>`` unchanged.
 
-    ``run_multi_session`` (and any other experiment entrypoint) configures
-    the pipeline by passing ``extraction_*`` kwargs to the loop constructor.
-    If the constructor ever silently drops or renames one of them,
-    experiments run on defaults while tests that check
+    Experiment entrypoints configure the pipeline by passing ``extraction_*``
+    kwargs to the loop constructor.  If the constructor ever silently drops or
+    renames one of them, experiments run on defaults while tests that check
     ``ExtractionPipeline.kwargs`` output still pass — because those tests
     seed a config by hand. This closes that loop.
     """

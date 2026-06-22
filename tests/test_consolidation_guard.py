@@ -15,14 +15,8 @@ from paramem.training.consolidation import ConsolidationLoop, TrialActiveError
 def _make_loop() -> ConsolidationLoop:
     """Build a ConsolidationLoop without loading any model or GPU resources."""
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
-    # Provide just enough attributes for guard_trial_state and run_cycle guard.
+    # Provide just enough attributes for guard_trial_state.
     loop.state_provider = None
-    # Minimal attributes required for run_cycle before extraction is called.
-    loop.cycle_count = 0
-    # Stand-in extraction pipeline — tests patch ``loop.extraction.run`` to
-    # assert the guard fires before extraction is reached.  No real model
-    # is required because the patch short-circuits the call.
-    loop.extraction = MagicMock()
     return loop
 
 
@@ -67,58 +61,6 @@ class TestGuardTrialState:
         state = {"migration": {"state": "TRIAL"}}
         with pytest.raises(TrialActiveError, match="rollback"):
             loop.guard_trial_state(state)
-
-
-# ---------------------------------------------------------------------------
-# /scheduled-tick and /consolidate return 409 when TRIAL is active
-# ---------------------------------------------------------------------------
-
-
-class TestRunCycleGuard:
-    """Fix 5: run_cycle raises TrialActiveError when state_provider returns TRIAL state."""
-
-    def test_run_cycle_blocks_when_trial_active(self):
-        """run_cycle raises TrialActiveError before extraction when TRIAL is active.
-
-        Verifies the state_provider injection: loop.state_provider returns a
-        TRIAL state dict; run_cycle must raise TrialActiveError before any
-        extraction (verified by patching loop.extraction.run to AssertionError).
-        """
-        trial_state = {"migration": {"state": "TRIAL"}}
-        loop = _make_loop()
-        loop.state_provider = lambda: trial_state
-        loop.extraction.run.side_effect = AssertionError(
-            "should not be called — guard must raise first"
-        )
-
-        with pytest.raises(TrialActiveError):
-            loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
-
-    def test_run_cycle_proceeds_when_live(self):
-        """run_cycle does NOT block when state_provider returns LIVE state.
-
-        This test only verifies that the guard does not raise; it does NOT run
-        the full extraction (which requires a real model).
-        """
-        live_state = {"migration": {"state": "LIVE"}}
-        loop = _make_loop()
-        loop.state_provider = lambda: live_state
-        loop.extraction.run.side_effect = RuntimeError("extract called — guard did not block")
-
-        # Guard should pass; RuntimeError from extract (not TrialActiveError).
-        with pytest.raises(RuntimeError, match="extract called"):
-            loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
-
-    def test_run_cycle_proceeds_when_no_state_provider(self):
-        """run_cycle is unaffected when state_provider is None (experiment path)."""
-        loop = _make_loop()
-        # state_provider defaults to None for experiment scripts.
-        assert loop.state_provider is None
-        loop.extraction.run.side_effect = RuntimeError("extract called — guard did not block")
-
-        # No TrialActiveError; RuntimeError from extract is expected.
-        with pytest.raises(RuntimeError, match="extract called"):
-            loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")
 
 
 class TestEndpointGuards:
@@ -186,57 +128,3 @@ class TestEndpointGuards:
         # Should NOT be 409 trial_active.
         detail = resp.json().get("detail", {})
         assert resp.status_code != 409 or detail.get("error") != "trial_active"
-
-
-class TestReplayLoopGuard:
-    """Fix 4: the _replay_loop constructed during lifespan gets state_provider
-    so that run_cycle raises TrialActiveError if a trial becomes active between
-    the lifespan check and the cycle call.
-    """
-
-    def test_consolidation_loop_stores_state_provider(self):
-        """ConsolidationLoop stores state_provider and uses it in run_cycle.
-
-        Verifies the end-to-end wiring: a loop built with state_provider set to
-        a callable returns TRIAL state → run_cycle raises TrialActiveError.
-        This mirrors the _replay_loop path in app.py:1321 where Fix 4 adds
-        state_provider=lambda: _state.
-        """
-        from paramem.training.consolidation import ConsolidationLoop, TrialActiveError
-
-        trial_state = {"migration": {"state": "TRIAL"}}
-        loop = ConsolidationLoop.__new__(ConsolidationLoop)
-        loop.state_provider = lambda: trial_state
-        loop.cycle_count = 0
-        loop.extraction = MagicMock()
-        loop.extraction.run.side_effect = AssertionError("should not reach extraction")
-
-        with pytest.raises(TrialActiveError):
-            loop.run_cycle("transcript", "session-x", speaker_id="Speaker0")
-
-        # Verify state_provider is stored and callable.
-        assert loop.state_provider is not None, "state_provider must not be None"
-        assert callable(loop.state_provider), "state_provider must be callable"
-        assert loop.state_provider() is trial_state, "state_provider must return the state dict"
-
-    def test_replay_loop_run_cycle_raises_trial_active_error(self):
-        """A ConsolidationLoop with state_provider raises TrialActiveError when TRIAL.
-
-        Verifies end-to-end that a loop created with state_provider=lambda: state
-        correctly blocks run_cycle once the state transitions to TRIAL.
-        This is the regression guard for Fix 4.
-        """
-        from paramem.training.consolidation import ConsolidationLoop, TrialActiveError
-
-        shared_state = {"migration": {"state": "TRIAL"}}
-
-        loop = ConsolidationLoop.__new__(ConsolidationLoop)
-        loop.state_provider = lambda: shared_state
-        loop.cycle_count = 0
-        loop.extraction = MagicMock()
-        loop.extraction.run.side_effect = AssertionError(
-            "should not reach extraction — guard must fire first"
-        )
-
-        with pytest.raises(TrialActiveError):
-            loop.run_cycle("some transcript", "session-1", speaker_id="Speaker0")

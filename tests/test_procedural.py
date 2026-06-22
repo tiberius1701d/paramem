@@ -117,8 +117,6 @@ def _make_minimal_loop(tmp_path):
     loop.snapshot_dir = None
     loop._indexed_next_index = 0
     loop._indexed_ep_interim = {}
-    loop.episodic_replay_pool = []
-    loop.curriculum_sampler = None
     return loop
 
 

@@ -27,9 +27,10 @@ class TestMentionsAny:
 
 
 class TestExtractionPathParity:
-    """extract_session() and run_cycle() must produce identical episodic/procedural
-    sets for the same transcript. Guards against drift between the production
-    path (server) and the experiment path (phase3/phase4 scripts)."""
+    """extract_session() must produce correct episodic/procedural sets and thread
+    extraction kwargs unchanged from the loop constructor into the extractor calls.
+    Guards against flag-forwarding drift and partition invariants in the unified
+    extraction path."""
 
     def _build_loop(
         self,
@@ -145,7 +146,15 @@ class TestExtractionPathParity:
             source_type=source_type,
         )
 
-    def _run_cycle_and_capture(self, monkeypatch, loop, source_type: str = "transcript"):
+    def _run_consolidation_cycle_and_capture(
+        self, monkeypatch, loop, source_type: str = "transcript"
+    ):
+        """Call extract_session and capture what run_consolidation_cycle receives.
+
+        Replaces the former ``_run_cycle_and_capture`` (which called the now-deleted
+        ``run_cycle``).  Routes through the live production path:
+        ``extract_session`` → dedup → ``run_consolidation_cycle``.
+        """
         captured: dict[str, list[dict]] = {"episodic_rels": [], "procedural_rels": []}
 
         def _capture_cycle(self_, episodic_rels, procedural_rels, **kwargs):
@@ -161,12 +170,8 @@ class TestExtractionPathParity:
                 "error": None,
             }
 
-        # Patch run_consolidation_cycle so run_cycle's indexed-key branch can be
-        # intercepted without needing the removed _run_indexed_key_episodic /
-        # _run_indexed_key_procedural methods.
         monkeypatch.setattr(type(loop), "run_consolidation_cycle", _capture_cycle, raising=False)
-        monkeypatch.setattr(type(loop), "_save_adapters", lambda self_: None, raising=False)
-        loop.run_cycle(
+        loop.extract_session(
             session_transcript="Alex lives in Millfield. He prefers Acme Radio.",
             session_id="s001",
             speaker_id="spk",
@@ -175,26 +180,13 @@ class TestExtractionPathParity:
         return captured["episodic_rels"], captured["procedural_rels"]
 
     def test_parity_procedural_enabled(self, monkeypatch, tmp_path):
-        loop_a = self._build_loop(monkeypatch, tmp_path / "a", procedural_enabled=True)
-        episodic_a, procedural_a = self._run_extract_session(loop_a)
-
-        loop_b = self._build_loop(monkeypatch, tmp_path / "b", procedural_enabled=True)
-        episodic_b, procedural_b = self._run_cycle_and_capture(monkeypatch, loop_b)
-
-        # Identity fields must match across both paths.
-        def _key(qa):
-            return (qa["subject"], qa["predicate"], qa["object"])
-
-        def _rel_key(rel):
-            return (rel["subject"], rel["predicate"], rel["object"])
-
-        assert sorted(map(_key, episodic_a)) == sorted(map(_key, episodic_b))
-        assert sorted(map(_rel_key, procedural_a)) == sorted(map(_rel_key, procedural_b))
+        loop = self._build_loop(monkeypatch, tmp_path, procedural_enabled=True)
+        episodic, procedural = self._run_extract_session(loop)
 
         # Partition invariant: no preference in episodic, and procedural carries
         # both the filter-sourced and the separately-extracted preference.
-        assert all(qa["predicate"] != "prefers" for qa in episodic_a)
-        assert {rel["predicate"] for rel in procedural_a} == {"prefers", "listens_to"}
+        assert all(qa["predicate"] != "prefers" for qa in episodic)
+        assert {rel["predicate"] for rel in procedural} == {"prefers", "listens_to"}
 
     @pytest.mark.parametrize("source_type", ["transcript", "document"])
     @pytest.mark.parametrize(
@@ -224,11 +216,12 @@ class TestExtractionPathParity:
     def test_parity_kwargs_identical(
         self, monkeypatch, tmp_path, procedural_enabled, loop_overrides, source_type
     ):
-        """Both orchestrator paths must pass IDENTICAL kwargs to the extractors.
+        """extract_session must pass IDENTICAL kwargs regardless of loop construction overrides.
 
-        Any new flag added to one path but not the other will fail here — the
-        helper + _extraction_kwargs are the only source of truth. Parametrized
-        over source_type so both transcript and document variants are covered.
+        Any new flag added to the extraction path but not threaded through the
+        loop constructor will fail here — the helper + _extraction_kwargs are the
+        only source of truth.  Parametrized over source_type so both transcript
+        and document variants are covered.
         """
         from paramem.graph.schema import Entity, Relation, SessionGraph
 
@@ -281,15 +274,15 @@ class TestExtractionPathParity:
             extract_procedural_spy=_spy(captured_b["procedural"], procedural_graph),
             **loop_overrides,
         )
-        self._run_cycle_and_capture(monkeypatch, loop_b, source_type=source_type)
+        self._run_consolidation_cycle_and_capture(monkeypatch, loop_b, source_type=source_type)
 
         # Each path calls extract_graph exactly once with the same kwargs.
         assert len(captured_a["graph"]) == 1
         assert len(captured_b["graph"]) == 1
         assert captured_a["graph"][0] == captured_b["graph"][0], (
-            "extract_graph kwargs diverged between extract_session and run_cycle. "
-            f"extract_session: {captured_a['graph'][0]!r}\n"
-            f"run_cycle:       {captured_b['graph'][0]!r}"
+            "extract_graph kwargs diverged between the two loop instances. "
+            f"loop_a: {captured_a['graph'][0]!r}\n"
+            f"loop_b: {captured_b['graph'][0]!r}"
         )
 
         # Procedural path: same kwarg shape when enabled, neither path calls it when disabled.
@@ -297,29 +290,21 @@ class TestExtractionPathParity:
         if procedural_enabled:
             assert len(captured_a["procedural"]) == 1
             assert captured_a["procedural"][0] == captured_b["procedural"][0], (
-                "extract_procedural_graph kwargs diverged between paths. "
-                f"extract_session: {captured_a['procedural'][0]!r}\n"
-                f"run_cycle:       {captured_b['procedural'][0]!r}"
+                "extract_procedural_graph kwargs diverged between loop instances. "
+                f"loop_a: {captured_a['procedural'][0]!r}\n"
+                f"loop_b: {captured_b['procedural'][0]!r}"
             )
         else:
             assert captured_a["procedural"] == []
             assert captured_b["procedural"] == []
 
     def test_parity_procedural_disabled(self, monkeypatch, tmp_path):
-        loop_a = self._build_loop(monkeypatch, tmp_path / "a", procedural_enabled=False)
-        episodic_a, procedural_a = self._run_extract_session(loop_a)
+        loop = self._build_loop(monkeypatch, tmp_path, procedural_enabled=False)
+        episodic, procedural = self._run_extract_session(loop)
 
-        loop_b = self._build_loop(monkeypatch, tmp_path / "b", procedural_enabled=False)
-        episodic_b, procedural_b = self._run_cycle_and_capture(monkeypatch, loop_b)
-
-        def _key(qa):
-            return (qa["subject"], qa["predicate"], qa["object"])
-
-        assert sorted(map(_key, episodic_a)) == sorted(map(_key, episodic_b))
         # With procedural disabled, preferences fall back into episodic — never lost.
-        assert any(qa["predicate"] == "prefers" for qa in episodic_a)
-        assert procedural_a == []
-        assert procedural_b == []
+        assert any(qa["predicate"] == "prefers" for qa in episodic)
+        assert procedural == []
 
 
 class TestInterimRefinementGate:
@@ -2907,8 +2892,6 @@ class TestAbortSkipsCommit:
         loop.snapshot_dir = None
         loop._indexed_next_index = 0
         loop._indexed_ep_interim = {}
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         return loop
 
     def test_run_consolidation_cycle_returns_aborted_on_abort(self, monkeypatch, tmp_path):
@@ -3312,8 +3295,6 @@ class TestConsolidateInterimAdaptersFullFlow:
         loop.save_cycle_snapshots = False
         loop.snapshot_dir = None
         loop._indexed_ep_interim = {}
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.graph_enrichment_neighborhood_hops = 2
         return loop
@@ -7560,8 +7541,6 @@ class TestHarvestKeylessEdgesSpeakerId:
         loop._procedural_tentative_next_index = 0
         loop._indexed_next_index = 0
         loop._indexed_ep_interim = {}
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop._bg_trainer = None
         loop.shutdown_requested = False
         loop._early_stop_callback = None
@@ -7687,8 +7666,6 @@ class TestCollectKeyedEdgesInto:
         loop.save_cycle_snapshots = False
         loop.snapshot_dir = None
         loop._indexed_ep_interim = {}
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         merger = MagicMock()
         merger.graph = nx.MultiDiGraph()
         loop.merger = merger
@@ -8113,8 +8090,6 @@ class TestMaterializeInterimB1:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
@@ -8546,8 +8521,6 @@ class TestInterimKeyedWalkB3:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
@@ -8741,8 +8714,6 @@ class TestMergeRegistryRelationsUnification:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
@@ -9002,8 +8973,6 @@ class TestSubtractiveRemovalsHelperInterim:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
@@ -9296,8 +9265,6 @@ class TestSubtractiveRemovalsHelperFold:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
@@ -9548,8 +9515,6 @@ class TestRunGraphNormalizationApply:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
         loop.graph_enrichment_max_entities_per_pass = 50
@@ -10039,8 +10004,6 @@ class TestSubtractiveRemovalsDuplicateMerge:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
@@ -10247,8 +10210,6 @@ class TestNormalizationLevelGating:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
         loop.graph_enrichment_max_entities_per_pass = 50
@@ -11485,8 +11446,6 @@ class TestFoldResumeHelpers:
         loop.save_cycle_snapshots = False
         loop.snapshot_dir = None
         loop._indexed_ep_interim = {}
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.graph_enrichment_neighborhood_hops = 2
         loop._debug_writer = MagicMock()
@@ -12193,8 +12152,6 @@ class TestConsumePendingPathC:
         loop.save_cycle_snapshots = False
         loop.snapshot_dir = None
         loop._indexed_ep_interim = {}
-        loop.episodic_replay_pool = []
-        loop.curriculum_sampler = None
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.graph_enrichment_neighborhood_hops = 2
         return loop

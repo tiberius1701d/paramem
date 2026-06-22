@@ -157,10 +157,6 @@ class ConsolidationConfig:
     promotion_threshold: int = 3
     decay_window: int = 10
     procedural_detection_window: int = 5
-    episodic_new_weight: float = 0.7
-    semantic_replay_weight: float = 0.9
-    curriculum_enabled: bool = False
-    min_exposure_cycles: int = 5
     max_active_keys: int = 100000  # no practical limit
     key_retirement_threshold: float = 0.1
     key_retirement_cycles: int = 3

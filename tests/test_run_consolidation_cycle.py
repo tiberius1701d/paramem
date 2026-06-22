@@ -1422,10 +1422,6 @@ class TestRecallFailedSessionStaysPending:
                 "paramem.training.trainer.train_adapter",
                 return_value={"train_loss": 0.3, "aborted": False},
             ),
-            patch(
-                "paramem.training.consolidation.train_adapter",
-                return_value={"train_loss": 0.3, "aborted": False},
-            ),
             patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
             patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
             patch.object(loop, "_make_training_config", return_value=MagicMock()),

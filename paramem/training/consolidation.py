@@ -9,7 +9,6 @@ import logging
 import os
 import random
 import secrets
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import cached_property
@@ -40,11 +39,9 @@ from paramem.memory.entry import (
 )
 from paramem.models.loader import atomic_save_adapter, switch_adapter
 from paramem.server.vram_guard import safe_empty_cache
-from paramem.training.curriculum import CurriculumSampler
 from paramem.training.key_registry import KeyRegistry
-from paramem.training.replay import MixedReplayDataset, SyntheticQADataset
 from paramem.training.thermal_throttle import ThermalPolicy
-from paramem.training.trainer import TrainingHooks, train_adapter
+from paramem.training.trainer import TrainingHooks
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
@@ -403,18 +400,6 @@ class ConsolidationLoop:
         # BASE-MODEL HOLDER (GraphMerger): model-only contradiction at merge.
         self.merger.model = self.model
         self.merger.tokenizer = self.tokenizer
-
-        # Replay pools: track relations available for replay per adapter
-        # Each entry: {"question": str, "answer": str}
-        self.episodic_replay_pool: list[dict] = []
-        self.semantic_replay_pool: list[dict] = []
-
-        # Curriculum-aware replay sampling
-        self.curriculum_sampler: Optional[CurriculumSampler] = None
-        if self.config.curriculum_enabled:
-            self.curriculum_sampler = CurriculumSampler(
-                min_exposure_cycles=self.config.min_exposure_cycles,
-            )
 
         # Per-tier indexed-key memory store — injected by the caller.
         # Lifespan-owned in production; experiments construct + hydrate
@@ -1475,204 +1460,6 @@ class ConsolidationLoop:
             minted.append(entry)
         return minted
 
-    def finalize_training(self) -> None:
-        """Save adapters and registries after background training completes."""
-        self._save_adapters()
-        logger.info("Training finalized — adapters and registries saved")
-
-    def run_cycle(
-        self,
-        session_transcript: str,
-        session_id: str,
-        speaker_id: str,
-        speaker_name: str | None = None,
-        source_type: str = "transcript",
-    ) -> CycleResult:
-        """Run one consolidation cycle for a new session.
-
-        Legacy method — extracts and trains in one pass.
-        Used by experiment scripts. Server uses extract_session + train_adapters.
-
-        Raises ``TrialActiveError`` before any extraction when a migration TRIAL
-        is active (gated via the injected ``state_provider``; experiment scripts
-        that do not set ``state_provider`` are unaffected).
-
-        Args:
-            session_transcript: The raw session transcript text.
-            session_id: Unique identifier for this session.
-            speaker_id: Speaker identifier for preference scoping. Required —
-                callers must always supply a real speaker ID.
-            source_type: ``"transcript"`` (default) or ``"document"``. Passed
-                through to the extractor to select the appropriate system prompt.
-
-        Returns:
-            CycleResult with metrics and timing.
-        """
-        # Guard: block new cycles during a migration TRIAL.
-        if self.state_provider is not None:
-            self.guard_trial_state(self.state_provider())
-
-        start_time = time.time()
-        self.cycle_count += 1
-        result = CycleResult(cycle_index=self.cycle_count, session_id=session_id)
-
-        logger.info(
-            "=== Consolidation cycle %d (session=%s) ===",
-            self.cycle_count,
-            session_id,
-        )
-
-        # --- 1. EXTRACT ---
-        # Unified extraction path: every consolidation site reaches the
-        # extractors through ``self.extraction`` so every SOTA pipeline flag
-        # configured on the loop is applied identically.
-        session_graph = self.extraction.run(
-            session_transcript,
-            session_id,
-            source_type=source_type,
-            speaker_name=speaker_name,
-            speaker_id=speaker_id,
-        )
-        self._debug_writer.on_session_extracted(session_graph, session_id, "graph")
-
-        result.entities_extracted = len(session_graph.entities)
-        result.relations_extracted = len(session_graph.relations)
-
-        # --- 2. MERGE ---
-        # Always merge.  resolve_contradictions is driven by contradiction_detection
-        # config: when False, Case-2 cardinality resolution is skipped (no model
-        # call, no edge removal).  When True, the model may supersede older edges.
-        # Disable gradient checkpointing: merger.merge may call model.generate()
-        # when a model is present and resolve_contradictions=True.  HF silently
-        # disables the KV cache when checkpointing is active (CLAUDE.md rule).
-        self._disable_gradient_checkpointing()
-        try:
-            self.merger.merge(
-                session_graph,
-                resolve_contradictions=self.config.contradiction_detection,
-            )
-        finally:
-            self._enable_gradient_checkpointing()
-
-        # --- 4. BUILD ENTRY RELATION DICTS ---
-        # Single entry point: graph → (episodic_rels, procedural_rels).
-        # Builds relation dicts directly via _entries_from_graph — no
-        # model.generate calls.
-        episodic_rels, procedural_rels = self._entries_from_graph(
-            session_graph,
-            procedural_enabled=self.procedural_config is not None,
-        )
-
-        # Mirror extract_session(): run the dedicated procedural prompt so
-        # experiments exercise the same pipeline as production.
-        if self.procedural_config is not None:
-            proc_graph = self.extraction.run_procedural(
-                session_transcript,
-                session_id,
-                speaker_name=speaker_name,
-                source_type=source_type,
-                speaker_id=speaker_id,
-            )
-            self._debug_writer.on_session_extracted(proc_graph, session_id, "procedural_graph")
-            procedural_rels.extend(
-                {
-                    "subject": r.subject,
-                    "predicate": r.predicate,
-                    "object": r.object,
-                    "relation_type": r.relation_type,
-                }
-                for r in proc_graph.relations
-            )
-            # Merge proc_graph into the cumulative graph so its relations
-            # reach the unified keying surface (_build_all_edge_entries_into).
-            # Mirrors extract_session(): same resolve_contradictions flag and
-            # gradient-checkpointing discipline (CLAUDE.md rule).
-            self._disable_gradient_checkpointing()
-            try:
-                self.merger.merge(
-                    proc_graph,
-                    resolve_contradictions=self.config.contradiction_detection,
-                )
-            finally:
-                self._enable_gradient_checkpointing()
-
-        # Apply same dedup as server path (identical policy across all paths).
-        episodic_rels = self.dedup_episodic(episodic_rels)
-        procedural_rels = self.dedup_procedural(procedural_rels)
-
-        # --- 4b. INDEXED KEY REPLAY (F4.9c validated) ---
-        # Delegate to run_consolidation_cycle (unified episodic + procedural
-        # pipeline) so experiments exercise the same code path as production.
-        # cycle_count was already incremented at the top of this method; pass
-        # stamp=None so run_consolidation_cycle computes a fresh sub-interval
-        # stamp and does NOT double-increment (it increments internally).
-        # Caller undoes the pre-increment so run_consolidation_cycle owns the
-        # authoritative count for this cycle.
-        if self.store.replay_enabled:
-            # Undo the cycle_count increment done at the top of run_cycle so
-            # run_consolidation_cycle's own increment lands on the correct value.
-            self.cycle_count -= 1
-            cycle_result = self.run_consolidation_cycle(
-                episodic_rels,
-                procedural_rels,
-                speaker_id=speaker_id,
-                mode="train",
-                run_label=session_id,
-                new_promotions=None,
-            )
-            # cycle_count is now managed by run_consolidation_cycle.
-            # Propagate the episodic train loss from the cycle result dict.
-            # Procedural facts ride the interim slot so their loss folds into
-            # episodic_train_loss (no separate procedural_train_loss field).
-            _epi_loss = cycle_result.get("episodic_train_loss")
-            if _epi_loss is not None:
-                result.episodic_train_loss = _epi_loss
-
-        else:
-            # --- 4b-alt. CURRICULUM PROBE (optional) ---
-            episodic_recall_scores: dict[str, float] = {}
-            if self.curriculum_sampler and self.episodic_replay_pool:
-                self._disable_gradient_checkpointing()
-                switch_adapter(self.model, "episodic")
-                episodic_recall_scores = self.curriculum_sampler.probe_recall(
-                    self.model,
-                    self.tokenizer,
-                    self.episodic_replay_pool,
-                )
-                self.curriculum_sampler.update_history(episodic_recall_scores)
-
-            # --- 5. TRAIN EPISODIC ---
-            if episodic_rels:
-                episodic_loss = self._train_adapter_with_replay(
-                    "episodic",
-                    episodic_rels,
-                    self.episodic_replay_pool,
-                    self.config.episodic_new_weight,
-                    f"phase3-episodic-cycle{self.cycle_count}",
-                    recall_scores=episodic_recall_scores,
-                )
-                result.episodic_train_loss = episodic_loss
-
-                # Add new relations to episodic replay pool (cap at 100)
-                self.episodic_replay_pool.extend(
-                    {"question": qa["question"], "answer": qa["answer"]} for qa in episodic_rels
-                )
-                if len(self.episodic_replay_pool) > 100:
-                    self.episodic_replay_pool = self.episodic_replay_pool[-100:]
-
-        # --- 6. SAVE ---
-        self._save_adapters()
-
-        result.wall_clock_seconds = time.time() - start_time
-        logger.info(
-            "Cycle %d complete: %d extracted (%.1fs)",
-            self.cycle_count,
-            result.entities_extracted,
-            result.wall_clock_seconds,
-        )
-
-        return result
-
     @staticmethod
     def _indexed_dataset(examples: list[dict]) -> Dataset:
         """Wrap pre-tokenized indexed memory examples as a Dataset."""
@@ -1688,139 +1475,6 @@ class ConsolidationLoop:
                 return self.items[idx]
 
         return _IndexedDataset(examples)
-
-    def _train_adapter_with_replay(
-        self,
-        adapter_name: str,
-        new_qa_pairs: list[dict],
-        replay_pool: list[dict],
-        replay_weight: float,
-        run_name: str,
-        recall_scores: Optional[dict[str, float]] = None,
-    ) -> Optional[float]:
-        """Train adapter on new relations with optional replay.
-
-        Args:
-            adapter_name: "episodic" or "semantic"
-            new_qa_pairs: List of new QA dicts
-            replay_pool: Existing replay pool for this adapter
-            replay_weight: Weight for replay (1 - weight is new material)
-            run_name: wandb run name
-            recall_scores: Optional curriculum recall scores for weighted sampling.
-
-        Returns:
-            Training loss or None if dataset is empty.
-        """
-        switch_adapter(self.model, adapter_name)
-        new_dataset = self._qa_to_dataset(new_qa_pairs)
-
-        train_dataset = new_dataset
-        if replay_pool:
-            self._disable_gradient_checkpointing()
-            replay_examples = self._generate_replay_from_pool(
-                replay_pool, recall_scores=recall_scores
-            )
-            self._enable_gradient_checkpointing()
-
-            if replay_examples:
-                replay_dataset = self._qa_to_dataset(replay_examples)
-                train_dataset = MixedReplayDataset(
-                    new_dataset=new_dataset,
-                    replay_dataset=replay_dataset,
-                    replay_ratio=replay_weight,
-                )
-
-        if len(train_dataset) == 0:
-            return None
-
-        training_config = self._make_training_config(num_epochs=self.training_config.num_epochs)
-
-        self._enable_gradient_checkpointing()
-        metrics = train_adapter(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            train_dataset=train_dataset,
-            adapter_name=adapter_name,
-            training_config=training_config,
-            adapter_config=(
-                self.episodic_config if adapter_name == "episodic" else self.semantic_config
-            ),
-            wandb_config=self.wandb_config,
-            output_dir=self._training_output_dir(adapter_name),
-            run_name=run_name,
-            thermal_policy=self._thermal_policy,
-            hooks=self._build_training_hooks(),
-        )
-
-        if metrics is not None and metrics.get("aborted"):
-            logger.info(
-                "_train_adapter_with_replay: training aborted for %s — skipping registry update",
-                adapter_name,
-            )
-            return None
-
-        return metrics.get("train_loss") if metrics is not None else None
-
-    def _generate_replay_from_pool(
-        self,
-        pool: list[dict],
-        max_replay: int = 8,
-        recall_scores: Optional[dict[str, float]] = None,
-    ) -> list[dict]:
-        """Generate replay examples by querying the model on pool questions.
-
-        Uses the current adapter's knowledge to regenerate answers,
-        implementing generative replay without storing raw training data.
-        Samples up to max_replay items from the pool to keep cycle time bounded.
-
-        When curriculum sampling is enabled and recall_scores are provided,
-        sampling is weighted toward items with lower recall (harder facts).
-        """
-        from paramem.evaluation.recall import generate_answer
-        from paramem.training.dataset import format_inference_prompt
-
-        # Sample from pool — curriculum-weighted or uniform
-        if self.curriculum_sampler and recall_scores:
-            sampled = self.curriculum_sampler.weighted_sample(
-                pool, recall_scores, n_samples=max_replay
-            )
-        elif len(pool) > max_replay:
-            sampled = random.sample(pool, max_replay)
-        else:
-            sampled = pool
-
-        replay_examples = []
-        for item in sampled:
-            prompt = format_inference_prompt(item["question"], self.tokenizer)
-            generated = generate_answer(
-                self.model,
-                self.tokenizer,
-                prompt,
-                temperature=0.0,
-            )
-
-            # Quality gate
-            if len(generated.split()) < 3:
-                continue
-            if generated.strip().lower() == item["question"].strip().lower():
-                continue
-
-            replay_examples.append(
-                {
-                    "question": item["question"],
-                    "answer": generated,
-                }
-            )
-
-        return replay_examples
-
-    def _qa_to_dataset(self, qa_pairs: list[dict]) -> Dataset:
-        """Convert relation dicts to a SyntheticQADataset."""
-        return SyntheticQADataset(
-            examples=[{"question": qa["question"], "answer": qa["answer"]} for qa in qa_pairs],
-            tokenizer=self.tokenizer,
-            max_length=self.training_config.max_seq_length,
-        )
 
     def _make_training_config(self, num_epochs: int) -> TrainingConfig:
         """Build a TrainingConfig for consolidation training.
@@ -3561,6 +3215,91 @@ class ConsolidationLoop:
             )
         return _result
 
+    # ------------------------------------------------------------------
+    # Unified persist dispatch — replaces the three independent PATH A/B/C
+    # persist tails that previously lived inline in _run_fold.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _interim_venue_from_scope(scope: "FoldScope") -> "Literal['train', 'simulate']":
+        """Derive the ``commit_tier_slot`` venue string from *scope*.
+
+        This is a derivation, not a mode fork: the result flows from the
+        structural ``scope.source`` enum — no ``mode == "train"`` comparison
+        is introduced here, so the mode-fork guard is not triggered.
+
+        Args:
+            scope: The immutable :class:`FoldScope` for the current fold.
+
+        Returns:
+            ``"train"`` when weights are being written (``scope.source ==
+            "weights"``); ``"simulate"`` otherwise.
+        """
+        return "train" if scope.source == "weights" else "simulate"
+
+    def _persist_fold(
+        self,
+        scope: "FoldScope",
+        *,
+        # interim_slot inputs (PATH B)
+        adapter_name: "str | None" = None,
+        stamp: "str | None" = None,
+        all_keyed: "list[dict] | None" = None,
+        # main_tiers input (PATH C)
+        window_stamp_override: "str | None" = None,
+        # graph_json input (PATH A)
+        graph_path: "Path | None" = None,
+    ) -> None:
+        """Single persist tail for all three fold venues.
+
+        Dispatches on ``scope.persist`` only — never on a ``mode == "train"``
+        / ``mode == "simulate"`` literal (the mode-fork guard is satisfied).
+        Each branch writes its venue artifact; ``main_tiers`` already has disk
+        verify inside :meth:`_save_adapters`; ``interim_slot`` verify is wired
+        in COMMIT 2 via a callback param on :func:`~paramem.memory.persistence.commit_tier_slot`.
+
+        Called once by :meth:`_run_fold` in place of the three independent
+        persist tails that previously closed each PATH A / PATH B / PATH C
+        early-return block.  The surrounding venue-specific grooming (refine,
+        build-entries, train, result-dict assembly) stays inline in
+        :meth:`_run_fold`; only the **save action** is unified here.
+
+        Args:
+            scope: Immutable :class:`FoldScope` describing this fold.  The
+                ``persist`` field selects the dispatch branch.
+            adapter_name: Interim adapter name (``interim_slot`` path only).
+            stamp: Sub-interval stamp forwarded to
+                :func:`~paramem.memory.persistence.commit_tier_slot`
+                (``interim_slot`` path only).
+            all_keyed: Full keyed-pair list for the interim slot
+                (``interim_slot`` path only).
+            window_stamp_override: Forwarded to :meth:`_save_adapters`
+                (``main_tiers`` path only).
+            graph_path: Destination path for the merged graph
+                (``graph_json`` path only).
+        """
+        from paramem.memory.persistence import commit_tier_slot, save_memory_to_disk
+
+        if scope.persist == "graph_json":
+            # PATH A: write merger.graph directly (not tier_keyed).  No weights.
+            save_memory_to_disk(self.merger.graph, graph_path)  # type: ignore[arg-type]
+        elif scope.persist == "interim_slot":
+            # PATH B: commit adapter weights (train) or graph.json (simulate).
+            # The mode-fork lives inside commit_tier_slot, which is allowlisted.
+            commit_tier_slot(
+                loop=self,
+                tier="episodic",
+                adapter_name=adapter_name,  # type: ignore[arg-type]
+                stamp=stamp,  # type: ignore[arg-type]
+                mode=self._interim_venue_from_scope(scope),
+                all_keyed=all_keyed or [],
+                output_dir=self.output_dir,
+            )
+        elif scope.persist == "main_tiers":
+            # PATH C: rebuild main adapter weights.  Disk verify is inside
+            # _save_adapters (already had it pre-unification).
+            self._save_adapters(window_stamp_override=window_stamp_override)
+
     def _run_fold(
         self,
         scope: "FoldScope",
@@ -3701,8 +3440,6 @@ class ConsolidationLoop:
         # Replaces the deleted consolidate_interim_to_canonical_graph body.
         # ------------------------------------------------------------------
         if scope.persist == "graph_json":
-            from paramem.memory.persistence import save_memory_to_disk
-
             adapter_dir = self.output_dir
             canonical_graph_path = adapter_dir / "episodic" / "graph.json"
 
@@ -3767,7 +3504,7 @@ class ConsolidationLoop:
 
                 # MF-1: write merger.graph directly (not tier_keyed).
                 canonical_graph_path.parent.mkdir(parents=True, exist_ok=True)
-                save_memory_to_disk(self.merger.graph, canonical_graph_path)
+                self._persist_fold(scope, graph_path=canonical_graph_path)
                 _after_count = self.merger.graph.number_of_edges()
                 _minted_count = max(0, _after_count - _after_merge_count)
                 _collapsed_count = sum(
@@ -3833,8 +3570,6 @@ class ConsolidationLoop:
         # Extracted from the training body of run_consolidation_cycle.
         # ------------------------------------------------------------------
         if scope.persist == "interim_slot":
-            from paramem.memory.persistence import commit_tier_slot
-
             # --- PATH B fold-stamp (minted before any store mutation) ---
             # scope.tier gives the logical tier; adapter_name is the PEFT slot name.
             _fold_stamp_b = self._compute_fold_stamp(tier=adapter_name or scope.tier)
@@ -4049,17 +3784,11 @@ class ConsolidationLoop:
                 self._apply_subtractive_removals_to_store(scope=scope.subtractive_scope)
 
                 # --- Persist interim slot ---
-                # Derive the mode string required by commit_tier_slot from scope.source.
-                # The commit_tier_slot function is in the allowlist for mode comparisons.
-                _interim_venue = "train" if scope.source == "weights" else "simulate"
-                commit_tier_slot(
-                    loop=self,
-                    tier="episodic",
+                self._persist_fold(
+                    scope,
                     adapter_name=adapter_name,
                     stamp=stamp,
-                    mode=_interim_venue,
                     all_keyed=all_interim_keyed,
-                    output_dir=self.output_dir,
                 )
                 # Clear the PATH B fold_resume.json marker on clean commit.
                 self._clear_fold_resume()
@@ -4069,6 +3798,7 @@ class ConsolidationLoop:
                     switch_adapter(self.model, "episodic")
 
                 _interim_mode_label = "trained" if scope.source == "weights" else "simulated"
+                _interim_venue = self._interim_venue_from_scope(scope)
                 logger.info(
                     "_run_fold[interim]: %s %s — %d new keys, %d total interim keys",
                     _interim_mode_label,
@@ -4947,9 +4677,7 @@ class ConsolidationLoop:
 
             if self.store.replay_enabled and tiers_rebuilt:
                 try:
-                    self._save_adapters(
-                        window_stamp_override=window_stamp_override,
-                    )
+                    self._persist_fold(scope, window_stamp_override=window_stamp_override)
                 except Exception:
                     self._current_interim_stamp = None  # type: ignore[assignment]
                     raise
@@ -6944,60 +6672,6 @@ class ConsolidationLoop:
             retain_scratch_until_external_commit=retain_scratch_until_external_commit,
         )
         return metrics, recall_state
-
-
-def run_multi_session(
-    model,
-    tokenizer,
-    sessions: list[dict],
-    consolidation_config: ConsolidationConfig,
-    training_config: TrainingConfig,
-    episodic_adapter_config: AdapterConfig,
-    semantic_adapter_config: AdapterConfig,
-    wandb_config: Optional[WandbConfig] = None,
-    output_dir: str | Path = "outputs/phase3",
-    extraction_temperature: float = 0.0,
-) -> list[CycleResult]:
-    """Run consolidation loop across multiple sessions.
-
-    Args:
-        sessions: List of dicts with 'session_id' and 'transcript' keys.
-
-    Returns:
-        List of CycleResult, one per session.
-    """
-    from paramem.memory.store import MemoryStore
-
-    store = MemoryStore(
-        replay_enabled=consolidation_config.indexed_key_replay_enabled,
-    )
-    try:
-        store.load_registries_from_disk(Path(output_dir))
-    except Exception:
-        logger.exception("run_multi_session: registry load failed; starting with empty store")
-
-    loop = ConsolidationLoop(
-        model=model,
-        tokenizer=tokenizer,
-        consolidation_config=consolidation_config,
-        training_config=training_config,
-        episodic_adapter_config=episodic_adapter_config,
-        semantic_adapter_config=semantic_adapter_config,
-        memory_store=store,
-        wandb_config=wandb_config,
-        output_dir=output_dir,
-        extraction_temperature=extraction_temperature,
-    )
-
-    results = []
-    for session in sessions:
-        result = loop.run_cycle(
-            session_transcript=session["transcript"],
-            session_id=session["session_id"],
-        )
-        results.append(result)
-
-    return results
 
 
 def _mentions_any(text: str, terms: set[str]) -> bool:

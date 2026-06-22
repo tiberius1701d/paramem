@@ -431,11 +431,7 @@ PRODUCTION_MODULES = [
 # requirement).  Each entry is a (module_path, function-name) tuple.
 # Verified non-production by tracing all callers transitively from
 # paramem/server/app.py endpoints.
-EXPERIMENT_ONLY_ALLOWLIST = {
-    # Gated on indexed_key_registry is None (line ~1329); production
-    # server always has a registry.
-    ("paramem/training/consolidation.py", "_train_adapter_with_replay"),
-}
+EXPERIMENT_ONLY_ALLOWLIST: set[tuple[str, str]] = set()
 
 
 def _find_train_adapter_calls(tree: ast.AST) -> list[tuple[ast.AST, ast.Call]]:
