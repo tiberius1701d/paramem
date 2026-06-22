@@ -11310,9 +11310,17 @@ def _is_full_cycle_due(config) -> bool:
     Both signals are gated on ``n ≥ 1`` (un-folded interims must exist).
     An empty store returns ``False`` and stays on the interim path.
 
-    **N > 0 guard is mandatory**: ``(n - 1) % 0`` is a ``ZeroDivisionError``.
-    ``max_interim_count == 0`` is config-rejected (S4 validator); this guard
-    is the defensive belt.
+    **N == 0 special case (full-fold-only consume-pending mode)**: when
+    ``max_interim_count == 0`` there are no interim adapter slots — the
+    interim path never mints any, so ``n`` is always 0 and the count/deadline
+    logic below does not apply.  Every scheduled tick IS a full-cycle tick at
+    ``count == 0``; there is no interim path to route to.  The "no pending
+    sessions → don't train" decision is made downstream in ``_run_full_cycle``
+    (the existing noop/accumulating machinery).  At ``N == 0`` return ``True``
+    unconditionally.
+
+    ``N < 0`` is rejected at config load; the defensive belt below guards
+    against any future code path that bypasses the validator.
 
     Timestamps are in LOCAL time throughout, consistent with
     ``current_interim_stamp``'s ``datetime.now()`` basis.
@@ -11328,8 +11336,14 @@ def _is_full_cycle_due(config) -> bool:
     from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
 
     N = config.consolidation.max_interim_count
-    # N > 0 guard: (n-1) % 0 is ZeroDivisionError; also N<=0 is misconfigured.
-    if N <= 0:
+    # count==0 → full-fold-only consume-pending mode: every tick is a full cycle.
+    # There are no interim dirs to count or age; return True unconditionally so
+    # the dispatcher routes every tick to the full path.  The noop/accumulating
+    # machinery in _run_full_cycle owns the "nothing to train" fast-path.
+    if N == 0:
+        return True
+    # Negative N is config-rejected upstream; defensive belt only.
+    if N < 0:
         return False
 
     dirs = list(iter_interim_dirs(config.adapter_dir))
@@ -11588,9 +11602,11 @@ def _maybe_trigger_scheduled_consolidation() -> str:
         return "started_migration"
 
     # Full-cycle gate: when the period has elapsed, route to full
-    # consolidation regardless of whether sessions are pending. Pending
-    # sessions wait one tick (~refresh_cadence) for their interim write —
-    # acceptable given the period is much longer than the cadence.
+    # consolidation regardless of whether sessions are pending.
+    # At max_interim_count > 0: pending sessions wait one tick (~refresh_cadence)
+    # for their interim write — acceptable given the period is much longer than
+    # the cadence.  At max_interim_count == 0: no interim write; the full cycle
+    # consumes pending sessions directly via the consume-pending pre-stage.
     if _is_full_cycle_due(config):
         logger.info("Scheduler tick: full cycle due — running consolidate_interim_adapters")
         # Do NOT clear last_consolidation_error here.  A failure row stays visible
@@ -11681,6 +11697,10 @@ def _maybe_trigger_scheduled_consolidation() -> str:
     logger.info("Scheduler tick: %d NAMED session(s), starting extract + train", named_count)
     _state["consolidating"] = True
 
+    # count==0 cannot reach this branch: _is_full_cycle_due returns True
+    # at N==0 so the full-cycle gate at the top of this function (line ~11594)
+    # short-circuits before this interim path executes.  This branch mints
+    # episodic_interim_* slots — that is never correct at count==0.
     event_loop = asyncio.get_running_loop()
     future = event_loop.run_in_executor(None, _extract_and_start_training)
     future.add_done_callback(_scheduled_extract_done_callback)
@@ -13096,8 +13116,11 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
             Sessions are NOT marked consolidated; window stamp is not advanced.
     """
     from paramem.server.consolidation import (
+        SessionClass,
         _save_key_metadata,
+        classify_session,
         create_consolidation_loop,
+        session_retention_dir,
     )
 
     config = _state["config"]
@@ -13119,12 +13142,13 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
 
     def _run_full_cycle() -> None:
         """Run on the BG trainer worker thread under the GPU lock."""
-        # No voice eviction here. The full cycle collapses existing
-        # interim slots (already-trained keys) into main; it does not
-        # re-run the extraction chain that drives the KV-cache spikes
-        # the eviction was meant to mitigate. Voice eviction is scoped
-        # to the extraction path in _extract_and_start_training, and
-        # only when the pending batch is document-only.
+        # Voice eviction: the standard full cycle (count > 0) collapses existing
+        # interim slots (already-trained keys) into main — it does not run the
+        # extraction chain, so the KV-cache spikes that motivate eviction do not
+        # apply.  At count == 0 (consume-pending mode) we DO run the extraction
+        # chain below.  The eviction decision is made inside the consume-pending
+        # pre-stage and the restore fires in its finally block, so it correctly
+        # covers all exits including abort, exception, accumulating, and noop.
         #
         # Mode dispatch: simulate mode has no PEFT interim adapters —
         # calling consolidate_interim_adapters would trigger
@@ -13132,6 +13156,202 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # Simulate mode uses consolidate_simulate_fold instead, which
         # merges the per-cycle graph.json sidecars into the canonical
         # main-tier graph without touching PEFT weights.
+
+        # ------------------------------------------------------------------
+        # Consume-pending pre-stage (max_interim_count == 0 only).
+        #
+        # At count == 0 no interim slots are ever minted, so pending sessions
+        # must be extracted directly here, before the fold, depositing their
+        # relations into loop.merger.graph.  The fold's consume_pending capture
+        # stage (PATH C) then snapshots merger.graph into extra_relations and
+        # trains them into the main tiers.
+        #
+        # OD-A HARD CONSTRAINT: extract_session is called DIRECTLY here —
+        # NOT via bt.submit / gpu_lock_sync / gpu_lock / acquire_gpu.  This
+        # function already runs under the BG trainer worker's GPU lock
+        # (background_trainer.py:345).  Any second lock acquisition on the
+        # non-reentrant _gpu_thread_lock would deadlock the worker thread.
+        # extract_session / ExtractionPipeline / GraphMerger acquire zero
+        # locks and never call .submit() (grep-confirmed safe).
+        #
+        # Locals track extraction-succeeded sessions for mark_consolidated.
+        # Extraction-failed sessions are NOT marked; they stay pending for
+        # the next tick.  A successfully-extracted session is marked on BOTH
+        # fold success and fold noop (extraction succeeded but no NEW facts
+        # after dedup — session is processed, not retried).  U2 guard: this
+        # prevents unbounded pending growth from already-processed sessions.
+        # ------------------------------------------------------------------
+        _consume_pending = (
+            config.consolidation.max_interim_count == 0
+            and not housekeeping
+            and config.consolidation.mode != "simulate"
+        )
+        # Extraction tracking locals (populated in consume-pending pre-stage).
+        _cp_session_buffer = _state["session_buffer"]
+        _cp_session_ids: list[str] = []
+        _cp_failed_session_ids: set[str] = set()
+        _cp_speaker_ids: list[str] = []
+        _cp_evict_voice = False
+
+        if _consume_pending:
+            # Build NAMED-only set — mirror _extract_and_start_training:12430-12438.
+            _cp_store = _state.get("speaker_store")
+
+            def _cp_is_anon(sid: "str | None") -> bool:
+                return bool(_cp_store is not None and sid and _cp_store.is_anonymous(sid))
+
+            _named_ids: set[str] = {
+                f["session_id"]
+                for f in _cp_session_buffer.pending_facts()
+                if classify_session(
+                    speaker_id=f["speaker_id"],
+                    is_anonymous=_cp_is_anon(f["speaker_id"]),
+                    has_voice_embedding=f["has_voice_embedding"],
+                )
+                == SessionClass.NAMED
+            }
+            pending = [s for s in _cp_session_buffer.get_pending() if s["session_id"] in _named_ids]
+
+            # Voice eviction: evict when the pending batch contains ANY document
+            # session (same regime as _extract_and_start_training:12470-12472).
+            # We are already under the GPU lock (lock_held=True throughout).
+            _cp_evict_voice = bool(pending) and any(
+                s.get("source_type") == "document" for s in pending
+            )
+
+            ha_context = None
+            ha_client = _state.get("ha_client")
+            if ha_client is not None:
+                ha_context = ha_client.get_home_context()
+
+            try:
+                if _cp_evict_voice:
+                    _set_voice_pipeline_profile("cpu", lock_held=True)
+
+                for session in pending:
+                    session_id = session["session_id"]
+                    session_speaker_id = session.get("speaker_id")
+                    _cp_session_ids.append(session_id)
+
+                    if loop.shutdown_requested:
+                        logger.info("consume-pending: shutdown — stopping extraction early")
+                        break
+
+                    speaker_name = None
+                    if _state.get("speaker_store") is not None:
+                        try:
+                            speaker_name = _state["speaker_store"].get_name(session_speaker_id)
+                        except Exception as e:
+                            logger.warning(
+                                "speaker_store.get_name(%s) failed: %s",
+                                session_speaker_id,
+                                e,
+                            )
+
+                    try:
+                        check_vram_headroom(
+                            session_id,
+                            int(config.vram.vram_cache_headroom_gib * 2**30),
+                            _state,
+                        )
+                        with vram_scope(session_id):
+                            episodic_rels, procedural_rels = loop.extract_session(
+                                session["transcript"],
+                                session_id,
+                                speaker_id=session_speaker_id,
+                                speaker_name=speaker_name,
+                                ha_context=ha_context,
+                                stt_correction=config.consolidation.extraction_stt_correction,
+                                ha_validation=config.consolidation.extraction_ha_validation,
+                                noise_filter=config.consolidation.extraction_noise_filter,
+                                noise_filter_model=config.consolidation.extraction_noise_filter_model,
+                                noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint
+                                or None,
+                                ner_check=config.consolidation.extraction_ner_check,
+                                ner_model=config.consolidation.extraction_ner_model,
+                                plausibility_judge=config.consolidation.extraction_plausibility_judge,
+                                plausibility_stage=config.consolidation.extraction_plausibility_stage,
+                                verify_anonymization=config.consolidation.extraction_verify_anonymization,
+                                source_type=session.get("source_type", "transcript"),
+                            )
+                    except VramExhausted as exc:
+                        phase = exc.args[0] if exc.args else "unknown"
+                        logger.warning(
+                            "consume-pending: chunk %s OOM at phase=%s — skipping; "
+                            "remains pending for retry",
+                            session_id,
+                            phase,
+                        )
+                        _cp_failed_session_ids.add(session_id)
+                        _state.setdefault("chunk_failures", []).append(
+                            {
+                                "session_id": session_id,
+                                "phase": phase,
+                                "at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        )
+                        continue
+                    except ExtractionFailed as exc:
+                        # Whole-batch abort: leave ALL sessions pending, restore
+                        # voice, and return so the next tick retries.
+                        logger.error(
+                            "consume-pending: chunk %s extraction failed at phase=%s"
+                            " — %s. All %d session(s) remain pending; next tick retries.",
+                            session_id,
+                            exc.phase,
+                            exc.reason,
+                            len(_cp_session_ids),
+                        )
+                        _state.setdefault("chunk_failures", []).append(
+                            {
+                                "session_id": session_id,
+                                "phase": exc.phase,
+                                "reason": exc.reason,
+                                "at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        )
+                        record_incident(
+                            _state["config"].paths.data / "state",
+                            type="extraction_failed",
+                            key=str(exc.phase),
+                            severity="failed",
+                            summary=f"consume-pending: extraction failed at phase {exc.phase}",
+                            detail={
+                                "type": "extraction_failed",
+                                "phase": exc.phase,
+                                "reason": exc.reason,
+                                "session_id": session_id,
+                                "at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                        _state["consolidating"] = False
+                        return
+
+                    for qa in episodic_rels:
+                        qa["speaker_id"] = session_speaker_id
+                        qa["session_id"] = session_id
+                    for rel in procedural_rels:
+                        rel["speaker_id"] = session_speaker_id
+                        rel["session_id"] = session_id
+                    _cp_speaker_ids.append(session_speaker_id)
+
+            finally:
+                # Restore voice on ALL exits: success, noop (empty pending),
+                # accumulating, abort, uncaught exception, and ExtractionFailed
+                # (Python finally runs even when an enclosing try-block returns).
+                # lock_held=True: this closure runs inside the BG worker's GPU lock
+                # (OD-A corollary — lock_held=False would re-acquire the
+                # non-reentrant lock and deadlock).
+                if _cp_evict_voice:
+                    _set_voice_pipeline_profile(_target_profile(), lock_held=True)
+
+        # Helper: mark only extraction-succeeded sessions, further filtered by
+        # document-atomic retirement rules (SessionBuffer.retirable).
+        # Failed chunks remain pending so the next cycle retries them.
+        def _cp_completed_session_ids() -> list[str]:
+            raw = {sid for sid in _cp_session_ids if sid not in _cp_failed_session_ids}
+            return _cp_session_buffer.retirable(raw)
+
         _mode = config.consolidation.mode
         try:
             if housekeeping:
@@ -13149,6 +13369,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 result = loop.consolidate_interim_adapters(
                     trainer=bt,
                     router=_state.get("router"),
+                    consume_pending=_consume_pending,
                 )
         except AbortedDuringConsolidation as exc:
             # aborted = normal yield-to-chat outcome; NOT an incident.
@@ -13261,6 +13482,19 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 )
             except Exception:
                 logger.exception("Failed to record noop run status (non-fatal)")
+            # MF-A Site A: at count==0 the consume-pending pre-stage extracted
+            # sessions into merger.graph, but the fold found nothing new to train
+            # (all facts already present after dedup).  Mark extraction-succeeded
+            # sessions consolidated so they do not accumulate unboundedly (U2 guard).
+            # Extraction-failed sessions keep their pending status for retry.
+            if _consume_pending and _cp_session_ids:
+                try:
+                    _cp_session_buffer.mark_consolidated(
+                        _cp_completed_session_ids(),
+                        retention_dir=session_retention_dir(loop, config),
+                    )
+                except Exception:
+                    logger.exception("consume-pending noop: mark_consolidated failed (non-fatal)")
             _state["consolidating"] = False
             logger.info(
                 "Full cycle no-op — nothing to rebuild, inner finalize already "
@@ -13278,17 +13512,33 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
 
         # Persist key metadata.
         #
-        # The full consolidation run folds interim-adapter content into main; it
-        # does NOT run the extraction chain on pending sessions.  Pending sessions
-        # remain in the buffer and are consumed by the next interim tick (matching
-        # the dispatch contract at _maybe_trigger_scheduled_consolidation, which
-        # documents "Pending sessions wait one tick (~refresh_cadence) for their
-        # interim write").  Marking them consolidated here would permanently discard
-        # them without ever extracting or training on their content.
+        # When max_interim_count > 0 (standard mode): the full consolidation run
+        # folds interim-adapter content into main; it does NOT run the extraction
+        # chain on pending sessions.  Pending sessions remain in the buffer and are
+        # consumed by the next interim tick.  Marking them consolidated here would
+        # permanently discard them without ever extracting or training on their
+        # content.
+        #
+        # When max_interim_count == 0 (consume-pending mode): the pre-stage above
+        # extracted pending sessions into merger.graph, and the fold's consume_pending
+        # capture trained them into the main tiers.  MF-A Site B: mark
+        # extraction-succeeded sessions consolidated now that the fold has persisted
+        # their knowledge to the main tiers.  Extraction-failed sessions stay pending.
         try:
             _save_key_metadata(loop, config)
         except Exception:
             logger.exception("Post-full-cycle bookkeeping failed (non-fatal)")
+
+        # MF-A Site B: mark extraction-succeeded sessions consolidated after
+        # successful fold training (count==0 consume-pending mode only).
+        if _consume_pending and _cp_session_ids:
+            try:
+                _cp_session_buffer.mark_consolidated(
+                    _cp_completed_session_ids(),
+                    retention_dir=session_retention_dir(loop, config),
+                )
+            except Exception:
+                logger.exception("consume-pending success: mark_consolidated failed (non-fatal)")
 
         # ------------------------------------------------------------------ #
         # Post-fold re-probe — runs HERE on the BG worker thread under        #

@@ -10,7 +10,6 @@ All GPU/model calls are mocked — no hardware required.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # ---------------------------------------------------------------------------
@@ -85,21 +84,24 @@ class TestAbortQuiesceTimeoutConfig:
 
 
 def _make_scheduler_state(last_chat_monotonic=None, debounce_s: int = 30) -> tuple:
-    """Return (state_patch_dict, config_mock) for scheduler debounce tests."""
+    """Return (state_patch_dict, config_mock) for scheduler debounce tests.
+
+    These tests focus on the idle-debounce gate only.  ``_is_full_cycle_due``
+    is patched to ``False`` in each caller that needs to reach the pending-
+    session path — callers add that patch to their ``with`` block.
+    """
     cfg = MagicMock()
     cfg.consolidation.training_idle_debounce_s = debounce_s
-    # max_interim_count=0 makes _is_full_cycle_due return False immediately
-    # (N<=0 guard), keeping these tests focused on the debounce gate.
-    cfg.consolidation.max_interim_count = 0
-    cfg.consolidation.consolidation_period_seconds = None
-    cfg.adapter_dir = Path("/tmp/fake")
+
+    buf = MagicMock()
+    buf.pending_facts.return_value = []
 
     state_patch = {
         "consolidating": False,
         "mode": "local",
         "background_trainer": None,
         "config": cfg,
-        "session_buffer": MagicMock(get_pending=lambda: []),
+        "session_buffer": buf,
         "speaker_store": None,
         "pending_rehydration": False,
         "store_load_degraded": False,
@@ -138,10 +140,13 @@ class TestSchedulerIdleDebounce:
             debounce_s=30,
         )
         # The tick should reach the no-pending check and return noop_no_pending
-        # (session_buffer.get_pending() returns [] from the mock).
+        # (session_buffer.pending_facts() returns [] from the mock).
+        # _is_full_cycle_due is patched False so this test exercises the debounce
+        # gate in isolation without triggering the full-cycle event-loop path.
         with (
             patch.dict(app_module._state, state_patch, clear=False),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch("paramem.server.app._is_full_cycle_due", return_value=False),
         ):
             result = app_module._maybe_trigger_scheduled_consolidation()
 
@@ -157,9 +162,12 @@ class TestSchedulerIdleDebounce:
             last_chat_monotonic=time.monotonic(),
             debounce_s=0,
         )
+        # _is_full_cycle_due is patched False so this test exercises the debounce
+        # gate in isolation without triggering the full-cycle event-loop path.
         with (
             patch.dict(app_module._state, state_patch, clear=False),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch("paramem.server.app._is_full_cycle_due", return_value=False),
         ):
             result = app_module._maybe_trigger_scheduled_consolidation()
 
@@ -170,9 +178,12 @@ class TestSchedulerIdleDebounce:
         import paramem.server.app as app_module
 
         state_patch, _ = _make_scheduler_state(last_chat_monotonic=None, debounce_s=30)
+        # _is_full_cycle_due is patched False so this test exercises the debounce
+        # gate in isolation without triggering the full-cycle event-loop path.
         with (
             patch.dict(app_module._state, state_patch, clear=False),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch("paramem.server.app._is_full_cycle_due", return_value=False),
         ):
             result = app_module._maybe_trigger_scheduled_consolidation()
 

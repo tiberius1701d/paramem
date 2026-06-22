@@ -1718,14 +1718,27 @@ class TestFullCycleGateHelpers:
         cfg.consolidation.consolidation_period_seconds = period_seconds
         return cfg
 
-    def test_is_full_cycle_due_zero_count_returns_false(self, tmp_path):
-        """N==0 guard: (n-1) % 0 would be ZeroDivisionError; gate returns False."""
+    def test_is_full_cycle_due_zero_count_returns_true(self, tmp_path):
+        """N==0 (full-fold-only consume-pending mode): every tick is a full cycle → True.
+
+        At count==0 no interim slots are minted, so the count/deadline logic
+        does not apply.  _is_full_cycle_due returns True unconditionally so the
+        dispatcher always routes to the full path.
+        """
         from paramem.server.app import _is_full_cycle_due
 
-        # Populate N+1=1 interim dirs — would fire if N=0 were not guarded.
+        # No interim dirs at all (the normal state at count==0).
+        cfg = self._make_config(tmp_path, max_interim_count=0)
+        assert _is_full_cycle_due(cfg) is True
+
+    def test_is_full_cycle_due_zero_count_returns_true_with_interim_dirs(self, tmp_path):
+        """N==0 returns True even when stale interim dirs exist (recovery scenario)."""
+        from paramem.server.app import _is_full_cycle_due
+
+        # Stale interim dirs that might have been left from a prior mode change.
         self._make_interim_dir(tmp_path, "20260620T0000")
         cfg = self._make_config(tmp_path, max_interim_count=0)
-        assert _is_full_cycle_due(cfg) is False
+        assert _is_full_cycle_due(cfg) is True
 
     def test_is_full_cycle_due_no_interims_returns_false(self, tmp_path):
         """Empty interim store (n=0): gate always returns False regardless of config."""
@@ -12465,3 +12478,524 @@ class TestConsumePendingPathC:
         extra = path_c_call.get("extra_relations")
         # Helper returns [] on empty graph; PATH C passes it through.
         assert extra == [] or extra is None  # both are valid no-ops for materialize
+
+
+# ---------------------------------------------------------------------------
+# Dispatch: count==0 routes every tick to the full path, never interim
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchCountZeroRoutesToFull:
+    """_maybe_trigger_scheduled_consolidation at count==0 → always full, never interim.
+
+    At max_interim_count==0, _is_full_cycle_due returns True unconditionally,
+    so every scheduled tick routes to the full consolidation path ("started_full")
+    and the interim slot-minting path (_extract_and_start_training) is never reached.
+    """
+
+    def _make_minimal_state(self, tmp_path, buffer, store=None) -> dict:
+        """Minimal _state for the dispatch tests.
+
+        Uses a plain MagicMock (no spec) for config so attribute assignment
+        works without triggering spec-gating on the nested consolidation field.
+        """
+        config = MagicMock()
+        config.consolidation.max_interim_count = 0
+        config.consolidation.refresh_cadence = "12h"
+        config.consolidation.training_idle_debounce_s = 0
+        config.consolidation.orphan_retirement_seconds = None
+        config.debug = False
+        config.debug_dir = tmp_path / "debug"
+
+        return {
+            "config": config,
+            "session_buffer": buffer,
+            "speaker_store": store or MagicMock(),
+            "consolidating": False,
+            "mode": "local",
+            "last_chat_monotonic": None,
+            "pending_rehydration": False,
+            "store_load_degraded": False,
+        }
+
+    def _call_tick_count_zero(self, state_overrides: dict) -> str:
+        """Run _maybe_trigger_scheduled_consolidation with count==0 real _is_full_cycle_due.
+
+        Does NOT patch _is_full_cycle_due — at count==0 the real function returns True
+        unconditionally so the test exercises the real routing logic.  Patches out the
+        asyncio event loop and the side-effectful dispatch functions so no GPU work runs.
+        """
+        from unittest.mock import MagicMock, patch
+
+        import paramem.server.app as _app
+
+        # Provide a mock event loop so asyncio.get_running_loop() doesn't raise.
+        mock_loop = MagicMock()
+        mock_future = MagicMock()
+        mock_future.add_done_callback = MagicMock()
+        mock_loop.run_in_executor = MagicMock(return_value=mock_future)
+
+        with (
+            patch.object(_app, "_state", state_overrides),
+            patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch("paramem.server.app._run_full_consolidation_sync") as _mock_full,
+            patch("paramem.server.app._extract_and_start_training") as _mock_interim,
+            patch("asyncio.get_running_loop", return_value=mock_loop),
+        ):
+            result = _app._maybe_trigger_scheduled_consolidation()
+        return result, _mock_full.call_count, _mock_interim.call_count
+
+    def test_count_zero_every_tick_routes_to_full(self, tmp_path):
+        """At max_interim_count==0, every tick returns started_full (never started)."""
+        from paramem.server.session_buffer import SessionBuffer
+
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
+        # Add a NAMED session so the dispatch has something to see.
+        buffer.append("conv-named", "user", "Hello", speaker_id="sp-abc")
+        buffer.append("conv-named", "assistant", "Hi")
+
+        state = self._make_minimal_state(tmp_path, buffer)
+        result, full_count, interim_count = self._call_tick_count_zero(state)
+        assert result == "started_full", f"Expected 'started_full' at count==0, got {result!r}"
+
+    def test_count_zero_never_reaches_extract_and_start_training(self, tmp_path):
+        """The interim slot-minting path is never invoked at count==0."""
+        from paramem.server.session_buffer import SessionBuffer
+
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
+        buffer.append("conv-named", "user", "Hello", speaker_id="sp-abc")
+        buffer.append("conv-named", "assistant", "Hi")
+
+        state = self._make_minimal_state(tmp_path, buffer)
+        _result, _full_count, interim_count = self._call_tick_count_zero(state)
+        assert interim_count == 0, (
+            "_extract_and_start_training must NOT be called at count==0; "
+            f"was called {interim_count} time(s)"
+        )
+
+    def test_count_zero_empty_buffer_still_routes_to_full(self, tmp_path):
+        """At count==0, even with no pending sessions the tick routes to started_full.
+
+        The noop/accumulating decision lives in _run_full_cycle, not in the dispatcher.
+        """
+        from paramem.server.session_buffer import SessionBuffer
+
+        buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
+        # No sessions at all.
+        state = self._make_minimal_state(tmp_path, buffer)
+        result, _full_count, _interim_count = self._call_tick_count_zero(state)
+        assert result == "started_full", (
+            f"Expected 'started_full' at count==0 (empty buffer), got {result!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _run_full_cycle: consume-pending pre-stage extract-loop + mark_consolidated
+# ---------------------------------------------------------------------------
+
+
+class TestRunFullCycleConsumePending:
+    """_run_full_consolidation_sync at count==0 exercises the consume-pending path.
+
+    Tests verify:
+    - extract_session called per pending NAMED session
+    - consolidate_interim_adapters receives consume_pending=True
+    - mark_consolidated called on fold SUCCESS (Site B)
+    - mark_consolidated called on fold NOOP with extraction success (Site A)
+    - mark_consolidated NOT called on AbortedDuringConsolidation
+    - mark_consolidated NOT called on Exception (fold crash)
+    - mark_consolidated NOT called on status="accumulating"
+    - Extraction-FAILED sessions not marked in either site
+    """
+
+    def _make_state(self, tmp_path, *, max_interim_count: int = 0) -> dict:
+        """Build minimal _state for _run_full_consolidation_sync.
+
+        Pre-populates consolidation_loop and session_buffer mocks.
+        config.consolidation.mode is 'train'; training_temp_limit=0 so
+        ThermalPolicy returns None (avoids MagicMock int comparison).
+        """
+        mock_config = MagicMock()
+        mock_config.consolidation.mode = "train"
+        mock_config.consolidation.max_interim_count = max_interim_count
+        mock_config.consolidation.training_temp_limit = 0
+        # VRAM config accessed in check_vram_headroom:
+        mock_config.vram.vram_cache_headroom_gib = 0.5
+        if tmp_path is not None:
+            mock_config.paths.data = tmp_path
+
+        mock_loop = MagicMock()
+        mock_loop.model = MagicMock(name="model")
+        mock_loop.shutdown_requested = False
+        mock_loop.store.replay_enabled = False
+
+        # consolidate_interim_adapters returns success by default.
+        mock_loop.consolidate_interim_adapters.return_value = {
+            "tiers_rebuilt": ["episodic"],
+            "graph_drift_count": 0,
+            "rolled_back": False,
+        }
+
+        mock_session_buffer = MagicMock()
+        # retirable returns all ids passed to it (simplifies assertions).
+        mock_session_buffer.retirable.side_effect = lambda ids: list(ids)
+
+        return {
+            "config": mock_config,
+            "model": MagicMock(name="model"),
+            "tokenizer": MagicMock(name="tokenizer"),
+            "consolidation_loop": mock_loop,
+            "session_buffer": mock_session_buffer,
+            "speaker_store": None,
+            "router": None,
+            "background_trainer": None,
+            "consolidating": True,
+            "last_consolidation": None,
+            "ha_client": None,
+            "voice_profile": "gpu",
+        }
+
+    def _pending_session(self, session_id: str = "sess-1", speaker_id: str = "sp-abc") -> dict:
+        """Build a minimal pending-session dict (as returned by get_pending)."""
+        return {
+            "session_id": session_id,
+            "speaker_id": speaker_id,
+            "transcript": "Hello, my name is Test User.",
+            "source_type": "transcript",
+        }
+
+    def _pending_fact(self, session_id: str = "sess-1", speaker_id: str = "sp-abc") -> dict:
+        """Build a minimal pending_facts() entry (as returned by pending_facts)."""
+        return {
+            "session_id": session_id,
+            "speaker_id": speaker_id,
+            "has_voice_embedding": False,
+        }
+
+    def _run_sync(self, state: dict, monkeypatch) -> None:
+        """Run _run_full_consolidation_sync under patched _state + inlined bt.submit."""
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        monkeypatch.setattr(app_module, "_state", state)
+
+        mock_bt = MagicMock()
+        mock_bt.abort_requested = False
+        # submit(fn, **kw) → call fn() directly (no threading).
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        with patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt):
+            app_module._run_full_consolidation_sync()
+
+    def test_count_zero_extract_session_called_per_pending(self, monkeypatch, tmp_path):
+        """At count==0, extract_session is called once per pending NAMED session."""
+        from unittest.mock import patch
+
+        state = self._make_state(tmp_path)
+        loop = state["consolidation_loop"]
+        # extract_session returns empty lists (no relations extracted).
+        loop.extract_session.return_value = ([], [])
+
+        sb = state["session_buffer"]
+        session1 = self._pending_session("sess-1", "sp-abc")
+        session2 = self._pending_session("sess-2", "sp-abc")
+        sb.get_pending.return_value = [session1, session2]
+        # pending_facts used to build the NAMED-only set.
+        sb.pending_facts.return_value = [
+            self._pending_fact("sess-1", "sp-abc"),
+            self._pending_fact("sess-2", "sp-abc"),
+        ]
+
+        # Patch check_vram_headroom and vram_scope to no-ops so no GPU required.
+        # Also patch the success-path helpers that would try to serialize MagicMock.
+        with (
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+            patch("paramem.server.consolidation._save_key_metadata"),
+            patch("paramem.server.app._dispatch_finalize"),
+            patch("paramem.server.consolidation.session_retention_dir", return_value=None),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        assert loop.extract_session.call_count == 2, (
+            f"Expected 2 extract_session calls (one per session), "
+            f"got {loop.extract_session.call_count}"
+        )
+
+    def test_count_zero_consume_pending_true_passed_to_fold(self, monkeypatch, tmp_path):
+        """At count==0, consolidate_interim_adapters receives consume_pending=True."""
+        from unittest.mock import patch
+
+        state = self._make_state(tmp_path)
+        loop = state["consolidation_loop"]
+        loop.extract_session.return_value = ([], [])
+
+        sb = state["session_buffer"]
+        sb.get_pending.return_value = [self._pending_session()]
+        sb.pending_facts.return_value = [self._pending_fact()]
+
+        with (
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+            patch("paramem.server.consolidation._save_key_metadata"),
+            patch("paramem.server.app._dispatch_finalize"),
+            patch("paramem.server.consolidation.session_retention_dir", return_value=None),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        call_kwargs = loop.consolidate_interim_adapters.call_args
+        assert call_kwargs is not None
+        assert call_kwargs.kwargs.get("consume_pending") is True, (
+            f"consolidate_interim_adapters must receive consume_pending=True at count==0; "
+            f"kwargs={call_kwargs.kwargs}"
+        )
+
+    def test_count_greater_zero_consume_pending_false(self, monkeypatch, tmp_path):
+        """At count>0 (standard mode), consolidate_interim_adapters gets consume_pending=False."""
+        state = self._make_state(tmp_path, max_interim_count=7)
+        from unittest.mock import patch
+
+        loop = state["consolidation_loop"]
+        # At count>0 extract_session must NOT be called (no consume-pending stage).
+        sb = state["session_buffer"]
+        sb.get_pending.return_value = []
+        sb.pending_facts.return_value = []
+
+        with (
+            patch("paramem.server.consolidation._save_key_metadata"),
+            patch("paramem.server.app._dispatch_finalize"),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        call_kwargs = loop.consolidate_interim_adapters.call_args
+        assert call_kwargs is not None
+        consume = call_kwargs.kwargs.get("consume_pending", False)
+        assert consume is False, (
+            f"consolidate_interim_adapters must receive consume_pending=False at count>0; "
+            f"kwargs={call_kwargs.kwargs}"
+        )
+        loop.extract_session.assert_not_called()
+
+    def test_mark_consolidated_called_on_fold_success_site_b(self, monkeypatch, tmp_path):
+        """MF-A Site B: mark_consolidated called on fold success at count==0."""
+        from unittest.mock import patch
+
+        state = self._make_state(tmp_path)
+        loop = state["consolidation_loop"]
+        loop.extract_session.return_value = ([], [])
+        # Fold returns success (tiers_rebuilt non-empty).
+        loop.consolidate_interim_adapters.return_value = {
+            "tiers_rebuilt": ["episodic"],
+            "graph_drift_count": 0,
+            "rolled_back": False,
+        }
+
+        sb = state["session_buffer"]
+        session1 = self._pending_session("sess-1", "sp-abc")
+        sb.get_pending.return_value = [session1]
+        sb.pending_facts.return_value = [self._pending_fact("sess-1", "sp-abc")]
+
+        with (
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+            patch("paramem.server.consolidation._save_key_metadata"),
+            patch("paramem.server.app._dispatch_finalize"),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        sb.mark_consolidated.assert_called_once()
+
+    def test_mark_consolidated_called_on_fold_noop_site_a(self, monkeypatch, tmp_path):
+        """MF-A Site A: mark_consolidated called when fold returns noop at count==0.
+
+        Noop = tiers_rebuilt=[] and status != 'accumulating'.  Extraction succeeded,
+        but the fold found nothing new to train (all facts already present after dedup).
+        The sessions are processed — mark them consolidated to prevent re-extraction
+        unboundedly (U2 guard).
+        """
+        from unittest.mock import patch
+
+        state = self._make_state(tmp_path)
+        loop = state["consolidation_loop"]
+        loop.extract_session.return_value = ([], [])
+        # Fold returns noop.
+        loop.consolidate_interim_adapters.return_value = {
+            "tiers_rebuilt": [],
+            "graph_drift_count": 0,
+            "rolled_back": False,
+        }
+
+        sb = state["session_buffer"]
+        session1 = self._pending_session("sess-1", "sp-abc")
+        sb.get_pending.return_value = [session1]
+        sb.pending_facts.return_value = [self._pending_fact("sess-1", "sp-abc")]
+
+        with (
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+            patch("paramem.server.consolidation.session_retention_dir", return_value=None),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        sb.mark_consolidated.assert_called_once()
+
+    def test_mark_consolidated_not_called_on_accumulating(self, monkeypatch, tmp_path):
+        """mark_consolidated NOT called when fold returns status='accumulating'."""
+        from unittest.mock import patch
+
+        state = self._make_state(tmp_path)
+        loop = state["consolidation_loop"]
+        loop.extract_session.return_value = ([], [])
+        loop.consolidate_interim_adapters.return_value = {
+            "status": "accumulating",
+            "accumulating_reason": {"floor": 30},
+            "tiers_rebuilt": [],
+        }
+
+        sb = state["session_buffer"]
+        sb.get_pending.return_value = [self._pending_session()]
+        sb.pending_facts.return_value = [self._pending_fact()]
+
+        with (
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        sb.mark_consolidated.assert_not_called()
+
+    def test_mark_consolidated_not_called_on_abort(self, monkeypatch, tmp_path):
+        """mark_consolidated NOT called when fold raises AbortedDuringConsolidation."""
+        from unittest.mock import patch
+
+        from paramem.training.consolidation import AbortedDuringConsolidation
+
+        state = self._make_state(tmp_path)
+        loop = state["consolidation_loop"]
+        loop.extract_session.return_value = ([], [])
+        loop.consolidate_interim_adapters.side_effect = AbortedDuringConsolidation(
+            "aborted for chat"
+        )
+
+        sb = state["session_buffer"]
+        sb.get_pending.return_value = [self._pending_session()]
+        sb.pending_facts.return_value = [self._pending_fact()]
+
+        with (
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        sb.mark_consolidated.assert_not_called()
+
+    def test_mark_consolidated_not_called_on_exception(self, monkeypatch, tmp_path):
+        """mark_consolidated NOT called when fold raises an unexpected exception."""
+        from unittest.mock import patch
+
+        state = self._make_state(tmp_path)
+        loop = state["consolidation_loop"]
+        loop.extract_session.return_value = ([], [])
+        loop.consolidate_interim_adapters.side_effect = RuntimeError("fold exploded")
+
+        sb = state["session_buffer"]
+        sb.get_pending.return_value = [self._pending_session()]
+        sb.pending_facts.return_value = [self._pending_fact()]
+
+        with (
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        sb.mark_consolidated.assert_not_called()
+
+    def test_extraction_failed_session_not_marked(self, monkeypatch, tmp_path):
+        """Extraction-failed sessions are NOT marked consolidated (stay pending).
+
+        VramExhausted on one session: that session goes into failed_session_ids and
+        is excluded from the mark_consolidated call (only the other session is marked).
+        """
+        from unittest.mock import patch
+
+        from paramem.server.vram_guard import VramExhausted
+
+        state = self._make_state(tmp_path)
+        loop = state["consolidation_loop"]
+
+        call_count = {"n": 0}
+
+        def _extract_side_effect(*_args, **_kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise VramExhausted("extract", 0, 0)
+            return ([], [])
+
+        loop.extract_session.side_effect = _extract_side_effect
+
+        sb = state["session_buffer"]
+        session1 = self._pending_session("sess-fail", "sp-abc")
+        session2 = self._pending_session("sess-ok", "sp-abc")
+        sb.get_pending.return_value = [session1, session2]
+        sb.pending_facts.return_value = [
+            self._pending_fact("sess-fail", "sp-abc"),
+            self._pending_fact("sess-ok", "sp-abc"),
+        ]
+
+        with (
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+            patch("paramem.server.consolidation._save_key_metadata"),
+            patch("paramem.server.app._dispatch_finalize"),
+            patch("paramem.server.consolidation.session_retention_dir", return_value=None),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        # mark_consolidated should be called — with only sess-ok, not sess-fail.
+        sb.mark_consolidated.assert_called_once()
+        call_args = sb.mark_consolidated.call_args
+        if call_args.args:
+            marked_ids = call_args.args[0]
+        else:
+            marked_ids = call_args.kwargs.get("session_ids", [])
+        assert "sess-fail" not in marked_ids, (
+            "VramExhausted session must NOT be marked consolidated"
+        )
+        assert "sess-ok" in marked_ids, "Extraction-succeeded session must be marked consolidated"
+
+    def test_extraction_failed_aborts_whole_batch(self, monkeypatch, tmp_path):
+        """ExtractionFailed on any session aborts the whole batch at count==0.
+
+        All sessions must remain pending (mark_consolidated never called), and
+        the fold (consolidate_interim_adapters) must never be reached.
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.extractor import ExtractionFailed
+
+        state = self._make_state(tmp_path)
+        loop = state["consolidation_loop"]
+        loop.extract_session.side_effect = ExtractionFailed(
+            "sota_enrich", "upstream 529 overloaded"
+        )
+
+        sb = state["session_buffer"]
+        session1 = self._pending_session("sess-1", "sp-abc")
+        session2 = self._pending_session("sess-2", "sp-abc")
+        sb.get_pending.return_value = [session1, session2]
+        sb.pending_facts.return_value = [
+            self._pending_fact("sess-1", "sp-abc"),
+            self._pending_fact("sess-2", "sp-abc"),
+        ]
+
+        with (
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+            patch("paramem.server.app.record_incident"),
+        ):
+            self._run_sync(state, monkeypatch)
+
+        loop.consolidate_interim_adapters.assert_not_called()
+        sb.mark_consolidated.assert_not_called()
