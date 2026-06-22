@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING
 import networkx as nx
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from typing import Literal
 
     from paramem.training.consolidation import ConsolidationLoop
@@ -391,6 +392,7 @@ def commit_tier_slot(
     mode: "Literal['simulate', 'train']",
     all_keyed: "list[dict]",
     output_dir: Path,
+    verify: "Callable[[Path], None] | None" = None,
 ) -> None:
     """Atomic write of one interim-tier slot, venue-switching on mode.
 
@@ -414,13 +416,18 @@ def commit_tier_slot(
        Same root for both modes.
     5. Write venue payload:
 
-       - **Train mode**: :func:`paramem.models.loader.atomic_save_adapter`
+       - **Train mode**: :func:`paramem.models.loader.save_adapter`
          writes the PEFT adapter weights into a timestamped slot dir under the
          root.  The manifest (from step 3) is embedded as ``meta.json``.
+         If *verify* is not ``None``, it is called with the slot path
+         immediately after the weight write and before the registry flush
+         (step 6).  A raise from *verify* propagates as-is; the ``finally``
+         orphan-cleanup fires because ``_registry_flushed`` is still ``False``
+         at that point, removing the half-committed slot.
        - **Simulate mode**: builds a ``MultiDiGraph`` from *all_keyed* and
          writes it as ``<slot_root>/graph.json`` via :func:`save_memory_to_disk`
          (encrypted/plaintext depending on daily-key state).  No PEFT weights
-         are written.
+         are written.  *verify* is not called in simulate mode.
 
     6. Flush the exact registry bytes from step 1 to
        ``<slot_root>/indexed_key_registry.json`` as the commit signal (both
@@ -428,7 +435,7 @@ def commit_tier_slot(
        This is the last write — its presence on disk signals that all preceding
        files are complete.
 
-    Crash semantics: a kill after step 5 but before step 7 leaves the slot
+    Crash semantics: a kill after step 5 but before step 6 leaves the slot
     present without the registry file.  The boot validator in
     :func:`paramem.server.app._mount_adapters_from_slots` (via
     :func:`paramem.server.app.find_live_slot` / ``iter_interim_dirs``) skips
@@ -458,9 +465,15 @@ def commit_tier_slot(
             scanning the full store (avoids including keys from other tiers).
         output_dir: Adapter store root (``loop.output_dir``).  Slot root is
             derived from this via ``adapter_slot_root_for_name``.
+        verify: Optional callable invoked with the written slot ``Path``
+            after weight write and **before** the registry flush (train mode
+            only).  A raise propagates unchanged; the ``finally`` orphan-cleanup
+            removes the slot because ``_registry_flushed`` is still ``False``.
+            Pass ``None`` (default) to skip verification (simulate mode or
+            callers that do not need disk-integrity gating).
 
     Returns:
-        ``None``.  Raises on I/O failure.
+        ``None``.  Raises on I/O failure or verify failure.
 
     Raises:
         RuntimeError: When ``loop.store.replay_enabled`` is ``False`` (no
@@ -525,14 +538,22 @@ def commit_tier_slot(
 
             # Use save_adapter (thin forwarder to atomic_save_adapter) so tests can
             # patch paramem.models.loader.save_adapter without reaching atomic internals.
+            # save_adapter now returns the timestamped slot Path so the verify
+            # callback receives the exact directory that was written.
             from paramem.models.loader import save_adapter as _save_adapter
 
-            _save_adapter(loop.model, slot_root, adapter_name, manifest=manifest)
+            slot = _save_adapter(loop.model, slot_root, adapter_name, manifest=manifest)
             logger.debug(
                 "commit_tier_slot: adapter weights saved for %s (tier=%s)",
                 adapter_name,
                 tier,
             )
+            # Disk-integrity gate: runs BEFORE the registry flush (step 6) so
+            # that a failed verify fires while _registry_flushed is still False.
+            # The finally orphan-cleanup then removes the half-committed slot.
+            # GPU recall in 'simulate' mode is a no-op path — verify is None there.
+            if verify is not None:
+                verify(slot)
         else:
             # Simulate mode: build graph from all_keyed and write graph.json.
             # When all_keyed is empty, re-project from the canonical store so

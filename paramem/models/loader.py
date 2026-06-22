@@ -345,7 +345,7 @@ def save_adapter(
     adapter_name: str,
     *,
     manifest=None,
-) -> None:
+) -> Path:
     """Save a specific adapter to disk via the atomic slot-dir path.
 
     Thin forwarder to :func:`atomic_save_adapter`.  All callers receive
@@ -358,8 +358,12 @@ def save_adapter(
         manifest: Optional :class:`paramem.adapters.manifest.AdapterManifest`
             to write alongside the adapter files.  When ``None``, no
             ``meta.json`` is written.
+
+    Returns:
+        Path to the final (promoted) slot directory, as returned by
+        :func:`atomic_save_adapter`.
     """
-    atomic_save_adapter(model, path, adapter_name, manifest=manifest)
+    return atomic_save_adapter(model, path, adapter_name, manifest=manifest)
 
 
 def atomic_save_adapter(

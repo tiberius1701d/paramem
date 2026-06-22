@@ -3237,6 +3237,62 @@ class ConsolidationLoop:
         """
         return "train" if scope.source == "weights" else "simulate"
 
+    def _verify_committed_slot(
+        self,
+        adapter_name: str,
+        all_keyed: "list[dict]",
+        slot: Path,
+    ) -> None:
+        """Reload an interim slot from disk and probe recall integrity.
+
+        Bridges :meth:`_persist_fold` (interim-train path) to the shared
+        :meth:`_verify_saved_adapter_from_disk` method that ``_save_adapters``
+        uses for main tiers — closing the disk-verify gap for interim slots
+        without mirroring the verify implementation.
+
+        Entry shape passed to the probe contains ONLY the four canonical
+        SPO fields (``key``, ``subject``, ``predicate``, ``object``).
+        Sentinel fields such as ``_new`` carried by ``all_interim_keyed``
+        are intentionally stripped (M2) so the probe entry shape matches what
+        ``_entries_for_tier`` produces and what ``_run_recall_sanity_probe``
+        expects.
+
+        Called as the *verify* callback in :func:`~paramem.memory.persistence.commit_tier_slot`
+        (train branch only, before the registry flush).  A raise propagates
+        unchanged; the ``finally`` orphan-cleanup in ``commit_tier_slot``
+        removes the half-committed slot because ``_registry_flushed`` is still
+        ``False`` at the point of the raise.
+
+        Reuses :meth:`_verify_saved_adapter_from_disk` and the same
+        ``recall_sanity_threshold`` as main-tier verification.  No second
+        cleanup path is added here — slot removal is delegated entirely to
+        ``commit_tier_slot``'s existing ``finally`` block.
+
+        Args:
+            adapter_name: PEFT adapter name of the interim slot just written
+                (e.g. ``"episodic_interim_YYYYMMDDTHHMM"``).
+            all_keyed: Full keyed-pair list from the fold, as passed to
+                ``commit_tier_slot``.  May carry extra sentinel fields
+                (``_new``, etc.) — these are stripped before the probe.
+            slot: Path to the timestamped slot directory returned by
+                :func:`~paramem.models.loader.save_adapter`.
+        """
+        entries = [
+            {
+                "key": kp["key"],
+                "subject": kp["subject"],
+                "predicate": kp["predicate"],
+                "object": kp["object"],
+            }
+            for kp in all_keyed
+        ]
+        self._verify_saved_adapter_from_disk(
+            adapter_name,
+            slot,
+            entries,
+            threshold=self.config.recall_sanity_threshold,
+        )
+
     def _persist_fold(
         self,
         scope: "FoldScope",
@@ -3254,9 +3310,18 @@ class ConsolidationLoop:
 
         Dispatches on ``scope.persist`` only — never on a ``mode == "train"``
         / ``mode == "simulate"`` literal (the mode-fork guard is satisfied).
-        Each branch writes its venue artifact; ``main_tiers`` already has disk
-        verify inside :meth:`_save_adapters`; ``interim_slot`` verify is wired
-        in COMMIT 2 via a callback param on :func:`~paramem.memory.persistence.commit_tier_slot`.
+        Each branch writes its venue artifact and runs disk-integrity
+        verification where adapter weights were written:
+
+        - ``graph_json``: no weights, no verify.
+        - ``interim_slot`` (train): passes a
+          :meth:`_verify_committed_slot` callback into
+          :func:`~paramem.memory.persistence.commit_tier_slot` so the slot
+          is reloaded and probed before the registry flush (commit signal).
+          A failed probe propagates; ``commit_tier_slot``'s ``finally``
+          orphan-cleanup removes the half-committed slot.
+        - ``interim_slot`` (simulate): ``verify=None`` — no weights, no probe.
+        - ``main_tiers``: disk verify is already inside :meth:`_save_adapters`.
 
         Called once by :meth:`_run_fold` in place of the three independent
         persist tails that previously closed each PATH A / PATH B / PATH C
@@ -3286,14 +3351,24 @@ class ConsolidationLoop:
         elif scope.persist == "interim_slot":
             # PATH B: commit adapter weights (train) or graph.json (simulate).
             # The mode-fork lives inside commit_tier_slot, which is allowlisted.
+            # For train interim, pass a verify callback so the slot is probed
+            # before the registry flush — closing the disk-verify gap.
+            # For simulate interim (no weights), pass verify=None.
+            _keyed = all_keyed or []
+            _verify: "Callable[[Path], None] | None" = (
+                (lambda slot: self._verify_committed_slot(adapter_name, _keyed, slot))  # type: ignore[arg-type]
+                if scope.source == "weights"
+                else None
+            )
             commit_tier_slot(
                 loop=self,
                 tier="episodic",
                 adapter_name=adapter_name,  # type: ignore[arg-type]
                 stamp=stamp,  # type: ignore[arg-type]
                 mode=self._interim_venue_from_scope(scope),
-                all_keyed=all_keyed or [],
+                all_keyed=_keyed,
                 output_dir=self.output_dir,
+                verify=_verify,
             )
         elif scope.persist == "main_tiers":
             # PATH C: rebuild main adapter weights.  Disk verify is inside

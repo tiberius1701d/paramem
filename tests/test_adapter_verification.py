@@ -17,7 +17,7 @@ is patched directly on the loop instance so the tests are independent of
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from peft import PeftModel
@@ -866,3 +866,471 @@ class TestRecallSanityThresholdKnob:
                 slot,
                 _SAMPLE_KEYED_PAIRS,
             )
+
+
+# ---------------------------------------------------------------------------
+# save_adapter returns Path (M1 — COMMIT 2)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveAdapterReturnsPath:
+    """save_adapter must return the slot Path produced by atomic_save_adapter."""
+
+    def test_save_adapter_returns_path(self, tmp_path: Path) -> None:
+        """save_adapter is now declared ``-> Path`` and returns the slot directory.
+
+        The return value is the timestamped slot subdir created by
+        ``atomic_save_adapter`` — the same path that ``commit_tier_slot``
+        captures and forwards to the verify callback.
+        """
+        from paramem.models.loader import save_adapter
+
+        model = MagicMock()
+
+        def _fake_save_pretrained(path: str, selected_adapters=None) -> None:
+            from pathlib import Path as _Path
+
+            p = _Path(path)
+            p.mkdir(parents=True, exist_ok=True)
+            (p / "adapter_model.safetensors").write_bytes(b"weights")
+            (p / "adapter_config.json").write_text("{}")
+
+        model.save_pretrained.side_effect = _fake_save_pretrained
+
+        result = save_adapter(model, tmp_path, "episodic")
+
+        assert isinstance(result, Path), f"save_adapter must return Path, got {type(result)!r}"
+        assert result.exists(), f"Returned slot path must exist on disk: {result}"
+        assert result.parent == tmp_path or result.parent.parent == tmp_path, (
+            "Slot must be a child (or grandchild via .pending) of target_dir"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _verify_committed_slot — entry shaping (M2) and delegation (COMMIT 2)
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyCommittedSlot:
+    """_verify_committed_slot must strip sentinel fields and delegate to
+    _verify_saved_adapter_from_disk without mirroring its body.
+    """
+
+    def test_strips_new_sentinel_from_entries(self, tmp_path: Path) -> None:
+        """The ``_new`` sentinel field must not reach _verify_saved_adapter_from_disk.
+
+        ``all_interim_keyed`` carries ``_new=True`` (tag_new=True fold path).
+        The probe entry builder must produce ONLY the four canonical SPO fields.
+        """
+        loop = _make_verify_loop(tmp_path)
+        slot = _make_slot(tmp_path, "episodic_interim_20260101T0000")
+
+        captured_entries: list[list[dict]] = []
+
+        def _fake_verify(
+            adapter_name: str,
+            slot_path: Path,
+            entries: list[dict],
+            *,
+            threshold: float | None = None,
+            max_probe: int = 100,
+        ) -> float:
+            captured_entries.append(entries)
+            return 1.0
+
+        loop._verify_saved_adapter_from_disk = _fake_verify  # type: ignore[assignment]
+
+        all_keyed_with_sentinels = [
+            {
+                "key": "graph1",
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "_new": True,  # sentinel — must be stripped
+                "extra_field": "ignored",  # any extra field must be stripped
+            },
+            {
+                "key": "graph2",
+                "subject": "Alice",
+                "predicate": "works_at",
+                "object": "Acme Corp",
+                "_new": False,
+            },
+        ]
+
+        loop._verify_committed_slot(
+            "episodic_interim_20260101T0000",
+            all_keyed_with_sentinels,
+            slot,
+        )
+
+        assert len(captured_entries) == 1, "_verify_saved_adapter_from_disk called once"
+        entries = captured_entries[0]
+        assert len(entries) == 2
+        for entry in entries:
+            assert set(entry.keys()) == {"key", "subject", "predicate", "object"}, (
+                f"Entry must have only 4 SPO fields, got: {set(entry.keys())!r}"
+            )
+            assert "_new" not in entry, "Sentinel field '_new' must be stripped"
+
+    def test_delegates_to_verify_saved_adapter(self, tmp_path: Path) -> None:
+        """_verify_committed_slot must call _verify_saved_adapter_from_disk, not copy it."""
+        loop = _make_verify_loop(tmp_path)
+        slot = _make_slot(tmp_path, "episodic_interim_20260101T0000")
+
+        verify_called: list[tuple] = []
+
+        def _fake_verify(
+            adapter_name: str,
+            slot_path: Path,
+            entries: list[dict],
+            *,
+            threshold: float | None = None,
+            max_probe: int = 100,
+        ) -> float:
+            verify_called.append((adapter_name, slot_path))
+            return 1.0
+
+        loop._verify_saved_adapter_from_disk = _fake_verify  # type: ignore[assignment]
+
+        loop._verify_committed_slot(
+            "episodic_interim_20260101T0000",
+            [{"key": "g1", "subject": "A", "predicate": "b", "object": "C"}],
+            slot,
+        )
+
+        assert len(verify_called) == 1, "_verify_saved_adapter_from_disk must be called once"
+        assert verify_called[0][0] == "episodic_interim_20260101T0000"
+        assert verify_called[0][1] == slot
+
+    def test_propagates_verify_failure(self, tmp_path: Path) -> None:
+        """A RuntimeError from _verify_saved_adapter_from_disk propagates unchanged."""
+        loop = _make_verify_loop(tmp_path)
+        slot = _make_slot(tmp_path, "episodic_interim_20260101T0000")
+        loop._run_recall_sanity_probe = MagicMock(return_value=0.0)
+
+        def _fake_verify(
+            adapter_name: str,
+            slot_path: Path,
+            entries: list[dict],
+            *,
+            threshold: float | None = None,
+            max_probe: int = 100,
+        ) -> float:
+            raise RuntimeError("Post-save disk-integrity probe failed for adapter 'x'")
+
+        loop._verify_saved_adapter_from_disk = _fake_verify  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError, match="Post-save disk-integrity probe failed"):
+            loop._verify_committed_slot(
+                "episodic_interim_20260101T0000",
+                [{"key": "g1", "subject": "A", "predicate": "b", "object": "C"}],
+                slot,
+            )
+
+
+# ---------------------------------------------------------------------------
+# commit_tier_slot verify callback (COMMIT 2)
+# ---------------------------------------------------------------------------
+
+
+class TestCommitTierSlotVerifyCallback:
+    """commit_tier_slot must invoke the verify callback train-branch-only,
+    between weight write and registry flush; a raise cleans up the orphan slot.
+    """
+
+    def _make_loop(self, tmp_path: Path) -> "ConsolidationLoop":
+        """Minimal ConsolidationLoop for commit_tier_slot testing."""
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.output_dir = tmp_path
+        loop.fingerprint_cache = None
+
+        store = MemoryStore(replay_enabled=True)
+        reg = KeyRegistry()
+        reg.add("graph1")
+        store.load_registry("episodic_interim_20260101T0000", reg)
+        store.put(
+            "episodic_interim_20260101T0000",
+            "graph1",
+            {
+                "subject": "Alice",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "sp1",
+                "first_seen_cycle": 0,
+            },
+            register=False,
+        )
+        loop.store = store
+        return loop
+
+    def test_verify_called_before_registry_flush_train(self, tmp_path: Path) -> None:
+        """verify callback fires after weight write, before registry flush (train mode)."""
+        from paramem.memory.persistence import commit_tier_slot
+
+        loop = self._make_loop(tmp_path)
+
+        call_order: list[str] = []
+
+        def _fake_save_adapter(*args, **kwargs) -> Path:
+            call_order.append("save_adapter")
+            # Return a stub slot path (atomic_save_adapter would return real path).
+            slot = tmp_path / "fake_slot"
+            slot.mkdir(parents=True, exist_ok=True)
+            (slot / "adapter_model.safetensors").write_bytes(b"weights")
+            (slot / "adapter_config.json").write_text("{}")
+            return slot
+
+        from paramem.training.key_registry import KeyRegistry as _KR
+
+        def _fake_save_from_bytes(payload, path, **kwargs) -> None:
+            call_order.append("save_from_bytes")
+
+        verify_calls: list[Path] = []
+
+        def _verify(slot_path: Path) -> None:
+            call_order.append("verify")
+            verify_calls.append(slot_path)
+
+        with (
+            patch("paramem.models.loader.save_adapter", side_effect=_fake_save_adapter),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch.object(_KR, "save_from_bytes", side_effect=_fake_save_from_bytes),
+        ):
+            commit_tier_slot(
+                loop=loop,
+                tier="episodic",
+                adapter_name="episodic_interim_20260101T0000",
+                stamp="20260101T0000",
+                mode="train",
+                all_keyed=[],
+                output_dir=tmp_path,
+                verify=_verify,
+            )
+
+        assert "verify" in call_order, "verify callback was not called"
+        assert "save_from_bytes" in call_order, "registry flush was not called"
+        verify_idx = call_order.index("verify")
+        flush_idx = call_order.index("save_from_bytes")
+        assert verify_idx < flush_idx, (
+            f"verify must precede registry flush; order was: {call_order}"
+        )
+        assert len(verify_calls) == 1, "verify must be called exactly once"
+
+    def test_verify_raise_removes_orphan_slot(self, tmp_path: Path) -> None:
+        """When verify raises, the slot is removed and registry is NOT written.
+
+        The existing _registry_flushed=False orphan-cleanup in commit_tier_slot's
+        finally handles the removal — no second cleanup path needed.
+        """
+        from paramem.memory.interim_adapter import adapter_slot_root_for_name
+        from paramem.memory.persistence import commit_tier_slot
+
+        loop = self._make_loop(tmp_path)
+
+        def _verify_that_raises(slot_path: Path) -> None:
+            raise RuntimeError("Post-save disk-integrity probe failed for adapter 'x'")
+
+        with (
+            patch(
+                "paramem.models.loader.save_adapter",
+                return_value=tmp_path / "fake_slot",
+            ),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+        ):
+            # Ensure slot_root exists before the call so we can check cleanup.
+            slot_root = adapter_slot_root_for_name(tmp_path, "episodic_interim_20260101T0000")
+            slot_root.mkdir(parents=True, exist_ok=True)
+
+            with pytest.raises(RuntimeError, match="Post-save disk-integrity probe failed"):
+                commit_tier_slot(
+                    loop=loop,
+                    tier="episodic",
+                    adapter_name="episodic_interim_20260101T0000",
+                    stamp="20260101T0000",
+                    mode="train",
+                    all_keyed=[],
+                    output_dir=tmp_path,
+                    verify=_verify_that_raises,
+                )
+
+        # Slot root must be removed by the orphan-cleanup finally.
+        assert not slot_root.exists(), (
+            f"Orphan slot dir must be removed after verify failure: {slot_root}"
+        )
+
+        # Registry file must NOT exist (registry flush never ran).
+        registry_file = slot_root / "indexed_key_registry.json"
+        assert not registry_file.exists(), (
+            "Registry must not be written when verify raises before registry flush"
+        )
+
+    def test_verify_none_train_proceeds_unchanged(self, tmp_path: Path) -> None:
+        """When verify=None, train mode commits exactly as before (no-op for verify)."""
+        from paramem.memory.persistence import commit_tier_slot
+
+        loop = self._make_loop(tmp_path)
+
+        committed: list[bool] = []
+
+        def _fake_save_from_bytes(payload, path, **kwargs) -> None:
+            committed.append(True)
+
+        from paramem.training.key_registry import KeyRegistry as _KR
+
+        with (
+            patch(
+                "paramem.models.loader.save_adapter",
+                return_value=tmp_path / "fake_slot",
+            ),
+            patch("paramem.adapters.manifest.build_manifest_for", return_value=MagicMock()),
+            patch.object(_KR, "save_from_bytes", side_effect=_fake_save_from_bytes),
+        ):
+            commit_tier_slot(
+                loop=loop,
+                tier="episodic",
+                adapter_name="episodic_interim_20260101T0000",
+                stamp="20260101T0000",
+                mode="train",
+                all_keyed=[],
+                output_dir=tmp_path,
+                verify=None,
+            )
+
+        assert committed, "Registry flush (commit) must still happen when verify=None"
+
+    def test_verify_not_called_in_simulate_mode(self, tmp_path: Path) -> None:
+        """verify callback must NOT be called in simulate mode (no weights written)."""
+        from paramem.memory.persistence import commit_tier_slot
+
+        loop = self._make_loop(tmp_path)
+
+        verify_called: list[bool] = []
+
+        def _should_not_be_called(slot_path: Path) -> None:
+            verify_called.append(True)
+
+        with patch(
+            "paramem.memory.persistence.save_memory_to_disk",
+        ):
+            commit_tier_slot(
+                loop=loop,
+                tier="episodic",
+                adapter_name="episodic_interim_20260101T0000",
+                stamp="20260101T0000",
+                mode="simulate",
+                all_keyed=[
+                    {
+                        "key": "graph1",
+                        "subject": "Alice",
+                        "predicate": "lives_in",
+                        "object": "Berlin",
+                        "speaker_id": "sp1",
+                        "first_seen_cycle": 0,
+                    }
+                ],
+                output_dir=tmp_path,
+                verify=_should_not_be_called,
+            )
+
+        assert not verify_called, "verify must NOT be called in simulate mode"
+
+
+# ---------------------------------------------------------------------------
+# _persist_fold verify wiring (COMMIT 2)
+# ---------------------------------------------------------------------------
+
+
+class TestPersistFoldVerifyWiring:
+    """_persist_fold must pass a non-None verify for interim-train and
+    verify=None for interim-simulate.
+    """
+
+    def _make_persist_loop(self, tmp_path: Path) -> "ConsolidationLoop":
+        """Return a ConsolidationLoop minimal enough to call _persist_fold directly."""
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.tokenizer = MagicMock()
+        loop.output_dir = tmp_path
+        loop.fingerprint_cache = None
+        loop.config = ConsolidationConfig()
+        loop.merger = MagicMock()
+
+        store = MemoryStore(replay_enabled=True)
+        reg = KeyRegistry()
+        store.load_registry("episodic_interim_20260601T0000", reg)
+        loop.store = store
+        return loop
+
+    def test_interim_train_passes_non_none_verify(self, tmp_path: Path) -> None:
+        """_persist_fold wires a verify callback when scope.source == 'weights'."""
+        from paramem.training.consolidation import FoldScope
+
+        loop = self._make_persist_loop(tmp_path)
+        scope = FoldScope(
+            name="interim",
+            source="weights",
+            persist="interim_slot",
+        )
+
+        captured_verify: list[object] = []
+
+        def _fake_commit_tier_slot(**kwargs: object) -> None:
+            captured_verify.append(kwargs.get("verify"))
+
+        with patch(
+            "paramem.memory.persistence.commit_tier_slot",
+            side_effect=_fake_commit_tier_slot,
+        ):
+            loop._persist_fold(
+                scope,
+                adapter_name="episodic_interim_20260601T0000",
+                stamp="20260601T0000",
+                all_keyed=[{"key": "g1", "subject": "A", "predicate": "b", "object": "C"}],
+            )
+
+        assert len(captured_verify) == 1
+        assert captured_verify[0] is not None, (
+            "_persist_fold must pass a non-None verify for train interim (scope.source='weights')"
+        )
+        assert callable(captured_verify[0]), "verify must be callable"
+
+    def test_interim_simulate_passes_none_verify(self, tmp_path: Path) -> None:
+        """_persist_fold passes verify=None when scope.source != 'weights'."""
+        from paramem.training.consolidation import FoldScope
+
+        loop = self._make_persist_loop(tmp_path)
+        scope = FoldScope(
+            name="interim",
+            source="disk",
+            persist="interim_slot",
+        )
+
+        captured_verify: list[object] = []
+
+        def _fake_commit_tier_slot(**kwargs: object) -> None:
+            captured_verify.append(kwargs.get("verify"))
+
+        with patch(
+            "paramem.memory.persistence.commit_tier_slot",
+            side_effect=_fake_commit_tier_slot,
+        ):
+            loop._persist_fold(
+                scope,
+                adapter_name="episodic_interim_20260601T0000",
+                stamp="20260601T0000",
+                all_keyed=[],
+            )
+
+        assert len(captured_verify) == 1
+        assert captured_verify[0] is None, (
+            "_persist_fold must pass verify=None for simulate interim (scope.source='disk')"
+        )
