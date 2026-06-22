@@ -11,7 +11,8 @@ without spinning a FastAPI server or loading a model.
 Display order (most actionable first):
 
     Migration → Consolidation → Sweeper → Backup* → Config drift →
-    Boot degraded → Key rotation* → Encryption* → Adapter fingerprint → Pre-flight*
+    Boot degraded → Key rotation* → Encryption* → Adapter fingerprint →
+    Local recall inactive → Voice degradation → Pre-flight*
 
     (* stub returns [] — future populators fill them.)
 """
@@ -582,6 +583,113 @@ def _collect_adapter_fingerprint_items(state: dict) -> list[AttentionItem]:
     return primary_items + secondary_items
 
 
+def _collect_local_recall_inactive_items(state: dict) -> list[AttentionItem]:
+    """Emit a warning when local PA recall is inactive and pending sessions exist.
+
+    Covers the gap where the adapter store is genuinely empty (no trained
+    personal memory — no slots on disk at all, no registry keys) but the
+    operator has pending sessions that would be trained on consolidation.
+    Without this item the situation is completely silent: the two
+    "PA routing DISABLED" items in :func:`_collect_adapter_fingerprint_items`
+    only fire when slot directories *exist* on disk (``has_slots=True``),
+    leaving the truly-empty fresh-install case unreported when memory is
+    expected.
+
+    Fire condition (all three must hold):
+
+    1. ``keys_count == 0`` — no active registry keys in the live
+       :class:`~paramem.memory.store.MemoryStore` (or cold-load equivalent).
+       Derived via ``state["memory_store"].all_active_keys()`` when the store
+       is present; falls back to ``state.get("_status_keys_count")`` (a
+       pre-computed int written by the :func:`/status` handler, not yet wired)
+       or ``0`` as a safe default.
+    2. ``pending_sessions > 0`` — at least one session is waiting in the
+       :class:`~paramem.server.session_buffer.SessionBuffer`.  Derived via
+       ``session_buffer.get_summary()["total"]`` so the count matches the
+       ``/status pending_sessions`` field exactly.
+    3. No existing problematic adapter-manifest entry (status in
+       ``{"no_matching_slot", "mismatch", "manifest_missing",
+       "migrated_unverified"}``) — those rows carry their own, more specific
+       action hints.  If any such entry is present, this item stays silent to
+       avoid double-reporting.
+
+    Stay silent when:
+
+    * ``keys_count > 0`` — memory is present; local recall is active.
+    * ``pending_sessions == 0`` — truly fresh install with no memory and no
+      pending input; nothing actionable yet.
+    * A slot-level manifest problem is already reported.
+
+    Parameters
+    ----------
+    state:
+        Server ``_state`` dict.  Read-only.
+
+    Returns
+    -------
+    list[AttentionItem]
+        Zero or one item.
+    """
+    # -- Guard: if any adapter-manifest row signals a slot-level problem,
+    # defer to _collect_adapter_fingerprint_items which has the specific hint.
+    _PROBLEMATIC_STATUSES = {
+        "no_matching_slot",
+        "mismatch",
+        "manifest_missing",
+        "migrated_unverified",
+    }
+    manifest_status: dict = state.get("adapter_manifest_status") or {}
+    for row in manifest_status.values():
+        if isinstance(row, dict) and row.get("status") in _PROBLEMATIC_STATUSES:
+            return []
+
+    # -- Derive keys_count from the live store (same source as /status).
+    # MemoryStore lives at state["memory_store"] and is None until the lifespan
+    # completes (or in cloud-only mode with no adapter load).
+    keys_count: int = 0
+    store = state.get("memory_store")
+    if store is not None:
+        try:
+            keys_count = len(store.all_active_keys())
+        except Exception:
+            # Defensive: if the store raises (e.g. partially initialised),
+            # treat as zero-but-uncertain and stay silent to avoid false alarms.
+            return []
+
+    if keys_count != 0:
+        return []
+
+    # -- Derive pending_sessions from the session buffer (same source as /status).
+    session_buffer = state.get("session_buffer")
+    pending_sessions: int = 0
+    if session_buffer is not None:
+        try:
+            pending_sessions = session_buffer.get_summary().get("total", 0) or 0
+        except Exception:
+            return []  # Buffer not yet ready; stay silent.
+
+    if pending_sessions == 0:
+        return []
+
+    summary = (
+        f"Local recall INACTIVE — no trained personal memory "
+        f"({pending_sessions} pending session(s)); recall falls back to HA/SOTA"
+    )
+    action = (
+        "consolidate the pending sessions (POST /consolidate or wait for the "
+        "scheduled cycle), or restore a backup (paramem restore <id>)"
+    )
+    return [
+        AttentionItem(
+            kind="local_recall_inactive",
+            level="action_required",
+            summary=summary,
+            action_hint=action,
+            age_seconds=None,
+        )
+    ]
+
+
 def _collect_vram_overflow_items(state: dict) -> list[AttentionItem]:
     """Emit a persistent warning when the configured topology exceeds usable VRAM.
 
@@ -1116,7 +1224,7 @@ def collect_attention_items(
 
         Migration → Consolidation → Sweeper → Backup* → Config drift →
         Boot degraded → Key rotation* → Encryption* → Adapter fingerprint →
-        Voice degradation → Pre-flight*
+        Local recall inactive → Voice degradation → Pre-flight*
 
         (* stub returns [] — future populators fill them.)
 
@@ -1152,6 +1260,7 @@ def collect_attention_items(
     items.extend(_collect_key_rotation_items(state))  # stub
     items.extend(_collect_encryption_items(state))  # stub
     items.extend(_collect_adapter_fingerprint_items(state))
+    items.extend(_collect_local_recall_inactive_items(state))
     items.extend(_collect_voice_degradation_items(state, config))
     items.extend(_collect_pre_flight_items(state, config))
     items.extend(_collect_vram_overflow_items(state))

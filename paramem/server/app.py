@@ -1033,8 +1033,15 @@ def _validate_main_adapter_slot(
     slot = find_live_slot(kind_dir, live_registry_sha256) if kind_dir.exists() else None
 
     if slot is None:
+        # Count only directories that contain meta.json — the authoritative marker
+        # of a committed adapter slot (see find_live_slot in manifest.py which also
+        # gates on meta.json).  A subdir containing only progress.json (aborted
+        # training run) is NOT a real slot and must not trigger the no_matching_slot
+        # red incident; it should fall through to the fresh-install branch instead.
         has_slots = kind_dir.exists() and any(
-            e for e in kind_dir.iterdir() if not e.name.startswith(".") and e.is_dir()
+            e
+            for e in kind_dir.iterdir()
+            if not e.name.startswith(".") and e.is_dir() and (e / "meta.json").is_file()
         )
         if has_slots:
             _record_manifest_row(
@@ -12333,6 +12340,10 @@ def _run_extraction_phase(
                 schedule=config.consolidation.refresh_cadence,
                 max_interim_count=config.consolidation.max_interim_count,
             )
+        # Both verifies are intentional: run_consolidation_cycle above performs
+        # the interim-slot disk-verify (_verify_committed_slot), and
+        # _save_adapters performs its own main-tier disk-integrity verify (step
+        # 4a in its docstring).  Do not collapse them into one.
         loop._save_adapters()
         _save_key_metadata(loop, config)
     except Exception:

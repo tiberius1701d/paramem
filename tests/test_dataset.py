@@ -2,10 +2,7 @@
 
 from unittest.mock import MagicMock
 
-import torch
-
 from paramem.training.dataset import (
-    PersonalFactsDataset,
     _build_training_messages,
     format_inference_prompt,
     load_eval_pairs,
@@ -62,22 +59,3 @@ def test_load_eval_pairs_filtered():
     pairs = load_eval_pairs(DATA_PATH, tokenizer=tokenizer, fact_ids=["fact_001"])
     assert len(pairs) == 2  # fact_001 has 2 QA pairs
     assert all(p["fact_id"] == "fact_001" for p in pairs)
-
-
-def test_personal_facts_dataset():
-    tokenizer = _make_mock_tokenizer()
-
-    # Mock tokenizer __call__ to return tensor-like outputs
-    def mock_tokenize(text, **kwargs):
-        # Simulate different lengths for full vs prompt text
-        seq_len = kwargs.get("max_length", 128)
-        return {
-            "input_ids": torch.ones(1, seq_len, dtype=torch.long),
-            "attention_mask": torch.ones(1, seq_len, dtype=torch.long),
-        }
-
-    tokenizer.side_effect = mock_tokenize
-    tokenizer.return_value = mock_tokenize("dummy", max_length=128)
-
-    dataset = PersonalFactsDataset(DATA_PATH, tokenizer, max_length=128)
-    assert len(dataset) == 40  # 20 facts * 2 QA pairs each

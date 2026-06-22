@@ -125,24 +125,6 @@ class TrainingConfig:
 
 
 @dataclass
-class TopicConfig:
-    name: str = ""
-    fact_ids: list[str] = field(default_factory=list)
-
-
-@dataclass
-class ReplayConfig:
-    epochs_per_topic: int = 60
-    gradient_accumulation_steps: int = 2
-    naive_replay_ratio: float = 0.5
-    generative_replay_ratio: float = 0.5
-    generative_temperature: float = 0.3
-    ewc_lambda: float = 400.0
-    ewc_fisher_samples: Optional[int] = None
-    topics: list[TopicConfig] = field(default_factory=list)
-
-
-@dataclass
 class GraphConfig:
     extraction_temperature: float = 0.3
     max_extraction_tokens: int = 1024
@@ -239,7 +221,6 @@ class ParaMemConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     adapters: dict[str, AdapterConfig] = field(default_factory=dict)
     training: TrainingConfig = field(default_factory=TrainingConfig)
-    replay: ReplayConfig = field(default_factory=ReplayConfig)
     graph: GraphConfig = field(default_factory=GraphConfig)
     consolidation: ConsolidationConfig = field(default_factory=ConsolidationConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
@@ -286,16 +267,10 @@ def load_config(
     for name, adapter_data in raw.get("adapters", {}).items():
         adapters[name] = _build_dataclass(AdapterConfig, adapter_data)
 
-    replay_raw = raw.get("replay", {})
-    topics_raw = replay_raw.pop("topics", [])
-    replay = _build_dataclass(ReplayConfig, replay_raw)
-    replay.topics = [_build_dataclass(TopicConfig, t) for t in topics_raw]
-
     return ParaMemConfig(
         model=model,
         adapters=adapters,
         training=training,
-        replay=replay,
         graph=graph,
         consolidation=consolidation,
         wandb=wandb_cfg,

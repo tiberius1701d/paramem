@@ -23,6 +23,7 @@ from paramem.server.attention import (
     _collect_encryption_items,
     _collect_integrity_cleanup_items,
     _collect_key_rotation_items,
+    _collect_local_recall_inactive_items,
     _collect_migration_items,
     _collect_pre_flight_items,
     _collect_sweeper_items,
@@ -877,3 +878,118 @@ def test_voice_degraded_components_reflect_only_enabled_gpu_component():
     assert len(items) == 1
     assert "TTS on CPU" in items[0].summary
     assert "STT/TTS" not in items[0].summary
+
+
+# ---------------------------------------------------------------------------
+# _collect_local_recall_inactive_items
+# ---------------------------------------------------------------------------
+
+
+def _mock_store(key_count: int):
+    """Return a MagicMock MemoryStore whose all_active_keys() returns key_count keys."""
+    store = MagicMock()
+    store.all_active_keys.return_value = [f"k{i}" for i in range(key_count)]
+    return store
+
+
+def _mock_buffer(total: int):
+    """Return a MagicMock SessionBuffer whose get_summary() reports total sessions."""
+    buf = MagicMock()
+    buf.get_summary.return_value = {"total": total}
+    return buf
+
+
+def test_local_recall_inactive_fires_when_keys_zero_and_pending_positive():
+    """keys_count==0 + pending_sessions>0 → one action_required item."""
+    state = _live_state(
+        memory_store=_mock_store(0),
+        session_buffer=_mock_buffer(3),
+    )
+    items = _collect_local_recall_inactive_items(state)
+    assert len(items) == 1
+    item = items[0]
+    assert item.kind == "local_recall_inactive"
+    assert item.level == "action_required"
+    assert "INACTIVE" in item.summary
+    assert "3" in item.summary
+    assert item.action_hint is not None
+    assert "consolidate" in item.action_hint.lower()
+    assert "restore" in item.action_hint.lower()
+
+
+def test_local_recall_inactive_silent_when_keys_present():
+    """keys_count>0 → no item (memory is active; live server with 198 keys must not fire)."""
+    state = _live_state(
+        memory_store=_mock_store(198),
+        session_buffer=_mock_buffer(5),
+    )
+    items = _collect_local_recall_inactive_items(state)
+    assert items == []
+
+
+def test_local_recall_inactive_silent_on_true_fresh_install():
+    """keys_count==0 + pending_sessions==0 → no item (nothing actionable yet)."""
+    state = _live_state(
+        memory_store=_mock_store(0),
+        session_buffer=_mock_buffer(0),
+    )
+    items = _collect_local_recall_inactive_items(state)
+    assert items == []
+
+
+def test_local_recall_inactive_silent_when_no_matching_slot_present():
+    """keys_count==0 + pending>0 BUT adapter_manifest_status has no_matching_slot →
+    no item; the fingerprint collector already covers that case with a better hint."""
+    state = _live_state(
+        memory_store=_mock_store(0),
+        session_buffer=_mock_buffer(2),
+        adapter_manifest_status={
+            "episodic": {
+                "status": "no_matching_slot",
+                "reason": "no_matching_slot",
+                "field": None,
+                "severity": "red",
+                "slot_path": "/adapters/episodic",
+                "checked_at": "",
+            }
+        },
+    )
+    items = _collect_local_recall_inactive_items(state)
+    assert items == []
+
+
+def test_local_recall_inactive_silent_when_mismatch_present():
+    """keys_count==0 + pending>0 BUT mismatch row exists → defer to fingerprint collector."""
+    state = _live_state(
+        memory_store=_mock_store(0),
+        session_buffer=_mock_buffer(4),
+        adapter_manifest_status={
+            "episodic": {
+                "status": "mismatch",
+                "reason": "sha mismatch",
+                "field": "base_model.sha",
+                "severity": "red",
+                "slot_path": "/adapters/episodic",
+                "checked_at": "",
+            }
+        },
+    )
+    items = _collect_local_recall_inactive_items(state)
+    assert items == []
+
+
+def test_local_recall_inactive_no_store_no_buffer_stays_silent():
+    """No memory_store + no session_buffer → zero keys assumed; pending zero → silent."""
+    state = _live_state()
+    # Neither memory_store nor session_buffer set in _live_state.
+    items = _collect_local_recall_inactive_items(state)
+    assert items == []
+
+
+def test_local_recall_inactive_no_store_but_buffer_with_pending():
+    """No memory_store (keys_count=0 by default) + pending>0 → item fires."""
+    state = _live_state(session_buffer=_mock_buffer(1))
+    # memory_store absent → keys_count treated as 0.
+    items = _collect_local_recall_inactive_items(state)
+    assert len(items) == 1
+    assert items[0].kind == "local_recall_inactive"

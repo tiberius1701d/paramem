@@ -235,11 +235,20 @@ class TestCorruptManifest:
 
 
 class TestManifestMissing:
-    def test_weights_present_no_meta_gives_no_matching_slot(self, tmp_path: Path) -> None:
-        """Slot without meta.json is invisible to find_live_slot (no hash match).
+    def test_weights_present_no_meta_classified_as_fresh(self, tmp_path: Path) -> None:
+        """A subdir with adapter weights but no meta.json is not a real slot.
 
-        Since find_live_slot requires a readable meta.json, a slot without one is
-        skipped. The result is no_matching_slot (other slots exist but none match).
+        meta.json is the authoritative marker of a committed adapter slot (see
+        find_live_slot in manifest.py, which gates slot discovery on a readable
+        meta.json).  A subdir lacking meta.json — whether it holds weights, only
+        progress.json, or any other content — is treated as a non-slot and the
+        tier is classified as fresh (no manifest row emitted).
+
+        The manifest_missing path (find_live_slot returns a slot but the manifest
+        read then raises ManifestNotFoundError) is exercised separately via patching
+        in TestManifestMissingWithPatch, which is the only real-world path to that
+        state: the caller holds a slot reference it obtained before the manifest
+        disappeared.
         """
         config = _make_config(tmp_path)
         kind_dir = config.adapter_dir / "episodic"
@@ -248,13 +257,12 @@ class TestManifestMissing:
         slot.mkdir()
         (slot / "adapter_config.json").write_text("{}")
         (slot / "adapter_model.safetensors").write_bytes(b"w")
-        # No meta.json written
+        # No meta.json written — subdir is not a real slot.
 
         _, state = _run(config)
-        # find_live_slot skips the slot → no_matching_slot row
+        # No real slot found; classifier treats the tier as fresh — no row.
         row = state["adapter_manifest_status"].get("episodic")
-        assert row is not None
-        assert row["status"] == "no_matching_slot"
+        assert row is None
 
 
 class TestManifestMissingWithPatch:
@@ -309,6 +317,65 @@ class TestNoMatchingSlot:
 
         row = state["adapter_manifest_status"].get("episodic")
         assert row is not None
+        assert row["status"] == "no_matching_slot"
+        assert row["severity"] == "red"  # episodic is primary
+
+    def test_progress_only_stub_dir_classified_as_fresh(self, tmp_path: Path) -> None:
+        """A subdir containing only progress.json (aborted training run) must NOT
+        trigger no_matching_slot.  The tier has no real weight-bearing slot, so
+        the classifier must report fresh install (no manifest row, info log only).
+
+        Regression guard: before the fix, has_slots counted any non-hidden subdir,
+        which caused the stub to be mistaken for a real slot and produced a false
+        red adapter_no_matching_slot_primary incident even though boot-time integrity
+        passed and the registry was genuinely absent.
+        """
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir()
+        # Replicate the on-disk shape of an aborted interim training run:
+        # a timestamped subdir with only progress.json, no meta.json or weights.
+        stub = kind_dir / "interim_20260619T1200"
+        stub.mkdir()
+        (stub / "progress.json").write_text('{"phase": "phase4-episodic", "epoch": 0}')
+
+        _, state = _run(config)
+
+        # No manifest row — tier must be treated as fresh/empty, not corrupt.
+        assert "episodic" not in state["adapter_manifest_status"]
+
+    def test_empty_tier_dir_classified_as_fresh(self, tmp_path: Path) -> None:
+        """A tier directory with no subdirs at all is fresh install — no row emitted."""
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir()
+        # No subdirs at all.
+
+        _, state = _run(config)
+
+        assert "episodic" not in state["adapter_manifest_status"]
+
+    def test_real_slot_wrong_hash_still_gives_no_matching_slot(self, tmp_path: Path) -> None:
+        """A directory that contains meta.json (a real slot) but whose registry hash
+        does not match the live registry hash must STILL produce no_matching_slot.
+
+        This is the genuine-mismatch / possible-corruption case that warrants the
+        red incident and investigate/restore guidance.
+        """
+        config = _make_config(tmp_path)
+        kind_dir = config.adapter_dir / "episodic"
+        kind_dir.mkdir()
+        # Real slot: meta.json written with a non-matching registry_sha256.
+        _write_slot(kind_dir, registry_sha256="stale_hash_from_old_training_run")
+        # Also place a progress.json stub alongside it — must not affect outcome.
+        stub = kind_dir / "interim_20260619T1200"
+        stub.mkdir()
+        (stub / "progress.json").write_text('{"phase": "phase4-episodic", "epoch": 0}')
+
+        _, state = _run(config)
+
+        row = state["adapter_manifest_status"].get("episodic")
+        assert row is not None, "Real weight-bearing slot with hash mismatch must produce a row"
         assert row["status"] == "no_matching_slot"
         assert row["severity"] == "red"  # episodic is primary
 
