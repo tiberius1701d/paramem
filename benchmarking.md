@@ -3228,8 +3228,8 @@ Same speaker, pyannote 512-dim embeddings:
 Consolidation is driven by a systemd user timer (`paramem-consolidate.timer`,
 `Persistent=true`) whose period derives from `consolidation.refresh_cadence`
 (default `12h`). The `BackgroundTrainer` releases the GPU lock per step so
-inference interleaves with training, and saves `resume_state.json` +
-`bg_checkpoint/` at each epoch boundary — a crash or `SIGUSR1` mid-cycle
+inference interleaves with training, and saves `staging_resume.json` +
+`bg_checkpoint_epoch/` at each epoch boundary — a crash or `SIGUSR1` mid-cycle
 resumes at the last completed epoch instead of restarting from zero
 (SHA-256 fingerprint gate on `keyed_pairs` + training config).
 

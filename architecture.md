@@ -50,7 +50,6 @@ All model-specific logic is isolated behind an abstraction that exposes:
 - `create_adapter(model, adapter_config) -> PeftModel`
 - `load_adapter(model, path, name) -> PeftModel`
 - `switch_adapter(model, name)`
-- `merge_adapters(model, names, weights) -> PeftModel`
 
 The consolidation loop, graph extractor, and evaluation harness operate against this interface, not against specific model implementations. Swapping Qwen for Llama requires changing one config value (design-supported, not empirically validated on Llama). Validated on three model families (Qwen 2.5 3B, Gemma 2 9B, Mistral 7B); broader validation pending.
 
@@ -65,7 +64,7 @@ Base Model (frozen, 4-bit quantized)
   └── adapter: "procedural"  (rank 8, lr 5e-5)   — preferences and behavioral patterns
 ```
 
-During inference, adapters can be switched or merged with configurable weights. During training, each adapter is optimized independently with its own objective.
+During inference, adapters can be switched at near-zero cost. During training, each adapter is optimized independently with its own objective.
 
 ### AD-11: Procedural Adapter Targets MLP Layers (Phase 4, live in server deployment)
 
@@ -123,7 +122,7 @@ The consolidation loop runs as a standalone batch process, not integrated into i
 Session Transcript
   → Graph Extractor (LLM structured output → JSON graph)
   → Graph Merger (resolve entities, reinforce duplicate edges, count recurrence)
-  → Consolidation Loop (per-adapter: replay + compress + optimize)
+  → Consolidation Loop (per-adapter: compress + optimize)
   → Fold-time promotion (recurrence_count ≥ threshold: episodic→semantic) + passive decay
 ```
 
@@ -160,7 +159,7 @@ The consolidation loop integrates indexed key memory (AD-13) with the existing g
 **Transcript-stage boundary (§4.S architectural symmetry).** The consolidation fold has two modes sharing an identical grooming pipeline — they diverge ONLY in their persistence tail:
 - **`train` mode**: source = reconstruct-from-adapter-weights; sink = retrain PEFT adapters.
 - **`simulate` mode**: source = `load_memory_from_disk(graph.json)`; sink = `save_memory_to_disk(graph.json)`.
-Both modes run `canonical()` node identity + Case-1/Case-2 dedup via `GraphMerger.merge(additive=True)` + `_run_graph_enrichment` before the divergence point. Any change to grooming logic must be applied in `consolidate_interim_adapters` AND `consolidate_interim_graphs` to maintain parity. The `POST /consolidate/housekeeping` endpoint triggers an on-demand grooming pass through `run_housekeeping()`, which dispatches to the correct mode-specific method with gate (d) bypassed.
+Both modes run `canonical()` node identity + Case-1/Case-2 dedup via `GraphMerger.merge(additive=True)` + `_run_graph_enrichment` before the divergence point. Grooming logic is shared: both `run_consolidation_cycle` (interim) and `consolidate_interim_adapters` (full fold) route through the single spine `_run_fold`; `consolidate_simulate_fold` likewise delegates to `_run_fold`. There is no dual-method parity requirement — a grooming change goes in `_run_fold` once and both modes inherit it. The `POST /consolidate/housekeeping` endpoint triggers an on-demand grooming pass through `run_housekeeping()`, which dispatches to the correct mode-specific method with gate (d) bypassed.
 
 **Fold merge input is registry-true.** The fold sources its Stage-2 merge input from `store.get(key)` / `store.bookkeeping_for_key(key)` (registry-true SPO) for every active key, not from the reconstruction result. Reconstruction is a **health/retry signal** only: a key whose reconstructed SPO disagrees with its registry-true SPO is flagged in `result["recall_miss_keys"]` and retrained with its registry-true content — it is never silently dropped. A recall miss does not delete a key.
 
@@ -172,12 +171,6 @@ Key design decisions:
 - **Tier graduation** (`tier_fast_start`, default `true`): when a parked tier first crosses the floor in a fold it **graduates**. With `tier_fast_start: true` (default), graduation copies the episodic adapter's LoRA weights into the new tier adapter and rebooks the registry — no training required. The keys were already trained into episodic during their parked cycles, so the copied adapter inherits their encoding. Episodic trains on its own keys plus all graduating keys in the same fold before the copy runs, making it the accurate donor. A pre-save recall probe gates acceptance; if the probe falls below the recall threshold the tier falls back to training from scratch for that cycle. Procedural's adapter targets additional MLP modules beyond episodic's attention-only set, so graduation uses an attention-subset copy (MLP weights stay zero-initialised); semantic shares the same module set as episodic and uses a full copy. With `tier_fast_start: false`, every tier trains from scratch on its own key set at graduation — the principled baseline and always-available fallback.
 
 Validated: 10-cycle smoke test, episodic 6/6 (100%), semantic 6/6 (100%), 49.9 min total.
-
-### AD-9: Curriculum-Aware Replay (Phase 4)
-
-Before each training cycle, probe the adapter on replay pool items to measure per-fact recall. Facts with low scores get higher sampling probability. This directly addresses the Phase 3b finding that replay pool samples only ~8% of accumulated facts per cycle — curriculum sampling ensures the hardest facts get more exposure.
-
-Trade-off: probing adds latency (~10-30s per cycle). Acceptable given 42-min fast-iteration target.
 
 ### AD-10: Key-Addressable Replay (Phase 4)
 
@@ -317,6 +310,8 @@ The RAG pipeline is evaluation infrastructure, not a competing product. It exist
 
 ## Superseded Decisions
 
+**AD-9: Curriculum-Aware Replay** — superseded by AD-10. A per-cycle probe-and-weight-sampling mechanism over an external replay pool was designed to address low sampling coverage (~8% per cycle). It was removed when the replay-pool architecture itself was replaced by reconstruction-from-weights (AD-10), which requires no external corpus and uses recall misses as the retry signal instead of curriculum sampling.
+
 **AD-12: Swappable Extraction Backend** — superseded by AD-16. The `backend` parameter on `extract_graph()` was never shipped; the single-backend staged chain of AD-16 replaced it.
 
 ## Known Constraints
@@ -328,4 +323,3 @@ The RAG pipeline is evaluation infrastructure, not a competing product. It exist
 | Multi-adapter simultaneous training not natively batched in PEFT | Must train adapters sequentially per consolidation cycle | Acceptable for PoC; each adapter trains independently anyway |
 | Graph extractor quality depends on base model capability | Poor extraction → poor consolidation signal | Evaluate extraction quality early; consider separate extractor model if needed |
 | Key reconstruction quality degrades with many keys | Adapter capacity limits reliable reconstruction | Reconstruction-based replay reinforces active keys each cycle; unreinforced keys passively decay via reconstruction noise (`decay_window` log-candidate, no deletion). Validated to 550 keys with no observed ceiling. |
-| Curriculum probing adds latency | Slows iteration cycle | Cap probe to 50 items, cache results, skip on smoke test runs |
