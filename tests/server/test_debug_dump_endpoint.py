@@ -104,17 +104,17 @@ class TestDebugDumpHappyPath:
             (
                 "episodic",
                 "graph1",
-                {"subject": "Tobias", "predicate": "lives_in", "object": "Berlin"},
+                {"subject": "Mara", "predicate": "lives_in", "object": "Berlin"},
             ),
             (
                 "episodic",
                 "graph2",
-                {"subject": "Tobias", "predicate": "works_at", "object": "Anthropic"},
+                {"subject": "Mara", "predicate": "works_at", "object": "Anthropic"},
             ),
             (
                 "procedural",
                 "proc1",
-                {"subject": "Tobias", "predicate": "prefers", "object": "concise answers"},
+                {"subject": "Mara", "predicate": "prefers", "object": "concise answers"},
             ),
         ]
         state = _make_state(tmp_path, store_items=items)
@@ -129,7 +129,7 @@ class TestDebugDumpHappyPath:
         first = body["entries"][0]
         assert first["tier"] == "episodic"
         assert first["key"] == "graph1"
-        assert first["subject"] == "Tobias"
+        assert first["subject"] == "Mara"
         assert first["object"] == "Berlin"
 
     def test_bookkeeping_fields_sourced_from_bookkeeping_for_key(self, tmp_path, monkeypatch):
@@ -147,7 +147,7 @@ class TestDebugDumpHappyPath:
                 # Entry payload carries a stale/wrong speaker_id — the overlay
                 # must overwrite it with the bookkeeping value.
                 {
-                    "subject": "Tobias",
+                    "subject": "Mara",
                     "predicate": "lives_in",
                     "object": "Berlin",
                     "speaker_id": "stale_value",

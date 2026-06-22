@@ -1051,7 +1051,7 @@ class TestSimulateModePromptIteration:
             metadata={
                 "source_type": source_type,
                 "chunk_index": 0,
-                "doc_title": "tobias_resume_test",
+                "doc_title": "fictional_resume_test",
             },
         )
 

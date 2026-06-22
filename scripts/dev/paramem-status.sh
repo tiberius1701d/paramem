@@ -57,7 +57,7 @@ if [[ "${1:-}" == "--config" ]]; then
         echo "ERROR: config not found at $CONFIG_PATH" >&2
         exit 2
     fi
-    PYTHON_BIN="${PARAMEM_PYTHON:-/home/tiberius/miniforge3/envs/paramem/bin/python}"
+    PYTHON_BIN="${PARAMEM_PYTHON:-$HOME/miniforge3/envs/paramem/bin/python}"
     cd "$PROJECT_ROOT"
     exec "$PYTHON_BIN" - "$CONFIG_PATH" <<'PYEOF'
 """Render the effective ServerConfig (post-load, post-merge) as yaml.

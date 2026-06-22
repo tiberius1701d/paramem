@@ -3297,7 +3297,7 @@ class TestBuildAnonymizationMapping:
                     attributes={
                         "last_name": "Walker",
                         "email": "alex.walker@example.com",
-                        "linkedin": "linkedin.com/in/tobias-preusser",
+                        "linkedin": "linkedin.com/in/alex-walker-fictional",
                         "phone": "+49 30 12345678",
                         "location": "Germany",
                         # Non-PII attribute MUST NOT enter the mapping.
@@ -3315,7 +3315,7 @@ class TestBuildAnonymizationMapping:
         attr_values = (
             "Walker",
             "alex.walker@example.com",
-            "linkedin.com/in/tobias-preusser",
+            "linkedin.com/in/alex-walker-fictional",
             "+49 30 12345678",
             "Germany",
         )

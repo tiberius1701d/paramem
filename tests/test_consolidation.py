@@ -8749,7 +8749,7 @@ class TestMergeRegistryRelationsUnification:
         path used entities=[] which caused subject nodes to receive
         entity_type='concept' and no speaker_id attribute.  Graph-enrichment
         then rooted enrichment facts at unattributed concept nodes (Speaker0
-        vs Tobias divergence).
+        vs Mara divergence).
         """
         from unittest.mock import patch
 
@@ -8882,10 +8882,10 @@ class TestMergeRegistryRelationsUnification:
 
         loop = self._make_loop(tmp_path)
 
-        # subject="Tobias", speaker_id="Speaker0" → subject != speaker_id → no entity.
+        # subject="Mara", speaker_id="Speaker0" → subject != speaker_id → no entity.
         extra_relations = [
             Relation(
-                subject="Tobias",
+                subject="Mara",
                 predicate="works at",
                 object="Acme Corp",
                 relation_type="factual",
@@ -8902,7 +8902,7 @@ class TestMergeRegistryRelationsUnification:
 
         from paramem.graph.name_match import canonical
 
-        node_key = canonical("Tobias")
+        node_key = canonical("Mara")
         # Node must exist (the edge was merged), but must NOT have entity_type="person"
         # or speaker_id from entity synthesis (the subject is not a speaker node).
         if node_key in loop.merger.graph.nodes:

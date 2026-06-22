@@ -41,7 +41,7 @@ pytestmark = pytest.mark.integration
 
 PARAMEM_BINARY = os.environ.get(
     "PARAMEM_BINARY",
-    "/home/tiberius/miniforge3/envs/paramem/bin/paramem",
+    str(Path.home() / "miniforge3/envs/paramem/bin/paramem"),
 )
 
 AGE_MAGIC = b"age-encryption.org/v1\n"

@@ -580,7 +580,7 @@ class TestProbeAndReasonDispatch:
                 for k in keys:
                     results[k] = {
                         "key": k,
-                        "fact_text": f"Tobias has_attr_{k} value_{k}",
+                        "fact_text": f"Mara has_attr_{k} value_{k}",
                         "confidence": 1.0,
                     }
             return results
@@ -655,14 +655,14 @@ class TestProbeAndReasonDispatch:
         text = captured["augmented_text"]
 
         # Procedural facts present.
-        assert "Tobias has_attr_p1 value_p1" in text, (
+        assert "Mara has_attr_p1 value_p1" in text, (
             f"procedural fact missing from prompt; augmented_text:\n{text}"
         )
         # Interim-episodic facts present — this is the regression check.
-        assert "Tobias has_attr_phone_key value_phone_key" in text, (
+        assert "Mara has_attr_phone_key value_phone_key" in text, (
             f"episodic_interim phone fact missing from prompt; augmented_text:\n{text}"
         )
-        assert "Tobias has_attr_email_key value_email_key" in text, (
+        assert "Mara has_attr_email_key value_email_key" in text, (
             f"episodic_interim email fact missing from prompt; augmented_text:\n{text}"
         )
         # Layer label is "Recent knowledge" (the canonical episodic-tier label),

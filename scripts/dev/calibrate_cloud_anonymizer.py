@@ -13,7 +13,7 @@ The script itself is GPU-free in code; the run needs GPU.
 Usage::
 
     set -a && source .env && set +a && \\
-      /home/tiberius/miniforge3/envs/paramem/bin/python \\
+      $HOME/miniforge3/envs/paramem/bin/python \\
       scripts/dev/calibrate_cloud_anonymizer.py
 
 Optional flags:

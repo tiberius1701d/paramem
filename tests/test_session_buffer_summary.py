@@ -57,10 +57,10 @@ def test_append_explicit_speaker_id_attributes_without_set_speaker(buf):
     and persisted speaker_id=None — consolidation then skipped the session and
     dropped the user's facts. append() now takes the resolved id explicitly.
     """
-    buf.append("conv-tok", "user", "I live in Kelkheim", speaker_id="spk-tok", speaker="Tobias")
+    buf.append("conv-tok", "user", "I live in Freiburg", speaker_id="spk-tok", speaker="Mara")
     turns = buf._turns["conv-tok"]
     assert turns[0]["speaker_id"] == "spk-tok"
-    assert turns[0]["speaker"] == "Tobias"
+    assert turns[0]["speaker"] == "Mara"
     s = buf.get_summary()
     assert s["orphaned"] == 0
     assert s["per_speaker"] == {"spk-tok": 1}

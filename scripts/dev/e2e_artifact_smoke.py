@@ -141,7 +141,7 @@ logger = logging.getLogger("e2e_artifact_smoke")
 # ---------------------------------------------------------------------------
 
 COOLDOWN_THRESHOLD_C = 52
-GPU_COOLDOWN_SCRIPT = Path("/home/tiberius/.local/bin/gpu-cooldown.sh")
+GPU_COOLDOWN_SCRIPT = Path.home() / ".local/bin/gpu-cooldown.sh"
 PRODUCTION_CONFIG = _REPO_ROOT / "configs" / "server.yaml"
 SMOKE_SPEAKER_ID = "smoke-spk-001"
 

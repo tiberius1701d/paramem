@@ -157,11 +157,11 @@ class TestHappyPath:
     def test_returns_raw_text_and_parsed_entry(self, tmp_path, monkeypatch):
         state = _make_state(tmp_path)
         client = _make_client(monkeypatch, state)
-        raw = '{"key": "graph1", "subject": "Tobias", "predicate": "lives_in", "object": "Berlin"}'
+        raw = '{"key": "graph1", "subject": "Mara", "predicate": "lives_in", "object": "Berlin"}'
         with patch("paramem.evaluation.recall.generate_answer", return_value=raw):
             resp = client.post(
                 "/debug/recall",
-                json={"text": "Tell me about Tobias", "adapter": "episodic"},
+                json={"text": "Tell me about Mara", "adapter": "episodic"},
             )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -169,7 +169,7 @@ class TestHappyPath:
         assert body["adapter_active"] == "episodic"
         assert body["parsed_entry"] == {
             "key": "graph1",
-            "subject": "Tobias",
+            "subject": "Mara",
             "predicate": "lives_in",
             "object": "Berlin",
         }

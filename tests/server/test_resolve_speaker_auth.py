@@ -72,14 +72,14 @@ def _make_request(embedding=None, conversation_id="default"):
 class TestAuthSpeakerIdAuthoritative:
     def test_returns_auth_id_and_name_when_store_knows_id(self):
         """auth_speaker_id set + store has profile → returns (id, name)."""
-        store = _make_store({"Speaker0": "Tobias"})
+        store = _make_store({"Speaker0": "Mara"})
         buf = _make_buffer()
         req = _make_request()
 
         sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="Speaker0")
 
         assert sid == "Speaker0"
-        assert name == "Tobias"
+        assert name == "Mara"
 
     def test_returns_auth_id_with_none_name_when_store_has_no_profile(self):
         """auth_speaker_id set + store has no profile for that ID → (id, None)."""
@@ -108,10 +108,10 @@ class TestAuthSpeakerIdAuthoritative:
         Even when the request carries a speaker embedding that would match a
         different speaker via voice, the authenticated token identity wins.
         """
-        # Store: auth ID "Speaker0" (name "Tobias"); voice match would return
+        # Store: auth ID "Speaker0" (name "Mara"); voice match would return
         # "Speaker1" if the embedding branch ran — but it must not run.
         store = MagicMock()
-        store.get_name.return_value = "Tobias"
+        store.get_name.return_value = "Mara"
 
         voice_match = MagicMock()
         voice_match.speaker_id = "Speaker1"
@@ -124,13 +124,13 @@ class TestAuthSpeakerIdAuthoritative:
         sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="Speaker0")
 
         assert sid == "Speaker0"
-        assert name == "Tobias"
+        assert name == "Mara"
         # store.match must never have been called (voice path skipped)
         store.match.assert_not_called()
 
     def test_auth_id_overrides_session_history(self):
         """auth_speaker_id overrides a previously identified session speaker."""
-        store = _make_store({"Speaker0": "Tobias"})
+        store = _make_store({"Speaker0": "Mara"})
         # Buffer has a different speaker from an earlier turn.
         buf = _make_buffer(speaker_id="Speaker1", speaker_name="Alice")
         req = _make_request()
@@ -138,7 +138,7 @@ class TestAuthSpeakerIdAuthoritative:
         sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="Speaker0")
 
         assert sid == "Speaker0"
-        assert name == "Tobias"
+        assert name == "Mara"
 
 
 # ---------------------------------------------------------------------------
