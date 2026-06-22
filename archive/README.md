@@ -61,10 +61,6 @@ f4_10_*}/qwen2.5-3b/` are the canonical reference for paper numbers.
 Phase 1 basic-recall experiment. Earliest Paper v1 driver — single-fact
 recall via LoRA training, no consolidation loop yet.
 
-## experiments/phase2_forgetting.py
-Phase 2 catastrophic-forgetting study. Drove the move to replay-based
-training; reads `config.replay` heavily.
-
 ## experiments/phase3_consolidation.py
 Phase 3 consolidation loop driver. Predates the indexed-key pipeline.
 

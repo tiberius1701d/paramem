@@ -331,11 +331,6 @@ def _fingerprint_dataset(train_dataset) -> str:
     - Anything else — ``str(train_dataset)`` last-resort fallback (documented:
       address-free only within a run for opaque datasets).
 
-    Note: for replay datasets (``SyntheticQADataset``, ``MixedReplayDataset``)
-    the fingerprint is address-free (no heap-address ``str``), but
-    cross-restart match is not achievable because replay content is
-    model-output-driven and regenerated on each run.
-
     Returns:
         Hex-encoded SHA-256 digest string.
     """
