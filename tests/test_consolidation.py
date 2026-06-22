@@ -10910,12 +10910,28 @@ class TestInterimOverflowSlackConfig:
         cfg = ConsolidationScheduleConfig(max_interim_count=7, interim_overflow_slack=3)
         assert cfg.interim_overflow_slack == 3
 
-    def test_max_interim_count_zero_raises_value_error(self):
-        """max_interim_count=0 must raise ValueError at config creation."""
+    def test_max_interim_count_zero_with_cadence_accepted(self):
+        """max_interim_count=0 + non-empty refresh_cadence constructs without error.
+
+        count==0 is the full-fold-only consume-pending mode; with a scheduled
+        cadence it is valid — the full fold runs every refresh_cadence and
+        pending sessions are consumed without minting interim adapters.
+        """
         from paramem.server.config import ConsolidationScheduleConfig
 
-        with pytest.raises(ValueError, match="max_interim_count"):
-            ConsolidationScheduleConfig(max_interim_count=0)
+        cfg = ConsolidationScheduleConfig(max_interim_count=0)  # default cadence "12h"
+        assert cfg.max_interim_count == 0
+
+    def test_max_interim_count_zero_empty_cadence_raises(self):
+        """max_interim_count=0 + empty refresh_cadence raises ValueError naming refresh_cadence.
+
+        Without a scheduled full fold the pending sessions would accumulate
+        unboundedly; the validator rejects this combination at construction time.
+        """
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="refresh_cadence"):
+            ConsolidationScheduleConfig(max_interim_count=0, refresh_cadence="")
 
     def test_max_interim_count_negative_raises_value_error(self):
         """max_interim_count=-1 must raise ValueError at config creation."""

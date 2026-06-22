@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from paramem.server.config import load_server_config
+from paramem.server.config import ConsolidationScheduleConfig, load_server_config
 
 
 @pytest.fixture
@@ -170,6 +170,59 @@ def test_consolidation_period_derived(example_config):
     period = example_config.consolidation.consolidation_period_seconds
     assert period == 12 * 3600 * 7, f"expected 84h (302400s), got {period}s"
     assert example_config.consolidation.consolidation_period_string == "every 84h"
+
+
+def test_consolidation_period_count_zero_equals_refresh_cadence():
+    """At max_interim_count=0 the full-cycle period equals refresh_cadence itself.
+
+    count==0 is the full-fold-only consume-pending mode — no interim adapters
+    are minted, so the full fold runs every refresh_cadence (not × count).
+    consolidation_period_seconds must return refresh_seconds, not 0.
+    consolidation_period_string must return "every 12h", not "every 0h".
+    """
+    cfg = ConsolidationScheduleConfig(max_interim_count=0, refresh_cadence="12h")
+    refresh_seconds = 12 * 3600  # 43200
+    assert cfg.consolidation_period_seconds == refresh_seconds, (
+        f"expected {refresh_seconds}s (12h), got {cfg.consolidation_period_seconds}s"
+    )
+    assert cfg.consolidation_period_string == "every 12h", (
+        f"expected 'every 12h', got {cfg.consolidation_period_string!r}"
+    )
+
+
+def test_consolidation_count_zero_requires_nonempty_refresh_cadence():
+    """max_interim_count=0 with empty or 'off' refresh_cadence must raise ValueError.
+
+    Without a scheduled full fold the pending sessions accumulate unboundedly;
+    the validator rejects this combination at construction time so the operator
+    sees a clear error at startup rather than a silent resource leak.
+    """
+    for disabled_cadence in ("", "off"):
+        with pytest.raises(ValueError, match="refresh_cadence"):
+            ConsolidationScheduleConfig(max_interim_count=0, refresh_cadence=disabled_cadence)
+
+
+def test_consolidation_count_zero_with_cadence_constructs_ok():
+    """max_interim_count=0 + non-empty refresh_cadence must not raise."""
+    cfg = ConsolidationScheduleConfig(max_interim_count=0, refresh_cadence="12h")
+    assert cfg.max_interim_count == 0
+
+
+def test_consolidation_count_zero_malformed_cadence_raises_contextualized_error():
+    """max_interim_count=0 + malformed refresh_cadence raises ValueError naming the field.
+
+    A bad cadence string (e.g. '12x') must produce a field-contextualized
+    error mentioning 'refresh_cadence' so the operator knows exactly which
+    field to fix, mirroring the orphan_retirement validator pattern.
+    """
+    with pytest.raises(ValueError, match="refresh_cadence"):
+        ConsolidationScheduleConfig(max_interim_count=0, refresh_cadence="12x")
+
+
+def test_consolidation_negative_count_raises():
+    """max_interim_count < 0 must raise ValueError (unchanged rejection)."""
+    with pytest.raises(ValueError, match="max_interim_count"):
+        ConsolidationScheduleConfig(max_interim_count=-1)
 
 
 @pytest.mark.parametrize(

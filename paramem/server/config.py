@@ -1154,14 +1154,33 @@ class ConsolidationScheduleConfig:
                 f"got {self.consolidation_retry_cap!r}"
             )
 
-        # B8a-5: relax when consume-pending full-fold mode lands (count==0 → full-fold-only).
-        if self.max_interim_count < 1:
+        if self.max_interim_count < 0:
             raise ValueError(
-                f"consolidation.max_interim_count must be >= 1; "
+                f"consolidation.max_interim_count must be >= 0; "
                 f"got {self.max_interim_count!r}. "
-                f"Queue-until-consolidation (count=0) is not supported; "
-                f"use max_interim_count >= 1."
+                f"Use 0 for full-fold-only consume-pending mode (no interim adapters "
+                f"minted; pending sessions consumed by the scheduled full fold on "
+                f"refresh_cadence). Use >= 1 for the standard interim-adapter mode."
             )
+
+        if self.max_interim_count == 0:
+            try:
+                from paramem.memory.interim_adapter import compute_schedule_period_seconds
+
+                _period = compute_schedule_period_seconds(self.refresh_cadence)
+            except ValueError as exc:
+                raise ValueError(
+                    f"consolidation.max_interim_count=0 requires a valid refresh_cadence; "
+                    f"got {self.refresh_cadence!r}: {exc}"
+                ) from exc
+            if _period is None:
+                raise ValueError(
+                    f"consolidation.max_interim_count=0 requires a non-empty "
+                    f"refresh_cadence; got {self.refresh_cadence!r}. "
+                    f"At count=0 the full fold is the only training venue and runs "
+                    f"every refresh_cadence — with no cadence configured the full fold "
+                    f"never runs and pending sessions accumulate unboundedly."
+                )
 
         if self.interim_overflow_slack < 0:
             raise ValueError(
@@ -1214,12 +1233,19 @@ class ConsolidationScheduleConfig:
         when ``refresh_cadence`` is disabled (``""``/``"off"``/etc.). Used by
         the systemd timer to schedule the full-consolidation cycle and by
         ``pstatus`` to display the effective cadence.
+
+        Special case: when ``max_interim_count == 0`` (full-fold-only
+        consume-pending mode) there are no interim adapters; the full fold
+        runs every ``refresh_cadence`` directly, so this returns
+        ``refresh_seconds`` rather than ``refresh_seconds * 0``.
         """
         from paramem.memory.interim_adapter import compute_schedule_period_seconds
 
         refresh_seconds = compute_schedule_period_seconds(self.refresh_cadence)
         if refresh_seconds is None:
             return None
+        if self.max_interim_count == 0:
+            return refresh_seconds
         return refresh_seconds * self.max_interim_count
 
     @property
