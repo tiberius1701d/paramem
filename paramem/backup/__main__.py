@@ -91,7 +91,7 @@ def _run_standalone(server_config, args, state_dir, backups_root, config_path) -
     from paramem.backup.state import update_backup_state
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    _err = "server unavailable — bundle backup requires the running server"
+    _err = "could not reach the running server"
     artifacts_cfg = list(getattr(getattr(server_config.security, "backups", None), "artifacts", []))
     result = ScheduledBackupResult(
         started_at=now_iso,

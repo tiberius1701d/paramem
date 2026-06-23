@@ -111,7 +111,7 @@ def test_falls_back_to_degraded_state_when_unreachable(config_file, monkeypatch)
     assert "result" in state_written, "update_backup_state was not called"
     result = state_written["result"]
     assert result.success is False
-    assert result.error == "server unavailable — bundle backup requires the running server"
+    assert result.error == "could not reach the running server"
     assert result.written_slots == {}
 
 
@@ -141,7 +141,7 @@ def test_falls_back_to_degraded_state_when_endpoint_missing(config_file, monkeyp
     assert rc == 0
     assert "result" in state_written, "update_backup_state was not called"
     assert state_written["result"].success is False
-    assert "server unavailable" in state_written["result"].error
+    assert "could not reach the running server" in state_written["result"].error
 
 
 def test_schedule_off_is_noop(tmp_path, monkeypatch):

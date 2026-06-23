@@ -103,10 +103,10 @@ class TestBackupItemsEmitsFailed:
         failed_items = [i for i in items if i.kind == "backup_failed"]
         assert len(failed_items) == 1
         assert failed_items[0].level == "failed"
-        assert "FAILED" in failed_items[0].summary
+        assert "skipped" in failed_items[0].summary.lower()
         assert "disk full" in failed_items[0].summary
         assert failed_items[0].action_hint is not None
-        assert "logs" in failed_items[0].action_hint.lower()
+        assert "journal" in failed_items[0].action_hint.lower()
 
 
 # ---------------------------------------------------------------------------

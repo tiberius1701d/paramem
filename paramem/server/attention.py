@@ -897,12 +897,19 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
         last_succ = record.last_success_at or ""
         if record.last_failure_at > last_succ:  # ISO strings compare correctly as UTC
             reason = record.last_failure_reason or "(unknown)"
+            if schedule_str not in ("", "off", "disabled", "none"):
+                retry = f" Will retry at the next scheduled run ({raw_schedule})."
+            else:
+                retry = ""
             items.append(
                 AttentionItem(
                     kind="backup_failed",
                     level="failed",
-                    summary=(f"Backup: FAILED {record.last_failure_at[:19]} — {reason}"),
-                    action_hint="Inspect the backup runner logs.",
+                    summary=(f"Backup skipped {record.last_failure_at[:19]} — {reason}.{retry}"),
+                    action_hint=(
+                        "Non-fatal — retries next cycle. If it recurs, check the "
+                        "server journal (journalctl --user -u paramem-server)."
+                    ),
                     age_seconds=_age_seconds_from_iso(record.last_failure_at),
                 )
             )
