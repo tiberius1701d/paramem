@@ -533,6 +533,8 @@ _STAGE_FILENAME = {
     "anonymize": "anonymization.txt",
     "enrich": "sota_enrichment.txt",
     "plausibility": "sota_plausibility.txt",
+    "normalize_filter": "graph_dedup_filter.txt",
+    "normalize_merge": "graph_dedup_merge.txt",
 }
 
 
@@ -549,7 +551,15 @@ def _parse_seeds(spec: str | None) -> list[int | None]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--server", default="http://localhost:8420")
-    parser.add_argument("--input", required=True)
+    parser.add_argument(
+        "--input",
+        required=False,
+        default=None,
+        help=(
+            "input file (PDF, markdown, txt, jsonl). Required for chunk stages "
+            "(extract, anonymize, enrich, plausibility). Not used for 'normalize'."
+        ),
+    )
     parser.add_argument("--source-type", choices=["transcript", "document"], default=None)
     parser.add_argument("--speaker", default="Alex")
     parser.add_argument("--speaker-id", default="Speaker0")
@@ -559,7 +569,17 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "comma-separated stage names; stages are stop points along the "
             "production pipeline — selecting fewer stages just spares out "
-            "the later steps"
+            "the later steps. 'normalize' is a standalone graph-level stage "
+            "that requires --snapshot and cannot be combined with chunk stages."
+        ),
+    )
+    parser.add_argument(
+        "--snapshot",
+        default=None,
+        help=(
+            "path to a graph_merged_snapshot.json (NetworkX node-link format). "
+            "Required when --stages includes 'normalize'. "
+            "Cannot be combined with chunk stages (extract, anonymize, enrich, plausibility)."
         ),
     )
     parser.add_argument(
@@ -629,6 +649,12 @@ def main(argv: list[str] | None = None) -> int:
     prompts_dir = Path(args.prompts_dir)
     if not prompts_dir.exists():
         raise SystemExit(f"--prompts-dir does not exist: {prompts_dir}")
+    params_base: dict = {
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "max_tokens": args.max_tokens,
+    }
 
     # Default dump dir under data/ha/debug/calibration/<ts>/.
     if args.dump_dir is None:
@@ -638,11 +664,22 @@ def main(argv: list[str] | None = None) -> int:
         dump_dir = Path(args.dump_dir)
     dump_dir.mkdir(parents=True, exist_ok=True)
 
-    chunks, source_type = _load_chunks(Path(args.input), args.source_type)
-    if args.chunk is not None:
-        if args.chunk < 0 or args.chunk >= len(chunks):
-            raise SystemExit(f"--chunk {args.chunk} out of range (input has {len(chunks)} chunks)")
-        chunks = [chunks[args.chunk]]
+    if args.input is not None:
+        chunks, source_type = _load_chunks(Path(args.input), args.source_type)
+        if args.chunk is not None:
+            if args.chunk < 0 or args.chunk >= len(chunks):
+                raise SystemExit(
+                    f"--chunk {args.chunk} out of range (input has {len(chunks)} chunks)"
+                )
+            chunks = [chunks[args.chunk]]
+    elif "normalize" not in stages:
+        raise SystemExit(
+            "Error: --input is required for chunk stages "
+            "(extract, anonymize, enrich, plausibility)."
+        )
+    else:
+        chunks = []
+        source_type = "document"
 
     # Decide whether baseline runs alongside candidate.
     base_filenames_per_stage = {
@@ -650,6 +687,7 @@ def main(argv: list[str] | None = None) -> int:
         "anonymize": [_STAGE_FILENAME["anonymize"]],
         "enrich": [_STAGE_FILENAME["enrich"]],
         "plausibility": [_STAGE_FILENAME["plausibility"]],
+        "normalize": [_STAGE_FILENAME["normalize_filter"], _STAGE_FILENAME["normalize_merge"]],
     }
 
     def _run_baseline_for(stage: str) -> bool:
@@ -659,6 +697,19 @@ def main(argv: list[str] | None = None) -> int:
             return True
         return _calibration_variant_exists(
             prompts_dir, base_filenames_per_stage[stage], args.prompt_prefix
+        )
+
+    # Guard: normalize cannot be combined with chunk stages.
+    _CHUNK_STAGES = {"extract", "anonymize", "enrich", "plausibility"}
+    if "normalize" in stages and stages != ["normalize"]:
+        raise SystemExit(
+            "Error: 'normalize' cannot be combined with chunk stages "
+            "(extract, anonymize, enrich, plausibility). "
+            "Run normalize in a separate invocation: --stages normalize --snapshot <path>"
+        )
+    if "normalize" in stages and not args.snapshot:
+        raise SystemExit(
+            "Error: --stages normalize requires --snapshot <graph_merged_snapshot.json>"
         )
 
     invocation = {
@@ -694,13 +745,6 @@ def main(argv: list[str] | None = None) -> int:
                         prior_anonymize = blob
                     elif slot == "enrich":
                         prior_enrich = blob
-
-        params_base: dict = {
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-            "max_tokens": args.max_tokens,
-        }
 
         if "extract" in stages:
             extract_runs: list[dict] = []
@@ -835,6 +879,37 @@ def main(argv: list[str] | None = None) -> int:
             (dump_dir / f"04_plausibility_chunk_{chunk_idx}.json").write_text(
                 json.dumps(plaus, indent=2, default=str)
             )
+
+    # ----- normalize stage (graph-level, runs outside the chunk loop) -------
+    if "normalize" in stages:
+        filter_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['normalize_filter']}"
+        merge_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['normalize_merge']}"
+        filter_override = filter_calib if (prompts_dir / filter_calib).exists() else None
+        merge_override = merge_calib if (prompts_dir / merge_calib).exists() else None
+        normalize_runs: list[dict] = []
+        for seed in seeds:
+            params = dict(params_base)
+            params["seed"] = seed
+            norm = _post_stage(
+                args.server,
+                "normalize",
+                {
+                    "snapshot_path": args.snapshot,
+                    "filter_prompt_filename": filter_override,
+                    "merge_prompt_filename": merge_override,
+                    "prompts_dir": args.prompts_dir,
+                    "params": {k: v for k, v in params.items() if v is not None},
+                },
+            )
+            normalize_runs.append({"seed": seed, **norm})
+        out_blob: dict[str, Any] = {
+            "stage": "normalize",
+            "snapshot_path": args.snapshot,
+            "candidate_runs": normalize_runs,
+        }
+        if len(seeds) > 1:
+            out_blob["variance"] = _variance_report("normalize", normalize_runs)
+        (dump_dir / "05_normalize.json").write_text(json.dumps(out_blob, indent=2, default=str))
 
     print(f"Calibration complete.  Dump: {dump_dir}")
     return 0

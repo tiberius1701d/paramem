@@ -23,6 +23,7 @@ from paramem.graph.extraction_pipeline import ExtractionPipeline
 from paramem.server.calibrate import (
     CalibrateAnonymizeRequest,
     CalibrateExtractRequest,
+    CalibrateNormalizeRequest,
     CalibrateParams,
     CalibratePlausibilityRequest,
     _effective_params,
@@ -30,6 +31,7 @@ from paramem.server.calibrate import (
     _read_prompt,
     calibrate_anonymize,
     calibrate_extract,
+    calibrate_normalize,
     calibrate_plausibility,
 )
 
@@ -165,6 +167,106 @@ class TestCalibratePlausibility:
         with pytest.raises(HTTPException) as exc:
             calibrate_plausibility(_state_disabled(), req)
         assert exc.value.status_code == 404
+
+
+class TestCalibrateNormalize:
+    """Tests for CalibrateNormalizeRequest validation and calibrate_normalize."""
+
+    def test_disabled_404(self):
+        req = CalibrateNormalizeRequest(relations=[])
+        with pytest.raises(HTTPException) as exc:
+            calibrate_normalize(_state_disabled(), req)
+        assert exc.value.status_code == 404
+
+    def test_consolidating_503(self):
+        state = _state_enabled()
+        state["consolidating"] = True
+        req = CalibrateNormalizeRequest(relations=[])
+        with pytest.raises(HTTPException) as exc:
+            calibrate_normalize(state, req)
+        assert exc.value.status_code == 503
+
+    def test_neither_relations_nor_snapshot_400(self, tmp_path):
+        """Providing neither relations nor snapshot_path raises 400."""
+        state = _state_enabled()
+        # Write minimal prompt files so _read_prompt doesn't raise first.
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {facts_json}")
+        (prompts_dir / "graph_dedup_merge.txt").write_text("merge {clusters_json}")
+        req = CalibrateNormalizeRequest(
+            relations=None,
+            snapshot_path=None,
+            prompts_dir=str(prompts_dir),
+        )
+        with pytest.raises(HTTPException) as exc:
+            calibrate_normalize(state, req)
+        assert exc.value.status_code == 400
+        assert "exactly one" in exc.value.detail.lower()
+
+    def test_both_relations_and_snapshot_400(self, tmp_path):
+        """Providing both relations and snapshot_path raises 400."""
+        state = _state_enabled()
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {facts_json}")
+        (prompts_dir / "graph_dedup_merge.txt").write_text("merge {clusters_json}")
+        req = CalibrateNormalizeRequest(
+            relations=[{"subject": "A", "predicate": "p", "object": "B"}],
+            snapshot_path="/some/path.json",
+            prompts_dir=str(prompts_dir),
+        )
+        with pytest.raises(HTTPException) as exc:
+            calibrate_normalize(state, req)
+        assert exc.value.status_code == 400
+        assert "exactly one" in exc.value.detail.lower()
+
+    def test_snapshot_node_link_flattening(self, tmp_path):
+        """Snapshot node-link edges are correctly flattened to relation dicts."""
+        import json
+
+        snap = {
+            "nodes": [{"id": "Alex"}, {"id": "Acme"}],
+            "links": [
+                {"source": "Alex", "target": "Acme", "predicate": "works_for"},
+                {"source": "Alex", "target": "Acme", "predicate": "employed_by"},
+                {"source": "Alex", "target": "Acme"},  # missing predicate — skip
+            ],
+        }
+        snap_path = tmp_path / "graph_merged_snapshot.json"
+        snap_path.write_text(json.dumps(snap), encoding="utf-8")
+
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {facts_json}")
+        (prompts_dir / "graph_dedup_merge.txt").write_text("merge {clusters_json}")
+
+        state = _state_enabled()
+        # Stub the model to return empty JSON so the primitive completes.
+        import json as _json
+
+        filter_raw = _json.dumps({"groups": []})
+        merge_raw = _json.dumps({"merges": []})
+        state["model"].generate = MagicMock()
+        # generate_answer is called via tokenizer + model; mock at the module level.
+        import unittest.mock as _mock
+
+        with _mock.patch(
+            "paramem.graph.extractor.generate_answer",
+            side_effect=[filter_raw, merge_raw],
+        ):
+            result = calibrate_normalize(
+                state,
+                CalibrateNormalizeRequest(
+                    snapshot_path=str(snap_path),
+                    prompts_dir=str(prompts_dir),
+                ),
+            )
+
+        parsed = result["parsed"]
+        # Two grounded links (third has no predicate and is skipped).
+        assert parsed["input_count"] == 2
+        assert result["stage"] == "normalize"
 
 
 class TestEffectiveParamsSeed:

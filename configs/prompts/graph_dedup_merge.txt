@@ -1,0 +1,49 @@
+You are given synonym clusters for same-(subject, object) fact groups. Each cluster contains 2 or more predicates that express the same relationship. Your task is to pick ONE predicate to keep per cluster (the clearest, most specific one) and list the rest as dropped.
+
+RULES:
+1. For each cluster with 2 or more predicates, pick exactly ONE to keep and list the rest as dropped.
+2. Clusters with only 1 predicate have nothing to merge — skip them (do not emit a merge entry for them).
+3. The kept predicate MUST be one already in the cluster. Do not invent new predicates.
+4. Prefer the predicate that is most specific or most commonly understood (e.g. "works_for" over "employed_by", "lives_in" over "resides_in").
+5. Do not merge across groups — each merge entry is scoped to one (subject, object) pair.
+6. Output valid JSON only. No prose, no markdown fences.
+
+In the examples below every JSON literal uses double braces {{ }} so the format engine collapses them to single braces. The output you emit must use plain single-brace JSON.
+
+POSITIVE example — two synonym clusters merge; single-predicate cluster skipped:
+Input clusters:
+[
+  {{"subject": "Alex", "object": "Acme", "clusters": [["works_for", "employed_by"]]}},
+  {{"subject": "Alex", "object": "Portland", "clusters": [["resides_in", "lives_in"]]}},
+  {{"subject": "Alex", "object": "hiking", "clusters": [["likes"]]}}
+]
+Output:
+{{"merges": [
+  {{"subject": "Alex", "object": "Acme", "keep": "works_for", "drop": ["employed_by"]}},
+  {{"subject": "Alex", "object": "Portland", "keep": "lives_in", "drop": ["resides_in"]}}
+]}}
+
+POSITIVE example — asymmetric predicates in separate clusters; each has only one predicate after filtering, so no merges:
+Input clusters:
+[
+  {{"subject": "River", "object": "Casey", "clusters": [["manages"]]}},
+  {{"subject": "Casey", "object": "River", "clusters": [["reports_to"]]}}
+]
+Output:
+{{"merges": []}}
+
+POSITIVE example — multi-element cluster yields a merge; skip the single-element one:
+Input clusters:
+[
+  {{"subject": "Jordan", "object": "Tech Corp", "clusters": [["works_at", "employed_at", "works_for"]]}},
+  {{"subject": "Jordan", "object": "cycling", "clusters": [["enjoys"]]}}
+]
+Output:
+{{"merges": [
+  {{"subject": "Jordan", "object": "Tech Corp", "keep": "works_for", "drop": ["works_at", "employed_at"]}}
+]}}
+
+Input clusters:
+{clusters_json}
+
+Output the merge decisions as JSON: {{"merges": [{{"subject": "...", "object": "...", "keep": "predA", "drop": ["predB"]}}]}}

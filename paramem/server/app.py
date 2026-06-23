@@ -6906,6 +6906,11 @@ async def calibrate_plausibility_route(req: calibrate_module.CalibratePlausibili
     return calibrate_module.calibrate_plausibility(_state, req)
 
 
+@app.post("/calibrate/normalize", dependencies=[Depends(require_admin)])
+async def calibrate_normalize_route(req: calibrate_module.CalibrateNormalizeRequest):
+    return calibrate_module.calibrate_normalize(_state, req)
+
+
 @app.post(
     "/scheduled-tick",
     response_model=ConsolidateResponse,

@@ -133,6 +133,34 @@ class CalibratePlausibilityRequest(BaseModel):
     params: CalibrateParams = Field(default_factory=CalibrateParams)
 
 
+class CalibrateNormalizeRequest(BaseModel):
+    """Run the two-stage synonym-predicate dedup on an explicit relation list
+    or a graph snapshot.
+
+    Exactly one of ``relations`` or ``snapshot_path`` must be provided;
+    supplying neither or both raises HTTP 400.
+
+    * ``relations`` — flat list of relation dicts (each with at minimum
+      ``subject``, ``predicate``, ``object`` keys), supplied directly by
+      the caller.
+    * ``snapshot_path`` — path to a NetworkX node-link
+      ``graph_merged_snapshot.json`` on the server filesystem.  Edges are
+      flattened to ``{subject, predicate, object}`` dicts; edges missing a
+      ``predicate`` key are skipped.
+
+    ``filter_prompt_filename`` and ``merge_prompt_filename`` default to
+    ``graph_dedup_filter.txt`` and ``graph_dedup_merge.txt`` respectively.
+    ``prompts_dir`` defaults to the project's ``configs/prompts/`` directory.
+    """
+
+    relations: list[dict] | None = None
+    snapshot_path: str | None = None
+    filter_prompt_filename: str | None = None
+    merge_prompt_filename: str | None = None
+    prompts_dir: str | None = None
+    params: CalibrateParams = Field(default_factory=CalibrateParams)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -524,6 +552,152 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
         "parsed": parsed,
         "n_input_tokens": _count_tokens(tokenizer, prompt_content),
         "n_output_tokens": _count_tokens(tokenizer, raw_output) if raw_output else -1,
+        "wall_clock_seconds": elapsed,
+        "model": state.get("model_id", "unknown"),
+        "params_effective": _effective_params(req.params, supports_seed=True),
+        "vram_before": vram_before,
+        "vram_after": vram_after,
+    }
+
+
+def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str, Any]:
+    """Run the two-stage synonym-predicate dedup on an explicit relation list
+    or a graph snapshot.
+
+    Routes through :func:`paramem.graph.extractor.dedup_synonym_predicates_local`
+    (the graph-layer primitive).  No merger/ledger state is modified — this is
+    a read-only probe.
+
+    The GPU lock and cuDNN deterministic flags are acquired here (not inside
+    the primitive) so production callers can apply their own locking policy.
+    """
+    _preflight(state)
+
+    # Validate mutually exclusive inputs.
+    has_relations = req.relations is not None
+    has_snapshot = req.snapshot_path is not None
+    if has_relations == has_snapshot:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Exactly one of 'relations' or 'snapshot_path' must be provided, "
+                "not both and not neither."
+            ),
+        )
+
+    from paramem.graph.extractor import dedup_synonym_predicates_local
+
+    model = state["model"]
+    tokenizer = state["tokenizer"]
+
+    filter_filename = req.filter_prompt_filename or "graph_dedup_filter.txt"
+    merge_filename = req.merge_prompt_filename or "graph_dedup_merge.txt"
+    filter_path, filter_sha, filter_content = _read_prompt(req.prompts_dir, filter_filename)
+    merge_path, merge_sha, merge_content = _read_prompt(req.prompts_dir, merge_filename)
+
+    if has_relations:
+        relations: list[dict] = req.relations  # type: ignore[assignment]
+    else:
+        # Load from a NetworkX node-link snapshot.
+        import json as _json
+        from pathlib import Path as _Path
+
+        snap_path = _Path(req.snapshot_path)  # type: ignore[arg-type]
+        if not snap_path.exists():
+            raise HTTPException(
+                status_code=400,
+                detail=f"snapshot_path does not exist: {snap_path}",
+            )
+        try:
+            snap = _json.loads(snap_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read snapshot_path: {exc}",
+            ) from exc
+        # NetworkX node-link format: {"nodes": [...], "links": [...]} where
+        # each link is {source, target, key, ...edge_data...}.
+        links = snap.get("links", snap.get("edges", []))
+        relations = []
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            pred = link.get("predicate")
+            if not pred:
+                continue
+            relations.append(
+                {
+                    "subject": str(link.get("source", "")),
+                    "predicate": str(pred),
+                    "object": str(link.get("target", "")),
+                }
+            )
+
+    max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
+    temperature = req.params.temperature if req.params.temperature is not None else 0.0
+
+    vram_before = _vram_block()
+    t0 = time.perf_counter()
+
+    from peft import PeftModel as _PeftModel
+
+    with gpu_lock_sync(), _cudnn_deterministic():
+        if isinstance(model, _PeftModel):
+            with model.disable_adapter():
+                surviving, diag = dedup_synonym_predicates_local(
+                    relations,
+                    model,
+                    tokenizer,
+                    filter_prompt=filter_content,
+                    merge_prompt=merge_content,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    seed=req.params.seed,
+                )
+        else:
+            surviving, diag = dedup_synonym_predicates_local(
+                relations,
+                model,
+                tokenizer,
+                filter_prompt=filter_content,
+                merge_prompt=merge_content,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=req.params.seed,
+            )
+
+    elapsed = time.perf_counter() - t0
+    vram_after = _vram_block()
+
+    raw_filter = diag.pop("raw_filter", "")
+    raw_merge = diag.pop("raw_merge", "")
+    parsed: dict[str, Any] = {
+        "surviving_relations": surviving,
+        "input_count": len(relations),
+        "surviving_count": len(surviving),
+        **diag,
+    }
+
+    return {
+        "stage": "normalize",
+        "prompts": [
+            {
+                "role": "filter",
+                "path": filter_path,
+                "sha": filter_sha,
+                "content": filter_content,
+            },
+            {
+                "role": "merge",
+                "path": merge_path,
+                "sha": merge_sha,
+                "content": merge_content,
+            },
+        ],
+        "raw_output": {"filter": raw_filter, "merge": raw_merge},
+        "parsed": parsed,
+        "n_input_tokens": _count_tokens(tokenizer, filter_content),
+        "n_output_tokens": _count_tokens(tokenizer, raw_filter) if raw_filter else -1,
         "wall_clock_seconds": elapsed,
         "model": state.get("model_id", "unknown"),
         "params_effective": _effective_params(req.params, supports_seed=True),
