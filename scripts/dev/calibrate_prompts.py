@@ -61,6 +61,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from paramem.cli.http_client import resolve_token  # noqa: E402
 from paramem.graph.document_chunker import (  # noqa: E402
     chunk_markdown_file,
     chunk_pdf_file,
@@ -136,8 +137,17 @@ def _post_stage(
     payload: dict,
     timeout: float = 600.0,
 ) -> dict:
+    """POST *payload* to ``/calibrate/<stage>`` and return the parsed JSON response.
+
+    Resolves the bearer token from the environment, secret file, or repo ``.env``
+    (via :func:`paramem.cli.http_client.resolve_token`) and attaches it as an
+    ``Authorization: Bearer <token>`` header.  When no token is present the
+    header is omitted so auth-OFF servers keep working.
+    """
     url = f"{server.rstrip('/')}/calibrate/{stage}"
-    r = requests.post(url, json=payload, timeout=timeout)
+    token = resolve_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    r = requests.post(url, json=payload, timeout=timeout, headers=headers)
     if r.status_code == 503:
         raise SystemExit(
             f"Server returned 503 for /calibrate/{stage}: {r.text}\n"
@@ -147,6 +157,12 @@ def _post_stage(
         raise SystemExit(
             f"Server returned 404 for /calibrate/{stage}: {r.text}\n"
             f"Set consolidation.calibrate_endpoint_enabled: true in server.yaml."
+        )
+    if r.status_code == 401:
+        raise SystemExit(
+            f"Server returned 401 for /calibrate/{stage}: no/invalid bearer token.\n"
+            f"Set PARAMEM_API_TOKEN (env, ~/.config/paramem/secrets/PARAMEM_API_TOKEN,"
+            f" or repo .env)."
         )
     r.raise_for_status()
     return r.json()

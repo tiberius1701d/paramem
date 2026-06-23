@@ -3,6 +3,9 @@
 Specifically guards the NameError that occurred when --stages normalize was
 invoked with an empty chunk loop: params_base was assigned inside the
 for-chunk loop and therefore never bound when chunks == [].
+
+Also covers the auth gap: _post_stage must attach the Authorization header
+and raise SystemExit with an actionable message on 401.
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -133,4 +136,51 @@ class TestNormalizeStageNoNameError:
             f"params_base (line {params_base_line}) must be assigned BEFORE "
             f"'for chunk in chunks:' (line {chunk_loop_line}). "
             "The NameError regression has been re-introduced."
+        )
+
+
+class TestPostStageAuth:
+    """_post_stage must attach an Authorization header and handle 401 gracefully."""
+
+    def test_bearer_header_attached_when_token_present(self):
+        """_post_stage sends Authorization: Bearer <token> when resolve_token returns a token."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"ok": True}
+
+        with (
+            patch.object(calibrate_prompts, "resolve_token", return_value="test-secret-token"),
+            patch("calibrate_prompts.requests.post", return_value=mock_response) as mock_post,
+        ):
+            result = calibrate_prompts._post_stage(
+                "http://localhost:8420", "normalize", {"snapshot_path": "/tmp/snap.json"}
+            )
+
+        assert result == {"ok": True}
+        _, kwargs = mock_post.call_args
+        assert "headers" in kwargs, "_post_stage did not pass headers kwarg to requests.post"
+        headers = kwargs["headers"]
+        assert headers.get("Authorization") == "Bearer test-secret-token", (
+            f"Expected 'Bearer test-secret-token', got: {headers.get('Authorization')!r}"
+        )
+
+    def test_401_raises_systemexit_with_actionable_message(self):
+        """_post_stage raises SystemExit with a helpful message when the server returns 401."""
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+        mock_response.text = "Unauthorized"
+
+        with (
+            patch.object(calibrate_prompts, "resolve_token", return_value=None),
+            patch("calibrate_prompts.requests.post", return_value=mock_response),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                calibrate_prompts._post_stage(
+                    "http://localhost:8420", "normalize", {"snapshot_path": "/tmp/snap.json"}
+                )
+
+        message = str(exc_info.value)
+        assert "401" in message, f"Expected '401' in SystemExit message, got: {message!r}"
+        assert "PARAMEM_API_TOKEN" in message, (
+            f"Expected 'PARAMEM_API_TOKEN' in SystemExit message, got: {message!r}"
         )
