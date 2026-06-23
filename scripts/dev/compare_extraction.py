@@ -613,9 +613,9 @@ def plausibility_filter_local(
     Operates on whatever data the caller passes — typically de-anonymized
     real-name facts + real-name transcript. Returns filtered list or None.
     """
-    from paramem.graph.extractor import _local_plausibility_filter
+    from paramem.graph.extractor import local_plausibility_filter
 
-    return _local_plausibility_filter(
+    return local_plausibility_filter(
         facts,
         transcript,
         model,
@@ -649,9 +649,9 @@ def _self_anonymize_with_transcript(
             anon_transcript = _anonymize_transcript(transcript, mapping)
         return anon_facts, mapping, anon_transcript
 
-    from paramem.graph.extractor import _anonymize_with_local_model
+    from paramem.graph.extractor import anonymize_with_local_model
 
-    anon_facts, mapping, anon_transcript = _anonymize_with_local_model(
+    anon_facts, mapping, anon_transcript, _raw = anonymize_with_local_model(
         graph,
         local_model,
         local_tokenizer,

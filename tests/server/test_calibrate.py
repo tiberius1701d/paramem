@@ -19,10 +19,13 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
+from paramem.graph.extraction_pipeline import ExtractionPipeline
 from paramem.server.calibrate import (
     CalibrateAnonymizeRequest,
     CalibrateExtractRequest,
+    CalibrateParams,
     CalibratePlausibilityRequest,
+    _effective_params,
     _preflight,
     _read_prompt,
     calibrate_anonymize,
@@ -162,3 +165,51 @@ class TestCalibratePlausibility:
         with pytest.raises(HTTPException) as exc:
             calibrate_plausibility(_state_disabled(), req)
         assert exc.value.status_code == 404
+
+
+class TestEffectiveParamsSeed:
+    """Verify seed threads through _effective_params for all three local stages."""
+
+    def test_extract_supports_seed(self):
+        params = CalibrateParams(seed=42)
+        result = _effective_params(params, supports_seed=True)
+        assert result["seed"] == 42
+
+    def test_anonymize_supports_seed(self):
+        params = CalibrateParams(seed=42)
+        result = _effective_params(params, supports_seed=True)
+        assert result["seed"] == 42
+
+    def test_plausibility_supports_seed(self):
+        params = CalibrateParams(seed=42)
+        result = _effective_params(params, supports_seed=True)
+        assert result["seed"] == 42
+
+    def test_seed_none_when_supports_seed_false(self):
+        """SOTA stages report seed=null even when caller sends a seed."""
+        params = CalibrateParams(seed=99)
+        result = _effective_params(params, supports_seed=False)
+        assert result["seed"] is None
+
+    def test_seed_none_when_not_set(self):
+        params = CalibrateParams()
+        result = _effective_params(params, supports_seed=True)
+        assert result["seed"] is None
+
+
+class TestExtractionPipelineKwargsSeed:
+    """Verify ExtractionPipeline.kwargs passes seed through."""
+
+    def test_seed_forwarded(self):
+        from unittest.mock import MagicMock
+
+        pipeline = ExtractionPipeline(MagicMock(), MagicMock())
+        kwargs = pipeline.kwargs(seed=7, speaker_id="Speaker0")
+        assert kwargs["seed"] == 7
+
+    def test_seed_none_by_default(self):
+        from unittest.mock import MagicMock
+
+        pipeline = ExtractionPipeline(MagicMock(), MagicMock())
+        kwargs = pipeline.kwargs(speaker_id="Speaker0")
+        assert kwargs["seed"] is None

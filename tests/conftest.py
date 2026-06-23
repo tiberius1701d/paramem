@@ -171,7 +171,7 @@ def _extraction_trace_scope():
     every :func:`phase_trace` call to fire inside an active
     :func:`extraction_trace` — production runs through ``extract_graph``
     which establishes that scope.  Tests that exercise pipeline
-    internals (``_sota_pipeline``, ``_anonymize_with_local_model``, etc.)
+    internals (``_sota_pipeline``, ``anonymize_with_local_model``, etc.)
     directly would otherwise trip the "outside an active trace" guard.
 
     The fixture is no-op when nesting (``extraction_trace`` is

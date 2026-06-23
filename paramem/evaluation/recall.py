@@ -33,11 +33,12 @@ def generate_answer(
 
     ``top_p`` / ``top_k`` / ``seed`` are optional sampling overrides used by
     the calibration tool to probe LLM-compliance variance.  ``seed`` is
-    applied via a process-local ``torch.Generator`` (NOT a global
-    ``torch.manual_seed`` call) so concurrent inference on the same model
-    in the same process is unaffected.  All three default to ``None`` —
-    production paths preserve the current temperature-driven sampling
-    behaviour.
+    applied via ``torch.manual_seed`` immediately before generation (global
+    torch RNG), which makes sampling reproducible at temperature > 0 and is
+    a no-op at temperature 0 (greedy).  This affects the global RNG, which
+    is acceptable for the serialized calibration use case.  All three default
+    to ``None`` — production paths preserve the current temperature-driven
+    sampling behaviour.
     """
     if repetition_penalty is None:
         repetition_penalty = _DEFAULT_REPETITION_PENALTY
@@ -50,19 +51,14 @@ def generate_answer(
         if len(encoded) == 1 and encoded[0] not in stop_ids:
             stop_ids.append(encoded[0])
 
-    # Build optional generate kwargs.  Scoped seed via per-call Generator
-    # avoids touching the global torch RNG (which would race other inference
-    # in the same process).
     extra_kwargs: dict = {}
     if top_p is not None:
         extra_kwargs["top_p"] = top_p
     if top_k is not None:
         extra_kwargs["top_k"] = top_k
-    if seed is not None:
-        gen = torch.Generator(device=model.device)
-        gen.manual_seed(int(seed))
-        extra_kwargs["generator"] = gen
 
+    if seed is not None:
+        torch.manual_seed(int(seed))
     with torch.no_grad():
         outputs = model.generate(
             **inputs,

@@ -2,11 +2,9 @@
 ``paramem.evaluation.recall.generate_answer``.
 
 These tests verify that ``top_p`` / ``top_k`` / ``seed`` are forwarded
-to ``model.generate(...)`` correctly, and — critically — that ``seed``
-is implemented via a per-call ``torch.Generator`` rather than a global
-``torch.manual_seed`` call.  Touching the global RNG would race any
-other inference happening on the same model in the same process, so
-that contract is load-bearing.
+to ``model.generate(...)`` correctly, and that ``seed`` is implemented
+via ``torch.manual_seed`` immediately before generation (global torch RNG),
+making sampling reproducible at temperature > 0 (no-op at temperature 0).
 """
 
 from __future__ import annotations
@@ -51,27 +49,29 @@ def test_top_p_top_k_forwarded_to_generate():
     kwargs = model.generate.call_args.kwargs
     assert kwargs["top_p"] == 0.95
     assert kwargs["top_k"] == 40
-    assert "generator" not in kwargs  # seed not provided → no Generator
+    assert "generator" not in kwargs  # seed not provided → no generator kwarg
 
 
-def test_seed_passed_as_torch_generator_not_global():
-    """seed= must NOT touch torch.manual_seed (global RNG); it must
-    materialise a per-call ``torch.Generator`` and pass it via
-    ``generator=`` kwarg."""
+def test_seed_sets_global_rng_and_no_generator_kwarg():
+    """seed= must call torch.manual_seed (global RNG) immediately before
+    generation and must NOT pass a ``generator=`` kwarg to model.generate.
+    The global RNG is mutated; that is the intended contract for the
+    serialized calibration use case."""
     model = _fake_model()
     tok = _FakeTokenizer()
 
-    # Capture global RNG state; assert it is unchanged after the call.
+    # Capture global RNG state; assert it IS changed after the call (seed was applied).
     before = torch.random.get_rng_state()
     generate_answer(model, tok, "p", max_new_tokens=4, seed=12345)
     after = torch.random.get_rng_state()
-    assert torch.equal(before, after), (
-        "generate_answer(seed=...) must not perturb the global torch RNG"
+    assert not torch.equal(before, after), (
+        "generate_answer(seed=...) must set the global torch RNG via torch.manual_seed"
     )
 
     kwargs = model.generate.call_args.kwargs
-    assert "generator" in kwargs
-    assert isinstance(kwargs["generator"], torch.Generator)
+    assert "generator" not in kwargs, (
+        "generate_answer(seed=...) must not pass a generator= kwarg to model.generate"
+    )
 
 
 def test_no_overrides_no_extra_kwargs():

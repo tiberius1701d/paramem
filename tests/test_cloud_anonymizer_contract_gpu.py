@@ -1,7 +1,7 @@
 """LLM-compliance contract test for ``extract_and_anonymize_for_cloud``.
 
 Why this test exists: the helper calls ``extract_graph`` +
-``_anonymize_with_local_model`` end-to-end on a real multi-turn
+``anonymize_with_local_model`` end-to-end on a real multi-turn
 **transcript** -- the same input shape ParaMem operates on in
 production.  Mocked tests cannot catch prompt-compliance regressions;
 only a live model run on production-shaped input can verify the contract.

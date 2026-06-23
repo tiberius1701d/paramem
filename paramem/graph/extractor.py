@@ -719,6 +719,7 @@ def extract_graph(
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
     stop_phase: str | None = None,
     model_alias: str | None = None,
+    seed: int | None = None,
 ) -> SessionGraph:
     """Extract a knowledge graph from a session transcript.
 
@@ -779,6 +780,11 @@ def extract_graph(
             ``sota_*`` prompts (cloud enricher) and ``anonymization.txt``
             are model-independent by design and are NOT affected by this
             parameter.
+        seed: Optional RNG seed forwarded to every :func:`generate_answer`
+            call within the pipeline (extraction, anonymization,
+            plausibility).  At the default ``temperature=0.0`` (greedy
+            decoding) this is a strict no-op.  Default ``None`` preserves
+            production behaviour unchanged.
     """
     # Validate stop_phase against the canonical whitelist before any
     # work happens.  Catches typos early ("anonymise" vs "anonymize")
@@ -819,6 +825,7 @@ def extract_graph(
                     system_prompt_filename=system_prompt_filename,
                     user_prompt_filename=user_prompt_filename,
                     model_alias=model_alias,
+                    seed=seed,
                 )
                 t.set_raw(raw_output)
                 logger.debug("Raw extraction output: %s", raw_output[:500])
@@ -898,6 +905,7 @@ def extract_graph(
                     max_tokens=max_tokens,
                     plausibility_max_tokens=plausibility_max_tokens,
                     stop_phase=stop_phase,
+                    seed=seed,
                 )
 
             return graph
@@ -926,7 +934,7 @@ def extract_and_anonymize_for_cloud(
 
     1. ``extract_graph(validate=False)`` — local extraction only,
        produces a SessionGraph the anonymizer can anchor on.
-    2. ``_anonymize_with_local_model(graph, transcript=transcript)`` —
+    2. ``anonymize_with_local_model(graph, transcript=transcript)`` —
        model-based anonymization of facts + transcript.
     3. Mechanical transcript fallback when the model omits
        ``anonymized_transcript`` (older prompt schema returns facts only).
@@ -1015,7 +1023,7 @@ def extract_and_anonymize_for_cloud(
         return "", {}, {}
 
     try:
-        anon_facts, mapping, anon_transcript, _raw = _anonymize_with_local_model(
+        anon_facts, mapping, anon_transcript, _raw = anonymize_with_local_model(
             graph, model, tokenizer, transcript=transcript
         )
     except Exception:
@@ -1032,7 +1040,7 @@ def extract_and_anonymize_for_cloud(
         # `_sota_pipeline` uses).
         anon_transcript = _anonymize_transcript(transcript, mapping)
 
-    # Build the reverse map alongside the forward.  ``_anonymize_with_local_model``
+    # Build the reverse map alongside the forward.  ``anonymize_with_local_model``
     # produces a one-to-one ``{real → placeholder}`` mapping (the anonymizer
     # prompt operates on relation participants only, no attribute fold), so a
     # straight dict inversion is information-preserving here.  Repairs below
@@ -1125,6 +1133,7 @@ def _generate_extraction(
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
     model_alias: str | None = None,
+    seed: int | None = None,
 ) -> str:
     """Generate graph extraction output from the model. Called once.
 
@@ -1142,6 +1151,9 @@ def _generate_extraction(
     ``model_alias`` enables per-file prompt resolution — see
     :func:`load_extraction_prompts`.  The ``sota_*`` prompts are
     model-independent by design and are not affected.
+
+    ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the
+    default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
     """
     system, prompt = load_extraction_prompts(
         prompts_dir,
@@ -1181,6 +1193,7 @@ def _generate_extraction(
             formatted,
             max_new_tokens=max_tokens,
             temperature=temperature,
+            seed=seed,
         )
 
 
@@ -1934,6 +1947,7 @@ def _fallback_plausibility_on_raw(
     speaker_id: str,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
+    seed: int | None = None,
 ) -> SessionGraph:
     """Fallback pipeline path: run local plausibility on raw (unanonymized) facts.
 
@@ -1979,13 +1993,14 @@ def _fallback_plausibility_on_raw(
 
     # Local plausibility filter (uses real names).
     if raw_facts and model is not None and tokenizer is not None:
-        filtered, _raw = _local_plausibility_filter(
+        filtered, _raw = local_plausibility_filter(
             raw_facts,
             transcript,
             model,
             tokenizer,
             max_tokens=plausibility_max_tokens,
             temperature=_DEFAULT_FILTER_TEMPERATURE,
+            seed=seed,
         )
         if filtered is not None:
             pre = len(raw_facts)
@@ -2046,6 +2061,7 @@ def _sota_pipeline(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     stop_phase: str | None = None,
+    seed: int | None = None,
 ) -> SessionGraph:
     """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
 
@@ -2103,8 +2119,8 @@ def _sota_pipeline(
     # variants on the anonymizer in isolation.
     _vram_snapshot(f"sota_pipeline_entry session={graph.session_id}")
     with phase_trace("anonymize") as t:
-        anon_facts, mapping, anon_transcript, anon_raw = _anonymize_with_local_model(
-            graph, model, tokenizer, transcript=transcript, max_tokens=max_tokens
+        anon_facts, mapping, anon_transcript, anon_raw = anonymize_with_local_model(
+            graph, model, tokenizer, transcript=transcript, max_tokens=max_tokens, seed=seed
         )
         t.set_raw(anon_raw)
         t.set_parsed(
@@ -2134,6 +2150,7 @@ def _sota_pipeline(
             speaker_id=speaker_id,
             max_tokens=max_tokens,
             plausibility_max_tokens=plausibility_max_tokens,
+            seed=seed,
         )
     if not anon_facts:
         logger.info("Anonymization produced 0 facts — skipping SOTA pipeline")
@@ -2303,6 +2320,7 @@ def _sota_pipeline(
                     speaker_id=speaker_id,
                     max_tokens=max_tokens,
                     plausibility_max_tokens=plausibility_max_tokens,
+                    seed=seed,
                 )
 
     # Phase — sota_enrich.  Cloud (Anthropic by default) runs the
@@ -2569,13 +2587,14 @@ def _sota_pipeline(
     ):
         with phase_trace("deanon_plausibility") as t:
             _vram_snapshot(f"before_plausibility_deanon session={graph.session_id}")
-            filtered_deanon, plaus_raw = _local_plausibility_filter(
+            filtered_deanon, plaus_raw = local_plausibility_filter(
                 deanon_facts,
                 transcript,  # original real-name transcript — intentional, see docstring
                 model,
                 tokenizer,
                 max_tokens=plausibility_max_tokens,
                 temperature=_DEFAULT_FILTER_TEMPERATURE,
+                seed=seed,
             )
             t.set_raw(plaus_raw)
             if filtered_deanon is not None:
@@ -2676,6 +2695,7 @@ def _sota_pipeline(
             speaker_id=speaker_id,
             max_tokens=max_tokens,
             plausibility_max_tokens=plausibility_max_tokens,
+            seed=seed,
         )
 
     # Rebuild entity list from surviving + new relations.
@@ -3740,13 +3760,14 @@ def load_anonymization_prompt() -> str:
     return _load_prompt("anonymization.txt", _DEFAULT_ANONYMIZATION_PROMPT)
 
 
-def _anonymize_with_local_model(
+def anonymize_with_local_model(
     graph: SessionGraph,
     model,
     tokenizer,
     transcript: str = "",
     max_tokens: int = _DEFAULT_ANONYMIZER_MAX_TOKENS,
     temperature: float = _DEFAULT_ANONYMIZER_TEMPERATURE,
+    seed: int | None = None,
 ) -> tuple[list[dict] | None, dict, str, str]:
     """Anonymize extracted facts AND transcript using the local model.
 
@@ -3759,6 +3780,9 @@ def _anonymize_with_local_model(
     The raw model output is the fourth element so the calibration phase
     trace can record it without re-running the call.  An empty string is
     returned only when the model did not produce a response at all.
+
+    ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the
+    default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
     """
     facts = [
         {
@@ -3793,7 +3817,12 @@ def _anonymize_with_local_model(
     # the other wraps.
     with vram_scope("anonymize"):
         raw = generate_answer(
-            model, tokenizer, formatted, max_new_tokens=max_tokens, temperature=temperature
+            model,
+            tokenizer,
+            formatted,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
         )
     logger.debug("Anonymization raw: %s", raw[:500])
 
@@ -4747,13 +4776,14 @@ def _plausibility_filter_with_sota(
     return _apply_drop_set(enriched_anon_facts, raw), raw
 
 
-def _local_plausibility_filter(
+def local_plausibility_filter(
     facts: list[dict],
     transcript: str,
     model,
     tokenizer,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
+    seed: int | None = None,
 ) -> tuple[list[dict] | None, str]:
     """Local-model plausibility filter — drops invalid relations only.
 
@@ -4769,6 +4799,9 @@ def _local_plausibility_filter(
 
     The prompt is external config — edit ``configs/prompts/sota_plausibility.txt``
     to tune; no code changes are needed.
+
+    ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the
+    default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
     """
     _vram_snapshot(f"plaus_filter_entry n_facts={len(facts)}")
     plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
@@ -4812,6 +4845,7 @@ def _local_plausibility_filter(
                 formatted,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
+                seed=seed,
             )
     except Exception as exc:  # noqa: BLE001
         logger.error(

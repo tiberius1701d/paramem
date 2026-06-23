@@ -79,7 +79,7 @@ def _fact_key(fact: dict) -> tuple[str, str, str]:
 
 def test_plausibility_prompt_llm_compliance(loaded_model, fixture_data):
     """Live local judge matches >= 90% of ground-truth keep/drop labels."""
-    from paramem.graph.extractor import _local_plausibility_filter
+    from paramem.graph.extractor import local_plausibility_filter
 
     model, tokenizer = loaded_model
     transcript = fixture_data["transcript"]
@@ -100,9 +100,9 @@ def test_plausibility_prompt_llm_compliance(loaded_model, fixture_data):
 
     if isinstance(model, PeftModel):
         with model.disable_adapter():
-            survivors, _raw = _local_plausibility_filter(judge_input, transcript, model, tokenizer)
+            survivors, _raw = local_plausibility_filter(judge_input, transcript, model, tokenizer)
     else:
-        survivors, _raw = _local_plausibility_filter(judge_input, transcript, model, tokenizer)
+        survivors, _raw = local_plausibility_filter(judge_input, transcript, model, tokenizer)
     assert survivors is not None, "Judge returned None (parse failure) — check raw output"
 
     survivor_keys = {_fact_key(f) for f in survivors}

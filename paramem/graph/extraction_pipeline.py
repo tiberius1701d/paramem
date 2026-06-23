@@ -251,6 +251,7 @@ class ExtractionPipeline:
             system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),
             user_prompt_filename=pick("user_prompt_filename", user_prompt_filename),
             stop_phase=overrides.get("stop_phase"),
+            seed=overrides.get("seed"),
         )
 
     def run(

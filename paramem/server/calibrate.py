@@ -21,9 +21,9 @@ Endpoints:
   or /calibrate call); calibrate reaches it via ``loop.extraction`` so
   every flag the production cycle applies is applied here too.  Returns
   the local-only graph (pre-anonymization).
-* ``POST /calibrate/anonymize`` — runs ``_anonymize_with_local_model`` on
+* ``POST /calibrate/anonymize`` — runs ``anonymize_with_local_model`` on
   the caller-supplied SessionGraph + transcript.
-* ``POST /calibrate/plausibility`` — runs ``_local_plausibility_filter``
+* ``POST /calibrate/plausibility`` — runs ``local_plausibility_filter``
   on the caller-supplied fact list + transcript.
 
 Returns a uniform shape:
@@ -54,6 +54,8 @@ from typing import Any
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
+from paramem.server.gpu_lock import gpu_lock_sync
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,7 +70,9 @@ class CalibrateParams(BaseModel):
     All fields default to ``None`` — the underlying call site uses its
     configured production default for every unset field.  ``seed`` only
     applies to local stages (Anthropic does not accept a seed parameter;
-    SOTA stages report ``seed: null`` in ``params_effective``).
+    SOTA stages report ``seed: null`` in ``params_effective``).  seed
+    only affects output at temperature>0; at the default greedy
+    temperature 0.0 it is a no-op.
     """
 
     temperature: float | None = None
@@ -353,14 +357,14 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
         overrides["temperature"] = req.params.temperature
     if req.stop_phase is not None:
         overrides["stop_phase"] = req.stop_phase
-    # NOTE: top_p, top_k, seed do not currently flow through
-    # extract_graph's signature — those are for direct generate_answer
-    # calls (anonymize / plausibility paths).  Document the limitation
-    # in params_effective.
+    if req.params.seed is not None:
+        overrides["seed"] = req.params.seed
+    # NOTE: top_p, top_k do not flow through extract_graph's signature.
+    # Document the limitation in params_effective.
 
     vram_before = _vram_block()
     t0 = time.perf_counter()
-    with _cudnn_deterministic():
+    with gpu_lock_sync(), _cudnn_deterministic():
         graph = loop.extraction.run(
             req.transcript,
             req.session_id,
@@ -409,7 +413,7 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
         "n_output_tokens": _count_tokens(tokenizer, raw_output) if raw_output else -1,
         "wall_clock_seconds": elapsed,
         "model": getattr(state.get("model_id"), "name", state.get("model_id", "unknown")),
-        "params_effective": _effective_params(req.params, supports_seed=False),
+        "params_effective": _effective_params(req.params, supports_seed=True),
         "vram_before": vram_before,
         "vram_after": vram_after,
     }
@@ -418,7 +422,7 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
 def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str, Any]:
     """Run the local anonymizer on an explicit graph + transcript."""
     _preflight(state)
-    from paramem.graph.extractor import _anonymize_with_local_model
+    from paramem.graph.extractor import anonymize_with_local_model
     from paramem.graph.schema import SessionGraph
 
     model = state["model"]
@@ -438,13 +442,14 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     vram_before = _vram_block()
     t0 = time.perf_counter()
-    with _cudnn_deterministic():
-        anon_facts, mapping, anon_transcript, raw_output = _anonymize_with_local_model(
+    with gpu_lock_sync(), _cudnn_deterministic():
+        anon_facts, mapping, anon_transcript, raw_output = anonymize_with_local_model(
             graph,
             model,
             tokenizer,
             transcript=req.transcript,
             max_tokens=max_tokens,
+            seed=req.params.seed,
         )
     elapsed = time.perf_counter() - t0
     vram_after = _vram_block()
@@ -466,7 +471,7 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
         "n_output_tokens": _count_tokens(tokenizer, raw_output) if raw_output else -1,
         "wall_clock_seconds": elapsed,
         "model": state.get("model_id", "unknown"),
-        "params_effective": _effective_params(req.params, supports_seed=False),
+        "params_effective": _effective_params(req.params, supports_seed=True),
         "vram_before": vram_before,
         "vram_after": vram_after,
     }
@@ -475,7 +480,7 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
 def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> dict[str, Any]:
     """Run the local plausibility filter on an explicit fact list."""
     _preflight(state)
-    from paramem.graph.extractor import _local_plausibility_filter
+    from paramem.graph.extractor import local_plausibility_filter
 
     model = state["model"]
     tokenizer = state["tokenizer"]
@@ -488,14 +493,15 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
 
     vram_before = _vram_block()
     t0 = time.perf_counter()
-    with _cudnn_deterministic():
-        kept, raw_output = _local_plausibility_filter(
+    with gpu_lock_sync(), _cudnn_deterministic():
+        kept, raw_output = local_plausibility_filter(
             req.facts,
             req.transcript,
             model,
             tokenizer,
             max_tokens=max_tokens,
             temperature=temperature,
+            seed=req.params.seed,
         )
     elapsed = time.perf_counter() - t0
     vram_after = _vram_block()
@@ -520,7 +526,7 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
         "n_output_tokens": _count_tokens(tokenizer, raw_output) if raw_output else -1,
         "wall_clock_seconds": elapsed,
         "model": state.get("model_id", "unknown"),
-        "params_effective": _effective_params(req.params, supports_seed=False),
+        "params_effective": _effective_params(req.params, supports_seed=True),
         "vram_before": vram_before,
         "vram_after": vram_after,
     }
@@ -535,11 +541,11 @@ def _effective_params(params: CalibrateParams, *, supports_seed: bool) -> dict:
     response uses this to inform the operator which fields actually
     landed.
 
-    Currently extract / anonymize / plausibility do not yet thread
-    top_p / top_k / seed into ``generate_answer`` from the calibrate
-    layer — those flow when the underlying helper is updated.  The
-    field is reported as-requested for transparency; future iterations
-    will push them through.
+    seed threads through all three local stages (extract, anonymize,
+    plausibility) via the helpers' ``seed`` parameter forwarded to
+    ``generate_answer``.  top_p / top_k are not yet threaded for these
+    stages (documented gap; SOTA stages follow the Anthropic API which
+    omits them).  The field is reported as-requested for transparency.
     """
     out: dict = {}
     for f in ("temperature", "top_p", "top_k", "max_tokens"):

@@ -356,7 +356,7 @@ class TestParseFactsResponseSalvage:
     closing ``]`` never arrives).
 
     Without the salvage path the plausibility filter's strict array parse
-    fails and ``_local_plausibility_filter`` returns ``None`` — the gate
+    fails and ``local_plausibility_filter`` returns ``None`` — the gate
     fail-opens and 0 facts get filtered.  Salvage extracts the well-formed
     inner ``{…}`` blocks via depth-walk and returns those.
     """
@@ -1144,7 +1144,7 @@ class TestSOTANoiseFilter:
             assert len(result.relations) == 1
 
     def test_anonymize_graceful_on_bad_output(self):
-        from paramem.graph.extractor import _anonymize_with_local_model
+        from paramem.graph.extractor import anonymize_with_local_model
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1165,7 +1165,7 @@ class TestSOTANoiseFilter:
             patch("paramem.graph.extractor.generate_answer", return_value="not json"),
             patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
-            result, mapping, anon_transcript, _raw = _anonymize_with_local_model(
+            result, mapping, anon_transcript, _raw = anonymize_with_local_model(
                 graph, model, tokenizer
             )
         assert result is None
@@ -1190,10 +1190,10 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(None, {}, "", ""),
             ),
-            # Pass model=None/tokenizer=None → _local_plausibility_filter skipped inside fallback
+            # Pass model=None/tokenizer=None → local_plausibility_filter skipped inside fallback
         ):
             # Transcript "Alex lives in Millfield" grounds both entities.
             result = _sota_pipeline(
@@ -1237,7 +1237,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, "", ""),
             ),
             patch(
@@ -1269,7 +1269,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, "", ""),
             ),
             patch(
@@ -1310,7 +1310,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, "", ""),
             ),
             patch(
@@ -1340,7 +1340,7 @@ class TestSOTANoiseFilter:
         inputs (see ``TestPlausibilityDropSet`` for the structural tests
         and the new prompt contract).
         """
-        from paramem.graph.extractor import _local_plausibility_filter
+        from paramem.graph.extractor import local_plausibility_filter
 
         facts = [
             {"subject": "Alex", "predicate": "lives_in", "object": "Millfield"},
@@ -1356,7 +1356,7 @@ class TestSOTANoiseFilter:
             patch("paramem.graph.extractor.generate_answer", return_value=drop_response),
             patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
-            result, raw = _local_plausibility_filter(facts, "transcript", MagicMock(), tokenizer)
+            result, raw = local_plausibility_filter(facts, "transcript", MagicMock(), tokenizer)
         assert result is not None
         assert len(result) == 1
         assert result[0] == facts[0]  # input fact returned unchanged
@@ -1706,7 +1706,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
@@ -1761,7 +1761,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
@@ -2297,7 +2297,7 @@ class TestPlausibilityAnon:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
@@ -2363,7 +2363,7 @@ class TestPlausibilityDeanon:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
@@ -2371,7 +2371,7 @@ class TestPlausibilityDeanon:
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor._local_plausibility_filter",
+                "paramem.graph.extractor.local_plausibility_filter",
                 side_effect=fake_local_plaus,
             ),
         ):
@@ -2467,7 +2467,7 @@ class TestResidualLeakDropsReferencingTriples:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts_initial, mapping, anon_transcript, ""),
             ),
             patch(
@@ -2532,7 +2532,7 @@ class TestAnonFailureFallback:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(None, {}, "", ""),
             ),
             patch(
@@ -2577,7 +2577,7 @@ class TestSotaEnrichmentFailureRaises:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, "", ""),
             ),
             patch(
@@ -2642,7 +2642,7 @@ class TestAllDroppedSafetyNet:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, "anon transcript", ""),
             ),
             patch(
@@ -2650,7 +2650,7 @@ class TestAllDroppedSafetyNet:
                 return_value=(sota_enriched, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor._local_plausibility_filter",
+                "paramem.graph.extractor.local_plausibility_filter",
                 return_value=([], ""),
             ),
             patch(
@@ -2703,7 +2703,7 @@ class TestEntityTypePreservation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
@@ -2745,7 +2745,7 @@ class TestEntityTypePreservation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
@@ -2801,7 +2801,7 @@ class TestEntityTypePreservation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
@@ -3032,7 +3032,7 @@ class TestExtractGraphNewKwargs:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
@@ -3081,7 +3081,7 @@ class TestDiagnosticsKeys:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
@@ -3089,7 +3089,7 @@ class TestDiagnosticsKeys:
                 return_value=(anon_facts, None, {}, None, {}),
             ),
             patch(
-                "paramem.graph.extractor._local_plausibility_filter",
+                "paramem.graph.extractor.local_plausibility_filter",
                 side_effect=fake_local_plaus,
             ),
         ):
@@ -3125,7 +3125,7 @@ class TestDiagnosticsKeys:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor._anonymize_with_local_model",
+                "paramem.graph.extractor.anonymize_with_local_model",
                 return_value=(anon_facts, mapping, "anon transcript", ""),
             ),
             patch(

@@ -197,7 +197,7 @@ class TestExtractProceduralGraph:
 class TestSOTAFullFlow:
     def test_anonymize_with_local_model(self, model_and_tokenizer):
         """Test that local model can anonymize extracted facts."""
-        from paramem.graph.extractor import _anonymize_with_local_model
+        from paramem.graph.extractor import anonymize_with_local_model
         from paramem.graph.schema import Entity, Relation, SessionGraph
 
         model, tokenizer = model_and_tokenizer
@@ -219,7 +219,7 @@ class TestSOTAFullFlow:
                 ),
             ],
         )
-        result, mapping, anon_transcript, raw = _anonymize_with_local_model(graph, model, tokenizer)
+        result, mapping, anon_transcript, raw = anonymize_with_local_model(graph, model, tokenizer)
         # Mistral may or may not produce valid anonymization
         # Just verify no crash and correct return types
         if result is not None:

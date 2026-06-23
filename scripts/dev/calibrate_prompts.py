@@ -580,7 +580,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--seeds",
         default="none",
-        help="comma-separated seed list, 'random:N', or 'none' (default)",
+        help=(
+            "comma-separated seed list, 'random:N', or 'none' (default). "
+            "Seeds only vary output at --temperature>0; at the default "
+            "greedy temperature 0.0 they are a no-op."
+        ),
     )
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top-p", type=float, default=None)
