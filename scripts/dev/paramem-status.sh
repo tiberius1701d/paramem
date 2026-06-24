@@ -1003,7 +1003,7 @@ if [[ -n "$backup_line" ]]; then
             echo -e "  Backup:   ${DIM}scheduled backups disabled${RESET}"
             ;;
         *)
-            # B5 fix (2026-04-22 E2E baseline): cap=0 (max_total_disk_gb: 0) means
+            # (2026-04-22 E2E baseline): cap=0 (max_total_disk_gb: 0) means
             # no disk cap is configured.  Render a plain success/never-run line so
             # the failure-branch guard can never mis-fire with cap-related fields.
             # Without this guard, the (cap=0) state could produce garbled output

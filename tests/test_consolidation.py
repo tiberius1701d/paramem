@@ -2899,7 +2899,7 @@ class TestAbortSkipsCommit:
         returns {'mode': 'aborted'} without updating simhashes or committing
         the tier slot.
 
-        B3: key generation uses the graph-walk (merger.graph) via _run_fold.
+        Key generation uses the graph-walk (merger.graph) via _run_fold.
         Set up a real NetworkX graph with one keyless episodic edge so the
         graph-walk produces a non-empty training set and triggers the
         train_adapter call.
@@ -2912,7 +2912,7 @@ class TestAbortSkipsCommit:
 
         loop = self._make_minimal_loop(monkeypatch, tmp_path)
 
-        # B3: populate merger.graph with a real MultiDiGraph so _build_all_edge_entries_into
+        # Populate merger.graph with a real MultiDiGraph so _build_all_edge_entries_into
         # (defer=True) finds a keyless edge and produces a non-empty deferred write →
         # all_interim_keyed is non-empty → training is triggered.
         real_graph = nx.MultiDiGraph()
@@ -2994,7 +2994,7 @@ class TestAbortSkipsCommit:
         """When interim train_adapter returns aborted=True, store.put must be
         skipped for BOTH episodic and procedural minted entries.
 
-        B5: procedural entries now ride the same interim slot as episodic and
+        Procedural entries now ride the same interim slot as episodic and
         are flushed in the same deferred-mutation block.  An abort before flush
         must leave the store unchanged for both tiers.
 
@@ -8106,34 +8106,34 @@ class TestBuildRegistryTrueRelationsKeysFilter:
 
 
 # ---------------------------------------------------------------------------
-# B1 — _materialize_consolidation_graph: extra_relations seam + interim call
+# _materialize_consolidation_graph: extra_relations seam + interim call
 # ---------------------------------------------------------------------------
 
 
-class TestMaterializeInterimB1:
-    """Unit tests for the B1 seam: extra_relations parameter on
+class TestMaterializeInterimExtraRelations:
+    """Unit tests for the extra_relations parameter on
     _materialize_consolidation_graph and its use in run_consolidation_cycle.
 
     Covered invariants:
 
-    B1-1. extra_relations=None and extra_relations=[] are no-ops for the fold
-          caller — the output is byte-identical to the call without extra_relations.
-    B1-2. After the interim materialize call, the merged graph contains both the
-          slot's recalled (registry-true) relations AND the pending-session
-          extra_relations.  A pending fact whose SPO matches a recalled key fires
-          Case-1-adopt: exactly one key survives, recurrence is bumped.
-    B1-3. A pending UNREGISTERED relation (not in the slot registry) does NOT
-          appear in recall_miss_keys.  recall_miss_keys is computed against
-          store.all_active_keys() BEFORE the reset — unregistered relations are
-          invisible to the miss set.
-    B1-4. dcf4189 speaker_id invariant: a minted interim key inherits speaker_id
-          from the relation dict through the graph-walk keying step — the
-          B1 materialize step does not disrupt this flow.
+    1. extra_relations=None and extra_relations=[] are no-ops for the fold
+       caller — the output is byte-identical to the call without extra_relations.
+    2. After the interim materialize call, the merged graph contains both the
+       slot's recalled (registry-true) relations AND the pending-session
+       extra_relations.  A pending fact whose SPO matches a recalled key fires
+       Case-1-adopt: exactly one key survives, recurrence is bumped.
+    3. A pending UNREGISTERED relation (not in the slot registry) does NOT
+       appear in recall_miss_keys.  recall_miss_keys is computed against
+       store.all_active_keys() BEFORE the reset — unregistered relations are
+       invisible to the miss set.
+    4. dcf4189 speaker_id invariant: a minted interim key inherits speaker_id
+       from the relation dict through the graph-walk keying step — the
+       materialize step does not disrupt this flow.
     """
 
     @staticmethod
     def _make_loop(tmp_path):
-        """Minimal ConsolidationLoop with a real GraphMerger for B1 tests.
+        """Minimal ConsolidationLoop with a real GraphMerger for materialize tests.
 
         Uses object.__new__ so no GPU model or extraction pipeline is needed.
         Includes a real GraphMerger (model=None) so merger.merge / reset_graph
@@ -8206,7 +8206,7 @@ class TestMaterializeInterimB1:
     def _fake_reconstruct(loop, *, tier=None, strict=False):
         """Reconstruct stub: returns empty graph + no failures.
 
-        Used to suppress real GPU probe calls in B1 unit tests.
+        Used to suppress real GPU probe calls in materialize unit tests.
         The recall-miss diagnostics tested here operate on an already-populated
         store; the stub causes ALL registered keys to land in recall_miss_keys
         (no reconstruction → failure for each active key).  Tests that need
@@ -8219,7 +8219,7 @@ class TestMaterializeInterimB1:
         return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
 
     # ------------------------------------------------------------------
-    # B1-1: extra_relations=None / [] is a no-op for the fold caller
+    # 1. extra_relations=None / [] is a no-op for the fold caller
     # ------------------------------------------------------------------
 
     def test_extra_relations_none_is_noop(self, tmp_path):
@@ -8265,7 +8265,7 @@ class TestMaterializeInterimB1:
         )
 
     # ------------------------------------------------------------------
-    # B1-2: Case-1 adoption — pending fact matching recalled key → one key
+    # 2. Case-1 adoption — pending fact matching recalled key → one key
     # ------------------------------------------------------------------
 
     def test_extra_relations_case1_adoption(self, tmp_path):
@@ -8362,7 +8362,7 @@ class TestMaterializeInterimB1:
         )
 
     # ------------------------------------------------------------------
-    # B1-3: Pending unregistered relation does NOT enter recall_miss_keys
+    # 3. Pending unregistered relation does NOT enter recall_miss_keys
     # ------------------------------------------------------------------
 
     def test_unregistered_extra_relation_not_in_recall_miss(self, tmp_path):
@@ -8413,14 +8413,14 @@ class TestMaterializeInterimB1:
         )
 
     # ------------------------------------------------------------------
-    # B1-4: dcf4189 speaker_id inheritance through the materialize path
+    # 4. dcf4189 speaker_id inheritance through the materialize path
     # ------------------------------------------------------------------
 
     def test_speaker_id_preserved_through_materialize_in_cycle(self, tmp_path):
         """Minted interim keys inherit speaker_id from episodic_rels through the
         new materialize path.
 
-        B1 inserts _materialize_consolidation_graph BEFORE the graph-walk keying step.
+        _materialize_consolidation_graph runs BEFORE the graph-walk keying step.
         The key-prep reads speaker_id from episodic_rels (via _mint_keyed_entries),
         NOT from graph nodes.  This test verifies that adding the materialize step
         does not corrupt speaker_id in minted keys (dcf4189 invariant).
@@ -8485,23 +8485,23 @@ class TestMaterializeInterimB1:
                         )
 
     # ------------------------------------------------------------------
-    # B1 integration: interim materialize call in run_consolidation_cycle
+    # Integration: interim materialize call in run_consolidation_cycle
     # ------------------------------------------------------------------
 
     def test_interim_materialize_called_before_key_prep(self, tmp_path):
         """run_consolidation_cycle calls _materialize_consolidation_graph before
-        the graph-walk keying step (B3).
+        the graph-walk keying step.
 
         Uses a spy on _materialize_consolidation_graph and asserts:
         (a) It is called exactly once per cycle.
         (b) It is called with tier=adapter_name and the slot's active keys.
 
-        B3 note: key generation uses the unified graph-walk
+        Key generation uses the unified graph-walk
         (_build_all_edge_entries_into, defer=True).  When the materialize stub returns
         (set(), []) and the merger graph is empty, the walk produces zero keys
         — the store's tier is empty after the cycle (expected here).
         Tests that verify key minting (dcf4189, speaker_id) are in
-        TestInterimKeyedWalkB3.
+        TestInterimKeyedWalk.
         """
 
         loop = self._make_loop(tmp_path)
@@ -8549,28 +8549,29 @@ class TestMaterializeInterimB1:
 
 
 # ---------------------------------------------------------------------------
-# B3 — multi-speaker dcf4189 invariant + keyed-walk vs flat parity
+# Multi-speaker dcf4189 invariant + keyed-walk vs flat parity
 # ---------------------------------------------------------------------------
 
 
-class TestInterimKeyedWalkB3:
-    """B3 acceptance tests: keyed-walk speaker_id and SPO-content parity.
+class TestInterimKeyedWalk:
+    """Keyed-walk acceptance tests: speaker_id and SPO-content parity.
 
-    B3-1. Multi-speaker dcf4189 invariant: two pending facts from DISTINCT
-          speakers in one interim cycle must yield minted keys with DIFFERENT,
-          correct speaker_ids — they must NOT collapse to a single default.
+    1. Multi-speaker dcf4189 invariant: two pending facts from DISTINCT
+       speakers in one interim cycle must yield minted keys with DIFFERENT,
+       correct speaker_ids — they must NOT collapse to a single default.
 
-    B3-2. Training-set equivalence: the keyed-walk (harvest+apply) produces the
-          same (subject, predicate, object) content set as the episodic relation
-          input for the same fixed input.
+    2. Training-set equivalence: the keyed-walk (harvest+apply) produces the
+       same (subject, predicate, object) content set as the episodic relation
+       input for the same fixed input.
     """
 
     @staticmethod
     def _make_loop(tmp_path):
         """Minimal ConsolidationLoop with a real GraphMerger.
 
-        Mirrors TestMaterializeInterimB1._make_loop exactly so both B3 tests
-        run against the same test-loop shape as the B1 tests.
+        Mirrors TestMaterializeInterimExtraRelations._make_loop exactly so the
+        keyed-walk tests run against the same test-loop shape as the
+        materialize tests.
         """
         from peft import PeftModel
 
@@ -8642,7 +8643,7 @@ class TestInterimKeyedWalkB3:
         return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
 
     # ------------------------------------------------------------------
-    # B3-1: multi-speaker dcf4189 invariant through the graph-walk
+    # 1. Multi-speaker dcf4189 invariant through the graph-walk
     # ------------------------------------------------------------------
 
     def test_two_speakers_yield_distinct_speaker_ids_in_minted_keys(self, tmp_path):
@@ -8652,7 +8653,7 @@ class TestInterimKeyedWalkB3:
 
         Regression class: dcf4189 fixed keyless-edge minting inheriting
         speaker_id from the graph subject node rather than falling back to "".
-        Without the B3 entity re-synthesis in _materialize_consolidation_graph,
+        Without entity re-synthesis in _materialize_consolidation_graph,
         both minted keys would carry speaker_id="" because the merged graph
         lacked speaker_id attributes on the subject nodes.
 
@@ -8763,7 +8764,7 @@ class TestMergeRegistryRelationsUnification:
     def _make_loop(tmp_path):
         """Minimal ConsolidationLoop with a real GraphMerger (model=None).
 
-        Mirrors TestMaterializeInterimB1._make_loop exactly.
+        Mirrors TestMaterializeInterimExtraRelations._make_loop exactly.
         """
         from peft import PeftModel
 
@@ -9238,7 +9239,7 @@ class TestSubtractiveRemovalsHelperInterim:
     def test_stale_flag_persisted_to_disk_before_commit(self, tmp_path):
         """ASRI-5: stale flag written to disk via commit_tier_slot after M5 reorder.
 
-        Regression test for the MF-1 durability bug: ``_apply_subtractive_removals_to_store``
+        Regression test for the stale-flag durability bug: ``_apply_subtractive_removals_to_store``
         must run BEFORE ``commit_tier_slot`` so the on-disk registry carries the stale
         flag.  If the order is reversed (stale after commit), the reloaded registry
         shows the key as active and this test fails.
@@ -9307,11 +9308,11 @@ class TestSubtractiveRemovalsHelperInterim:
         # Step 5: the reloaded registry must show the key as stale.
         assert _key not in reloaded.list_active(), (
             "Reloaded registry must NOT list the staled key as active "
-            "(MF-1: stale flag must be captured on disk before the commit write)"
+            "(stale flag must be captured on disk before the commit write)"
         )
         assert reloaded.is_stale(_key), (
             "Reloaded registry must show the key as stale "
-            "(MF-1: stale flag must be captured on disk before the commit write)"
+            "(stale flag must be captured on disk before the commit write)"
         )
 
 
@@ -11493,7 +11494,7 @@ class TestS5OverflowDoesNotLeakIntoClearSuccessCheck:
 
 
 # ---------------------------------------------------------------------------
-# Slice 2b — fold_resume.json crash-durable marker tests
+# fold_resume.json crash-durable marker tests
 # ---------------------------------------------------------------------------
 
 
@@ -11682,7 +11683,7 @@ class TestFoldResumeHelpers:
         assert state["train_assignment"]["episodic"] == entries
 
     def test_b1_accumulating_return_does_not_write_marker(self, tmp_path):
-        """B1 binding: an accumulating return MUST NOT leave a fold_resume.json marker.
+        """An accumulating return MUST NOT leave a fold_resume.json marker.
 
         The accumulate guard fires when total trainable keys < min_tier_key_floor.
         After the return no marker file must exist.
@@ -11740,10 +11741,10 @@ class TestFoldResumeHelpers:
             _gpu_thread_lock.release()
 
         assert result.get("status") == "accumulating", f"Expected accumulating, got {result!r}"
-        # B1: no marker must have been written.
+        # No marker must have been written on an accumulating return.
         marker_path = loop._fold_state_dir / "fold_resume.json"
         assert not marker_path.exists(), (
-            "fold_resume.json MUST NOT be written on an accumulating return (B1)"
+            "fold_resume.json MUST NOT be written on an accumulating return"
         )
 
     def test_resume_on_entry_skips_completed_tier(self, tmp_path):
@@ -11878,7 +11879,7 @@ class TestFoldResumeHelpers:
     def test_stale_marker_is_never_resumed_on_stamp_mismatch(self, tmp_path):
         """A fold_resume.json with a mismatched fold_stamp is cleared and NOT resumed.
 
-        The stale marker must be discarded immediately at PATH C entry.  The fresh fold
+        The stale marker must be discarded immediately at full-fold entry.  The fresh fold
         then proceeds with full derivation, writing a new marker with the correct stamp.
         The key invariant: the stale assignment is NEVER used as a resume source.
         """
@@ -12168,17 +12169,17 @@ class TestCapturePendingRelations:
 
 
 # =============================================================================
-# TestConsumePendingPathC — PATH C fresh-derivation consume-pending wiring
+# TestConsumePendingFullFold — full-fold fresh-derivation consume-pending wiring
 # =============================================================================
 
 
-class TestConsumePendingPathC:
-    """Tests for consume_pending wiring in PATH C of _run_fold (the full fold).
+class TestConsumePendingFullFold:
+    """Tests for consume_pending wiring in the full-fold branch of _run_fold.
 
     Verifies that:
     1. The full-fold FoldScope sets consume_pending=True and
        extra_relations_source="pending" when consume_pending=True is passed.
-    2. When consume_pending=True, PATH C's fresh-derivation branch calls
+    2. When consume_pending=True, the full fold's fresh-derivation branch calls
        _capture_pending_relations and passes the result as extra_relations
        to _materialize_consolidation_graph.
     3. When consume_pending=False (normal mode), the non-consume full fold is
@@ -12192,7 +12193,7 @@ class TestConsumePendingPathC:
 
     @staticmethod
     def _make_loop(tmp_path, *, merger_graph=None):
-        """Minimal ConsolidationLoop stub for consume-pending PATH C tests.
+        """Minimal ConsolidationLoop stub for consume-pending full-fold tests.
 
         The consume_pending decision is NOT stored on the loop — it is a
         caller decision passed to ``consolidate_interim_adapters(consume_pending=...)``
@@ -12419,8 +12420,8 @@ class TestConsumePendingPathC:
         assert scope.consume_pending is False
         assert scope.extra_relations_source == "none"
 
-    def test_path_c_captures_pending_relations_into_materialize(self, tmp_path):
-        """PATH C fresh-derivation passes captured pending relations to _materialize."""
+    def test_full_fold_captures_pending_relations_into_materialize(self, tmp_path):
+        """Full-fold fresh-derivation passes captured pending relations to _materialize."""
         import networkx as nx
 
         g = nx.MultiDiGraph()
@@ -12440,9 +12441,9 @@ class TestConsumePendingPathC:
         )
 
         assert len(materialize_calls) >= 1
-        # The PATH C (main_tiers) materialize call passes extra_relations with the pending fact.
-        path_c_call = materialize_calls[0]
-        extra = path_c_call.get("extra_relations")
+        # The full-fold (main_tiers) materialize call passes extra_relations with the pending fact.
+        materialize_call = materialize_calls[0]
+        extra = materialize_call.get("extra_relations")
         assert extra is not None, "extra_relations must be passed when consume_pending=True"
         assert len(extra) == 1
         assert extra[0].subject == "Alice"
@@ -12450,8 +12451,8 @@ class TestConsumePendingPathC:
         assert extra[0].speaker_id == "spk_01"
         assert extra[0].session_ids == ["sess_x"]
 
-    def test_path_c_no_extra_relations_when_consume_pending_false(self, tmp_path):
-        """PATH C fresh-derivation passes extra_relations=None when consume_pending=False."""
+    def test_full_fold_no_extra_relations_when_consume_pending_false(self, tmp_path):
+        """Full-fold fresh-derivation passes extra_relations=None when consume_pending=False."""
         import networkx as nx
 
         # Populate merger.graph even for count>0 to confirm it is NOT captured.
@@ -12470,15 +12471,15 @@ class TestConsumePendingPathC:
         )
 
         assert len(materialize_calls) >= 1
-        path_c_call = materialize_calls[0]
-        extra = path_c_call.get("extra_relations")
+        materialize_call = materialize_calls[0]
+        extra = materialize_call.get("extra_relations")
         # extra_relations must be None (not the pending graph content) when consume_pending=False.
         assert extra is None, (
             f"extra_relations should be None for non-consume full fold, got: {extra}"
         )
 
-    def test_path_c_resolve_contradictions_extra_uses_config_when_consume_pending(self, tmp_path):
-        """PATH C passes resolve_contradictions_extra from config when consume_pending=True."""
+    def test_full_fold_resolve_contradictions_extra_uses_config_on_consume_pending(self, tmp_path):
+        """Full fold passes resolve_contradictions_extra from config when consume_pending=True."""
         import networkx as nx
 
         from paramem.utils.config import ConsolidationConfig
@@ -12499,11 +12500,11 @@ class TestConsumePendingPathC:
         )
 
         assert materialize_calls
-        path_c_call = materialize_calls[0]
-        assert path_c_call.get("resolve_contradictions_extra") is True
+        materialize_call = materialize_calls[0]
+        assert materialize_call.get("resolve_contradictions_extra") is True
 
-    def test_path_c_resolve_contradictions_extra_false_when_not_consume_pending(self, tmp_path):
-        """PATH C passes resolve_contradictions_extra=False for non-consume full fold."""
+    def test_full_fold_resolve_contradictions_extra_false_when_not_consume_pending(self, tmp_path):
+        """Full fold passes resolve_contradictions_extra=False for non-consume full fold."""
         import networkx as nx
 
         g = nx.MultiDiGraph()
@@ -12514,11 +12515,11 @@ class TestConsumePendingPathC:
         )
 
         assert materialize_calls
-        path_c_call = materialize_calls[0]
-        assert path_c_call.get("resolve_contradictions_extra") is False
+        materialize_call = materialize_calls[0]
+        assert materialize_call.get("resolve_contradictions_extra") is False
 
-    def test_path_c_empty_merger_graph_gives_empty_extra_relations(self, tmp_path):
-        """PATH C with consume_pending=True and empty graph passes empty extra_relations."""
+    def test_full_fold_empty_merger_graph_gives_empty_extra_relations(self, tmp_path):
+        """Full fold with consume_pending=True and empty graph passes empty extra_relations."""
         import networkx as nx
 
         g = nx.MultiDiGraph()  # empty
@@ -12529,9 +12530,9 @@ class TestConsumePendingPathC:
         )
 
         assert materialize_calls
-        path_c_call = materialize_calls[0]
-        extra = path_c_call.get("extra_relations")
-        # Helper returns [] on empty graph; PATH C passes it through.
+        materialize_call = materialize_calls[0]
+        extra = materialize_call.get("extra_relations")
+        # Helper returns [] on empty graph; the full fold passes it through.
         assert extra == [] or extra is None  # both are valid no-ops for materialize
 
 
@@ -12868,7 +12869,7 @@ class TestRunFullCycleConsumePending:
         Noop = tiers_rebuilt=[] and status != 'accumulating'.  Extraction succeeded,
         but the fold found nothing new to train (all facts already present after dedup).
         The sessions are processed — mark them consolidated to prevent re-extraction
-        unboundedly (U2 guard).
+        unboundedly (prevents already-processed sessions from accumulating unboundedly in pending).
         """
         from unittest.mock import patch
 

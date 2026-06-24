@@ -47,7 +47,7 @@ def _extract_backup_line(status_json: dict) -> str:
         capture_output=True,
         text=True,
     )
-    # Find the BACKUP line (pipe-separated since B5 fix switched from \t to |).
+    # Find the BACKUP line (pipe-separated since the backup-footer fix switched from \t to |).
     for line in result.stdout.splitlines():
         if line.startswith("BACKUP|"):
             return line
@@ -254,7 +254,7 @@ class TestFooterNoBackupBlock:
 
 
 # ---------------------------------------------------------------------------
-# B5 regression — cap=0 + success=true renders clean output
+# Regression — cap=0 + success=true renders clean output
 # ---------------------------------------------------------------------------
 
 
@@ -318,7 +318,7 @@ def _render_backup_footer(backup: dict) -> str:
     bash_case_block = script_text[case_start:case_end]
 
     # Compose the full bash test fragment.
-    # NOTE: The BACKUP line uses | as separator (not \t) since the B5 fix.
+    # NOTE: The BACKUP line uses | as separator (not \t) since the backup-footer fix.
     # IFS=$'\t' with consecutive empty tabs collapses them (bash whitespace rule).
     # Pass the backup_line via env var (BACKUP_LINE) so the shell sees real
     # pipe characters without any escaping artifacts from Python f-string quoting.
@@ -359,7 +359,7 @@ bk_next_disp=$(fmt_ts "$bk_next")
 
 
 class TestFooterCapZeroSuccessTrue:
-    """B5 regression: cap=0 + last_success_at set + no failures must render cleanly.
+    """Regression: cap=0 + last_success_at set + no failures must render cleanly.
 
     Observed symptom (2026-04-22 E2E baseline): pstatus rendered
     ``Backup:   FAILED false — 57141`` instead of a clean success or disabled line.
@@ -392,12 +392,12 @@ class TestFooterCapZeroSuccessTrue:
         # Field 3 = last_failure_at must be empty (no failure recorded).
         assert parts[3] == "", (
             f"last_failure_at field must be empty when no failure recorded, got {parts[3]!r}.  "
-            "Non-empty means the field alignment is wrong (B5 regression)."
+            "Non-empty means the field alignment is wrong."
         )
         # Field 6 = stale must be 'false' (not confused with last_failure_at).
         assert parts[6] == "false", (
             f"stale field must be 'false', got {parts[6]!r}.  "
-            "Wrong value means field alignment is off (B5 regression)."
+            "Wrong value means field alignment is off."
         )
         # Field 7 = disk_used_bytes must be the integer.
         assert parts[7] == "57141", f"disk_used_bytes field must be '57141', got {parts[7]!r}."
@@ -407,7 +407,7 @@ class TestFooterCapZeroSuccessTrue:
     def test_footer_cap_zero_success_renders_no_failed_text(self):
         """The bash rendering of cap=0 + success=true must not say FAILED.
 
-        This is the direct guard against the B5 symptom: pstatus showed
+        This is the direct guard against the symptom: pstatus showed
         'Backup:   FAILED false — 57141' when it should show a clean line.
         """
         rendered = _render_backup_footer(
@@ -426,7 +426,7 @@ class TestFooterCapZeroSuccessTrue:
             pytest.skip("Could not extract bash case block from script")
 
         assert "FAILED" not in rendered, (
-            f"B5 regression: cap=0 + success=true rendered 'FAILED' in the footer: "
+            f"cap=0 + success=true rendered 'FAILED' in the footer: "
             f"{rendered!r}.  "
             "The fix must route this state to the cap=0 guard branch, not the failure branch."
         )

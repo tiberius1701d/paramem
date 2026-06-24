@@ -139,7 +139,7 @@ class FoldScope:
               graph from ``tier_keyed``: for ``source="disk"`` disk relations carry
               ``ik_key``, the keyed branch of ``_build_all_edge_entries_into`` does
               ``store.get(key)`` against the empty simulate store and silently skips
-              unmatched edges → ``tier_keyed`` is empty.  S1 / MF-1.
+              unmatched edges → ``tier_keyed`` is empty.
         tier: Target adapter name for the interim scope (e.g.
             ``"episodic_interim_YYYYMMDDTHHMM"``).  ``None`` for the full fold
             (all tiers are rebuilt).
@@ -173,10 +173,12 @@ class FoldScope:
         subtractive_scope: Forwarded to
             :meth:`~ConsolidationLoop._apply_subtractive_removals_to_store`
             (``"interim"`` | ``"fold"``).
-        consume_pending: Reserved for B8a-5 (``max_interim_count == 0``
-            consume-pending mode).  Not activated in B8a-2.
-        cross_tier_resume: Reserved for B8a-4 (cross-tier resume checkpointing).
-            Not activated in B8a-2.
+        consume_pending: When ``True``, the full fold extracts pending sessions
+            in-fold and merges them before training (the ``max_interim_count == 0``
+            consume-pending mode, set by the server).
+        cross_tier_resume: When ``True``, the fold would checkpoint completed
+            tiers for cross-tier crash resume.  Declared but not yet wired —
+            no code path currently sets or reads it.
     """
 
     # --- identity / dispatch ---
@@ -198,9 +200,9 @@ class FoldScope:
     tier_floor: bool = False
     subtractive_scope: "Literal['interim', 'fold']" = "fold"
 
-    # --- reserved for future slices ---
-    consume_pending: bool = False  # B8a-5: extract pending sessions in-fold
-    cross_tier_resume: bool = False  # B8a-4: checkpoint completed tiers
+    # --- pending capture / resume ---
+    consume_pending: bool = False  # extract pending sessions in-fold
+    cross_tier_resume: bool = False  # checkpoint completed tiers (not yet wired)
 
 
 @dataclass(frozen=True)
@@ -1771,8 +1773,8 @@ class ConsolidationLoop:
 
         Args:
             tier: When set, scope the stamp to
-                ``store.active_keys_in_tier(tier)`` (PATH B interim slot).
-                When ``None``, use all active keys across all tiers (PATH C).
+                ``store.active_keys_in_tier(tier)`` (interim-slot fold).
+                When ``None``, use all active keys across all tiers (full fold).
 
         Returns:
             Hex-encoded SHA-256 digest of the sorted ``(key, subject, predicate,
@@ -1812,7 +1814,8 @@ class ConsolidationLoop:
         The file is age-encrypted when a daily identity is loaded; plaintext
         otherwise.  On ``OSError`` (e.g. ENOSPC), logs a loud warning and
         continues — crash-resume degrades to fresh-restart for that fold,
-        which is the pre-Slice-2 behaviour.  Non-IO exceptions propagate.
+        which is the behaviour from before crash-resume markers existed.
+        Non-IO exceptions propagate.
 
         Args:
             state: JSON-serialisable dict representing the full marker state.
@@ -1875,7 +1878,8 @@ class ConsolidationLoop:
         first tier that has training entries.
 
         Args:
-            scope_name: ``"main_tiers"`` (PATH C) or ``"interim_slot"`` (PATH B).
+            scope_name: ``"main_tiers"`` (full fold) or ``"interim_slot"``
+                (interim-slot fold).
             fold_stamp: SHA-256 from ``_compute_fold_stamp`` (pre-mutation).
             train_assignment: Per-tier lists of entry dicts
                 (``key/subject/predicate/object/speaker_id``).
@@ -2256,7 +2260,7 @@ class ConsolidationLoop:
         # source is derived from mode: "weights" for train, "disk" for simulate.
         # All pipeline stages (materialize, refine, build-keyed, train/skip, commit)
         # execute inside _run_fold; this wrapper only owns pre-resolution + early-exits.
-        # WARN-5 (B8a-2): new_promotions forwarded as a parameter — _run_fold handles
+        # new_promotions forwarded as a parameter — _run_fold handles
         # the semantic-transfer block scope-gated on source=="weights" && new_promotions.
         # Map the caller's mode Literal to the FoldScope source axis without a mode== fork.
         _interim_source = {"train": "weights", "simulate": "disk"}[mode]
@@ -3101,13 +3105,13 @@ class ConsolidationLoop:
 
         1. Load the canonical ``episodic/graph.json`` via
            :func:`~paramem.memory.persistence.load_memory_from_disk`.  Capture its
-           edge count as ``active_before_count`` (MF-2: must be captured here, before
+           edge count as ``active_before_count`` (must be captured here, before
            the merger reset in :meth:`_materialize_consolidation_graph`).
         2. Build :class:`Relation` objects from every edge in the canonical graph.
         3. For each ``episodic/interim_<stamp>`` directory via
            :func:`~paramem.memory.interim_adapter.iter_interim_dirs`: skip slots
-           without a ``graph.json`` (train-mode interim slots carry only PEFT weights —
-           WARN-6 guard); build :class:`Relation` objects from the slot graph.
+           without a ``graph.json`` (train-mode interim slots carry only PEFT
+           weights); build :class:`Relation` objects from the slot graph.
         4. Return a :class:`DiskFoldInput` with the accumulated relations, the interim
            directory list, and the pre-merge edge count.
 
@@ -3152,7 +3156,7 @@ class ConsolidationLoop:
         for _interim_name, interim_dir in iter_interim_dirs(adapter_dir):
             interim_graph_path = interim_dir / "graph.json"
             if not interim_graph_path.exists():
-                # WARN-6: Skip train-mode interim slots (no graph.json — only PEFT weights).
+                # Skip train-mode interim slots (no graph.json — only PEFT weights).
                 continue
             slot_graph = load_memory_from_disk(interim_graph_path)
             for _entry in iter_entries(slot_graph):
@@ -3190,10 +3194,9 @@ class ConsolidationLoop:
         so the pending-session content survives the reset and re-enters the merge
         via the ``extra_relations`` channel.
 
-        Shared by PATH B (interim fold) and PATH C (consume-pending full fold).
-        PATH B calls this when ``scope.extra_relations_source == "pending"``
-        (replacing the former inline capture block at 3808-3835).
-        PATH C calls this when ``scope.consume_pending`` is ``True`` (the
+        Shared by the interim fold and the consume-pending full fold.
+        The interim fold calls this when ``scope.extra_relations_source == "pending"``.
+        The full fold calls this when ``scope.consume_pending`` is ``True`` (the
         consume-pending full fold, where app.py has pre-populated
         ``merger.graph`` with pending-session relations).
 
@@ -3243,8 +3246,9 @@ class ConsolidationLoop:
         return _result
 
     # ------------------------------------------------------------------
-    # Unified persist dispatch — replaces the three independent PATH A/B/C
-    # persist tails that previously lived inline in _run_fold.
+    # Unified persist dispatch — replaces the three independent persist tails
+    # (graph-json simulate, interim-slot, main-tiers full fold) that previously
+    # lived inline in _run_fold.
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -3324,13 +3328,13 @@ class ConsolidationLoop:
         self,
         scope: "FoldScope",
         *,
-        # interim_slot inputs (PATH B)
+        # interim_slot inputs
         adapter_name: "str | None" = None,
         stamp: "str | None" = None,
         all_keyed: "list[dict] | None" = None,
-        # main_tiers input (PATH C)
+        # main_tiers input
         window_stamp_override: "str | None" = None,
-        # graph_json input (PATH A)
+        # graph_json input
         graph_path: "Path | None" = None,
     ) -> None:
         """Single persist tail for all three fold venues.
@@ -3351,8 +3355,9 @@ class ConsolidationLoop:
         - ``main_tiers``: disk verify is already inside :meth:`_save_adapters`.
 
         Called once by :meth:`_run_fold` in place of the three independent
-        persist tails that previously closed each PATH A / PATH B / PATH C
-        early-return block.  The surrounding venue-specific grooming (refine,
+        persist tails that previously closed each of the graph-json,
+        interim-slot, and main-tiers early-return blocks.  The surrounding
+        venue-specific grooming (refine,
         build-entries, train, result-dict assembly) stays inline in
         :meth:`_run_fold`; only the **save action** is unified here.
 
@@ -3373,10 +3378,10 @@ class ConsolidationLoop:
         from paramem.memory.persistence import commit_tier_slot, save_memory_to_disk
 
         if scope.persist == "graph_json":
-            # PATH A: write merger.graph directly (not tier_keyed).  No weights.
+            # graph-json simulate: write merger.graph directly (not tier_keyed).  No weights.
             save_memory_to_disk(self.merger.graph, graph_path)  # type: ignore[arg-type]
         elif scope.persist == "interim_slot":
-            # PATH B: commit adapter weights (train) or graph.json (simulate).
+            # interim slot: commit adapter weights (train) or graph.json (simulate).
             # The mode-fork lives inside commit_tier_slot, which is allowlisted.
             # For train interim, pass a verify callback so the slot is probed
             # before the registry flush — closing the disk-verify gap.
@@ -3398,7 +3403,7 @@ class ConsolidationLoop:
                 verify=_verify,
             )
         elif scope.persist == "main_tiers":
-            # PATH C: rebuild main adapter weights.  Disk verify is inside
+            # main tiers full fold: rebuild main adapter weights.  Disk verify is inside
             # _save_adapters (already had it pre-unification).
             self._save_adapters(window_stamp_override=window_stamp_override)
 
@@ -3444,7 +3449,7 @@ class ConsolidationLoop:
         scope-gated via ``scope.promote`` and ``scope.tier_floor`` respectively — both
         are weight-venue stages that the simulate path correctly skips by scope design.
 
-        **Return schema (MF-3 / B8a-2):** always returns the FULL train schema.
+        **Return schema:** always returns the FULL train schema.
         The ``graph_json`` persist path returns zero/empty equivalents for fields that
         have no meaning for the disk venue (``drift_intended_removal``,
         ``recall_miss_keys``, ``tier_keyed``, etc.) so callers never ``KeyError``
@@ -3481,7 +3486,7 @@ class ConsolidationLoop:
                 (``interim_slot`` path only).
             new_promotions: Optional list of entity names to transfer to semantic
                 before training (``interim_slot`` / ``source="weights"`` path only).
-                WARN-5 (B8a-2): retained explicitly so the semantic-transfer block is
+                Retained explicitly so the semantic-transfer block is
                 not lost when ``run_consolidation_cycle`` becomes a thin wrapper.
             run_label: Tag woven into the wandb ``run_name`` for traceability
                 (``interim_slot`` path only).
@@ -3531,7 +3536,7 @@ class ConsolidationLoop:
             recall_sanity_threshold = self.config.recall_sanity_threshold
 
         # ------------------------------------------------------------------
-        # PATH A: simulate full fold (scope.persist == "graph_json")
+        # graph-json simulate full fold (scope.persist == "graph_json")
         # ------------------------------------------------------------------
         # Source: disk (graph.json files); no weight reconstruction.
         # Persist: save_memory_to_disk(merger.graph, canonical_graph_path).
@@ -3579,8 +3584,8 @@ class ConsolidationLoop:
                 # Materialize: merge disk relations via the shared helper.
                 # source="disk" skips weight reconstruction; feeds inp.relations as
                 # extra_relations; merger.reset_graph() runs inside;
-                # recall_miss_keys=set() (§7 of B8a plan).
-                # MF-1: persist tail writes merger.graph DIRECTLY via save_memory_to_disk
+                # recall_miss_keys=set() (no recall probe on the simulate path).
+                # The persist tail writes merger.graph DIRECTLY via save_memory_to_disk
                 # — NOT via tier_keyed.  Disk edges carry ik_key; the keyed branch of
                 # _build_all_edge_entries_into does store.get against the empty simulate
                 # store and silently skips unmatched edges → tier_keyed would be empty.
@@ -3601,7 +3606,7 @@ class ConsolidationLoop:
                     enrich=(scope.level == "full"),
                 )
 
-                # MF-1: write merger.graph directly (not tier_keyed).
+                # Write merger.graph directly (not tier_keyed).
                 canonical_graph_path.parent.mkdir(parents=True, exist_ok=True)
                 self._persist_fold(scope, graph_path=canonical_graph_path)
                 _after_count = self.merger.graph.number_of_edges()
@@ -3661,7 +3666,7 @@ class ConsolidationLoop:
                 self.merger.reset_graph()
 
         # ------------------------------------------------------------------
-        # PATH B: interim mini-fold (scope.persist == "interim_slot")
+        # interim mini-fold (scope.persist == "interim_slot")
         # ------------------------------------------------------------------
         # Source: weights (reconstruct from adapter weights, scoped to tier).
         # Persist: commit_tier_slot (writes adapter weights + sidecar JSON).
@@ -3669,7 +3674,7 @@ class ConsolidationLoop:
         # Extracted from the training body of run_consolidation_cycle.
         # ------------------------------------------------------------------
         if scope.persist == "interim_slot":
-            # --- PATH B fold-stamp (minted before any store mutation) ---
+            # --- interim-slot fold-stamp (minted before any store mutation) ---
             # scope.tier gives the logical tier; adapter_name is the PEFT slot name.
             _fold_stamp_b = self._compute_fold_stamp(tier=adapter_name or scope.tier)
 
@@ -3769,7 +3774,7 @@ class ConsolidationLoop:
                     self._indexed_next_index += len(new_keyed_episodic)
                     self._procedural_next_index += len(new_keyed_proc)
 
-                # --- WARN-5 (B8a-2): Semantic promotion transfer (weights path, when
+                # --- Semantic promotion transfer (weights path, when
                 # promotions supplied).  Separate from _promote_mature_keys_inline;
                 # operates on the interim keyed set before training.
                 promoted_key_set: set[str] = set()
@@ -3789,13 +3794,13 @@ class ConsolidationLoop:
                         kp for kp in all_interim_keyed if kp["key"] not in promoted_key_set
                     ]
 
-                # --- PATH B: write single-entry fold_resume.json marker ---
+                # --- interim slot: write single-entry fold_resume.json marker ---
                 # Written AFTER all_interim_keyed is fully finalized (promotion
-                # filter above may shrink it).  Per W1: not "at PATH B entry".
+                # filter above may shrink it) — not at fold entry.
                 # On crash, the marker enables epoch-resume via _resolve_resume_checkpoint
-                # (Slice 1 + §3.A already wired epoch checkpoint path).
-                # Interim does NOT pass retain_scratch_until_external_commit (§6 of
-                # plan): commit_tier_slot is an inline durable write right after training,
+                # (the epoch checkpoint path is already wired).
+                # Interim does NOT pass retain_scratch_until_external_commit:
+                # commit_tier_slot is an inline durable write right after training,
                 # so there is no multi-tier window where a completed-but-uncommitted
                 # tier can be lost.
                 if scope.source == "weights":
@@ -3890,7 +3895,7 @@ class ConsolidationLoop:
                     stamp=stamp,
                     all_keyed=all_interim_keyed,
                 )
-                # Clear the PATH B fold_resume.json marker on clean commit.
+                # Clear the interim-slot fold_resume.json marker on clean commit.
                 self._clear_fold_resume()
 
                 # --- Restore episodic as active adapter ---
@@ -3943,7 +3948,7 @@ class ConsolidationLoop:
                 self.merger.reset_graph()
 
         # ------------------------------------------------------------------
-        # PATH C: full-fold train (scope.persist == "main_tiers")
+        # main-tiers full-fold train (scope.persist == "main_tiers")
         # ------------------------------------------------------------------
         # Source: weights (reconstruct all tiers from adapter weights).
         # Persist: _save_adapters (rebuild main adapter weights + manifest).
@@ -3953,7 +3958,7 @@ class ConsolidationLoop:
         from paramem.memory.interim_adapter import unload_interim_adapters
         from paramem.models.loader import create_adapter
 
-        # --- Fold-stamp + crash-resume marker (PATH C) ---
+        # --- Fold-stamp + crash-resume marker (full fold) ---
         # Mint fold_stamp BEFORE any store mutation (promote/tier-floor/
         # _build_all_edge_entries_into all mutate the store; the stamp must
         # reflect the pristine on-disk registry so it is byte-identical on
@@ -4009,7 +4014,7 @@ class ConsolidationLoop:
                 # Drift counters zero on resume. Finalize never ran pre-crash, so drift
                 # soft-stale flips were NOT durably applied — they are intentionally skipped
                 # here (accepted divergence, affects only non-assigned duplicate/contradiction
-                # keys, never primary facts). Owner-acknowledged: plan §5.2 / Risk 2.
+                # keys, never primary facts). Accepted as an intentional resume-path divergence.
                 graph_drift_count = 0
                 drift_deduplicated_count = 0
                 drift_orphan_count = 0
@@ -4028,7 +4033,7 @@ class ConsolidationLoop:
                 # FRESH-DERIVATION PATH: reconstruct → promote → tier-floor → assign.
                 # -----------------------------------------------------------------
                 # Capture pending-session relations from merger.graph BEFORE
-                # _materialize_consolidation_graph resets the graph (MF-4 ordering:
+                # _materialize_consolidation_graph resets the graph (ordering:
                 # capture-before-reset, re-merge-after-reset via extra_relations).
                 # Only active when scope.consume_pending is True (the consume-pending
                 # full fold, where app.py has pre-populated merger.graph).
@@ -4212,7 +4217,7 @@ class ConsolidationLoop:
                 # end of fresh-derivation path.
                 # Compute dataset fingerprints and persist the fold assignment marker
                 # AFTER the accumulate guard (so accumulating returns never leave a
-                # stale marker — B1 binding correction).
+                # stale marker).
                 # Fingerprint is over sorted SPO tuples, NOT tokenized examples.
                 # Calling format_entry_training here (before the per-tier loop) would
                 # interfere with per-tier format spy patterns in existing tests and is
@@ -4511,7 +4516,7 @@ class ConsolidationLoop:
                             "_run_fold[main_tiers]: crash-resume deleted stale slot %s", tier
                         )
                     if _ckpt_path and Path(_ckpt_path).is_dir():
-                        # B2: checkpoint-N dir present — load the staged adapter
+                        # checkpoint-N dir present — load the staged adapter
                         # from it.  HF Trainer saves all PEFT adapters under
                         # checkpoint-N/<adapter_name>/ (one subdir per adapter).
                         # The training adapter staging slot is "in_training"
@@ -4552,7 +4557,7 @@ class ConsolidationLoop:
 
                                 _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
                     else:
-                        # B2: no checkpoint dir (fast-start tier, or checkpoint missing).
+                        # no checkpoint dir (fast-start tier, or checkpoint missing).
                         # Reload from the EXISTING production slot on disk — it was not
                         # overwritten (final _save_adapters never ran on crash).
                         from paramem.memory.interim_adapter import (
@@ -4641,7 +4646,7 @@ class ConsolidationLoop:
                             self.store.move(_fse["key"], tier)
                         last_per_key_by_tier[tier] = None
                         tiers_rebuilt.append(tier)
-                        # B2: mark fast-start tier complete (no checkpoint-N dir
+                        # mark fast-start tier complete (no checkpoint-N dir
                         # exists; _mark_tier_complete stores None for reload-from-
                         # production-slot on a subsequent crash-resume).
                         self._mark_tier_complete(tier, None)
@@ -5708,7 +5713,7 @@ class ConsolidationLoop:
                   ``[]``, making :meth:`_refine_consolidation_graph`'s recurrence-bump
                   guard a no-op (correct: simulate store has no registered keys to bump).
 
-                **MF-1 persist contract (B8a-1):** for ``source="disk"`` the persist tail
+                **Persist contract:** for ``source="disk"`` the persist tail
                 MUST write ``save_memory_to_disk(self.merger.graph, path)`` DIRECTLY —
                 NOT derive the graph from ``tier_keyed``.  Disk relations carry ``ik_key``;
                 the keyed branch of ``_build_all_edge_entries_into`` does ``store.get(key)``
@@ -5758,7 +5763,7 @@ class ConsolidationLoop:
         # The disk-loaded Relations are supplied via extra_relations and enter the merge
         # through the existing extra_relations channel below.
         # recall_miss_keys is empty: a retrain signal is meaningless for a venue that
-        # does not retrain (§7 of the B8a plan).
+        # does not retrain.
         # _build_registry_true_relations is NOT called: it reads self.store (empty in
         # simulate) and would return [], silently zeroing the merge input.
         if source == "disk":

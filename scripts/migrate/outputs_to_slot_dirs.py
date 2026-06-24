@@ -1,13 +1,13 @@
 """Migration script: reshape old flat adapter directories to slot-dir layout.
 
-Old layout (pre-Slice-3a)::
+Old layout (flat, pre-slot-dir)::
 
     outputs/test8/mistral/20260101-120000/episodic/
         adapter_config.json
         adapter_model.safetensors
         keyed_pairs.json           # optional
 
-New layout (post-Slice-3a)::
+New layout (timestamped slot dirs)::
 
     outputs/test8/mistral/20260101-120000/episodic/
         20260101-120000/           # timestamped slot (mtime of safetensors)

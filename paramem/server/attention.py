@@ -39,9 +39,9 @@ class AttentionItem:
     """One row in the operator-attention block.
 
     Forward-compat: ``kind`` is a free-form ``str`` (NOT ``Literal``).
-    Slices 6/7 will introduce kinds like ``"backup_failed"``,
+    Future kinds like ``"backup_failed"``,
     ``"backup_stale"``, ``"key_rotation"``, ``"encryption_degraded"``,
-    ``"pre_flight_fail"`` without any schema bump here.
+    ``"pre_flight_fail"`` can be added without any schema bump here.
 
     Attributes
     ----------

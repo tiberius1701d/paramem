@@ -316,7 +316,7 @@ class RecallEarlyStopCallback(TrainerCallback):
     def set_probe_adapter(self, adapter_name: str) -> None:
         """Bind the recall probe to a specific adapter slot (explicit handoff).
 
-        Called by the staging owner (``train_adapter``) under the AD-20
+        Called by the staging owner (``train_adapter``) under the
         staging+promote contract: HF trains the transient ``in_training``
         slot, so the probe must measure that slot, not the caller-supplied
         production name (which holds un-promoted weights until the post-train

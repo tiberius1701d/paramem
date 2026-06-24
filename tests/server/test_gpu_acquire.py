@@ -539,7 +539,7 @@ def test_apply_config_live_rpaths_carve_no_auto_restart():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  B1-test: real-hash no-op skip (hasher NOT mocked — fix B1 validation)
+#  Real-hash no-op skip (hasher NOT mocked — validates the source_path fix)
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -551,8 +551,8 @@ def test_apply_config_live_noop_skip_real_hash_rollback():
     takes the no-op skip WITHOUT calling _live_reload_base_model (rollback case:
     disk = A, loaded = A, no real change).
 
-    This catches B1 (the prior source_path bug would cause the skip to ALWAYS
-    fire for ANY disk file because both sides hashed the same live_config_path).
+    This validates that the skip does not fire for ANY disk file due to both
+    sides hashing the same live_config_path (the prior source_path bug).
     """
     from paramem.server import app as app_module
     from paramem.server.drift import compute_config_hash

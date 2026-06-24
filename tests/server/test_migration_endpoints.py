@@ -481,7 +481,7 @@ class TestPreviewRegistryPathNoneGracefulDegradation:
 # ---------------------------------------------------------------------------
 
 
-class TestStatusContractSlice3b2:
+class TestStatusContractTrialFields:
     """MigrationStatusResponse forward-compatibility: TRIAL-specific fields must be absent
     (None / []) in non-TRIAL states and populated in TRIAL state.
 

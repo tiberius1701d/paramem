@@ -1,6 +1,6 @@
-"""Tests for procedural facts in the B5 unified interim pipeline.
+"""Tests for procedural facts in the unified interim pipeline.
 
-B5 routes procedural-typed facts through the same interim slot as episodic
+Procedural-typed facts route through the same interim slot as episodic
 facts, instead of training a separate per-cycle ``procedural`` MAIN adapter.
 
 Key invariants verified here:
@@ -9,9 +9,10 @@ Key invariants verified here:
 - Procedural interim keys are minted into the store only after successful
   training (deferred-write atomicity mirrors the episodic path).
 - Simulate mode registers procedural interim keys immediately (mirrors episodic).
-- B7 durability: a recall-failed NEW preference keeps its source session pending.
+- Recall-failed NEW preference keeps its source session pending.
 - The _run_indexed_key_procedural and _prepare_procedural_keys_for_tier
-  per-cycle helper functions no longer exist (deleted in B5).
+  per-cycle helper functions no longer exist (deleted when procedural folded
+  into the unified interim slot).
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 
 
 class TestDeletedHelpers:
-    """The per-cycle procedural helpers deleted in B5 must not reappear."""
+    """Per-cycle procedural helpers removed in the unified-interim refactor must not reappear."""
 
     def test_run_indexed_key_procedural_deleted(self):
         """_run_indexed_key_procedural must not exist in the AST."""
@@ -44,7 +45,7 @@ class TestDeletedHelpers:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         assert "_run_indexed_key_procedural" not in func_names, (
-            "_run_indexed_key_procedural was deleted in B5 and must not reappear"
+            "_run_indexed_key_procedural was removed in the unified-interim refactor"
         )
 
     def test_prepare_procedural_keys_for_tier_deleted(self):
@@ -57,7 +58,7 @@ class TestDeletedHelpers:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         assert "_prepare_procedural_keys_for_tier" not in func_names, (
-            "_prepare_procedural_keys_for_tier was deleted in B5 and must not reappear"
+            "_prepare_procedural_keys_for_tier was removed in the unified-interim refactor"
         )
 
 
@@ -67,7 +68,7 @@ class TestDeletedHelpers:
 
 
 def _make_minimal_loop(tmp_path):
-    """Return a ConsolidationLoop stub with enough state for B5 tests.
+    """Return a ConsolidationLoop stub with enough state for procedural-unified-interim tests.
 
     Bypasses __init__ (object.__new__) to avoid model/GPU requirements.
     Mirrors the pattern used by TestAbortSkipsCommit._make_minimal_loop.
@@ -155,14 +156,14 @@ def _common_patches(loop):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: proc_graph gap-regression (B5 core)
+# Test 1: proc_graph gap-regression (unified interim slot)
 # ---------------------------------------------------------------------------
 
 
 class TestProcGraphMergeGap:
     """Gap-regression: proc_graph merged into merger.graph reaches _tier_keyed["procedural"].
 
-    Before B5 the proc_graph produced by run_procedural() was extracted but
+    Before the unified-interim refactor, the proc_graph from run_procedural() was extracted but
     NEVER merged into merger.graph, so procedural-typed edges never reached
     _build_all_edge_entries_into's graph-walk.  This test proves the gap is
     closed: a keyless edge with relation_type="preference" in merger.graph
@@ -352,12 +353,12 @@ class TestSimulateModeRegistersProceduralKeys:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: B7 durability — recall-failed preference keeps session pending
+# Test 4: Durability — recall-failed preference keeps session pending
 # ---------------------------------------------------------------------------
 
 
-class TestB7ProceduralSessionPending:
-    """B7 durability: a recall-failed procedural key keeps its source session pending.
+class TestProceduralSessionPending:
+    """Durability: a recall-failed procedural key keeps its source session pending.
 
     session_ids carried on the edge (from merger.graph via proc_graph merge)
     must flow: proc_graph relation → edge["sessions"] → rec["session_ids"]

@@ -939,7 +939,7 @@ class TestGate3KindSubdirLayout:
 
 
 # ---------------------------------------------------------------------------
-# B3-residual — gate 4 file-not-found → SKIPPED (2026-04-22 re-test fix)
+# Gate 4 file-not-found → SKIPPED (2026-04-22 re-test fix)
 # ---------------------------------------------------------------------------
 
 
@@ -949,13 +949,14 @@ class TestGate4RegistryFileNotFoundSkip:
 
     Spec L381: "Skipped with — if the live registry has fewer than 20 keys
     (fresh install)."  File-not-found is the strongest form of that condition.
-    Only corrupt / unparseable files (that *do* exist) should FAIL (B3-residual).
+    Only corrupt / unparseable files (that *do* exist) should FAIL (missing-file
+    case was changed to SKIPPED; corrupt-but-existing is still FAIL).
     """
 
     def test_gate4_skips_when_registry_file_does_not_exist(self, tmp_path):
         """live_registry_path points at a non-existent file → status='skipped'.
 
-        Before the B3-residual fix, gate 4 returned FAIL with
+        Before the file-not-found fix, gate 4 returned FAIL with
         'live registry file not found'.  Fresh-install hosts have no
         production registry and must not be penalised.
         """
@@ -989,10 +990,10 @@ class TestGate4RegistryFileNotFoundSkip:
     def test_gate4_fails_when_registry_file_exists_but_unparseable(self, tmp_path):
         """File-not-found is SKIPPED; corrupt-but-existing is still FAIL.
 
-        Pins the narrow scope of the B3-residual fix: only the missing-file
-        case was changed to SKIPPED.  A file that exists but contains invalid
-        JSON must still return FAIL so genuine data corruption is not silently
-        swallowed as a fresh-install skip.
+        Pins the narrow scope of the fix: only the missing-file case was changed
+        to SKIPPED.  A file that exists but contains invalid JSON must still
+        return FAIL so genuine data corruption is not silently swallowed as a
+        fresh-install skip.
         """
         trial_dir = tmp_path / "trial_adapter"
         trial_dir.mkdir()
@@ -1029,7 +1030,7 @@ class TestGate4RegistryFileNotFoundSkip:
 
 
 class TestGate4MissingRegistrySkips:
-    """Gate 4 SKIPS on missing key_metadata.json — fresh install OR pre-Slice-3a
+    """Gate 4 SKIPS on missing key_metadata.json — fresh install or pre-timestamped-slot
     layout. The CRITICAL #1 fix isolates trial registry writes to
     state/trial_registry/, so trial-induced corruption of the live file is no
     longer a concern that the gate needs to police.
@@ -1094,8 +1095,8 @@ class TestTrialProbeMountResolvesKindSubdir:
     """
 
     def test_resolver_picks_episodic_slot_first(self, tmp_path):
-        """Slice-3a layout: <kind>/<ts>/adapter_model.safetensors. Episodic wins
-        over semantic/procedural; newest slot wins within episodic."""
+        """Under the timestamped-slot layout: <kind>/<ts>/adapter_model.safetensors.
+        Episodic wins over semantic/procedural; newest slot wins within episodic."""
         from paramem.server.gates import _resolve_adapter_mount_path
 
         trial_dir = tmp_path / "trial_adapter"

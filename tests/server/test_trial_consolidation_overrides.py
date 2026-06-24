@@ -516,7 +516,7 @@ class TestUpdateTrialGates:
 # ---------------------------------------------------------------------------
 
 
-class TestSlice4GateExtensions:
+class TestTrialGateExtensions:
     """Gate integration tests for _run_trial_consolidation: payload shape and backward-compat."""
 
     def test_trial_gates_no_new_sessions_has_details_list(self, tmp_path, monkeypatch):
@@ -766,14 +766,14 @@ class TestRunTrialConsolidationMissingConfig:
 
 
 # ---------------------------------------------------------------------------
-# B3 regression — live_registry_path uses data/registry/key_metadata.json
+# Regression — live_registry_path uses data/registry/key_metadata.json
 # ---------------------------------------------------------------------------
 
 
 class TestRunTrialConsolidationRegistryPath:
     """Verify _run_trial_consolidation passes the correct registry path to evaluate_gates.
 
-    B3 bug (2026-04-22 E2E baseline): the handler derived registry path from
+    (2026-04-22 E2E baseline): the handler derived registry path from
     ``live_config.registry_path`` which resolves to
     ``config.paths.data / "registry.json"`` (missing the ``registry/`` sub-
     directory and ``key_metadata.json`` filename).  Gate 4 emitted a false FAIL
@@ -843,12 +843,12 @@ class TestRunTrialConsolidationRegistryPath:
         # Must end with registry/key_metadata.json (canonical path), NOT registry.json.
         assert path_str.endswith("registry/key_metadata.json"), (
             f"live_registry_path {path_str!r} must end with 'registry/key_metadata.json'.  "
-            "B3 bug: old code used config.registry_path which resolves to "
+            "old code used config.registry_path which resolves to "
             "'data/ha/registry.json' (missing the registry/ subdirectory)."
         )
         assert not path_str.endswith("registry.json") or path_str.endswith(
             "registry/key_metadata.json"
         ), (
             f"live_registry_path {path_str!r} must NOT be the bare 'registry.json' path.  "
-            "This was the B3 bug."
+            "This was the registry-path bug."
         )

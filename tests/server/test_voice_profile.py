@@ -117,7 +117,7 @@ def test_profile_idempotent_returns_early():
 def test_gpu_to_cpu_swaps_box_then_unloads_gpu_pair():
     """gpu->cpu: voice_box updated to CPU pair, then GPU pair unloaded and set to None.
 
-    B2 atomic ordering: box updated BEFORE old GPU pair unloaded.
+    Atomic ordering: box updated BEFORE old GPU pair unloaded.
     """
     import paramem.server.app as app_module
 
@@ -166,7 +166,7 @@ def test_gpu_to_cpu_swaps_box_then_unloads_gpu_pair():
         assert app_module._state["tts_gpu"] is None
         # CPU pair NOT torn down.
         stt_cpu.unload.assert_not_called()
-        # B2: box was pointing at CPU pair before unload was called.
+        # Atomic ordering: box was pointing at CPU pair before unload was called.
         assert box_at_unload["stt"] is stt_cpu
         # Profile updated.
         assert app_module._state["voice_profile"] == "cpu"

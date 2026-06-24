@@ -466,12 +466,12 @@ class TestIntentTierSelection:
 
 
 # ---------------------------------------------------------------------------
-# QueryRouter — COMMAND path privacy filter (B5)
+# QueryRouter — COMMAND path privacy filter
 # ---------------------------------------------------------------------------
 
 
 class TestCommandInterimPrivacy:
-    """B5 regression: COMMAND path emits preference keys from interim slots
+    """Regression: COMMAND path emits preference keys from interim slots
     but NEVER emits factual/temporal/social interim keys.
 
     The router reaches interim slots via ``_command_interim_tiers()`` which

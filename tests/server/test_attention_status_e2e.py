@@ -1,4 +1,4 @@
-"""Endpoint-level E2E tests for /status attention + migration blocks (Slice 5a).
+"""Endpoint-level E2E tests for /status attention + migration blocks.
 
 Drives /status through various _state configurations, asserting
 attention.items content and migration block at each transition.

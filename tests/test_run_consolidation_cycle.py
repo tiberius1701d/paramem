@@ -123,7 +123,7 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     loop.shutdown_requested = False
     loop._thermal_policy = None
     loop.merger = MagicMock()
-    # B3: _build_all_edge_entries_into reads merger.graph.edges(data=True).
+    # _build_all_edge_entries_into reads merger.graph.edges(data=True).
     # Provide a real NetworkX MultiDiGraph with two keyless episodic edges so the
     # graph-walk mints keys and training is triggered in tests that expect it.
     # The _materialize_consolidation_graph stub below skips reset_graph(), so the
@@ -149,11 +149,11 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     # test_consolidation_recall_early_stop.py.
     loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
 
-    # Stub out _materialize_consolidation_graph so the B1 materialize step
-    # does not call reconstruct_graph / probe_entries on the MagicMock model.
-    # B3: the stub skips merger.reset_graph() so loop.merger.graph retains the
+    # Stub out _materialize_consolidation_graph so the materialize step does not
+    # call reconstruct_graph / probe_entries on the MagicMock model.
+    # The stub skips merger.reset_graph() so loop.merger.graph retains the
     # pre-populated keyless edges for the graph-walk keying step.
-    # The materialize diagnostic is covered in test_consolidation.py::TestMaterializeInterimB1.
+    # Materialize diagnostics: see test_consolidation.py::TestMaterializeInterimExtraRelations.
     loop._materialize_consolidation_graph = lambda **kw: (set(), [])
 
     return loop
@@ -700,8 +700,8 @@ class TestManifestWritten:
 class TestInterTierCommitRecoverable:
     """A crash during ``commit_tier_slot`` must always be RECOVERABLE.
 
-    B5: the unified interim slot now covers both episodic and procedural entries
-    in a SINGLE ``commit_tier_slot`` call (step 12 of run_consolidation_cycle).
+    The unified interim slot covers both episodic and procedural entries in a
+    SINGLE ``commit_tier_slot`` call (step 12 of run_consolidation_cycle).
     If that commit crashes, the session is NOT marked consolidated — the production
     caller marks ``mark_consolidated`` ONLY after the cycle returns successfully.
 
@@ -713,7 +713,7 @@ class TestInterTierCommitRecoverable:
         """``commit_tier_slot`` raising must propagate out of the cycle so a
         caller's ``mark_consolidated`` is never reached.
 
-        B5: there is ONE commit for the unified interim slot.  A crash in it
+        There is ONE commit for the unified interim slot.  A crash in it
         propagates; the session stays pending and is re-extracted on reboot.
         """
         loop = _make_mock_loop_with_procedural(tmp_path)
@@ -774,12 +774,12 @@ class TestInterTierCommitRecoverable:
 
 
 # ---------------------------------------------------------------------------
-# B7-A — session_ids provenance carry through _build_all_edge_entries_into
+# session_ids provenance carry through _build_all_edge_entries_into
 # ---------------------------------------------------------------------------
 
 
 class TestSessionIdsProvenanceCarry:
-    """B7-A acceptance tests: session_ids rides the in-RAM deferred-write record
+    """session_ids rides the in-RAM deferred-write record
     but is NEVER written to the persisted entry dict (store.put schema).
 
     These tests verify the carry-slot contract stated in _build_all_edge_entries_into:
@@ -833,7 +833,7 @@ class TestSessionIdsProvenanceCarry:
 
         assert len(deferred_writes) == 1, f"Expected 1 deferred write; got {len(deferred_writes)}"
         rec = deferred_writes[0]
-        assert "session_ids" in rec, "rec must carry session_ids (B7-A provenance plumbing)"
+        assert "session_ids" in rec, "rec must carry session_ids (provenance plumbing)"
         result_ids = set(rec["session_ids"])
         assert "session-abc" in result_ids, f"session-abc missing from {result_ids}"
         assert "session-xyz" in result_ids, f"session-xyz missing from {result_ids}"
@@ -933,21 +933,20 @@ class TestSessionIdsProvenanceCarry:
 
 
 # ---------------------------------------------------------------------------
-# B7-B — keep recall-failed sessions pending + bounded retry + incident
+# Keep recall-failed sessions pending + bounded retry + incident
 # ---------------------------------------------------------------------------
 
 
 class TestRecallFailedSessionStaysPending:
-    """B7-B acceptance tests.
+    """Acceptance tests for the keep-pending / bounded-retry / incident wiring.
 
-    The keep-pending / bounded-retry / incident wiring (B7-B, T6/T7/T8/T10,
-    §3, S-4) is validated without GPU or model weights.
+    Validated without GPU or model weights.
 
     Test strategy:
     - Call run_consolidation_cycle directly so we can control the graph and
       probe stub precisely.
     - Set up the merger graph with an edge tagged with a real session id so
-      rec["session_ids"] carries it through the harvest path (B7-A).
+      rec["session_ids"] carries it through the harvest path.
     - Override _probe_passing_keys to exclude one key, triggering the drop
       site at step 11b.
     - Assert result["recall_failed_session_ids"] and downstream behavior.
@@ -1088,7 +1087,7 @@ class TestRecallFailedSessionStaysPending:
     def test_simulate_mode_produces_empty_recall_failed_session_ids(self, tmp_path: Path) -> None:
         """Simulate mode: recall gate is not run → recall_failed_session_ids is [].
 
-        B2: the simulate callsite is NOT plumbed; the result is always empty.
+        The simulate callsite does not run the recall gate; the result is always empty.
         """
         session_id = "real-session-sim"
         loop = self._make_loop_with_session_edge(
@@ -1381,16 +1380,16 @@ class TestRecallFailedSessionStaysPending:
     ) -> None:
         """New procedural key that fails the recall gate → session id collected.
 
-        B5: proc facts flow through merger.graph (merged by extract_session/run_cycle).
+        Proc facts flow through merger.graph (merged by extract_session/run_cycle).
         The session_id rides on the graph edge's ``sessions`` set (same path as
-        episodic B7).  When _probe_passing_keys returns an empty set, every new
+        episodic).  When _probe_passing_keys returns an empty set, every new
         key fails and the session id lands in recall_failed_session_ids.
         """
         loop = _make_mock_loop_with_procedural(tmp_path)
         loop.model.peft_config["episodic_interim_20260617T0000"] = MagicMock()
 
         proc_sid = "session-proc-fail"
-        # B5: inject the procedural fact into merger.graph with the session_id on
+        # Inject the procedural fact into merger.graph with the session_id on
         # the edge's sessions set — that's how extract_session delivers it in prod.
         loop.merger.graph.add_node("Alice", attributes={"name": "Alice"})
         loop.merger.graph.add_node("Tea", attributes={"name": "Tea"})
@@ -1439,7 +1438,7 @@ class TestRecallFailedSessionStaysPending:
         )
 
     # ------------------------------------------------------------------
-    # S-4 — conditional resolve: failing cycle keeps incident; clean cycle resolves
+    # Conditional resolve: failing cycle keeps incident; clean cycle resolves
     # ------------------------------------------------------------------
 
     def test_s4_failing_cycle_does_not_resolve_recall_failure_incident(
@@ -1447,7 +1446,7 @@ class TestRecallFailedSessionStaysPending:
     ) -> None:
         """A cycle returning non-empty recall_failed_session_ids must NOT resolve the incident.
 
-        Mirrors the S-4 ordering hazard: B7 records/bumps when non-empty;
+        Ordering hazard: the recall-fail recorder records/bumps when non-empty;
         the success path MUST NOT wipe it in the same cycle.
         """
         from paramem.server.incidents import (
@@ -1468,7 +1467,7 @@ class TestRecallFailedSessionStaysPending:
             detail={"session_id": sid},
         )
 
-        # Simulate the S-4 conditional: result has a non-empty failed set.
+        # Simulate the conditional: result has a non-empty failed set.
         result_with_failures = {"recall_failed_session_ids": [sid]}
         if not result_with_failures.get("recall_failed_session_ids", []):
             resolve_incidents_by_type(state_dir, "consolidation_retry_exhausted")
@@ -1478,13 +1477,13 @@ class TestRecallFailedSessionStaysPending:
         recall_incidents = [i for i in incidents if i.type == "consolidation_retry_exhausted"]
         assert len(recall_incidents) == 1
         assert recall_incidents[0].status == "active", (
-            "Incident must remain active when failing cycle runs (S-4 ordering)"
+            "Incident must remain active when failing cycle runs"
         )
 
     def test_s4_clean_cycle_resolves_recall_failure_incident(self, tmp_path: Path) -> None:
         """A cycle returning empty recall_failed_session_ids RESOLVES the incident.
 
-        S-4 resolution rule: resolve consolidation_retry_exhausted ONLY when ZERO
+        Resolution rule: resolve consolidation_retry_exhausted ONLY when ZERO
         keys failed this cycle.
         """
         from paramem.server.incidents import (
@@ -1504,7 +1503,7 @@ class TestRecallFailedSessionStaysPending:
             detail={"session_id": sid},
         )
 
-        # Simulate the S-4 conditional: result has an empty failed set.
+        # Simulate the conditional: result has an empty failed set.
         result_clean = {"recall_failed_session_ids": []}
         if not result_clean.get("recall_failed_session_ids", []):
             resolve_incidents_by_type(state_dir, "consolidation_retry_exhausted")
@@ -1513,5 +1512,5 @@ class TestRecallFailedSessionStaysPending:
         recall_incidents = [i for i in incidents if i.type == "consolidation_retry_exhausted"]
         assert len(recall_incidents) == 1
         assert recall_incidents[0].status == "resolved", (
-            "Incident must be resolved when clean cycle runs (S-4 ordering)"
+            "Incident must be resolved when clean cycle runs"
         )

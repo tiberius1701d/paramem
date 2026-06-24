@@ -123,7 +123,7 @@ class TestRelation:
     def test_session_ids_excluded_from_serialisation(self):
         """session_ids is exclude=True — never persisted to JSON / registry.
 
-        B7-A acceptance test: a Relation round-trip through model_dump() (which
+        Acceptance test: a Relation round-trip through model_dump() (which
         drives all JSON persistence in the pipeline) must NOT contain
         'session_ids', so the field never leaks into the registry,
         cumulative_graph.json, or adapter-training data.

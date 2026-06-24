@@ -10,7 +10,7 @@ Schema
 ``{"version": 1, "incidents": [Incident, ...]}``
 
 Each ``Incident`` has a deterministic ``id = f"{type}:{key}"`` so that
-``ack_incident(state_dir, id)`` needs no separate lookup table (U3).
+``ack_incident(state_dir, id)`` needs no separate lookup table.
 
 Dedup
 -----

@@ -1,4 +1,4 @@
-"""Tests for the daily-key file primitives (Slice C of WP2b).
+"""Tests for the daily-key file primitives.
 
 Covers:
 

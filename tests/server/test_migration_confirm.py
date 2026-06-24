@@ -316,14 +316,14 @@ class TestConfirmStepFailures:
 
 
 # ---------------------------------------------------------------------------
-# B2 regression — trial_adapter_dir in marker uses state_dir, not state_dir.parent
+# Regression — trial_adapter_dir in marker uses state_dir, not state_dir.parent
 # ---------------------------------------------------------------------------
 
 
 class TestConfirmTrialAdapterDirUnderStateDir:
     """Verify confirm stores trial_adapter_dir under state_dir (not state_dir.parent).
 
-    B2 bug (2026-04-22 E2E baseline): the confirm handler computed
+    (2026-04-22 E2E baseline): the confirm handler computed
     ``(state_dir.parent / "trial_adapter")`` which resolves to
     ``data/ha/trial_adapter`` (missing the ``state/`` segment).  Gate 3
     looked for quads.json at that wrong path and emitted a false FAIL
@@ -356,7 +356,7 @@ class TestConfirmTrialAdapterDirUnderStateDir:
         assert trial_adapter_dir.startswith(expected_prefix), (
             f"trial_adapter_dir {trial_adapter_dir!r} must be a child of "
             f"state_dir {expected_prefix!r}.  "
-            "B2 bug: old code used state_dir.parent which put trial_adapter/ one level "
+            "old code used state_dir.parent which put trial_adapter/ one level "
             "up, causing gate 3 to look at the wrong path."
         )
 
@@ -381,13 +381,13 @@ class TestConfirmTrialAdapterDirUnderStateDir:
 
 
 # ---------------------------------------------------------------------------
-# B1 regression — config_artifact_filename extraction uses real backup layout
+# Regression — config_artifact_filename extraction uses real backup layout
 # ---------------------------------------------------------------------------
 
 
 class TestConfirmConfigArtifactFilenameRealSlotLayout:
     """Verify confirm extracts the artifact filename (not the sidecar) from a real
-    backup-writer slot layout (B1 fix, 2026-04-22 E2E baseline).
+    backup-writer slot layout (2026-04-22 E2E baseline).
 
     The backup writer names its sidecar ``<kind>-<ts>.meta.json`` (prefixed, NOT
     the exact string ``"meta.json"``).  The old filter ``_entry.name != "meta.json"``
@@ -404,7 +404,7 @@ class TestConfirmConfigArtifactFilenameRealSlotLayout:
 
         Uses the real backup.write() call path so the sidecar naming convention
         (``config-<ts>.meta.json``) is exercised — this is the layout that caused
-        the B1 bug.
+        the confirm-handler bug.
         """
         resp = client.post("/migration/confirm", json={})
         assert resp.status_code == 200, resp.text
@@ -423,7 +423,7 @@ class TestConfirmConfigArtifactFilenameRealSlotLayout:
         assert not filename.endswith(".meta.json"), (
             f"config_artifact_filename is a sidecar name: {filename!r}.  "
             "The iterdir filter must exclude all *.meta.json sidecars, not just "
-            "the exact string 'meta.json' (B1 fix, 2026-04-22 E2E baseline)."
+            "the exact string 'meta.json' (2026-04-22 E2E baseline)."
         )
 
         # The artifact must be the binary blob written by backup.write().
@@ -1016,7 +1016,7 @@ class TestRunBaseSwapPhaseA:
 # ---------------------------------------------------------------------------
 
 
-class TestBaseSwapOrchestrationSlice2:
+class TestBaseSwapOrchestration:
     """Unit tests for the reload-deferred and Phase B orchestration paths.
 
     All tests run without GPU.  Mock gpu_release/gpu_acquire to control reload
@@ -1373,7 +1373,7 @@ class TestBaseSwapOrchestrationSlice2:
     def test_post_phase_b_reload_runs_before_success_marker(self, tmp_path, monkeypatch):
         """Post-Phase-B in-process reload fires after Phase B and before status=pass.
 
-        Regression for the AD-20 live-reload-after-final-tier gap: Phase B's
+        Regression for the live-reload-after-final-tier gap: Phase B's
         per-tier migrate() loop leaves the in-RAM PeftModel mounted in the
         last tier's transient shape; without a final reload the published
         ``adapter_available`` topology stays stale until a systemctl restart.
@@ -1556,12 +1556,12 @@ class TestBaseSwapOrchestrationSlice2:
 
 
 # ---------------------------------------------------------------------------
-# B1: phase-aware resume — write_bundle never called on resume
+# Phase-aware resume — write_bundle never called on resume
 # ---------------------------------------------------------------------------
 
 
 class TestBaseSwapResumePhaseAware:
-    """Tests for the resume_phase parameter added for B1.
+    """Tests for the resume_phase parameter (phase-aware resume).
 
     Verifies that:
     - Fresh start (resume_phase="") calls write_bundle once.
@@ -1818,7 +1818,7 @@ class TestBaseSwapResumePhaseAware:
         """Resume at phaseA_done must NOT call write_bundle.
 
         The bundle was written at fresh start; calling it again on resume
-        would orphan the original Mistral-weights bundle (B1 fix).
+        would orphan the original Mistral-weights bundle.
         """
         state = self._make_state(tmp_path)
         # Seed the state_dir with a phaseA_done marker containing a bundle slot.

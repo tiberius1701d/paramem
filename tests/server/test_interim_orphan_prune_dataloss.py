@@ -210,7 +210,7 @@ class TestSoftStaleBookkeepingRetention:
         )
         kept = _read_key_metadata(km_path)["keys"]
         assert "active1" in kept, "active1 must be retained by prune"
-        assert "stale1" in kept, "stale1 (soft-staled) must NOT be pruned (W1)"
+        assert "stale1" in kept, "stale1 (soft-staled) must NOT be pruned"
 
     def test_save_key_metadata_persists_stale_key_bookkeeping(self, tmp_path):
         """_save_key_metadata persists bookkeeping for both active and stale keys.
@@ -264,7 +264,7 @@ class TestSoftStaleBookkeepingRetention:
         saved = _read_key_metadata(km_path)
         keys = saved["keys"]
         assert "active1" in keys, "active1 must be persisted by _save_key_metadata"
-        assert "stale1" in keys, "stale1 (soft-staled) must be persisted by _save_key_metadata (W1)"
+        assert "stale1" in keys, "stale1 (soft-staled) must be persisted by _save_key_metadata"
         assert keys["stale1"]["relation_type"] == "preference", (
             "stale1 bookkeeping must include the original relation_type"
         )

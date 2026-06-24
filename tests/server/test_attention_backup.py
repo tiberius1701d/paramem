@@ -304,12 +304,12 @@ class TestBackupItemsConfigNoneReturnsEmpty:
 
 
 # ---------------------------------------------------------------------------
-# Test 21 — B4 regression: cap=0 + used>0 → backup_disk_pressure at failed level
+# Test 21 — regression: cap=0 + used>0 → backup_disk_pressure at failed level
 # ---------------------------------------------------------------------------
 
 
 class TestBackupItemsDiskPressureCapZeroUsedNonzero:
-    """B4 fix (2026-04-22 E2E baseline): when max_total_disk_gb=0 and disk_used>0,
+    """(2026-04-22 E2E baseline): when max_total_disk_gb=0 and disk_used>0,
     the old guard ``usage.cap_bytes > 0`` skipped the DISK PRESSURE alert entirely.
 
     With cap=0, any non-zero disk usage means the store is infinitely over cap.
@@ -340,7 +340,7 @@ class TestBackupItemsDiskPressureCapZeroUsedNonzero:
         pressure_items = [i for i in items if i.kind == "backup_disk_pressure"]
         assert len(pressure_items) == 1, (
             f"Expected 1 backup_disk_pressure item, got {len(pressure_items)}.  "
-            "B4 bug: cap=0 + used>0 silently skipped the disk pressure alert because "
+            "cap=0 + used>0 silently skipped the disk pressure alert because "
             "the old guard 'usage.cap_bytes > 0' was false."
         )
         assert pressure_items[0].level == "failed", (

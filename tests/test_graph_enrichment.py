@@ -1154,12 +1154,12 @@ class TestInterimEnrichmentHook:
 
 
 # ---------------------------------------------------------------------------
-# Tests for _refine_consolidation_graph (B2: enrich gate + recurrence-bump)
+# Tests for _refine_consolidation_graph (enrich gate + recurrence-bump)
 # ---------------------------------------------------------------------------
 
 
 class TestRefineConsolidationGraph:
-    """Unit tests for _refine_consolidation_graph's enrich param (B2).
+    """Unit tests for _refine_consolidation_graph's enrich param.
 
     Covers:
     - enrich=True calls _run_graph_enrichment (fold default, unconditional).
@@ -1887,16 +1887,16 @@ class TestEnrichmentRemovalLedger:
 
 
 # ---------------------------------------------------------------------------
-# B3 interim keying seams
+# Interim keying seams
 # ---------------------------------------------------------------------------
 
 
-class TestB3InterimKeyingSeams:
-    """B3: graph-walk keying for the interim path (_build_all_edge_entries_into).
+class TestInterimKeyingSeams:
+    """Graph-walk keying for the interim path (_build_all_edge_entries_into).
 
     Covers:
-    - C-1 invariant: speaker_id read from edge first (A-1 merger stamp), then
-      subject node attr, then "" terminal fallback (no default_speaker_id param).
+    - speaker_id resolution order: read from edge first (the merger's edge stamp),
+      then subject node attr, then "" terminal fallback (no default_speaker_id param).
     - Merger-routed relations carry edge speaker_id through to bookkeeping.
     - Concept node with no speaker yields "" (allow-empty path).
     - defer=True performs NO store writes and NO counter advances.

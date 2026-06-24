@@ -778,7 +778,7 @@ class TestBookkeeping:
         assert "_bookkeeping" not in snap
         assert "bookkeeping" not in snap
 
-    # -- Slice 1: relation_type round-trip tests --
+    # -- relation_type round-trip tests --
 
     def test_relation_type_round_trips(self):
         """set_bookkeeping with relation_type='preference' → bookkeeping_for_key returns it."""

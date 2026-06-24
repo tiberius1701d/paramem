@@ -184,7 +184,7 @@ echo ""
 
 # ========================================================================
 # Cleanup on exit — undo HA side-effects triggered during the test
-# (music started in §8, kitchen lights turned on in §6). Runs on any
+# (music started in section 8, kitchen lights turned on in section 6). Runs on any
 # exit path including failure. Silent; best-effort.
 # ========================================================================
 cleanup_ha_state() {

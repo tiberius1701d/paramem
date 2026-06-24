@@ -154,8 +154,8 @@ def _row_log_errors(gates: dict) -> dict[str, Any]:
     metrics — because the capture spans the entire consolidation + gate
     run (extraction, training, adapter reload, gate 4).
 
-    When ``trial_log`` is absent (pre-Slice-5a runs or runs that failed
-    before capture attached), both cells render ``"—"`` with an explicit
+    When ``trial_log`` is absent (runs from before trial-log capture existed,
+    or runs that failed before capture attached), both cells render ``"—"`` with an explicit
     ``sub_note`` so the row is never silently empty.
 
     Parameters

@@ -138,7 +138,7 @@ class TestTrainAdapterResumeParam:
 
         Also patches ``_ensure_staging_slot`` to a no-op: the fixture
         pre-populates ``peft_config`` with the in_training slot for tensor
-        access, which would otherwise trip the AD-20 lifecycle invariant guard.
+        access, which would otherwise trip the staging lifecycle invariant guard.
         """
         with (
             patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
@@ -602,7 +602,7 @@ class TestFingerprintDatasetContentStable:
 
 
 # ---------------------------------------------------------------------------
-# Slice 2a — on_save records output_dir/checkpoint-* in default epoch-save mode
+# on_save records output_dir/checkpoint-* in default epoch-save mode
 # ---------------------------------------------------------------------------
 
 
@@ -835,7 +835,7 @@ class TestStagingResumeCallbackOnSave:
 
 
 # ---------------------------------------------------------------------------
-# Slice 2a (fresh-start purge) — stale checkpoint-N purged on fingerprint mismatch
+# Fresh-start purge — stale checkpoint-N purged on fingerprint mismatch
 # ---------------------------------------------------------------------------
 
 

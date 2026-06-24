@@ -144,7 +144,7 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     loop.shutdown_requested = False
     loop.merger = MagicMock()
 
-    # B3: _build_all_edge_entries_into reads merger.graph.edges(data=True).
+    # _build_all_edge_entries_into reads merger.graph.edges(data=True).
     # Replace the MagicMock graph with a real MultiDiGraph populated from
     # _EPISODIC_RELS so the graph-walk mints keys for the parity tests.
     # The _materialize_consolidation_graph stub below skips merger.reset_graph(),
@@ -193,11 +193,11 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     # probe is covered separately in test_consolidation_recall_early_stop.py.
     loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
 
-    # Stub out _materialize_consolidation_graph so the B1 materialize step
-    # does not call reconstruct_graph / probe_entries on the MagicMock model.
-    # B3: the stub skips merger.reset_graph() so loop.merger.graph retains the
+    # Stub out _materialize_consolidation_graph so the materialize step does not
+    # call reconstruct_graph / probe_entries on the MagicMock model.
+    # The stub skips merger.reset_graph() so loop.merger.graph retains the
     # pre-populated keyless edges for the graph-walk keying step.
-    # The materialize diagnostic is covered in TestMaterializeInterimB1.
+    # The materialize diagnostic is covered in TestMaterializeInterimExtraRelations.
     loop._materialize_consolidation_graph = lambda **kw: (set(), [])
 
     # Enrichment flags — disabled to keep tests deterministic.
@@ -416,7 +416,7 @@ class TestSimulateTrainParity:
 
         # All keys from cycle 1 (episodic graph* AND procedural proc*) must
         # survive into cycle 2.  Per-session procedural sp_index-driven retirement
-        # has been removed (consolidation_architecture.md §4.3); procedural
+        # Per-session procedural sp_index-driven retirement has been removed; procedural
         # contradictions are now resolved at full consolidation by the
         # model-bearing GraphMerger.  Duplicate procedural keys from a same-
         # preference re-run are tolerated in the interim.
@@ -537,7 +537,7 @@ class TestSimulateTrainParity:
     def test_procedural_persisted_in_interim_slot_in_simulate_mode(self, loop_sim, tmp_path):
         """Procedural facts persist in the interim slot graph.json in simulate mode.
 
-        B5 design: procedural entries ride the SINGLE interim slot
+        Procedural entries ride the SINGLE interim slot
         (``episodic_interim_<stamp>``) alongside episodic — there is no separate
         per-cycle ``procedural/graph.json`` commit.  ``commit_tier_slot`` is called
         once with ``tier="episodic"`` and ``adapter_name="episodic_interim_<stamp>"``;
@@ -565,7 +565,7 @@ class TestSimulateTrainParity:
 
         assert graph_path.exists(), (
             f"Interim slot graph.json missing at {graph_path} — "
-            "B5: procedural facts must persist in the interim slot, not a separate procedural/ dir"
+            "procedural facts must persist in the interim slot, not a separate procedural/ dir"
         )
 
         graph = load_memory_from_disk(graph_path)
@@ -581,7 +581,7 @@ class TestSimulateTrainParity:
         proc_keys = {e["key"] for e in entries if e.get("key", "").startswith("proc")}
         assert proc_keys, (
             f"No proc-prefixed keys found in interim slot graph.json — "
-            f"procedural facts must co-reside with episodic in the interim slot (B5). "
+            f"procedural facts must co-reside with episodic in the interim slot. "
             f"Keys present: {sorted(e.get('key') for e in entries)}"
         )
 
@@ -1148,7 +1148,7 @@ class TestConsolidateSimulateFold:
         (a) The variants COLLAPSE to a single edge in the persisted main graph.json
             (canonical() node identity + Case-1 dedup in the GraphMerger topology,
             simulate/train parity satisfied end-to-end).
-        (b) W1: merger.removal_ledger is cleared by the cycle's finally block; the
+        (b) merger.removal_ledger is cleared by the cycle's finally block; the
             dedup evidence is verified via the single-edge graph output instead.
 
         This is the end-to-end assertion the merger-isolation tests cannot cover:
@@ -1203,7 +1203,7 @@ class TestConsolidateSimulateFold:
             f"(keys: {[e['key'] for e in entries]})"
         )
 
-        # (b) W1: merger.removal_ledger is cleared by the cycle's finally block and
+        # (b) merger.removal_ledger is cleared by the cycle's finally block and
         # is not observable after the call.  The variant-collapse is already verified by
         # the single-edge assertion above.  Additionally verify that only the canonical
         # surface key survives (Alice/Acme Corp, not alice/acme corp).
@@ -1344,7 +1344,7 @@ class TestConsolidateSimulateFold:
 
         loop.consolidate_simulate_fold()
 
-        # W1: merger.graph is cleared at cycle-end; read the persisted graph.json instead.
+        # merger.graph is cleared by the cycle-end finally; read the persisted graph.json instead.
         from paramem.memory.persistence import load_memory_from_disk
 
         main_path = tmp_path / "episodic" / "graph.json"
@@ -1607,7 +1607,7 @@ class TestBuildTierDelta:
             f" has no entries for attribution; got {ep['staled_by_reason']!r}"
         )
 
-        # W1: merger.removal_ledger is cleared by the cycle's finally block.
+        # merger.removal_ledger is cleared by the cycle's finally block.
         # Confirm the dedup collapse happened via the persisted graph output (1 edge).
         main_path = tmp_path / "episodic" / "graph.json"
         assert main_path.exists(), "graph.json must exist after housekeeping fold"
@@ -1979,7 +1979,7 @@ class TestDebugSnapshotIntegration:
         assert cycle_dir is not None
         # graph_enriched_snapshot.json is written by _refine_consolidation_graph
         # via on_fold_graph (no interim_stamp) → lands under fold/ not cycle_dir.
-        # graph_merged_snapshot.json is no longer emitted on the interim path (B2).
+        # graph_merged_snapshot.json is no longer emitted on the interim path.
         fold_base = loop.snapshot_dir_for()
         assert fold_base is not None
         loop.merger.save_graph.assert_any_call(
@@ -2126,18 +2126,18 @@ class TestDebugSnapshotOnTierDelta:
 
 
 # ---------------------------------------------------------------------------
-# TestGraphLifecycle — W1 regression: merger.graph cleared at cycle-end
+# TestGraphLifecycle — cycle-end graph reset regression
 # ---------------------------------------------------------------------------
 
 
 class TestGraphLifecycle:
-    """W1 regression: consolidate_simulate_fold clears merger.graph at every exit.
+    """Regression: consolidate_simulate_fold clears merger.graph at every exit.
 
     Uses a REAL GraphMerger (not MagicMock) so reset_graph() actually clears the
-    graph, not a no-op as it would be under MagicMock.  This validates the W1
-    try/finally placement.
+    graph, not a no-op as it would be under MagicMock.  This validates the
+    cycle-end try/finally placement.
 
-    Root cause being tested: before W1, merger.graph leaked across cycles —
+    Root cause being tested: before the fix, merger.graph leaked across cycles —
     a prior fold's ~199 reconstructed relations were captured into the next
     interim cycle's extra_relations, producing a spurious 208-key interim slot
     (live observed: graph_reconstructed=0, graph_merged=199 from extra_relations).
@@ -2162,11 +2162,11 @@ class TestGraphLifecycle:
         loop.consolidate_simulate_fold()
 
         assert loop.merger.graph.number_of_nodes() == 0, (
-            f"W1 regression: merger.graph must be empty after successful fold; "
+            f"cycle-end graph reset regression: merger.graph must be empty after successful fold;"
             f"got {loop.merger.graph.number_of_nodes()} nodes"
         )
         assert loop.merger.graph.number_of_edges() == 0, (
-            f"W1 regression: merger.graph must be empty after successful fold; "
+            f"cycle-end graph reset regression: merger.graph must be empty after successful fold;"
             f"got {loop.merger.graph.number_of_edges()} edges"
         )
 
@@ -2182,11 +2182,11 @@ class TestGraphLifecycle:
         loop.consolidate_simulate_fold()
 
         assert loop.merger.graph.number_of_nodes() == 0, (
-            f"W1 regression: merger.graph must be empty after noop fold; "
+            f"cycle-end graph reset regression: merger.graph must be empty after noop fold;"
             f"got {loop.merger.graph.number_of_nodes()} nodes"
         )
         assert loop.merger.graph.number_of_edges() == 0, (
-            "W1 regression: merger.graph must be empty after noop fold; "
+            "cycle-end graph reset regression: merger.graph must be empty after noop fold;"
             f"got {loop.merger.graph.number_of_edges()} edges"
         )
 
@@ -2194,8 +2194,8 @@ class TestGraphLifecycle:
         """Two sequential folds with disjoint inputs produce disjoint canonical graphs.
 
         Regression for the 208-key bug: if merger.graph leaked from fold-1 into
-        fold-2, the second fold's output would contain fold-1's edges.  After W1
-        both folds start with an empty graph.
+        fold-2, the second fold's output would contain fold-1's edges.  After the
+        cycle-end reset fix both folds start with an empty graph.
         """
         loop = _make_bare_loop(tmp_path)
         # No pre-existing graph.json for fold 1 — load_memory_from_disk returns
@@ -2212,7 +2212,7 @@ class TestGraphLifecycle:
 
         # After fold 1 the graph must be EMPTY.
         assert loop.merger.graph.number_of_nodes() == 0, (
-            "W1 regression: merger.graph must be empty between folds; "
+            "cycle-end graph reset regression: merger.graph must be empty between folds; "
             f"got {loop.merger.graph.number_of_nodes()} nodes"
         )
 
@@ -2233,13 +2233,13 @@ class TestGraphLifecycle:
         # keys_per_tier for episodic should be ≥ 2 (both triples).
         keys_after = result2.get("keys_per_tier", {}).get("episodic", 0)
         assert keys_after >= 2, (
-            f"W1 regression: fold-2 canonical graph must contain both triples; "
+            f"cycle-end graph reset regression: fold-2 canonical graph must contain both triples; "
             f"got keys_per_tier.episodic={keys_after}"
         )
 
         # Critically, merger.graph is STILL empty after fold 2.
         assert loop.merger.graph.number_of_nodes() == 0, (
-            "W1 regression: merger.graph must be empty after fold 2; "
+            "cycle-end graph reset regression: merger.graph must be empty after fold 2; "
             f"got {loop.merger.graph.number_of_nodes()} nodes"
         )
 
@@ -2254,7 +2254,7 @@ class TestGraphLifecycle:
         being a no-op on a MagicMock).
 
         The _materialize_consolidation_graph stub is kept so the test does not
-        need a GPU — it bypasses reconstruct_graph.  W1's finally block calls
+        need a GPU — it bypasses reconstruct_graph.  The cycle-end finally block calls
         the REAL merger.reset_graph(), which this test verifies.
         """
         from paramem.graph.merger import GraphMerger
@@ -2270,7 +2270,7 @@ class TestGraphLifecycle:
     def test_run_consolidation_cycle_graph_empty_after_success(self, tmp_path):
         """merger.graph is empty (0 nodes, 0 edges) after a successful simulate cycle.
 
-        W1: the try/finally in run_consolidation_cycle calls reset_graph() on every
+        The try/finally in run_consolidation_cycle calls reset_graph() on every
         exit that goes through the main try block.  This test uses a REAL GraphMerger
         so reset_graph() actually clears the graph.
 
@@ -2290,12 +2290,12 @@ class TestGraphLifecycle:
         )
 
         assert loop.merger.graph.number_of_nodes() == 0, (
-            "W1 regression: run_consolidation_cycle finally must clear merger.graph; "
-            f"got {loop.merger.graph.number_of_nodes()} nodes after successful cycle"
+            "cycle-end graph reset regression: merger.graph must be empty after successful cycle; "
+            f"got {loop.merger.graph.number_of_nodes()} nodes"
         )
         assert loop.merger.graph.number_of_edges() == 0, (
-            "W1 regression: run_consolidation_cycle finally must clear merger.graph; "
-            f"got {loop.merger.graph.number_of_edges()} edges after successful cycle"
+            "cycle-end graph reset regression: merger.graph must be empty after successful cycle; "
+            f"got {loop.merger.graph.number_of_edges()} edges"
         )
 
     def test_run_consolidation_cycle_graph_empty_after_abort(self, tmp_path):
@@ -2327,9 +2327,8 @@ class TestGraphLifecycle:
                 pass  # expected — the abort propagated
 
         assert loop.merger.graph.number_of_nodes() == 0, (
-            "W1 regression: run_consolidation_cycle finally must clear merger.graph "
-            "even when an exception propagates; "
-            f"got {loop.merger.graph.number_of_nodes()} nodes after aborted cycle"
+            "cycle-end graph reset regression: merger.graph must be empty after aborted cycle; "
+            f"got {loop.merger.graph.number_of_nodes()} nodes"
         )
 
     # --- consolidate_interim_adapters lifecycle tests ---
@@ -2349,7 +2348,7 @@ class TestGraphLifecycle:
         The real GraphMerger is used so reset_graph() in the finally actually clears
         the graph.
 
-        Mutation check: without the W1 finally block, merger.graph retains the
+        Mutation check: without the cycle-end finally block, merger.graph retains the
         pre-seeded edge.
         """
         from paramem.graph.merger import GraphMerger
@@ -2376,19 +2375,17 @@ class TestGraphLifecycle:
             f"Expected status='accumulating' with 0 keys < floor 30; got {result!r}"
         )
         assert loop.merger.graph.number_of_nodes() == 0, (
-            "W1 regression: consolidate_interim_adapters finally must clear merger.graph "
-            "on accumulating return; "
+            "cycle-end graph reset regression: merger.graph must be empty on accumulating return; "
             f"got {loop.merger.graph.number_of_nodes()} nodes"
         )
         assert loop.merger.graph.number_of_edges() == 0, (
-            "W1 regression: consolidate_interim_adapters finally must clear merger.graph "
-            "on accumulating return; "
+            "cycle-end graph reset regression: merger.graph must be empty on accumulating return; "
             f"got {loop.merger.graph.number_of_edges()} edges"
         )
 
 
 # ---------------------------------------------------------------------------
-# TestCollectDiskFoldRelations (B8a-1 unit: new helper)
+# TestCollectDiskFoldRelations
 # ---------------------------------------------------------------------------
 
 
@@ -2396,8 +2393,8 @@ class TestCollectDiskFoldRelations:
     """Unit tests for :meth:`ConsolidationLoop._collect_disk_fold_relations`.
 
     Verifies:
-    - ``active_before_count`` is the canonical graph's pre-merge edge count (MF-2).
-    - Train-mode interim slots (no ``graph.json``) are skipped (WARN-6).
+    - ``active_before_count`` is the canonical graph's pre-merge edge count.
+    - Train-mode interim slots (no ``graph.json``) are skipped.
     - ``interim_dirs`` contains only simulate-mode slots that have a ``graph.json``.
     - Relations are built from BOTH the canonical graph and simulate-mode interim slots.
     - Missing canonical graph returns ``active_before_count=0`` (empty graph).
@@ -2461,7 +2458,7 @@ class TestCollectDiskFoldRelations:
         )
 
     def test_train_mode_slot_skipped_no_graph_json(self, tmp_path):
-        """Train-mode interim slots (no graph.json) are skipped (WARN-6).
+        """Train-mode interim slots (no graph.json) are skipped.
 
         Creates one simulate-mode slot (has graph.json) and one train-mode slot
         (directory with no graph.json, only a sentinel file).  Only the simulate
@@ -2489,7 +2486,7 @@ class TestCollectDiskFoldRelations:
             "Simulate-mode slot (has graph.json) must appear in interim_dirs"
         )
         assert train_slot_dir not in inp.interim_dirs, (
-            "Train-mode slot (no graph.json) must be skipped (WARN-6)"
+            "Train-mode slot (no graph.json) must be skipped"
         )
         # Relations from simulate slot are present; train slot contributes nothing.
         rel_keys = {r.indexed_key for r in inp.relations}
@@ -2528,7 +2525,7 @@ class TestCollectDiskFoldRelations:
 
 
 # ---------------------------------------------------------------------------
-# TestMaterializeConsolidationGraphDiskSource (B8a-1 unit: source="disk" axis)
+# TestMaterializeConsolidationGraphDiskSource (source="disk" axis)
 # ---------------------------------------------------------------------------
 
 
@@ -2688,14 +2685,14 @@ class TestMaterializeConsolidationGraphDiskSource:
 
 
 # ---------------------------------------------------------------------------
-# TestSimulateFoldReturnSchema (B8a-1/MF-3: return schema completeness)
+# TestSimulateFoldReturnSchema (return schema completeness)
 # ---------------------------------------------------------------------------
 
 
 class TestSimulateFoldReturnSchema:
     """Assert that consolidate_simulate_fold returns the FULL train schema.
 
-    MF-3 (B8a-2 parity): the train return dict carries ``drift_intended_removal``,
+    The train return dict carries ``drift_intended_removal``,
     ``drift_intended_removal_by_reason``, ``recall_miss_keys``, and ``tier_keyed``.
     The simulate path must return zero/empty equivalents so callers never KeyError
     post-collapse.
@@ -2747,7 +2744,7 @@ class TestSimulateFoldReturnSchema:
         """Active return (interim slots present) carries all required keys.
 
         After a successful merge, the result must include all required schema
-        keys — including the MF-3 additions with their zero/empty values.
+        keys — including the schema additions with their zero/empty values.
         """
         loop = _make_bare_loop(tmp_path)
         _write_interim_graph(
@@ -2777,7 +2774,8 @@ class TestSimulateFoldReturnSchema:
 
         The simulate venue has an empty store; the recall-miss set is empty
         (no weight reconstruction); drift_genuine_loss == 0 reproduces the
-        invariant from §7 of the B8a plan.
+        invariant: the simulate path has an empty store and no weight reconstruction,
+        so the recall-miss set is empty and drift_genuine_loss is always 0.
         """
         loop = _make_bare_loop(tmp_path)
         _write_interim_graph(

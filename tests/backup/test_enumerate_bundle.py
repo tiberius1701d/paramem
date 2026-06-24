@@ -6,7 +6,7 @@ Covers:
 - enumerate_backups with kind=SNAPSHOT_BUNDLE returns only bundles.
 - Mixed store (per-kind + bundle) → all returned when kind=None.
 - Bundle slot with corrupt bundle.meta.json → skipped with WARN, not raised.
-- prune does not classify bundle slots as invalid (B2 fix).
+- prune does not classify bundle slots as invalid (bundle-slot prune fix).
 """
 
 from __future__ import annotations
@@ -243,7 +243,7 @@ class TestCorruptBundleManifest:
 
 
 # ---------------------------------------------------------------------------
-# Prune does NOT classify bundle slots as invalid (B2 fix)
+# Prune does NOT classify bundle slots as invalid
 # ---------------------------------------------------------------------------
 
 
@@ -251,7 +251,7 @@ class TestPruneDoesNotFlagBundleSlotInvalid:
     def test_prune_sees_bundle_slot_as_valid(self, tmp_path) -> None:
         """prune() must not add bundle slots to invalid_slots.
 
-        Before the B2 fix, read_meta raised MetaSchemaError on a bundle slot
+        Before the bundle-slot prune fix, read_meta raised MetaSchemaError on a bundle slot
         because there was no per-artifact .meta.json, and prune added the slot
         to invalid_slots.  After the fix, enumerate_backups correctly reads
         bundle slots, so prune iterates valid records.
@@ -284,5 +284,5 @@ class TestPruneDoesNotFlagBundleSlotInvalid:
 
         assert result.invalid_slots == [], (
             f"prune classified bundle slot as invalid: {result.invalid_slots}. "
-            "B2 regression: bundle slots must not be marked invalid."
+            "bundle slots must not be marked invalid."
         )

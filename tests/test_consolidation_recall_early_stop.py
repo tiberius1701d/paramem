@@ -330,8 +330,9 @@ class TestCallSiteWiringSourcePresence:
 
     def test_site2_unified_cycle_uses_funnel_for_interim(self) -> None:
         """run_consolidation_cycle trains episodic+procedural via _train_tier_adapter
-        (the funnel).  _run_indexed_key_procedural was deleted in B5 — the flat
-        per-cycle procedural train path no longer exists.
+        (the funnel).  _run_indexed_key_procedural was deleted when procedural
+        folded into the unified interim slot — the flat per-cycle procedural
+        train path no longer exists.
         """
         # The funnel check is already covered by test_site1_unified_cycle_calls_funnel.
         # This test guards that the deleted function no longer exists in the module.
@@ -345,10 +346,10 @@ class TestCallSiteWiringSourcePresence:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         assert "_run_indexed_key_procedural" not in func_names, (
-            "_run_indexed_key_procedural must not exist after B5 deletion"
+            "_run_indexed_key_procedural must not exist after unified-interim refactor"
         )
         assert "_prepare_procedural_keys_for_tier" not in func_names, (
-            "_prepare_procedural_keys_for_tier must not exist after B5 deletion"
+            "_prepare_procedural_keys_for_tier must not exist after unified-interim refactor"
         )
 
     def test_site4_migration(self) -> None:

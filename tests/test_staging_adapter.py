@@ -104,8 +104,8 @@ class TestAtomicSaveAdapter:
     def test_creates_target_directory(self, tmp_path):
         """atomic_save_adapter creates target_dir and a timestamped slot under it.
 
-        Post-Slice-3a: adapter files live in target_dir/<ts>/, not in target_dir
-        itself.  Verify the slot exists and contains the adapter files.
+        Under the timestamped-slot layout: adapter files live in target_dir/<ts>/,
+        not in target_dir itself.  Verify the slot exists and contains the adapter files.
         """
         model = MagicMock()
 

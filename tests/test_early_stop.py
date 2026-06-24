@@ -1113,10 +1113,10 @@ class TestRecallEarlyStopCallbackResume:
     def test_set_probe_adapter_rebinds_probe_target(self, tmp_path):
         """set_probe_adapter explicitly rebinds the probe to the staging slot.
 
-        Under the AD-20 staging+promote contract the staging owner
-        (train_adapter) calls this so the probe measures the slot HF is
-        actually training (``in_training``) instead of the caller-supplied
-        production name, which holds un-promoted weights during the loop.
+        Under the staging+promote contract the staging owner (train_adapter)
+        calls this so the probe measures the slot HF is actually training
+        (``in_training``) instead of the caller-supplied production name, which
+        holds un-promoted weights during the loop.
         """
         cb, _, _ = _make_callback(tmp_path)
         assert cb._adapter_name == "journal"  # caller-supplied production target

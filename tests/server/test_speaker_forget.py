@@ -66,8 +66,9 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     is exercised.
 
     ``/forget`` routes through ``store.iter_bookkeeping()`` to resolve speaker
-    keys (W2: ``merger.graph`` is cleared at cycle-end, so the old graph-based
-    ``keys_for_speaker`` path cannot be used after W1).  It then calls
+    keys (``merger.graph`` is cleared at cycle-end by the cycle's finally-block
+    reset, so the old graph-based ``keys_for_speaker`` path is unavailable).
+    It then calls
     ``store.discard_keys(keys, mode="erase")`` (the shared helper).  Tests verify
     that the helper is called with the correct arguments.
     """

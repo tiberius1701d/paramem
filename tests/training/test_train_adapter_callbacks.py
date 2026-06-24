@@ -71,7 +71,7 @@ def _capture_callbacks(**train_adapter_kwargs):
     staging_cfg.target_modules = set(adapter_config.target_modules)
     # peft_config pre-populated with both production + staging; the test patches
     # _ensure_staging_slot to a no-op below so the pre-existing slot does NOT
-    # trip the per-AD-20 lifecycle-invariant guard.  Callback-ordering tests do
+    # trip the staging lifecycle-invariant guard.  Callback-ordering tests do
     # not exercise staging slot create/delete — those are covered by
     # TestStagingPromoteContract.
     model.peft_config = {adapter_name: prod_cfg, "in_training": staging_cfg}
@@ -93,7 +93,7 @@ def _capture_callbacks(**train_adapter_kwargs):
             "paramem.training.trainer._FixedDecayTrainer",
             side_effect=_capture_init,
         ),
-        # Bypass the AD-20 lifecycle guard for callback-ordering tests.
+        # Bypass the staging lifecycle guard for callback-ordering tests.
         patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
     ):
         train_adapter(
@@ -549,12 +549,12 @@ class TestStagingPromoteContract:
         )
 
     def test_staging_slot_pre_existing_raises_lifecycle_error(self, tmp_path):
-        """Pre-existing 'in_training' at entry violates AD-20 lifecycle — RuntimeError."""
+        """Pre-existing 'in_training' at entry violates the staging lifecycle — RuntimeError."""
         import pytest
 
-        # Per AD-20, staging is transient: created at training entry, deleted at
-        # exit (both success and abort paths). If 'in_training' is present at
-        # entry, the prior training event failed to clean up — a real bug.
+        # Staging is transient (created at training entry, deleted at exit on both
+        # success and abort paths). If 'in_training' is present at entry, the
+        # prior training event failed to clean up — a real bug.
         model = _make_staging_model(has_staging=True)
         stack, mock_create, mock_copy, mock_switch = _staging_patches(tmp_path)
         with stack, pytest.raises(RuntimeError, match="Lifecycle invariant violated"):
@@ -607,11 +607,11 @@ class TestStagingPromoteContract:
     def test_two_sequential_calls_do_not_trip_lifecycle_guard(self, tmp_path):
         """Multi-tier consolidation safety: episodic→semantic in the same process.
 
-        The single load-bearing invariant of AD-20 is that the staging slot is
-        DELETED on training exit so the next training event enters
-        ``_ensure_staging_slot`` with a clean slate.  This test simulates the
-        consolidation cycle's per-tier sequential ``train_adapter`` calls and
-        asserts that the second call does not trip the lifecycle guard.
+        The load-bearing staging invariant is that the staging slot is DELETED
+        on training exit so the next training event enters ``_ensure_staging_slot``
+        with a clean slate.  This test simulates the consolidation cycle's
+        per-tier sequential ``train_adapter`` calls and asserts that the second
+        call does not trip the lifecycle guard.
         """
         # The mock's peft_config is a dict; treat delete_adapter as a real mutation
         # so the second train_adapter call sees an absent in_training slot.
@@ -976,7 +976,7 @@ class TestStagingPromoteContract:
 
 
 # ---------------------------------------------------------------------------
-# Slice 2a — retain_scratch_until_external_commit flag
+# retain_scratch_until_external_commit flag
 # ---------------------------------------------------------------------------
 
 
@@ -990,7 +990,7 @@ class TestRetainScratchFlag:
     - ``in_training`` slot still deleted (staging lifecycle invariant upheld).
 
     When False (default), behaviour is identical to today: both are cleaned.
-    The abort branch is NOT changed by this flag (Slice 3 scope).
+    The abort branch is NOT changed by this flag (the abort path is separate scope).
     """
 
     def _run_train(self, tmp_path, *, retain: bool, trainer_cls=None) -> dict:
@@ -1072,7 +1072,7 @@ class TestRetainScratchFlag:
     def test_abort_always_cleans_regardless_of_retain(self, tmp_path):
         """The abort branch (Step 6b) is NOT changed by the retain flag — always cleans.
 
-        Slice 3 owns the abort branch. Slice 2 must not change it.
+        The abort branch is separate scope. The retain flag must not change it.
 
         The aborting trainer writes checkpoint-10 during train() so the checkpoint
         is created AFTER the fresh-start purge.  The abort branch then removes it,

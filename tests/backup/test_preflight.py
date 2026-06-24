@@ -49,7 +49,7 @@ def _make_loop(graph_bytes: bytes, tmp_path: Path) -> MagicMock:
 
     W2.3: preflight reads the on-disk ``output_dir/episodic/graph.json`` via
     ``read_maybe_encrypted`` rather than calling ``loop.merger.save_bytes()``
-    (which serialises an empty in-memory graph after W1's cycle-end reset).
+    (which serialises an empty in-memory graph after the cycle's finally-block reset).
     The test fixture writes ``graph_bytes`` to the file so the preflight
     estimate equals ``len(graph_bytes)`` for the graph contribution.
 

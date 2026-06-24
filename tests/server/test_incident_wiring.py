@@ -12,7 +12,7 @@ Covers:
 - T16  VramExhausted callback → record_incident called, NOT RAM write
 - T16b success branch (trained) → record_last_run called, NOT record_incident
 - T17  auto-resolve: vram_exhausted incident resolves after _finalize_interim
-- T17b S-4 ordering: consolidation_retry_exhausted NOT resolved by Pass B success
+- T17b consolidation_retry_exhausted NOT resolved by Pass B success
         (M1 guard owns that conditional resolve — Pass B must NOT touch it)
 - T18  resolve_incident idempotency fix: already-resolved returns False
 - T4b  (ack endpoint) acknowledged incident omitted from attention items
@@ -577,7 +577,7 @@ class TestAutoResolve:
 
 
 # ---------------------------------------------------------------------------
-# T17b — S-4 ordering: consolidation_retry_exhausted NOT resolved by Pass B
+# T17b — consolidation_retry_exhausted NOT resolved by Pass B
 # ---------------------------------------------------------------------------
 
 
@@ -610,7 +610,7 @@ class TestS4Ordering:
         assert len(recall_failures) == 1
         assert recall_failures[0].status == "active", (
             "consolidation_retry_exhausted must remain active — "
-            "M1 guard owns its conditional resolve (S-4 ordering hazard)"
+            "M1 guard owns its conditional resolve — Pass B must not touch it"
         )
 
 

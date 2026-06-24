@@ -8,14 +8,14 @@ Coverage:
 - ``_consolidation_dispatch_guards`` shared guard helper
 - ``_maybe_trigger_housekeeping`` dispatcher (guard pass-through, submission path)
 - ``_run_full_consolidation_sync(housekeeping=True)`` gate overrides:
-  - B1 fix: ``tiers_rebuilt==[]`` does not trigger the noop early-return
+  - ``tiers_rebuilt==[]`` does not trigger the noop early-return
   - Session non-consumption: ``mark_consolidated`` NOT called
   - ``_state["consolidating"]`` cleared on completion
 - Route guard: ``POST /consolidate/housekeeping`` requires ``require_admin``
   (introspection test already in test_require_admin.py; this file tests runtime
   behaviour via the dispatch functions, not the HTTP layer, to avoid full-app init)
 - Window-stamp preservation: train-mode housekeeping passes the existing stamp
-  as ``window_stamp_override`` so ``_is_full_cycle_due`` is not perturbed (B1).
+  as ``window_stamp_override`` so ``_is_full_cycle_due`` is not perturbed.
 """
 
 from __future__ import annotations
@@ -221,7 +221,7 @@ class TestRunFullConsolidationSyncHousekeeping:
             app_module._run_full_consolidation_sync(housekeeping=True)
 
     def test_b1_fix_tiers_rebuilt_empty_does_not_noop(self, monkeypatch, tmp_path) -> None:
-        """B1 fix: housekeeping=True + tiers_rebuilt==[] does NOT trigger noop early-return.
+        """housekeeping=True + tiers_rebuilt==[] does NOT trigger noop early-return.
 
         Under the scheduled fold, an empty tiers_rebuilt signals a no-op and the
         function returns early without calling _save_key_metadata.  Under
@@ -261,7 +261,7 @@ class TestRunFullConsolidationSyncHousekeeping:
 
         (
             mock_save_meta.assert_called_once(),
-            ("B1 fix: _save_key_metadata must be called even when tiers_rebuilt==[]"),
+            ("_save_key_metadata must be called even when tiers_rebuilt==[]"),
         )
 
     def test_sessions_not_marked_consolidated(self, monkeypatch, tmp_path) -> None:
@@ -353,7 +353,7 @@ class TestRunFullConsolidationSyncHousekeeping:
 
 
 # ---------------------------------------------------------------------------
-# TestWindowStampPreservation (B1 regression guard)
+# TestWindowStampPreservation (window-stamp regression guard)
 # ---------------------------------------------------------------------------
 
 
@@ -398,7 +398,7 @@ def _make_train_loop_with_stamp(output_dir: Path, window_stamp: str) -> "object"
 
 
 class TestWindowStampPreservation:
-    """B1 regression: train-mode housekeeping must not advance the window stamp.
+    """Regression: train-mode housekeeping must not advance the window stamp.
 
     ``run_housekeeping`` reads the existing stamp from the lex-max main slot's
     ``meta.json`` and passes it as ``window_stamp_override`` to

@@ -744,7 +744,7 @@ class TestAcceptLiveApplySuccess:
         )
 
     def test_accept_live_apply_sets_maintenance_guard_before_dispatch(self, tmp_path, monkeypatch):
-        """Maintenance guard (mode=cloud-only) is set BEFORE _apply_config_live runs (S-4)."""
+        """Maintenance guard (mode=cloud-only) is set BEFORE _apply_config_live runs."""
         fresh = _make_state(tmp_path)
         fresh["mode"] = "local"
         monkeypatch.setattr(app_module, "_state", fresh)
@@ -769,7 +769,7 @@ class TestAcceptLiveApplySuccess:
         # the handler set it synchronously before dispatching the executor.
         assert guard_set_before_apply, "apply was never called"
         assert guard_set_before_apply[0] == "cloud-only", (
-            f"Expected mode='cloud-only' before apply, got {guard_set_before_apply[0]!r} (S-4)"
+            f"Expected mode='cloud-only' before apply, got {guard_set_before_apply[0]!r}"
         )
 
 
@@ -1112,7 +1112,7 @@ class TestApplyConfigLiveRPathsShortCircuit:
 class TestApplyConfigLiveNoOpSkip:
     """Real _apply_config_live: no-op skip fires iff disk hash == loaded hash.
 
-    Correction B1: ServerConfig has no source_path attribute.  The prior
+    Fix for ServerConfig missing source_path attribute: the prior
     implementation derived mem_hash from the live file (always matching disk),
     so the skip fired on every accept call.  The fix uses
     ``_state["config_drift"]["loaded_hash"]`` (set at boot / last accept) as

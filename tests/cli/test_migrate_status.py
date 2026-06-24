@@ -185,7 +185,7 @@ class TestMigrateStatusOfflineFallback:
 # ---------------------------------------------------------------------------
 
 
-class TestTrialJsonPathCorrection4:
+class TestTrialJsonPathCorrection:
     """_trial_json_path returns data/ha/state/trial.json.
 
     The marker lives at data/ha/state/trial.json inside the data/ha/ tree,

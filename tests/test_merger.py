@@ -2135,13 +2135,13 @@ class TestObjectVariantDedup:
 
 
 # ---------------------------------------------------------------------------
-# B7-A — session_ids provenance union in _upsert_relation
-# Plan test 5: Relation.session_ids survives the merge as a SET union.
+# session_ids provenance union in _upsert_relation
+# Relation.session_ids survives the merge as a SET union.
 # ---------------------------------------------------------------------------
 
 
 class TestSessionIdsProvenanceUnion:
-    """B7-A acceptance tests for session_ids provenance plumbing.
+    """Acceptance tests for session_ids provenance plumbing.
 
     GraphMerger._upsert_relation must union Relation.session_ids into
     edge['sessions'] in BOTH Case-1 (duplicate-SPO reinforcement) AND
@@ -2261,7 +2261,7 @@ class TestSessionIdsProvenanceUnion:
         )
 
     def test_speaker_id_attribution_unchanged_by_session_ids_union(self):
-        """dcf4189 invariant: speaker_id on the SUBJECT NODE is unchanged by B7-A.
+        """dcf4189 invariant: speaker_id on the SUBJECT NODE is unchanged by the session_ids union.
 
         Multi-session edge: two merges under different scalar session_ids each
         carrying a real session_id.  The subject node must retain speaker_id
@@ -2289,7 +2289,7 @@ class TestSessionIdsProvenanceUnion:
         m.merge(s2)
 
         # Speaker entities are keyed by speaker_id in the graph.
-        # B7-A session_ids union touches only edge['sessions'] — never the node.
+        # session_ids union touches only edge['sessions'] — never the node.
         speaker_node = m.graph.nodes.get("Speaker0", {})
         assert speaker_node.get("speaker_id") == "Speaker0", (
             "speaker_id on the subject node must come from the Entity, not from "

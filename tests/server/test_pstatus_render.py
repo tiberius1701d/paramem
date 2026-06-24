@@ -313,7 +313,7 @@ class TestMigrateFooter:
         assert "2026-04-18" in result.stdout
 
     def test_status_response_schema_unchanged_for_existing_consumers(self):
-        """Pre-Slice-5a JSON (no attention/migration keys) → script does not crash."""
+        """JSON from before the attention/migration keys existed → script does not crash."""
         status = {
             k: v
             for k, v in _BASE_STATUS.items()

@@ -11356,7 +11356,7 @@ def _is_full_cycle_due(config) -> bool:
     ``current_interim_stamp``'s ``datetime.now()`` basis.
 
     ``current_full_consolidation_stamp`` and ``_last_full_consolidation_window``
-    are NOT used here (trigger use deleted per §3.6 of the design).  They remain
+    are NOT used here (their full-consolidation trigger use was removed).  They remain
     live: ``_save_adapters`` still stamps ``window_stamp`` via
     ``current_full_consolidation_stamp``, and ``run_housekeeping`` reads the
     stamp via ``_last_full_consolidation_window``.
@@ -13196,11 +13196,11 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         #
         # At count == 0 no interim slots are ever minted, so pending sessions
         # must be extracted directly here, before the fold, depositing their
-        # relations into loop.merger.graph.  The fold's consume_pending capture
-        # stage (PATH C) then snapshots merger.graph into extra_relations and
+        # relations into loop.merger.graph.  The full fold's consume_pending
+        # capture stage then snapshots merger.graph into extra_relations and
         # trains them into the main tiers.
         #
-        # OD-A HARD CONSTRAINT: extract_session is called DIRECTLY here —
+        # HARD CONSTRAINT: extract_session is called DIRECTLY here —
         # NOT via bt.submit / gpu_lock_sync / gpu_lock / acquire_gpu.  This
         # function already runs under the BG trainer worker's GPU lock
         # (background_trainer.py:345).  Any second lock acquisition on the
@@ -13212,8 +13212,8 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # Extraction-failed sessions are NOT marked; they stay pending for
         # the next tick.  A successfully-extracted session is marked on BOTH
         # fold success and fold noop (extraction succeeded but no NEW facts
-        # after dedup — session is processed, not retried).  U2 guard: this
-        # prevents unbounded pending growth from already-processed sessions.
+        # after dedup — session is processed, not retried).  This prevents
+        # already-processed sessions from accumulating unboundedly in pending.
         # ------------------------------------------------------------------
         _consume_pending = (
             config.consolidation.max_interim_count == 0
@@ -13374,8 +13374,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 # accumulating, abort, uncaught exception, and ExtractionFailed
                 # (Python finally runs even when an enclosing try-block returns).
                 # lock_held=True: this closure runs inside the BG worker's GPU lock
-                # (OD-A corollary — lock_held=False would re-acquire the
-                # non-reentrant lock and deadlock).
+                # (lock_held=False would re-acquire the non-reentrant lock and deadlock).
                 if _cp_evict_voice:
                     _set_voice_pipeline_profile(_target_profile(), lock_held=True)
 
@@ -13519,7 +13518,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
             # MF-A Site A: at count==0 the consume-pending pre-stage extracted
             # sessions into merger.graph, but the fold found nothing new to train
             # (all facts already present after dedup).  Mark extraction-succeeded
-            # sessions consolidated so they do not accumulate unboundedly (U2 guard).
+            # sessions consolidated so they do not accumulate unboundedly.
             # Extraction-failed sessions keep their pending status for retry.
             if _consume_pending and _cp_session_ids:
                 try:

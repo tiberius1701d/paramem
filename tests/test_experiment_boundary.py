@@ -51,13 +51,13 @@ def _is_boundary_layer(py_file: Path) -> bool:
 
 # Existing private imports as of 2026-05-28 (9 imports across 4 files).
 # Format: (relative_path_from_repo_root, module, symbol_name).
-# Each entry is a B2-tracked candidate for either (a) promotion to public,
+# Each entry is a candidate for either (a) promotion to public,
 # (b) rewriting the call site through a public path, or (c) explicit retire.
 _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
     {
         # smoke_graph_enrichment.py — reaches into the SOTA enrichment helpers
         # for direct probing.  Migrate to ExtractionPipeline once it exposes a
-        # debug surface (B2).
+        # debug surface.
         (
             "experiments/smoke_graph_enrichment.py",
             "paramem.graph.extractor",
@@ -70,7 +70,7 @@ _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ),
         # test11_adapter_extraction.py — calls the raw extractor internals.
         # CLAUDE.md says all extraction must go through ExtractionPipeline.run;
-        # this experiment violates that.  Rewrite (B2).
+        # this experiment violates that.  Rewrite.
         (
             "experiments/test11_adapter_extraction.py",
             "paramem.graph.extractor",
@@ -83,12 +83,12 @@ _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ),
         # test16_repair_sweep.py / test18_probe_batching.py — adapter-slot
         # plumbing internals.  Promote to public or wrap via a load_adapter
-        # variant that returns the slot path (B2).
+        # variant that returns the slot path.
         ("experiments/test16_repair_sweep.py", "paramem.models.loader", "_adapter_slot_for_load"),
         ("experiments/test18_probe_batching.py", "paramem.models.loader", "_adapter_slot_for_load"),
         # experiments/utils/early_stop.py — already a thin re-export of the
         # private early_stop state.  Either inline into the harness or promote
-        # the underlying symbols (B2).
+        # the underlying symbols.
         ("experiments/utils/early_stop.py", "paramem.training.early_stop", "_EarlyStopState"),
     }
 )

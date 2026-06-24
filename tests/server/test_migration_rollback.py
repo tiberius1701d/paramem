@@ -1232,7 +1232,7 @@ class TestRollbackMaintenanceGuard:
         client.post("/migration/rollback")
         assert guard_set_before_apply, "apply was never called"
         assert guard_set_before_apply[0] == "cloud-only", (
-            f"Expected mode='cloud-only' before apply, got {guard_set_before_apply[0]!r} (S-4)"
+            f"Expected mode='cloud-only' before apply, got {guard_set_before_apply[0]!r}"
         )
 
 
@@ -1472,7 +1472,7 @@ class TestBaseSwapRollback:
         assert body["detail"]["error"] == "rollback_precondition_failed"
 
     def test_maintenance_guard_set_before_apply_in_base_swap(self, tmp_path, monkeypatch):
-        """mode=cloud-only is set before _apply_config_live runs in base-swap rollback (S-4)."""
+        """mode=cloud-only is set before _apply_config_live runs in base-swap rollback."""
         fresh = _make_base_swap_state(tmp_path)
         fresh["mode"] = "local"
         monkeypatch.setattr(app_module, "_state", fresh)
@@ -1493,5 +1493,5 @@ class TestBaseSwapRollback:
         assert guard_mode_at_apply, "_apply_config_live was never called"
         assert guard_mode_at_apply[0] == "cloud-only", (
             f"Expected mode='cloud-only' before apply in base-swap rollback; "
-            f"got {guard_mode_at_apply[0]!r} (S-4)"
+            f"got {guard_mode_at_apply[0]!r}"
         )
