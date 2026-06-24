@@ -2595,3 +2595,480 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             u == "Speaker0" and d.get("predicate") == "knows"
             for u, _v, d in loop.merger.graph.edges(data=True)
         ), "knows edge must move onto the 'Speaker0' speaker node after contraction"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _unique_speaker_predecessor (pure unit + integration)
+# ---------------------------------------------------------------------------
+
+
+class TestUniqueSpeakerPredecessor:
+    """Direct unit tests for ConsolidationLoop._unique_speaker_predecessor.
+
+    Uses a minimal loop with a manually-populated merger.graph (nx.MultiDiGraph).
+    No enrichment, no SOTA calls.
+    """
+
+    def test_zero_predecessors_returns_empty(self, tmp_path):
+        """An isolated node with no predecessors → ''."""
+        loop = _make_loop(tmp_path)
+        loop.merger.graph.add_node("concept", attributes={})
+
+        assert loop._unique_speaker_predecessor("concept") == ""
+
+    def test_one_speaker_predecessor_returns_sid(self, tmp_path):
+        """Exactly one predecessor with a non-empty speaker_id → that sid."""
+        loop = _make_loop(tmp_path)
+        loop.merger.graph.add_node(
+            "Speaker0",
+            entity_type="person",
+            speaker_id="Speaker0",
+        )
+        loop.merger.graph.add_node("concept", attributes={})
+        loop.merger.graph.add_edge("Speaker0", "concept", predicate="held role")
+
+        assert loop._unique_speaker_predecessor("concept") == "Speaker0"
+
+    def test_two_speaker_predecessors_returns_empty(self, tmp_path):
+        """Two distinct speakers → '' (ambiguous — never mis-attribute)."""
+        loop = _make_loop(tmp_path)
+        loop.merger.graph.add_node("Speaker0", speaker_id="Speaker0")
+        loop.merger.graph.add_node("Speaker1", speaker_id="Speaker1")
+        loop.merger.graph.add_node("concept", attributes={})
+        loop.merger.graph.add_edge("Speaker0", "concept", predicate="held role")
+        loop.merger.graph.add_edge("Speaker1", "concept", predicate="held role")
+
+        assert loop._unique_speaker_predecessor("concept") == ""
+
+    def test_no_transitive_inheritance(self, tmp_path):
+        """Chain A(speaker_id='S0') → B(concept) → C(concept): query on C returns ''
+        because B carries no speaker_id — inheritance is 1-hop only."""
+        loop = _make_loop(tmp_path)
+        loop.merger.graph.add_node("Speaker0", speaker_id="Speaker0")
+        loop.merger.graph.add_node("B", attributes={})
+        loop.merger.graph.add_node("C", attributes={})
+        loop.merger.graph.add_edge("Speaker0", "B", predicate="held role")
+        loop.merger.graph.add_edge("B", "C", predicate="related to")
+
+        # B is C's predecessor, but B has no speaker_id → does not propagate.
+        assert loop._unique_speaker_predecessor("C") == ""
+
+    def test_node_not_in_graph_returns_empty(self, tmp_path):
+        """Querying a node that is not in the graph returns ''."""
+        loop = _make_loop(tmp_path)
+        assert loop._unique_speaker_predecessor("nonexistent_node") == ""
+
+    def test_predecessor_with_empty_speaker_id_filtered(self, tmp_path):
+        """A predecessor whose speaker_id attribute is '' is not counted as a speaker."""
+        loop = _make_loop(tmp_path)
+        loop.merger.graph.add_node("NoSid", speaker_id="")
+        loop.merger.graph.add_node("concept", attributes={})
+        loop.merger.graph.add_edge("NoSid", "concept", predicate="related to")
+
+        # '' is not a speaker — no non-empty speaker predecessor → ''.
+        assert loop._unique_speaker_predecessor("concept") == ""
+
+
+class TestSpeakerPredecessorInheritance:
+    """Integration: _unique_speaker_predecessor fills speaker_id gaps for
+    concept-rooted enrichment edges going through the real merger path.
+
+    All tests seed the graph via _seed_speaker_node / _run_graph_enrichment so
+    edges land in merger.graph through the real merger (no raw add_edge for
+    enrichment edges).
+    """
+
+    def test_gap_filled_single_speaker_predecessor(self, tmp_path, monkeypatch):
+        """Role-concept attribute edge inherits speaker_id from the unique speaker.
+
+        Graph: Speaker0 →held_role→ 'Senior PM', 'Senior PM' →achievement→ 'Award X'
+        (both via SOTA canned result).  After enrichment + mint, the minted key for
+        'achievement' must carry speaker_id='Speaker0' and be filed under Speaker0
+        in a rebuilt router index.
+        """
+        from paramem.server.router import QueryRouter
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        _populate_graph(loop.merger.graph, n_persons=10)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # Real speaker node via the merger (verbatim key "Speaker0").
+        _seed_speaker_node(loop, "Speaker0", "Alex")
+
+        # SOTA emits: bridge edge + role-concept attribute edge.
+        # The role concept node ("Senior PM") has no speaker_id of its own.
+        rels = [
+            {
+                "subject": "Speaker0",
+                "predicate": "held_role",
+                "object": "Senior PM",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            },
+            {
+                "subject": "Senior PM",
+                "predicate": "achievement",
+                "object": "Award X",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            },
+        ]
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=(rels, [], "raw"),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+
+        # Confirm the role concept node has no own speaker_id (pre-condition for fallback).
+        role_node = loop.merger.graph.nodes.get("senior pm", {})
+        assert not role_node.get("speaker_id"), (
+            "Role concept node must NOT carry a direct speaker_id before fallback"
+        )
+
+        # Confirm Speaker0 is a predecessor of "senior pm" (bridge edge present).
+        preds = list(loop.merger.graph.predecessors("senior pm"))
+        assert "Speaker0" in preds, (
+            f"Bridge edge Speaker0 →held_role→ 'senior pm' must be in graph; predecessors={preds}"
+        )
+
+        # Mint keys via the unified builder (fold discipline).
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        # Find the minted key for the 'achievement' edge (subject = "senior pm").
+        achievement_keys = [
+            e
+            for tier in ("episodic", "procedural")
+            for e in tier_keyed[tier]
+            if e.get("predicate") == "achievement"
+        ]
+        assert achievement_keys, "No minted key found for the 'achievement' edge"
+        key = achievement_keys[0]["key"]
+        assert achievement_keys[0]["speaker_id"] == "Speaker0", (
+            f"Minted achievement key must carry speaker_id='Speaker0' via fallback; "
+            f"got {achievement_keys[0]['speaker_id']!r}"
+        )
+
+        bk = loop.store.bookkeeping_for_key(key)
+        assert bk is not None
+        assert bk["speaker_id"] == "Speaker0", (
+            f"Bookkeeping speaker_id must be 'Speaker0'; got {bk['speaker_id']!r}"
+        )
+
+        # Router index must file the key under Speaker0.
+        router = QueryRouter(adapter_dir=tmp_path, memory_store=loop.store)
+        router.reload()
+        s0_keys = router._speaker_key_index.get("Speaker0", set())
+        assert key in s0_keys, (
+            f"Achievement key must be in router._speaker_key_index['Speaker0']; "
+            f"index={s0_keys}, key={key!r}"
+        )
+
+    def test_no_misattribution_two_speaker_predecessors(self, tmp_path, monkeypatch):
+        """Two speakers both hold the same role concept → attribute key mints with ''
+        (ambiguous — must not be attributed to either speaker).
+
+        Graph: Speaker0 →held_role→ 'Engineer', Speaker1 →held_role→ 'Engineer',
+        'Engineer' →attr→ 'Y'.  Fallback sees 2 distinct predecessors → ''.
+        """
+        from paramem.server.router import QueryRouter
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        _populate_graph(loop.merger.graph, n_persons=10)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        _seed_speaker_node(loop, "Speaker0", "Alex")
+        _seed_speaker_node(loop, "Speaker1", "Robin")
+
+        rels = [
+            {
+                "subject": "Speaker0",
+                "predicate": "held_role",
+                "object": "Engineer",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            },
+            {
+                "subject": "Speaker1",
+                "predicate": "held_role",
+                "object": "Engineer",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            },
+            {
+                "subject": "Engineer",
+                "predicate": "attr",
+                "object": "Y",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            },
+        ]
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=(rels, [], "raw"),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        attr_keys = [
+            e
+            for tier in ("episodic", "procedural")
+            for e in tier_keyed[tier]
+            if e.get("predicate") == "attr"
+        ]
+        assert attr_keys, "No minted key found for the 'attr' edge"
+        assert attr_keys[0]["speaker_id"] == "", (
+            f"Shared-role attribute key must mint with speaker_id='' (ambiguous); "
+            f"got {attr_keys[0]['speaker_id']!r}"
+        )
+
+        # Must not be indexed under either speaker.
+        router = QueryRouter(adapter_dir=tmp_path, memory_store=loop.store)
+        router.reload()
+        attr_key = attr_keys[0]["key"]
+        s0_keys = router._speaker_key_index.get("Speaker0", set())
+        s1_keys = router._speaker_key_index.get("Speaker1", set())
+        assert attr_key not in s0_keys, "Ambiguous key must NOT appear under Speaker0"
+        assert attr_key not in s1_keys, "Ambiguous key must NOT appear under Speaker1"
+
+    def test_never_overwrites_working_attribution(self, tmp_path, monkeypatch):
+        """Fallback must NOT fire when attribution already resolves correctly.
+
+        Sub-case (a): speaker-rooted enrichment — subject IS the speaker node.
+        The subject node carries speaker_id='Speaker0', so the node-attr branch
+        resolves before the fallback.
+
+        Sub-case (b): extraction edge with a non-empty edge-level speaker_id.
+        The edge-attr branch resolves before both the node-attr AND the fallback.
+
+        _unique_speaker_predecessor must NOT be called for either subject.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        _populate_graph(loop.merger.graph, n_persons=10)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # Seed a real speaker node.
+        _seed_speaker_node(loop, "Speaker0", "Alex")
+
+        # Sub-case (a): speaker-rooted enrichment (subject = speaker node).
+        rels_a = [
+            {
+                "subject": "Speaker0",
+                "predicate": "likes",
+                "object": "Coffee",
+                "relation_type": "preference",
+                "confidence": 0.9,
+            }
+        ]
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=(rels_a, [], "raw"),
+        ):
+            loop._run_graph_enrichment()
+
+        # Spy on _unique_speaker_predecessor to assert it is NOT called for
+        # subjects that already have working attribution.
+        called_for: list[str] = []
+        original_helper = loop._unique_speaker_predecessor
+
+        def _spy(node: str) -> str:
+            called_for.append(node)
+            return original_helper(node)
+
+        loop._unique_speaker_predecessor = _spy  # type: ignore[method-assign]
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        # The 'likes' edge's subject is "Speaker0" which carries speaker_id —
+        # node-attr branch resolves, fallback must NOT be reached.
+        assert "Speaker0" not in called_for, (
+            f"_unique_speaker_predecessor must NOT be called for 'Speaker0' "
+            f"(already has speaker_id); was called for: {called_for}"
+        )
+
+        # Minted 'likes' key carries speaker_id='Speaker0' (came from node-attr).
+        likes_entries = [
+            e
+            for tier in ("episodic", "procedural")
+            for e in tier_keyed[tier]
+            if e.get("predicate") == "likes"
+        ]
+        assert likes_entries, "Expected a minted 'likes' key"
+        assert likes_entries[0]["speaker_id"] == "Speaker0", (
+            f"Speaker-rooted edge must carry speaker_id='Speaker0' (via node-attr); "
+            f"got {likes_entries[0]['speaker_id']!r}"
+        )
+
+        # Sub-case (b): extraction edge with edge-level speaker_id already set.
+        called_for.clear()
+        tier_keyed2: dict = {"episodic": [], "semantic": [], "procedural": []}
+
+        # Add a raw edge whose edge data carries speaker_id (simulates extraction stamp).
+        loop.merger.graph.add_node("work_item", attributes={"name": "Work Item"})
+        loop.merger.graph.add_edge(
+            "concept_x",
+            "work_item",
+            predicate="tracks",
+            relation_type="factual",
+            speaker_id="Speaker0",  # edge-level stamp
+            confidence=0.9,
+        )
+        loop.merger.graph.add_node("concept_x", attributes={"name": "Concept X"})
+
+        loop._build_all_edge_entries_into(tier_keyed2)
+
+        # The edge-attr branch resolves; fallback must NOT be called for "concept_x".
+        assert "concept_x" not in called_for, (
+            f"_unique_speaker_predecessor must NOT be called for 'concept_x' "
+            f"(edge carries speaker_id); was called for: {called_for}"
+        )
+        tracks_entries = [
+            e
+            for tier in ("episodic", "procedural")
+            for e in tier_keyed2[tier]
+            if e.get("predicate") == "tracks"
+        ]
+        assert tracks_entries, "Expected a minted 'tracks' key"
+        assert tracks_entries[0]["speaker_id"] == "Speaker0", (
+            f"Edge-stamped edge must carry speaker_id='Speaker0' (via edge attr); "
+            f"got {tracks_entries[0]['speaker_id']!r}"
+        )
+
+    def test_zero_predecessor_concept(self, tmp_path, monkeypatch):
+        """An isolated concept node with an enrichment attribute edge and no
+        speaker predecessors mints with speaker_id='' (allow_empty path).
+
+        The node is introduced as the object of an enrichment edge (so it
+        appears in the graph), but no bridge edge points into it from any speaker.
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        _populate_graph(loop.merger.graph, n_persons=10)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        _seed_speaker_node(loop, "Speaker0", "Alex")
+
+        # SOTA emits an attribute edge whose SUBJECT is a brand-new concept node
+        # with no speaker predecessor (no bridge edge into it).
+        rels = [
+            {
+                "subject": "Isolated Concept",
+                "predicate": "has_property",
+                "object": "Some Value",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            }
+        ]
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=(rels, [], "raw"),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        prop_keys = [
+            e
+            for tier in ("episodic", "procedural")
+            for e in tier_keyed[tier]
+            if e.get("predicate") == "has property"
+        ]
+        assert prop_keys, "No minted key found for the 'has_property' edge"
+        assert prop_keys[0]["speaker_id"] == "", (
+            f"Zero-predecessor concept must mint with speaker_id=''; "
+            f"got {prop_keys[0]['speaker_id']!r}"
+        )
+
+    def test_extraction_concept_edge_not_attributed(self, tmp_path):
+        """Scope boundary: an EXTRACTION concept-edge (no edge_source) with a
+        single speaker predecessor must keep speaker_id='' — the fallback must
+        NOT fire for non-enrichment edges.
+
+        This locks the deliberate unattributed-fact behavior (e.g. a company-
+        location fact extracted alongside a speaker → the company node has the
+        speaker as a predecessor, but the fact is not personal to that speaker).
+        """
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = _make_loop(tmp_path, replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # Speaker node with speaker_id (simulates a real speaker in the graph).
+        loop.merger.graph.add_node(
+            "Speaker0",
+            entity_type="person",
+            speaker_id="Speaker0",
+            attributes={"name": "Speaker0"},
+        )
+
+        # Concept node that the speaker is the UNIQUE predecessor of
+        # (e.g. "Acme Corp" — Speaker0 has a works_at edge into it).
+        loop.merger.graph.add_node(
+            "acme corp",
+            entity_type="organization",
+            attributes={"name": "Acme Corp"},
+        )
+        loop.merger.graph.add_edge(
+            "Speaker0",
+            "acme corp",
+            predicate="works at",
+            relation_type="factual",
+            speaker_id="Speaker0",
+            confidence=1.0,
+            # NOTE: no edge_source here (extraction edge, not enrichment).
+        )
+
+        # Extraction concept-edge: Acme Corp →is_located_in→ Germany.
+        # No edge_source (extraction), no speaker_id on the edge, no speaker_id
+        # on the subject node.  Even though Speaker0 is the unique predecessor
+        # of "acme corp", the fallback must NOT fire — deliberate unattributed fact.
+        loop.merger.graph.add_node(
+            "germany", entity_type="location", attributes={"name": "Germany"}
+        )
+        loop.merger.graph.add_edge(
+            "acme corp",
+            "germany",
+            predicate="is located in",
+            relation_type="factual",
+            confidence=1.0,
+            # NOTE: no edge_source (extraction), no speaker_id.
+        )
+
+        tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        located_keys = [
+            e
+            for tier in ("episodic", "procedural")
+            for e in tier_keyed[tier]
+            if e.get("predicate") == "is located in"
+        ]
+        assert located_keys, "No minted key found for the 'is located in' edge"
+        assert located_keys[0]["speaker_id"] == "", (
+            f"Extraction concept-edge must keep speaker_id='' even when a unique "
+            f"speaker predecessor exists; got {located_keys[0]['speaker_id']!r}"
+        )

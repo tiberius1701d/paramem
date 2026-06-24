@@ -5138,6 +5138,7 @@ class ConsolidationLoop:
             the :class:`~paramem.memory.store.MemoryStore` and advances
             ``_indexed_next_index`` / ``_procedural_next_index`` for each minted key.
         """
+        from paramem.memory.persistence import _EDGE_SOURCE_ATTR
         from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
         minted_by_tier: dict[str, int] = {"episodic": 0, "procedural": 0}
@@ -5173,14 +5174,26 @@ class ConsolidationLoop:
                 )
                 # C-1: resolve speaker_id from the edge first (stamped by the merger
                 # A-1 from Relation.speaker_id), then fall back to the subject node's
-                # top-level speaker_id attribute.  Terminal fallback is "" (concept-
-                # rooted edges with no speaker attribution — minted with allow_empty).
+                # top-level speaker_id attribute.  When both are empty, try the
+                # unique-speaker-predecessor fallback (concept-rooted enrichment edges
+                # whose subject is a role/project/org concept with exactly one speaker
+                # pointing in).  Terminal fallback is "" (allow_empty path).
                 _edge_sid = _t_data.get("speaker_id", None)
                 if _edge_sid:
                     _subj_sid = _edge_sid
                 else:
                     _node_attrs = self.merger.graph.nodes.get(_t_subj, {}) or {}
                     _subj_sid = _node_attrs.get("speaker_id", "") or ""
+                    if not _subj_sid and _t_data.get(_EDGE_SOURCE_ATTR) == "graph_enrichment":
+                        # FALLBACK-ONLY (enrichment edges only): subject node carries no
+                        # speaker_id and this edge is a SOTA-enrichment edge.  Inherit
+                        # from the subject's UNIQUE non-empty speaker predecessor (1-hop,
+                        # direct in-edges).  Exactly one distinct speaker → use it;
+                        # zero or ≥2 → keep "".
+                        # Extraction concept-edges (no edge_source / different value)
+                        # keep the existing "" terminal — deliberate unattributed facts
+                        # (e.g. company-location) must NOT be attributed to a speaker.
+                        _subj_sid = self._unique_speaker_predecessor(_t_subj)
 
                 # Derive tier via partition_relations (mirrors the keyed branch).
                 _dummy = [
@@ -5355,6 +5368,44 @@ class ConsolidationLoop:
                 " [deferred]" if defer else "",
             )
         return minted_by_tier, deferred_writes
+
+    def _unique_speaker_predecessor(self, node: str) -> str:
+        """Return the single non-empty ``speaker_id`` among *node*'s direct
+        (1-hop) graph predecessors, or ``""`` when there is not exactly one.
+
+        Reads ``self.merger.graph``.  Only DIRECT predecessors (in-edge source
+        nodes) are considered; the walk is 1-hop, never transitive — a
+        predecessor that itself carries no ``speaker_id`` contributes nothing
+        and does NOT propagate a chain.  Authoritative-graph-state signal: a
+        predecessor whose own node attribute ``speaker_id`` is non-empty.  No
+        static predicate map is consulted.
+
+        Used ONLY by the keyless-branch terminal fallback in
+        :meth:`_build_all_edge_entries_into`, and ONLY when the subject node
+        has no ``speaker_id`` of its own — fills gaps, never overwrites.
+
+        Exactly one distinct non-empty speaker predecessor → return that
+        ``speaker_id``.  Zero predecessors, all predecessors have empty
+        ``speaker_id``, or ≥2 distinct non-empty speaker predecessors →
+        return ``""`` (ambiguous or unattributed — never mis-attribute across
+        speakers).
+
+        Args:
+            node: Canonical node key in ``self.merger.graph``.
+
+        Returns:
+            A non-empty ``speaker_id`` string when exactly one distinct speaker
+            predecessor exists; ``""`` otherwise.
+        """
+        g = self.merger.graph
+        if node not in g:
+            return ""
+        speakers = {
+            sid
+            for pred in g.predecessors(node)
+            if (sid := (g.nodes[pred].get("speaker_id", "") or ""))
+        }
+        return next(iter(speakers)) if len(speakers) == 1 else ""
 
     def _build_tier_delta(
         self,
