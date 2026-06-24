@@ -4,14 +4,23 @@ Required for both outputs:
 - `subject` / `object` / `canonical` / `variant` must be exact node names from the input graph.
 - `relation_type` ∈ {{factual, temporal, preference, social}}; use `social` for interpersonal relations, `factual` otherwise.
 - Confidence ≥ 0.7. Emit nothing rather than guess.
+- each input triple includes a `speaker_id`; a non-empty `speaker_id` marks the subject as a speaker.
+- each emitted relation must include `"symmetric": true` or `"symmetric": false`.
 
 
 ## Part 1 — RELATIONS
 
-Emit cross-session relations that are implied by shared context but not already in the input. For symmetric predicates emit ONE direction only: lexicographic-min subject wins.
+Symmetric predicates hold in both directions (colleague_of, friend_of, married_to, sibling_of, classmate_of, teammate_of, neighbor_of, knows, family_of, shares_interest_with, attended_with, ...) and must carry `"symmetric": true`. Directional predicates (mentored_by, manages, parent_of, works_at) carry `"symmetric": false`. For non-speaker symmetric pairs emit ONE direction only (the system canonicalizes direction). When the input triple's `speaker_id` is absent or empty, the speaker↔speaker exception below does not fire — emit a single direction (safe default).
 
-POSITIVE — input has `works_at(Alice, Acme)` AND `works_at(Bob, Acme)`:
-→ EMIT `colleague_of(Alice, Bob)` — symmetric, lexicographic-min subject.
+EXCEPTION — when BOTH endpoints are speakers (each input triple carries a non-empty `speaker_id`), emit BOTH directions of a symmetric relation `(A,P,B)` AND `(B,P,A)`, each with `"symmetric": true`. For speaker↔non-speaker or non-speaker↔non-speaker symmetric relations, emit ONE direction.
+
+Emit cross-session relations that are implied by shared context but not already in the input.
+
+POSITIVE — input has `works_at(Alice, Acme)[speaker_id=Alice]` AND `works_at(Bob, Acme)[speaker_id=Bob]`:
+→ EMIT `colleague_of(Alice, Bob)` with `"symmetric": true` AND `colleague_of(Bob, Alice)` with `"symmetric": true` — speaker↔speaker exception: both directions.
+
+POSITIVE — input has `works_at(Alice, Acme)[speaker_id=]` AND `works_at(Bob, Acme)[speaker_id=]` (no speaker_id):
+→ EMIT `colleague_of(Alice, Bob)` with `"symmetric": true`, single direction only — speaker exception does not fire.
 
 POSITIVE — input has `attended(Alice, Stanford)`, `attended(Bob, Stanford)`, AND `study_partner_of(Alice, Bob)`:
 → EMIT `classmate_of(Alice, Bob)` — supported by both shared institution AND an explicit interaction triple.
@@ -22,7 +31,7 @@ NEGATIVE — input has only `lives_in(Alice, Portland)` AND `lives_in(Bob, Portl
 NEGATIVE — input has only `attended(Alice, Stanford)` AND `attended(Bob, Stanford)`:
 → DO NOT emit `knows(Alice, Bob)`. Graph co-presence alone is not evidence of acquaintance. Prefer a specific predicate (colleague_of, classmate_of, friend_of, family_of, neighbor_of); if none is justified, emit nothing.
 
-NEGATIVE — input already contains `colleague_of(Alice, Bob)`:
+NEGATIVE — input already contains `colleague_of(Alice, Bob)` and NEITHER is a speaker:
 → DO NOT re-emit `colleague_of(Bob, Alice)` — symmetric pair, single direction only. DO NOT re-emit any input triple.
 
 NEGATIVE — input has triples about Alice's program work but no node named `"€200M+"`, `"12 months"`, or `"Independent"`:
@@ -63,7 +72,7 @@ Return ONLY a JSON object:
 ```
 {{
   "relations": [
-    {{"subject": "...", "predicate": "...", "object": "...", "relation_type": "...", "confidence": 0.0}}
+    {{"subject": "...", "predicate": "...", "object": "...", "relation_type": "...", "confidence": 0.0, "symmetric": false}}
   ],
   "same_as": [
     ["canonical_name", "variant_name"]

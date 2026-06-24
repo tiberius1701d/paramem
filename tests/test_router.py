@@ -73,7 +73,13 @@ def _make_router_from_entries(
         fsc = payload.get("first_seen_cycle", 0)
         rtype = payload.get("relation_type", "factual")
         if spk or fsc:
-            store.set_bookkeeping(key, speaker_id=spk, first_seen_cycle=fsc, relation_type=rtype)
+            store.set_bookkeeping(
+                key,
+                speaker_id=spk,
+                first_seen_cycle=fsc,
+                relation_type=rtype,
+                allow_empty_speaker=(spk == ""),
+            )
 
     kwargs: dict = {
         "adapter_dir": adapter_dir or Path("/nonexistent"),

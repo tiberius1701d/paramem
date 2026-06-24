@@ -69,6 +69,7 @@ _SYNTHETIC_SESSION_IDS: frozenset[str] = frozenset(
         "__full_consolidation_recon__",
         "__interim_pending_sessions__",
         "__simulate_consolidation_merge__",
+        "__graph_enrichment__",
     }
 )
 
@@ -2275,7 +2276,6 @@ class ConsolidationLoop:
             ),
             adapter_name=adapter_name,
             stamp=stamp,
-            speaker_id=speaker_id,
             new_promotions=new_promotions,
             run_label=run_label,
             triples_extracted=triples_extracted,
@@ -2430,7 +2430,7 @@ class ConsolidationLoop:
 
         import networkx as nx
 
-        from paramem.memory.persistence import _EDGE_SOURCE_ATTR, _IK_KEY_ATTR
+        from paramem.memory.persistence import _IK_KEY_ATTR
 
         _empty = {"chunks": 0, "new_edges": 0, "same_as_merges": 0}
 
@@ -2507,7 +2507,6 @@ class ConsolidationLoop:
             seen_chunks.add(key)
             chunks.append(nodes)
 
-        total_new = 0
         total_merges = 0
         calls_made = 0
         seen_merge_keys: set[frozenset] = set()
@@ -2516,6 +2515,10 @@ class ConsolidationLoop:
         # so the classifier can distinguish intended enrichment-driven removals from
         # genuine reconstruction failures.
         _collapsed_ik: dict[str, str] = {}  # ik_key → keep node
+        # SF-2: accumulate Relation objects across all chunks; edge-count delta
+        # computed after _merge_registry_relations so merger deduplication is counted.
+        enrichment_relations: list[Relation] = []
+        _edges_before = graph.number_of_edges()
 
         for chunk_nodes in chunks:
             try:
@@ -2547,15 +2550,29 @@ class ConsolidationLoop:
             #   2. Unordered-pair dedup across the whole enrichment pass.
             #   3. Surface-form safety gate (token-subset + Jaro-Winkler).
             coref_map: dict[str, str] = {}
+
+            def _resolve_node_key(name: str) -> str:
+                # Map a SOTA-returned surface name to the ACTUAL existing graph
+                # node key.  Verbatim match wins so a name equal to an existing
+                # node key resolves to that key unchanged — this is load-bearing
+                # for speaker nodes, which are keyed by their VERBATIM speaker_id
+                # ("Speaker0") via _resolve_entity, while canonical() would
+                # casefold to "speaker0" and miss the node.  Falls back to
+                # canonical(name) for ordinary surface forms (node-key model A).
+                if name in graph:
+                    return name
+                return canonical(name)
+
             for pair in same_as_pairs:
                 keep, drop = pair[0], pair[1]
                 if keep == drop:
                     continue
-                # Canonicalize for graph lookup; SOTA returns surface names, nodes
-                # are canonical post-model-A.  BL-1: keep _safe_to_merge_surface on
-                # the original SURFACE strings (fuzzy layer-2 check).
-                keep_canon = canonical(keep)
-                drop_canon = canonical(drop)
+                # Resolve to actual node keys: verbatim-first (speaker nodes keyed
+                # by their verbatim speaker_id), else canonical.  BL-1: keep
+                # _safe_to_merge_surface on the original SURFACE strings (fuzzy
+                # layer-2 check).
+                keep_canon = _resolve_node_key(keep)
+                drop_canon = _resolve_node_key(drop)
                 if keep_canon == drop_canon:
                     continue
                 if keep_canon not in graph or drop_canon not in graph:
@@ -2607,15 +2624,20 @@ class ConsolidationLoop:
                     )
 
             def _resolve_name(name: str) -> str:
-                # Canonicalize surface name then follow drop→keep chains.
-                name = canonical(name)
+                # Resolve to the actual node key (verbatim-first; same resolver as
+                # the same_as pass so speaker nodes keyed by verbatim speaker_id
+                # are not casefolded into a missing "speaker0" key), then follow
+                # the drop→keep coref chain.
+                name = _resolve_node_key(name)
                 seen: set[str] = set()
                 while name in coref_map and name not in seen:
                     seen.add(name)
                     name = coref_map[name]
                 return name
 
-            # Apply new edges.
+            # Build Relation objects from SOTA-emitted new_rels for this chunk.
+            # BLOCKER-1 endpoint surface rule: speaker endpoints pass their canonical
+            # key (the speaker_id), non-speaker endpoints pass the display surface.
             fallback_rtype = "factual"
             valid_rtypes = {"factual", "temporal", "preference", "social"}
             for rel in new_rels:
@@ -2623,40 +2645,29 @@ class ConsolidationLoop:
                     continue
                 # Remap endpoints through this chunk's coref map so edges
                 # referencing a to-be-dropped node still land on the canonical.
-                subj = _resolve_name(rel.get("subject", ""))
+                subj_canon = _resolve_name(rel.get("subject", ""))
                 raw_pred = rel.get("predicate", "")
-                obj = _resolve_name(rel.get("object", ""))
+                obj_canon = _resolve_name(rel.get("object", ""))
                 rtype = rel.get("relation_type", fallback_rtype)
                 if rtype not in valid_rtypes:
                     rtype = fallback_rtype
-                pred = canonical(raw_pred)
-                if not (subj and pred and obj and subj != obj):
+                if not (subj_canon and raw_pred and obj_canon):
                     continue
 
-                # Canonicalize symmetric predicates so (A,P,B) and (B,P,A)
-                # collapse to a single direction (subj < obj lexicographically).
-                if pred in _SYMMETRIC_ENRICHMENT_PREDICATES and subj > obj:
-                    subj, obj = obj, subj
+                # BLOCKER-1: choose endpoint string per endpoint.
+                # Speaker endpoint (node carries speaker_id): pass the canonical key
+                # (== speaker_id) so _synth_speaker_entities can emit the Entity.
+                # Non-speaker endpoint: pass the display surface from node attributes.
+                def _endpoint_str(canon: str) -> str:
+                    _n = graph.nodes.get(canon, {})
+                    if _n.get("speaker_id"):
+                        return canon
+                    return _n.get("attributes", {}).get("name", canon)
 
-                # Ensure both endpoint nodes exist.
-                for node_name in (subj, obj):
-                    if node_name not in graph:
-                        graph.add_node(
-                            node_name,
-                            entity_type="concept",
-                            attributes={},
-                            recurrence_count=1,
-                            sessions=[],
-                            first_seen="graph_enrichment",
-                            last_seen="graph_enrichment",
-                        )
+                subj_endpoint = _endpoint_str(subj_canon)
+                obj_endpoint = _endpoint_str(obj_canon)
 
-                # Skip exact-triple duplicates.
-                duplicate = any(
-                    d.get("predicate") == pred and tgt == obj
-                    for _, tgt, d in graph.out_edges(subj, data=True)
-                )
-                if duplicate:
+                if not (subj_endpoint and obj_endpoint and subj_endpoint != obj_endpoint):
                     continue
 
                 try:
@@ -2668,20 +2679,34 @@ class ConsolidationLoop:
                 if confidence < 0.7:
                     continue
 
-                graph.add_edge(
-                    subj,
-                    obj,
-                    predicate=pred,
-                    relation_type=rtype,
-                    confidence=confidence,
-                    # Stored under _EDGE_SOURCE_ATTR ("edge_source"), not "source":
-                    # NetworkX's node_link_data reserves "source" for the edge's
-                    # source-NODE name and would clobber this provenance tag on
-                    # persist (same collision class as "key" → "ik_key").
-                    **{_EDGE_SOURCE_ATTR: "graph_enrichment"},
-                    sessions=[],
+                # B-3: derive speaker_id from the subject node's speaker_id attribute.
+                _subj_sid = graph.nodes.get(subj_canon, {}).get("speaker_id", "")
+
+                enrichment_relations.append(
+                    Relation(
+                        subject=subj_endpoint,
+                        predicate=raw_pred,
+                        object=obj_endpoint,
+                        relation_type=rtype,  # type: ignore[arg-type]
+                        confidence=confidence,
+                        speaker_id=_subj_sid,
+                        symmetric=bool(rel.get("symmetric")),
+                        edge_source="graph_enrichment",
+                    )
                 )
-                total_new += 1
+
+        # Route all accumulated enrichment relations through the merger so they
+        # receive full Case-1/Case-3 treatment (dedup, edge-source stamp, speaker_id).
+        if enrichment_relations:
+            self._merge_registry_relations(
+                enrichment_relations,
+                session_id="__graph_enrichment__",
+                log_label="enrichment relations",
+                resolve_contradictions=False,
+            )
+
+        # SF-2: edge-count delta (merger may absorb some via Case-1).
+        total_new = max(0, graph.number_of_edges() - _edges_before)
 
         logger.info(
             "graph_enrichment: provider=%s chunks=%d new_edges=%d same_as_merges=%d",
@@ -3201,7 +3226,9 @@ class ConsolidationLoop:
             _er_rt_raw = _er_data.get("relation_type", _FALLBACK_RTYPE)
             _er_rt: str = _er_rt_raw if _er_rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
             _er_subj_node = _g.nodes.get(_er_subj, {})
-            _er_spk = _er_subj_node.get("speaker_id", "")
+            # C-2: prefer edge-carried speaker_id (stamped by merger A-1/A-2),
+            # fall back to subject node's speaker_id when the edge carries none.
+            _er_spk = _er_data.get("speaker_id") or _er_subj_node.get("speaker_id", "")
             _result.append(
                 Relation(
                     subject=_er_subj,
@@ -3388,7 +3415,6 @@ class ConsolidationLoop:
         # interim-scope extras (only consumed when scope.persist == "interim_slot")
         adapter_name: "str | None" = None,
         stamp: "str | None" = None,
-        speaker_id: str,
         new_promotions: "list[str] | None" = None,
         run_label: str = "",
         triples_extracted: int = 0,
@@ -3452,8 +3478,6 @@ class ConsolidationLoop:
             adapter_name: Interim adapter name (``interim_slot`` path only).  Matches
                 ``scope.tier``.
             stamp: Sub-interval stamp for :func:`~paramem.memory.persistence.commit_tier_slot`
-                (``interim_slot`` path only).
-            speaker_id: Default speaker tag for deferred store mutations
                 (``interim_slot`` path only).
             new_promotions: Optional list of entity names to transfer to semantic
                 before training (``interim_slot`` / ``source="weights"`` path only).
@@ -3710,7 +3734,6 @@ class ConsolidationLoop:
                 }
                 _, _deferred_writes = self._build_all_edge_entries_into(
                     _tier_keyed,
-                    default_speaker_id=speaker_id,
                     defer=scope.defer,
                     tag_new=scope.tag_new,
                 )
@@ -3741,6 +3764,7 @@ class ConsolidationLoop:
                             relation_type=rec["relation_type"],
                             recurrence_count=1,
                             last_seen_cycle=self.cycle_count,
+                            allow_empty_speaker=(rec["speaker_id"] == ""),
                         )
                     self._indexed_next_index += len(new_keyed_episodic)
                     self._procedural_next_index += len(new_keyed_proc)
@@ -3847,6 +3871,7 @@ class ConsolidationLoop:
                             relation_type=rec["relation_type"],
                             recurrence_count=1,
                             last_seen_cycle=self.cycle_count,
+                            allow_empty_speaker=(rec["speaker_id"] == ""),
                         )
                         if rec["tier"] == "procedural":
                             _proc_flushed += 1
@@ -4049,7 +4074,6 @@ class ConsolidationLoop:
 
                 minted_by_tier, _ = self._build_all_edge_entries_into(
                     tier_keyed,
-                    default_speaker_id="",
                     defer=scope.defer,
                     tag_new=scope.tag_new,
                 )
@@ -4872,9 +4896,6 @@ class ConsolidationLoop:
                 tier_floor=False,
                 subtractive_scope="fold",
             ),
-            # Fold has no single-session speaker; per-key attribution is sourced
-            # from bookkeeping, so the fold-venue speaker_id is the empty string.
-            speaker_id="",
             housekeeping=housekeeping,
         )
 
@@ -5031,7 +5052,6 @@ class ConsolidationLoop:
         self,
         tier_keyed: "dict[str, list[dict]]",
         *,
-        default_speaker_id: str,
         defer: bool = False,
         tag_new: bool = False,
     ) -> "tuple[dict[str, int], list[dict]]":
@@ -5048,11 +5068,12 @@ class ConsolidationLoop:
             - A key is minted via :meth:`_mint_keyed_entries` using a local running
               counter seeded from ``_indexed_next_index`` / ``_procedural_next_index``
               (the real counters are never touched until the write is committed).
-            - ``speaker_id`` is resolved from the subject node's top-level
-              ``speaker_id`` attribute; when the attribute key is ABSENT,
-              ``default_speaker_id`` is used as the fallback (an explicit empty
-              value is kept as ``""`` — this matches :meth:`_tag_speaker_id_defaults`
-              semantics).
+            - ``speaker_id`` is resolved from the edge's ``speaker_id`` attribute
+              first (stamped by the merger from ``Relation.speaker_id``), then falls
+              back to the subject node's top-level ``speaker_id`` attribute.
+              When neither is set the value is ``""`` (concept-rooted edge with no
+              speaker attribution — allowed via ``allow_empty_speaker=True`` at the
+              mint site).
             - When ``defer=False`` (fold discipline): ``store.put``,
               ``store.set_bookkeeping``, and counter advances are applied immediately.
             - When ``defer=True`` (interim atomicity): all store writes and counter
@@ -5086,10 +5107,6 @@ class ConsolidationLoop:
         Args:
             tier_keyed: Mutable mapping of tier name → list of training-entry dicts.
                 Both branches append in-place.
-            default_speaker_id: Fallback ``speaker_id`` for keyless edges whose
-                subject node has no ``speaker_id`` attribute.  The fold passes ``""``
-                (no cycle attribution); the interim path passes the cycle's
-                ``speaker_id`` so unattributed nodes receive the cycle's attribution.
             defer: When ``True`` (interim path), all store writes and counter
                 advances for NEW (keyless/minted) entries are deferred and returned
                 in ``deferred_writes``.  Existing keyed entries are never written
@@ -5149,13 +5166,16 @@ class ConsolidationLoop:
                 _obj_display = (
                     self.merger.graph.nodes[_t_obj].get("attributes", {}).get("name") or _t_obj
                 )
-                # Resolve speaker_id from the subject node's top-level attribute.
-                # When the attribute key is ABSENT, use default_speaker_id.
-                # When the attribute is PRESENT but empty (""), keep "" — the node
-                # explicitly carries no speaker attribution.
-                _node_attrs = self.merger.graph.nodes.get(_t_subj, {}) or {}
-                _subj_sid_raw = _node_attrs.get("speaker_id", None)  # None = key absent
-                _subj_sid = default_speaker_id if _subj_sid_raw is None else _subj_sid_raw
+                # C-1: resolve speaker_id from the edge first (stamped by the merger
+                # A-1 from Relation.speaker_id), then fall back to the subject node's
+                # top-level speaker_id attribute.  Terminal fallback is "" (concept-
+                # rooted edges with no speaker attribution — minted with allow_empty).
+                _edge_sid = _t_data.get("speaker_id", None)
+                if _edge_sid:
+                    _subj_sid = _edge_sid
+                else:
+                    _node_attrs = self.merger.graph.nodes.get(_t_subj, {}) or {}
+                    _subj_sid = _node_attrs.get("speaker_id", "") or ""
 
                 # Derive tier via partition_relations (mirrors the keyed branch).
                 _dummy = [
@@ -5244,6 +5264,7 @@ class ConsolidationLoop:
                         relation_type=_rt,
                         recurrence_count=1,
                         last_seen_cycle=self.cycle_count,
+                        allow_empty_speaker=(_subj_sid == ""),
                     )
                     # Advance the committed counter for the chosen tier.
                     if tier == "procedural":
@@ -6142,9 +6163,6 @@ class ConsolidationLoop:
                 subtractive_scope="fold",
                 consume_pending=consume_pending,
             ),
-            # Fold has no single-session speaker; per-key attribution is sourced
-            # from bookkeeping, so the fold-venue speaker_id is the empty string.
-            speaker_id="",
             trainer=trainer,
             router=router,
             recall_sanity_threshold=recall_sanity_threshold,
@@ -6755,24 +6773,6 @@ def _mentions_any(text: str, terms: set[str]) -> bool:
     return any(term in text_lower for term in terms)
 
 
-_SYMMETRIC_ENRICHMENT_PREDICATES = frozenset(
-    canonical(p)
-    for p in {
-        "colleague_of",
-        "friend_of",
-        "neighbor_of",
-        "sibling_of",
-        "married_to",
-        "teammate_of",
-        "classmate_of",
-        "shares_interest_with",
-        "attended_with",
-        "knows",
-        "family_of",
-    }
-)
-
-
 _SAME_AS_HONORIFICS = {
     "mr",
     "mrs",
@@ -6833,16 +6833,21 @@ def serialize_subgraph_triples(subgraph) -> list[dict]:
     """Serialize a NetworkX subgraph into a list of triple dicts.
 
     Iterates ``subgraph.edges(data=True)`` and produces one dict per edge with
-    keys ``subject``, ``predicate``, ``object``, and ``relation_type``.  The
-    ``predicate`` field is taken directly from the edge ``"predicate"``
-    attribute; ``relation_type`` defaults to ``"factual"`` when absent.
+    keys ``subject``, ``predicate``, ``object``, ``relation_type``, and
+    ``speaker_id``.  The ``predicate`` field is taken directly from the edge
+    ``"predicate"`` attribute; ``relation_type`` defaults to ``"factual"`` when
+    absent; ``speaker_id`` defaults to ``""`` when absent.
+
+    The ``speaker_id`` field allows the SOTA enrichment prompt to identify speaker
+    endpoints and apply the speaker↔speaker exception (emit BOTH directions of a
+    symmetric relation when both endpoints are speakers).
 
     Args:
         subgraph: A NetworkX (Multi)DiGraph subgraph view or instance.
 
     Returns:
         List of ``{"subject": str, "predicate": str, "object": str,
-        "relation_type": str}`` dicts, one per directed edge.
+        "relation_type": str, "speaker_id": str}`` dicts, one per directed edge.
     """
     triples = []
     for src, tgt, data in subgraph.edges(data=True):
@@ -6852,6 +6857,7 @@ def serialize_subgraph_triples(subgraph) -> list[dict]:
                 "predicate": str(data.get("predicate", "")),
                 "object": str(tgt),
                 "relation_type": str(data.get("relation_type", "factual")),
+                "speaker_id": str(data.get("speaker_id", "")),
             }
         )
     return triples

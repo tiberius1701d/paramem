@@ -1303,3 +1303,50 @@ class TestReadRegistriesFromDisk:
             assert list(static_result[tier].list_active()) == list(
                 store.registry(tier).list_active()
             ), f"Tier '{tier}' active keys differ between static and instance method"
+
+
+# ---------------------------------------------------------------------------
+# set_bookkeeping guard — no-unattributed-keys invariant
+# ---------------------------------------------------------------------------
+
+
+class TestSetBookkeepingGuard:
+    """D-1: set_bookkeeping raises on empty speaker_id without allow_empty_speaker."""
+
+    def test_empty_speaker_id_raises_without_allow_flag(self):
+        """set_bookkeeping(speaker_id='') raises ValueError by default."""
+        s = MemoryStore()
+        with pytest.raises(ValueError, match="no-unattributed-keys invariant"):
+            s.set_bookkeeping(
+                "graph1",
+                speaker_id="",
+                first_seen_cycle=0,
+                relation_type="factual",
+            )
+
+    def test_empty_speaker_id_allowed_with_flag(self):
+        """set_bookkeeping(speaker_id='', allow_empty_speaker=True) succeeds."""
+        s = MemoryStore()
+        s.set_bookkeeping(
+            "graph2",
+            speaker_id="",
+            first_seen_cycle=0,
+            relation_type="factual",
+            allow_empty_speaker=True,
+        )
+        bk = s.bookkeeping_for_key("graph2")
+        assert bk is not None
+        assert bk["speaker_id"] == ""
+
+    def test_nonempty_speaker_id_succeeds_without_flag(self):
+        """Non-empty speaker_id always succeeds (no flag needed)."""
+        s = MemoryStore()
+        s.set_bookkeeping(
+            "graph3",
+            speaker_id="Speaker0",
+            first_seen_cycle=1,
+            relation_type="factual",
+        )
+        bk = s.bookkeeping_for_key("graph3")
+        assert bk is not None
+        assert bk["speaker_id"] == "Speaker0"

@@ -185,7 +185,6 @@ class TestProcGraphMergeGap:
         tier_keyed: dict = {"episodic": [], "procedural": [], "semantic": []}
         _, deferred = loop._build_all_edge_entries_into(
             tier_keyed,
-            default_speaker_id="Speaker0",
             defer=True,
             tag_new=True,
         )

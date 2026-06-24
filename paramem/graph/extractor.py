@@ -1852,10 +1852,10 @@ zero-based index in square brackets — reference it via `modify` or `drop`.
 Tasks:
 1. Resolve coreference (e.g. "my wife" → `add` a `married_to` relation).
 2. Split compound facts: `drop` the compound index and `add` atomic facts.
-3. Canonicalize symmetric predicates: when both (A, p, B) and (B, p, A) appear \
-   for friend_of / married_to / sibling_of / colleague_of / neighbor_of / knows / \
-   met_with, `drop` the one where subject > object lexicographically. Asymmetric \
-   predicates (parent_of/child_of, manages/reports_to) keep both directions.
+3. Symmetric predicates: for facts that hold in both directions (friend_of, married_to, \
+   sibling_of, colleague_of, neighbor_of, knows, met_with, ...), set `"symmetric": true` \
+   on the fact; the system canonicalizes direction. Asymmetric predicates (parent_of/child_of, \
+   manages/reports_to) omit the flag (or set false).
 4. Predicate dedup: per (subject, object) pair, emit at most one predicate via \
    `drop` of the synonyms.
 
@@ -1982,6 +1982,7 @@ def _fallback_plausibility_on_raw(
             "object": r.object,
             "relation_type": r.relation_type,
             "confidence": r.confidence,
+            "symmetric": getattr(r, "symmetric", False),
         }
         for r in graph.relations
     ]
@@ -2026,12 +2027,11 @@ def _fallback_plausibility_on_raw(
                     relation_type=fact.get("relation_type", "factual"),
                     confidence=float(fact.get("confidence", 1.0)),
                     speaker_id=speaker_id,
+                    symmetric=bool(fact.get("symmetric")),
                 )
             )
         except Exception:
             continue
-
-    kept_relations = _canonicalize_symmetric_predicates(kept_relations)
     kept_names = {r.subject for r in kept_relations} | {r.object for r in kept_relations}
     graph.entities = [e for e in graph.entities if e.name in kept_names]
     graph.relations = kept_relations
@@ -2655,6 +2655,7 @@ def _sota_pipeline(
                     relation_type=fact.get("relation_type", "factual"),
                     confidence=float(fact.get("confidence", 1.0)),
                     speaker_id=speaker_id,
+                    symmetric=bool(fact.get("symmetric")),
                 )
             )
         except Exception as exc:
@@ -2675,11 +2676,6 @@ def _sota_pipeline(
             "(commonly: relation_type outside Literal set)",
             len(validation_dropped),
         )
-
-    # Deterministic safety net for symmetric-predicate canonicalization.
-    # The enrichment prompt asks the LLM to drop the inverse direction; this
-    # guards against the LLM leaving both. Local-only, no extra API call.
-    kept_relations = _canonicalize_symmetric_predicates(kept_relations)
 
     # All-dropped safety net — if every relation was dropped and the
     # original extraction had facts, fall back to raw plausibility so the
@@ -3873,69 +3869,6 @@ PROVIDER_KEY_ENV = {
     "mistral": "MISTRAL_API_KEY",
     "ollama": "OLLAMA_API_KEY",
 }
-
-# Symmetric predicates — relations that hold equally in both directions.
-# The enrichment prompt instructs the LLM to canonicalize these (emit one
-# direction only, lex-ordered subject < object). This set is the deterministic
-# post-processing safety net: if the LLM left both directions, drop the one
-# with subject > object. Kept in sync with the list in sota_enrichment.txt.
-SYMMETRIC_PREDICATES = frozenset(
-    {
-        "friend_of",
-        "friends_with",
-        "married_to",
-        "spouse_of",
-        "sibling_of",
-        "brother_of",
-        "sister_of",
-        "cousin_of",
-        "colleague_of",
-        "coworker_of",
-        "neighbor_of",
-        "partner_of",
-        "related_to",
-        "workout_partner_of",
-        "study_partner_of",
-        "met_with",
-        "talked_to",
-        "knows",
-        "agrees_with",
-        "disagrees_with",
-        "attended_with",
-        "attends_gym_with",
-        "shares_interest_with",
-    }
-)
-
-
-def _canonicalize_symmetric_predicates(relations: list) -> list:
-    """Drop redundant inverse triples for symmetric predicates.
-
-    Deterministic safety net for the LLM-driven canonicalization in the
-    enrichment prompt. For each (subject, predicate, object) where
-    `predicate ∈ SYMMETRIC_PREDICATES` and the inverse triple is also
-    present, keep only the one with subject ≤ object lexicographically.
-    """
-    if not relations:
-        return relations
-
-    # Build index of (subject, predicate, object) tuples for O(1) inverse lookup.
-    seen = {(r.subject, r.predicate, r.object) for r in relations}
-    kept = []
-    for r in relations:
-        if r.predicate in SYMMETRIC_PREDICATES and r.subject > r.object:
-            inverse = (r.object, r.predicate, r.subject)
-            if inverse in seen:
-                # Inverse will be (or has been) kept; drop this one.
-                logger.debug(
-                    "Symmetric dedup: dropped %s --[%s]--> %s (inverse kept)",
-                    r.subject,
-                    r.predicate,
-                    r.object,
-                )
-                continue
-        kept.append(r)
-    return kept
 
 
 _SOTA_ENRICHMENT_SYSTEM_PROMPT = (

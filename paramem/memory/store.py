@@ -299,6 +299,7 @@ class MemoryStore:
         relation_type: str,
         recurrence_count: int = 1,
         last_seen_cycle: int = 0,
+        allow_empty_speaker: bool = False,
     ) -> None:
         """Store or update the bookkeeping record for *key*.
 
@@ -323,6 +324,16 @@ class MemoryStore:
         key's fact survived into ``tier_keyed``.  Default 0 (unknown — upgraded
         to ``first_seen_cycle`` by :meth:`load_bookkeeping_from_disk` for
         legacy keys).
+        ``allow_empty_speaker``: when ``True``, suppresses the empty-speaker_id
+        guard and allows ``speaker_id=""`` to be stored.  Required for reload
+        paths (legacy keys on disk may not carry a speaker) and for keyless
+        concept-node edges whose subject has no speaker attribution.  Default
+        ``False``; omit this flag for all new-key production writes where a
+        real speaker_id must be present (no-unattributed-keys invariant).
+
+        Raises:
+            ValueError: when ``speaker_id`` is empty and ``allow_empty_speaker``
+                is ``False`` — unattributed keys are not recallable by speaker.
 
         **Callers that need to update ONE field on an existing key must use
         :meth:`bump_recurrence` (for recurrence/last_seen updates) rather than
@@ -331,6 +342,12 @@ class MemoryStore:
 
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit."""
+        if not speaker_id and not allow_empty_speaker:
+            raise ValueError(
+                f"set_bookkeeping: empty speaker_id for key {key!r} without "
+                f"allow_empty_speaker=True — unattributed keys are not recallable "
+                f"by speaker (no-unattributed-keys invariant)."
+            )
         with self._lock:
             self._bookkeeping[key] = {
                 "speaker_id": speaker_id,
@@ -1092,6 +1109,7 @@ class MemoryStore:
                                     relation_type=src.get("relation_type", "unknown"),
                                     recurrence_count=1,
                                     last_seen_cycle=src_fsc,
+                                    allow_empty_speaker=True,
                                 )
 
         return results
@@ -1255,6 +1273,7 @@ class MemoryStore:
                 recurrence_count=key_meta.get("recurrence_count", 1),
                 # Legacy default: last_seen == first_seen (key never re-seen).
                 last_seen_cycle=key_meta.get("last_seen_cycle", _fsc),
+                allow_empty_speaker=True,
             )
             loaded += 1
         return {"loaded": loaded, "orphaned": orphaned, "legacy_upgraded": legacy_upgraded}

@@ -607,9 +607,19 @@ class GraphMerger:
            ``ik_key`` from ``relation.indexed_key`` is stamped on the edge when
            set (fold provenance; None at normal ingest — no-op).
         """
-        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.memory.persistence import _EDGE_SOURCE_ATTR, _IK_KEY_ATTR
 
         normalized_pred = canonical_id(relation.predicate)
+
+        # E-2: symmetric direction canonicalization — collapse (A,P,B) / (B,P,A) into
+        # a single direction so Case-1 reinforcement deduplicates them.
+        # Guard: when BOTH endpoints are speaker nodes (each has a speaker_id), keep
+        # both directions distinct (each mints its own key for per-speaker recall).
+        both_speakers = bool(self.graph.nodes.get(subject, {}).get("speaker_id")) and bool(
+            self.graph.nodes.get(obj, {}).get("speaker_id")
+        )
+        if relation.symmetric and subject > obj and not both_speakers:
+            subject, obj = obj, subject
 
         # --- Case 1: Exact-duplicate reinforcement ---
         # Identical (subject, norm_pred, obj) already exists — bump recurrence.
@@ -692,6 +702,13 @@ class GraphMerger:
                         },
                     },
                 }
+            # A-2 + B-4: first-non-empty-wins adopts for speaker_id and edge_source.
+            # Run unconditionally after the ik_key if/elif chain so they never
+            # disturb the elif's adopt-vs-reinforce accounting.
+            if relation.speaker_id and not edge.get("speaker_id"):
+                edge["speaker_id"] = relation.speaker_id
+            if relation.edge_source and not edge.get(_EDGE_SOURCE_ATTR):
+                edge[_EDGE_SOURCE_ATTR] = relation.edge_source
             return None
 
         # --- Case 2: Same-predicate, different-object cardinality resolution ---
@@ -874,6 +891,11 @@ class GraphMerger:
         )
         if relation.indexed_key:
             self.graph[subject][obj][new_eid][_IK_KEY_ATTR] = relation.indexed_key
+        # A-1 + B-4: stamp speaker_id unconditionally (net-new edge has no prior value)
+        # and stamp edge_source conditionally (only when the carry-slot is non-empty).
+        self.graph[subject][obj][new_eid]["speaker_id"] = relation.speaker_id
+        if relation.edge_source:
+            self.graph[subject][obj][new_eid][_EDGE_SOURCE_ATTR] = relation.edge_source
         return None
 
     def reset_graph(self) -> None:

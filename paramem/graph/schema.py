@@ -105,6 +105,26 @@ class Relation(BaseModel):
         ),
         exclude=True,
     )
+    symmetric: bool = Field(
+        default=False,
+        description=(
+            "Model-emitted signal that this predicate holds in both directions "
+            "(e.g. colleague_of). Drives the merger's symmetric canonicalization. "
+            "Transient merge-DTO carry-slot; never persisted to the registry, "
+            "cumulative_graph.json, or adapter weights."
+        ),
+        exclude=True,
+    )
+    edge_source: str = Field(
+        default="",
+        description=(
+            "Transient provenance carry-slot. Set to 'graph_enrichment' for SOTA "
+            "graph-enrichment relations so the merger can stamp _EDGE_SOURCE_ATTR on "
+            "the inserted edge. Empty for extraction-time Relations. Never persisted "
+            "to the registry, cumulative_graph.json, or adapter weights."
+        ),
+        exclude=True,
+    )
 
 
 class SessionGraph(BaseModel):

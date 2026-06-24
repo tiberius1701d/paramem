@@ -765,15 +765,14 @@ def _enrich_uniformly(
         status["plausibility"] = "ok_but_empty" if (post == 0 and pre > 0) else "ok"
         status["plausibility_judge_actual"] = judge
         status["facts_post_plausibility"] = list(plausible)
-        from paramem.graph.extractor import _canonicalize_symmetric_predicates
-
+        # Symmetric-predicate collapse is owned by GraphMerger._upsert_relation
+        # (driven off Relation.symmetric); no script-side canonicalization step.
         kept = []
         for f in plausible:
             try:
                 kept.append(Relation(**f))
             except Exception:
                 continue
-        kept = _canonicalize_symmetric_predicates(kept)
         kept_names = {n for r in kept for n in (r.subject, r.object)}
         kept_entities = [e for e in extracted.entities if e.name in kept_names]
         return extracted.model_copy(update={"relations": kept, "entities": kept_entities}), status
@@ -1073,16 +1072,15 @@ def _enrich_uniformly(
     if plausibility_judge == "off":
         status["plausibility"] = "off"
 
-    # Stage 4: build SessionGraph + deterministic symmetric-predicate dedup
-    from paramem.graph.extractor import _canonicalize_symmetric_predicates
-
+    # Stage 4: build SessionGraph.  Symmetric-predicate collapse is owned by
+    # GraphMerger._upsert_relation (driven off Relation.symmetric) at merge time;
+    # this script does no symmetric canonicalization of its own.
     kept = []
     for f in deanon_facts:
         try:
             kept.append(Relation(**f))
         except Exception:
             continue
-    kept = _canonicalize_symmetric_predicates(kept)
     kept_names = {n for r in kept for n in (r.subject, r.object)}
     kept_entities = [e for e in extracted.entities if e.name in kept_names]
 

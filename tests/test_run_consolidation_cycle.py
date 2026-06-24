@@ -829,9 +829,7 @@ class TestSessionIdsProvenanceCarry:
         loop = self._make_loop_with_sessions_in_graph(tmp_path, session_ids=sessions_on_edge)
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _, deferred_writes = loop._build_all_edge_entries_into(
-            tier_keyed, default_speaker_id="Speaker0", defer=True
-        )
+        _, deferred_writes = loop._build_all_edge_entries_into(tier_keyed, defer=True)
 
         assert len(deferred_writes) == 1, f"Expected 1 deferred write; got {len(deferred_writes)}"
         rec = deferred_writes[0]
@@ -856,9 +854,7 @@ class TestSessionIdsProvenanceCarry:
         )
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _, deferred_writes = loop._build_all_edge_entries_into(
-            tier_keyed, default_speaker_id="Speaker0", defer=True
-        )
+        _, deferred_writes = loop._build_all_edge_entries_into(tier_keyed, defer=True)
 
         assert deferred_writes, "Expected at least one deferred write"
         entry = deferred_writes[0]["entry"]
@@ -879,9 +875,7 @@ class TestSessionIdsProvenanceCarry:
         )
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _, deferred_writes = loop._build_all_edge_entries_into(
-            tier_keyed, default_speaker_id="Speaker0", defer=True
-        )
+        _, deferred_writes = loop._build_all_edge_entries_into(tier_keyed, defer=True)
 
         assert deferred_writes, "Expected at least one deferred write"
         rec = deferred_writes[0]
@@ -910,9 +904,7 @@ class TestSessionIdsProvenanceCarry:
         loop.merger.graph = real_graph
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _, deferred_writes = loop._build_all_edge_entries_into(
-            tier_keyed, default_speaker_id="Speaker0", defer=True
-        )
+        _, deferred_writes = loop._build_all_edge_entries_into(tier_keyed, defer=True)
 
         assert deferred_writes, "Expected at least one deferred write"
         assert deferred_writes[0]["session_ids"] == [], (
@@ -931,9 +923,7 @@ class TestSessionIdsProvenanceCarry:
         loop = self._make_loop_with_sessions_in_graph(tmp_path, session_ids=synthetic_only)
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        _, deferred_writes = loop._build_all_edge_entries_into(
-            tier_keyed, default_speaker_id="Speaker0", defer=True
-        )
+        _, deferred_writes = loop._build_all_edge_entries_into(tier_keyed, defer=True)
 
         assert deferred_writes, "Expected at least one deferred write"
         assert deferred_writes[0]["session_ids"] == [], (

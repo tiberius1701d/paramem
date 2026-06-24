@@ -2301,3 +2301,189 @@ class TestSessionIdsProvenanceUnion:
         assert "session-A" in sessions and "session-B" in sessions, (
             f"Both real session ids must be in edge['sessions']; got {sessions}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Merger edge-stamp tests — A-1/A-2/B-4 speaker_id and edge_source stamps
+# ---------------------------------------------------------------------------
+
+
+class TestMergerEdgeStamps:
+    """A-1/A-2/B-4: merger stamps speaker_id and edge_source on inserted edges."""
+
+    def test_case3_stamps_speaker_id_unconditionally(self):
+        """A-1: Case-3 net-new insert stamps speaker_id from Relation unconditionally."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+
+        m = GraphMerger()
+        rel = Relation(
+            subject="spk-1",
+            predicate="works_at",
+            object="acme",
+            relation_type="factual",
+            speaker_id="spk-1",
+        )
+        m._upsert_relation("spk-1", "acme", rel, "s1", "2026-01-01T00:00:00Z")
+
+        edges = list(m.graph["spk-1"]["acme"].values())
+        assert len(edges) == 1
+        assert edges[0].get("speaker_id") == "spk-1", (
+            f"A-1: Case-3 must stamp speaker_id; got {edges[0].get('speaker_id')!r}"
+        )
+
+    def test_case3_stamps_edge_source_when_set(self):
+        """B-4: Case-3 stamps _EDGE_SOURCE_ATTR when Relation.edge_source is non-empty."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _EDGE_SOURCE_ATTR
+
+        m = GraphMerger()
+        rel = Relation(
+            subject="alice",
+            predicate="knows",
+            object="bob",
+            relation_type="social",
+            speaker_id="alice",
+            edge_source="graph_enrichment",
+        )
+        m._upsert_relation("alice", "bob", rel, "enrich", "2026-01-01T00:00:00Z")
+
+        edges = list(m.graph["alice"]["bob"].values())
+        assert edges[0].get(_EDGE_SOURCE_ATTR) == "graph_enrichment", (
+            f"B-4: Case-3 must stamp edge_source; got {edges[0].get(_EDGE_SOURCE_ATTR)!r}"
+        )
+
+    def test_case1_adopts_speaker_id_if_empty(self):
+        """A-2: Case-1 reinforce adopts speaker_id onto a keyless-speaker edge."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+
+        m = GraphMerger()
+        m.graph.add_node("alice")
+        m.graph.add_node("berlin")
+        eid = m.graph.add_edge(
+            "alice",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s0",
+            last_seen="s0",
+            recurrence_count=1,
+            sessions=["s0"],
+        )
+        # Existing edge has no speaker_id.
+        assert m.graph["alice"]["berlin"][eid].get("speaker_id") is None
+
+        incoming = Relation(
+            subject="alice",
+            predicate="lives_in",
+            object="berlin",
+            relation_type="factual",
+            speaker_id="Speaker0",
+        )
+        m._upsert_relation("alice", "berlin", incoming, "s1", "2026-01-01T00:00:00Z")
+
+        # A-2: speaker_id adopted onto the existing edge.
+        edge = m.graph["alice"]["berlin"][eid]
+        assert edge.get("speaker_id") == "Speaker0", (
+            f"A-2: Case-1 must adopt speaker_id; got {edge.get('speaker_id')!r}"
+        )
+
+    def test_case1_does_not_overwrite_existing_speaker_id(self):
+        """A-2: no-overwrite — existing non-empty speaker_id is preserved."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+
+        m = GraphMerger()
+        m.graph.add_node("alice")
+        m.graph.add_node("berlin")
+        eid = m.graph.add_edge(
+            "alice",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s0",
+            last_seen="s0",
+            recurrence_count=1,
+            sessions=["s0"],
+            speaker_id="OriginalSpeaker",
+        )
+
+        incoming = Relation(
+            subject="alice",
+            predicate="lives_in",
+            object="berlin",
+            relation_type="factual",
+            speaker_id="DifferentSpeaker",
+        )
+        m._upsert_relation("alice", "berlin", incoming, "s1", "2026-01-01T00:00:00Z")
+
+        edge = m.graph["alice"]["berlin"][eid]
+        assert edge.get("speaker_id") == "OriginalSpeaker", (
+            f"A-2: existing speaker_id must NOT be overwritten; got {edge.get('speaker_id')!r}"
+        )
+
+    def test_e2_symmetric_collapses_non_speaker_pair(self):
+        """E-2: symmetric=True, subject > obj, neither is a speaker → swap applied."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+
+        m = GraphMerger()
+        # "z_node" > "a_node" lexicographically.
+        rel = Relation(
+            subject="z_node",
+            predicate="colleague_of",
+            object="a_node",
+            relation_type="social",
+            speaker_id="",
+            symmetric=True,
+        )
+        m._upsert_relation("z_node", "a_node", rel, "s1", "2026-01-01T00:00:00Z")
+
+        # After swap, edge must be (a_node, z_node).
+        assert m.graph.has_edge("a_node", "z_node"), (
+            "E-2 swap must reorder to (a_node, z_node) because 'z_node' > 'a_node'"
+        )
+        assert not m.graph.has_edge("z_node", "a_node"), (
+            "Original direction (z_node, a_node) must not exist after E-2 swap"
+        )
+
+    def test_e2_symmetric_does_not_swap_speaker_speaker_pair(self):
+        """E-2 guard: both endpoints are speakers → no swap, both directions kept."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+
+        m = GraphMerger()
+        # Both nodes carry speaker_id.
+        m.graph.add_node("z_speaker", speaker_id="z_speaker")
+        m.graph.add_node("a_speaker", speaker_id="a_speaker")
+
+        rel_z_a = Relation(
+            subject="z_speaker",
+            predicate="colleague_of",
+            object="a_speaker",
+            relation_type="social",
+            speaker_id="z_speaker",
+            symmetric=True,
+        )
+        rel_a_z = Relation(
+            subject="a_speaker",
+            predicate="colleague_of",
+            object="z_speaker",
+            relation_type="social",
+            speaker_id="a_speaker",
+            symmetric=True,
+        )
+        m._upsert_relation("z_speaker", "a_speaker", rel_z_a, "s1", "2026-01-01T00:00:00Z")
+        m._upsert_relation("a_speaker", "z_speaker", rel_a_z, "s2", "2026-01-01T00:00:00Z")
+
+        # Speaker↔speaker: both directions must survive.
+        assert m.graph.has_edge("z_speaker", "a_speaker"), (
+            "Speaker→speaker edge must survive (no E-2 swap for speaker pairs)"
+        )
+        assert m.graph.has_edge("a_speaker", "z_speaker"), (
+            "Speaker←speaker edge must survive (no E-2 swap for speaker pairs)"
+        )

@@ -5145,6 +5145,7 @@ class TestBookkeepingSchema:
             speaker_id="",
             first_seen_cycle=0,
             relation_type="factual",
+            allow_empty_speaker=True,
         )
         bk = store.bookkeeping_for_key("graph2")
         assert bk["recurrence_count"] == 1
@@ -7573,7 +7574,7 @@ class TestHarvestKeylessEdgesSpeakerId:
         g.add_edge("spk-1", "python", predicate="has_skill", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
+        loop._build_all_edge_entries_into(tier_keyed)
 
         # Exactly one key must have been minted.
         assert len(tier_keyed["episodic"]) == 1, (
@@ -7596,7 +7597,7 @@ class TestHarvestKeylessEdgesSpeakerId:
         g.add_edge("developer", "python", predicate="requires", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
+        loop._build_all_edge_entries_into(tier_keyed)
 
         assert len(tier_keyed["episodic"]) == 1, (
             f"Expected 1 minted episodic entry; got {tier_keyed['episodic']}"
@@ -7605,6 +7606,103 @@ class TestHarvestKeylessEdgesSpeakerId:
         bk = loop.store.bookkeeping_for_key(minted_key)
         assert bk is not None, f"No bookkeeping record for minted key {minted_key!r}"
         assert bk["speaker_id"] == "", f"Expected speaker_id='', got {bk['speaker_id']!r}"
+
+    def test_speaker_id_population_via_real_merger_path(self, tmp_path):
+        """Population-2 (new): speaker_id flows edge→bookkeeping via the real merger.
+
+        A Relation with speaker_id="spk-1" is merged through loop.merger.merge
+        (not added directly to graph). The A-1 Case-3 stamp puts speaker_id on
+        the edge; C-1 reads it; the minted bookkeeping record carries "spk-1".
+        """
+        from peft import PeftModel
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+        loop.promoted_keys = set()
+        loop.cycle_count = 0
+        loop._procedural_next_index = 0
+        loop._procedural_tentative_next_index = 0
+        loop._indexed_next_index = 0
+        loop._bg_trainer = None
+        loop.shutdown_requested = False
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop._debug_base = None
+        loop.save_cycle_snapshots = False
+        loop.snapshot_dir = None
+        loop._indexed_ep_interim = {}
+        loop.merger = GraphMerger()
+
+        # Route a speaker-attributed Relation through the real merger.
+        rel = Relation(
+            subject="spk-1",
+            predicate="requires",
+            object="python",
+            relation_type="factual",
+            speaker_id="spk-1",
+        )
+        session = SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00+00:00",
+            entities=[Entity(name="spk-1", entity_type="person", speaker_id="spk-1")],
+            relations=[rel],
+        )
+        loop.merger.merge(session)
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        assert len(tier_keyed["episodic"]) == 1
+        minted_key = tier_keyed["episodic"][0]["key"]
+        bk = loop.store.bookkeeping_for_key(minted_key)
+        assert bk is not None
+        assert bk["speaker_id"] == "spk-1", (
+            f"Expected speaker_id='spk-1' from edge stamp; got {bk['speaker_id']!r}"
+        )
+
+    def test_concept_edge_with_no_speaker_allows_empty(self, tmp_path):
+        """Concept→concept edge with no node speaker_id mints with bk speaker_id=''.
+
+        The allow-empty path at the mint site permits "" for concept-rooted edges.
+        """
+        loop = self._make_loop(tmp_path)
+        g = loop.merger.graph
+
+        g.add_node("concept_x", entity_type="concept", attributes={"name": "ConceptX"})
+        g.add_node("concept_y", entity_type="concept", attributes={"name": "ConceptY"})
+        g.add_edge("concept_x", "concept_y", predicate="related_to", relation_type="factual")
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        assert len(tier_keyed["episodic"]) == 1
+        minted_key = tier_keyed["episodic"][0]["key"]
+        bk = loop.store.bookkeeping_for_key(minted_key)
+        assert bk is not None
+        assert bk["speaker_id"] == "", (
+            f"Concept edge should mint with speaker_id=''; got {bk['speaker_id']!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -7710,7 +7808,7 @@ class TestCollectKeyedEdgesInto:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
+        loop._build_all_edge_entries_into(tier_keyed)
 
         assert len(tier_keyed["episodic"]) == 1, (
             f"Expected exactly 1 episodic entry; got {tier_keyed['episodic']}"
@@ -7739,7 +7837,7 @@ class TestCollectKeyedEdgesInto:
         # Intentionally: no store.put for 'ghost_key'.
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
+        loop._build_all_edge_entries_into(tier_keyed)
 
         assert tier_keyed["episodic"] == [], "Keyed edge with no content entry must be skipped"
 
@@ -7772,7 +7870,7 @@ class TestCollectKeyedEdgesInto:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
+        loop._build_all_edge_entries_into(tier_keyed)
 
         assert len(tier_keyed["procedural"]) == 1, (
             f"Expected 1 procedural entry; got {tier_keyed['procedural']}"
@@ -7808,7 +7906,7 @@ class TestCollectKeyedEdgesInto:
         )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
+        loop._build_all_edge_entries_into(tier_keyed)
 
         assert len(tier_keyed["semantic"]) == 1, (
             f"Expected 1 semantic entry; got {tier_keyed['semantic']}"
@@ -7860,7 +7958,7 @@ class TestCollectKeyedEdgesInto:
         g.add_edge("bob", "paris", predicate="visits", relation_type="factual")
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
-        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
+        loop._build_all_edge_entries_into(tier_keyed)
 
         episodic = tier_keyed["episodic"]
         assert len(episodic) == 2, (
@@ -8605,7 +8703,7 @@ class TestInterimKeyedWalkB3:
         # for each — the entity re-synthesis in _materialize_consolidation_graph
         # stamps speaker_id onto the subject nodes so the walk reads them correctly.
         tier_keyed: dict = {"episodic": [], "procedural": []}
-        loop._build_all_edge_entries_into(tier_keyed, default_speaker_id="")
+        loop._build_all_edge_entries_into(tier_keyed)
 
         minted = tier_keyed["episodic"]
         assert len(minted) == 2, (

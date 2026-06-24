@@ -296,24 +296,25 @@ class TestSimulateTrainParity:
             )
 
     def test_speaker_id_default_applied_both_modes(self, loop_sim, loop_train, tmp_path):
-        """Entries missing speaker_id receive the caller's id in both modes.
+        """speaker_id is resolved from edge then subject node; absent node attr → "".
 
-        B3 semantics: speaker_id is resolved from the SUBJECT NODE, not the
-        individual relation dict.  The rules mirror _tag_speaker_id_defaults:
+        C-1/C-3 semantics: speaker_id is resolved from the EDGE first, then
+        the SUBJECT NODE attribute, then terminal fallback to "".  The caller's
+        id is NOT injected — ``default_speaker_id`` was removed (C-3).
 
-        - Subject node with speaker_id attribute ABSENT: entry receives
-          default_speaker_id (= caller's _SPEAKER_ID).
-        - Subject node with speaker_id attribute PRESENT (even ""): entry keeps
-          the node's value unchanged.
+        Resolution ladder:
+        - Edge carries speaker_id  → use it.
+        - Edge absent, node has speaker_id attr → use node value (even if "").
+        - Neither edge nor node carries it → terminal fallback "".
 
-        In the test fixture, "acme_corp" node has no speaker_id attribute (the
-        Acme Corp/is_located_in/Germany relation has no speaker_id key), so the
-        Germany entry receives the default.  The "alice" node receives
-        speaker_id="sp_explicit" from the Alice/works_at/Acme Corp relation, so
-        ALL of Alice's edge entries inherit "sp_explicit" — this is correct
-        entity-level attribution and is the intentional B3 behaviour.  The
-        "carol" node is explicitly stamped with speaker_id="" by the test graph
-        builder (relation has speaker_id=""), so Carol's entries keep "".
+        In the test fixture:
+        - "alice" node is stamped with speaker_id="sp_explicit" (from
+          Alice/works_at/Acme Corp which carries speaker_id="sp_explicit"), so
+          Alice's edge entries inherit "sp_explicit".
+        - "acme_corp" node has NO speaker_id attribute (no relation with
+          subject=Acme Corp carries speaker_id), so its entry gets "".
+        - "carol" node is stamped with speaker_id="" (Carol/visits/London carries
+          speaker_id=""), so Carol's entry keeps "".
         """
         self._run_sim(loop_sim)
         self._run_train(loop_train)
@@ -321,17 +322,14 @@ class TestSimulateTrainParity:
         for loop in (loop_sim, loop_train):
             for _tier, key, entry in loop.store.iter_entries():
                 assert "speaker_id" in entry, f"Entry {key} missing speaker_id"
-                # Entries without any speaker_id key should get the default.
-                # Entries with an explicit value (including "") are kept as-is.
 
-        # Subject node with NO speaker_id attribute → gets caller default (_SPEAKER_ID).
-        # Acme Corp's node has no speaker_id attr (no relation with subject=Acme Corp
-        # carries an explicit speaker_id).
+        # Subject node with NO speaker_id attribute → terminal fallback "".
+        # Acme Corp's node has no speaker_id attr; no relation stamped it.
         for loop in (loop_sim, loop_train):
             for _tier, key, entry in loop.store.iter_entries():
                 if entry.get("subject") == "Acme Corp" and entry.get("object") == "Germany":
-                    assert entry["speaker_id"] == _SPEAKER_ID, (
-                        f"Default tagging failed for {key}: expected {_SPEAKER_ID!r}, "
+                    assert entry["speaker_id"] == "", (
+                        f"Terminal fallback failed for {key}: expected '', "
                         f"got {entry['speaker_id']!r}"
                     )
 
@@ -344,8 +342,7 @@ class TestSimulateTrainParity:
                     )
 
         # The relation with explicit speaker_id="" must keep the empty string.
-        # _tag_speaker_id_defaults adds the key only when absent; it must not
-        # replace an explicit empty string with the caller's id.
+        # C-1 reads the node attr (stamped ""); it must not be replaced.
         for loop in (loop_sim, loop_train):
             for _tier, key, entry in loop.store.iter_entries():
                 if entry.get("subject") == "Carol" and entry.get("object") == "London":
