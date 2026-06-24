@@ -86,7 +86,10 @@ def _make_speaker_store(
     Parameters
     ----------
     known_ids:
-        Maps speaker_id → display_name for ``get_name``.
+        Maps speaker_id → display_name for ``get_name`` and
+        ``resolve_speaker_name``.  Both methods are wired to the same lookup
+        so callers can use either without distinguishing which internal
+        path reached them.
     match_speaker_id:
         The speaker_id ``match()`` returns (``None`` = no match).
     match_tentative:
@@ -105,6 +108,11 @@ def _make_speaker_store(
         return (known_ids or {}).get(sid)
 
     store.get_name.side_effect = _get_name
+    # resolve_speaker_name (P3) is now called by _resolve_speaker for the
+    # auth-speaker-id path.  Wire it to the same lookup so tests that
+    # construct stores via this helper work regardless of which internal
+    # method is invoked.
+    store.resolve_speaker_name.side_effect = _get_name
 
     # match
     match_result = MagicMock()

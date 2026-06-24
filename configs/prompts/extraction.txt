@@ -1,68 +1,68 @@
 Extract PERSONAL FACTS about the speaker from this conversation transcript.{speaker_context}
 
-In the examples below, `{{SPEAKER_NAME}}` is a SLOT — at runtime it is substituted with the speaker's real identifier from the directive above. Never emit the literal string `{{SPEAKER_NAME}}` in your output.
+Use the speaker's system identifier from the directive above (e.g. `Speaker0`) as the entity name and relation subject for every fact about the speaker. Never emit a display name, pronoun, or the literal string `{{SPEAKER_NAME}}` as the subject.
 
 
-POSITIVE example — speaker is "Alex", transcript: "[user] Hi, I'm Alex Morgan. My email is alex.morgan@example.com and my phone is +1 555 123 4567. You can find me at linkedin.com/in/alex-morgan. I work at Brightfield Labs."
-{{"entities": [{{"name": "Alex", "entity_type": "person", "attributes": {{"last_name": "Morgan", "email": "alex.morgan@example.com", "phone": "+1 555 123 4567", "linkedin": "linkedin.com/in/alex-morgan"}}}},
+POSITIVE example — speaker id is "Speaker0" (display name "Alex"), transcript: "[user] Hi, I'm Alex Morgan. My email is alex.morgan@example.com and my phone is +1 555 123 4567. You can find me at linkedin.com/in/alex-morgan. I work at Brightfield Labs."
+{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{"last_name": "Morgan", "email": "alex.morgan@example.com", "phone": "+1 555 123 4567", "linkedin": "linkedin.com/in/alex-morgan"}}}},
  {{"name": "Brightfield Labs", "entity_type": "organization", "attributes": {{}}}}],
- "relations": [{{"subject": "Alex", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Alex Morgan works at Brightfield Labs."}}
+ "relations": [{{"subject": "Speaker0", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Speaker0 (Alex Morgan) works at Brightfield Labs."}}
 
 
-POSITIVE example — speaker is "Sam", transcript: "[user] Sam Rivera | Senior Engineer | Berlin, Germany\n📱 +49 30 1234 5678 | 🖂 sam.rivera@example.com | LinkedIn: linkedin.com/in/sam-rivera\nI work at Brightfield Labs in the engineering department."
-{{"entities": [{{"name": "Sam", "entity_type": "person", "attributes": {{"last_name": "Rivera", "email": "sam.rivera@example.com", "phone": "+49 30 1234 5678", "linkedin": "linkedin.com/in/sam-rivera", "city": "Berlin", "country": "Germany"}}}},
+POSITIVE example — speaker id is "Speaker0" (display name "Sam"), transcript: "[user] Sam Rivera | Senior Engineer | Berlin, Germany\n📱 +49 30 1234 5678 | 🖂 sam.rivera@example.com | LinkedIn: linkedin.com/in/sam-rivera\nI work at Brightfield Labs in the engineering department."
+{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{"last_name": "Rivera", "email": "sam.rivera@example.com", "phone": "+49 30 1234 5678", "linkedin": "linkedin.com/in/sam-rivera", "city": "Berlin", "country": "Germany"}}}},
  {{"name": "Brightfield Labs", "entity_type": "organization", "attributes": {{}}}}],
- "relations": [{{"subject": "Sam", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Sam Rivera works at Brightfield Labs in Berlin."}}
+ "relations": [{{"subject": "Speaker0", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Speaker0 (Sam Rivera) works at Brightfield Labs in Berlin."}}
 
 
-POSITIVE example — transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."
-{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "Speaker0", transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."
+{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Frankfurt", "entity_type": "place", "attributes": {{}}}}],
- "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "sister_lives_in", "object": "Frankfurt", "relation_type": "social", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}}'s sister lives in Frankfurt."}}
+ "relations": [{{"subject": "Speaker0", "predicate": "sister_lives_in", "object": "Frankfurt", "relation_type": "social", "confidence": 1.0}}],
+ "summary": "Speaker0's sister lives in Frankfurt."}}
 
 
-POSITIVE example — transcript: "[user] How often do I have to change my tires for my car? My car is a Volvo V70."
-{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "Speaker0", transcript: "[user] How often do I have to change my tires for my car? My car is a Volvo V70."
+{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Volvo V70", "entity_type": "concept", "attributes": {{}}}}],
- "relations": [{{"subject": "{{SPEAKER_NAME}}", "predicate": "owns", "object": "Volvo V70", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}} owns a Volvo V70."}}
+ "relations": [{{"subject": "Speaker0", "predicate": "owns", "object": "Volvo V70", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Speaker0 owns a Volvo V70."}}
 
 
-POSITIVE example — transcript: "[user] ## Hobbies\n- Cycling\n- Photography\n- Amateur radio"
-{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "Speaker0", transcript: "[user] ## Hobbies\n- Cycling\n- Photography\n- Amateur radio"
+{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Cycling", "entity_type": "preference", "attributes": {{}}}},
  {{"name": "Photography", "entity_type": "preference", "attributes": {{}}}},
  {{"name": "Amateur Radio", "entity_type": "preference", "attributes": {{}}}}],
  "relations": [
-   {{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Cycling", "relation_type": "preference", "confidence": 1.0}},
-   {{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Photography", "relation_type": "preference", "confidence": 1.0}},
-   {{"subject": "{{SPEAKER_NAME}}", "predicate": "likes", "object": "Amateur Radio", "relation_type": "preference", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}} enjoys cycling, photography, and amateur radio."}}
+   {{"subject": "Speaker0", "predicate": "likes", "object": "Cycling", "relation_type": "preference", "confidence": 1.0}},
+   {{"subject": "Speaker0", "predicate": "likes", "object": "Photography", "relation_type": "preference", "confidence": 1.0}},
+   {{"subject": "Speaker0", "predicate": "likes", "object": "Amateur Radio", "relation_type": "preference", "confidence": 1.0}}],
+ "summary": "Speaker0 enjoys cycling, photography, and amateur radio."}}
 
 
-POSITIVE example — transcript: "[user] Born and raised in Millfield, I moved to Westport after university."
-{{"entities": [{{"name": "{{SPEAKER_NAME}}", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "Speaker0", transcript: "[user] Born and raised in Millfield, I moved to Westport after university."
+{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Millfield", "entity_type": "place", "attributes": {{}}}},
  {{"name": "Westport", "entity_type": "place", "attributes": {{}}}}],
  "relations": [
-   {{"subject": "{{SPEAKER_NAME}}", "predicate": "born_in", "object": "Millfield", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "{{SPEAKER_NAME}}", "predicate": "lives_in", "object": "Westport", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "{{SPEAKER_NAME}} was born in Millfield and now lives in Westport."}}
+   {{"subject": "Speaker0", "predicate": "born_in", "object": "Millfield", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "Speaker0", "predicate": "lives_in", "object": "Westport", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Speaker0 was born in Millfield and now lives in Westport."}}
 
 
-NEGATIVE example — speaker is "Jordan", transcript: "[user] My name is Jordan Wells and I live in Millbrook."
-BAD output (two entities for the same speaker):
+NEGATIVE example — speaker id is "Speaker0" (display name "Jordan"), transcript: "[user] My name is Jordan Wells and I live in Millbrook."
+BAD output (two entities for the same speaker, and using the display name as subject):
 {{"entities": [{{"name": "Jordan", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Jordan Wells", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Millbrook", "entity_type": "place", "attributes": {{}}}}], ...}}
-CORRECT output (single entity, last name as attribute):
-{{"entities": [{{"name": "Jordan", "entity_type": "person", "attributes": {{"last_name": "Wells"}}}},
+CORRECT output (single entity named by the speaker id, last name as attribute):
+{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{"last_name": "Wells"}}}},
  {{"name": "Millbrook", "entity_type": "place", "attributes": {{}}}}],
- "relations": [{{"subject": "Jordan", "predicate": "lives_in", "object": "Millbrook", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Jordan Wells lives in Millbrook."}}
+ "relations": [{{"subject": "Speaker0", "predicate": "lives_in", "object": "Millbrook", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Speaker0 (Jordan Wells) lives in Millbrook."}}
 
 
 NEGATIVE example — transcript: "[user] What's the weather in Tokyo? [assistant] Tokyo is 18°C and rainy."

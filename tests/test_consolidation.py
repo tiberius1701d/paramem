@@ -8894,9 +8894,9 @@ class TestMergeRegistryRelationsUnification:
             )
 
         # The merged graph must have a node for the speaker subject.
-        # GraphMerger._resolve_entity keys speaker nodes by entity.speaker_id directly
-        # (not by canonical form) — the speaker_id IS the canonical graph identity.
-        node_key = "Speaker0"
+        # §0 invariant (Step 2): speaker node keys are the casefolded speaker_id.
+        # GraphMerger._resolve_entity returns canonical_speaker(entity.speaker_id).
+        node_key = "speaker0"  # casefolded: canonical_speaker("Speaker0") == "speaker0"
         assert node_key in loop.merger.graph.nodes, (
             f"Speaker subject node {node_key!r} missing from merged graph after recon path; "
             f"nodes present: {list(loop.merger.graph.nodes)}"
@@ -8911,7 +8911,7 @@ class TestMergeRegistryRelationsUnification:
             "used entities=[], causing entity_type='concept' with no speaker_id."
         )
         assert node_data.get("speaker_id") == "Speaker0", (
-            f"Recon path: expected speaker_id='Speaker0' on speaker subject node; "
+            f"Recon path: expected speaker_id='Speaker0' (cased) in node attribute; "
             f"got speaker_id={node_data.get('speaker_id')!r}. "
             "Regression: entity synthesis was not applied to the recon path."
         )
@@ -8951,8 +8951,8 @@ class TestMergeRegistryRelationsUnification:
         ):
             loop._materialize_consolidation_graph(extra_relations=extra_relations)
 
-        # GraphMerger._resolve_entity keys speaker nodes by entity.speaker_id directly.
-        node_key = "Speaker1"
+        # §0 invariant (Step 2): speaker node keys are the casefolded speaker_id.
+        node_key = "speaker1"  # casefolded: canonical_speaker("Speaker1") == "speaker1"
         assert node_key in loop.merger.graph.nodes, (
             f"Extra-relations path: speaker subject node {node_key!r} missing; "
             f"nodes: {list(loop.merger.graph.nodes)}"
@@ -8963,7 +8963,7 @@ class TestMergeRegistryRelationsUnification:
             f"got {node_data.get('entity_type')!r}"
         )
         assert node_data.get("speaker_id") == "Speaker1", (
-            f"Extra-relations path: expected speaker_id='Speaker1'; "
+            f"Extra-relations path: expected speaker_id='Speaker1' (cased) in attribute; "
             f"got {node_data.get('speaker_id')!r}"
         )
 
@@ -9019,6 +9019,409 @@ class TestMergeRegistryRelationsUnification:
                 f"Non-speaker subject node should NOT have speaker_id set; "
                 f"got speaker_id={node_data.get('speaker_id')!r}."
             )
+
+
+# ---------------------------------------------------------------------------
+# B1 regression: _synth_speaker_entities with casefolded subject vs cased id
+# ---------------------------------------------------------------------------
+
+
+class TestSynthSpeakerEntitiesB1Regression:
+    """B1 regression: _synth_speaker_entities must emit a speaker Entity even
+    when Relation.subject is the casefolded node key (``"speaker0"``) and
+    Relation.speaker_id is the cased id (``"Speaker0"``).
+
+    Before the B1 fix: raw ``_r.subject == _r.speaker_id`` failed because
+    ``"speaker0" != "Speaker0"``, so no Entity was synthesized, causing the
+    dcf4189 regression (node has no speaker_id attribute, minted keys fall back
+    to speaker_id="").
+
+    After the fix: ``speaker_ref_matches(_r.subject, _r.speaker_id)`` =
+    ``canonical("speaker0") == canonical("Speaker0")`` = ``True``.
+    """
+
+    def test_casefolded_subject_matches_cased_speaker_id(self):
+        """Build a Relation list as the enrichment path produces it — subject is
+        the casefolded node key ('speaker0'), speaker_id is cased ('Speaker0').
+        Assert _synth_speaker_entities emits exactly one speaker Entity.
+        """
+        import unittest.mock as mock
+
+        from paramem.graph.schema import Relation
+        from paramem.training.consolidation import ConsolidationLoop
+
+        # Construct a minimal ConsolidationLoop-like object with only the method
+        # we need (no model, no store needed for this unit test).
+        loop = object.__new__(ConsolidationLoop)
+        # Patch required attrs so __init__ is not called.
+        loop.__dict__["config"] = mock.MagicMock()
+
+        # Relation as enrichment path produces it:
+        # subject = casefolded node key "speaker0" (what _endpoint_str emits)
+        # speaker_id = cased system id "Speaker0" (from node attribute)
+        relations = [
+            Relation(
+                subject="speaker0",  # casefolded node key
+                predicate="works at",
+                object="Acme",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker0",  # cased system id
+            ),
+        ]
+
+        entities = ConsolidationLoop._synth_speaker_entities(loop, relations)
+
+        assert len(entities) == 1, (
+            f"Expected 1 speaker Entity, got {len(entities)}: {entities!r}. "
+            "B1 regression: speaker_ref_matches must be used, not raw ==."
+        )
+        assert entities[0].speaker_id == "Speaker0"
+
+    def test_raw_equality_would_fail(self):
+        """Verify the PRE-FIX condition: raw == on casefolded subject vs cased id
+        returns False, which is why the B1 fix is necessary.
+        """
+        subject = "speaker0"
+        speaker_id = "Speaker0"
+        # Raw equality that the old code used — must be False.
+        assert (subject == speaker_id) is False, (
+            "Pre-fix condition: raw 'speaker0' == 'Speaker0' must be False "
+            "to confirm the B1 regression was real."
+        )
+        # The fix — canonical comparison must be True.
+        from paramem.graph.name_match import speaker_ref_matches
+
+        assert speaker_ref_matches(subject, speaker_id) is True, (
+            "Post-fix condition: speaker_ref_matches('speaker0', 'Speaker0') must be True."
+        )
+
+    def test_distinct_speaker_produces_no_spurious_entity(self):
+        """A subject that is a DIFFERENT speaker must not produce an entity for
+        speaker_id — the comparison must be identity, not just 'is a speaker'.
+        """
+        import unittest.mock as mock
+
+        from paramem.graph.schema import Relation
+        from paramem.training.consolidation import ConsolidationLoop
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.__dict__["config"] = mock.MagicMock()
+
+        relations = [
+            Relation(
+                subject="speaker1",  # different speaker node key
+                predicate="knows",
+                object="Acme",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="Speaker0",  # mismatch — must NOT produce Entity
+            ),
+        ]
+
+        entities = ConsolidationLoop._synth_speaker_entities(loop, relations)
+        assert len(entities) == 0, (
+            f"Expected 0 entities for mismatched subject/speaker_id, got {entities!r}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# W1 guard: resolve_to_node_key + same_as speaker-casing guard
+# ---------------------------------------------------------------------------
+
+
+class TestResolveToNodeKeyP5:
+    """Unit tests for the module-level ``resolve_to_node_key`` function (P5)."""
+
+    def test_membership_shortcut(self):
+        """When ``in_graph(name)`` is True the name IS returned unchanged."""
+        from paramem.training.consolidation import resolve_to_node_key
+
+        graph_keys = {"alice", "berlin", "acme corp"}
+        in_graph = lambda n: n in graph_keys  # noqa: E731
+
+        assert resolve_to_node_key("alice", in_graph) == "alice"
+        assert resolve_to_node_key("berlin", in_graph) == "berlin"
+
+    def test_canonical_fallback(self):
+        """When name is NOT in graph, canonical(name) is returned."""
+        from paramem.training.consolidation import resolve_to_node_key
+
+        in_graph = lambda n: False  # noqa: E731
+
+        # canonical("Speaker0") == "speaker0" (casefolded)
+        assert resolve_to_node_key("Speaker0", in_graph) == "speaker0"
+        # canonical("Tobias") == "tobias"
+        assert resolve_to_node_key("Tobias", in_graph) == "tobias"
+
+    def test_coref_chain_follow(self):
+        """With a coref_map, the resolved key is followed through the chain."""
+        from paramem.training.consolidation import resolve_to_node_key
+
+        in_graph = lambda n: False  # noqa: E731
+        coref_map = {"speaker1": "speaker0"}  # speaker1 merged into speaker0
+
+        result = resolve_to_node_key("Speaker1", in_graph, coref_map)
+        # canonical("Speaker1") == "speaker1", then follows chain → "speaker0"
+        assert result == "speaker0"
+
+    def test_coref_chain_cycle_guarded(self):
+        """A cyclic coref_map must not loop forever."""
+        from paramem.training.consolidation import resolve_to_node_key
+
+        in_graph = lambda n: False  # noqa: E731
+        coref_map = {"a": "b", "b": "a"}  # cycle
+
+        # Must return without hanging; result is either "a" or "b"
+        result = resolve_to_node_key("a", in_graph, coref_map)
+        assert result in ("a", "b")
+
+    def test_no_coref_map(self):
+        """Without a coref_map, only membership+canonical resolution applies."""
+        from paramem.training.consolidation import resolve_to_node_key
+
+        in_graph = lambda n: n == "existing"  # noqa: E731
+
+        assert resolve_to_node_key("existing", in_graph) == "existing"
+        assert resolve_to_node_key("Missing", in_graph) == "missing"
+
+
+class TestW1SameAsGuard:
+    """W1 guard: any same_as pair where BOTH surfaces are speaker ids must be
+    skipped unconditionally.
+
+    Speaker identity is authoritative (voice/enrollment) and must never be
+    coalesced by a surface-similarity heuristic.  Two speaker-id surfaces are
+    either the SAME speaker (already unified by canonical node-keying — redundant)
+    or DIFFERENT speakers (must never merge — Jaro-Winkler treats the
+    distinguishing digit as a typo, so ``_safe_to_merge_surface`` returns True
+    for every distinct speaker pair).  The guard blocks both scenarios.
+    """
+
+    @staticmethod
+    def _make_w1_loop(tmp_path):
+        """Minimal ConsolidationLoop for W1 tests (≥10-node graph, real merger)."""
+        from unittest.mock import MagicMock  # noqa: F811
+
+        from peft import PeftModel
+
+        from paramem.graph.schema import Entity, SessionGraph
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        model = MagicMock()
+        model.__class__ = PeftModel
+        model.peft_config = {
+            "episodic": MagicMock(),
+            "semantic": MagicMock(),
+            "in_training": MagicMock(),
+        }
+
+        loop = ConsolidationLoop(
+            model=model,
+            tokenizer=MagicMock(),
+            consolidation_config=ConsolidationConfig(),
+            training_config=TrainingConfig(),
+            episodic_adapter_config=AdapterConfig(),
+            semantic_adapter_config=AdapterConfig(),
+            memory_store=MemoryStore(replay_enabled=True),
+            procedural_adapter_config=None,
+            output_dir=tmp_path,
+            extraction_noise_filter="anthropic",
+            extraction_noise_filter_model="claude-sonnet-4-6",
+        )
+        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+
+        # Populate ≥10 nodes so the floor gate passes.
+        graph = loop.merger.graph
+        org = "acmecorp"
+        graph.add_node(
+            org,
+            entity_type="organization",
+            attributes={"name": "AcmeCorp"},
+            recurrence_count=10,
+            sessions=["s000"],
+            first_seen="s000",
+            last_seen="s000",
+        )
+        for i in range(10):
+            name = f"person{i}"
+            graph.add_node(
+                name,
+                entity_type="person",
+                attributes={"name": f"Person{i}"},
+                recurrence_count=i + 1,
+                sessions=[f"s{i:03d}"],
+                first_seen=f"s{i:03d}",
+                last_seen=f"s{i:03d}",
+            )
+            graph.add_edge(
+                name,
+                org,
+                predicate="works at",
+                relation_type="factual",
+                confidence=1.0,
+                source="extraction",
+                sessions=["s000"],
+            )
+
+        # Seed a speaker node (casefolded key "speaker0").
+        loop.merger.merge(
+            SessionGraph(
+                session_id="seed-Speaker0",
+                timestamp="2026-01-01T00:00:00Z",
+                entities=[Entity(name="Alex", entity_type="person", speaker_id="Speaker0")],
+                relations=[],
+            )
+        )
+        return loop
+
+    def test_speaker_id_casing_pair_is_skipped(self, tmp_path, monkeypatch):
+        """SOTA same_as ['Speaker0', 'speaker0'] must not contract the speaker node.
+
+        Drives the real _run_graph_enrichment production path with a mocked SOTA
+        response.  Asserts that after processing the casing-variant pair:
+        - result["same_as_merges"] == 0  (no contraction counted)
+        - "speaker0" still exists as a distinct node in the graph
+        - no node was removed by a self-contraction
+
+        The W1 guard fires first (both surfaces are speaker ids); the
+        ``keep_canon == drop_canon`` post-resolution check is a secondary
+        backstop for this specific case only.
+        """
+        from unittest.mock import patch
+
+        loop = self._make_w1_loop(tmp_path)
+
+        node_count_before = loop.merger.graph.number_of_nodes()
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=([], [["Speaker0", "speaker0"]], "raw"),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["same_as_merges"] == 0, (
+            "W1/post-resolution guard must prevent the speaker casing-variant pair "
+            "from counting as a merge; got same_as_merges="
+            f"{result['same_as_merges']}"
+        )
+        # "speaker0" must still be present — no self-contraction removed it.
+        assert "speaker0" in loop.merger.graph.nodes, (
+            "Speaker node 'speaker0' must survive the casing-variant same_as pair"
+        )
+        # Graph size must be unchanged.
+        assert loop.merger.graph.number_of_nodes() == node_count_before, (
+            "Graph node count must not change after a guarded (no-op) same_as pair"
+        )
+
+    def test_distinct_speaker_ids_are_not_merged(self, tmp_path, monkeypatch):
+        """SOTA same_as ['Speaker0', 'Speaker1'] must NOT merge distinct speakers.
+
+        Drives the real _run_graph_enrichment production path.  Speaker0 and
+        Speaker1 are distinct enrollments; a SOTA same_as proposal must be
+        blocked by the generalized W1 guard (both surfaces are speaker ids).
+
+        This test is load-bearing: without the W1 guard,
+        ``_safe_to_merge_surface("Speaker0", "Speaker1")`` returns True (JW
+        treats the digit as a typo, score ≈ 0.950) and the merger would
+        contract speaker1 into speaker0 — catastrophic in a real 2-speaker
+        deployment.
+
+        Asserts after enrichment:
+        - result["same_as_merges"] == 0
+        - both "speaker0" and "speaker1" still exist as distinct nodes
+        """
+        from unittest.mock import patch
+
+        loop = self._make_w1_loop(tmp_path)
+        # Seed a second speaker node so both endpoints are in the graph.
+        from paramem.graph.schema import Entity, SessionGraph
+
+        loop.merger.merge(
+            SessionGraph(
+                session_id="seed-Speaker1",
+                timestamp="2026-01-01T00:00:00Z",
+                entities=[Entity(name="Robin", entity_type="person", speaker_id="Speaker1")],
+                relations=[],
+            )
+        )
+        assert "speaker0" in loop.merger.graph.nodes
+        assert "speaker1" in loop.merger.graph.nodes
+
+        node_count_before = loop.merger.graph.number_of_nodes()
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=([], [["Speaker0", "Speaker1"]], "raw"),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert result["same_as_merges"] == 0, (
+            "W1 guard must block distinct speaker ids from merging; "
+            f"got same_as_merges={result['same_as_merges']}"
+        )
+        # Both speaker nodes must remain distinct — no contraction occurred.
+        assert "speaker0" in loop.merger.graph.nodes, (
+            "speaker0 must survive — W1 guard must block the Speaker0/Speaker1 merge"
+        )
+        assert "speaker1" in loop.merger.graph.nodes, (
+            "speaker1 must survive — W1 guard must block the Speaker0/Speaker1 merge"
+        )
+        assert loop.merger.graph.number_of_nodes() == node_count_before, (
+            "Graph node count must not change after a W1-guarded speaker same_as pair"
+        )
+
+    def test_non_speaker_pairs_are_not_guarded(self, tmp_path, monkeypatch):
+        """Non-speaker same_as pairs (e.g. name variants) must pass through W1.
+
+        Drives the real _run_graph_enrichment path.  A pair of ordinary non-speaker
+        names must NOT be intercepted by the W1 guard; they continue to the normal
+        resolution and surface-gate checks.
+        """
+        from unittest.mock import patch
+
+        from paramem.graph.name_match import is_speaker_id
+
+        loop = self._make_w1_loop(tmp_path)
+        graph = loop.merger.graph
+        # Add two non-speaker nodes for the same_as pair.
+        for name in ("alexander", "alex"):
+            graph.add_node(
+                name,
+                entity_type="person",
+                attributes={"name": name.capitalize()},
+                recurrence_count=2,
+                sessions=["s100"],
+                first_seen="s100",
+                last_seen="s100",
+            )
+
+        assert not is_speaker_id("alexander")
+        assert not is_speaker_id("alex")
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        # Non-speaker pair: W1 must not fire; normal gates apply.
+        # "Alexander"/"Alex" pass _safe_to_merge_surface (token subset), so the merge
+        # is allowed and same_as_merges == 1.
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=([], [["Alexander", "Alex"]], "raw"),
+        ):
+            result = loop._run_graph_enrichment()
+
+        # Non-speaker pair was not guarded by W1 — the merge proceeded normally.
+        assert result["same_as_merges"] >= 1, (
+            "Non-speaker same_as pair must not be blocked by the W1 guard; "
+            f"expected at least 1 merge, got {result['same_as_merges']}"
+        )
 
 
 # ---------------------------------------------------------------------------

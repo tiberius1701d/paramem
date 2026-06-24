@@ -3546,7 +3546,7 @@ def _resolve_speaker(
     if auth_speaker_id is not None:
         speaker_name: str | None = None
         if speaker_store is not None:
-            speaker_name = speaker_store.get_name(auth_speaker_id)
+            speaker_name = speaker_store.resolve_speaker_name(auth_speaker_id)
         # Record on session state for multi-turn continuity (priority 2 below)
         # and any session-state reader, mirroring the voice branch. Turn
         # attribution itself no longer depends on this — append() now takes the
@@ -12191,10 +12191,7 @@ def _run_extraction_phase(
 
         speaker_name = None
         if speaker_store is not None:
-            try:
-                speaker_name = speaker_store.get_name(session_speaker_id)
-            except Exception as e:
-                logger.warning("speaker_store.get_name(%s) failed: %s", session_speaker_id, e)
+            speaker_name = speaker_store.resolve_speaker_name(session_speaker_id)
         with vram_scope(session_id):
             episodic_rels, procedural_rels = loop.extract_session(
                 transcript,
@@ -12540,10 +12537,7 @@ def _extract_and_start_training():
 
             speaker_name = None
             if _state.get("speaker_store") is not None:
-                try:
-                    speaker_name = _state["speaker_store"].get_name(session_speaker_id)
-                except Exception as e:
-                    logger.warning("speaker_store.get_name(%s) failed: %s", session_speaker_id, e)
+                speaker_name = _state["speaker_store"].resolve_speaker_name(session_speaker_id)
 
             # vram_scope mirrors the full-cycle path in paramem/server/
             # consolidation.py:335 — empty_cache between sessions and OOM
@@ -13273,14 +13267,9 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
 
                     speaker_name = None
                     if _state.get("speaker_store") is not None:
-                        try:
-                            speaker_name = _state["speaker_store"].get_name(session_speaker_id)
-                        except Exception as e:
-                            logger.warning(
-                                "speaker_store.get_name(%s) failed: %s",
-                                session_speaker_id,
-                                e,
-                            )
+                        speaker_name = _state["speaker_store"].resolve_speaker_name(
+                            session_speaker_id
+                        )
 
                     try:
                         check_vram_headroom(

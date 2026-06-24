@@ -2067,32 +2067,42 @@ class TestPlausibilityTupleReturn:
 
 
 class TestSpeakerContextInjection:
-    def test_build_speaker_context_empty_when_unknown(self):
+    def test_build_speaker_context_empty_when_no_id(self):
+        """build_speaker_context returns empty string when speaker_id is absent."""
         from paramem.graph.extractor import build_speaker_context
 
-        assert build_speaker_context(None) == ""
-        assert build_speaker_context("") == ""
+        assert build_speaker_context(None, None) == ""
+        assert build_speaker_context("", None) == ""
+        assert build_speaker_context(None, "Alice") == ""
+        assert build_speaker_context("", "Alice") == ""
 
-    def test_build_speaker_context_includes_name_and_directive(self):
+    def test_build_speaker_context_includes_id_and_name(self):
+        """Directive pins speaker_id as subject and injects display name as context."""
         from paramem.graph.extractor import build_speaker_context
 
-        out = build_speaker_context("Ye Jie")
+        out = build_speaker_context("Speaker0", "Ye Jie")
+        # Speaker id must appear as the required subject.
+        assert "Speaker0" in out
+        # Display name must appear as comprehension context.
         assert "Ye Jie" in out
-        assert "'Ye Jie'" in out
         # Must forbid generic fallback strings so the model cannot emit them.
-        # {SPEAKER_NAME} is the wrapped slot used in the few-shots; the bare
-        # and title-cased forms stay listed because the graph normalizer
-        # title-cases the bare form and because Mistral occasionally emits
-        # "Speaker"/"User"/"I" as training-data fallbacks.
         for forbidden in (
             "{SPEAKER_NAME}",
             "SPEAKER_NAME",
             "Speaker_Name",
-            "Speaker",
             "User",
             "'I'",
         ):
             assert forbidden in out, f"directive must mention {forbidden!r}"
+
+    def test_build_speaker_context_id_only_no_display_name(self):
+        """Anonymous speaker: id used for both subject and context; no KeyError."""
+        from paramem.graph.extractor import build_speaker_context
+
+        out = build_speaker_context("Speaker0", None)
+        assert "Speaker0" in out
+        assert "{speaker_id}" not in out
+        assert "{speaker_name}" not in out
 
 
 # --- Background Trainer ---

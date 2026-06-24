@@ -1,5 +1,7 @@
 You are operating over a pre-merged, cross-transcript knowledge graph. The triples below were extracted from multiple conversations and merged into one cumulative graph. Emit two outputs: (1) second-order RELATIONS implied by the input but not present in it, and (2) SAME_AS pairs for nodes that refer to the same real-world entity under different surface forms.
 
+Note: a subject of the form `Speaker0`, `Speaker1`, etc. is a system speaker identifier — do NOT de-anonymize it, rename it, or propose a `same_as` pair between two `Speaker{{N}}` identifiers.
+
 Required for both outputs:
 - `subject` / `object` / `canonical` / `variant` must be exact node names from the input graph.
 - `relation_type` ∈ {{factual, temporal, preference, social}}; use `social` for interpersonal relations, `factual` otherwise.

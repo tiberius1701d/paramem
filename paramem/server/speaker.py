@@ -3,11 +3,12 @@
 Speaker identity = voice embedding (authenticator) + display name (label).
 Multiple speakers can share the same name — each gets a unique internal ID.
 
-Profiles stored as JSON with UUID-based speaker IDs. Each profile holds
-multiple embeddings (from different utterances and devices). Matching
-uses the L2-normalized centroid for robustness.
+Profiles stored as JSON with canonical ``Speaker{N}`` speaker IDs (monotonic
+counter, persisted as ``next_anon_index``). Each profile holds multiple
+embeddings (from different utterances and devices). Matching uses the
+L2-normalized centroid for robustness.
 
-{"speakers": {"a1b2c3d4": {"name": "Alex", "embeddings": [[0.1, ...], ...]}}, "version": 3}
+{"speakers": {"Speaker0": {"name": "Alex", "embeddings": [[0.1, ...], ...]}}, "version": 5}
 
 Embedding computation happens externally (Wyoming STT wrapper) —
 this module only stores and matches pre-computed embeddings.
@@ -17,7 +18,6 @@ import json
 import logging
 import math
 import threading
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,7 +79,8 @@ def compute_centroid(embeddings: list[list[float]]) -> list[float]:
 class SpeakerStore:
     """Persistent store for speaker voice profiles.
 
-    Each profile is keyed by a unique speaker ID (UUID4 short hash).
+    Each profile is keyed by a canonical ``Speaker{N}`` id allocated by a
+    shared monotonic counter (``_next_anon_index``, persisted across reloads).
     Profiles store multiple embeddings — matching uses the centroid.
     New embeddings are added on confirmed matches to strengthen the profile.
     """
@@ -155,11 +156,13 @@ class SpeakerStore:
                 logger.info("Migrated %d v2 profiles to v5", len(self._profiles))
                 self._save()
         else:
-            # v1 → v5: name-keyed → UUID-keyed + multi-embedding + preferred_language
+            # v1 → v5: name-keyed → Speaker{N}-keyed + multi-embedding + preferred_language
+            # _mint_anon_speaker_id() is safe here: _load runs single-threaded during
+            # __init__ before any other thread has access to this instance.
             legacy = data.get("speakers", {})
             self._profiles = {}
             for name, embedding in legacy.items():
-                speaker_id = uuid.uuid4().hex[:8]
+                speaker_id = self._mint_anon_speaker_id()
                 self._profiles[speaker_id] = {
                     "name": name,
                     "embeddings": [embedding] if embedding else [],
@@ -368,6 +371,19 @@ class SpeakerStore:
         )
         return True
 
+    def _mint_anon_speaker_id(self) -> str:
+        """Allocate the next canonical ``Speaker{N}`` id and advance the counter.
+
+        The counter is shared across BOTH named and anonymous enrollments — it
+        is a monotonic allocator, not an anonymous-only count.  Counter monotonicity
+        guarantees uniqueness, so no collision-guard loop is needed.
+
+        Caller MUST hold ``self._lock`` (counter mutation is not atomic).
+        """
+        speaker_id = f"Speaker{self._next_anon_index}"
+        self._next_anon_index += 1
+        return speaker_id
+
     def enroll(
         self, name: str, embedding: list[float], method: str = "self_introduced"
     ) -> str | None:
@@ -393,12 +409,14 @@ class SpeakerStore:
             # Check inside lock to prevent concurrent enrolls of the same voice.
             # NOTE: match() is read-only and must NOT acquire _lock (would deadlock).
             existing = self.match(embedding)
-            if existing.speaker_id is not None and existing.confidence >= self.high_threshold:
+            if existing.speaker_id is not None:
                 matched_profile = self._profiles.get(existing.speaker_id, {})
-                if matched_profile.get("enroll_method") == "anonymous_voice":
-                    # Upgrade the anonymous profile in-place: assign a real name
-                    # and update the enroll method. Preserves the Speaker{N} ID
-                    # so deferred-identity-binding can resolve it at consolidation.
+                is_anon = matched_profile.get("enroll_method") == "anonymous_voice"
+                # Upgrade an anonymous profile in BOTH the high-confidence and
+                # tentative bands — the tentative band is what closes the
+                # anonymous→named identity split (mirrors register_anonymous's
+                # tentative-reuse of anonymous profiles).
+                if is_anon:
                     matched_profile["name"] = display_name
                     matched_profile["enroll_method"] = method
                     if embedding not in matched_profile["embeddings"]:
@@ -411,24 +429,21 @@ class SpeakerStore:
                         display_name,
                     )
                     return existing.speaker_id
-                # High-confidence match against a named profile — reject to prevent
-                # duplicate enrollment of the same voice under a different name.
-                logger.warning(
-                    "Enrollment rejected: voice already enrolled as '%s' (id=%s, conf=%.2f)",
-                    existing.name,
-                    existing.speaker_id,
-                    existing.confidence,
-                )
-                return None
+                # Named profile matched:
+                #   high-confidence → reject (duplicate voice under a different name)
+                #   tentative       → fall through to mint a new Speaker{N} (protect
+                #                     the named centroid from ambiguous-voice contamination)
+                if not existing.tentative:
+                    logger.warning(
+                        "Enrollment rejected: voice already enrolled as '%s' (id=%s, conf=%.2f)",
+                        existing.name,
+                        existing.speaker_id,
+                        existing.confidence,
+                    )
+                    return None
+                # tentative + named → fall through to mint a fresh Speaker{N}.
 
-            speaker_id = uuid.uuid4().hex[:8]
-            for _ in range(10):
-                if speaker_id not in self._profiles:
-                    break
-                speaker_id = uuid.uuid4().hex[:16]  # wider ID space on retry
-            # Final collision guard (astronomically unlikely)
-            while speaker_id in self._profiles:
-                speaker_id = uuid.uuid4().hex
+            speaker_id = self._mint_anon_speaker_id()
             self._profiles[speaker_id] = {
                 "name": display_name,
                 "embeddings": [embedding],
@@ -506,8 +521,7 @@ class SpeakerStore:
                 if matched_method_locked == "anonymous_voice":
                     return existing_locked.speaker_id
 
-            speaker_id = f"Speaker{self._next_anon_index}"
-            self._next_anon_index += 1
+            speaker_id = self._mint_anon_speaker_id()
             self._profiles[speaker_id] = {
                 "name": speaker_id,
                 "embeddings": [embedding],
@@ -540,6 +554,38 @@ class SpeakerStore:
         """Get the display name for a speaker ID."""
         profile = self._profiles.get(speaker_id)
         return profile["name"] if profile else None
+
+    def resolve_speaker_name(self, speaker_id: str) -> str | None:
+        """Resolve a speaker id to its display name with anonymous suppression.
+
+        Returns the display name when the profile is known AND the speaker has
+        disclosed a real name (i.e. is not anonymous).  Returns ``None`` in all
+        other cases:
+
+        * ``speaker_id`` not in the store (unknown caller).
+        * Profile exists but ``enroll_method == "anonymous_voice"`` (the
+          ``name`` field equals the ``speaker_id`` — an internal token, not a
+          salutation).  Callers constructing user-facing text (greeting prefix,
+          system-prompt "You are speaking with X" strings, extraction context)
+          must never pin the opaque ``Speaker{N}`` token as a display name;
+          returning ``None`` lets them suppress the token cleanly.
+
+        Unlike ``get_name``, this method never raises — it is safe to use as a
+        direct replacement for the ``try/except get_name failed`` pattern that
+        guarded a non-raising dict lookup.
+
+        Args:
+            speaker_id: The speaker's system id (e.g. ``"Speaker0"``).
+
+        Returns:
+            Display name string when known and not anonymous; ``None`` otherwise.
+        """
+        profile = self._profiles.get(speaker_id)
+        if profile is None:
+            return None
+        if profile.get("enroll_method") == "anonymous_voice":
+            return None
+        return profile.get("name") or None
 
     def is_anonymous(self, speaker_id: str | None) -> bool:
         """True if the profile is voice-promoted but not yet name-disclosed.

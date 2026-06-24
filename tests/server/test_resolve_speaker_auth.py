@@ -38,6 +38,11 @@ def _make_store(known_ids: dict[str, str | None] | None = None):
 
     *known_ids* maps speaker_id → display_name (None when not profiled).
     ``match`` always returns a tentative/no-match result so it never fires.
+
+    Both ``get_name`` and ``resolve_speaker_name`` are wired to the same
+    lookup so tests that check the auth-speaker-id path (which calls
+    ``resolve_speaker_name``) and tests that check other paths (which may
+    call ``get_name``) both work correctly.
     """
     store = MagicMock()
 
@@ -47,6 +52,10 @@ def _make_store(known_ids: dict[str, str | None] | None = None):
         return known_ids.get(sid)
 
     store.get_name.side_effect = _get_name
+    # _resolve_speaker now calls resolve_speaker_name (P3) for the
+    # auth-speaker-id path (app.py:3549). Wire the same lookup so mocks
+    # that rely on known_ids still work.
+    store.resolve_speaker_name.side_effect = _get_name
 
     # match returns a tentative non-match (voice path should not fire)
     match_result = MagicMock()
@@ -112,6 +121,8 @@ class TestAuthSpeakerIdAuthoritative:
         # "Speaker1" if the embedding branch ran — but it must not run.
         store = MagicMock()
         store.get_name.return_value = "Mara"
+        # _resolve_speaker now calls resolve_speaker_name (P3) for the auth path.
+        store.resolve_speaker_name.return_value = "Mara"
 
         voice_match = MagicMock()
         voice_match.speaker_id = "Speaker1"

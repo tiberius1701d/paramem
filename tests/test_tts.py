@@ -230,6 +230,133 @@ def test_personalize_prompt_with_language():
     assert "You are speaking with" not in result
 
 
+def test_personalize_prompt_injects_id_mapping():
+    """Step 7: _personalize_prompt injects id→name mapping when speaker_id is provided.
+
+    When both display name and speaker_id are given, the INFERENCE-IDENTITY
+    section of speaker_directive.txt is injected into the local system prompt.
+    The mapping must mention the speaker_id and the display name so recalled
+    Speaker{N} facts resolve at inference time.
+    """
+    from paramem.server.inference import _personalize_prompt
+
+    base = "You are a helpful assistant."
+    result_with = _personalize_prompt(base, "Alice", "en", speaker_id="Speaker0")
+    # The id→name mapping must be present.
+    assert "Speaker0" in result_with
+    assert "Alice" in result_with
+    # Base prompt text is still present.
+    assert base in result_with
+
+
+def test_personalize_prompt_no_mapping_without_speaker_id():
+    """When speaker_id is absent, no id mapping is injected (still shows display name)."""
+    from paramem.server.inference import _personalize_prompt
+
+    base = "You are a helpful assistant."
+    result = _personalize_prompt(base, "Alice", "en")
+    # Display name present via the "You are speaking with" part.
+    assert "Alice" in result
+    # Without speaker_id the INFERENCE-IDENTITY mapping is not injected;
+    # no bare "Speaker" token should appear.
+    assert "Speaker0" not in result
+
+
+def test_personalize_prompt_sota_excludes_id_mapping():
+    """SOTA escalation path (include_id_mapping=False) must NEVER contain the id mapping.
+
+    Privacy invariant: the Speaker{N} → display-name mapping is local-inference
+    only.  _escalate_to_sota calls _build_speaker_prefix with
+    include_id_mapping=False so even when speaker_id is in scope it is not leaked.
+    """
+    from paramem.server.inference import _build_speaker_prefix
+
+    # Simulate SOTA path: include_id_mapping=False, speaker_id present.
+    prefix = _build_speaker_prefix(
+        "Alice", "en", None, include_id_mapping=False, speaker_id="Speaker0"
+    )
+    # Must not contain the id mapping; SOTA only sees "You are speaking with Alice."
+    assert "Speaker0" not in prefix
+    # Local path: include_id_mapping=True injects the mapping.
+    prefix_local = _build_speaker_prefix(
+        "Alice", "en", None, include_id_mapping=True, speaker_id="Speaker0"
+    )
+    assert "Speaker0" in prefix_local
+    assert "Alice" in prefix_local
+
+
+# ---------------------------------------------------------------------------
+# P6 — _build_speaker_prefix shared helper + SOTA privacy invariant
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSpeakerPrefix:
+    """``_build_speaker_prefix`` is the single shared implementation for the
+    "You are speaking with X" + language block used by both local inference
+    and SOTA escalation.
+
+    The ``include_id_mapping`` flag encodes the SOTA privacy invariant:
+    step 7 will only inject the id→name mapping when the flag is True (local
+    path).  The flag must be False on the SOTA path.
+    """
+
+    def test_speaker_and_language(self):
+        from paramem.server.inference import _build_speaker_prefix
+
+        result = _build_speaker_prefix("Alice", "de", None, include_id_mapping=False)
+        assert "Alice" in result
+        assert "German" in result
+
+    def test_no_speaker_no_language(self):
+        from paramem.server.inference import _build_speaker_prefix
+
+        result = _build_speaker_prefix(None, None, None, include_id_mapping=True)
+        assert result == ""
+
+    def test_speaker_only(self):
+        from paramem.server.inference import _build_speaker_prefix
+
+        result = _build_speaker_prefix("Bob", None, None, include_id_mapping=True)
+        assert "Bob" in result
+        assert "Respond in" not in result
+
+    def test_language_only(self):
+        from paramem.server.inference import _build_speaker_prefix
+
+        result = _build_speaker_prefix(None, "fr", None, include_id_mapping=False)
+        assert "French" in result
+        assert "You are speaking with" not in result
+
+    def test_sota_path_uses_false_flag(self):
+        """The SOTA escalation path must pass include_id_mapping=False.
+
+        Privacy invariant: the id→name mapping must NEVER reach the cloud.
+        Even when speaker_id is provided, the SOTA path (include_id_mapping=False)
+        must NOT inject it.  The local path (include_id_mapping=True) DOES inject
+        the mapping when speaker_id and speaker are both non-empty.
+        """
+        from paramem.server.inference import _build_speaker_prefix
+
+        # SOTA path: no speaker_id, id mapping suppressed.
+        prefix_sota = _build_speaker_prefix("Alice", "en", None, include_id_mapping=False)
+        # Local path without speaker_id: no mapping either.
+        prefix_no_id = _build_speaker_prefix("Alice", "en", None, include_id_mapping=True)
+        # Without speaker_id both paths produce the same result.
+        assert prefix_sota == prefix_no_id
+        # Local path with speaker_id injects the mapping.
+        prefix_local = _build_speaker_prefix(
+            "Alice", "en", None, include_id_mapping=True, speaker_id="Speaker0"
+        )
+        # Local path must be richer (has the id mapping sentence).
+        assert len(prefix_local) > len(prefix_sota)
+        assert "Speaker0" in prefix_local
+        # SOTA path with speaker_id must still suppress it (privacy invariant).
+        prefix_sota_with_id = _build_speaker_prefix(
+            "Alice", "en", None, include_id_mapping=False, speaker_id="Speaker0"
+        )
+        assert "Speaker0" not in prefix_sota_with_id
+
+
 # --- Speaker language preference ---
 
 

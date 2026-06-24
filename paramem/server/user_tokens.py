@@ -58,6 +58,7 @@ from pathlib import Path
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
 from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, daily_identity_loadable
+from paramem.graph.name_match import is_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -225,9 +226,13 @@ class UserTokenStore:
         Parameters
         ----------
         speaker_id:
-            The speaker this token authenticates (e.g. ``"Speaker0"``), or
-            ``None`` for an unattributed token (shared device that identifies
-            speakers by voice embedding at request time).
+            The speaker this token authenticates.  MUST be a ``Speaker{N}``
+            id (e.g. ``"Speaker0"``), or ``None`` for an unattributed token
+            (shared device that identifies speakers by voice embedding at
+            request time).  A non-``None`` id that does not match the
+            ``Speaker{N}`` form raises :exc:`ValueError` — all minted tokens
+            must reference a canonical id so they can participate in
+            graph-side speaker resolution.
         label:
             Human-readable device or purpose label (e.g. ``"Alice iPad"``).
         scope:
@@ -246,13 +251,20 @@ class UserTokenStore:
         Raises
         ------
         ValueError
-            If *scope* is not one of the allowed values.
+            If *scope* is not one of the allowed values, or if *speaker_id*
+            is a non-``None`` string that does not conform to ``Speaker{N}``.
         RuntimeError
             In Security ON mode only: if a key-eviction race causes the store
             to be written in plaintext (see :meth:`_save`).
         """
         if scope not in _ALLOWED_SCOPES:
             raise ValueError(f"Invalid scope {scope!r}; must be one of {_ALLOWED_SCOPES}")
+        if speaker_id is not None and not is_speaker_id(speaker_id):
+            raise ValueError(
+                f"mint: speaker_id={speaker_id!r} is not a canonical Speaker{{N}} id. "
+                "Tokens must reference a canonical Speaker{N} id (e.g. 'Speaker0') or "
+                "pass speaker_id=None for an unattributed shared-device token."
+            )
         token = secrets.token_urlsafe(32)
         key = _sha256hex(token)
         entry: dict = {

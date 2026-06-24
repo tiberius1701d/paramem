@@ -114,7 +114,7 @@ class TestExtractionPrompt:
         tmpl = _load_prompt("extraction.txt", _DEFAULT_EXTRACTION_PROMPT)
         rendered = tmpl.format(
             transcript="[user] hello",
-            speaker_context=build_speaker_context(None),
+            speaker_context=build_speaker_context(None, None),
             entity_types=format_entity_types(),
             predicate_examples=format_predicate_examples(),
             relation_types=format_relation_types(),
@@ -125,16 +125,33 @@ class TestExtractionPrompt:
         assert "\n\n\n\n" not in rendered
 
     def test_renders_with_speaker_context_set(self):
+        """Directive pins Speaker0 as subject; display name injected as comprehension context."""
         tmpl = _load_prompt("extraction.txt", _DEFAULT_EXTRACTION_PROMPT)
         rendered = tmpl.format(
             transcript="[user] hello",
-            speaker_context=build_speaker_context("Alex"),
+            speaker_context=build_speaker_context("Speaker0", "Alex"),
             entity_types=format_entity_types(),
             predicate_examples=format_predicate_examples(),
             relation_types=format_relation_types(),
         )
+        # The directive must mention the speaker id as the required subject.
+        assert "Speaker0" in rendered
+        # The display name is injected as comprehension context.
         assert "Alex" in rendered
-        assert "'Alex'" in rendered
+
+    def test_renders_with_speaker_id_no_display_name(self):
+        """Anonymous speaker: id used for both subject and context; no KeyError."""
+        tmpl = _load_prompt("extraction.txt", _DEFAULT_EXTRACTION_PROMPT)
+        rendered = tmpl.format(
+            transcript="[user] hello",
+            speaker_context=build_speaker_context("Speaker0", None),
+            entity_types=format_entity_types(),
+            predicate_examples=format_predicate_examples(),
+            relation_types=format_relation_types(),
+        )
+        assert "Speaker0" in rendered
+        assert "{speaker_id}" not in rendered
+        assert "{speaker_name}" not in rendered
 
 
 class TestEnrichmentPromptContract:
@@ -371,7 +388,7 @@ class TestProceduralPrompt:
         tmpl = _load_prompt("extraction_procedural.txt", _DEFAULT_PROCEDURAL_PROMPT)
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
-            speaker_context=build_speaker_context(None),
+            speaker_context=build_speaker_context(None, None),
             entity_types=format_entity_types(scope="procedural"),
             predicate_examples=format_predicate_examples(scope="procedural"),
         )
@@ -381,21 +398,24 @@ class TestProceduralPrompt:
         assert "\n\n\n\n" not in rendered
 
     def test_renders_with_speaker_context_set(self):
-        """Procedural prompt injects real speaker name when provided.
+        """Procedural prompt pins Speaker0 as subject with display name as context.
 
         Guards against the silent identity fragmentation bug where
-        procedural facts get subject "Speaker" while main-extraction
-        facts use the real name, creating two nodes for the same person.
+        procedural facts get subject "Speaker" or a display name while
+        main-extraction facts use the speaker id, creating two nodes for
+        the same person.
         """
         tmpl = _load_prompt("extraction_procedural.txt", _DEFAULT_PROCEDURAL_PROMPT)
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
-            speaker_context=build_speaker_context("Alex"),
+            speaker_context=build_speaker_context("Speaker0", "Alex"),
             entity_types=format_entity_types(scope="procedural"),
             predicate_examples=format_predicate_examples(scope="procedural"),
         )
+        # The directive must mention the speaker id as the required subject.
+        assert "Speaker0" in rendered
+        # The display name appears as comprehension context.
         assert "Alex" in rendered
-        assert "'Alex'" in rendered
 
 
 class TestAnonymizationPrompt:
@@ -646,3 +666,198 @@ class TestMergerContradictionPrompt:
         file_path = _DEFAULT_PROMPT_DIR / "merger_contradiction.txt"
         assert file_path.exists(), f"Prompt file not found: {file_path}"
         assert file_path.read_text().strip() == _CONTRADICTION_PROMPT
+
+
+class TestSpeakerDirectiveFile:
+    """Contract tests for ``configs/prompts/speaker_directive.txt``.
+
+    The file holds two sentinel-delimited sections consumed by separate callers:
+
+    * ``EXTRACTION-DIRECTIVE`` — loaded by ``build_speaker_context`` and
+      injected into the extraction user prompt via ``{speaker_context}``.
+    * ``INFERENCE-IDENTITY`` — loaded by ``_build_speaker_prefix`` (local
+      inference path only; SOTA path is excluded for privacy).
+
+    Tests verify the section-split loader, slot rendering, and the
+    SOTA-privacy invariant.
+    """
+
+    def test_file_exists(self):
+        """speaker_directive.txt must be present under the default prompt dir."""
+        path = _DEFAULT_PROMPT_DIR / "speaker_directive.txt"
+        assert path.exists(), f"speaker_directive.txt not found at {path}"
+
+    def test_section_split_returns_both_sections(self):
+        """_load_speaker_directive_section returns both named sections without error."""
+        from paramem.graph.prompts import _load_speaker_directive_section
+
+        extraction = _load_speaker_directive_section("EXTRACTION-DIRECTIVE")
+        inference = _load_speaker_directive_section("INFERENCE-IDENTITY")
+        assert extraction, "EXTRACTION-DIRECTIVE section must be non-empty"
+        assert inference, "INFERENCE-IDENTITY section must be non-empty"
+        # The two sections must differ.
+        assert extraction != inference
+
+    def test_extraction_directive_renders_slots(self):
+        """EXTRACTION-DIRECTIVE section renders {speaker_id} and {speaker_name} slots."""
+        from paramem.graph.prompts import _load_speaker_directive_section
+
+        tmpl = _load_speaker_directive_section("EXTRACTION-DIRECTIVE")
+        rendered = tmpl.format(speaker_id="Speaker0", speaker_name="Alice")
+        assert "Speaker0" in rendered
+        assert "Alice" in rendered
+        # No unrendered slot tokens remain.
+        assert "{speaker_id}" not in rendered
+        assert "{speaker_name}" not in rendered
+
+    def test_inference_identity_renders_slots(self):
+        """INFERENCE-IDENTITY section renders {speaker_id} and {speaker_name} slots."""
+        from paramem.graph.prompts import _load_speaker_directive_section
+
+        tmpl = _load_speaker_directive_section("INFERENCE-IDENTITY")
+        rendered = tmpl.format(speaker_id="Speaker0", speaker_name="Alice")
+        assert "Speaker0" in rendered
+        assert "Alice" in rendered
+        assert "{speaker_id}" not in rendered
+        assert "{speaker_name}" not in rendered
+
+    def test_unknown_section_raises_key_error(self):
+        """Requesting a non-existent section raises KeyError immediately."""
+        import pytest
+
+        from paramem.graph.prompts import _load_speaker_directive_section
+
+        with pytest.raises(KeyError, match="NONEXISTENT"):
+            _load_speaker_directive_section("NONEXISTENT")
+
+    def test_build_speaker_context_two_arg_renders_speaker_id(self):
+        """build_speaker_context(speaker_id, speaker_name) pins id as subject."""
+        ctx = build_speaker_context("Speaker0", "Alice")
+        assert "Speaker0" in ctx
+        # Display name present as comprehension context.
+        assert "Alice" in ctx
+        # No unrendered slot tokens.
+        assert "{speaker_id}" not in ctx
+        assert "{speaker_name}" not in ctx
+
+    def test_build_speaker_context_empty_id_returns_empty(self):
+        """build_speaker_context with empty/None speaker_id returns empty string."""
+        assert build_speaker_context("", "Alice") == ""
+        assert build_speaker_context(None, "Alice") == ""
+        assert build_speaker_context(None, None) == ""
+
+    def test_build_speaker_context_no_display_name(self):
+        """Anonymous speaker: id used in place of display name; no KeyError."""
+        ctx = build_speaker_context("Speaker0", None)
+        assert "Speaker0" in ctx
+        # No unrendered slot tokens.
+        assert "{speaker_id}" not in ctx
+        assert "{speaker_name}" not in ctx
+
+    def test_sota_graph_enrichment_contains_speaker_id_note(self):
+        """W1: sota_graph_enrichment.txt must instruct the model not to de-anonymize
+        Speaker{N} ids or propose same_as pairs between them.
+        """
+        tmpl = _load_prompt("sota_graph_enrichment.txt", "")
+        lower = tmpl.lower()
+        # The note must reference the system-id format.
+        assert "speaker" in lower and ("identifier" in lower or "system" in lower), (
+            "sota_graph_enrichment.txt must note that Speaker{N} is a system id."
+        )
+        assert "do not" in lower or "never" in lower, (
+            "sota_graph_enrichment.txt must forbid de-anonymizing or renaming Speaker{N} ids."
+        )
+
+
+class TestB2AnonymizerPrivacy:
+    """B2 privacy regression tests for the SOTA-egress anonymizer.
+
+    Under id-as-subject the session speaker entity is named ``Speaker0``
+    (not the display name).  The deterministic builder in
+    ``_build_anonymization_mapping`` must still cover the display name
+    ("Tobias") so it cannot egress to SOTA verbatim in the anonymized
+    transcript.
+
+    Two paths:
+    1. Named speaker (``speaker_name="Tobias"``): display name must be
+       covered under the speaker entity placeholder.
+    2. Anonymous speaker (``speaker_name=None``): ``Speaker0`` is covered
+       by the entity-mint pass; no leak.
+    """
+
+    @staticmethod
+    def _make_graph(entity_name: str, speaker_id_attr: str | None):
+        """Build a minimal SessionGraph with one person entity."""
+        from paramem.graph.schema import Entity, SessionGraph
+
+        entities = [
+            Entity(
+                name=entity_name,
+                entity_type="person",
+                speaker_id=speaker_id_attr,
+            )
+        ]
+        return SessionGraph(
+            session_id="b2_test",
+            timestamp="2026-06-24T00:00:00Z",
+            entities=entities,
+            relations=[],
+        )
+
+    def test_named_speaker_display_name_covered(self):
+        """When speaker entity is Speaker0 and display name is 'Tobias',
+        the anonymizer must cover 'Tobias' under the speaker placeholder.
+        """
+        from paramem.graph.extractor import _build_anonymization_mapping
+
+        graph = self._make_graph("Speaker0", "Speaker0")
+        forward, _reverse = _build_anonymization_mapping(
+            graph,
+            {},
+            pii_scope={"person"},
+            speaker_name="Tobias",
+        )
+        # Speaker0 is covered by the entity-mint pass.
+        assert "Speaker0" in forward, "Speaker0 entity must be in forward mapping"
+        # Tobias must be covered by the speaker-name seeding branch.
+        assert "Tobias" in forward, (
+            "Display name 'Tobias' must be covered in the forward mapping; "
+            "otherwise it can egress verbatim to SOTA."
+        )
+        # Both map to the same placeholder (speaker entity reuse).
+        assert forward["Speaker0"] == forward["Tobias"], (
+            "Speaker0 and Tobias must share the same placeholder (speaker entity reuse)."
+        )
+
+    def test_named_speaker_anonymized_transcript_excludes_display_name(self):
+        """Transcript containing 'Tobias' verbatim is scrubbed when display name is seeded."""
+        from paramem.graph.extractor import _anonymize_transcript, _build_anonymization_mapping
+
+        graph = self._make_graph("Speaker0", "Speaker0")
+        forward, _reverse = _build_anonymization_mapping(
+            graph,
+            {},
+            pii_scope={"person"},
+            speaker_name="Tobias",
+        )
+        raw_transcript = "[user] Hi, I'm Tobias and I work at Acme."
+        anon = _anonymize_transcript(raw_transcript, forward)
+        assert "Tobias" not in anon, (
+            "Anonymized transcript must not contain the display name 'Tobias'."
+        )
+
+    def test_anonymous_speaker_speaker0_covered_no_leak(self):
+        """Anonymous speaker (speaker_name=None): Speaker0 entity is covered, no crash."""
+        from paramem.graph.extractor import _build_anonymization_mapping
+
+        graph = self._make_graph("Speaker0", "Speaker0")
+        forward, _reverse = _build_anonymization_mapping(
+            graph,
+            {},
+            pii_scope={"person"},
+            speaker_name=None,
+        )
+        # Speaker0 covered by entity-mint pass.
+        assert "Speaker0" in forward
+        # No crash; result is a valid mapping.
+        assert isinstance(forward, dict)

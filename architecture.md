@@ -141,7 +141,7 @@ The local model owns everything that touches real user data; the SOTA cloud mode
 sees only anonymized placeholders. Every stage falls forward — a failure at stage
 N keeps the predecessor's output and continues.
 
-1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. Speaker-name injection pins the real speaker as canonical subject.
+1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. The session speaker's stable `Speaker{N}` system id is injected as the canonical subject of their facts; the display name is passed as comprehension context and resolved to a name only at inference/render time.
 2. **Anonymize** (`configs/prompts/anonymization.txt`): local model produces `{real → placeholder}` mapping + anonymized transcript.
 3. **Leak guard + repair**: PII-scoped check with optional spaCy NER cross-check. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`). Missed names extend the mapping, hallucinated names drop referencing triples, orphan placeholders are dropped at the residual sweep.
 4. **SOTA enrichment with delta protocol** (`configs/prompts/sota_enrichment.txt`): SOTA returns a delta envelope `{add, modify, drop, bindings}` — only the changes against the input fact list, plus `bindings: {placeholder: real_name}` for net-new entities. The pipeline applies the delta, merges bindings before de-anonymization, and reconstructs the updated transcript locally. No transcript token-diff and no fact-echo (order-of-magnitude token reduction vs. the prior "echo every fact" envelope).

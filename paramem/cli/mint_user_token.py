@@ -231,7 +231,11 @@ def run(args: argparse.Namespace) -> int:
     store_path = Path(data_dir) / "user_tokens.json"
 
     store = UserTokenStore(store_path)
-    token = store.mint(effective_speaker, args.label, scope=scope)
+    try:
+        token = store.mint(effective_speaker, args.label, scope=scope)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     # Build and emit the QR only when --server-url is given.  Without it we
     # cannot produce an absolute deep-link that the native camera can open.

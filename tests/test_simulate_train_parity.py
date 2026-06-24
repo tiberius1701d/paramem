@@ -1351,8 +1351,9 @@ class TestConsolidateSimulateFold:
         assert main_path.exists(), "graph.json must be written after the simulate fold"
         saved_graph = load_memory_from_disk(main_path)
 
-        # _resolve_entity keys speaker nodes by speaker_id directly.
-        node_key = "Speaker0"
+        # §0 invariant (Step 2): speaker node key is the casefolded speaker_id.
+        # canonical_speaker("Speaker0") == "speaker0"
+        node_key = "speaker0"
         assert node_key in saved_graph.nodes, (
             f"Speaker subject node {node_key!r} missing from merged graph after simulate path; "
             f"nodes present: {list(saved_graph.nodes)}"
@@ -1365,7 +1366,7 @@ class TestConsolidateSimulateFold:
             "entities=[] so speaker nodes received entity_type='concept' with no speaker_id."
         )
         assert node_data.get("speaker_id") == "Speaker0", (
-            f"Simulate path: expected speaker_id='Speaker0' on speaker subject node; "
+            f"Simulate path: expected speaker_id='Speaker0' (cased, in node attribute); "
             f"got speaker_id={node_data.get('speaker_id')!r}. "
             "Regression: _synth_speaker_entities was not applied to the simulate path."
         )

@@ -9,7 +9,7 @@ from paramem.graph.extractor import (
     _normalize_extraction,
     _stamp_speaker_entity,
 )
-from paramem.graph.schema import Entity, Relation, SessionGraph
+from paramem.graph.schema import Entity, SessionGraph
 
 
 class TestExtractJsonBlock:
@@ -227,7 +227,12 @@ class TestNormalizeExtraction:
 
 
 class TestStampSpeakerEntity:
-    """Unit tests for _stamp_speaker_entity post-processor."""
+    """Unit tests for _stamp_speaker_entity post-processor (id-based stamping).
+
+    Under the id-as-subject convention the model emits ``Speaker{N}`` as the
+    entity name and relation subject.  The stamp function identifies entities
+    by structural speaker-id form, not by display-name match.
+    """
 
     def _make_graph(self, entities, relations=None):
         """Helper: build a minimal SessionGraph."""
@@ -238,105 +243,117 @@ class TestStampSpeakerEntity:
             relations=relations or [],
         )
 
-    def test_stamps_speaker_id_on_matching_entity(self):
-        """Entity whose name matches speaker_name receives speaker_id."""
+    def test_stamps_session_speaker_entity_by_id(self):
+        """Entity whose name is the session speaker id receives the authoritative cased id."""
         graph = self._make_graph(
             entities=[
-                Entity(name="Alex", entity_type="person"),
+                Entity(name="Speaker0", entity_type="person"),
                 Entity(name="Berlin", entity_type="place"),
             ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
-        alex = next(e for e in result.entities if e.name == "Alex")
-        assert alex.speaker_id == "Speaker0"
+        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="Speaker0")
+        speaker_ent = next(e for e in result.entities if e.name == "Speaker0")
+        assert speaker_ent.speaker_id == "Speaker0"
         berlin = next(e for e in result.entities if e.name == "Berlin")
         assert berlin.speaker_id is None
 
-    def test_folds_full_name_duplicate_into_first_name_canonical(self):
-        """When the model emits both 'Alex' and 'Alex Morgan', fold 'Alex Morgan'
-        into 'Alex', merge attributes, and rewrite relations."""
+    def test_display_name_entity_is_not_stamped(self):
+        """A display-name entity (not a speaker id) must not receive speaker_id."""
         graph = self._make_graph(
             entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(
-                    name="Alex Morgan",
-                    entity_type="person",
-                    attributes={"has_last_name": "Morgan"},
-                ),
-                Entity(name="Brightfield Labs", entity_type="organization"),
-            ],
-            relations=[
-                Relation(
-                    subject="Alex Morgan",
-                    predicate="works_at",
-                    object="Brightfield Labs",
-                    relation_type="factual",
-                    speaker_id="Speaker0",
-                ),
-                Relation(
-                    subject="Alex",
-                    predicate="lives_in",
-                    object="Berlin",
-                    relation_type="factual",
-                    speaker_id="Speaker0",
-                ),
-            ],
+                Entity(name="Tobias Becker", entity_type="person"),
+                Entity(name="Speaker0", entity_type="person"),
+            ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
+        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="Speaker0")
+        third_party = next(e for e in result.entities if e.name == "Tobias Becker")
+        assert third_party.speaker_id is None
+        speaker_ent = next(e for e in result.entities if e.name == "Speaker0")
+        assert speaker_ent.speaker_id == "Speaker0"
 
-        # Only one speaker entity should remain.
-        names = [e.name for e in result.entities]
-        assert "Alex" in names
-        assert "Alex Morgan" not in names, f"Duplicate not folded; entities: {names}"
+    def test_other_speaker_id_entity_receives_own_name(self):
+        """A different Speaker{N} entity (not the session speaker) gets its own
+        name as speaker_id, preserving separate speaker identity."""
+        graph = self._make_graph(
+            entities=[
+                Entity(name="Speaker0", entity_type="person"),
+                Entity(name="Speaker1", entity_type="person"),
+                Entity(name="Vienna", entity_type="place"),
+            ]
+        )
+        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="Speaker0")
+        s0 = next(e for e in result.entities if e.name == "Speaker0")
+        s1 = next(e for e in result.entities if e.name == "Speaker1")
+        assert s0.speaker_id == "Speaker0"
+        assert s1.speaker_id == "Speaker1"
+        vienna = next(e for e in result.entities if e.name == "Vienna")
+        assert vienna.speaker_id is None
 
-        # The canonical entity has the last name merged in and speaker_id set.
-        alex = next(e for e in result.entities if e.name == "Alex")
-        assert alex.speaker_id == "Speaker0"
-        assert alex.attributes.get("has_last_name") == "Morgan"
+    def test_empty_entities_list_does_not_raise(self):
+        """Empty entity list does not raise."""
+        graph = self._make_graph(entities=[])
+        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="Speaker0")
+        assert result.entities == []
 
-        # The relation originally referencing "Alex Morgan" now references "Alex".
-        works_at = next(r for r in result.relations if r.predicate == "works_at")
-        assert works_at.subject == "Alex"
-
-    def test_no_match_returns_graph_unchanged(self):
-        """When speaker_name is not found among entities, return unchanged."""
+    def test_no_speaker_id_entity_returns_graph_unchanged(self):
+        """When no entity has a speaker-id name, all speaker_id fields stay None."""
         graph = self._make_graph(entities=[Entity(name="Berlin", entity_type="place")])
-        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
+        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="Speaker0")
         assert len(result.entities) == 1
         assert result.entities[0].speaker_id is None
 
-    def test_empty_entities_list(self):
-        """Empty entity list does not raise."""
-        graph = self._make_graph(entities=[])
-        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
-        assert result.entities == []
-
-    def test_idempotent_when_no_duplicates(self):
-        """When there is no full-name duplicate, only stamping occurs — no fold."""
+    def test_casefolded_id_also_stamped(self):
+        """Entity named with the casefolded form 'speaker0' is also recognised
+        as a speaker id (is_speaker_id is case-insensitive)."""
         graph = self._make_graph(
             entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Berlin", entity_type="place"),
-            ],
-            relations=[
-                Relation(
-                    subject="Alex",
-                    predicate="lives_in",
-                    object="Berlin",
-                    relation_type="factual",
-                    speaker_id="Speaker0",
-                )
-            ],
+                Entity(name="speaker0", entity_type="person"),
+            ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name="Alex", speaker_id="Speaker0")
-        assert len(result.entities) == 2
-        assert len(result.relations) == 1
-        alex = next(e for e in result.entities if e.name == "Alex")
-        assert alex.speaker_id == "Speaker0"
+        result = _stamp_speaker_entity(graph, speaker_name=None, speaker_id="Speaker0")
+        ent = result.entities[0]
+        # speaker_ref_matches("speaker0", "Speaker0") is True → gets authoritative id.
+        assert ent.speaker_id == "Speaker0"
 
-    def test_case_insensitive_name_match(self):
-        """Name matching is case-insensitive (speaker_name='alex', entity='Alex')."""
-        graph = self._make_graph(entities=[Entity(name="Alex", entity_type="person")])
-        result = _stamp_speaker_entity(graph, speaker_name="alex", speaker_id="Speaker0")
-        alex = next(e for e in result.entities if e.name == "Alex")
-        assert alex.speaker_id == "Speaker0"
+    def test_speaker_name_none_still_stamps(self):
+        """speaker_name=None is accepted; stamping proceeds based on speaker_id only."""
+        graph = self._make_graph(
+            entities=[
+                Entity(name="Speaker0", entity_type="person"),
+            ]
+        )
+        result = _stamp_speaker_entity(graph, speaker_name=None, speaker_id="Speaker0")
+        ent = result.entities[0]
+        assert ent.speaker_id == "Speaker0"
+
+    def test_idempotent_on_already_stamped_entity(self):
+        """Calling stamp twice on an already-stamped entity is idempotent."""
+        graph = self._make_graph(
+            entities=[
+                Entity(name="Speaker0", entity_type="person", speaker_id="Speaker0"),
+                Entity(name="Berlin", entity_type="place"),
+            ]
+        )
+        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="Speaker0")
+        result2 = _stamp_speaker_entity(result, speaker_name="Tobias", speaker_id="Speaker0")
+        speaker_ent = next(e for e in result2.entities if e.name == "Speaker0")
+        assert speaker_ent.speaker_id == "Speaker0"
+        assert len(result2.entities) == 2
+
+    def test_other_speaker_casefolded_name_stamped_with_cased_id(self):
+        """Other-speaker entity emitted with casefolded name (e.g. 'speaker1')
+        must receive the canonical cased 'Speaker1' as speaker_id, not the
+        casefolded form."""
+        graph = self._make_graph(
+            entities=[
+                Entity(name="Speaker0", entity_type="person"),
+                Entity(name="speaker1", entity_type="person"),
+            ]
+        )
+        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="Speaker0")
+        s0 = next(e for e in result.entities if e.name == "Speaker0")
+        s1 = next(e for e in result.entities if e.name == "speaker1")
+        assert s0.speaker_id == "Speaker0"
+        # Must be cased "Speaker1", not the casefolded "speaker1" emitted by
+        # the model.
+        assert s1.speaker_id == "Speaker1"

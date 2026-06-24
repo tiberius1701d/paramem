@@ -436,13 +436,12 @@ class TestSpeakerIdDedup:
         )
 
     def test_speaker_node_keyed_by_speaker_id(self):
-        """Speaker entity is keyed by ``speaker_id`` in the graph; the
-        display name moves to ``attributes["name"]``.
+        """Speaker entity is keyed by the casefolded speaker_id in the graph;
+        the display name moves to ``attributes["name"]``.
 
-        This is the architectural invariant from
-        :class:`paramem.graph.schema.Entity`: ``speaker_id`` is the
-        canonical graph identity; ``name`` is a mutable display
-        attribute.
+        §0 invariant (Step 2): node keys for speakers are the casefolded form
+        of the speaker_id (``canonical_speaker("Speaker0") == "speaker0"``).
+        The display name and the raw ``speaker_id`` attribute remain cased.
         """
         m = GraphMerger(similarity_threshold=85.0)
         sg = SessionGraph(
@@ -458,11 +457,12 @@ class TestSpeakerIdDedup:
             relations=[],
         )
         m.merge(sg)
-        # Node key IS the speaker_id, NOT the display name.
-        assert "Speaker0" in m.graph.nodes
+        # Node key IS the casefolded speaker_id, NOT the cased form or the display name.
+        assert "speaker0" in m.graph.nodes
+        assert "Speaker0" not in m.graph.nodes
         assert "Alex" not in m.graph.nodes
-        assert m.graph.nodes["Speaker0"]["speaker_id"] == "Speaker0"
-        assert m.graph.nodes["Speaker0"]["attributes"]["name"] == "Alex"
+        assert m.graph.nodes["speaker0"]["speaker_id"] == "Speaker0"
+        assert m.graph.nodes["speaker0"]["attributes"]["name"] == "Alex"
 
     def test_non_speaker_entities_still_dedup_by_name(self):
         """Object entities (speaker_id=None) must still dedup by name (regression)."""
@@ -517,9 +517,9 @@ class TestSpeakerIdDedup:
         )
         m.merge(sg1)
         m.merge(sg2)
-        # Speaker entity is keyed by speaker_id; display name lives in
-        # attributes alongside the merged role / last_name.
-        attrs = m.graph.nodes["Speaker0"]["attributes"]
+        # Speaker entity is keyed by casefolded speaker_id ("speaker0"); display name
+        # lives in attributes alongside the merged role / last_name.
+        attrs = m.graph.nodes["speaker0"]["attributes"]
         assert attrs.get("role") == "engineer"
         assert attrs.get("has_last_name") == "Kim"
         assert attrs.get("name") == "Alex"
@@ -564,7 +564,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
         )
         m.merge(sg1)
         m.merge(sg2)
-        assert m.graph.nodes["Speaker0"]["attributes"]["has_email"] == "alex@example.com"
+        assert m.graph.nodes["speaker0"]["attributes"]["has_email"] == "alex@example.com"
 
     def test_na_placeholder_does_not_overwrite(self):
         from paramem.graph.merger import GraphMerger
@@ -598,7 +598,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
         )
         m.merge(sg1)
         m.merge(sg2)
-        assert m.graph.nodes["Speaker0"]["attributes"]["has_phone"] == "+1 555 123 4567"
+        assert m.graph.nodes["speaker0"]["attributes"]["has_phone"] == "+1 555 123 4567"
 
     def test_real_value_supersedes_existing_empty(self):
         """Reverse direction: if first chunk emits empty, second chunk
@@ -634,7 +634,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
         )
         m.merge(sg1)
         m.merge(sg2)
-        assert m.graph.nodes["Speaker0"]["attributes"]["has_email"] == "alex@example.com"
+        assert m.graph.nodes["speaker0"]["attributes"]["has_email"] == "alex@example.com"
 
 
 class TestMultiUserNameCollision:
@@ -727,12 +727,12 @@ class TestMultiUserNameCollision:
         ``speaker_id`` unset (he's not the speaker of that session).
 
         The name namespace and the speaker-ID namespace are disjoint by
-        construction: speaker IDs follow the ``Speaker_N`` pattern
+        construction: speaker IDs follow the ``Speaker{N}`` pattern
         produced by the speaker pool, so a display name like
-        ``"Alex"`` will never collide with a speaker_id-keyed node.
+        ``"Alex"`` will never collide with a casefolded speaker-id node key.
         The third-party Alex becomes a separate node keyed by
-        ``"alex"`` (canonical form); Speaker0's node remains keyed by
-        ``"Speaker0"`` with its own attributes intact.
+        ``"alex"`` (canonical form); Speaker0's node is keyed by
+        ``"speaker0"`` (casefolded §0 key) with its own attributes intact.
         """
         m = GraphMerger(similarity_threshold=85.0)
         m.merge(self._build_speaker_session("s001", "Speaker0", "Walker", "Portland"))
@@ -746,15 +746,17 @@ class TestMultiUserNameCollision:
         )
         m.merge(third_party)
 
-        # Speaker0 is keyed by speaker_id; third-party Alex by canonical name "alex" —
-        # disjoint namespaces, two separate nodes.
-        assert "Speaker0" in m.graph.nodes
+        # Speaker0 is keyed by the casefolded speaker_id ("speaker0");
+        # third-party Alex is keyed by canonical name "alex" — disjoint
+        # namespaces, two separate nodes.
+        assert "speaker0" in m.graph.nodes
+        assert "Speaker0" not in m.graph.nodes
         assert "alex" in m.graph.nodes
-        assert m.graph.nodes["Speaker0"]["speaker_id"] == "Speaker0"
+        assert m.graph.nodes["speaker0"]["speaker_id"] == "Speaker0"
         assert m.graph.nodes["alex"].get("speaker_id") is None
         # Speaker0's last_name attribute is untouched by the third-party
         # merge (different node, different namespace).
-        assert m.graph.nodes["Speaker0"]["attributes"]["last_name"] == "Walker"
+        assert m.graph.nodes["speaker0"]["attributes"]["last_name"] == "Walker"
 
 
 class TestCrossPredicateContradictionFlag:
@@ -2188,10 +2190,10 @@ class TestSessionIdsProvenanceUnion:
         )
         m.merge(s1)
 
-        # Speaker entities are keyed by speaker_id; non-speakers by canonical form.
-        # Relation subject="Alex" with speaker_id="Speaker0" → node key "Speaker0".
+        # Speaker entities are keyed by the casefolded speaker_id ("speaker0").
+        # Relation subject="Alex" with speaker_id="Speaker0" → node key "speaker0".
         # Relation object="Berlin" → canonical node key "berlin".
-        edges = list(m.graph["Speaker0"]["berlin"].values())
+        edges = list(m.graph["speaker0"]["berlin"].values())
         assert len(edges) == 1, f"expected 1 edge; got {len(edges)}"
         sessions = edges[0]["sessions"]
         assert "real-session-abc" in sessions, (
@@ -2214,7 +2216,7 @@ class TestSessionIdsProvenanceUnion:
         )
         m.merge(s1)
 
-        edges = list(m.graph["Speaker0"]["berlin"].values())
+        edges = list(m.graph["speaker0"]["berlin"].values())
         sessions = edges[0]["sessions"]
         assert sessions == ["session-xyz"], (
             f"Empty session_ids → edge['sessions'] == [scalar]; got {sessions}"
@@ -2250,8 +2252,8 @@ class TestSessionIdsProvenanceUnion:
         )
         m.merge(s2)
 
-        # Speaker entity keyed by speaker_id "Speaker0"; object "Berlin" → "berlin".
-        edges = list(m.graph["Speaker0"]["berlin"].values())
+        # Speaker entity keyed by casefolded speaker_id "speaker0"; object "Berlin" → "berlin".
+        edges = list(m.graph["speaker0"]["berlin"].values())
         assert len(edges) == 1, f"Duplicate SPO must collapse to one edge; got {len(edges)}"
         sessions = set(edges[0]["sessions"])
         assert "session-A" in sessions, f"session-A missing from {sessions}"
@@ -2288,15 +2290,15 @@ class TestSessionIdsProvenanceUnion:
         )
         m.merge(s2)
 
-        # Speaker entities are keyed by speaker_id in the graph.
+        # Speaker entities are keyed by the casefolded speaker_id ("speaker0").
         # session_ids union touches only edge['sessions'] — never the node.
-        speaker_node = m.graph.nodes.get("Speaker0", {})
+        speaker_node = m.graph.nodes.get("speaker0", {})
         assert speaker_node.get("speaker_id") == "Speaker0", (
-            "speaker_id on the subject node must come from the Entity, not from "
+            "speaker_id attribute on the subject node must come from the Entity, not from "
             f"session_ids union; got {speaker_node.get('speaker_id')!r}"
         )
         # And the edge carries both real session ids.
-        edges = list(m.graph["Speaker0"]["berlin"].values())
+        edges = list(m.graph["speaker0"]["berlin"].values())
         sessions = set(edges[0]["sessions"])
         assert "session-A" in sessions and "session-B" in sessions, (
             f"Both real session ids must be in edge['sessions']; got {sessions}"
@@ -2486,4 +2488,190 @@ class TestMergerEdgeStamps:
         )
         assert m.graph.has_edge("a_speaker", "z_speaker"), (
             "Speaker←speaker edge must survive (no E-2 swap for speaker pairs)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Casing-collision regression test (Step 2 — headline bug)
+# ---------------------------------------------------------------------------
+
+
+class TestSpeakerCasingCollisionRegression:
+    """Regression: a Speaker0 Entity and a Speaker0 relation-endpoint that
+    arrives WITHOUT a matching Entity must resolve to exactly ONE node key.
+
+    Before Step 2: _resolve_entity returned entity.speaker_id VERBATIM
+    ("Speaker0") while the relation-endpoint fallback used canonical_id("Speaker0")
+    == "speaker0", minting two distinct node keys.  This test must FAIL on
+    pre-Step-2 code and PASS after.
+    """
+
+    def test_entity_and_fallback_endpoint_resolve_to_one_node(self):
+        """Merge a session where the speaker arrives as an Entity (Speaker0) and
+        ALSO as a relation subject without a matching Entity entry.
+
+        The merger must produce exactly ONE node for Speaker0 — keyed as the
+        casefolded form ("speaker0") — regardless of which path resolved it.
+        """
+        merger = GraphMerger(similarity_threshold=85.0)
+
+        # The session has a Speaker0 Entity and a relation whose subject is
+        # "Speaker0" but references a separate entity (SomeOrg) that has no
+        # Entity declaration.  The "Speaker0" subject on the relation thus goes
+        # through the fallback resolution path.
+        session = SessionGraph(
+            session_id="s_casing",
+            timestamp="2026-06-24T10:00:00Z",
+            entities=[
+                # Speaker0 arrives as a full Entity.
+                Entity(
+                    name="Speaker0",
+                    entity_type="person",
+                    speaker_id="Speaker0",
+                ),
+            ],
+            relations=[
+                # Relation whose subject IS "Speaker0" but "Speaker0" is already
+                # in entity_name_map from the entity above, so it resolves via the
+                # entity path.  We also need a relation that exercises the FALLBACK
+                # path: one where the subject is NOT in entity_name_map.
+                Relation(
+                    subject="Speaker0",
+                    predicate="works at",
+                    object="Acme",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                ),
+            ],
+        )
+        merger.merge(session)
+
+        # Now merge a second session that has "Speaker0" as a relation SUBJECT
+        # with NO corresponding Entity — this exercises the :370 fallback path.
+        session2 = SessionGraph(
+            session_id="s_casing2",
+            timestamp="2026-06-24T11:00:00Z",
+            entities=[],  # Intentionally NO Entity for Speaker0
+            relations=[
+                Relation(
+                    subject="Speaker0",
+                    predicate="lives in",
+                    object="Berlin",
+                    relation_type="factual",
+                    speaker_id="Speaker0",
+                ),
+            ],
+        )
+        merger.merge(session2)
+
+        # Both sessions must have resolved Speaker0 to the SAME casefolded key.
+        # Pre-fix: entity path → "Speaker0", fallback path → "speaker0" → 2 nodes.
+        # Post-fix: both paths → canonical_speaker("Speaker0") == "speaker0" → 1 node.
+        speaker_nodes = [n for n in merger.graph.nodes if n in ("speaker0", "Speaker0")]
+        assert len(speaker_nodes) == 1, (
+            f"Expected exactly one Speaker0 node key (casefolded), "
+            f"got {speaker_nodes!r} — casing-collision dup not eliminated."
+        )
+        assert speaker_nodes[0] == "speaker0", (
+            f"Speaker node key must be casefolded 'speaker0', got {speaker_nodes[0]!r}"
+        )
+
+        # The display name must still be stored in attributes["name"] (cased).
+        node_data = merger.graph.nodes["speaker0"]
+        assert node_data.get("attributes", {}).get("name") == "Speaker0", (
+            "Display name must be cased 'Speaker0' in attributes['name']"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Id-based stamp → merger integration: speaker_id attribute + both_speakers
+# ---------------------------------------------------------------------------
+
+
+class TestStampedSpeakerMergerIntegration:
+    """Verify that an entity stamped by _stamp_speaker_entity (id-based)
+    produces the correct merger node state and enables the both_speakers guard
+    on symmetric relations.
+    """
+
+    def _make_stamped_session(
+        self,
+        session_id: str,
+        speaker_id: str,
+        place: str,
+    ) -> "SessionGraph":
+        """Build a SessionGraph where the speaker entity is already stamped
+        (entity.speaker_id set, entity.name == speaker_id as the model emits)."""
+        return SessionGraph(
+            session_id=session_id,
+            timestamp="2026-06-24T10:00:00Z",
+            entities=[
+                Entity(
+                    name=speaker_id,
+                    entity_type="person",
+                    speaker_id=speaker_id,  # stamped by _stamp_speaker_entity
+                ),
+                Entity(name=place, entity_type="place"),
+            ],
+            relations=[
+                Relation(
+                    subject=speaker_id,
+                    predicate="lives in",
+                    object=place,
+                    relation_type="factual",
+                    speaker_id=speaker_id,
+                ),
+            ],
+        )
+
+    def test_stamped_entity_produces_correct_node_attributes(self):
+        """After merging a stamped-speaker session, the graph node for the
+        speaker must carry speaker_id attribute (cased) and entity_type person."""
+        m = GraphMerger(similarity_threshold=85.0)
+        session = self._make_stamped_session("s001", "Speaker0", "Berlin")
+        m.merge(session)
+
+        node_key = "speaker0"
+        assert node_key in m.graph, f"Expected node '{node_key}' in graph"
+        node_data = m.graph.nodes[node_key]
+        assert node_data.get("speaker_id") == "Speaker0", (
+            f"speaker_id attribute must be cased 'Speaker0', got {node_data.get('speaker_id')!r}"
+        )
+        assert node_data.get("entity_type") == "person", (
+            f"entity_type must be 'person', got {node_data.get('entity_type')!r}"
+        )
+
+    def test_both_speakers_guard_works_for_two_stamped_speakers(self):
+        """Two speaker endpoints (both stamped) on a symmetric relation must
+        produce two distinct directed edges — the both_speakers guard prevents
+        the E-2 canonical swap that would collapse them."""
+        m = GraphMerger(similarity_threshold=85.0)
+        m.merge(self._make_stamped_session("s001", "Speaker0", "Berlin"))
+        m.merge(self._make_stamped_session("s002", "Speaker1", "Munich"))
+
+        # Add a symmetric social relation between the two speakers.
+        rel_0_to_1 = Relation(
+            subject="speaker0",
+            predicate="colleague of",
+            object="speaker1",
+            relation_type="social",
+            speaker_id="Speaker0",
+            symmetric=True,
+        )
+        rel_1_to_0 = Relation(
+            subject="speaker1",
+            predicate="colleague of",
+            object="speaker0",
+            relation_type="social",
+            speaker_id="Speaker1",
+            symmetric=True,
+        )
+        m._upsert_relation("speaker0", "speaker1", rel_0_to_1, "s3", "2026-06-24T11:00:00Z")
+        m._upsert_relation("speaker1", "speaker0", rel_1_to_0, "s4", "2026-06-24T12:00:00Z")
+
+        assert m.graph.has_edge("speaker0", "speaker1"), (
+            "Speaker0→Speaker1 edge must survive (both_speakers guard active)"
+        )
+        assert m.graph.has_edge("speaker1", "speaker0"), (
+            "Speaker1→Speaker0 edge must survive (both_speakers guard active)"
         )

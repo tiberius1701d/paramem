@@ -58,24 +58,100 @@ def _language_instruction(language: str | None, config: ServerConfig | None = No
     return f"Respond in {name}."
 
 
+def _build_speaker_prefix(
+    speaker: str | None,
+    language: str | None,
+    config: ServerConfig | None,
+    *,
+    include_id_mapping: bool,
+    speaker_id: str | None = None,
+) -> str:
+    """Assemble the speaker + language prefix for a system prompt.
+
+    This is the single shared implementation for the "You are speaking with X"
+    + language instruction block used by both local inference and SOTA
+    escalation paths.
+
+    When ``include_id_mapping=True`` (local inference path only) and both
+    ``speaker_id`` and ``speaker`` are provided, the ``INFERENCE-IDENTITY``
+    section of ``configs/prompts/speaker_directive.txt`` is injected so that
+    recalled ``Speaker{N}`` facts resolve to the display name in model output.
+
+    Args:
+        speaker: Display name of the resolved speaker, or ``None`` when
+            unknown or suppressed (e.g. anonymous profile).
+        language: BCP-47 language code, or ``None`` / ``"en"`` when no
+            instruction is needed.
+        config: Server config, used to derive the language display name via
+            ``config.tts.language_name``.
+        include_id_mapping: When ``True`` (local inference path), injects the
+            ``Speaker{N} → display name`` mapping from the INFERENCE-IDENTITY
+            section of ``speaker_directive.txt``.  **Must be ``False`` for the
+            SOTA escalation path** (cloud privacy invariant: the id→name
+            mapping is never sent to the cloud).
+        speaker_id: System speaker id (e.g. ``"Speaker0"``).  Required for
+            the id mapping to fire (both ``speaker_id`` and ``speaker`` must be
+            non-empty when ``include_id_mapping=True``).  Ignored (and must be
+            ``None``) on the SOTA path (``include_id_mapping=False``).
+
+    Returns:
+        A prefix string (possibly empty) ready to be prepended to the base
+        system prompt.
+    """
+    parts: list[str] = []
+    if speaker:
+        parts.append(f"You are speaking with {speaker}.")
+    if include_id_mapping and speaker_id and speaker:
+        # PRIVACY: this branch is local-inference only.  _escalate_to_sota
+        # calls with include_id_mapping=False so this block is unreachable on
+        # the cloud path.  The id→name mapping must NEVER reach the cloud.
+        from paramem.graph.prompts import _load_speaker_directive_section
+
+        template = _load_speaker_directive_section("INFERENCE-IDENTITY")
+        mapping_sentence = template.format(speaker_id=speaker_id, speaker_name=speaker)
+        parts.append(mapping_sentence)
+    lang_instr = _language_instruction(language, config)
+    if lang_instr:
+        parts.append(lang_instr)
+    return " ".join(parts)
+
+
 def _personalize_prompt(
     base_prompt: str,
     speaker: str | None,
     language: str | None = None,
     config: ServerConfig | None = None,
+    *,
+    speaker_id: str | None = None,
 ) -> str:
-    """Inject speaker name and language instruction into the system prompt.
+    """Inject speaker name, id→name mapping, and language instruction into the system prompt.
+
+    Uses :func:`_build_speaker_prefix` to assemble the prefix so that the
+    local-inference and SOTA-escalation paths share exactly one implementation.
+
+    When both ``speaker`` (display name) and ``speaker_id`` are provided, the
+    ``INFERENCE-IDENTITY`` section of ``speaker_directive.txt`` is injected so
+    that recalled ``Speaker{N}`` facts resolve to the display name at inference
+    time.  This mapping is LOCAL-ONLY and must never reach the cloud
+    (``_escalate_to_sota`` calls ``_build_speaker_prefix`` with
+    ``include_id_mapping=False``).
 
     Greeting is handled at the app layer (prepended to response text)
     so it works across all paths including escalation.
+
+    Args:
+        base_prompt: The base system prompt to prepend to.
+        speaker: Display name of the resolved speaker, or ``None``.
+        language: BCP-47 language code, or ``None`` / ``"en"``.
+        config: Server config for language display names.
+        speaker_id: System speaker id (e.g. ``"Speaker0"``).  When
+            provided alongside ``speaker``, the id→name mapping is
+            injected via the INFERENCE-IDENTITY section of the prompt
+            file.
     """
-    parts = []
-    if speaker:
-        parts.append(f"You are speaking with {speaker}.")
-    lang_instr = _language_instruction(language, config)
-    if lang_instr:
-        parts.append(lang_instr)
-    prefix = " ".join(parts)
+    prefix = _build_speaker_prefix(
+        speaker, language, config, include_id_mapping=True, speaker_id=speaker_id
+    )
     if prefix:
         return prefix + " " + base_prompt
     return base_prompt
@@ -210,7 +286,10 @@ def handle_chat(
         # Pre-compute sanitization once for all cloud escalation paths.
         # Personal-content detection is anchored on the graph's
         # subject/object names (read directly from the MemoryStore — the
-        # same source the router uses for speaker scoping) plus a
+        # same source the router uses for speaker scoping) plus the
+        # speaker's display name (M3 coverage: the display name must be
+        # flagged as a personal referent even when it is no longer a
+        # registry subject under the id-as-subject refactor) plus a
         # first-person token-set + the resolved speaker_id — the same
         # ground truth the extraction-path anonymizer uses, no static
         # keyword list.  The set is rebuilt per /chat call; cost is O(N)
@@ -223,6 +302,16 @@ def handle_chat(
                     if _name and len(_name) > 1:
                         _entity_names.add(_name.lower().strip())
             known_entities = _entity_names
+        # M3: ensure the speaker's display name is always a personal-referent
+        # signal regardless of what subjects appear in the registry.  Under
+        # id-as-subject (step 8+) the display name leaves the registry
+        # subjects; sourcing it here from the resolved ``speaker`` argument
+        # (P3-produced display name, None for anonymous) keeps the sanitizer
+        # coverage intact without coupling inference.py to SpeakerStore.
+        if speaker and len(speaker) > 1:
+            if known_entities is None:
+                known_entities = set()
+            known_entities = known_entities | {speaker.lower().strip()}
         sanitized_text, sanitization_findings = sanitize_for_cloud(
             text,
             mode=config.sanitization.mode,
@@ -565,15 +654,12 @@ def _escalate_to_sota(
     """
     sanitized_history = _sanitize_history(history, mode=config.sanitization.mode)
 
-    prompt = SOTA_PROMPT
-    parts = []
-    if speaker:
-        parts.append(f"You are speaking with {speaker}.")
-    lang_instr = _language_instruction(language, config)
-    if lang_instr:
-        parts.append(lang_instr)
-    if parts:
-        prompt = " ".join(parts) + " " + prompt
+    # PRIVACY: include_id_mapping=False — the id→name mapping must NEVER reach
+    # the cloud.  The shared helper encodes this invariant at the seam so that
+    # step 7 (which adds the mapping to the local path) cannot accidentally
+    # leak it onto the SOTA path.
+    prefix = _build_speaker_prefix(speaker, language, config, include_id_mapping=False)
+    prompt = (prefix + " " + SOTA_PROMPT) if prefix else SOTA_PROMPT
 
     logger.info(
         "SOTA escalation (%d history turns): %s",
@@ -817,7 +903,9 @@ def _probe_and_reason(
     layered_context = "\n\n".join(context_sections)
     augmented_text = f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
 
-    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker, language, config)
+    system_prompt = _personalize_prompt(
+        config.voice.load_prompt(), speaker, language, config, speaker_id=speaker_id
+    )
     messages = _build_messages(augmented_text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -867,7 +955,9 @@ def _base_model_answer(
     """
     from peft import PeftModel
 
-    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker, language, config)
+    system_prompt = _personalize_prompt(
+        config.voice.load_prompt(), speaker, language, config, speaker_id=speaker_id
+    )
     messages = _build_messages(text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 

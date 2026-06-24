@@ -1,13 +1,25 @@
-"""Unit tests for :func:`paramem.graph.name_match.canonical`.
+"""Unit tests for :func:`paramem.graph.name_match.canonical` and the
+speaker-identity primitives P1/P2 (``is_speaker_id``,
+``speaker_ref_matches``, ``canonical_speaker``).
 
 Verifies the GUARANTEED-identical-only contract: only Unicode canonical
 form, case (incl. ligatures covered by str.casefold), diacritics, and
 ``_``/``-``/whitespace-run folding are collapsed.  NFKC compatibility
 forms (superscript digits, full-width), typos, and substrings are NOT
 folded.
+
+Speaker-identity primitive tests verify the §0 invariant: every
+speaker-identity comparison routes through ``speaker_ref_matches``
+(``canonical(a) == canonical(b)``), and ``canonical_speaker`` maps a
+speaker id to its casefolded node key.
 """
 
-from paramem.graph.name_match import canonical
+from paramem.graph.name_match import (
+    canonical,
+    canonical_speaker,
+    is_speaker_id,
+    speaker_ref_matches,
+)
 
 
 class TestCaseFolding:
@@ -123,3 +135,99 @@ class TestNegatives:
 
     def test_numbers_not_folded(self):
         assert canonical("1") != canonical("2")
+
+
+# ---------------------------------------------------------------------------
+# Speaker-identity primitive tests (P1 / P2 — §0 invariant)
+# ---------------------------------------------------------------------------
+
+
+class TestIsSpeakerId:
+    """``is_speaker_id`` structural test for the ``Speaker{N}`` format."""
+
+    def test_cased_single_digit(self):
+        """Standard cased form emitted by the speaker store."""
+        assert is_speaker_id("Speaker0") is True
+
+    def test_cased_multi_digit(self):
+        assert is_speaker_id("Speaker12") is True
+
+    def test_casefolded_node_key(self):
+        """Casefolded form used as the graph node key must also pass."""
+        assert is_speaker_id("speaker0") is True
+
+    def test_casefolded_multi_digit(self):
+        assert is_speaker_id("speaker12") is True
+
+    def test_plain_name_false(self):
+        assert is_speaker_id("tobias") is False
+
+    def test_lowercase_word_speaker_false(self):
+        """'speaker' without a digit suffix is not a speaker id."""
+        assert is_speaker_id("speaker") is False
+
+    def test_cased_word_only_false(self):
+        """'Speaker' without a digit suffix is not a speaker id."""
+        assert is_speaker_id("Speaker") is False
+
+    def test_letter_suffix_false(self):
+        """'SpeakerX' uses a letter suffix, not digits — must be False."""
+        assert is_speaker_id("SpeakerX") is False
+
+    def test_empty_string_false(self):
+        assert is_speaker_id("") is False
+
+    def test_prefix_only_false(self):
+        """String must ONLY contain the Speaker{N} pattern, no trailing chars."""
+        assert is_speaker_id("Speaker0Extra") is False
+
+
+class TestSpeakerRefMatches:
+    """``speaker_ref_matches`` — the single §0 canonical comparison."""
+
+    def test_cased_vs_casefolded_true(self):
+        """The headline case: cased id vs casefolded node key are the same speaker."""
+        assert speaker_ref_matches("Speaker0", "speaker0") is True
+
+    def test_both_cased_same_true(self):
+        assert speaker_ref_matches("Speaker0", "Speaker0") is True
+
+    def test_different_speakers_false(self):
+        assert speaker_ref_matches("Speaker0", "Speaker1") is False
+
+    def test_different_speakers_casefolded_false(self):
+        assert speaker_ref_matches("speaker0", "speaker1") is False
+
+    def test_allcaps_matches(self):
+        """canonical() handles all-caps; SPEAKER12 casefolds to speaker12."""
+        assert speaker_ref_matches("Speaker12", "SPEAKER12") is True
+
+    def test_cross_number_false(self):
+        assert speaker_ref_matches("Speaker2", "Speaker20") is False
+
+
+class TestCanonicalSpeaker:
+    """``canonical_speaker`` maps a speaker id to its casefolded node key."""
+
+    def test_cased_to_casefolded(self):
+        assert canonical_speaker("Speaker0") == "speaker0"
+
+    def test_already_casefolded(self):
+        assert canonical_speaker("speaker0") == "speaker0"
+
+    def test_multi_digit(self):
+        assert canonical_speaker("Speaker12") == "speaker12"
+
+    def test_empty(self):
+        assert canonical_speaker("") == ""
+
+    def test_idempotent(self):
+        """f(f(x)) == f(x)."""
+        for s in ("Speaker0", "speaker0", "Speaker12", "SPEAKER0"):
+            once = canonical_speaker(s)
+            assert canonical_speaker(once) == once, f"Not idempotent for {s!r}"
+
+    def test_casing_collapses(self):
+        """All case variants of the same speaker id map to the same key."""
+        assert canonical_speaker("Speaker0") == canonical_speaker("speaker0")
+        assert canonical_speaker("SPEAKER0") == canonical_speaker("Speaker0")

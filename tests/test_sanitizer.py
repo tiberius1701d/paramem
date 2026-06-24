@@ -3,8 +3,11 @@
 The sanitizer detects personal content using ground truth that already
 exists in the running system:
 
-* ``known_entities`` — caller-supplied set of entity / speaker names
-  (typically ``router._all_entities | speaker_store.speaker_names()``).
+* ``known_entities`` — caller-supplied set of lowercased entity / speaker
+  names.  Assembled by ``handle_chat`` from ``memory_store.iter_entries()``
+  subject/object fields plus the resolved speaker display name (M3 — plumbed
+  directly from the ``speaker`` argument so the real name is covered even when
+  it is no longer a registry subject under id-as-subject extraction).
   Reuses the extraction pipeline's ``_anonymize_transcript`` primitive to
   decide whether the query references any of them.
 * ``speaker_id`` + first-person pronouns from a fixed token set — covers
@@ -421,3 +424,168 @@ class TestSanitizationConfigCloudMode:
 
         config = load_server_config("configs/server.yaml")
         assert config.sanitization.cloud_mode in {"block", "anonymize", "both"}
+
+
+# ---------------------------------------------------------------------------
+# M3 — speaker display-name coverage in known_entities (handle_chat plumbing)
+# ---------------------------------------------------------------------------
+
+
+class TestM3SpeakerDisplayNameCoverage:
+    """M3 coverage: the speaker's display name must be flagged as a personal
+    referent even when it is not a registry subject.
+
+    Under the id-as-subject refactor (step 8+) the registry holds ``Speaker0``
+    as the subject rather than ``"Tobias"``.  inference.py::handle_chat now
+    explicitly adds the resolved ``speaker`` display name to ``known_entities``
+    so the sanitizer still catches queries that mention the real name.
+
+    These tests verify the sanitizer side of the contract: passing the display
+    name in ``known_entities`` flags it as personal.  The inference.py plumbing
+    (which adds ``speaker`` to ``known_entities``) is covered by the integration
+    test below.
+    """
+
+    def test_display_name_in_known_entities_flags_personal(self):
+        """Querying the speaker by their display name is caught as personal."""
+        findings = check_personal_content(
+            "What does Tobias do for work?",
+            known_entities={"tobias"},
+        )
+        assert "personal_entity" in findings
+
+    def test_display_name_absent_from_known_entities_is_clean(self):
+        """Without the display name in known_entities, a name query is not personal.
+
+        This is the regression case for M3: if the display name falls out of
+        known_entities the sanitizer would let personal queries through.
+        """
+        findings = check_personal_content(
+            "What does Tobias do for work?",
+            known_entities=set(),
+        )
+        assert "personal_entity" not in findings
+
+    def test_handle_chat_adds_speaker_to_known_entities(self):
+        """handle_chat plumbs the speaker display name into known_entities.
+
+        This unit test verifies the inference.py M3 fix without invoking the
+        GPU model.  We patch the downstream sanitize_for_cloud call to capture
+        the known_entities argument and confirm it contains the speaker name.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server.inference import handle_chat
+
+        captured: dict = {}
+
+        def _fake_sanitize(text, mode="warn", *, speaker_id=None, known_entities=None, **kw):
+            captured["known_entities"] = known_entities
+            return text, []
+
+        mock_config = MagicMock()
+        mock_config.sanitization.mode = "warn"
+        mock_config.personal_referent = None
+        mock_config.debug = False
+        mock_config.voice.load_prompt.return_value = "base"
+        mock_config.sentence_type = None
+        mock_config.abstention = MagicMock()
+        mock_config.abstention.enabled = False
+
+        mock_router = MagicMock()
+        mock_plan = MagicMock()
+        mock_plan.intent.value = "GENERAL"
+        from paramem.server.router import Intent
+
+        mock_plan.intent = Intent.GENERAL
+        mock_plan.steps = []
+        mock_router.route.return_value = mock_plan
+
+        mock_model = MagicMock()
+        mock_model.gradient_checkpointing_disable = MagicMock()
+        mock_tokenizer = MagicMock()
+
+        with (
+            patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize),
+            patch(
+                "paramem.server.inference._base_model_answer",
+                return_value=MagicMock(text="ok", escalated=False, probed_keys=[]),
+            ),
+        ):
+            handle_chat(
+                text="What does Tobias do for work?",
+                conversation_id="conv1",
+                speaker="Tobias",
+                speaker_id="Speaker0",
+                history=None,
+                model=mock_model,
+                tokenizer=mock_tokenizer,
+                config=mock_config,
+                router=mock_router,
+            )
+
+        assert "known_entities" in captured
+        assert captured["known_entities"] is not None
+        assert "tobias" in captured["known_entities"]
+
+    def test_handle_chat_anonymous_speaker_not_added_to_known_entities(self):
+        """Anonymous display-name suppression: None speaker must not pollute known_entities.
+
+        When resolve_speaker_name returns None (anonymous profile), handle_chat
+        receives speaker=None and must not add anything to known_entities.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.server.inference import handle_chat
+
+        captured: dict = {}
+
+        def _fake_sanitize(text, mode="warn", *, speaker_id=None, known_entities=None, **kw):
+            captured["known_entities"] = known_entities
+            return text, []
+
+        mock_config = MagicMock()
+        mock_config.sanitization.mode = "warn"
+        mock_config.personal_referent = None
+        mock_config.debug = False
+        mock_config.voice.load_prompt.return_value = "base"
+        mock_config.sentence_type = None
+        mock_config.abstention = MagicMock()
+        mock_config.abstention.enabled = False
+
+        mock_router = MagicMock()
+        mock_plan = MagicMock()
+        from paramem.server.router import Intent
+
+        mock_plan.intent = Intent.GENERAL
+        mock_plan.steps = []
+        mock_router.route.return_value = mock_plan
+
+        mock_model = MagicMock()
+        mock_model.gradient_checkpointing_disable = MagicMock()
+        mock_tokenizer = MagicMock()
+
+        with (
+            patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize),
+            patch(
+                "paramem.server.inference._base_model_answer",
+                return_value=MagicMock(text="ok", escalated=False, probed_keys=[]),
+            ),
+        ):
+            handle_chat(
+                text="Hello there.",
+                conversation_id="conv2",
+                speaker=None,  # anonymous / not resolved
+                speaker_id="Speaker0",
+                history=None,
+                model=mock_model,
+                tokenizer=mock_tokenizer,
+                config=mock_config,
+                router=mock_router,
+            )
+
+        # known_entities may be None (no memory_store) or an empty set —
+        # but must NOT contain a non-None speaker name since speaker is None.
+        ke = captured.get("known_entities")
+        if ke is not None:
+            assert not any(v for v in ke if v)  # no truthy entity from anonymous

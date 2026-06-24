@@ -253,10 +253,11 @@ def check_personal_content(
     mapping = _build_known_entity_mapping(known_entities)
     if mapping:
         # Case-insensitive comparison: production stores lowercased entity
-        # names (assembled by the chat handler from
-        # ``memory_store.iter_entries()`` subject/object fields, plus
-        # ``SpeakerStore.speaker_names()`` lowercased by the caller), but
-        # the user's query is mixed-case.  Lowercase both sides and run
+        # names (assembled by handle_chat from ``memory_store.iter_entries()``
+        # subject/object fields, plus the resolved speaker display name — M3
+        # coverage so the real name is flagged even when it is no longer a
+        # registry subject under id-as-subject extraction), but the user's
+        # query is mixed-case.  Lowercase both sides and run
         # _anonymize_transcript with the same word-boundary substitution
         # the extraction path uses; the original text is preserved for
         # the return value.
@@ -301,9 +302,10 @@ def sanitize_for_cloud(
             interpretation — without an identified speaker there is no one
             for "I" / "my" to refer to.
         known_entities: lowercased set of entity / speaker names that count
-            as personal references.  Assembled by the chat handler from
-            ``memory_store.iter_entries()`` subject/object fields plus
-            enrolled ``SpeakerStore.speaker_names()``.
+            as personal references.  Assembled by ``handle_chat`` from
+            ``memory_store.iter_entries()`` subject/object fields plus the
+            resolved speaker display name (M3 — plumbed directly from the
+            ``speaker`` argument, not from ``SpeakerStore.speaker_names()``).
         personal_referent_config: optional
             :class:`paramem.server.config.PersonalReferentConfig`.  When
             supplied (production), the encoder-based classifier is used

@@ -23,7 +23,11 @@ from paramem.graph.extractor import (
     _graph_enrich_with_sota,
 )
 from paramem.graph.merger import GraphMerger
-from paramem.graph.name_match import canonical
+from paramem.graph.name_match import (
+    canonical,
+    is_speaker_id,
+    speaker_ref_matches,
+)
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.qa_generator import (
     partition_relations,
@@ -72,6 +76,66 @@ _SYNTHETIC_SESSION_IDS: frozenset[str] = frozenset(
         "__graph_enrichment__",
     }
 )
+
+
+def resolve_to_node_key(
+    name: str,
+    in_graph: "Callable[[str], bool]",
+    coref_map: "dict[str, str] | None" = None,
+) -> str:
+    """Resolve a surface name to the actual node key used in the graph (P5).
+
+    Collapses the two formerly-duplicated nested resolvers
+    (``_resolve_node_key`` / ``_resolve_name``) into one module-level
+    function so the resolution logic lives in exactly one place.
+
+    Resolution order:
+
+    1. **Membership shortcut** — if ``in_graph(name)`` is ``True``, the name
+       IS already a valid node key; return it unchanged.  This handles ordinary
+       non-speaker node keys (node-key model A: the key IS the canonical form)
+       without an extra ``canonical()`` call.  Note: with casefolded speaker
+       keys (§0 invariant), verbatim speaker ids (``"Speaker0"``) are NOT in
+       the graph (the key is ``"speaker0"``), so they fall through to step 2.
+    2. **Canonical fallback** — ``canonical(name)`` (casefolds, diacritic-folds,
+       separator-normalizes).  This resolves speaker ids to their casefolded node
+       keys (``"Speaker0"`` → ``"speaker0"``) and ordinary display-surface names
+       to their canonical keys.
+    3. **Coref-chain follow** (optional) — if ``coref_map`` is provided, follow
+       the drop→keep chain on the resolved key.  Cycle-guarded via a ``seen``
+       set so a malformed coref loop does not block.
+
+    The stale rationale "verbatim-first because speaker nodes are keyed
+    VERBATIM" no longer applies: after Step 2 of the speaker-identity
+    unification, speaker node keys ARE casefolded, so the membership shortcut
+    is only useful for ordinary node keys.
+
+    Args:
+        name: Surface name or node key to resolve.
+        in_graph: Callable that returns ``True`` when its argument is a live
+            node key in the graph (typically ``graph.__contains__`` or
+            ``lambda n: n in graph``).
+        coref_map: Optional mapping from dropped node key to kept node key,
+            built during the same_as contraction pass.  When provided, the
+            resolved key is followed through the chain (cycle-guarded).
+
+    Returns:
+        The resolved node key as a string.  May not be present in the graph
+        if neither the input nor its canonical form is a live node.
+    """
+    # Step 1: membership shortcut (node already keyed canonically).
+    if in_graph(name):
+        return name
+    # Step 2: canonical fallback (casefolds speaker ids, normalizes surfaces).
+    resolved = canonical(name)
+    if coref_map is None:
+        return resolved
+    # Step 3: follow the drop→keep coref chain (cycle-guarded).
+    seen: set[str] = set()
+    while resolved in coref_map and resolved not in seen:
+        seen.add(resolved)
+        resolved = coref_map[resolved]
+    return resolved
 
 
 @dataclass
@@ -2500,28 +2564,38 @@ class ConsolidationLoop:
             #   3. Surface-form safety gate (token-subset + Jaro-Winkler).
             coref_map: dict[str, str] = {}
 
-            def _resolve_node_key(name: str) -> str:
-                # Map a SOTA-returned surface name to the ACTUAL existing graph
-                # node key.  Verbatim match wins so a name equal to an existing
-                # node key resolves to that key unchanged — this is load-bearing
-                # for speaker nodes, which are keyed by their VERBATIM speaker_id
-                # ("Speaker0") via _resolve_entity, while canonical() would
-                # casefold to "speaker0" and miss the node.  Falls back to
-                # canonical(name) for ordinary surface forms (node-key model A).
-                if name in graph:
-                    return name
-                return canonical(name)
+            # _in_graph closure passed to resolve_to_node_key (P5).
+            _in_graph = graph.__contains__
 
             for pair in same_as_pairs:
                 keep, drop = pair[0], pair[1]
                 if keep == drop:
                     continue
-                # Resolve to actual node keys: verbatim-first (speaker nodes keyed
-                # by their verbatim speaker_id), else canonical.  BL-1: keep
-                # _safe_to_merge_surface on the original SURFACE strings (fuzzy
-                # layer-2 check).
-                keep_canon = _resolve_node_key(keep)
-                drop_canon = _resolve_node_key(drop)
+                # W1 guard: skip same_as pairs where BOTH surface strings are
+                # speaker ids.  Speaker identity is authoritative (voice/enrollment);
+                # it must never be coalesced by a surface-similarity heuristic.
+                # Two speaker-id surfaces are either the SAME speaker (already
+                # unified by canonical node-keying, so no merge needed) or
+                # DIFFERENT speakers (must never merge — Jaro-Winkler treats the
+                # distinguishing digit as a typo and would incorrectly merge
+                # Speaker0/Speaker1).  Skip unconditionally: the pair is always
+                # either redundant or catastrophically wrong.
+                # Note: the ``keep_canon == drop_canon`` post-resolution check
+                # handles the casing-only case (Speaker0/speaker0), but does NOT
+                # catch distinct speaker ids (speaker0 ≠ speaker1) — this guard
+                # is load-bearing for the distinct-speaker scenario.
+                if is_speaker_id(keep) and is_speaker_id(drop):
+                    logger.debug(
+                        "graph_enrichment: same_as skip — both surfaces are speaker ids %r / %r",
+                        keep,
+                        drop,
+                    )
+                    continue
+                # Resolve to actual node keys via P5 (membership shortcut then
+                # canonical).  BL-1: keep _safe_to_merge_surface on the ORIGINAL
+                # SURFACE strings (fuzzy layer-2 check; done before resolution).
+                keep_canon = resolve_to_node_key(keep, _in_graph)
+                drop_canon = resolve_to_node_key(drop, _in_graph)
                 if keep_canon == drop_canon:
                     continue
                 if keep_canon not in graph or drop_canon not in graph:
@@ -2572,18 +2646,6 @@ class ConsolidationLoop:
                         exc,
                     )
 
-            def _resolve_name(name: str) -> str:
-                # Resolve to the actual node key (verbatim-first; same resolver as
-                # the same_as pass so speaker nodes keyed by verbatim speaker_id
-                # are not casefolded into a missing "speaker0" key), then follow
-                # the drop→keep coref chain.
-                name = _resolve_node_key(name)
-                seen: set[str] = set()
-                while name in coref_map and name not in seen:
-                    seen.add(name)
-                    name = coref_map[name]
-                return name
-
             # Build Relation objects from SOTA-emitted new_rels for this chunk.
             # BLOCKER-1 endpoint surface rule: speaker endpoints pass their canonical
             # key (the speaker_id), non-speaker endpoints pass the display surface.
@@ -2594,9 +2656,10 @@ class ConsolidationLoop:
                     continue
                 # Remap endpoints through this chunk's coref map so edges
                 # referencing a to-be-dropped node still land on the canonical.
-                subj_canon = _resolve_name(rel.get("subject", ""))
+                # P5: resolve_to_node_key(membership shortcut → canonical → coref chain).
+                subj_canon = resolve_to_node_key(rel.get("subject", ""), _in_graph, coref_map)
                 raw_pred = rel.get("predicate", "")
-                obj_canon = _resolve_name(rel.get("object", ""))
+                obj_canon = resolve_to_node_key(rel.get("object", ""), _in_graph, coref_map)
                 rtype = rel.get("relation_type", fallback_rtype)
                 if rtype not in valid_rtypes:
                     rtype = fallback_rtype
@@ -2604,8 +2667,10 @@ class ConsolidationLoop:
                     continue
 
                 # BLOCKER-1: choose endpoint string per endpoint.
-                # Speaker endpoint (node carries speaker_id): pass the canonical key
-                # (== speaker_id) so _synth_speaker_entities can emit the Entity.
+                # Speaker endpoint (node carries speaker_id attribute): pass the node
+                # key (casefolded, e.g. "speaker0") — distinct from the cased
+                # speaker_id attribute ("Speaker0") — so _synth_speaker_entities can
+                # emit the correct Entity from the canonical key.
                 # Non-speaker endpoint: pass the display surface from node attributes.
                 def _endpoint_str(canon: str) -> str:
                     _n = graph.nodes.get(canon, {})
@@ -2720,12 +2785,10 @@ class ConsolidationLoop:
 
         _system_content = _load_prompt("extraction_system.txt", "", None)
         if not _system_content:
-            # Inline fallback mirrors extraction_system.txt content.
-            _system_content = (
-                "You are a precise knowledge graph extractor. Output a single raw JSON "
-                "object only. No code fences, no markdown, no wrapping tags, no "
-                "explanatory text before or after the JSON."
+            logger.warning(
+                "graph_normalization: extraction_system.txt missing — skipping model call"
             )
+            return []
 
         # Serialize as bare "subject | predicate | object" lines (no index).
         _fact_lines_text = "\n".join(
@@ -5509,15 +5572,24 @@ class ConsolidationLoop:
         """Synthesise :class:`~paramem.graph.schema.Entity` objects for speaker-attributed subjects.
 
         For each :class:`Relation` in *relations* whose ``speaker_id`` is non-empty
-        and whose ``subject`` equals ``speaker_id`` (the node key IS the speaker's
-        system ID per ``_resolve_entity``), emit one
-        :class:`~paramem.graph.schema.Entity` with ``entity_type="person"`` and the
-        matching ``speaker_id``.  Deduplicates by ``speaker_id`` so exactly one
-        entity is produced per unique speaker.
+        and whose ``subject`` canonically matches ``speaker_id`` (§0 invariant —
+        compared via :func:`~paramem.graph.name_match.speaker_ref_matches` so that a
+        casefolded node key ``"speaker0"`` and a cased id ``"Speaker0"`` are treated
+        as identical), emit one :class:`~paramem.graph.schema.Entity` with
+        ``entity_type="person"`` and the matching ``speaker_id``.  Deduplicates by
+        ``speaker_id`` so exactly one entity is produced per unique speaker.
 
-        Non-speaker subjects (``speaker_id == ""`` OR ``subject != speaker_id``) are
-        skipped; their nodes retain no ``speaker_id`` attribute, which resolves to
-        ``""`` in the keyed-walk (the correct default for non-person nodes).
+        The canonical comparison (B1 fix) is load-bearing: after the merger casefoldes
+        speaker node keys (Step 2), the enrichment path produces ``Relation.subject``
+        as the casefolded key (``"speaker0"``) while ``Relation.speaker_id`` remains
+        the cased id (``"Speaker0"``).  A raw ``==`` would miss the entity and trigger
+        the dcf4189 regression (no ``speaker_id`` attribute stamped on the node, minted
+        keys fall back to ``speaker_id=""``).
+
+        Non-speaker subjects (``speaker_id == ""`` OR subject does not canonically
+        match ``speaker_id``) are skipped; their nodes retain no ``speaker_id``
+        attribute, which resolves to ``""`` in the keyed-walk (the correct default for
+        non-person nodes).
 
         Used by :meth:`_merge_registry_relations` so that
         :meth:`~paramem.graph.merger.GraphMerger._upsert_entity` stamps
@@ -5534,8 +5606,8 @@ class ConsolidationLoop:
         Returns:
             A :class:`list` of :class:`~paramem.graph.schema.Entity` objects, one
             per unique speaker subject found in *relations*.  May be empty when no
-            relation carries a non-empty ``speaker_id`` whose subject equals the
-            speaker ID.
+            relation carries a non-empty ``speaker_id`` whose subject canonically
+            matches the speaker ID.
         """
         from paramem.graph.schema import Entity as _Entity
 
@@ -5543,13 +5615,20 @@ class ConsolidationLoop:
         entities: list[_Entity] = []
         for _r in relations:
             if _r.speaker_id and _r.speaker_id not in _seen_speaker_ids:
-                # Only create an entity when the subject is the speaker node
-                # (node key == speaker_id, set by _resolve_entity for speakers).
+                # §0 invariant: compare canonically (B1 fix) — the subject may be the
+                # casefolded node key ("speaker0") while speaker_id is cased ("Speaker0").
+                # Raw == would fail; speaker_ref_matches(a, b) = canonical(a)==canonical(b).
                 # Non-speaker subjects are skipped; their nodes retain no speaker_id.
-                if _r.subject == _r.speaker_id:
+                if speaker_ref_matches(_r.subject, _r.speaker_id):
                     entities.append(
                         _Entity(
-                            name=_r.subject,
+                            # Use the cased speaker_id as the display name (§0): node key
+                            # is the casefolded form ("speaker0"); the cased system id
+                            # ("Speaker0") is the correct display/training surface stored in
+                            # attributes["name"].  Using _r.subject here would write the
+                            # casefolded node key as the display name, clobbering the cased
+                            # surface via _upsert_entity's is_speaker refresh branch.
+                            name=_r.speaker_id,
                             entity_type="person",
                             speaker_id=_r.speaker_id,
                         )

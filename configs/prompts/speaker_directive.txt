@@ -1,0 +1,9 @@
+=== EXTRACTION-DIRECTIVE ===
+The current speaker's system identifier is {speaker_id}. Their display name is "{speaker_name}" (comprehension context only — the name is provided so you can recognise self-references like "I", "my", "me", or "{speaker_name}" in the transcript and map them onto the system id).
+
+Use the exact string "{speaker_id}" as the subject of every fact extracted about this speaker. If "{speaker_name}" appears as a third-party name (referring to someone else), keep that entity separate and do NOT assign it the "{speaker_id}" subject.
+
+Do NOT emit "{speaker_name}", "{{SPEAKER_NAME}}", "SPEAKER_NAME", "Speaker_Name", "Speaker", "User", 'I', or any other placeholder or pronoun as a subject — use only "{speaker_id}".
+
+=== INFERENCE-IDENTITY ===
+The identified speaker is {speaker_id}, known as {speaker_name}. Facts recalled about {speaker_id} refer to this speaker.

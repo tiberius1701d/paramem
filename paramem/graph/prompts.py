@@ -10,6 +10,65 @@ from pathlib import Path
 
 _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "configs" / "prompts"
 
+_SPEAKER_DIRECTIVE_FILE = "speaker_directive.txt"
+_SPEAKER_DIRECTIVE_SENTINEL = "==="
+
+
+def _load_speaker_directive_section(section_name: str) -> str:
+    """Load a named section from ``configs/prompts/speaker_directive.txt``.
+
+    The file contains two sentinel-delimited sections::
+
+        === EXTRACTION-DIRECTIVE ===
+        ...directive text...
+
+        === INFERENCE-IDENTITY ===
+        ...mapping text...
+
+    Args:
+        section_name: One of ``"EXTRACTION-DIRECTIVE"`` or
+            ``"INFERENCE-IDENTITY"``.  The sentinel format is
+            ``=== <NAME> ===`` (leading/trailing ``===`` with spaces).
+
+    Returns:
+        The section body as a stripped string.
+
+    Raises:
+        FileNotFoundError: When ``speaker_directive.txt`` is absent from
+            ``configs/prompts/`` and no fallback is registered.
+        KeyError: When the requested section is not found in the file.
+    """
+    path = _DEFAULT_PROMPT_DIR / _SPEAKER_DIRECTIVE_FILE
+    raw = path.read_text()
+    sections: dict[str, str] = {}
+    current_name: str | None = None
+    current_lines: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(_SPEAKER_DIRECTIVE_SENTINEL) and stripped.endswith(
+            _SPEAKER_DIRECTIVE_SENTINEL
+        ):
+            # Sentinel line: flush previous section, start a new one.
+            if current_name is not None:
+                sections[current_name] = "\n".join(current_lines).strip()
+            current_name = (
+                stripped[len(_SPEAKER_DIRECTIVE_SENTINEL) :]
+                .rstrip(_SPEAKER_DIRECTIVE_SENTINEL)
+                .strip()
+            )
+            current_lines = []
+        else:
+            if current_name is not None:
+                current_lines.append(line)
+    if current_name is not None:
+        sections[current_name] = "\n".join(current_lines).strip()
+    if section_name not in sections:
+        raise KeyError(
+            f"Section {section_name!r} not found in {_SPEAKER_DIRECTIVE_FILE}. "
+            f"Available sections: {list(sections)}"
+        )
+    return sections[section_name]
+
 
 def _load_prompt(
     filename: str,

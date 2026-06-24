@@ -144,7 +144,7 @@ def test_list_profiles_legacy_default_method(store, sample_embedding):
 def test_enroll_and_exact_match(store, sample_embedding):
     speaker_id = store.enroll("Alice", sample_embedding)
     assert speaker_id is not None
-    assert len(speaker_id) == 8
+    assert speaker_id == "Speaker0"  # first enroll into empty store gets Speaker0
     result = store.match(sample_embedding)
     assert result.speaker_id == speaker_id
     assert result.name == "Alice"
@@ -275,6 +275,58 @@ def test_get_name(store, sample_embedding):
     assert store.get_name("nonexistent") is None
 
 
+# ---------------------------------------------------------------------------
+# P3 — resolve_speaker_name (anonymous-suppressed name resolver)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveSpeakerName:
+    """P3: ``resolve_speaker_name`` returns the display name or ``None``.
+
+    Miss cases:
+    - Unknown speaker_id → ``None`` (no such profile).
+    - Anonymous profile (``enroll_method == "anonymous_voice"``) → ``None``
+      (name equals speaker_id, not a salutation).
+
+    Hit case:
+    - Known, named profile → display name.
+
+    No exception path: the method is a dict lookup on ``_profiles`` and must
+    never raise, so removing the ``try/except get_name failed`` wrappers in
+    app.py is safe.
+    """
+
+    def test_known_named_speaker_returns_name(self, tmp_path, sample_embedding):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        sid = store.enroll("Tobias", sample_embedding)
+        assert store.resolve_speaker_name(sid) == "Tobias"
+
+    def test_unknown_speaker_id_returns_none(self, tmp_path):
+        store = SpeakerStore(tmp_path / "profiles.json")
+        assert store.resolve_speaker_name("Speaker99") is None
+
+    def test_anonymous_profile_returns_none(self, tmp_path, sample_embedding):
+        """Anonymous profiles must NOT surface their speaker_id as a display name."""
+        store = SpeakerStore(tmp_path / "profiles.json")
+        sid = store.register_anonymous(sample_embedding)
+        # Verify the profile was created with anonymous_voice method.
+        assert store.is_anonymous(sid)
+        # P3 must suppress the anonymous token.
+        assert store.resolve_speaker_name(sid) is None
+
+    def test_no_exception_on_unknown(self, tmp_path):
+        """resolve_speaker_name must not raise for any speaker_id value.
+
+        This proves the deleted try/except blocks in app.py were dead
+        defensive code: a dict lookup on _profiles cannot raise.
+        """
+        store = SpeakerStore(tmp_path / "profiles.json")
+        # None-like inputs, missing keys, empty string — all return None safely.
+        assert store.resolve_speaker_name("nonexistent") is None
+        assert store.resolve_speaker_name("Speaker0") is None
+        assert store.resolve_speaker_name("") is None
+
+
 def test_empty_embedding_no_match(store, sample_embedding):
     store.enroll("Alice", sample_embedding)
     result = store.match([])
@@ -313,19 +365,19 @@ def test_file_created_on_first_enroll(tmp_path, sample_embedding):
 
 
 def test_legacy_v1_migration(tmp_path, sample_embedding):
-    """Legacy v1 name-keyed format is auto-migrated to v5."""
+    """Legacy v1 name-keyed format is auto-migrated to v5 with Speaker{N} ids."""
     path = tmp_path / "profiles.json"
     legacy_data = {"speakers": {"Alice": sample_embedding}}
     path.write_text(json.dumps(legacy_data))
 
     store = SpeakerStore(path)
     assert store.profile_count == 1
-    assert store._next_anon_index == 0
+    # One profile was minted via _mint_anon_speaker_id() during migration.
+    assert store._next_anon_index == 1
 
     result = store.match(sample_embedding)
     assert result.name == "Alice"
-    assert result.speaker_id is not None
-    assert len(result.speaker_id) == 8
+    assert result.speaker_id == "Speaker0"
 
     data = json.loads(path.read_text())
     assert data["version"] == 5
@@ -699,8 +751,9 @@ class TestRegisterAnonymous:
         # register_anonymous should return the existing named profile via centroid match.
         anon_id = store.register_anonymous(sample_embedding)
         assert anon_id == named_id
-        # No anonymous profile should have been created.
-        assert store._next_anon_index == 0
+        # enroll() now uses _mint_anon_speaker_id() — the shared monotonic counter
+        # advances for ALL mints, named or anonymous. Alice's enroll bumped it to 1.
+        assert store._next_anon_index == 1
         profiles = store.list_profiles()
         assert len(profiles) == 1
         assert profiles[0]["name"] == "Alice"
@@ -854,15 +907,126 @@ class TestRegisterAnonymousTentative:
         store = self._make_tentative_store(tmp_path)
         emb_a, emb_b = self._make_tentative_pair()
 
-        # Enroll emb_a as a named speaker.
+        # Enroll emb_a as a named speaker — now uses the shared counter, so
+        # Alice gets Speaker0 and the counter advances to 1.
         alice_id = store.enroll("Alice", emb_a)
         assert alice_id is not None
+        assert alice_id == "Speaker0"
 
         # emb_b is tentative against Alice's profile — must not contaminate it.
+        # register_anonymous falls through and allocates the next counter slot.
         anon_id = store.register_anonymous(emb_b)
         assert anon_id != alice_id
-        assert anon_id == "Speaker0"
+        assert anon_id == "Speaker1"
         # Alice's profile must remain unchanged.
         assert store.get_name(alice_id) == "Alice"
         profiles = {p["id"]: p for p in store.list_profiles()}
         assert profiles[alice_id]["enroll_method"] != "anonymous_voice"
+
+
+# ---------------------------------------------------------------------------
+# enroll() tentative-band upgrade — closes the anonymous→named identity split
+# ---------------------------------------------------------------------------
+
+
+class TestEnrollTentativeUpgrade:
+    """Regression tests for the anonymous→named identity split fix.
+
+    Previously, enroll() only upgraded anonymous profiles at high-confidence
+    (conf >= high_threshold).  A tentative-band self-introduction minted a new
+    uuid id, splitting the speaker's identity from their existing Speaker{N}.
+
+    After the fix, enroll() upgrades anonymous profiles in BOTH bands
+    (mirrors register_anonymous's tentative-reuse of anonymous profiles).
+    Named profiles at tentative confidence still mint a fresh Speaker{N}
+    (protects the named centroid from ambiguous-voice contamination).
+    """
+
+    def _make_tentative_store(self, tmp_path: object) -> "SpeakerStore":
+        return SpeakerStore(
+            tmp_path / "profiles.json",
+            high_threshold=0.95,
+            low_threshold=0.50,
+        )
+
+    def _make_tentative_pair(self) -> tuple[list[float], list[float]]:
+        import math
+
+        a = [1.0, 0.0, 0.0, 0.0]
+        b_raw = [0.7, 0.7, 0.0, 0.0]
+        norm_b = math.sqrt(sum(x * x for x in b_raw))
+        b = [x / norm_b for x in b_raw]
+        return a, b
+
+    def test_tentative_enroll_upgrades_anonymous_profile(self, tmp_path):
+        """The split-fix regression: an anonymous Speaker{N} followed by a
+        tentative-confidence self-introduction MUST return the SAME Speaker{N}
+        and upgrade the profile (not mint a new id).
+
+        This test MUST fail on pre-fix code (enroll mints a uuid at tentative
+        confidence) and pass after.
+        """
+        store = self._make_tentative_store(tmp_path)
+        emb_a, emb_b = self._make_tentative_pair()
+
+        anon_id = store.register_anonymous(emb_a)
+        assert anon_id == "Speaker0"
+
+        # emb_b is tentative against Speaker0 (anonymous).  After the fix,
+        # enroll should upgrade Speaker0 in-place (not mint a new id).
+        result_id = store.enroll("Alice", emb_b)
+        assert result_id == "Speaker0", (
+            "enroll() with a tentative anonymous match must return the existing Speaker{N}, "
+            "not a new id — the anonymous→named identity split is the root-cause bug"
+        )
+        assert store.get_name("Speaker0") == "Alice"
+        assert store.is_anonymous("Speaker0") is False
+        # Upgrade in-place: no new profile created, counter did NOT advance again.
+        assert store.profile_count == 1
+        assert store._next_anon_index == 1
+
+    def test_two_new_enrollments_get_sequential_speaker_ids(
+        self, tmp_path, sample_embedding, different_embedding
+    ):
+        """Two new named enrollments (no prior match) get sequential Speaker{N} ids."""
+        store = SpeakerStore(tmp_path / "profiles.json", high_threshold=0.90, low_threshold=0.70)
+        alice_id = store.enroll("Alice", sample_embedding)
+        bob_id = store.enroll("Bob", different_embedding)
+        assert alice_id == "Speaker0"
+        assert bob_id == "Speaker1"
+        assert alice_id != bob_id
+        assert store.profile_count == 2
+
+    def test_tentative_enroll_against_named_mints_new_speaker_id(self, tmp_path):
+        """A tentative match against a NAMED profile mints a new Speaker{N}
+        (protects the named centroid from ambiguous-voice contamination).
+
+        This mirrors ``TestRegisterAnonymousTentative.
+        test_tentative_against_named_allocates_new_speaker``
+        but exercises enroll() instead of register_anonymous().
+        """
+        store = self._make_tentative_store(tmp_path)
+        emb_a, emb_b = self._make_tentative_pair()
+
+        alice_id = store.enroll("Alice", emb_a)
+        assert alice_id == "Speaker0"
+
+        # emb_b is tentative against Alice's named profile — must mint a NEW id.
+        bob_id = store.enroll("Bob", emb_b)
+        assert bob_id is not None
+        assert bob_id != alice_id
+        assert bob_id == "Speaker1"
+        # Alice's profile must be unchanged.
+        assert store.get_name(alice_id) == "Alice"
+        assert store.is_anonymous(alice_id) is False
+        assert store.profile_count == 2
+
+    def test_named_rejection_still_holds_at_high_confidence(self, tmp_path, sample_embedding):
+        """High-confidence match against a named profile still returns None (no change)."""
+        store = SpeakerStore(tmp_path / "profiles.json", high_threshold=0.90, low_threshold=0.70)
+        alice_id = store.enroll("Alice", sample_embedding)
+        assert alice_id is not None
+        # Same embedding — high-confidence → reject.
+        result = store.enroll("Bob", sample_embedding)
+        assert result is None
+        assert store.profile_count == 1

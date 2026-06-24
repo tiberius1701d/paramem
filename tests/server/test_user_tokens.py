@@ -678,3 +678,49 @@ class TestToctouClearsMemory:
             "lookup() must return None after TOCTOU guard clears in-memory state"
         )
         assert store.list() == [], "list() must return [] after TOCTOU guard clears in-memory state"
+
+
+# ---------------------------------------------------------------------------
+# Speaker-id canonicality enforcement at mint boundary (strict REJECT)
+# ---------------------------------------------------------------------------
+
+
+class TestMintSpeakerIdValidation:
+    """mint() raises ValueError on a non-canonical speaker_id (strict enforcement).
+
+    The invariant is absolute: every attributed token MUST reference a
+    canonical ``Speaker{N}`` id.  A non-conforming non-None id raises
+    ``ValueError`` — no warn-and-allow path exists.
+    """
+
+    def test_mint_raises_on_non_speaker_id(self, tmp_path, monkeypatch, store_path):
+        """mint() raises ValueError when speaker_id is a non-Speaker{N} string."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+
+        with pytest.raises(ValueError, match="Speaker{N}"):
+            store.mint("legacyuuid12", "Legacy Device")
+
+        # No token must have been stored — the store stays clean.
+        assert store.list() == []
+
+    def test_mint_none_speaker_id_succeeds(self, tmp_path, monkeypatch, store_path):
+        """mint(None, ...) succeeds — None is a valid sentinel for unattributed tokens."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+
+        token = store.mint(None, "Shared Device")
+        assert token is not None
+        result = store.resolve(token)
+        assert result is not None
+        _authenticated, speaker_id, _scope = result
+        assert speaker_id is None
+
+    def test_mint_canonical_speaker_id_succeeds(self, tmp_path, monkeypatch, store_path):
+        """mint('Speaker0', ...) succeeds — Speaker{N} is the canonical form."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+
+        token = store.mint("Speaker0", "My Device")
+        assert token is not None
+        assert store.lookup(token) == "Speaker0"

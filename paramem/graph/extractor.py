@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.evaluation.recall import generate_answer
+from paramem.graph.name_match import is_speaker_id, speaker_ref_matches
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Entity, SessionGraph
@@ -449,24 +450,45 @@ DEFAULT_USER_PROMPT_FILENAME = "extraction.txt"
 DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME = "extraction_procedural.txt"
 
 
-def build_speaker_context(speaker_name: str | None) -> str:
+def build_speaker_context(
+    speaker_id: str | None,
+    speaker_name: str | None,
+) -> str:
     """Single source of truth for the extraction-prompt speaker directive.
 
-    Empty string when the speaker cannot be identified, leaving the
-    ``{SPEAKER_NAME}`` slot in the few-shots unsubstituted (the prompt's
-    closing note tells the model never to emit that literal string).
-    When known, pins the real name — which may be a real first name
-    ("Alice") or an opaque anonymous id ("Speaker7") — as the canonical
-    subject across every extracted fact.
+    Loads the ``EXTRACTION-DIRECTIVE`` section from
+    ``configs/prompts/speaker_directive.txt`` and slots in
+    ``{speaker_id}`` (the stable system id, e.g. ``"Speaker0"``) and
+    ``{speaker_name}`` (the display name, e.g. ``"Alice"``).
+
+    Returns an empty string when ``speaker_id`` is absent or empty —
+    leaving the ``{speaker_context}`` slot in the few-shots blank (the
+    prompt's note tells the model never to emit the ``{{SPEAKER_NAME}}``
+    literal).
+
+    The display name is injected as COMPREHENSION CONTEXT so the model
+    can map self-references ("I", "my name is Alice", etc.) onto the
+    stable ``Speaker{N}`` id while keeping any same-named third party
+    separate.  The subject of every extracted speaker-fact must be
+    ``speaker_id``, not the display name.
+
+    Args:
+        speaker_id: System speaker id (e.g. ``"Speaker0"``).  When
+            empty or ``None``, the directive is suppressed entirely.
+        speaker_name: Display name resolved from the speaker store (e.g.
+            ``"Alice"``).  ``None`` when unknown or anonymous (P3
+            semantics); the directive uses the id string in place of the
+            display name so the model still binds onto the id.
     """
-    if not speaker_name:
+    if not speaker_id:
         return ""
-    return (
-        f"\nThe current speaker is {speaker_name}. Use the exact string "
-        f"'{speaker_name}' as the subject of every fact about the speaker; "
-        f"do NOT use '{{SPEAKER_NAME}}', 'SPEAKER_NAME', 'Speaker_Name', "
-        f"'Speaker', 'User', 'I', or any other placeholder.\n"
-    )
+    from paramem.graph.prompts import _load_speaker_directive_section
+
+    template = _load_speaker_directive_section("EXTRACTION-DIRECTIVE")
+    # When no display name is known, use the id itself as comprehension
+    # context so the placeholder reference is consistent throughout.
+    effective_name = speaker_name or speaker_id
+    return "\n" + template.format(speaker_id=speaker_id, speaker_name=effective_name) + "\n"
 
 
 _DEFAULT_EXTRACTION_PROMPT = """\
@@ -595,11 +617,12 @@ def extract_procedural_graph(
     behavioral patterns rather than factual knowledge.
 
     Args:
-        speaker_name: Real name of the speaker (e.g. from voice enrollment).
-            When provided, injected into the prompt via ``build_speaker_context``
-            so the model uses the real name as the subject of every extracted
-            preference instead of the ``SPEAKER_NAME`` slot. Mirrors
-            the same parameter on ``extract_graph``.
+        speaker_name: Display name of the speaker (e.g. from voice enrollment).
+            Passed to ``build_speaker_context`` as comprehension context so the
+            model can map self-references in the transcript onto the stable
+            ``speaker_id``.  The model uses the ``Speaker{N}`` id — not the
+            display name — as the subject of every extracted preference.
+            Mirrors the same parameter on ``extract_graph``.
         speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
             ``Relation`` extracted in this pass as provenance. Required —
             callers must always supply a real speaker ID.
@@ -629,7 +652,7 @@ def extract_procedural_graph(
         user_filename=user_prompt_filename,
         model=model_alias,
     )
-    speaker_context = build_speaker_context(speaker_name)
+    speaker_context = build_speaker_context(speaker_id, speaker_name)
     messages = [
         {"role": "system", "content": system},
         {
@@ -669,15 +692,19 @@ def extract_procedural_graph(
         for rel_dict in data.get("relations", []):
             rel_dict.setdefault("speaker_id", speaker_id)
         graph = SessionGraph.model_validate(data)
-        # Bind speaker Entity and fold any split-name duplicates.
-        if speaker_name:
-            graph = _stamp_speaker_entity(graph, speaker_name=speaker_name, speaker_id=speaker_id)
     except Exception as exc:
+        # Broad catch is intentional: malformed model output can produce any
+        # JSON/parse/schema error shape, and the recovery action is always the
+        # same — return an empty graph so the session is skipped cleanly.
         logger.warning("Procedural extraction failed (%s), returning empty", exc)
         return SessionGraph(
             session_id=session_id,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
+    # _stamp_speaker_entity runs on an already-validated graph; it cannot fail
+    # on malformed model output and must not be swallowed by the parse guard.
+    if speaker_id:
+        graph = _stamp_speaker_entity(graph, speaker_name=speaker_name, speaker_id=speaker_id)
 
     if graph.relations and stt_correction:
         graph = _correct_entity_names(graph, transcript)
@@ -822,6 +849,7 @@ def extract_graph(
                     max_tokens,
                     prompts_dir,
                     speaker_name,
+                    speaker_id=speaker_id,
                     system_prompt_filename=system_prompt_filename,
                     user_prompt_filename=user_prompt_filename,
                     model_alias=model_alias,
@@ -1130,6 +1158,7 @@ def _generate_extraction(
     prompts_dir: str | Path | None = None,
     speaker_name: str | None = None,
     *,
+    speaker_id: str | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
     model_alias: str | None = None,
@@ -1137,16 +1166,16 @@ def _generate_extraction(
 ) -> str:
     """Generate graph extraction output from the model. Called once.
 
-    When ``speaker_name`` is provided (e.g. from voice enrollment in
-    production, or from session metadata in the test harness), inject it
-    into the prompt so the model uses the real name as subject instead of
-    guessing or emitting the ``SPEAKER_NAME`` slot from the few-shots.
+    Narrator binding is achieved via the ``{speaker_context}`` placeholder
+    in the **user** template (``extraction.txt``), populated by
+    :func:`build_speaker_context`.  The directive pins the stable
+    ``speaker_id`` (e.g. ``"Speaker0"``) as the subject of every extracted
+    speaker-fact, with the display ``speaker_name`` supplied as comprehension
+    context so the model maps self-references onto the id.
 
     The system prompt is passed verbatim — no slot substitution is performed
-    on it.  Narrator binding is achieved via the ``{speaker_context}``
-    placeholder in the **user** template (``extraction.txt``), populated by
-    :func:`build_speaker_context`.  One prompt-pair serves every source
-    type — document chunks land in the same ``{transcript}`` slot.
+    on it.  One prompt-pair serves every source type — document chunks land
+    in the same ``{transcript}`` slot.
 
     ``model_alias`` enables per-file prompt resolution — see
     :func:`load_extraction_prompts`.  The ``sota_*`` prompts are
@@ -1161,7 +1190,7 @@ def _generate_extraction(
         user_filename=user_prompt_filename,
         model=model_alias,
     )
-    speaker_context = build_speaker_context(speaker_name)
+    speaker_context = build_speaker_context(speaker_id, speaker_name)
     format_kwargs = dict(
         transcript=transcript,
         speaker_context=speaker_context,
@@ -1211,21 +1240,20 @@ def _parse_extraction(
     ``{"entities": [...], "relations": [...]}`` envelope; that case is
     rewrapped here so downstream normalization can proceed.
 
-    After schema validation, :func:`_stamp_speaker_entity` is called to:
-    - Stamp ``speaker_id`` on the entity whose name matches ``speaker_name``.
-    - Fold any duplicate speaker-named entity (e.g. "Alex Morgan" alongside
-      "Alex") into the canonical one and rewrite all affected relation
-      subjects/objects.
+    After schema validation, :func:`_stamp_speaker_entity` is called to stamp
+    ``speaker_id`` on every entity whose name is a speaker id (``Speaker{N}``
+    format).  The session speaker receives the authoritative cased ``speaker_id``
+    value; other speaker-id entities receive their own name as ``speaker_id``.
 
     Args:
         raw_output: Raw model output string.
         session_id: Session identifier for the graph.
-        speaker_id: Speaker store ID stamped onto every relation as provenance.
-            Required — callers must always supply the session's speaker ID.
-        speaker_name: Real display name of the speaker (e.g. "Alex" or
-            "Speaker0").  When provided, the speaker Entity is identified and
-            its ``speaker_id`` field is set.  When ``None`` the post-processing
-            step is skipped.
+        speaker_id: Speaker store ID (e.g. ``"Speaker0"``).  Stamped onto
+            every relation as provenance and used to identify the session
+            speaker entity.  Required — callers must always supply a real id.
+        speaker_name: Display name of the speaker (e.g. ``"Tobias"``).
+            Passed through for call-site compatibility; not used for entity
+            matching in :func:`_stamp_speaker_entity`.
     """
     json_str = _extract_json_block(raw_output)
     data = json.loads(json_str)
@@ -1249,8 +1277,8 @@ def _parse_extraction(
 
     graph = SessionGraph.model_validate(data)
 
-    # Post-process: bind speaker Entity and fold any split-name duplicates.
-    if speaker_name:
+    # Post-process: stamp speaker_id on speaker-id entities.
+    if speaker_id:
         graph = _stamp_speaker_entity(graph, speaker_name=speaker_name, speaker_id=speaker_id)
 
     logger.info(
@@ -1265,123 +1293,65 @@ def _parse_extraction(
 def _stamp_speaker_entity(
     graph: SessionGraph,
     *,
-    speaker_name: str,
+    speaker_name: str | None,
     speaker_id: str,
 ) -> SessionGraph:
-    """Stamp ``speaker_id`` on the canonical speaker Entity and fold duplicates.
+    """Stamp ``speaker_id`` on speaker-id entities in the extracted graph.
 
-    Two tasks are performed on the parsed :class:`~paramem.graph.schema.SessionGraph`:
+    Under the id-as-subject convention the extraction prompt instructs the
+    model to emit ``Speaker{N}`` (the system speaker id) as the entity name
+    and relation subject for the session speaker.  This post-processor walks
+    the entity list and sets ``entity.speaker_id`` on every entity whose name
+    is structurally a speaker id (``is_speaker_id(entity.name)`` is ``True``):
 
-    1. **Stamp** — find the entity whose ``name`` matches ``speaker_name``
-       (case-insensitive) and set its ``speaker_id`` to ``speaker_id``.  If no
-       exact match is found, the entity whose name starts with the
-       ``speaker_name`` prefix is treated as the canonical entity (e.g. "Alex"
-       found as prefix of "Alex Morgan" — only when the speaker's display name
-       is the first-name part of a longer name the model emitted).
+    * **Session speaker** — when ``speaker_ref_matches(entity.name, speaker_id)``
+      is ``True``, the entity IS the session speaker.  Its ``speaker_id`` field
+      is set to the authoritative cased value supplied by the caller
+      (``speaker_id``, e.g. ``"Speaker0"``), guaranteeing the node key and
+      the cased id attribute are always consistent.
 
-    2. **Fold** — if the model emitted a *second* entity whose name is a
-       longer form of the speaker's name (e.g. speaker_name="Alex" and model
-       also emitted "Alex Morgan"), fold the duplicate into the canonical
-       entity: merge attributes, rewrite every relation whose subject or object
-       matched the duplicate name to the canonical name, and remove the
-       duplicate from the entity list.
+    * **Other speaker reference** — when a different ``Speaker{N}`` id appears
+      (e.g. the model extracted a third-party speaker who is also a registered
+      participant), ``entity.speaker_id`` is normalised to the canonical cased
+      form (``"Speaker{digits}"``) regardless of how the model emitted the id,
+      so the attribute is always ``"Speaker0"``, never ``"speaker0"``.
 
-    Any entity whose name matches ``speaker_id`` exactly (opaque IDs like
-    "Speaker0") is also treated as a speaker alias and folded.
+    Non-speaker entities (display names like ``"Tobias Becker"``, places, orgs)
+    are left untouched: ``is_speaker_id`` returns ``False`` for them.
 
-    This post-processor is a defensive measure against the model ignoring the
-    prompt's "collapse self-references" instruction.  It is idempotent — if
-    the model obeyed the prompt perfectly only task 1 fires (no duplicates to
-    fold).
+    The ``speaker_name`` parameter is retained for call-site compatibility and
+    is passed to context-building helpers upstream; it is not used for entity
+    matching in this function.
 
     Args:
         graph: Parsed :class:`~paramem.graph.schema.SessionGraph` after
             schema validation.
-        speaker_name: Canonical display name of the speaker as passed to the
-            extraction prompt (e.g. ``"Alex"`` or ``"Speaker0"``).
-        speaker_id: Speaker store ID to stamp onto the canonical entity.
+        speaker_name: Display name of the session speaker (e.g. ``"Tobias"``).
+            Accepted but not used for matching — kept for call-site API
+            compatibility.
+        speaker_id: Authoritative cased speaker id (e.g. ``"Speaker0"``).
+            Stamped onto the session-speaker entity.
 
     Returns:
-        Updated ``SessionGraph`` with ``speaker_id`` set on the canonical
-        speaker Entity and any duplicate entities removed.
+        Updated ``SessionGraph`` with ``speaker_id`` set on all speaker-id
+        entities.  Entities that are not speaker ids are unmodified.
     """
     if not graph.entities:
         return graph
 
-    speaker_name_lower = speaker_name.lower()
-    speaker_id_lower = speaker_id.lower()
-
-    # Identify the canonical entity: exact name match first, then prefix match.
-    canonical: Entity | None = None
     for ent in graph.entities:
-        if ent.name.lower() == speaker_name_lower:
-            canonical = ent
-            break
-
-    if canonical is None:
-        # Fallback: entity whose name starts with speaker_name (full-name variants).
-        # Do NOT rename canonical.name to speaker_name here — relations still
-        # reference the longer form, and the privacy verifier would then flag
-        # the bare display name as a leak when it appears as a substring of
-        # email/URL tokens (e.g. "alex" inside "alex.smith@example.com"
-        # — the dot is a regex word boundary). The graph identity is
-        # speaker_id (stamped below), not the name string; rendering layers
-        # can resolve display names via SpeakerStore.get_name() at render time.
-        for ent in graph.entities:
-            if ent.name.lower().startswith(speaker_name_lower + " "):
-                canonical = ent
-                break
-
-    if canonical is None:
-        # No match at all — nothing to stamp or fold.
-        return graph
-
-    # Stamp speaker_id.
-    canonical.speaker_id = speaker_id
-
-    # Collect alias names: any entity that is a longer form of the speaker name
-    # or matches the opaque speaker_id, excluding the canonical entity itself.
-    alias_names: set[str] = set()
-    for ent in graph.entities:
-        if ent is canonical:
+        if not is_speaker_id(ent.name):
             continue
-        name_lower = ent.name.lower()
-        # Full-name variant (e.g. "Alex Morgan" when canonical is "Alex")
-        if name_lower.startswith(speaker_name_lower + " ") or name_lower.startswith(
-            speaker_name_lower + "-"
-        ):
-            alias_names.add(ent.name)
-        # Opaque speaker_id entity (e.g. "Speaker0" entity alongside "Alex")
-        elif name_lower == speaker_id_lower:
-            alias_names.add(ent.name)
-
-    if not alias_names:
-        return graph
-
-    # Merge attributes from all alias entities into canonical.
-    alias_map: dict[str, str] = {}  # alias_name -> canonical.name
-    entities_to_remove: set[str] = set()
-    for ent in graph.entities:
-        if ent.name in alias_names:
-            canonical.attributes.update(ent.attributes)
-            alias_map[ent.name] = canonical.name
-            entities_to_remove.add(ent.name)
-            logger.info(
-                "Speaker entity fold: '%s' → '%s' (speaker_id=%s)",
-                ent.name,
-                canonical.name,
-                speaker_id,
-            )
-
-    # Rewrite relation subjects/objects that referenced alias names.
-    for rel in graph.relations:
-        if rel.subject in alias_map:
-            rel.subject = alias_map[rel.subject]
-        if rel.object in alias_map:
-            rel.object = alias_map[rel.object]
-
-    # Remove folded entity objects.
-    graph.entities = [e for e in graph.entities if e.name not in entities_to_remove]
+        if speaker_ref_matches(ent.name, speaker_id):
+            # This entity IS the session speaker — stamp the authoritative id.
+            ent.speaker_id = speaker_id
+        else:
+            # A different registered speaker referenced in this session.
+            # Normalise to canonical cased form ("Speaker{N}") regardless of
+            # how the model emitted the id — the model may casefold to
+            # "speaker0" even when the few-shots show "Speaker0".
+            digits = ent.name.lower().removeprefix("speaker")
+            ent.speaker_id = f"Speaker{digits}"
 
     return graph
 
