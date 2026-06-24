@@ -38,7 +38,8 @@ def _make_registry_dict(keys_by_adapter: dict[str, list[str]]) -> dict:
 
     Each tier in *keys_by_adapter* becomes a separate ``KeyRegistry`` instance
     containing only the keys for that tier — matching the production schema
-    where ``ConsolidationLoop.indexed_key_registry`` is keyed by tier name.
+    where the store's registries are keyed by tier name
+    (``MemoryStore.tiers_with_registry()``).
     """
     reg_dict: dict[str, KeyRegistry] = {}
     for adapter_id, keys in keys_by_adapter.items():

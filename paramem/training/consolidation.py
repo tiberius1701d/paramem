@@ -689,73 +689,18 @@ class ConsolidationLoop:
             entry["answer"] = answer
         return entry
 
-    # ------------------------------------------------------------------
-    # DEPRECATED — transitional accessors for the legacy attribute names
-    # ------------------------------------------------------------------
-    # The 2026-05-14 MemoryStore cleanup moved {entries, simhashes, registry}
-    # off the loop and into ``self.store``.  Production code is fully
-    # migrated.  These accessors exist ONLY to keep the test surface green
-    # while we migrate the ~250 test sites that still reach in by name —
-    # they are NOT part of the supported API and MUST be deleted once
-    # tests are migrated.
-    #
-    # Read-write coupling: indexed_key_cache returns the *live* internal dict
-    # via the store, so existing tests that mutate it
-    # (``loop.indexed_key_cache[k] = v``) propagate to the store.
-    # ``indexed_key_registry`` returns the store's internal dict for the same
-    # reason.
-    #
-    # TODO(arch-cleanup): delete indexed_key_cache + indexed_key_registry
-    # (+ the two _*-aliases) once all remaining test sites are migrated.
-    # The episodic_simhash/semantic_simhash/procedural_simhash trio was deleted
-    # 2026-06-13; call sites now use store.replace_simhashes_in_tier directly.
-
     def _ensure_store(self) -> None:
-        """Auto-create a :class:`MemoryStore` for bare-loop test instances.
+        """Auto-create a :class:`MemoryStore` when the loop has no store yet.
 
-        Some tests construct ``ConsolidationLoop`` via ``object.__new__``
-        without invoking ``__init__``, then assign attributes one by one.
-        The deprecated setters tolerate that pattern by lazily attaching
-        a store with replay enabled.  Production code always goes through
-        ``__init__`` and never reaches this path."""
+        Called in production by the fold ledger-attribution method
+        (``_attribute_ledger_removals_to_tiers``) to guarantee a store exists
+        before attributing removal entries.  Also guards bare-loop construction
+        paths (e.g. ``object.__new__`` in tests) that set store-dependent
+        attributes before ``__init__`` runs."""
         if not hasattr(self, "store") or self.store is None:
             from paramem.memory.store import MemoryStore
 
             self.store = MemoryStore(replay_enabled=True)
-
-    @property
-    def indexed_key_cache(self) -> dict[str, dict]:
-        """DEPRECATED: flat-across-tier view of the store's entries.
-
-        Mutations through ``loop.indexed_key_cache[key] = entry`` route to
-        the most-recently-touched tier or default to ``"episodic"`` — they
-        do NOT preserve tier semantics.  New code uses
-        :meth:`MemoryStore.put` / :meth:`MemoryStore.get` directly.
-        """
-        from paramem.memory.store import _LegacyFlatCacheView as _LV
-
-        self._ensure_store()
-        return _LV(self.store)
-
-    @indexed_key_cache.setter
-    def indexed_key_cache(self, value: dict[str, dict]) -> None:
-        """DEPRECATED: replace the entire cache (test-only reset path)."""
-        self._ensure_store()
-        self.store._entries = {"_legacy": dict(value)} if value else {}
-
-    @property
-    def indexed_key_registry(self) -> "dict[str, KeyRegistry] | None":
-        """DEPRECATED: returns the store's internal registry dict, or ``None``
-        when replay is disabled — preserves the legacy None-gate semantics."""
-        self._ensure_store()
-        return self.store._registry
-
-    @indexed_key_registry.setter
-    def indexed_key_registry(self, value: "dict[str, KeyRegistry] | None") -> None:
-        self._ensure_store()
-        self.store._registry = value
-        # Reflect the replay flag so MemoryStore.replay_enabled stays honest.
-        self.store._replay_enabled = value is not None
 
     # ------------------------------------------------------------------
     # Per-tier registry helpers

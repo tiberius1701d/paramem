@@ -838,7 +838,6 @@ class TestSessionClassification:
         loop.merger = MagicMock()
         loop.merger.graph = MagicMock()
         loop.merger.graph.nodes = []
-        loop.indexed_key_cache = {}
         loop.promoted_keys = set()
         loop.episodic_simhash = {}
         loop.semantic_simhash = {}
@@ -1257,8 +1256,10 @@ class TestSaveAdaptersManifest:
         loop.save_cycle_snapshots = False
         loop._debug_base = None
         loop._keep_prior_slots = 50  # high value so pruning is a no-op in these tests
-        loop.indexed_key_registry = {"episodic": KeyRegistry()}
-        loop.indexed_key_cache = {}
+        from paramem.memory.store import MemoryStore
+
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.store.load_registry("episodic", KeyRegistry())
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}
@@ -1277,7 +1278,7 @@ class TestSaveAdaptersManifest:
 
         ep_reg = KeyRegistry()
         ep_reg.add("graph1")
-        loop.indexed_key_registry = {"episodic": ep_reg}
+        loop.store.load_registry("episodic", ep_reg)
 
         loop._save_adapters()
 
@@ -1310,9 +1311,11 @@ class TestSaveAdaptersManifest:
         # Seed registry + quads state so every hash input is populated.
         ep_reg = KeyRegistry()
         ep_reg.add("graph1")
-        loop.indexed_key_registry = {"episodic": ep_reg}
-        loop.indexed_key_cache = {
-            "graph1": {
+        loop.store.load_registry("episodic", ep_reg)
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {
                 "key": "graph1",
                 "question": "What colour is the sky?",
                 "answer": "Blue.",
@@ -1321,8 +1324,9 @@ class TestSaveAdaptersManifest:
                 "object": "blue",
                 "speaker_id": "Speaker0",
                 "first_seen_cycle": 1,
-            }
-        }
+            },
+            register=False,
+        )
         loop.episodic_simhash = {"graph1": 0xABCDEF}
 
         # Pre-seed a *different* registry file on disk at the per-tier path
@@ -2717,8 +2721,10 @@ class TestSlotRetention:
         loop.save_cycle_snapshots = False
         loop._debug_base = None
         loop._keep_prior_slots = 2
-        loop.indexed_key_registry = {"episodic": KeyRegistry()}
-        loop.indexed_key_cache = {}
+        from paramem.memory.store import MemoryStore
+
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.store.load_registry("episodic", KeyRegistry())
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}
@@ -2872,7 +2878,6 @@ class TestAbortSkipsCommit:
         loop._thermal_policy = None
         loop.output_dir = tmp_path
         loop.store = MemoryStore(replay_enabled=True)
-        loop.indexed_key_cache = {}
         loop.promoted_keys = set()
         loop.cycle_count = 0
         loop.episodic_simhash = {}
@@ -7532,7 +7537,6 @@ class TestHarvestKeylessEdgesSpeakerId:
         loop._thermal_policy = None
         loop.output_dir = tmp_path
         loop.store = MemoryStore(replay_enabled=False)
-        loop.indexed_key_cache = {}
         loop.promoted_keys = set()
         loop.cycle_count = 1
         loop.episodic_simhash = {}

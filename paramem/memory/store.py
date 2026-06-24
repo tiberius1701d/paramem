@@ -2,13 +2,6 @@
 
 Public API: :class:`MemoryStore`.
 
-Private helper :class:`_LegacyFlatCacheView` exists ONLY to keep the
-``ConsolidationLoop.indexed_key_cache`` deprecation accessor working
-while ``tests/`` migrate off the legacy attribute names.  It is not
-part of the supported API; see the TODO at
-``ConsolidationLoop.indexed_key_cache``.
-
-
 Single source of truth for the answer content, integrity fingerprints, and
 lifecycle registries of every indexed key the system holds in RAM.  Replaces
 the previous mixed-shape state on :class:`ConsolidationLoop`:
@@ -184,8 +177,10 @@ class MemoryStore:
     # ------------------------------------------------------------------
     @property
     def replay_enabled(self) -> bool:
-        """True when the lifecycle registry is active.  Mirrors the legacy
-        ``ConsolidationLoop.indexed_key_registry is not None`` check."""
+        """True when the lifecycle registry is active.
+
+        When ``False``, :meth:`load_registry` raises and recall-gating paths
+        that require a registry are bypassed."""
         return self._replay_enabled
 
     # ------------------------------------------------------------------
@@ -849,14 +844,6 @@ class MemoryStore:
                     if key not in reg._stale:
                         reg._simhash[key] = fp
 
-    def _entries_flat_view(self) -> "_LegacyFlatCacheView":
-        """Return a flat dict-like view of all entries across tiers.
-
-        DEPRECATED: only exists for test sites that still expect a flat
-        ``dict[key, entry]`` shape.  New code uses :meth:`iter_entries`
-        or :meth:`entries_in_tier`."""
-        return _LegacyFlatCacheView(self)
-
     # ------------------------------------------------------------------
     # Probe — resolve {key → entry} for inference, with optional source fallback
     # ------------------------------------------------------------------
@@ -1327,123 +1314,3 @@ class MemoryStore:
             self._entries = new_entries
             self._registry = new_registry
             self._bookkeeping = new_bookkeeping
-
-
-class _LegacyFlatCacheView:
-    """Flat dict-like view over :class:`MemoryStore` entries.
-
-    DEPRECATED — only exists so the ``ConsolidationLoop.indexed_key_cache``
-    property keeps the legacy tests green during the migration to
-    ``self.store``.  Delete once tests are migrated off the legacy
-    attribute name.
-
-    Read semantics: ``view[key]`` raises ``KeyError`` on miss, matching the
-    pre-refactor dict.  ``key in view``, ``.get``, ``.items``, ``.values``,
-    ``.keys``, ``len`` all work.
-
-    Write semantics: ``view[key] = entry`` routes to the tier that already
-    owns *key*; if *key* is new, defaults to ``"episodic"``.  ``del view[key]``
-    drops *key* from whichever tier owns it.  ``.pop`` and ``.update`` work.
-
-    Mutation routes through :meth:`MemoryStore.put` / :meth:`MemoryStore.delete`
-    so entries + simhash + registry stay coherent.  This is the SAFE write path
-    for legacy callers; new code uses the store API directly.
-    """
-
-    __slots__ = ("_store",)
-
-    def __init__(self, store: "MemoryStore") -> None:
-        self._store = store
-
-    def __getitem__(self, key: str) -> dict:
-        value = self._store.get(key)
-        if value is None:
-            raise KeyError(key)
-        return value
-
-    def __setitem__(self, key: str, value: dict) -> None:
-        # Prefer the tier the key already belongs to in ANY sub-structure
-        # (entry / registry / simhash) so legacy seeders that prime one
-        # tier's simhash and then write the entry observe consistent
-        # ownership.  Falls back to ``"episodic"`` only when the key is
-        # completely new.
-        tier = (
-            self._store.tier_of(key)
-            or self._store.tier_for_active_key(key)
-            or self._store._tier_for_simhash(key)
-            or "episodic"
-        )
-        # ``register=False``: the legacy ``indexed_key_cache[k] = q`` write
-        # only mutated the cache dict — it did NOT add to
-        # ``indexed_key_registry``.  Callers that want registration use
-        # the explicit store API or the registry directly.
-        self._store.put(tier, key, value, register=False)
-
-    def __delitem__(self, key: str) -> None:
-        former = self._store.delete(key)
-        if former is None:
-            raise KeyError(key)
-
-    def __contains__(self, key: object) -> bool:
-        return isinstance(key, str) and self._store.has(key)
-
-    def __iter__(self):
-        for _tier, key, _entry in self._store.iter_entries():
-            yield key
-
-    def __len__(self) -> int:
-        return len(self._store)
-
-    def __bool__(self) -> bool:
-        return len(self._store) > 0
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, _LegacyFlatCacheView):
-            return dict(self.items()) == dict(other.items())
-        if isinstance(other, dict):
-            return dict(self.items()) == other
-        return NotImplemented
-
-    def get(self, key: str, default=None):
-        value = self._store.get(key)
-        return default if value is None else value
-
-    def setdefault(self, key: str, default: dict) -> dict:
-        existing = self._store.get(key)
-        if existing is not None:
-            return existing
-        self[key] = default
-        return default
-
-    def pop(self, key: str, *default):
-        existing = self._store.get(key)
-        if existing is None:
-            if default:
-                return default[0]
-            raise KeyError(key)
-        self._store.delete(key)
-        return existing
-
-    def items(self):
-        return [(k, q) for _tier, k, q in self._store.iter_entries()]
-
-    def keys(self):
-        return [k for _tier, k, _q in self._store.iter_entries()]
-
-    def values(self):
-        return [q for _tier, _k, q in self._store.iter_entries()]
-
-    def update(self, *args, **kwargs) -> None:
-        if args:
-            arg = args[0]
-            if hasattr(arg, "items"):
-                for k, v in arg.items():
-                    self[k] = v
-            else:
-                for k, v in arg:
-                    self[k] = v
-        for k, v in kwargs.items():
-            self[k] = v
-
-    def __repr__(self) -> str:
-        return f"_LegacyFlatCacheView({dict(self.items())!r})"

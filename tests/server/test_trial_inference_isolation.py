@@ -1,8 +1,8 @@
 """Tests for trial adapter inference isolation.
 
-Verifies that the router uses ConsolidationLoop.store._entries_flat_view() (the
-canonical entity-index source) and does NOT pick up trial adapter keys when
-trial_adapter_dir is separate from config.adapter_dir.
+Verifies that the router reads from the lifespan-owned MemoryStore
+(``store.put`` / ``iter_bookkeeping``) and does NOT pick up trial adapter
+keys when trial_adapter_dir is separate from config.adapter_dir.
 
 Also tests _load_simhash_registry with the unified registry layout so the
 SimHash unification refactor has end-to-end coverage:
@@ -21,7 +21,8 @@ from paramem.server.router import QueryRouter
 
 
 class TestRouterReadsFromLoopCache:
-    """Router reads from ConsolidationLoop.store._entries_flat_view(), not from quads.json."""
+    """Router reads from the lifespan-owned MemoryStore (via ``store.put`` /
+    ``iter_bookkeeping``), not from quads.json."""
 
     def _make_store_with_cache(self, cache: dict):
         """Build a MemoryStore pre-populated with the given entries.

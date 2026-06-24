@@ -63,7 +63,8 @@ def reconstruct_graph(
 ) -> ReconstructionResult:
     """Probe every active key from the loop's adapter weights and build a graph.
 
-    Iterates ``loop.indexed_key_registry`` (a ``dict[str, KeyRegistry]``),
+    Iterates the store's per-tier registries
+    (``loop.store.tiers_with_registry()`` / ``active_keys_in_tier``),
     groups keys by tier, calls ``switch_adapter`` once per tier, probes
     every key in that group via :func:`~paramem.training.recall_eval.probe_entries`,
     and merges the entries into a fresh ``nx.MultiDiGraph``.

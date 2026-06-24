@@ -36,6 +36,7 @@ import networkx as nx
 import pytest
 
 from paramem.graph.reconstruct import ReconstructionResult
+from paramem.memory.store import MemoryStore
 from paramem.server.background_trainer import BackgroundTrainer, TrainingJob
 from paramem.training.key_registry import KeyRegistry
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
@@ -134,8 +135,11 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     """Construct a bare ConsolidationLoop without calling __init__.
 
     ``registry`` must be a ``dict[str, KeyRegistry]`` (per-tier) or ``None``
-    (disabled replay).  When omitted, a fresh three-tier dict is used so
-    ``_all_active_keys()`` works without a real ``__init__`` call.
+    (when absent, a fresh three-tier dict is used).  Each entry is installed
+    via ``store.load_registry`` so ``_all_active_keys()`` works without a real
+    ``__init__`` call.
+    ``indexed_key_cache`` entries are seeded via ``store.put("episodic", ...)``
+    with ``register=False`` (matching the legacy flat-view write semantics).
     """
     from paramem.training.consolidation import ConsolidationLoop
 
@@ -177,9 +181,13 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
         return _merger_graph
 
     loop.merger.merge.side_effect = _merge_into_graph
-    # indexed_key_registry is now dict[str, KeyRegistry] (per-tier).
-    loop.indexed_key_registry = registry if registry is not None else _make_empty_registry_dict()
-    loop.indexed_key_cache = indexed_key_cache if indexed_key_cache is not None else {}
+    loop.store = MemoryStore(replay_enabled=True)
+    reg_dict = registry if registry is not None else _make_empty_registry_dict()
+    for tier_name, reg in reg_dict.items():
+        loop.store.load_registry(tier_name, reg)
+    seed = indexed_key_cache if indexed_key_cache is not None else {}
+    for k, entry in seed.items():
+        loop.store.put("episodic", k, entry, register=False)
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
     loop._thermal_policy = None
@@ -200,12 +208,9 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
     # _promote_mature_keys_inline (called inside consolidate_interim_adapters) reads
     # cycle_count, promoted_keys, and store.  Wire sensible defaults so the method
-    # runs without error.  Call _ensure_store() rather than assigning a new store so
-    # we don't overwrite a store already created (and populated via the legacy
-    # indexed_key_cache setter) by the indexed_key_registry property setter above.
+    # runs without error.
     loop.cycle_count = 0
     loop.promoted_keys = set()
-    loop._ensure_store()
     return loop
 
 
@@ -1172,11 +1177,12 @@ class TestAtomicFinalizeOrdering:
         )
 
     def test_no_phantom_interim_entries_after_finalize(self, tmp_path: Path) -> None:
-        """After successful finalize, no episodic_interim_* tier remains in the registry dict.
+        """After successful finalize, no episodic_interim_* tier remains in the store's registries.
 
-        The per-tier dict schema encodes tier identity as the dict key.  After
+        The per-tier schema encodes tier identity as the registry key.  After
         finalize, ``_drop_interim_tier_registries`` must remove all
-        ``episodic_interim_*`` keys from ``loop.indexed_key_registry``.
+        ``episodic_interim_*`` keys from the store's registries
+        (``loop.store.tiers_with_registry()``).
         """
         from paramem.server.gpu_lock import _gpu_thread_lock
 
@@ -1258,8 +1264,8 @@ class TestAtomicFinalizeOrdering:
 
         assert not result["rolled_back"]
 
-        # Verify no episodic_interim_* tier key remains in the registry dict.
-        for tier_key in loop.indexed_key_registry:
+        # Verify no episodic_interim_* tier key remains in the store's registries.
+        for tier_key in loop.store.tiers_with_registry():
             assert not tier_key.startswith("episodic_interim_"), (
                 f"Interim tier key {tier_key!r} still present after finalize"
             )

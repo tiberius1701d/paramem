@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from peft import PeftModel
 
+from paramem.memory.store import MemoryStore
 from paramem.training.consolidation import ConsolidationLoop
 from paramem.training.key_registry import KeyRegistry
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
@@ -96,8 +97,8 @@ def _make_verify_loop(tmp_path: Path, model: MagicMock | None = None) -> Consoli
     loop.output_dir = tmp_path
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
-    loop.indexed_key_registry = {"episodic": KeyRegistry()}
-    loop.indexed_key_cache = {}
+    loop.store = MemoryStore(replay_enabled=True)
+    loop.store.load_registry("episodic", KeyRegistry())
     loop.cycle_count = 0
     loop.merger = MagicMock()
     loop.store.replace_simhashes_in_tier("episodic", {})
@@ -520,8 +521,8 @@ class TestSaveAdaptersCallsVerify:
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
         loop._keep_prior_slots = 50  # high value so pruning is a no-op in these tests
-        loop.indexed_key_registry = {"episodic": KeyRegistry()}
-        loop.indexed_key_cache = {}
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.store.load_registry("episodic", KeyRegistry())
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}
@@ -649,8 +650,8 @@ class TestPreSaveProbeRemoved:
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
         loop._keep_prior_slots = 50  # high value so pruning is a no-op in these tests
-        loop.indexed_key_registry = {"episodic": KeyRegistry()}
-        loop.indexed_key_cache = {}
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.store.load_registry("episodic", KeyRegistry())
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}
@@ -741,8 +742,8 @@ class TestPostSaveSlotCleanup:
         loop.snapshot_dir = None
         loop.save_cycle_snapshots = False
         loop._keep_prior_slots = 50  # high value so pruning is a no-op in these tests
-        loop.indexed_key_registry = {"episodic": KeyRegistry()}
-        loop.indexed_key_cache = {}
+        loop.store = MemoryStore(replay_enabled=True)
+        loop.store.load_registry("episodic", KeyRegistry())
         loop.cycle_count = 0
         loop.merger = MagicMock()
         loop.episodic_simhash = {}

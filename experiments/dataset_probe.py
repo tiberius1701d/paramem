@@ -18,7 +18,7 @@ Hard rules carried forward:
   - ConsolidationLoop is used exactly as in archive/experiments/phase3_consolidation.py.
   - Speaker-id tagging mirrors paramem/server/consolidation.py:155-158.
   - Write ordering: raw_qa → diagnostics → state (fsync at each step).
-  - Smoke test shim writes quads.json from loop.indexed_key_cache.
+  - Smoke test shim writes quads.json from the store (``loop.store.iter_entries()``).
 """
 
 import argparse
@@ -404,10 +404,9 @@ def _prepare_smoke_shim(run_dir: Path, loop) -> Path:
     fresh base model) can run on disk alone — the caller is expected to free
     GPU memory between the two.
 
-    quads.json is written from ``loop.indexed_key_cache`` (the canonical
-    in-memory store).  Each cache entry already carries the canonical fields
-    (subject, predicate, object, speaker_id, first_seen_cycle; question/answer
-    in QA mode).
+    quads.json is written from the store (``loop.store.iter_entries()``).
+    Each entry already carries the canonical fields (subject, predicate,
+    object, speaker_id, first_seen_cycle; question/answer in QA mode).
 
     Args:
         run_dir: The probe run directory (contains episodic/ adapter subdir).
@@ -419,8 +418,8 @@ def _prepare_smoke_shim(run_dir: Path, loop) -> Path:
     shim_dir = run_dir / "_smoke_shim"
     shim_dir.mkdir(parents=True, exist_ok=True)
 
-    # (a) quads.json — serialise from the canonical in-memory cache.
-    kp_list = list(loop.indexed_key_cache.values())
+    # (a) quads.json — serialise from the canonical in-memory store.
+    kp_list = [entry for _tier, _key, entry in loop.store.iter_entries()]
     _atomic_json_write(kp_list, shim_dir / "quads.json")
 
     # (b) simhash_registry.json
@@ -429,7 +428,7 @@ def _prepare_smoke_shim(run_dir: Path, loop) -> Path:
     if src_registry.exists():
         shutil.copy2(src_registry, dst_registry)
     else:
-        _atomic_json_write(loop.episodic_simhash, dst_registry)
+        _atomic_json_write(loop.store.tier_simhashes("episodic", include_stale=False), dst_registry)
 
     # (c) adapter symlink at {shim}/adapter/episodic -> the *live slot* under
     # {run_dir}/episodic.  After the 2026-04-30 slot-management refactor
@@ -473,7 +472,7 @@ def _run_smoke_on_shim(shim_dir: Path, model: str) -> dict:
     2026-05-20).  Loads the base model fresh, mounts the adapter from
     ``shim_dir/adapter/episodic``, reads entries + registry from the shim
     layout (which ``_prepare_smoke_shim`` materialized from the live
-    ``loop.indexed_key_cache``), and delegates to the production-shape
+    store (``loop.store.iter_entries()``), and delegates to the production-shape
     :func:`paramem.training.recall_eval.evaluate_indexed_recall`.
 
     Expects GPU memory from the main loop to already be freed — this call

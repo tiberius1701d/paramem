@@ -135,7 +135,7 @@ def main() -> int:
     )
 
     # Snapshot registry state before Step 7.
-    keys_before = loop.indexed_key_registry.list_active()
+    keys_before = loop.store.all_active_keys()
     adapters_before = sorted(model.peft_config.keys()) if hasattr(model, "peft_config") else []
     logger.info(
         "Pre-Step-7: %d active keys; adapters=%s",
@@ -157,7 +157,7 @@ def main() -> int:
     logger.info("Step 7 returned in %.1fs: %s", elapsed, json.dumps(step7_result, default=str))
 
     # Post-conditions.
-    keys_after = loop.indexed_key_registry.list_active()
+    keys_after = loop.store.all_active_keys()
     adapters_after = sorted(model.peft_config.keys()) if hasattr(model, "peft_config") else []
     interim_dirs_after = sorted(
         p.name

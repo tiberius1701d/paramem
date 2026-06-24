@@ -142,10 +142,10 @@ class TestPersistence:
 class TestPerTierSchema:
     """Per-tier KeyRegistry: each registry owns one tier's keys.
 
-    The adapter_id concept is now encoded by the dict key in
-    ``ConsolidationLoop.indexed_key_registry``, not by a field on the
-    registry record.  These tests verify the single-tier registry
-    behaviours that the per-tier dict pattern relies on.
+    The adapter_id concept is now encoded by the tier name in the store's
+    per-tier registries (``MemoryStore.registry(tier)``), not by a field
+    on the registry record.  These tests verify the single-tier registry
+    behaviours that the per-tier pattern relies on.
     """
 
     def test_add_no_adapter_id_kwarg(self):

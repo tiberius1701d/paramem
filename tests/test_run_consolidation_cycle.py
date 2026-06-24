@@ -21,22 +21,11 @@ from unittest.mock import MagicMock, patch
 import networkx as nx
 import pytest
 
+from paramem.memory.store import MemoryStore
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _count_registry_keys(loop) -> int:
-    """Return total active-key count across all tier registries.
-
-    ``loop.indexed_key_registry`` is now ``dict[str, KeyRegistry]``.  This
-    helper replaces the old ``len(loop.indexed_key_registry)`` pattern which
-    counted tiers, not keys.
-    """
-    reg = loop.indexed_key_registry
-    if reg is None:
-        return 0
-    return sum(len(r) for r in reg.values())
 
 
 def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
@@ -106,13 +95,9 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
         ),
         prompts_dir=None,
     )
-    # indexed_key_registry is now dict[str, KeyRegistry] (per-tier).
-    loop.indexed_key_registry = {
-        "episodic": KeyRegistry(),
-        "semantic": KeyRegistry(),
-        "procedural": KeyRegistry(),
-    }
-    loop.indexed_key_cache = {}
+    loop.store = MemoryStore(replay_enabled=True)
+    for t in ("episodic", "semantic", "procedural"):
+        loop.store.load_registry(t, KeyRegistry())
     loop._indexed_next_index = 1
     loop._procedural_next_index = 1
     loop.store.replace_simhashes_in_tier("episodic", {})

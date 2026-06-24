@@ -235,7 +235,6 @@ class TestConsolidationIntegration:
         loop.merger = MagicMock()
         loop.merger.graph = MagicMock()
         loop.merger.graph.nodes = []
-        loop.indexed_key_cache = {}
         loop.promoted_keys = set()
         loop.episodic_simhash = {}
         loop.semantic_simhash = {}

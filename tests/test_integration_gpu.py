@@ -1090,7 +1090,7 @@ class TestSimulateModePromptIteration:
 
         loop = result["loop"]
         assert loop is not None
-        assert loop.indexed_key_registry is not None
+        assert loop.store.replay_enabled
         assert len(loop._all_active_keys()) >= 1, (
             "Indexed-key registry empty — run_consolidation_cycle (simulate mode) "
             "did not assign keys."

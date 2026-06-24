@@ -98,7 +98,6 @@ def _make_minimal_loop(tmp_path):
     loop._thermal_policy = None
     loop.output_dir = tmp_path
     loop.store = MemoryStore(replay_enabled=True)
-    loop.indexed_key_cache = {}
     loop.promoted_keys = set()
     loop.cycle_count = 0
     loop.episodic_simhash = {}
