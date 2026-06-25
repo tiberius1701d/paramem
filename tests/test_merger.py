@@ -31,14 +31,14 @@ def session_graph_1():
                 predicate="lives_in",
                 object="Heilbronn",
                 relation_type="factual",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
             ),
             Relation(
                 subject="Alex",
                 predicate="works_at",
                 object="AutoMate",
                 relation_type="factual",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
             ),
         ],
     )
@@ -59,7 +59,7 @@ def session_graph_2():
                 predicate="prefers",
                 object="Python",
                 relation_type="preference",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
             ),
         ],
     )
@@ -103,7 +103,7 @@ class TestPredicateNormalization:
                     predicate="works_at",
                     object="B",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -120,7 +120,7 @@ class TestPredicateNormalization:
                     predicate="works at",
                     object="B",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -198,7 +198,7 @@ class TestEdgeAggregation:
                     predicate="lives_in",
                     object="B",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -215,7 +215,7 @@ class TestEdgeAggregation:
                     predicate="lives_in",
                     object="B",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -243,14 +243,14 @@ class TestEdgeAggregation:
                     predicate="works_at",
                     object="B",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
                 Relation(
                     subject="A",
                     predicate="manages",
                     object="B",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
         )
@@ -388,18 +388,18 @@ class TestSpeakerIdDedup:
             timestamp="2026-01-01T00:00:00Z",
             entities=[
                 Entity(
-                    name="Speaker0",
+                    name="speaker0",
                     entity_type="person",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[
                 Relation(
-                    subject="Speaker0",
+                    subject="speaker0",
                     predicate="lives_in",
                     object="Portland",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -412,7 +412,7 @@ class TestSpeakerIdDedup:
                     name="Alex",
                     entity_type="person",
                     attributes={"has_last_name": "Kim"},
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
                 Entity(name="Portland", entity_type="place"),
             ],
@@ -422,26 +422,27 @@ class TestSpeakerIdDedup:
                     predicate="lives_in",
                     object="Portland",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
         m.merge(sg1)
         m.merge(sg2)
 
-        # Must collapse to a single person node — no "Speaker0" + "Alex" split.
+        # Must collapse to a single person node — no "speaker0" + "Alex" split.
         person_nodes = [n for n, d in m.graph.nodes(data=True) if d.get("entity_type") == "person"]
         assert len(person_nodes) == 1, (
             f"Expected 1 person node, got {len(person_nodes)}: {person_nodes}"
         )
 
     def test_speaker_node_keyed_by_speaker_id(self):
-        """Speaker entity is keyed by the casefolded speaker_id in the graph;
+        """Speaker entity is keyed by entity.speaker_id verbatim in the graph;
         the display name moves to ``attributes["name"]``.
 
-        §0 invariant (Step 2): node keys for speakers are the casefolded form
-        of the speaker_id (``canonical_speaker("Speaker0") == "speaker0"``).
-        The display name and the raw ``speaker_id`` attribute remain cased.
+        Under lowercase-uniform identity the ingest safety-net guarantees
+        speaker_id is always lowercase ``speaker{N}`` before it reaches the
+        merger.  The merger uses entity.speaker_id verbatim as the node key
+        (no casing step needed).
         """
         m = GraphMerger(similarity_threshold=85.0)
         sg = SessionGraph(
@@ -451,17 +452,16 @@ class TestSpeakerIdDedup:
                 Entity(
                     name="Alex",
                     entity_type="person",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[],
         )
         m.merge(sg)
-        # Node key IS the casefolded speaker_id, NOT the cased form or the display name.
+        # Node key IS entity.speaker_id verbatim (lowercase).
         assert "speaker0" in m.graph.nodes
-        assert "Speaker0" not in m.graph.nodes
         assert "Alex" not in m.graph.nodes
-        assert m.graph.nodes["speaker0"]["speaker_id"] == "Speaker0"
+        assert m.graph.nodes["speaker0"]["speaker_id"] == "speaker0"
         assert m.graph.nodes["speaker0"]["attributes"]["name"] == "Alex"
 
     def test_non_speaker_entities_still_dedup_by_name(self):
@@ -497,7 +497,7 @@ class TestSpeakerIdDedup:
                     name="Alex",
                     entity_type="person",
                     attributes={"role": "engineer"},
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[],
@@ -510,7 +510,7 @@ class TestSpeakerIdDedup:
                     name="Alex",
                     entity_type="person",
                     attributes={"has_last_name": "Kim"},
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[],
@@ -544,7 +544,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
                     name="Alex",
                     entity_type="person",
                     attributes={"has_email": "alex@example.com"},
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[],
@@ -557,7 +557,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
                     name="Alex",
                     entity_type="person",
                     attributes={"has_email": ""},
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[],
@@ -578,7 +578,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
                     name="Alex",
                     entity_type="person",
                     attributes={"has_phone": "+1 555 123 4567"},
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[],
@@ -591,7 +591,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
                     name="Alex",
                     entity_type="person",
                     attributes={"has_phone": "N/A"},
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[],
@@ -614,7 +614,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
                     name="Alex",
                     entity_type="person",
                     attributes={"has_email": "N/A"},
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[],
@@ -627,7 +627,7 @@ class TestEmptyAttributeValueDoesNotOverwrite:
                     name="Alex",
                     entity_type="person",
                     attributes={"has_email": "alex@example.com"},
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             relations=[],
@@ -641,12 +641,12 @@ class TestMultiUserNameCollision:
     """Two distinct disclosed speakers with the same display name must NOT
     collapse into one graph node.
 
-    This is the multi-user PA case: Speaker0 (Alex Walker) and
-    Speaker1 (a different Alex) both enrol with display name
+    This is the multi-user PA case: speaker0 (Alex Walker) and
+    speaker1 (a different Alex) both enrol with display name
     ``Alex``.  Without a guard, ``_resolve_entity`` Tier 1 (exact
-    name match) returns Speaker0's node when Speaker1's entity arrives,
-    and ``_upsert_entity`` happily folds Speaker1's facts into
-    Speaker0's node — corrupting both speakers' graphs.
+    name match) returns speaker0's node when speaker1's entity arrives,
+    and ``_upsert_entity`` happily folds speaker1's facts into
+    speaker0's node — corrupting both speakers' graphs.
 
     Tier 0 (positive speaker_id match) was already in place; this
     class guards the missing NEGATIVE: name collision across distinct
@@ -688,31 +688,31 @@ class TestMultiUserNameCollision:
         graph nodes with their own attributes and relations.
         """
         m = GraphMerger(similarity_threshold=85.0)
-        m.merge(self._build_speaker_session("s001", "Speaker0", "Walker", "Portland"))
-        m.merge(self._build_speaker_session("s002", "Speaker1", "Schmidt", "Munich"))
+        m.merge(self._build_speaker_session("s001", "speaker0", "Walker", "Portland"))
+        m.merge(self._build_speaker_session("s002", "speaker1", "Schmidt", "Munich"))
 
         # Two speaker nodes — separate identities.
         speaker_nodes = [
             (node, data)
             for node, data in m.graph.nodes(data=True)
-            if data.get("speaker_id") in {"Speaker0", "Speaker1"}
+            if data.get("speaker_id") in {"speaker0", "speaker1"}
         ]
         speaker_ids = {data["speaker_id"] for _, data in speaker_nodes}
-        assert speaker_ids == {"Speaker0", "Speaker1"}, (
-            f"Expected separate nodes for Speaker0 and Speaker1, got "
+        assert speaker_ids == {"speaker0", "speaker1"}, (
+            f"Expected separate nodes for speaker0 and speaker1, got "
             f"speaker_ids={speaker_ids} on nodes "
             f"{[(n, d.get('speaker_id'), d.get('attributes', {})) for n, d in speaker_nodes]}"
         )
 
         # Each carries its own last_name — no cross-contamination.
         by_sid = {data["speaker_id"]: (node, data) for node, data in speaker_nodes}
-        speaker0_node, speaker0_data = by_sid["Speaker0"]
-        speaker1_node, speaker1_data = by_sid["Speaker1"]
+        speaker0_node, speaker0_data = by_sid["speaker0"]
+        speaker1_node, speaker1_data = by_sid["speaker1"]
         assert speaker0_data["attributes"].get("last_name") == "Walker", (
-            f"Speaker0's last_name attribute corrupted: got {speaker0_data['attributes']!r}"
+            f"speaker0's last_name attribute corrupted: got {speaker0_data['attributes']!r}"
         )
         assert speaker1_data["attributes"].get("last_name") == "Schmidt", (
-            f"Speaker1's last_name attribute corrupted: got {speaker1_data['attributes']!r}"
+            f"speaker1's last_name attribute corrupted: got {speaker1_data['attributes']!r}"
         )
 
         # Each speaker's lives_in relation points to the right place.
@@ -727,15 +727,15 @@ class TestMultiUserNameCollision:
         ``speaker_id`` unset (he's not the speaker of that session).
 
         The name namespace and the speaker-ID namespace are disjoint by
-        construction: speaker IDs follow the ``Speaker{N}`` pattern
+        construction: speaker IDs follow the ``speaker{N}`` pattern
         produced by the speaker pool, so a display name like
         ``"Alex"`` will never collide with a casefolded speaker-id node key.
         The third-party Alex becomes a separate node keyed by
-        ``"alex"`` (canonical form); Speaker0's node is keyed by
+        ``"alex"`` (canonical form); speaker0's node is keyed by
         ``"speaker0"`` (casefolded §0 key) with its own attributes intact.
         """
         m = GraphMerger(similarity_threshold=85.0)
-        m.merge(self._build_speaker_session("s001", "Speaker0", "Walker", "Portland"))
+        m.merge(self._build_speaker_session("s001", "speaker0", "Walker", "Portland"))
         third_party = SessionGraph(
             session_id="s002",
             timestamp="2026-05-06T00:00:00Z",
@@ -746,15 +746,14 @@ class TestMultiUserNameCollision:
         )
         m.merge(third_party)
 
-        # Speaker0 is keyed by the casefolded speaker_id ("speaker0");
+        # speaker0 is keyed by the casefolded speaker_id ("speaker0");
         # third-party Alex is keyed by canonical name "alex" — disjoint
         # namespaces, two separate nodes.
         assert "speaker0" in m.graph.nodes
-        assert "Speaker0" not in m.graph.nodes
         assert "alex" in m.graph.nodes
-        assert m.graph.nodes["speaker0"]["speaker_id"] == "Speaker0"
+        assert m.graph.nodes["speaker0"]["speaker_id"] == "speaker0"
         assert m.graph.nodes["alex"].get("speaker_id") is None
-        # Speaker0's last_name attribute is untouched by the third-party
+        # speaker0's last_name attribute is untouched by the third-party
         # merge (different node, different namespace).
         assert m.graph.nodes["speaker0"]["attributes"]["last_name"] == "Walker"
 
@@ -787,7 +786,7 @@ class TestCrossPredicateContradictionFlag:
                     predicate="validated_on",
                     object="Qwen",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -804,7 +803,7 @@ class TestCrossPredicateContradictionFlag:
                     predicate="validated_on",
                     object="Gemma",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -950,7 +949,7 @@ class TestCrossPredicateContradictionFlag:
                     predicate="lives_in",
                     object="Munich",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -967,7 +966,7 @@ class TestCrossPredicateContradictionFlag:
                     predicate="lives_in",
                     object="Berlin",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -1086,7 +1085,7 @@ class TestModelContradictionAndRelease:
                         predicate="lives_in",
                         object="Munich",
                         relation_type="factual",
-                        speaker_id="Speaker0",
+                        speaker_id="speaker0",
                     )
                 ],
             )
@@ -1103,7 +1102,7 @@ class TestModelContradictionAndRelease:
                         predicate="lives_in",
                         object="Berlin",
                         relation_type="factual",
-                        speaker_id="Speaker0",
+                        speaker_id="speaker0",
                     )
                 ],
             )
@@ -1146,7 +1145,7 @@ class TestModelContradictionAndRelease:
                     predicate="lives_in",
                     object="Munich",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -1163,7 +1162,7 @@ class TestModelContradictionAndRelease:
                     predicate="lives_in",
                     object="Berlin",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -1235,7 +1234,7 @@ class TestModelContradictionAndRelease:
                         predicate="speaks",
                         object="Python",
                         relation_type="factual",
-                        speaker_id="Speaker0",
+                        speaker_id="speaker0",
                     )
                 ],
             )
@@ -1252,7 +1251,7 @@ class TestModelContradictionAndRelease:
                         predicate="speaks",
                         object="Rust",
                         relation_type="factual",
-                        speaker_id="Speaker0",
+                        speaker_id="speaker0",
                     )
                 ],
             )
@@ -1298,7 +1297,7 @@ class TestIkKeyProvenance:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="graph42",
                 )
             ],
@@ -1331,7 +1330,7 @@ class TestIkKeyProvenance:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     # indexed_key defaults to None
                 )
             ],
@@ -1381,7 +1380,7 @@ class TestIkKeyProvenance:
                     object="dog",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="g2",
                 )
             ],
@@ -1426,7 +1425,7 @@ class TestReinforcementTracking:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="graph1",
                 )
             ],
@@ -1453,7 +1452,7 @@ class TestReinforcementTracking:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="graph1",
                 )
             ],
@@ -1473,7 +1472,7 @@ class TestReinforcementTracking:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="graph2",
                 )
             ],
@@ -1521,7 +1520,7 @@ class TestReinforcementTracking:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="graph1",
                 )
             ],
@@ -1541,7 +1540,7 @@ class TestReinforcementTracking:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="graph2",
                 )
             ],
@@ -1627,7 +1626,7 @@ class TestReinforcementTracking:
             object="berlin",
             relation_type="factual",
             confidence=1.0,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             indexed_key="graph5",
         )
         m._upsert_relation("alice", "berlin", incoming, "s1", "2026-01-01T00:00:00Z")
@@ -1682,7 +1681,7 @@ class TestReinforcementTracking:
             object="berlin",
             relation_type="factual",
             confidence=1.0,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             indexed_key="key_berlin",
         )
 
@@ -1764,7 +1763,7 @@ class TestRemovalLedger:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="key_survivor",
                 )
             ],
@@ -1782,7 +1781,7 @@ class TestRemovalLedger:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="key_drifter",
                 )
             ],
@@ -1839,7 +1838,7 @@ class TestRemovalLedger:
                     object="Munich",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -1865,7 +1864,7 @@ class TestRemovalLedger:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -1924,7 +1923,7 @@ class TestRemovalLedger:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="key_survivor",
                 )
             ],
@@ -1944,7 +1943,7 @@ class TestRemovalLedger:
                     object="berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="key_drifter",
                 )
             ],
@@ -1996,7 +1995,7 @@ class TestRemovalLedger:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="k_survivor",
                 )
             ],
@@ -2012,7 +2011,7 @@ class TestRemovalLedger:
                     object="Berlin",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     indexed_key="k_drifter",
                 )
             ],
@@ -2064,7 +2063,7 @@ class TestObjectVariantDedup:
                     predicate="values",
                     object="Execution Speed",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -2081,7 +2080,7 @@ class TestObjectVariantDedup:
                     predicate="values",
                     object="execution_speed",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -2122,7 +2121,7 @@ class TestObjectVariantDedup:
                     predicate="values",
                     object="Execution Speed",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -2157,7 +2156,7 @@ class TestSessionIdsProvenanceUnion:
     """
 
     @staticmethod
-    def _rel(session_ids: list[str], speaker_id: str = "Speaker0") -> Relation:
+    def _rel(session_ids: list[str], speaker_id: str = "speaker0") -> Relation:
         """Helper: build a minimal Relation with session_ids set."""
         return Relation(
             subject="Alex",
@@ -2174,7 +2173,7 @@ class TestSessionIdsProvenanceUnion:
         The scalar session_id param may be a synthetic sentinel (as in
         _merge_registry_relations); the real ids must still appear on the edge.
 
-        Speaker entities are keyed by speaker_id in the graph ("Speaker0"), not
+        Speaker entities are keyed by speaker_id in the graph ("speaker0"), not
         by the display name ("Alex"); non-speaker entities are keyed by canonical
         form ("berlin").  Edge lookup uses these canonical keys.
         """
@@ -2183,7 +2182,7 @@ class TestSessionIdsProvenanceUnion:
             session_id="__interim_pending_sessions__",  # synthetic sentinel
             timestamp="2026-01-01T00:00:00Z",
             entities=[
-                Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+                Entity(name="Alex", entity_type="person", speaker_id="speaker0"),
                 Entity(name="Berlin", entity_type="place"),
             ],
             relations=[self._rel(["real-session-abc"])],
@@ -2191,7 +2190,7 @@ class TestSessionIdsProvenanceUnion:
         m.merge(s1)
 
         # Speaker entities are keyed by the casefolded speaker_id ("speaker0").
-        # Relation subject="Alex" with speaker_id="Speaker0" → node key "speaker0".
+        # Relation subject="Alex" with speaker_id="speaker0" → node key "speaker0".
         # Relation object="Berlin" → canonical node key "berlin".
         edges = list(m.graph["speaker0"]["berlin"].values())
         assert len(edges) == 1, f"expected 1 edge; got {len(edges)}"
@@ -2209,7 +2208,7 @@ class TestSessionIdsProvenanceUnion:
             session_id="session-xyz",
             timestamp="2026-01-01T00:00:00Z",
             entities=[
-                Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+                Entity(name="Alex", entity_type="person", speaker_id="speaker0"),
                 Entity(name="Berlin", entity_type="place"),
             ],
             relations=[self._rel([])],
@@ -2231,7 +2230,7 @@ class TestSessionIdsProvenanceUnion:
         """
         m = GraphMerger()
         entities = [
-            Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+            Entity(name="Alex", entity_type="person", speaker_id="speaker0"),
             Entity(name="Berlin", entity_type="place"),
         ]
         # First merge: real id "session-A", scalar synthetic.
@@ -2271,14 +2270,14 @@ class TestSessionIdsProvenanceUnion:
         """
         m = GraphMerger()
         entities = [
-            Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+            Entity(name="Alex", entity_type="person", speaker_id="speaker0"),
             Entity(name="Berlin", entity_type="place"),
         ]
         s1 = SessionGraph(
             session_id="scalar-1",
             timestamp="2026-01-01T00:00:00Z",
             entities=entities,
-            relations=[self._rel(["session-A"], speaker_id="Speaker0")],
+            relations=[self._rel(["session-A"], speaker_id="speaker0")],
         )
         m.merge(s1)
 
@@ -2286,14 +2285,14 @@ class TestSessionIdsProvenanceUnion:
             session_id="scalar-2",
             timestamp="2026-01-01T01:00:00Z",
             entities=entities,
-            relations=[self._rel(["session-B"], speaker_id="Speaker0")],
+            relations=[self._rel(["session-B"], speaker_id="speaker0")],
         )
         m.merge(s2)
 
         # Speaker entities are keyed by the casefolded speaker_id ("speaker0").
         # session_ids union touches only edge['sessions'] — never the node.
         speaker_node = m.graph.nodes.get("speaker0", {})
-        assert speaker_node.get("speaker_id") == "Speaker0", (
+        assert speaker_node.get("speaker_id") == "speaker0", (
             "speaker_id attribute on the subject node must come from the Entity, not from "
             f"session_ids union; got {speaker_node.get('speaker_id')!r}"
         )
@@ -2383,13 +2382,13 @@ class TestMergerEdgeStamps:
             predicate="lives_in",
             object="berlin",
             relation_type="factual",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         m._upsert_relation("alice", "berlin", incoming, "s1", "2026-01-01T00:00:00Z")
 
         # A-2: speaker_id adopted onto the existing edge.
         edge = m.graph["alice"]["berlin"][eid]
-        assert edge.get("speaker_id") == "Speaker0", (
+        assert edge.get("speaker_id") == "speaker0", (
             f"A-2: Case-1 must adopt speaker_id; got {edge.get('speaker_id')!r}"
         )
 
@@ -2497,89 +2496,86 @@ class TestMergerEdgeStamps:
 
 
 class TestSpeakerCasingCollisionRegression:
-    """Regression: a Speaker0 Entity and a Speaker0 relation-endpoint that
+    """Regression: a speaker0 Entity and a speaker0 relation-endpoint that
     arrives WITHOUT a matching Entity must resolve to exactly ONE node key.
 
-    Before Step 2: _resolve_entity returned entity.speaker_id VERBATIM
-    ("Speaker0") while the relation-endpoint fallback used canonical_id("Speaker0")
-    == "speaker0", minting two distinct node keys.  This test must FAIL on
-    pre-Step-2 code and PASS after.
+    Under lowercase-uniform identity both the entity path and the fallback
+    path produce the same lowercase node key (entity.speaker_id verbatim).
+    The collision is structurally impossible because the ingest safety-net
+    guarantees all speaker tokens arrive as lowercase speaker{N}.
     """
 
     def test_entity_and_fallback_endpoint_resolve_to_one_node(self):
-        """Merge a session where the speaker arrives as an Entity (Speaker0) and
+        """Merge a session where the speaker arrives as an Entity (speaker0) and
         ALSO as a relation subject without a matching Entity entry.
 
-        The merger must produce exactly ONE node for Speaker0 — keyed as the
-        casefolded form ("speaker0") — regardless of which path resolved it.
+        The merger must produce exactly ONE node for speaker0 regardless of
+        which path resolved it — entity path returns entity.speaker_id verbatim,
+        fallback path passes the lowercase token through unchanged.
         """
         merger = GraphMerger(similarity_threshold=85.0)
 
-        # The session has a Speaker0 Entity and a relation whose subject is
-        # "Speaker0" but references a separate entity (SomeOrg) that has no
-        # Entity declaration.  The "Speaker0" subject on the relation thus goes
+        # The session has a speaker0 Entity and a relation whose subject is
+        # "speaker0" but references a separate entity (SomeOrg) that has no
+        # Entity declaration.  The "speaker0" subject on the relation thus goes
         # through the fallback resolution path.
         session = SessionGraph(
             session_id="s_casing",
             timestamp="2026-06-24T10:00:00Z",
             entities=[
-                # Speaker0 arrives as a full Entity.
+                # speaker0 arrives as a full Entity (lowercase — ingest safety-net).
                 Entity(
-                    name="Speaker0",
+                    name="speaker0",
                     entity_type="person",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
             relations=[
-                # Relation whose subject IS "Speaker0" but "Speaker0" is already
-                # in entity_name_map from the entity above, so it resolves via the
-                # entity path.  We also need a relation that exercises the FALLBACK
-                # path: one where the subject is NOT in entity_name_map.
+                # Relation whose subject IS "speaker0" — already in entity_name_map
+                # from the entity above, so it resolves via the entity path.
                 Relation(
-                    subject="Speaker0",
+                    subject="speaker0",
                     predicate="works at",
                     object="Acme",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
         )
         merger.merge(session)
 
-        # Now merge a second session that has "Speaker0" as a relation SUBJECT
-        # with NO corresponding Entity — this exercises the :370 fallback path.
+        # Now merge a second session that has "speaker0" as a relation SUBJECT
+        # with NO corresponding Entity — this exercises the fallback path.
         session2 = SessionGraph(
             session_id="s_casing2",
             timestamp="2026-06-24T11:00:00Z",
-            entities=[],  # Intentionally NO Entity for Speaker0
+            entities=[],  # Intentionally NO Entity for speaker0
             relations=[
                 Relation(
-                    subject="Speaker0",
+                    subject="speaker0",
                     predicate="lives in",
                     object="Berlin",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
         )
         merger.merge(session2)
 
-        # Both sessions must have resolved Speaker0 to the SAME casefolded key.
-        # Pre-fix: entity path → "Speaker0", fallback path → "speaker0" → 2 nodes.
-        # Post-fix: both paths → canonical_speaker("Speaker0") == "speaker0" → 1 node.
-        speaker_nodes = [n for n in merger.graph.nodes if n in ("speaker0", "Speaker0")]
+        # Both sessions must resolve to the SAME lowercase node key.
+        speaker_nodes = [n for n in merger.graph.nodes if n == "speaker0"]
         assert len(speaker_nodes) == 1, (
-            f"Expected exactly one Speaker0 node key (casefolded), "
+            f"Expected exactly one speaker0 node key, "
             f"got {speaker_nodes!r} — casing-collision dup not eliminated."
         )
         assert speaker_nodes[0] == "speaker0", (
-            f"Speaker node key must be casefolded 'speaker0', got {speaker_nodes[0]!r}"
+            f"Speaker node key must be lowercase 'speaker0', got {speaker_nodes[0]!r}"
         )
 
-        # The display name must still be stored in attributes["name"] (cased).
+        # Under lowercase-uniform identity, attributes["name"] is also lowercase speaker0.
         node_data = merger.graph.nodes["speaker0"]
-        assert node_data.get("attributes", {}).get("name") == "Speaker0", (
-            "Display name must be cased 'Speaker0' in attributes['name']"
+        assert node_data.get("attributes", {}).get("name") == "speaker0", (
+            "attributes['name'] must be lowercase 'speaker0' under lowercase-uniform identity"
         )
 
 
@@ -2628,14 +2624,14 @@ class TestStampedSpeakerMergerIntegration:
         """After merging a stamped-speaker session, the graph node for the
         speaker must carry speaker_id attribute (cased) and entity_type person."""
         m = GraphMerger(similarity_threshold=85.0)
-        session = self._make_stamped_session("s001", "Speaker0", "Berlin")
+        session = self._make_stamped_session("s001", "speaker0", "Berlin")
         m.merge(session)
 
         node_key = "speaker0"
         assert node_key in m.graph, f"Expected node '{node_key}' in graph"
         node_data = m.graph.nodes[node_key]
-        assert node_data.get("speaker_id") == "Speaker0", (
-            f"speaker_id attribute must be cased 'Speaker0', got {node_data.get('speaker_id')!r}"
+        assert node_data.get("speaker_id") == "speaker0", (
+            f"speaker_id attribute must be cased 'speaker0', got {node_data.get('speaker_id')!r}"
         )
         assert node_data.get("entity_type") == "person", (
             f"entity_type must be 'person', got {node_data.get('entity_type')!r}"
@@ -2646,8 +2642,8 @@ class TestStampedSpeakerMergerIntegration:
         produce two distinct directed edges — the both_speakers guard prevents
         the E-2 canonical swap that would collapse them."""
         m = GraphMerger(similarity_threshold=85.0)
-        m.merge(self._make_stamped_session("s001", "Speaker0", "Berlin"))
-        m.merge(self._make_stamped_session("s002", "Speaker1", "Munich"))
+        m.merge(self._make_stamped_session("s001", "speaker0", "Berlin"))
+        m.merge(self._make_stamped_session("s002", "speaker1", "Munich"))
 
         # Add a symmetric social relation between the two speakers.
         rel_0_to_1 = Relation(
@@ -2655,7 +2651,7 @@ class TestStampedSpeakerMergerIntegration:
             predicate="colleague of",
             object="speaker1",
             relation_type="social",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             symmetric=True,
         )
         rel_1_to_0 = Relation(
@@ -2663,15 +2659,15 @@ class TestStampedSpeakerMergerIntegration:
             predicate="colleague of",
             object="speaker0",
             relation_type="social",
-            speaker_id="Speaker1",
+            speaker_id="speaker1",
             symmetric=True,
         )
         m._upsert_relation("speaker0", "speaker1", rel_0_to_1, "s3", "2026-06-24T11:00:00Z")
         m._upsert_relation("speaker1", "speaker0", rel_1_to_0, "s4", "2026-06-24T12:00:00Z")
 
         assert m.graph.has_edge("speaker0", "speaker1"), (
-            "Speaker0→Speaker1 edge must survive (both_speakers guard active)"
+            "speaker0→speaker1 edge must survive (both_speakers guard active)"
         )
         assert m.graph.has_edge("speaker1", "speaker0"), (
-            "Speaker1→Speaker0 edge must survive (both_speakers guard active)"
+            "speaker1→speaker0 edge must survive (both_speakers guard active)"
         )

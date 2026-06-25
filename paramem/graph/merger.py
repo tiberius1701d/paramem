@@ -24,7 +24,7 @@ import networkx as nx
 from rapidfuzz import fuzz
 
 from paramem.graph.name_match import canonical as canonical_id
-from paramem.graph.name_match import canonical_speaker, is_speaker_id
+from paramem.graph.name_match import is_speaker_id
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
@@ -369,20 +369,24 @@ class GraphMerger:
             subj_surface = relation.subject
             obj_surface = relation.object
             # Fallback resolution for endpoints not present in entity_name_map:
-            # speaker endpoints (is_speaker_id) resolve via canonical_speaker (P2)
-            # so "Speaker0" and "speaker0" always land on the same casefolded key.
+            # speaker endpoints (is_speaker_id) pass through verbatim — the
+            # token is already lowercase (ingest safety-net + mint guarantee).
+            # Routing through canonical_id would be semantically wrong (it also
+            # folds separators/diacritics) even though speaker ids only contain
+            # ASCII alpha+digits and the result would be identical; keep the
+            # branch so the path is explicit and not merged with non-speaker ids.
             # Non-speaker endpoints resolve via canonical_id (node-key model A).
             if subj_surface in entity_name_map:
                 subject = entity_name_map[subj_surface]
             elif is_speaker_id(subj_surface):
-                subject = canonical_speaker(subj_surface)
+                subject = subj_surface
             else:
                 subject = canonical_id(subj_surface)
 
             if obj_surface in entity_name_map:
                 obj = entity_name_map[obj_surface]
             elif is_speaker_id(obj_surface):
-                obj = canonical_speaker(obj_surface)
+                obj = obj_surface
             else:
                 obj = canonical_id(obj_surface)
 
@@ -437,33 +441,29 @@ class GraphMerger:
         """Resolve an entity to its canonical NetworkX node key.
 
         Speaker entities are first-class graph roots: when
-        ``entity.speaker_id`` is set, the node key is
-        ``canonical_speaker(entity.speaker_id)`` — the casefolded form of
-        the system id (e.g. ``"Speaker0"`` → ``"speaker0"``).  This ensures
-        that a ``Speaker0`` Entity (entity path) and a ``Speaker0``
-        relation-endpoint that arrives without a matching Entity (fallback
-        path at ``merger.merge``) always resolve to the **same** node key,
-        preventing the casing-collision dup.  Display name lives at
-        ``node_data["attributes"]["name"]`` (cased; first-seen surface wins).
+        ``entity.speaker_id`` is set, the node key IS ``entity.speaker_id``
+        verbatim (already lowercase ``speaker{N}`` — guaranteed by the ingest
+        safety-net in :func:`~paramem.graph.extractor._normalize_extraction`
+        and by :meth:`~paramem.server.speaker.SpeakerStore._mint_anon_speaker_id`).
+        No casing step is needed.  Both the entity path and the relation-endpoint
+        fallback path produce the same node key, preventing casing-collision dups.
+        The display name lives at ``node_data["attributes"]["name"]``; for speakers
+        this is the same lowercase ``speaker{N}`` string — resolved to a human
+        name at render time by the Phase-B resolver.
 
-        §0 invariant: speaker node keys are casefolded; all speaker-identity
-        comparisons route through :func:`~paramem.graph.name_match.speaker_ref_matches`.
-
-        Two enrolled speakers who share a display name (e.g. both
-        ``"Alex"``) keep separate graph nodes because their
-        ``speaker_id`` values differ by construction.  Name changes
-        across sessions for the same speaker (e.g. anonymous
-        ``Speaker0`` → disclosed ``Alex``) collapse onto the same
-        casefolded speaker key.  Third-party mentions (no ``speaker_id``)
-        live in the **name namespace** which is disjoint from speaker
-        IDs by construction (speaker IDs follow ``Speaker{N}``).
+        Two enrolled speakers who share a display name (e.g. both ``"Alex"``)
+        keep separate graph nodes because their ``speaker_id`` values differ by
+        construction.  Name changes across sessions for the same speaker collapse
+        onto the same node because the key is the immutable ``speaker{N}`` id.
+        Third-party mentions (no ``speaker_id``) live in the name namespace which
+        is disjoint from speaker ids (speaker ids follow ``speaker{N}``).
 
         Resolution rules:
 
         * **Speaker entity** (``entity.speaker_id`` set) — node key is
-          ``canonical_speaker(entity.speaker_id)`` (casefolded).  No
-          name-based matching; no fuzzy match.  The display name is stored
-          as a mutable attribute downstream.
+          ``entity.speaker_id`` verbatim (lowercase).  No name-based matching;
+          no fuzzy match.  The display name is stored as a mutable attribute
+          downstream.
         * **Non-speaker entity** (``entity.speaker_id is None``) —
           two-tier name resolution:
 
@@ -477,11 +477,11 @@ class GraphMerger:
           Returns the existing node key on a hit, or
           ``canonical_id(entity.name)`` (a new node key) on a miss.
         """
-        # Speaker entities: node key is canonical_speaker(speaker_id) — casefolded
-        # (P2).  Both the entity path and the relation-endpoint fallback path use
-        # canonical_speaker so they always produce the same key.
+        # Speaker entities: node key is entity.speaker_id verbatim (lowercase).
+        # Both the entity path and the relation-endpoint fallback path produce the
+        # same key because both now carry an already-lowercase speaker{N} token.
         if entity.speaker_id is not None:
-            return canonical_speaker(entity.speaker_id)
+            return entity.speaker_id
 
         entity_canonical = canonical_id(entity.name)
 
@@ -525,23 +525,22 @@ class GraphMerger:
         """Insert or update an entity node.
 
         With node-key model A, every node is keyed by its canonical form
-        (``canonical_id(name)`` for non-speakers; ``canonical_speaker(speaker_id)``
-        — the casefolded form — for speakers).  The human-readable display name is
-        stored as a mutable attribute under ``attributes["name"]`` for ALL node
-        types — not just speakers — so downstream consumers never need to use the
-        node key for display.  First-seen surface wins: the ``"name"`` attribute is
-        set on insertion and NOT overwritten on subsequent updates (idempotent).
+        (``canonical_id(name)`` for non-speakers; ``entity.speaker_id`` verbatim
+        for speakers — always lowercase ``speaker{N}``).  The human-readable
+        display name is stored as a mutable attribute under ``attributes["name"]``
+        for ALL node types — not just speakers — so downstream consumers never need
+        to use the node key for display.  First-seen surface wins: the ``"name"``
+        attribute is set on insertion and NOT overwritten on subsequent updates
+        (idempotent).
 
         Speaker entities (``entity.speaker_id`` set) are keyed by
-        ``canonical_speaker(speaker_id)`` — the casefolded form, e.g.
-        ``"speaker0"`` for ``speaker_id="Speaker0"`` (see :meth:`_resolve_entity`).
-        The cased ``speaker_id`` value is stored in the node's ``speaker_id``
-        attribute and in ``attributes["name"]`` as the display surface.
-        Anonymous→disclosed name change (``"Speaker0"`` → ``"Alex"``) updates
-        ``attributes["name"]`` on the existing casefolded-keyed node —
-        no separate node is created.  For speakers the ``"name"`` attribute
-        IS refreshed on update (to capture disclosure), whereas for
-        non-speaker entities it is first-seen-wins only.
+        ``entity.speaker_id`` verbatim (lowercase ``speaker{N}``,
+        e.g. ``"speaker0"`` — see :meth:`_resolve_entity`).  The node's
+        ``speaker_id`` attribute carries the same lowercase id.
+        ``attributes["name"]`` stores the same lowercase ``speaker{N}`` id
+        and IS refreshed on update.  Display-name resolution happens at the
+        fact-render boundary via ``resolve_speaker_name``, not at graph-write time.
+        For non-speaker entities ``attributes["name"]`` is first-seen-wins only.
         """
         is_speaker = entity.speaker_id is not None
 
@@ -566,8 +565,8 @@ class GraphMerger:
                     continue
                 existing_attrs[k] = v
             # All entities: store display name in attributes["name"].
-            # For speaker entities, refresh on update (captures anonymous→
-            # disclosed name change, e.g. "Speaker0" → "Alex").
+            # For speaker entities, refresh on update (captures attribute
+            # changes; entity.name is always the lowercase speaker{N} id).
             # For non-speaker entities, first-seen wins — only write when
             # the attribute is absent or empty.
             if entity.name and not _attr_value_is_empty(entity.name):
@@ -576,11 +575,10 @@ class GraphMerger:
                 elif not existing_attrs.get("name"):
                     existing_attrs["name"] = entity.name
             node["attributes"] = existing_attrs
-            # The node key is the casefolded form (``canonical_speaker(speaker_id)``
-            # e.g. ``"speaker0"``); ``speaker_id`` is a separate node attribute
-            # carrying the cased system id (``"Speaker0"``).  Defensive: populate
-            # the attribute when it is missing (e.g. a node inserted before the
-            # casefold refactor that lacks the ``speaker_id`` attribute).
+            # The node key equals entity.speaker_id (lowercase speaker{N}).
+            # The ``speaker_id`` node attribute carries the same value.
+            # Defensive: populate the attribute when it is missing (e.g. a node
+            # inserted before this refactor that lacks the attribute).
             if is_speaker and node.get("speaker_id") is None:
                 node["speaker_id"] = entity.speaker_id
         else:

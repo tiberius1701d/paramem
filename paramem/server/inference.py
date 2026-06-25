@@ -28,6 +28,8 @@ import logging
 from dataclasses import dataclass, field
 
 from paramem.evaluation.recall import generate_answer
+from paramem.graph.name_match import is_speaker_id
+from paramem.graph.prompts import _load_speaker_directive_section
 from paramem.models.loader import adapt_messages
 from paramem.server.cloud.base import CloudAgent
 from paramem.server.config import ServerConfig
@@ -39,6 +41,9 @@ from paramem.server.tools.ha_client import HAClient
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_TURNS = 10
+
+# Loaded once at module import time; fails loud if speaker_directive.txt is missing.
+THIRD_PARTY_DESCRIPTOR: str = _load_speaker_directive_section("THIRD-PARTY-DESCRIPTOR")
 
 
 def _language_instruction(language: str | None, config: ServerConfig | None = None) -> str:
@@ -62,9 +67,6 @@ def _build_speaker_prefix(
     speaker: str | None,
     language: str | None,
     config: ServerConfig | None,
-    *,
-    include_id_mapping: bool,
-    speaker_id: str | None = None,
 ) -> str:
     """Assemble the speaker + language prefix for a system prompt.
 
@@ -72,10 +74,11 @@ def _build_speaker_prefix(
     + language instruction block used by both local inference and SOTA
     escalation paths.
 
-    When ``include_id_mapping=True`` (local inference path only) and both
-    ``speaker_id`` and ``speaker`` are provided, the ``INFERENCE-IDENTITY``
-    section of ``configs/prompts/speaker_directive.txt`` is injected so that
-    recalled ``Speaker{N}`` facts resolve to the display name in model output.
+    Speaker-id-to-name resolution at inference time is handled by the
+    ``speaker_resolver`` injected into :func:`MemoryStore.probe` — the raw
+    ``speaker{N}`` token in recalled facts is replaced with the display name at
+    the fact-render boundary, not via a prompt injection.  No id-mapping
+    sentence is emitted here; none reaches the cloud (privacy invariant).
 
     Args:
         speaker: Display name of the resolved speaker, or ``None`` when
@@ -84,15 +87,6 @@ def _build_speaker_prefix(
             instruction is needed.
         config: Server config, used to derive the language display name via
             ``config.tts.language_name``.
-        include_id_mapping: When ``True`` (local inference path), injects the
-            ``Speaker{N} → display name`` mapping from the INFERENCE-IDENTITY
-            section of ``speaker_directive.txt``.  **Must be ``False`` for the
-            SOTA escalation path** (cloud privacy invariant: the id→name
-            mapping is never sent to the cloud).
-        speaker_id: System speaker id (e.g. ``"Speaker0"``).  Required for
-            the id mapping to fire (both ``speaker_id`` and ``speaker`` must be
-            non-empty when ``include_id_mapping=True``).  Ignored (and must be
-            ``None``) on the SOTA path (``include_id_mapping=False``).
 
     Returns:
         A prefix string (possibly empty) ready to be prepended to the base
@@ -101,15 +95,6 @@ def _build_speaker_prefix(
     parts: list[str] = []
     if speaker:
         parts.append(f"You are speaking with {speaker}.")
-    if include_id_mapping and speaker_id and speaker:
-        # PRIVACY: this branch is local-inference only.  _escalate_to_sota
-        # calls with include_id_mapping=False so this block is unreachable on
-        # the cloud path.  The id→name mapping must NEVER reach the cloud.
-        from paramem.graph.prompts import _load_speaker_directive_section
-
-        template = _load_speaker_directive_section("INFERENCE-IDENTITY")
-        mapping_sentence = template.format(speaker_id=speaker_id, speaker_name=speaker)
-        parts.append(mapping_sentence)
     lang_instr = _language_instruction(language, config)
     if lang_instr:
         parts.append(lang_instr)
@@ -121,20 +106,15 @@ def _personalize_prompt(
     speaker: str | None,
     language: str | None = None,
     config: ServerConfig | None = None,
-    *,
-    speaker_id: str | None = None,
 ) -> str:
-    """Inject speaker name, id→name mapping, and language instruction into the system prompt.
+    """Inject speaker name and language instruction into the system prompt.
 
     Uses :func:`_build_speaker_prefix` to assemble the prefix so that the
     local-inference and SOTA-escalation paths share exactly one implementation.
 
-    When both ``speaker`` (display name) and ``speaker_id`` are provided, the
-    ``INFERENCE-IDENTITY`` section of ``speaker_directive.txt`` is injected so
-    that recalled ``Speaker{N}`` facts resolve to the display name at inference
-    time.  This mapping is LOCAL-ONLY and must never reach the cloud
-    (``_escalate_to_sota`` calls ``_build_speaker_prefix`` with
-    ``include_id_mapping=False``).
+    Speaker-id-to-name resolution is handled at the fact-render boundary via
+    the ``speaker_resolver`` in :func:`MemoryStore.probe` — not by a prompt
+    injection.  No ``speaker_id`` param is needed or accepted here.
 
     Greeting is handled at the app layer (prepended to response text)
     so it works across all paths including escalation.
@@ -144,14 +124,8 @@ def _personalize_prompt(
         speaker: Display name of the resolved speaker, or ``None``.
         language: BCP-47 language code, or ``None`` / ``"en"``.
         config: Server config for language display names.
-        speaker_id: System speaker id (e.g. ``"Speaker0"``).  When
-            provided alongside ``speaker``, the id→name mapping is
-            injected via the INFERENCE-IDENTITY section of the prompt
-            file.
     """
-    prefix = _build_speaker_prefix(
-        speaker, language, config, include_id_mapping=True, speaker_id=speaker_id
-    )
+    prefix = _build_speaker_prefix(speaker, language, config)
     if prefix:
         return prefix + " " + base_prompt
     return base_prompt
@@ -234,6 +208,7 @@ def handle_chat(
     known_entities: set[str] | None = None,
     effective_mode: str | None = None,
     memory_store=None,
+    speaker_store=None,
 ) -> ChatResult:
     """Process a chat message via intent-keyed dispatch.
 
@@ -312,6 +287,30 @@ def handle_chat(
             if known_entities is None:
                 known_entities = set()
             known_entities = known_entities | {speaker.lower().strip()}
+        # B5: extend known_entities with non-anonymous household display names so
+        # the sanitizer covers all enrolled speakers, not just the active one.
+        # household_display_names() filters out anonymous profiles
+        # (enroll_method == "anonymous_voice") — only real-name disclosures are
+        # added.  This closes the gap where a fact mentioning another household
+        # member's display name was not recognised as personal content.
+        if speaker_store is not None:
+            _household_names = speaker_store.household_display_names()
+            if _household_names:
+                if known_entities is None:
+                    known_entities = set()
+                known_entities = known_entities | {n.lower().strip() for n in _household_names if n}
+
+        # B3: build the speaker resolver closure once per request.  Passed into
+        # memory_store.probe so raw speaker{N} tokens in recalled facts are
+        # replaced with display names at the render boundary.
+        # read-tolerance: .lower() before lookup so pre-migration cased tokens
+        # (e.g. "Speaker0") still resolve during the forward-only transition.
+        def _speaker_resolver(tok: str) -> str:
+            if not is_speaker_id(tok):
+                return tok
+            name = speaker_store.resolve_speaker_name(tok.lower()) if speaker_store else None
+            return name if name else THIRD_PARTY_DESCRIPTOR
+
         sanitized_text, sanitization_findings = sanitize_for_cloud(
             text,
             mode=config.sanitization.mode,
@@ -374,6 +373,9 @@ def handle_chat(
                 effective_mode=effective_mode,
                 is_personal=True,
                 memory_store=memory_store,
+                speaker_store=speaker_store,
+                speaker_resolver=_speaker_resolver,
+                known_entities=known_entities,
             )
 
         # COMMAND / GENERAL / UNKNOWN (and the defensive PERSONAL-without-
@@ -398,6 +400,7 @@ def handle_chat(
                 speaker_id=speaker_id,
                 history=history,
                 language=language,
+                known_entities=known_entities,
             )
             if sota_result is not None:
                 routing_diags["exit_via"] = f"{intent_label}_sota"
@@ -509,8 +512,19 @@ SOTA_PROMPT = (
 def _sanitize_history(
     history: list[dict] | None,
     mode: str,
+    known_entities: set[str] | None = None,
 ) -> list[dict]:
-    """Sanitize conversation history for cloud, dropping blocked turns."""
+    """Sanitize conversation history for cloud, dropping blocked turns.
+
+    Args:
+        history: Conversation turns to sanitize.
+        mode: Sanitization mode (``"block"``, ``"anonymize"``, ``"both"``).
+        known_entities: Optional set of lowercased entity/speaker names to
+            treat as personal referents.  When provided, household display
+            names are recognised as personal content and stripped/replaced
+            so they never egress to the cloud.  ``None`` → same behaviour
+            as before (back-compat).
+    """
     if not history:
         return []
     sanitized = []
@@ -519,7 +533,7 @@ def _sanitize_history(
         text = turn.get("text", "")
         if not text:
             continue
-        clean, _ = sanitize_for_cloud(text, mode=mode)
+        clean, _ = sanitize_for_cloud(text, mode=mode, known_entities=known_entities)
         if clean is not None:
             sanitized.append({"role": role, "text": clean})
     return sanitized
@@ -537,6 +551,7 @@ def _escalate_via_cloud_policy(
     speaker_id: str | None = None,
     history: list[dict] | None = None,
     language: str | None = None,
+    known_entities: set[str] | None = None,
 ) -> ChatResult | None:
     """Apply the configured cloud-egress policy and call SOTA accordingly.
 
@@ -620,6 +635,7 @@ def _escalate_via_cloud_policy(
             speaker=speaker,
             history=history,
             language=language,
+            known_entities=known_entities,
         )
         # deanonymize_text is a no-op on an empty reverse map, so the
         # empty-scope opt-out path flows through unchanged.
@@ -634,6 +650,7 @@ def _escalate_via_cloud_policy(
         speaker=speaker,
         history=history,
         language=language,
+        known_entities=known_entities,
     )
 
 
@@ -644,6 +661,7 @@ def _escalate_to_sota(
     speaker: str | None = None,
     history: list[dict] | None = None,
     language: str | None = None,
+    known_entities: set[str] | None = None,
 ) -> ChatResult:
     """Route to SOTA cloud model for reasoning-heavy queries.
 
@@ -651,14 +669,23 @@ def _escalate_to_sota(
     persona, tone, and style from the conversation context. Personal
     details are stripped by the sanitizer — only the conversational
     pattern survives.
-    """
-    sanitized_history = _sanitize_history(history, mode=config.sanitization.mode)
 
-    # PRIVACY: include_id_mapping=False — the id→name mapping must NEVER reach
-    # the cloud.  The shared helper encodes this invariant at the seam so that
-    # step 7 (which adds the mapping to the local path) cannot accidentally
-    # leak it onto the SOTA path.
-    prefix = _build_speaker_prefix(speaker, language, config, include_id_mapping=False)
+    Args:
+        text: The query text (already sanitized by the caller).
+        sota_agent: Cloud agent to delegate to.
+        config: Server config.
+        speaker: Display name of the resolved speaker, or ``None``.
+        history: Conversation history turns.
+        language: BCP-47 language code.
+        known_entities: Lowercased set of household display names / personal
+            entity names to treat as personal referents when sanitizing
+            history.  Prevents household names from egressing to the cloud.
+    """
+    sanitized_history = _sanitize_history(
+        history, mode=config.sanitization.mode, known_entities=known_entities
+    )
+
+    prefix = _build_speaker_prefix(speaker, language, config)
     prompt = (prefix + " " + SOTA_PROMPT) if prefix else SOTA_PROMPT
 
     logger.info(
@@ -691,6 +718,9 @@ def _probe_and_reason(
     is_personal: bool = False,
     effective_mode: str | None = None,
     memory_store=None,
+    speaker_store=None,
+    speaker_resolver=None,
+    known_entities: set[str] | None = None,
 ) -> ChatResult:
     """Probe adapters in memory hierarchy order, assemble layered context.
 
@@ -763,6 +793,7 @@ def _probe_and_reason(
         source=source,
         speaker_id=speaker_id,
         memoize=config.inference.preload_cache,
+        speaker_resolver=speaker_resolver,
     )
 
     # Restore predictable adapter state after weight probing: episodic is
@@ -811,7 +842,9 @@ def _probe_and_reason(
             "" if is_personal else " → SOTA",
             plan.intent.value,
         )
-        sanitized, _ = sanitize_for_cloud(text, mode=config.sanitization.mode)
+        sanitized, _ = sanitize_for_cloud(
+            text, mode=config.sanitization.mode, known_entities=known_entities
+        )
         if sanitized is not None:
             result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
             if result is not None:
@@ -827,6 +860,7 @@ def _probe_and_reason(
                 speaker_id=speaker_id,
                 history=history,
                 language=language,
+                known_entities=known_entities,
             )
             if sota_result is not None:
                 return sota_result
@@ -903,9 +937,7 @@ def _probe_and_reason(
     layered_context = "\n\n".join(context_sections)
     augmented_text = f"What you know about the speaker:\n\n{layered_context}\n\nQuestion: {text}"
 
-    system_prompt = _personalize_prompt(
-        config.voice.load_prompt(), speaker, language, config, speaker_id=speaker_id
-    )
+    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker, language, config)
     messages = _build_messages(augmented_text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -931,6 +963,7 @@ def _probe_and_reason(
         is_personal=is_personal,
         model=model,
         tokenizer=tokenizer,
+        known_entities=known_entities,
     )
 
 
@@ -955,9 +988,7 @@ def _base_model_answer(
     """
     from peft import PeftModel
 
-    system_prompt = _personalize_prompt(
-        config.voice.load_prompt(), speaker, language, config, speaker_id=speaker_id
-    )
+    system_prompt = _personalize_prompt(config.voice.load_prompt(), speaker, language, config)
     messages = _build_messages(text, history, system_prompt, tokenizer)
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -998,6 +1029,7 @@ def _maybe_escalate(
     is_personal: bool = False,
     model=None,
     tokenizer=None,
+    known_entities: set[str] | None = None,
 ) -> ChatResult:
     """Check for [ESCALATE] tag and route HA → SOTA.
 
@@ -1021,7 +1053,9 @@ def _maybe_escalate(
         return ChatResult(text=response, probed_keys=probed_keys or [])
 
     intent_label = intent.value if intent is not None else "unknown"
-    sanitized, _ = sanitize_for_cloud(forwarded_query, mode=config.sanitization.mode)
+    sanitized, _ = sanitize_for_cloud(
+        forwarded_query, mode=config.sanitization.mode, known_entities=known_entities
+    )
     if sanitized is not None:
         logger.info("[ESCALATE] → HA (intent=%s): %s", intent_label, sanitized[:100])
         result = _escalate_to_ha_agent(sanitized, ha_client, config, language=language)
@@ -1038,6 +1072,7 @@ def _maybe_escalate(
             speaker_id=speaker_id,
             history=history,
             language=language,
+            known_entities=known_entities,
         )
         if sota_result is not None:
             logger.info("[ESCALATE] → SOTA fallback (intent=%s): %s", intent_label, sanitized[:100])

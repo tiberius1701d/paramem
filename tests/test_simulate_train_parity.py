@@ -1327,17 +1327,17 @@ class TestConsolidateSimulateFold:
 
         # Write an interim slot whose triple has subject == speaker_id.
         # _synth_speaker_entities fires when _r.speaker_id != "" AND
-        # _r.subject == _r.speaker_id.  We use "Speaker0" for both.
+        # _r.subject == _r.speaker_id.  We use "speaker0" for both.
         _write_interim_graph(
             tmp_path,
             "20260101T0000",
             [
                 {
                     "key": "graph1",
-                    "subject": "Speaker0",
+                    "subject": "speaker0",
                     "predicate": "works_at",
                     "object": "Acme Corp",
-                    "speaker_id": "Speaker0",
+                    "speaker_id": "speaker0",
                 },
             ],
         )
@@ -1351,8 +1351,8 @@ class TestConsolidateSimulateFold:
         assert main_path.exists(), "graph.json must be written after the simulate fold"
         saved_graph = load_memory_from_disk(main_path)
 
-        # §0 invariant (Step 2): speaker node key is the casefolded speaker_id.
-        # canonical_speaker("Speaker0") == "speaker0"
+        # §0 invariant (Step 2): speaker node key is the lowercase speaker_id.
+        # Under the lowercase-uniform design entity.speaker_id == node key == "speaker0".
         node_key = "speaker0"
         assert node_key in saved_graph.nodes, (
             f"Speaker subject node {node_key!r} missing from merged graph after simulate path; "
@@ -1365,8 +1365,8 @@ class TestConsolidateSimulateFold:
             "Regression: before _merge_registry_relations routing, simulate used "
             "entities=[] so speaker nodes received entity_type='concept' with no speaker_id."
         )
-        assert node_data.get("speaker_id") == "Speaker0", (
-            f"Simulate path: expected speaker_id='Speaker0' (cased, in node attribute); "
+        assert node_data.get("speaker_id") == "speaker0", (
+            f"Simulate path: expected speaker_id='speaker0' (cased, in node attribute); "
             f"got speaker_id={node_data.get('speaker_id')!r}. "
             "Regression: _synth_speaker_entities was not applied to the simulate path."
         )

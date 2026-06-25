@@ -230,131 +230,102 @@ def test_personalize_prompt_with_language():
     assert "You are speaking with" not in result
 
 
-def test_personalize_prompt_injects_id_mapping():
-    """Step 7: _personalize_prompt injects id→name mapping when speaker_id is provided.
-
-    When both display name and speaker_id are given, the INFERENCE-IDENTITY
-    section of speaker_directive.txt is injected into the local system prompt.
-    The mapping must mention the speaker_id and the display name so recalled
-    Speaker{N} facts resolve at inference time.
-    """
-    from paramem.server.inference import _personalize_prompt
-
-    base = "You are a helpful assistant."
-    result_with = _personalize_prompt(base, "Alice", "en", speaker_id="Speaker0")
-    # The id→name mapping must be present.
-    assert "Speaker0" in result_with
-    assert "Alice" in result_with
-    # Base prompt text is still present.
-    assert base in result_with
-
-
-def test_personalize_prompt_no_mapping_without_speaker_id():
-    """When speaker_id is absent, no id mapping is injected (still shows display name)."""
+def test_personalize_prompt_with_speaker():
+    """_personalize_prompt includes "You are speaking with X" when speaker is given."""
     from paramem.server.inference import _personalize_prompt
 
     base = "You are a helpful assistant."
     result = _personalize_prompt(base, "Alice", "en")
     # Display name present via the "You are speaking with" part.
     assert "Alice" in result
-    # Without speaker_id the INFERENCE-IDENTITY mapping is not injected;
-    # no bare "Speaker" token should appear.
+    # Base prompt text is still present.
+    assert base in result
+    # No raw speaker{N} token: id mapping is resolved at the fact-render boundary,
+    # not injected into the prompt.
+    assert "speaker0" not in result
     assert "Speaker0" not in result
 
 
-def test_personalize_prompt_sota_excludes_id_mapping():
-    """SOTA escalation path (include_id_mapping=False) must NEVER contain the id mapping.
+def test_personalize_prompt_no_id_in_prompt():
+    """_personalize_prompt never injects a speaker{N} id — resolution is at render time."""
+    from paramem.server.inference import _personalize_prompt
 
-    Privacy invariant: the Speaker{N} → display-name mapping is local-inference
-    only.  _escalate_to_sota calls _build_speaker_prefix with
-    include_id_mapping=False so even when speaker_id is in scope it is not leaked.
+    base = "You are a helpful assistant."
+    # Even passing speaker, no id token should appear.
+    result = _personalize_prompt(base, "Alice", "en")
+    assert "Alice" in result
+    assert "speaker" not in result.lower().split("you are speaking with alice.")[1]
+
+
+def test_personalize_prompt_sota_has_no_id():
+    """SOTA escalation path must NEVER contain a raw speaker{N} id.
+
+    Privacy invariant: resolved display names are used in the prefix;
+    speaker id tokens never reach the cloud.  _build_speaker_prefix (shared
+    by both paths) emits only "You are speaking with <display_name>." plus
+    optional language instruction — no id mapping.
     """
     from paramem.server.inference import _build_speaker_prefix
 
-    # Simulate SOTA path: include_id_mapping=False, speaker_id present.
-    prefix = _build_speaker_prefix(
-        "Alice", "en", None, include_id_mapping=False, speaker_id="Speaker0"
-    )
-    # Must not contain the id mapping; SOTA only sees "You are speaking with Alice."
-    assert "Speaker0" not in prefix
-    # Local path: include_id_mapping=True injects the mapping.
-    prefix_local = _build_speaker_prefix(
-        "Alice", "en", None, include_id_mapping=True, speaker_id="Speaker0"
-    )
-    assert "Speaker0" in prefix_local
-    assert "Alice" in prefix_local
+    # Both local and SOTA paths use the same _build_speaker_prefix; neither
+    # contains a raw speaker id.
+    prefix = _build_speaker_prefix("Alice", "en", None)
+    assert "speaker0" not in prefix.lower()
+    assert "Alice" in prefix
 
 
 # ---------------------------------------------------------------------------
-# P6 — _build_speaker_prefix shared helper + SOTA privacy invariant
+# P6 — _build_speaker_prefix shared helper + cloud safety invariant
 # ---------------------------------------------------------------------------
 
 
 class TestBuildSpeakerPrefix:
-    """``_build_speaker_prefix`` is the single shared implementation for the
-    "You are speaking with X" + language block used by both local inference
-    and SOTA escalation.
-
-    The ``include_id_mapping`` flag encodes the SOTA privacy invariant:
-    step 7 will only inject the id→name mapping when the flag is True (local
-    path).  The flag must be False on the SOTA path.
+    """``_build_speaker_prefix`` assembles the "You are speaking with X" +
+    language block.  Speaker-id-to-name resolution is handled at the
+    fact-render boundary (``entry_fact_text`` + ``speaker_resolver``), so
+    no id-mapping sentence is emitted here — and therefore nothing leaks to
+    the cloud either.
     """
 
     def test_speaker_and_language(self):
         from paramem.server.inference import _build_speaker_prefix
 
-        result = _build_speaker_prefix("Alice", "de", None, include_id_mapping=False)
+        result = _build_speaker_prefix("Alice", "de", None)
         assert "Alice" in result
         assert "German" in result
 
     def test_no_speaker_no_language(self):
         from paramem.server.inference import _build_speaker_prefix
 
-        result = _build_speaker_prefix(None, None, None, include_id_mapping=True)
+        result = _build_speaker_prefix(None, None, None)
         assert result == ""
 
     def test_speaker_only(self):
         from paramem.server.inference import _build_speaker_prefix
 
-        result = _build_speaker_prefix("Bob", None, None, include_id_mapping=True)
+        result = _build_speaker_prefix("Bob", None, None)
         assert "Bob" in result
         assert "Respond in" not in result
 
     def test_language_only(self):
         from paramem.server.inference import _build_speaker_prefix
 
-        result = _build_speaker_prefix(None, "fr", None, include_id_mapping=False)
+        result = _build_speaker_prefix(None, "fr", None)
         assert "French" in result
         assert "You are speaking with" not in result
 
-    def test_sota_path_uses_false_flag(self):
-        """The SOTA escalation path must pass include_id_mapping=False.
+    def test_no_speaker_id_emitted(self):
+        """No raw speaker{N} id token must appear in the prefix (cloud safety).
 
-        Privacy invariant: the id→name mapping must NEVER reach the cloud.
-        Even when speaker_id is provided, the SOTA path (include_id_mapping=False)
-        must NOT inject it.  The local path (include_id_mapping=True) DOES inject
-        the mapping when speaker_id and speaker are both non-empty.
+        Resolution is handled at the fact-render boundary; this helper
+        receives only the display name.
         """
         from paramem.server.inference import _build_speaker_prefix
 
-        # SOTA path: no speaker_id, id mapping suppressed.
-        prefix_sota = _build_speaker_prefix("Alice", "en", None, include_id_mapping=False)
-        # Local path without speaker_id: no mapping either.
-        prefix_no_id = _build_speaker_prefix("Alice", "en", None, include_id_mapping=True)
-        # Without speaker_id both paths produce the same result.
-        assert prefix_sota == prefix_no_id
-        # Local path with speaker_id injects the mapping.
-        prefix_local = _build_speaker_prefix(
-            "Alice", "en", None, include_id_mapping=True, speaker_id="Speaker0"
-        )
-        # Local path must be richer (has the id mapping sentence).
-        assert len(prefix_local) > len(prefix_sota)
-        assert "Speaker0" in prefix_local
-        # SOTA path with speaker_id must still suppress it (privacy invariant).
-        prefix_sota_with_id = _build_speaker_prefix(
-            "Alice", "en", None, include_id_mapping=False, speaker_id="Speaker0"
-        )
-        assert "Speaker0" not in prefix_sota_with_id
+        prefix = _build_speaker_prefix("Alice", "en", None)
+        # Only display name, no id token.
+        assert "speaker0" not in prefix.lower()
+        assert "speaker9" not in prefix.lower()
 
 
 # --- Speaker language preference ---
@@ -417,10 +388,10 @@ def test_speaker_v3_migration_adds_language(tmp_path):
     store = SpeakerStore(path)
     assert store.get_preferred_language("abc123") is None
 
-    # After flush, file should be v5
+    # After flush, file should be at the current version (v6 after Phase A migration).
     store.flush()
     data = json.loads(path.read_text())
-    assert data["version"] == 5
+    assert data["version"] == 6
     assert data["speakers"]["abc123"]["preferred_language"] == ""
 
 
@@ -1176,3 +1147,133 @@ def test_oneshot_synthesize_closes_without_stopped():
     assert _count(recorded, AudioStart) == 1
     assert _count(recorded, AudioStop) == 1
     assert _count(recorded, SynthesizeStopped) == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase B — cloud safety + resolver + _sanitize_history (B4/B5)
+# ---------------------------------------------------------------------------
+
+
+class TestCloudSafetyInferenceIdentityGone:
+    """INFERENCE-IDENTITY injection is deleted; no raw speaker{N} id appears in the
+    prompt prefix or in the SOTA system prompt.
+    """
+
+    def test_build_speaker_prefix_no_speaker_id_in_output(self) -> None:
+        """_build_speaker_prefix output contains no raw speaker{N} token."""
+        from paramem.server.inference import _build_speaker_prefix
+
+        prefix = _build_speaker_prefix("Alice", "en", None)
+        assert "speaker0" not in prefix.lower()
+        assert "speaker9" not in prefix.lower()
+
+    def test_build_speaker_prefix_sota_path_same_as_local(self) -> None:
+        """Both paths (formerly local=True, SOTA=False) now use the same function;
+        the result must never contain a raw id token regardless of caller.
+        """
+        from paramem.server.inference import _build_speaker_prefix
+
+        # Before: SOTA path was include_id_mapping=False; local=True.
+        # Now: single function, both produce the same clean prefix.
+        prefix = _build_speaker_prefix("Alice", "en", None)
+        assert "Alice" in prefix
+        assert "speaker" not in prefix.lower()
+
+
+class TestHouseholdNamesInKnownEntities:
+    """B5: household_display_names() excludes anonymous; known_entities is extended."""
+
+    def test_household_display_names_excludes_anon(self, tmp_path) -> None:
+        from paramem.server.speaker import SpeakerStore
+
+        store = SpeakerStore(tmp_path / "profiles.json")
+        emb = [0.1] * 192
+        store.enroll("Alice", emb)
+        anon_emb = [0.9] * 192
+        anon_id = store.register_anonymous(anon_emb)
+        names = store.household_display_names()
+        assert "Alice" in names
+        assert anon_id not in names
+
+    def test_known_entities_includes_household_names(self) -> None:
+        """When speaker_store is provided to handle_chat, household names appear in
+        known_entities so the sanitizer treats them as personal referents.
+        This is a structural smoke test using a stub speaker_store.
+        """
+        from unittest.mock import MagicMock, patch
+
+        stub_store = MagicMock()
+        stub_store.household_display_names.return_value = ["Alice"]
+        stub_store.resolve_speaker_name.return_value = "Alice"
+
+        captured: dict = {}
+
+        def _fake_sanitize(
+            text, *, mode=None, speaker_id=None, known_entities=None, personal_referent_config=None
+        ):
+            captured["known_entities"] = known_entities
+            return text, {}
+
+        with patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize):
+            from paramem.server.inference import handle_chat
+
+            try:
+                handle_chat(
+                    text="test",
+                    conversation_id="c1",
+                    speaker="Alice",
+                    history=None,
+                    model=MagicMock(),
+                    tokenizer=MagicMock(),
+                    config=MagicMock(
+                        abstention=MagicMock(enabled=False),
+                        sanitization=MagicMock(mode="block"),
+                        personal_referent=MagicMock(),
+                    ),
+                    router=None,
+                    memory_store=None,
+                    speaker_store=stub_store,
+                )
+            except Exception:
+                pass  # We only care that known_entities was set
+
+        entities = captured.get("known_entities") or set()
+        assert "alice" in entities  # household name lowercased
+
+
+class TestSanitizeHistoryKnownEntities:
+    """_sanitize_history passes known_entities to sanitize_for_cloud."""
+
+    def test_known_entities_forwarded(self) -> None:
+        from unittest.mock import patch
+
+        from paramem.server.inference import _sanitize_history
+
+        captured: dict = {}
+
+        def _fake_sanitize(text, *, mode=None, known_entities=None, **_kwargs):
+            captured["known_entities"] = known_entities
+            return text, {}
+
+        with patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize):
+            _sanitize_history(
+                [{"role": "user", "text": "hello"}],
+                mode="block",
+                known_entities={"alice"},
+            )
+        assert captured.get("known_entities") == {"alice"}
+
+    def test_no_known_entities_default_none(self) -> None:
+        from unittest.mock import patch
+
+        from paramem.server.inference import _sanitize_history
+
+        captured: dict = {}
+
+        def _fake_sanitize(text, *, mode=None, known_entities=None, **_kwargs):
+            captured["known_entities"] = known_entities
+            return text, {}
+
+        with patch("paramem.server.inference.sanitize_for_cloud", side_effect=_fake_sanitize):
+            _sanitize_history([{"role": "user", "text": "hello"}], mode="block")
+        assert captured.get("known_entities") is None

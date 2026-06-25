@@ -1339,7 +1339,10 @@ class TestSetBookkeepingGuard:
         assert bk["speaker_id"] == ""
 
     def test_nonempty_speaker_id_succeeds_without_flag(self):
-        """Non-empty speaker_id always succeeds (no flag needed)."""
+        """Non-empty speaker_id always succeeds (no flag needed).
+
+        A cased ``Speaker0`` is accepted and normalized to lowercase ``speaker0``
+        by :meth:`set_bookkeeping`'s ``is_speaker_id`` gate."""
         s = MemoryStore()
         s.set_bookkeeping(
             "graph3",
@@ -1349,4 +1352,287 @@ class TestSetBookkeepingGuard:
         )
         bk = s.bookkeeping_for_key("graph3")
         assert bk is not None
-        assert bk["speaker_id"] == "Speaker0"
+        assert bk["speaker_id"] == "speaker0"
+
+    def test_cased_speaker_id_normalized_to_lowercase(self):
+        """set_bookkeeping normalizes is_speaker_id values to lowercase.
+
+        Cased ``Speaker0`` is coerced to ``speaker0``; probe filter and router
+        index receive the normalized form, eliminating the silent-drop regression
+        where legacy key_metadata.json held cased ids."""
+        s = MemoryStore()
+        s.set_bookkeeping("g1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual")
+        bk = s.bookkeeping_for_key("g1")
+        assert bk is not None
+        assert bk["speaker_id"] == "speaker0", (
+            "set_bookkeeping must lowercase Speaker0 → speaker0 to match the probe filter."
+        )
+
+    def test_empty_speaker_id_passes_through_with_flag(self):
+        """Empty speaker_id passes through (allow_empty_speaker=True); not lowercased."""
+        s = MemoryStore()
+        s.set_bookkeeping(
+            "g2",
+            speaker_id="",
+            first_seen_cycle=1,
+            relation_type="factual",
+            allow_empty_speaker=True,
+        )
+        bk = s.bookkeeping_for_key("g2")
+        assert bk is not None
+        assert bk["speaker_id"] == ""
+
+    def test_non_speaker_value_passes_through_unchanged(self):
+        """A non-speaker_id value that is non-empty passes through without lowercasing."""
+        s = MemoryStore()
+        s.set_bookkeeping("g3", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        bk = s.bookkeeping_for_key("g3")
+        assert bk is not None
+        assert bk["speaker_id"] == "alice"
+
+    def test_load_bookkeeping_legacy_cased_speaker_id_normalized(self, tmp_path):
+        """Legacy key_metadata.json with cased Speaker0 is lowercased at boot.
+
+        :meth:`load_bookkeeping_from_disk` calls :meth:`set_bookkeeping`, which
+        normalizes ``Speaker0`` → ``speaker0`` via ``is_speaker_id``.  A subsequent
+        probe with the lowercase id must NOT drop the key (the live regression
+        this fix targets: 158 keys silently dropped after the speaker-identity
+        refactor)."""
+        import json
+
+        path = tmp_path / "key_metadata.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "keys": {
+                        "graph42": {
+                            "speaker_id": "Speaker0",
+                            "first_seen_cycle": 3,
+                            "relation_type": "factual",
+                            "recurrence_count": 1,
+                            "last_seen_cycle": 3,
+                        }
+                    }
+                }
+            )
+        )
+        s = MemoryStore()
+        from paramem.training.key_registry import KeyRegistry
+
+        reg = KeyRegistry()
+        reg.add("graph42")
+        s.load_registry("episodic", reg)
+        s.put(
+            "episodic",
+            "graph42",
+            {"key": "graph42", "subject": "speaker0", "predicate": "lives_in", "object": "London"},
+        )
+        s.load_bookkeeping_from_disk(path)
+
+        bk = s.bookkeeping_for_key("graph42")
+        assert bk is not None
+        assert bk["speaker_id"] == "speaker0", (
+            "Legacy cased Speaker0 must be normalized to speaker0 at boot."
+        )
+
+        # Probe with lowercase id must NOT drop the key.
+        results = s.probe({"episodic": ["graph42"]}, speaker_id="speaker0")
+        assert results.get("graph42") is not None, (
+            "probe(speaker_id='speaker0') must find the key after legacy normalization."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase B — speaker_resolver kwarg (B2)
+# ---------------------------------------------------------------------------
+
+
+class TestProbeSpeakerResolver:
+    """MemoryStore.probe(speaker_resolver=...) applies the resolver in both
+    render paths: cache-HIT and cache-MISS / source passthrough.
+    """
+
+    def _resolve(self, tok: str) -> str:
+        mapping = {"speaker0": "Alex", "speaker9": "Dana"}
+        return mapping.get(tok, "another speaker" if tok.startswith("speaker") else tok)
+
+    def test_cache_hit_resolves_subject(self) -> None:
+        """Cache-hit path: resolver applied to subject via entry_fact_text."""
+        s = MemoryStore()
+        s.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
+        )
+        s.set_bookkeeping(
+            "graph1", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+        results = s.probe({"episodic": ["graph1"]}, speaker_resolver=self._resolve)
+        ft = results["graph1"]["fact_text"]
+        assert "Alex" in ft
+        assert "speaker0" not in ft
+
+    def test_cache_hit_resolves_object(self) -> None:
+        """Cache-hit path: resolver applied to object via entry_fact_text."""
+        s = MemoryStore()
+        s.put(
+            "episodic",
+            "graph2",
+            {"key": "graph2", "subject": "speaker0", "predicate": "knows", "object": "speaker9"},
+        )
+        s.set_bookkeeping(
+            "graph2", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+        results = s.probe({"episodic": ["graph2"]}, speaker_resolver=self._resolve)
+        ft = results["graph2"]["fact_text"]
+        assert "Dana" in ft
+        assert "speaker9" not in ft
+
+    def test_cache_hit_no_resolver_verbatim(self) -> None:
+        """Without resolver, fact_text contains the raw token (byte-identical behaviour)."""
+        s = MemoryStore()
+        s.put(
+            "episodic",
+            "graph3",
+            {"key": "graph3", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
+        )
+        s.set_bookkeeping(
+            "graph3", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
+        )
+        results = s.probe({"episodic": ["graph3"]})
+        ft = results["graph3"]["fact_text"]
+        assert "speaker0" in ft
+
+    def test_source_miss_path_resolves(self) -> None:
+        """Cache-MISS / source passthrough: resolver applied before storing result."""
+
+        class _FakeSource:
+            def probe(self, keys_by_tier):
+                return {
+                    "graph9": {
+                        "key": "graph9",
+                        "subject": "speaker9",
+                        "predicate": "lives_in",
+                        "object": "Paris",
+                    }
+                }
+
+        s = MemoryStore()
+        # No cache entry for graph9 — forces source path.
+        results = s.probe(
+            {"episodic": ["graph9"]},
+            source=_FakeSource(),
+            speaker_resolver=self._resolve,
+            memoize=False,
+        )
+        ft = results["graph9"]["fact_text"]
+        assert "Dana" in ft
+        assert "speaker9" not in ft
+
+    def test_anon_renders_descriptor(self) -> None:
+        """Resolver returning THIRD_PARTY_DESCRIPTOR for unknown speakers yields descriptor."""
+        descriptor = "another speaker"
+        s = MemoryStore()
+        s.put(
+            "episodic",
+            "graphX",
+            {"key": "graphX", "subject": "speaker5", "predicate": "visited", "object": "Rome"},
+        )
+        s.set_bookkeeping(
+            "graphX", speaker_id="speaker5", first_seen_cycle=1, relation_type="factual"
+        )
+        results = s.probe({"episodic": ["graphX"]}, speaker_resolver=self._resolve)
+        ft = results["graphX"]["fact_text"]
+        assert descriptor in ft
+        assert "speaker5" not in ft
+
+    def test_memoized_stash_is_spo_only(self) -> None:
+        """After a source miss is memoized, a second probe re-renders from SPO (no stale name)."""
+
+        class _FakeSource:
+            def probe(self, keys_by_tier):
+                return {
+                    "graphM": {
+                        "key": "graphM",
+                        "subject": "speaker9",
+                        "predicate": "works_at",
+                        "object": "Acme",
+                    }
+                }
+
+        s = MemoryStore()
+        # First probe with resolver "Dana"
+        s.probe(
+            {"episodic": ["graphM"]},
+            source=_FakeSource(),
+            speaker_resolver=self._resolve,
+            memoize=True,
+        )
+
+        # Second probe with a different resolver (renamed to "Zoe") — must NOT return stale "Dana".
+        def _renamed(tok: str) -> str:
+            return "Zoe" if tok == "speaker9" else tok
+
+        results2 = s.probe({"episodic": ["graphM"]}, speaker_resolver=_renamed)
+        ft2 = results2["graphM"]["fact_text"]
+        assert "Zoe" in ft2
+        assert "Dana" not in ft2
+
+
+# ---------------------------------------------------------------------------
+# Contract: probe speaker-filter lowercase invariant
+# ---------------------------------------------------------------------------
+
+
+class TestProbeFilterLowercaseInvariant:
+    """A cased request speaker_id must not silently drop a lowercase-bookkept key.
+
+    The probe speaker-filter at store.py::1010 compares
+    ``bk_spk != speaker_id``.  Both sides MUST be lowercase after the
+    speaker-identity refactor; a cased request id would cause a mismatch
+    that silently returns ``None`` for the key, losing the recalled fact.
+
+    This test seeds bookkeeping with lowercase ``speaker0`` and asserts that
+    ``probe(speaker_id="speaker0")`` (lowercase) hits the entry, while
+    confirming that the comparison is equality (not cased mismatch).
+    """
+
+    def test_lowercase_request_id_passes_filter(self):
+        """Lowercase request speaker_id matches lowercase bookkeeping speaker_id."""
+        s = MemoryStore()
+        s.put(
+            "episodic",
+            "k1",
+            {"key": "k1", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
+        )
+        s.set_bookkeeping("k1", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual")
+
+        results = s.probe({"episodic": ["k1"]}, speaker_id="speaker0")
+        assert results.get("k1") is not None, (
+            "probe(speaker_id='speaker0') must not drop a key bookkeeping-owned by 'speaker0'."
+        )
+
+    def test_cased_id_mismatch_would_drop_key(self):
+        """Sanity: a cased request id does NOT match the lowercase bookkeeping id.
+
+        This documents the failure mode that the lowercase-uniform refactor
+        prevents: if a cased 'Speaker0' reaches the filter while bookkeeping
+        stores 'speaker0', the result is None (fact silently dropped).
+        The forward-only fix ensures this mismatch can no longer occur because
+        all speaker_id values are lowercase at their source.
+        """
+        s = MemoryStore()
+        s.put(
+            "episodic",
+            "k2",
+            {"key": "k2", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
+        )
+        s.set_bookkeeping("k2", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual")
+
+        # A cased 'Speaker0' reaching the filter would trigger a mismatch warning
+        # and return None — documenting why the upstream must always emit lowercase.
+        results = s.probe({"episodic": ["k2"]}, speaker_id="Speaker0")
+        assert results.get("k2") is None, (
+            "probe(speaker_id='Speaker0') must return None when bookkeeping stores 'speaker0' "
+            "— the casing mismatch protection is load-bearing; upstream must always emit lowercase."
+        )

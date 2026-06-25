@@ -1,87 +1,87 @@
 Extract PERSONAL FACTS about the speaker from this conversation transcript.{speaker_context}
 
-Use the speaker's system identifier from the directive above (e.g. `Speaker0`) as the entity name and relation subject for every fact about the speaker. Never emit a display name, pronoun, or the literal string `{{SPEAKER_NAME}}` as the subject.
+Use the speaker's system identifier from the directive above (e.g. `speaker0`) as the entity name and relation subject for every fact about the speaker. Never emit a display name, pronoun, or the literal string `{{SPEAKER_NAME}}` as the subject.
 
 When the transcript is a structured or bulleted list, treat EACH item as a separate fact and emit a relation for it — never collapse the list into the summary or into entity attributes alone. A heading (e.g. `## Experience`, `## Skills`) labels the facts that follow: extract the facts beneath it, not the heading. A single item may yield more than one relation (e.g. a role at an organization → both a role relation and a works_at relation).
 
 
-POSITIVE example — speaker id is "Speaker0" (display name "Alex"), transcript: "[user] Hi, I'm Alex Morgan. My email is alex.morgan@example.com and my phone is +1 555 123 4567. You can find me at linkedin.com/in/alex-morgan. I work at Brightfield Labs."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{"last_name": "Morgan", "email": "alex.morgan@example.com", "phone": "+1 555 123 4567", "linkedin": "linkedin.com/in/alex-morgan"}}}},
+POSITIVE example — speaker id is "speaker0" (display name "Alex"), transcript: "[user] Hi, I'm Alex Morgan. My email is alex.morgan@example.com and my phone is +1 555 123 4567. You can find me at linkedin.com/in/alex-morgan. I work at Brightfield Labs."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{"last_name": "Morgan", "email": "alex.morgan@example.com", "phone": "+1 555 123 4567", "linkedin": "linkedin.com/in/alex-morgan"}}}},
  {{"name": "Brightfield Labs", "entity_type": "organization", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker0", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Speaker0 (Alex Morgan) works at Brightfield Labs."}}
+ "relations": [{{"subject": "speaker0", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 (Alex Morgan) works at Brightfield Labs."}}
 
 
-POSITIVE example — speaker id is "Speaker0" (display name "Sam"), transcript: "[user] Sam Rivera | Senior Engineer | Berlin, Germany\n📱 +49 30 1234 5678 | 🖂 sam.rivera@example.com | LinkedIn: linkedin.com/in/sam-rivera\nI work at Brightfield Labs in the engineering department."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{"last_name": "Rivera", "email": "sam.rivera@example.com", "phone": "+49 30 1234 5678", "linkedin": "linkedin.com/in/sam-rivera", "city": "Berlin", "country": "Germany"}}}},
+POSITIVE example — speaker id is "speaker0" (display name "Sam"), transcript: "[user] Sam Rivera | Senior Engineer | Berlin, Germany\n📱 +49 30 1234 5678 | 🖂 sam.rivera@example.com | LinkedIn: linkedin.com/in/sam-rivera\nI work at Brightfield Labs in the engineering department."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{"last_name": "Rivera", "email": "sam.rivera@example.com", "phone": "+49 30 1234 5678", "linkedin": "linkedin.com/in/sam-rivera", "city": "Berlin", "country": "Germany"}}}},
  {{"name": "Brightfield Labs", "entity_type": "organization", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker0", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Speaker0 (Sam Rivera) works at Brightfield Labs in Berlin."}}
+ "relations": [{{"subject": "speaker0", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 (Sam Rivera) works at Brightfield Labs in Berlin."}}
 
 
-POSITIVE example — speaker id is "Speaker0", transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "speaker0", transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Frankfurt", "entity_type": "place", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker0", "predicate": "sister_lives_in", "object": "Frankfurt", "relation_type": "social", "confidence": 1.0}}],
- "summary": "Speaker0's sister lives in Frankfurt."}}
+ "relations": [{{"subject": "speaker0", "predicate": "sister_lives_in", "object": "Frankfurt", "relation_type": "social", "confidence": 1.0}}],
+ "summary": "speaker0's sister lives in Frankfurt."}}
 
 
-POSITIVE example — speaker id is "Speaker0", transcript: "[user] How often do I have to change my tires for my car? My car is a Volvo V70."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "speaker0", transcript: "[user] How often do I have to change my tires for my car? My car is a Volvo V70."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Volvo V70", "entity_type": "concept", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker0", "predicate": "owns", "object": "Volvo V70", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Speaker0 owns a Volvo V70."}}
+ "relations": [{{"subject": "speaker0", "predicate": "owns", "object": "Volvo V70", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 owns a Volvo V70."}}
 
 
-POSITIVE example — speaker id is "Speaker0", transcript: "[user] ## Hobbies\n- Cycling\n- Photography\n- Amateur radio"
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "speaker0", transcript: "[user] ## Hobbies\n- Cycling\n- Photography\n- Amateur radio"
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Cycling", "entity_type": "preference", "attributes": {{}}}},
  {{"name": "Photography", "entity_type": "preference", "attributes": {{}}}},
  {{"name": "Amateur Radio", "entity_type": "preference", "attributes": {{}}}}],
  "relations": [
-   {{"subject": "Speaker0", "predicate": "likes", "object": "Cycling", "relation_type": "preference", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "likes", "object": "Photography", "relation_type": "preference", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "likes", "object": "Amateur Radio", "relation_type": "preference", "confidence": 1.0}}],
- "summary": "Speaker0 enjoys cycling, photography, and amateur radio."}}
+   {{"subject": "speaker0", "predicate": "likes", "object": "Cycling", "relation_type": "preference", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "likes", "object": "Photography", "relation_type": "preference", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "likes", "object": "Amateur Radio", "relation_type": "preference", "confidence": 1.0}}],
+ "summary": "speaker0 enjoys cycling, photography, and amateur radio."}}
 
 
-POSITIVE example — speaker id is "Speaker0", transcript: "[user] ## Profile\n- Lead nurse at Riverside Clinic\n- Lives in Oakdale, grew up in Glenport\n- Studied marine biology at Coastal University\n- Owns a sailboat called Marigold"
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "speaker0", transcript: "[user] ## Profile\n- Lead nurse at Riverside Clinic\n- Lives in Oakdale, grew up in Glenport\n- Studied marine biology at Coastal University\n- Owns a sailboat called Marigold"
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Riverside Clinic", "entity_type": "organization", "attributes": {{}}}},
  {{"name": "Oakdale", "entity_type": "place", "attributes": {{}}}},
  {{"name": "Glenport", "entity_type": "place", "attributes": {{}}}},
  {{"name": "Coastal University", "entity_type": "organization", "attributes": {{}}}},
  {{"name": "Marigold", "entity_type": "concept", "attributes": {{"type": "sailboat"}}}}],
  "relations": [
-   {{"subject": "Speaker0", "predicate": "has_role", "object": "Lead nurse", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "works_at", "object": "Riverside Clinic", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "lives_in", "object": "Oakdale", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "grew_up_in", "object": "Glenport", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "studied_at", "object": "Coastal University", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "owns", "object": "Marigold", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Speaker0 is a lead nurse at Riverside Clinic, lives in Oakdale, grew up in Glenport, studied marine biology at Coastal University, and owns a sailboat called Marigold."}}
+   {{"subject": "speaker0", "predicate": "has_role", "object": "Lead nurse", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "works_at", "object": "Riverside Clinic", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "lives_in", "object": "Oakdale", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "grew_up_in", "object": "Glenport", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "studied_at", "object": "Coastal University", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "owns", "object": "Marigold", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 is a lead nurse at Riverside Clinic, lives in Oakdale, grew up in Glenport, studied marine biology at Coastal University, and owns a sailboat called Marigold."}}
 
 
-POSITIVE example — speaker id is "Speaker0", transcript: "[user] Born and raised in Millfield, I moved to Westport after university."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "speaker0", transcript: "[user] Born and raised in Millfield, I moved to Westport after university."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Millfield", "entity_type": "place", "attributes": {{}}}},
  {{"name": "Westport", "entity_type": "place", "attributes": {{}}}}],
  "relations": [
-   {{"subject": "Speaker0", "predicate": "born_in", "object": "Millfield", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "lives_in", "object": "Westport", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Speaker0 was born in Millfield and now lives in Westport."}}
+   {{"subject": "speaker0", "predicate": "born_in", "object": "Millfield", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "lives_in", "object": "Westport", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 was born in Millfield and now lives in Westport."}}
 
 
-NEGATIVE example — speaker id is "Speaker0" (display name "Jordan"), transcript: "[user] My name is Jordan Wells and I live in Millbrook."
+NEGATIVE example — speaker id is "speaker0" (display name "Jordan"), transcript: "[user] My name is Jordan Wells and I live in Millbrook."
 BAD output (two entities for the same speaker, and using the display name as subject):
 {{"entities": [{{"name": "Jordan", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Jordan Wells", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Millbrook", "entity_type": "place", "attributes": {{}}}}], ...}}
 CORRECT output (single entity named by the speaker id, last name as attribute):
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{"last_name": "Wells"}}}},
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{"last_name": "Wells"}}}},
  {{"name": "Millbrook", "entity_type": "place", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker0", "predicate": "lives_in", "object": "Millbrook", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Speaker0 (Jordan Wells) lives in Millbrook."}}
+ "relations": [{{"subject": "speaker0", "predicate": "lives_in", "object": "Millbrook", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 (Jordan Wells) lives in Millbrook."}}
 
 
 NEGATIVE example — transcript: "[user] What's the weather in Tokyo? [assistant] Tokyo is 18°C and rainy."
@@ -100,33 +100,33 @@ NEGATIVE example — transcript: "[user] Page 4 of 12"
 Extract: NONE — page numbers are structural noise.
 
 
-POSITIVE example — speaker id is "Speaker0" (display name "Jordan"), transcript: "[user] I'm Jordan Ellis. I led the Astra robotics platform at NovaTech, scaling the team from 8 to 60 engineers across 3 countries. We delivered 2 compute platforms to production. I also authored the paper 'Adaptive Control for Mobile Manipulators'."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{"last_name": "Ellis"}}}},
+POSITIVE example — speaker id is "speaker0" (display name "Jordan"), transcript: "[user] I'm Jordan Ellis. I led the Astra robotics platform at NovaTech, scaling the team from 8 to 60 engineers across 3 countries. We delivered 2 compute platforms to production. I also authored the paper 'Adaptive Control for Mobile Manipulators'."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{"last_name": "Ellis"}}}},
  {{"name": "NovaTech", "entity_type": "organization", "attributes": {{}}}},
  {{"name": "Astra", "entity_type": "concept", "attributes": {{"domain": "robotics platform"}}}},
  {{"name": "Adaptive Control for Mobile Manipulators", "entity_type": "concept", "attributes": {{"type": "paper"}}}}],
  "relations": [
-   {{"subject": "Speaker0", "predicate": "works_at", "object": "NovaTech", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "led", "object": "Astra", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "scaled_team_to", "object": "60 engineers", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "delivered", "object": "2 compute platforms", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "authored", "object": "Adaptive Control for Mobile Manipulators", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Speaker0 (Jordan Ellis) led the Astra robotics platform at NovaTech, scaled the team to 60 engineers, delivered 2 compute platforms, and authored a paper on adaptive control."}}
+   {{"subject": "speaker0", "predicate": "works_at", "object": "NovaTech", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "led", "object": "Astra", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "scaled_team_to", "object": "60 engineers", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "delivered", "object": "2 compute platforms", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "authored", "object": "Adaptive Control for Mobile Manipulators", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 (Jordan Ellis) led the Astra robotics platform at NovaTech, scaled the team to 60 engineers, delivered 2 compute platforms, and authored a paper on adaptive control."}}
 
 
-POSITIVE example — speaker id is "Speaker0", transcript: "[user] I completed my PhD in computational neuroscience at Lakeview University in 2019. During my doctorate I published 4 papers on neural signal decoding, received the Lakeview Graduate Excellence Award, and co-founded the NeuroSig open-source library used by over 200 labs worldwide."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "speaker0", transcript: "[user] I completed my PhD in computational neuroscience at Lakeview University in 2019. During my doctorate I published 4 papers on neural signal decoding, received the Lakeview Graduate Excellence Award, and co-founded the NeuroSig open-source library used by over 200 labs worldwide."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Lakeview University", "entity_type": "organization", "attributes": {{}}}},
  {{"name": "PhD in Computational Neuroscience", "entity_type": "concept", "attributes": {{"institution": "Lakeview University", "year": "2019"}}}},
  {{"name": "Lakeview Graduate Excellence Award", "entity_type": "concept", "attributes": {{"type": "award"}}}},
  {{"name": "NeuroSig", "entity_type": "concept", "attributes": {{"type": "open-source library"}}}}],
  "relations": [
-   {{"subject": "Speaker0", "predicate": "holds_degree", "object": "PhD in Computational Neuroscience", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "studied_at", "object": "Lakeview University", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "published", "object": "4 papers on neural signal decoding", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "received_award", "object": "Lakeview Graduate Excellence Award", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "Speaker0", "predicate": "co_founded", "object": "NeuroSig", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "Speaker0 completed a PhD in computational neuroscience at Lakeview University in 2019, published 4 papers, won the Graduate Excellence Award, and co-founded the NeuroSig open-source library."}}
+   {{"subject": "speaker0", "predicate": "holds_degree", "object": "PhD in Computational Neuroscience", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "studied_at", "object": "Lakeview University", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "published", "object": "4 papers on neural signal decoding", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "received_award", "object": "Lakeview Graduate Excellence Award", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "co_founded", "object": "NeuroSig", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 completed a PhD in computational neuroscience at Lakeview University in 2019, published 4 papers, won the Graduate Excellence Award, and co-founded the NeuroSig open-source library."}}
 
 
 Transcript:

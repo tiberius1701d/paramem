@@ -62,14 +62,14 @@ class TestExtractionPathParity:
                     predicate="lives_in",
                     object="Millfield",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
                 Relation(
                     subject="Alex",
                     predicate="prefers",
                     object="Acme Radio",
                     relation_type="preference",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
         )
@@ -83,7 +83,7 @@ class TestExtractionPathParity:
                     predicate="listens_to",
                     object="The Kooks",
                     relation_type="preference",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
         )
@@ -235,7 +235,7 @@ class TestExtractionPathParity:
                     predicate="lives_in",
                     object="Millfield",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
         )
@@ -807,7 +807,7 @@ class TestSessionClassification:
     - UNIDENTIFIABLE (no speaker_id AND no voice embedding) → NOT extracted.
 
     Anonymity is determined by the speaker store, not by the speaker_id string
-    format — do NOT use 'Speaker{N}' string patterns as the anonymity gate.
+    format — do NOT use 'speaker{N}' string patterns as the anonymity gate.
 
     Note: these tests call _run_extraction_phase directly (in paramem.server.app);
     run_consolidation was deleted and must not be re-introduced (see
@@ -917,7 +917,7 @@ class TestSessionClassification:
         from paramem.server.consolidation import SessionClass, classify_session
 
         result = classify_session(
-            speaker_id="Speaker3", is_anonymous=True, has_voice_embedding=False
+            speaker_id="speaker3", is_anonymous=True, has_voice_embedding=False
         )
         assert result == SessionClass.HOLDABLE
 
@@ -961,13 +961,13 @@ class TestSessionClassification:
     def test_anonymous_speaker_not_extracted(self, tmp_path):
         """Anonymous-voice (HOLDABLE) sessions are NOT extracted.
 
-        Anonymity is determined by the store, not by the 'Speaker{N}' string.
+        Anonymity is determined by the store, not by the 'speaker{N}' string.
         """
         loop = self._make_mock_loop(tmp_path)
         config = self._make_config(tmp_path)
-        # "Speaker3" is anonymous_voice in the store
-        buffer = self._make_session_buffer(tmp_path, speaker_id="Speaker3")
-        store = self._make_stub_store(anonymous_ids={"Speaker3"})
+        # "speaker3" is anonymous_voice in the store
+        buffer = self._make_session_buffer(tmp_path, speaker_id="speaker3")
+        store = self._make_stub_store(anonymous_ids={"speaker3"})
 
         self._call_run_extraction_phase(loop, config, buffer, store=store)
 
@@ -1322,7 +1322,7 @@ class TestSaveAdaptersManifest:
                 "subject": "sky",
                 "predicate": "has_colour",
                 "object": "blue",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=False,
@@ -2342,7 +2342,7 @@ class TestIndexedKeyCacheSchemaInvariant:
         subject: str = "Alice",
         predicate: str = "lives_in",
         obj: str = "Berlin",
-        speaker_id: str = "Speaker0",
+        speaker_id: str = "speaker0",
         first_seen_cycle: int = 1,
     ) -> dict:
         return {
@@ -2474,10 +2474,10 @@ def test_promotion_carry_over_restores_nonzero_attributes(tmp_path):
     meta = {
         "cycle_count": 5,
         "keys": {
-            "graph1": {"recurrence_count": 7, "speaker_id": "Speaker0", "first_seen_cycle": 1},
-            "graph2": {"recurrence_count": 3, "speaker_id": "Speaker0", "first_seen_cycle": 2},
-            "graph3": {"recurrence_count": 1, "speaker_id": "Speaker0", "first_seen_cycle": 3},
-            "orphan": {"recurrence_count": 9, "speaker_id": "Speaker0", "first_seen_cycle": 0},
+            "graph1": {"recurrence_count": 7, "speaker_id": "speaker0", "first_seen_cycle": 1},
+            "graph2": {"recurrence_count": 3, "speaker_id": "speaker0", "first_seen_cycle": 2},
+            "graph3": {"recurrence_count": 1, "speaker_id": "speaker0", "first_seen_cycle": 3},
+            "orphan": {"recurrence_count": 9, "speaker_id": "speaker0", "first_seen_cycle": 0},
         },
         "promoted_keys": ["graph1", "orphan"],
     }
@@ -2921,7 +2921,7 @@ class TestAbortSkipsCommit:
         # (defer=True) finds a keyless edge and produces a non-empty deferred write →
         # all_interim_keyed is non-empty → training is triggered.
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("speaker0", speaker_id="Speaker0", attributes={"name": "Alex"})
+        real_graph.add_node("speaker0", speaker_id="speaker0", attributes={"name": "Alex"})
         real_graph.add_node("millfield", attributes={"name": "Millfield"})
         real_graph.add_edge(
             "speaker0",
@@ -2977,11 +2977,11 @@ class TestAbortSkipsCommit:
                         "predicate": "lives_in",
                         "object": "Millfield",
                         "relation_type": "factual",
-                        "speaker_id": "Speaker0",
+                        "speaker_id": "speaker0",
                     }
                 ],
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="test_cycle",
                 stamp="t001",
@@ -3018,7 +3018,7 @@ class TestAbortSkipsCommit:
         # Populate merger.graph with a procedural-typed keyless edge so the
         # graph-walk mints a "proc…" key into _deferred_writes.
         proc_graph = nx.MultiDiGraph()
-        proc_graph.add_node("alice", speaker_id="Speaker0", attributes={"name": "Alice"})
+        proc_graph.add_node("alice", speaker_id="speaker0", attributes={"name": "Alice"})
         proc_graph.add_node("tea", attributes={"name": "Tea"})
         proc_graph.add_edge(
             "alice",
@@ -3077,11 +3077,11 @@ class TestAbortSkipsCommit:
                         "predicate": "prefers",
                         "object": "Tea",
                         "relation_type": "preference",
-                        "speaker_id": "Speaker0",
+                        "speaker_id": "speaker0",
                     }
                 ],
                 [],  # procedural_rels guard arg
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="test_proc_abort",
                 stamp="t001",
@@ -3125,7 +3125,7 @@ class TestAbortSkipsCommit:
                 "subject": "Alex",
                 "predicate": "lives_in",
                 "object": "Millfield",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
@@ -3134,7 +3134,7 @@ class TestAbortSkipsCommit:
         # the full-consolidation reconstruct→remerge pipeline.
         loop.store.set_bookkeeping(
             "graph1",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             first_seen_cycle=1,
             relation_type="factual",
         )
@@ -3442,14 +3442,14 @@ class TestConsolidateInterimAdaptersFullFlow:
                     "subject": "Alice",
                     "predicate": "lives_in",
                     "object": "Berlin",
-                    "speaker_id": "Speaker0",
+                    "speaker_id": "speaker0",
                     "first_seen_cycle": 1,
                 },
                 simhash=sh,
                 register=True,
             )
             loop.store.set_bookkeeping(
-                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+                key, speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
             )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
@@ -3542,13 +3542,13 @@ class TestConsolidateInterimAdaptersFullFlow:
                 "subject": "Alice",
                 "predicate": "prefers",
                 "object": "tea",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "proc1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="preference"
+            "proc1", speaker_id="speaker0", first_seen_cycle=1, relation_type="preference"
         )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
@@ -3597,14 +3597,14 @@ class TestConsolidateInterimAdaptersFullFlow:
                 "subject": "Alice",
                 "predicate": "prefers",
                 "object": "coffee",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         # Bookkeeping has relation_type="preference" — this must be injected.
         loop.store.set_bookkeeping(
-            "proc1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="preference"
+            "proc1", speaker_id="speaker0", first_seen_cycle=1, relation_type="preference"
         )
 
         # Capture merger.merge() call args.
@@ -3695,13 +3695,13 @@ class TestConsolidateInterimAdaptersFullFlow:
                 "subject": "Alice",
                 "predicate": "Lives In",  # raw form — stored as-is, not used for keying
                 "object": "Berlin",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "graph1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "graph1", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
@@ -3761,13 +3761,13 @@ class TestConsolidateInterimAdaptersFullFlow:
                 "subject": "Bob",
                 "predicate": "lives_in",
                 "object": "London",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "graph_bob", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "graph_bob", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         # Register drift1 — no recon edge.  Under registry-true dedup the SPO
@@ -3780,13 +3780,13 @@ class TestConsolidateInterimAdaptersFullFlow:
                 "subject": "Alice",
                 "predicate": "works_at",
                 "object": "Acme",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "drift1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "drift1", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
@@ -3863,13 +3863,13 @@ class TestConsolidateInterimAdaptersFullFlow:
                 "subject": "Alice",
                 "predicate": "lives_in",
                 "object": "Berlin",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "graph_ok", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "graph_ok", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         # graph_hydration_miss: registered in the store but NO content entry.
@@ -3883,7 +3883,7 @@ class TestConsolidateInterimAdaptersFullFlow:
                 "subject": "Bob",
                 "predicate": "works_at",
                 "object": "Acme",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
@@ -3893,7 +3893,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         # Bookkeeping carries the SPO (populated independently of _entries).
         loop.store.set_bookkeeping(
             "graph_hydration_miss",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             first_seen_cycle=1,
             relation_type="factual",
             recurrence_count=1,
@@ -3963,13 +3963,13 @@ class TestConsolidateInterimAdaptersFullFlow:
                     "subject": "Alice",
                     "predicate": "listens_to",
                     "object": obj,
-                    "speaker_id": "Speaker0",
+                    "speaker_id": "speaker0",
                     "first_seen_cycle": 1,
                 },
                 register=True,
             )
             loop.store.set_bookkeeping(
-                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+                key, speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
             )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
@@ -4021,13 +4021,13 @@ class TestConsolidateInterimAdaptersFullFlow:
                 "subject": "Alice",
                 "predicate": "lives_in",
                 "object": "Berlin",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "graph10", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "graph10", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
@@ -4107,7 +4107,7 @@ class TestConsolidateInterimAdaptersFullFlow:
             object="Berlin",
             relation_type="factual",
             confidence=1.0,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             indexed_key="g1",
         )
         m._upsert_relation("Alice", "Berlin", incoming, "s1", "2026-01-01T00:00:00Z")
@@ -4169,13 +4169,13 @@ class TestConsolidateInterimAdaptersFullFlow:
                     "subject": "Alex",
                     "predicate": "lives_in",
                     "object": obj,
-                    "speaker_id": "Speaker0",
+                    "speaker_id": "speaker0",
                     "first_seen_cycle": 1,
                 },
                 register=True,
             )
             loop.store.set_bookkeeping(
-                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+                key, speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
             )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
@@ -4221,13 +4221,13 @@ class TestConsolidateInterimAdaptersFullFlow:
                     "subject": "Alex",
                     "predicate": "lives_in",
                     "object": obj,
-                    "speaker_id": "Speaker0",
+                    "speaker_id": "speaker0",
                     "first_seen_cycle": 1,
                 },
                 register=True,
             )
             loop.store.set_bookkeeping(
-                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+                key, speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
             )
 
         # Spy that inserts BOTH edges (resolve_contradictions=False at fold).
@@ -4401,13 +4401,13 @@ class TestDriftPartitioning:
                 "subject": "Alice",
                 "predicate": "lives_in",
                 "object": "Berlin",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "key_dup1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "key_dup1", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         # key_dup2 — same SPO; recon edge collapses into key_dup1 via Case-1.
@@ -4419,13 +4419,13 @@ class TestDriftPartitioning:
                 "subject": "Alice",
                 "predicate": "lives_in",
                 "object": "Berlin",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "key_dup2", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "key_dup2", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         # key_orphan — no SPO content in entry; no recon edge.
@@ -4437,13 +4437,13 @@ class TestDriftPartitioning:
                 "subject": "",
                 "predicate": "",
                 "object": "",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "key_orphan", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "key_orphan", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         # key_loss — has real SPO content but no recon edge (reconstruction failed).
@@ -4455,13 +4455,13 @@ class TestDriftPartitioning:
                 "subject": "Bob",
                 "predicate": "works_at",
                 "object": "Acme",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "key_loss", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "key_loss", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
@@ -4533,13 +4533,13 @@ class TestDriftPartitioning:
                     "subject": "Carol",
                     "predicate": "lives_in",
                     "object": "Paris",
-                    "speaker_id": "Speaker0",
+                    "speaker_id": "speaker0",
                     "first_seen_cycle": 1,
                 },
                 register=True,
             )
             loop.store.set_bookkeeping(
-                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+                key, speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
             )
 
         # caplog.at_level alone does not capture in this project (log propagation
@@ -4608,13 +4608,13 @@ class TestDriftPartitioning:
                 "subject": "Dave",
                 "predicate": "lives_in",
                 "object": "London",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "key_ok", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "key_ok", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         # key_no_pred has a non-empty subject but empty predicate.
@@ -4627,13 +4627,13 @@ class TestDriftPartitioning:
                 "subject": "Eve",
                 "predicate": "",
                 "object": "Acme",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "key_no_pred", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "key_no_pred", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         # caplog.at_level alone does not capture in this project (log propagation
@@ -4720,13 +4720,13 @@ class TestDriftIntendedRemoval:
                 "subject": "Dave",
                 "predicate": "lives_in",
                 "object": "London",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
-            "key_ok", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+            "key_ok", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
         )
 
         # key_enrichment — active key, no recon edge; will be written to the ledger
@@ -4739,14 +4739,14 @@ class TestDriftIntendedRemoval:
                 "subject": "Alice",
                 "predicate": "alias_of",
                 "object": "Alicia",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
             "key_enrichment",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             first_seen_cycle=1,
             relation_type="factual",
         )
@@ -4856,13 +4856,13 @@ class TestDriftIntendedRemoval:
                     "subject": "Alice",
                     "predicate": "lives_in",
                     "object": "Berlin",
-                    "speaker_id": "Speaker0",
+                    "speaker_id": "speaker0",
                     "first_seen_cycle": 1,
                 },
                 register=True,
             )
             loop.store.set_bookkeeping(
-                key, speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
+                key, speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
             )
 
         # Pre-seed ledger for key_dup2 as well — to prove it doesn't divert to
@@ -5128,7 +5128,7 @@ class TestBookkeepingSchema:
         store = self._make_store()
         store.set_bookkeeping(
             "graph1",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             first_seen_cycle=3,
             relation_type="factual",
             recurrence_count=2,
@@ -5136,7 +5136,7 @@ class TestBookkeepingSchema:
         )
         bk = store.bookkeeping_for_key("graph1")
         assert bk is not None
-        assert bk["speaker_id"] == "Speaker0"
+        assert bk["speaker_id"] == "speaker0"
         assert bk["first_seen_cycle"] == 3
         assert bk["relation_type"] == "factual"
         assert bk["recurrence_count"] == 2
@@ -5189,14 +5189,14 @@ class TestBookkeepingSchema:
         store = self._make_store()
         store.set_bookkeeping(
             "k",
-            speaker_id="Speaker99",
+            speaker_id="speaker99",
             first_seen_cycle=0,
             relation_type="factual",
             recurrence_count=5,
             last_seen_cycle=0,
         )
         store.bump_recurrence("k", cycle=10)
-        assert store.bookkeeping_for_key("k")["speaker_id"] == "Speaker99"
+        assert store.bookkeeping_for_key("k")["speaker_id"] == "speaker99"
 
     def test_load_bookkeeping_from_disk_round_trip(self, tmp_path):
         """5-field round-trip: save via _save_key_metadata, reload via
@@ -8439,18 +8439,18 @@ class TestMaterializeInterimExtraRelations:
 
         episodic_rels = [
             {
-                "subject": "Speaker0",
+                "subject": "speaker0",
                 "predicate": "lives_in",
                 "object": "Berlin",
                 "relation_type": "factual",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
             },
             {
-                "subject": "Speaker0",
+                "subject": "speaker0",
                 "predicate": "works_at",
                 "object": "Acme Corp",
                 "relation_type": "factual",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
             },
         ]
 
@@ -8464,7 +8464,7 @@ class TestMaterializeInterimExtraRelations:
             result = loop.run_consolidation_cycle(
                 episodic_rels,
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="simulate",
                 run_label="b1-speaker-id-test",
                 stamp=stamp,
@@ -8476,16 +8476,16 @@ class TestMaterializeInterimExtraRelations:
         if result.get("mode") == "simulated":
             # Verify all minted keys have the correct speaker_id.
             for _tier, key, entry in loop.store.iter_entries():
-                if entry.get("subject") in ("Speaker0", "speaker0"):
-                    assert entry.get("speaker_id") == "Speaker0", (
+                if entry.get("subject") in ("speaker0", "speaker0"):
+                    assert entry.get("speaker_id") == "speaker0", (
                         f"Key {key!r} minted with wrong speaker_id: "
-                        f"expected 'Speaker0', got {entry.get('speaker_id')!r}"
+                        f"expected 'speaker0', got {entry.get('speaker_id')!r}"
                     )
                     bk = loop.store.bookkeeping_for_key(key)
                     if bk is not None:
-                        assert bk.get("speaker_id") == "Speaker0", (
+                        assert bk.get("speaker_id") == "speaker0", (
                             f"Bookkeeping for {key!r} has wrong speaker_id: "
-                            f"expected 'Speaker0', got {bk.get('speaker_id')!r}"
+                            f"expected 'speaker0', got {bk.get('speaker_id')!r}"
                         )
 
     # ------------------------------------------------------------------
@@ -8662,8 +8662,8 @@ class TestInterimKeyedWalk:
         lacked speaker_id attributes on the subject nodes.
 
         Strategy:
-        - Two Relation objects: Speaker0/works_at/Acme (speaker_id="Speaker0")
-          and Speaker1/lives_in/Paris (speaker_id="Speaker1").
+        - Two Relation objects: speaker0/works_at/Acme (speaker_id="speaker0")
+          and speaker1/lives_in/Paris (speaker_id="speaker1").
         - Call _materialize_consolidation_graph(extra_relations=[...]) so it
           synthesises entities and stamps speaker_id on each subject node.
         - Run _build_all_edge_entries_into.
@@ -8678,20 +8678,20 @@ class TestInterimKeyedWalk:
 
         extra_relations = [
             Relation(
-                subject="Speaker0",
+                subject="speaker0",
                 predicate="works at",
                 object="Acme Corp",
                 relation_type="factual",
                 confidence=1.0,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
             ),
             Relation(
-                subject="Speaker1",
+                subject="speaker1",
                 predicate="lives in",
                 object="Paris",
                 relation_type="factual",
                 confidence=1.0,
-                speaker_id="Speaker1",
+                speaker_id="speaker1",
             ),
         ]
 
@@ -8726,11 +8726,11 @@ class TestInterimKeyedWalk:
         speaker_ids_found = set(key_to_speaker.values())
 
         # Both speaker_ids must be present.
-        assert "Speaker0" in speaker_ids_found, (
-            f"Expected Speaker0 in minted speaker_ids; found: {speaker_ids_found}"
+        assert "speaker0" in speaker_ids_found, (
+            f"Expected speaker0 in minted speaker_ids; found: {speaker_ids_found}"
         )
-        assert "Speaker1" in speaker_ids_found, (
-            f"Expected Speaker1 in minted speaker_ids; found: {speaker_ids_found}"
+        assert "speaker1" in speaker_ids_found, (
+            f"Expected speaker1 in minted speaker_ids; found: {speaker_ids_found}"
         )
 
         # The two minted keys must carry DIFFERENT speaker_ids — not collapsed.
@@ -8851,7 +8851,7 @@ class TestMergeRegistryRelationsUnification:
         Regression: before _merge_registry_relations unification, the recon
         path used entities=[] which caused subject nodes to receive
         entity_type='concept' and no speaker_id attribute.  Graph-enrichment
-        then rooted enrichment facts at unattributed concept nodes (Speaker0
+        then rooted enrichment facts at unattributed concept nodes (speaker0
         vs Mara divergence).
         """
         from unittest.mock import patch
@@ -8869,17 +8869,17 @@ class TestMergeRegistryRelationsUnification:
             "graph1",
             {
                 "key": "graph1",
-                "subject": "Speaker0",
+                "subject": "speaker0",
                 "predicate": "works at",
                 "object": "Acme Corp",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "first_seen_cycle": 1,
             },
             register=True,
         )
         loop.store.set_bookkeeping(
             "graph1",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             first_seen_cycle=1,
             relation_type="factual",
         )
@@ -8895,8 +8895,8 @@ class TestMergeRegistryRelationsUnification:
 
         # The merged graph must have a node for the speaker subject.
         # §0 invariant (Step 2): speaker node keys are the casefolded speaker_id.
-        # GraphMerger._resolve_entity returns canonical_speaker(entity.speaker_id).
-        node_key = "speaker0"  # casefolded: canonical_speaker("Speaker0") == "speaker0"
+        # GraphMerger._resolve_entity returns entity.speaker_id verbatim.
+        node_key = "speaker0"  # casefolded: "speaker0" IS the canonical form
         assert node_key in loop.merger.graph.nodes, (
             f"Speaker subject node {node_key!r} missing from merged graph after recon path; "
             f"nodes present: {list(loop.merger.graph.nodes)}"
@@ -8910,8 +8910,8 @@ class TestMergeRegistryRelationsUnification:
             "Regression: before _merge_registry_relations unification the recon path "
             "used entities=[], causing entity_type='concept' with no speaker_id."
         )
-        assert node_data.get("speaker_id") == "Speaker0", (
-            f"Recon path: expected speaker_id='Speaker0' (cased) in node attribute; "
+        assert node_data.get("speaker_id") == "speaker0", (
+            f"Recon path: expected speaker_id='speaker0' (cased) in node attribute; "
             f"got speaker_id={node_data.get('speaker_id')!r}. "
             "Regression: entity synthesis was not applied to the recon path."
         )
@@ -8936,12 +8936,12 @@ class TestMergeRegistryRelationsUnification:
 
         extra_relations = [
             Relation(
-                subject="Speaker1",
+                subject="speaker1",
                 predicate="lives in",
                 object="Berlin",
                 relation_type="factual",
                 confidence=1.0,
-                speaker_id="Speaker1",
+                speaker_id="speaker1",
             ),
         ]
 
@@ -8952,7 +8952,7 @@ class TestMergeRegistryRelationsUnification:
             loop._materialize_consolidation_graph(extra_relations=extra_relations)
 
         # §0 invariant (Step 2): speaker node keys are the casefolded speaker_id.
-        node_key = "speaker1"  # casefolded: canonical_speaker("Speaker1") == "speaker1"
+        node_key = "speaker1"  # casefolded: "speaker1" == "speaker1"
         assert node_key in loop.merger.graph.nodes, (
             f"Extra-relations path: speaker subject node {node_key!r} missing; "
             f"nodes: {list(loop.merger.graph.nodes)}"
@@ -8962,8 +8962,8 @@ class TestMergeRegistryRelationsUnification:
             f"Extra-relations path: expected entity_type='person'; "
             f"got {node_data.get('entity_type')!r}"
         )
-        assert node_data.get("speaker_id") == "Speaker1", (
-            f"Extra-relations path: expected speaker_id='Speaker1' (cased) in attribute; "
+        assert node_data.get("speaker_id") == "speaker1", (
+            f"Extra-relations path: expected speaker_id='speaker1' (cased) in attribute; "
             f"got {node_data.get('speaker_id')!r}"
         )
 
@@ -8985,7 +8985,7 @@ class TestMergeRegistryRelationsUnification:
 
         loop = self._make_loop(tmp_path)
 
-        # subject="Mara", speaker_id="Speaker0" → subject != speaker_id → no entity.
+        # subject="Mara", speaker_id="speaker0" → subject != speaker_id → no entity.
         extra_relations = [
             Relation(
                 subject="Mara",
@@ -8993,7 +8993,7 @@ class TestMergeRegistryRelationsUnification:
                 object="Acme Corp",
                 relation_type="factual",
                 confidence=1.0,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
             ),
         ]
 
@@ -9022,51 +9022,38 @@ class TestMergeRegistryRelationsUnification:
 
 
 # ---------------------------------------------------------------------------
-# B1 regression: _synth_speaker_entities with casefolded subject vs cased id
+# _synth_speaker_entities: lowercase-uniform plain == comparison
 # ---------------------------------------------------------------------------
 
 
 class TestSynthSpeakerEntitiesB1Regression:
-    """B1 regression: _synth_speaker_entities must emit a speaker Entity even
-    when Relation.subject is the casefolded node key (``"speaker0"``) and
-    Relation.speaker_id is the cased id (``"Speaker0"``).
+    """_synth_speaker_entities must emit a speaker Entity when subject == speaker_id.
 
-    Before the B1 fix: raw ``_r.subject == _r.speaker_id`` failed because
-    ``"speaker0" != "Speaker0"``, so no Entity was synthesized, causing the
-    dcf4189 regression (node has no speaker_id attribute, minted keys fall back
-    to speaker_id="").
-
-    After the fix: ``speaker_ref_matches(_r.subject, _r.speaker_id)`` =
-    ``canonical("speaker0") == canonical("Speaker0")`` = ``True``.
+    Under lowercase-uniform identity both subject and speaker_id are lowercase
+    speaker{N}, so plain == is the correct comparison.  The old bridging
+    function speaker_ref_matches is deleted; this class validates that the
+    new plain-== path is correct.
     """
 
-    def test_casefolded_subject_matches_cased_speaker_id(self):
-        """Build a Relation list as the enrichment path produces it — subject is
-        the casefolded node key ('speaker0'), speaker_id is cased ('Speaker0').
-        Assert _synth_speaker_entities emits exactly one speaker Entity.
-        """
+    def test_matching_lowercase_subject_and_speaker_id(self):
+        """Relation with subject == speaker_id (both lowercase) emits exactly one Entity."""
         import unittest.mock as mock
 
         from paramem.graph.schema import Relation
         from paramem.training.consolidation import ConsolidationLoop
 
-        # Construct a minimal ConsolidationLoop-like object with only the method
-        # we need (no model, no store needed for this unit test).
         loop = object.__new__(ConsolidationLoop)
-        # Patch required attrs so __init__ is not called.
         loop.__dict__["config"] = mock.MagicMock()
 
-        # Relation as enrichment path produces it:
-        # subject = casefolded node key "speaker0" (what _endpoint_str emits)
-        # speaker_id = cased system id "Speaker0" (from node attribute)
+        # Both subject and speaker_id are lowercase speaker{N} (canonical form).
         relations = [
             Relation(
-                subject="speaker0",  # casefolded node key
+                subject="speaker0",
                 predicate="works at",
                 object="Acme",
                 relation_type="factual",
                 confidence=1.0,
-                speaker_id="Speaker0",  # cased system id
+                speaker_id="speaker0",
             ),
         ]
 
@@ -9074,26 +9061,17 @@ class TestSynthSpeakerEntitiesB1Regression:
 
         assert len(entities) == 1, (
             f"Expected 1 speaker Entity, got {len(entities)}: {entities!r}. "
-            "B1 regression: speaker_ref_matches must be used, not raw ==."
+            "Plain == must work when both subject and speaker_id are lowercase."
         )
-        assert entities[0].speaker_id == "Speaker0"
+        assert entities[0].speaker_id == "speaker0"
+        assert entities[0].name == "speaker0"
 
-    def test_raw_equality_would_fail(self):
-        """Verify the PRE-FIX condition: raw == on casefolded subject vs cased id
-        returns False, which is why the B1 fix is necessary.
-        """
+    def test_plain_equality_is_correct(self):
+        """Confirm that plain == is sufficient under lowercase-uniform identity."""
         subject = "speaker0"
-        speaker_id = "Speaker0"
-        # Raw equality that the old code used — must be False.
-        assert (subject == speaker_id) is False, (
-            "Pre-fix condition: raw 'speaker0' == 'Speaker0' must be False "
-            "to confirm the B1 regression was real."
-        )
-        # The fix — canonical comparison must be True.
-        from paramem.graph.name_match import speaker_ref_matches
-
-        assert speaker_ref_matches(subject, speaker_id) is True, (
-            "Post-fix condition: speaker_ref_matches('speaker0', 'Speaker0') must be True."
+        speaker_id = "speaker0"
+        assert (subject == speaker_id) is True, (
+            "Under lowercase-uniform identity, plain == must be True."
         )
 
     def test_distinct_speaker_produces_no_spurious_entity(self):
@@ -9110,12 +9088,12 @@ class TestSynthSpeakerEntitiesB1Regression:
 
         relations = [
             Relation(
-                subject="speaker1",  # different speaker node key
+                subject="speaker1",  # different speaker — must NOT produce Entity
                 predicate="knows",
                 object="Acme",
                 relation_type="factual",
                 confidence=1.0,
-                speaker_id="Speaker0",  # mismatch — must NOT produce Entity
+                speaker_id="speaker0",  # mismatch — must NOT produce Entity
             ),
         ]
 
@@ -9149,8 +9127,8 @@ class TestResolveToNodeKeyP5:
 
         in_graph = lambda n: False  # noqa: E731
 
-        # canonical("Speaker0") == "speaker0" (casefolded)
-        assert resolve_to_node_key("Speaker0", in_graph) == "speaker0"
+        # canonical("speaker0") == "speaker0" (casefolded)
+        assert resolve_to_node_key("speaker0", in_graph) == "speaker0"
         # canonical("Tobias") == "tobias"
         assert resolve_to_node_key("Tobias", in_graph) == "tobias"
 
@@ -9161,8 +9139,8 @@ class TestResolveToNodeKeyP5:
         in_graph = lambda n: False  # noqa: E731
         coref_map = {"speaker1": "speaker0"}  # speaker1 merged into speaker0
 
-        result = resolve_to_node_key("Speaker1", in_graph, coref_map)
-        # canonical("Speaker1") == "speaker1", then follows chain → "speaker0"
+        result = resolve_to_node_key("speaker1", in_graph, coref_map)
+        # canonical("speaker1") == "speaker1", then follows chain → "speaker0"
         assert result == "speaker0"
 
     def test_coref_chain_cycle_guarded(self):
@@ -9272,16 +9250,16 @@ class TestW1SameAsGuard:
         # Seed a speaker node (casefolded key "speaker0").
         loop.merger.merge(
             SessionGraph(
-                session_id="seed-Speaker0",
+                session_id="seed-speaker0",
                 timestamp="2026-01-01T00:00:00Z",
-                entities=[Entity(name="Alex", entity_type="person", speaker_id="Speaker0")],
+                entities=[Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
                 relations=[],
             )
         )
         return loop
 
     def test_speaker_id_casing_pair_is_skipped(self, tmp_path, monkeypatch):
-        """SOTA same_as ['Speaker0', 'speaker0'] must not contract the speaker node.
+        """SOTA same_as ['speaker0', 'speaker0'] must not contract the speaker node.
 
         Drives the real _run_graph_enrichment production path with a mocked SOTA
         response.  Asserts that after processing the casing-variant pair:
@@ -9302,7 +9280,7 @@ class TestW1SameAsGuard:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.consolidation._graph_enrich_with_sota",
-            return_value=([], [["Speaker0", "speaker0"]], "raw"),
+            return_value=([], [["speaker0", "speaker0"]], "raw"),
         ):
             result = loop._run_graph_enrichment()
 
@@ -9322,14 +9300,14 @@ class TestW1SameAsGuard:
         )
 
     def test_distinct_speaker_ids_are_not_merged(self, tmp_path, monkeypatch):
-        """SOTA same_as ['Speaker0', 'Speaker1'] must NOT merge distinct speakers.
+        """SOTA same_as ['speaker0', 'speaker1'] must NOT merge distinct speakers.
 
-        Drives the real _run_graph_enrichment production path.  Speaker0 and
-        Speaker1 are distinct enrollments; a SOTA same_as proposal must be
+        Drives the real _run_graph_enrichment production path.  speaker0 and
+        speaker1 are distinct enrollments; a SOTA same_as proposal must be
         blocked by the generalized W1 guard (both surfaces are speaker ids).
 
         This test is load-bearing: without the W1 guard,
-        ``_safe_to_merge_surface("Speaker0", "Speaker1")`` returns True (JW
+        ``_safe_to_merge_surface("speaker0", "speaker1")`` returns True (JW
         treats the digit as a typo, score ≈ 0.950) and the merger would
         contract speaker1 into speaker0 — catastrophic in a real 2-speaker
         deployment.
@@ -9346,9 +9324,9 @@ class TestW1SameAsGuard:
 
         loop.merger.merge(
             SessionGraph(
-                session_id="seed-Speaker1",
+                session_id="seed-speaker1",
                 timestamp="2026-01-01T00:00:00Z",
-                entities=[Entity(name="Robin", entity_type="person", speaker_id="Speaker1")],
+                entities=[Entity(name="Robin", entity_type="person", speaker_id="speaker1")],
                 relations=[],
             )
         )
@@ -9360,7 +9338,7 @@ class TestW1SameAsGuard:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
             "paramem.training.consolidation._graph_enrich_with_sota",
-            return_value=([], [["Speaker0", "Speaker1"]], "raw"),
+            return_value=([], [["speaker0", "speaker1"]], "raw"),
         ):
             result = loop._run_graph_enrichment()
 
@@ -9370,10 +9348,10 @@ class TestW1SameAsGuard:
         )
         # Both speaker nodes must remain distinct — no contraction occurred.
         assert "speaker0" in loop.merger.graph.nodes, (
-            "speaker0 must survive — W1 guard must block the Speaker0/Speaker1 merge"
+            "speaker0 must survive — W1 guard must block the speaker0/speaker1 merge"
         )
         assert "speaker1" in loop.merger.graph.nodes, (
-            "speaker1 must survive — W1 guard must block the Speaker0/Speaker1 merge"
+            "speaker1 must survive — W1 guard must block the speaker0/speaker1 merge"
         )
         assert loop.merger.graph.number_of_nodes() == node_count_before, (
             "Graph node count must not change after a W1-guarded speaker same_as pair"

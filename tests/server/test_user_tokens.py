@@ -72,17 +72,17 @@ class TestMintLookupRoundtrip:
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
 
-        token = store.mint("Speaker0", "Test Device")
+        token = store.mint("speaker0", "Test Device")
 
         assert isinstance(token, str)
         assert len(token) > 20
-        assert store.lookup(token) == "Speaker0"
+        assert store.lookup(token) == "speaker0"
 
     def test_unknown_token_returns_none(self, tmp_path, monkeypatch, store_path):
         """Lookup of a token that was never minted returns None."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "Device A")
+        store.mint("speaker0", "Device A")
 
         result = store.lookup("completely-unknown-token-value")
 
@@ -93,11 +93,11 @@ class TestMintLookupRoundtrip:
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
 
-        t1 = store.mint("Speaker0", "iPad")
-        t2 = store.mint("Speaker1", "Desktop")
+        t1 = store.mint("speaker0", "iPad")
+        t2 = store.mint("speaker1", "Desktop")
 
-        assert store.lookup(t1) == "Speaker0"
-        assert store.lookup(t2) == "Speaker1"
+        assert store.lookup(t1) == "speaker0"
+        assert store.lookup(t2) == "speaker1"
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ class TestRevoke:
         """revoke_token() on a valid token makes lookup return None."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Device A")
+        token = store.mint("speaker0", "Device A")
 
         found = store.revoke_token(token)
 
@@ -122,23 +122,23 @@ class TestRevoke:
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
 
-        t1 = store.mint("Speaker0", "iPad")
-        t2 = store.mint("Speaker0", "Phone")
-        t_other = store.mint("Speaker1", "Other device")
+        t1 = store.mint("speaker0", "iPad")
+        t2 = store.mint("speaker0", "Phone")
+        t_other = store.mint("speaker1", "Other device")
 
-        count = store.revoke_speaker("Speaker0")
+        count = store.revoke_speaker("speaker0")
 
         assert count == 2
         assert store.lookup(t1) is None
         assert store.lookup(t2) is None
         # Other speaker's token unaffected.
-        assert store.lookup(t_other) == "Speaker1"
+        assert store.lookup(t_other) == "speaker1"
 
     def test_revoke_token_unknown_returns_false(self, tmp_path, monkeypatch, store_path):
         """revoke_token() with an unknown token returns False."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
 
         found = store.revoke_token("no-such-token-value")
 
@@ -148,9 +148,9 @@ class TestRevoke:
         """revoke_speaker() with an unknown speaker_id returns 0."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
 
-        count = store.revoke_speaker("Speaker99")
+        count = store.revoke_speaker("speaker99")
 
         assert count == 0
 
@@ -158,7 +158,7 @@ class TestRevoke:
         """revoke_token() on an already-revoked token returns False (idempotent)."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Device")
+        token = store.mint("speaker0", "Device")
         store.revoke_token(token)
 
         found = store.revoke_token(token)
@@ -171,10 +171,10 @@ class TestRevoke:
         """revoke_speaker() when all tokens already revoked returns 0 (idempotent)."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "Device")
-        store.revoke_speaker("Speaker0")
+        store.mint("speaker0", "Device")
+        store.revoke_speaker("speaker0")
 
-        count = store.revoke_speaker("Speaker0")
+        count = store.revoke_speaker("speaker0")
 
         assert count == 0
 
@@ -182,22 +182,22 @@ class TestRevoke:
         """revoke_label() revokes all non-revoked tokens with that exact label."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        t_phone0 = store.mint("Speaker0", "phone")
-        t_phone1 = store.mint("Speaker1", "phone")
-        t_tablet = store.mint("Speaker0", "tablet")
+        t_phone0 = store.mint("speaker0", "phone")
+        t_phone1 = store.mint("speaker1", "phone")
+        t_tablet = store.mint("speaker0", "tablet")
 
         count = store.revoke_label("phone")
 
         assert count == 2
         assert store.lookup(t_phone0) is None
         assert store.lookup(t_phone1) is None
-        assert store.lookup(t_tablet) == "Speaker0"
+        assert store.lookup(t_tablet) == "speaker0"
 
     def test_revoke_label_unknown_returns_zero(self, tmp_path, monkeypatch, store_path):
         """revoke_label() with an unknown label returns 0."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "tablet")
+        store.mint("speaker0", "tablet")
 
         count = store.revoke_label("no-such-label")
 
@@ -207,7 +207,7 @@ class TestRevoke:
         """revoke_label() on an already-revoked label returns 0 (idempotent)."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "phone")
+        store.mint("speaker0", "phone")
         store.revoke_label("phone")
 
         count = store.revoke_label("phone")
@@ -225,13 +225,13 @@ class TestList:
         """list() returns entries with the four public fields."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "My iPad")
+        store.mint("speaker0", "My iPad")
 
         entries = store.list()
 
         assert len(entries) == 1
         entry = entries[0]
-        assert entry["speaker_id"] == "Speaker0"
+        assert entry["speaker_id"] == "speaker0"
         assert entry["label"] == "My iPad"
         assert "created" in entry
         assert entry["revoked"] is False
@@ -240,7 +240,7 @@ class TestList:
         """list() output must not contain the sha256 key or plaintext token."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Device")
+        token = store.mint("speaker0", "Device")
 
         entries = store.list()
 
@@ -256,7 +256,7 @@ class TestList:
         """list() marks revoked entries with revoked=True."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Device")
+        token = store.mint("speaker0", "Device")
         store.revoke_token(token)
 
         entries = store.list()
@@ -279,14 +279,14 @@ class TestHasActiveTokens:
     def test_true_after_mint(self, tmp_path, monkeypatch, store_path):
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
         assert store.has_active_tokens() is True
 
     def test_false_after_all_revoked(self, tmp_path, monkeypatch, store_path):
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "Device")
-        store.revoke_speaker("Speaker0")
+        store.mint("speaker0", "Device")
+        store.revoke_speaker("speaker0")
         assert store.has_active_tokens() is False
 
 
@@ -300,7 +300,7 @@ class TestOnDiskSecurity:
         """The plaintext token must never appear in the on-disk file bytes."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Device")
+        token = store.mint("speaker0", "Device")
 
         disk_bytes = store_path.read_bytes()
 
@@ -312,7 +312,7 @@ class TestOnDiskSecurity:
 
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
 
         disk_bytes = store_path.read_bytes()
 
@@ -334,7 +334,7 @@ class TestOnDiskSecurity:
 
         store = UserTokenStore(store_path)
         # mint() must not raise in Security OFF mode.
-        token = store.mint("Speaker0", "TestDevice")
+        token = store.mint("speaker0", "TestDevice")
 
         assert store_path.exists(), "store file must exist after mint"
 
@@ -367,11 +367,11 @@ class TestOnDiskSecurity:
         """A minted token survives store teardown and reload."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Device")
+        token = store.mint("speaker0", "Device")
 
         store2 = UserTokenStore(store_path)
 
-        assert store2.lookup(token) == "Speaker0"
+        assert store2.lookup(token) == "speaker0"
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +389,7 @@ class TestScope:
         """mint(..., scope='admin') → resolve() returns scope 'admin'."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Admin Device", scope="admin")
+        token = store.mint("speaker0", "Admin Device", scope="admin")
 
         result = store.resolve(token)
         assert result is not None
@@ -400,7 +400,7 @@ class TestScope:
         """mint() with default scope → resolve() returns scope 'chat'."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Phone")
+        token = store.mint("speaker0", "Phone")
 
         result = store.resolve(token)
         assert result is not None
@@ -413,7 +413,7 @@ class TestScope:
 
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "OldDevice")
+        token = store.mint("speaker0", "OldDevice")
 
         # Directly strip the scope field from the on-disk JSON to simulate a
         # Phase-1 record minted before the scope field existed.
@@ -464,14 +464,14 @@ class TestScope:
         store = UserTokenStore(store_path)
 
         with pytest.raises(ValueError, match="Invalid scope"):
-            store.mint("Speaker0", "Device", scope="bogus")
+            store.mint("speaker0", "Device", scope="bogus")
 
     def test_list_includes_scope(self, tmp_path, monkeypatch, store_path):
         """list() entries include a 'scope' key."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "Admin iPad", scope="admin")
-        store.mint("Speaker1", "Chat Phone", scope="chat")
+        store.mint("speaker0", "Admin iPad", scope="admin")
+        store.mint("speaker1", "Chat Phone", scope="chat")
 
         entries = store.list()
         assert len(entries) == 2
@@ -484,7 +484,7 @@ class TestScope:
 
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        store.mint("Speaker0", "OldDevice")
+        store.mint("speaker0", "OldDevice")
 
         from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
 
@@ -522,10 +522,10 @@ class TestScope:
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
         unattributed_token = store.mint(None, "Shared Device")
-        attributed_token = store.mint("Speaker0", "Personal Phone")
+        attributed_token = store.mint("speaker0", "Personal Phone")
 
-        # Revoke Speaker0 — should NOT revoke the unattributed token.
-        count = store.revoke_speaker("Speaker0")
+        # Revoke speaker0 — should NOT revoke the unattributed token.
+        count = store.revoke_speaker("speaker0")
         assert count == 1
         # The unattributed token remains valid.
         result = store.resolve(unattributed_token)
@@ -566,7 +566,7 @@ class TestLiveReload:
         # store_b is loaded before any mint — empty.
         store_b = UserTokenStore(store_path)
 
-        token = store_a.mint("Speaker0", "New Device")
+        token = store_a.mint("speaker0", "New Device")
 
         # Ensure the mtime actually advanced by at least 1 ns.
         # On most filesystems write_infra_bytes does an atomic replace so
@@ -593,7 +593,7 @@ class TestLiveReload:
 
         _setup_daily(tmp_path, monkeypatch)
         store_a = UserTokenStore(store_path)
-        token = store_a.mint("Speaker0", "Device")
+        token = store_a.mint("speaker0", "Device")
 
         store_b = UserTokenStore(store_path)
         # Both stores currently see the token.
@@ -616,7 +616,7 @@ class TestLiveReload:
         is NOT a reload (verify _mtime matches disk after _save)."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Device")
+        token = store.mint("speaker0", "Device")
 
         # _mtime should equal the current disk mtime (no spurious reload).
         disk_mtime = store._current_mtime()
@@ -632,7 +632,7 @@ class TestLiveReload:
         """If the store file disappears, _maybe_reload is a no-op and RAM state is kept."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
-        token = store.mint("Speaker0", "Device")
+        token = store.mint("speaker0", "Device")
 
         # Delete the file.
         store_path.unlink()
@@ -669,7 +669,7 @@ class TestToctouClearsMemory:
 
         with patch("paramem.server.user_tokens.write_infra_bytes", side_effect=_plaintext_write):
             with pytest.raises(RuntimeError, match="written in plaintext"):
-                store.mint("Speaker0", "TestDevice")
+                store.mint("speaker0", "TestDevice")
 
         # After the guard fires, in-memory state must be cleared — the minted
         # token must not authenticate even though it was inserted into _tokens
@@ -689,16 +689,16 @@ class TestMintSpeakerIdValidation:
     """mint() raises ValueError on a non-canonical speaker_id (strict enforcement).
 
     The invariant is absolute: every attributed token MUST reference a
-    canonical ``Speaker{N}`` id.  A non-conforming non-None id raises
+    canonical ``speaker{N}`` id.  A non-conforming non-None id raises
     ``ValueError`` — no warn-and-allow path exists.
     """
 
     def test_mint_raises_on_non_speaker_id(self, tmp_path, monkeypatch, store_path):
-        """mint() raises ValueError when speaker_id is a non-Speaker{N} string."""
+        """mint() raises ValueError when speaker_id is a non-speaker{N} string."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
 
-        with pytest.raises(ValueError, match="Speaker{N}"):
+        with pytest.raises(ValueError, match="speaker{N}"):
             store.mint("legacyuuid12", "Legacy Device")
 
         # No token must have been stored — the store stays clean.
@@ -717,10 +717,106 @@ class TestMintSpeakerIdValidation:
         assert speaker_id is None
 
     def test_mint_canonical_speaker_id_succeeds(self, tmp_path, monkeypatch, store_path):
-        """mint('Speaker0', ...) succeeds — Speaker{N} is the canonical form."""
+        """mint('speaker0', ...) succeeds — speaker{N} is the canonical form."""
         _setup_daily(tmp_path, monkeypatch)
         store = UserTokenStore(store_path)
 
-        token = store.mint("Speaker0", "My Device")
+        token = store.mint("speaker0", "My Device")
         assert token is not None
-        assert store.lookup(token) == "Speaker0"
+        assert store.lookup(token) == "speaker0"
+
+
+# ---------------------------------------------------------------------------
+# v1 → v2 migration (rekey speaker_id to lowercase)
+# ---------------------------------------------------------------------------
+
+
+class TestTokenStoreMigrationV1ToV2:
+    """v1 → v2 migration: speaker_id values must be lowercased on load.
+
+    Uses a synthetic v1 fixture written directly to disk (bypasses _save so
+    no encryption is needed — the file is plaintext for simplicity, matching
+    the Security OFF mode that unit tests run under).
+    """
+
+    def test_v1_cased_speaker_id_lowercased_on_load(self, tmp_path):
+        """A v1 store with cased 'Speaker0' speaker_id is lowercased to 'speaker0' on load."""
+        import json
+
+        store_path = tmp_path / "tokens.json"
+        # Synthesize a v1 on-disk payload with cased Speaker0.
+        fake_hash = "a" * 64  # dummy sha256hex key
+        v1_payload = {
+            "version": 1,
+            "tokens": {
+                fake_hash: {
+                    "speaker_id": "Speaker0",
+                    "label": "Test Device",
+                    "created": "2026-01-01T00:00:00+00:00",
+                    "revoked": False,
+                    "scope": "chat",
+                }
+            },
+        }
+        store_path.write_text(json.dumps(v1_payload))
+
+        store = UserTokenStore(store_path)
+
+        # After load+migration, the token's speaker_id must be lowercase.
+        entry = store._tokens.get(fake_hash)
+        assert entry is not None, "Token must survive migration"
+        assert entry["speaker_id"] == "speaker0", (
+            f"v1→v2 migration: expected 'speaker0', got {entry['speaker_id']!r}"
+        )
+
+    def test_v1_none_speaker_id_unchanged(self, tmp_path):
+        """A v1 store with speaker_id=None passes through unchanged (unattributed token)."""
+        import json
+
+        store_path = tmp_path / "tokens.json"
+        fake_hash = "b" * 64
+        v1_payload = {
+            "version": 1,
+            "tokens": {
+                fake_hash: {
+                    "speaker_id": None,
+                    "label": "Shared Device",
+                    "created": "2026-01-01T00:00:00+00:00",
+                    "revoked": False,
+                    "scope": "chat",
+                }
+            },
+        }
+        store_path.write_text(json.dumps(v1_payload))
+
+        store = UserTokenStore(store_path)
+
+        entry = store._tokens.get(fake_hash)
+        assert entry is not None
+        assert entry["speaker_id"] is None, "None speaker_id must not be altered by migration"
+
+    def test_v2_store_not_re_migrated(self, tmp_path):
+        """A v2 store already has lowercase ids — migration must not run again."""
+        import json
+
+        store_path = tmp_path / "tokens.json"
+        fake_hash = "c" * 64
+        v2_payload = {
+            "version": 2,
+            "tokens": {
+                fake_hash: {
+                    "speaker_id": "speaker0",
+                    "label": "Device",
+                    "created": "2026-01-01T00:00:00+00:00",
+                    "revoked": False,
+                    "scope": "chat",
+                }
+            },
+        }
+        store_path.write_text(json.dumps(v2_payload))
+
+        store = UserTokenStore(store_path)
+
+        entry = store._tokens.get(fake_hash)
+        assert entry is not None
+        assert entry["speaker_id"] == "speaker0"

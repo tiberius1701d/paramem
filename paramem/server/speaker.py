@@ -3,12 +3,12 @@
 Speaker identity = voice embedding (authenticator) + display name (label).
 Multiple speakers can share the same name — each gets a unique internal ID.
 
-Profiles stored as JSON with canonical ``Speaker{N}`` speaker IDs (monotonic
-counter, persisted as ``next_anon_index``). Each profile holds multiple
-embeddings (from different utterances and devices). Matching uses the
+Profiles stored as JSON with canonical lowercase ``speaker{N}`` speaker IDs
+(monotonic counter, persisted as ``next_anon_index``). Each profile holds
+multiple embeddings (from different utterances and devices). Matching uses the
 L2-normalized centroid for robustness.
 
-{"speakers": {"Speaker0": {"name": "Alex", "embeddings": [[0.1, ...], ...]}}, "version": 5}
+{"speakers": {"speaker0": {"name": "Alex", "embeddings": [[0.1, ...], ...]}}, "version": 6}
 
 Embedding computation happens externally (Wyoming STT wrapper) —
 this module only stores and matches pre-computed embeddings.
@@ -23,10 +23,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
+from paramem.graph.name_match import is_speaker_id
 
 logger = logging.getLogger(__name__)
 
-_PROFILE_VERSION = 5
+_PROFILE_VERSION = 6
 
 
 @dataclass
@@ -79,9 +80,9 @@ def compute_centroid(embeddings: list[list[float]]) -> list[float]:
 class SpeakerStore:
     """Persistent store for speaker voice profiles.
 
-    Each profile is keyed by a canonical ``Speaker{N}`` id allocated by a
-    shared monotonic counter (``_next_anon_index``, persisted across reloads).
-    Profiles store multiple embeddings — matching uses the centroid.
+    Each profile is keyed by a canonical lowercase ``speaker{N}`` id allocated
+    by a shared monotonic counter (``_next_anon_index``, persisted across
+    reloads).  Profiles store multiple embeddings — matching uses the centroid.
     New embeddings are added on confirmed matches to strengthen the profile.
     """
 
@@ -125,35 +126,68 @@ class SpeakerStore:
 
         if version >= _PROFILE_VERSION:
             self._profiles = data.get("speakers", {})
+        elif version == 5:
+            # v5 → v6: re-key profile dict and last_greeted dict from cased
+            # Speaker{N} keys to lowercase speaker{N} keys.  Voice embeddings
+            # and display names are VALUE data — only the dict keys change.
+            # _rebuild_centroids() called at the end of _load rekeys _centroids
+            # transitively because it iterates self._profiles.items().
+            legacy = data.get("speakers", {})
+            self._profiles = {k.lower() if is_speaker_id(k) else k: v for k, v in legacy.items()}
+            self._last_greeted = {
+                k.lower() if is_speaker_id(k) else k: v for k, v in self._last_greeted.items()
+            }
+            logger.info(
+                "Migrated speaker store v5 → v6 (%d profiles, lowercase keys)",
+                len(self._profiles),
+            )
+            self._save()
         elif version == 4:
-            # v4 → v5: add next_anon_index field (defaulted to 0 above)
-            self._profiles = data.get("speakers", {})
-            logger.info("Migrated speaker store v4 → v5 (anonymous index)")
+            # v4 → v6: add next_anon_index field (defaulted to 0 above);
+            # also lowercase-rekey any cased Speaker{N} keys so they are not
+            # persisted as v6 with cased keys (v5→v6 branch fires only for
+            # version==5; v4 saves as v6 directly via _save()).
+            legacy = data.get("speakers", {})
+            self._profiles = {k.lower() if is_speaker_id(k) else k: v for k, v in legacy.items()}
+            self._last_greeted = {
+                k.lower() if is_speaker_id(k) else k: v for k, v in self._last_greeted.items()
+            }
+            logger.info("Migrated speaker store v4 → v6 (anonymous index, lowercase keys)")
             self._save()
         elif version == 3:
-            # v3 → v5: add preferred_language + next_anon_index fields
-            self._profiles = data.get("speakers", {})
+            # v3 → v6: add preferred_language + next_anon_index fields;
+            # also lowercase-rekey any cased Speaker{N} keys.
+            legacy = data.get("speakers", {})
+            self._profiles = {k.lower() if is_speaker_id(k) else k: v for k, v in legacy.items()}
             for profile in self._profiles.values():
                 profile.setdefault("preferred_language", "")
+            self._last_greeted = {
+                k.lower() if is_speaker_id(k) else k: v for k, v in self._last_greeted.items()
+            }
             if self._profiles:
                 logger.info(
-                    "Migrated %d v3 profiles to v5 (language, anonymous index)",
+                    "Migrated %d v3 profiles to v6 (language, anonymous index, lowercase keys)",
                     len(self._profiles),
                 )
                 self._save()
         elif version == 2:
-            # v2 → v5: single "embedding" → list "embeddings" + preferred_language
+            # v2 → v6: single "embedding" → list "embeddings" + preferred_language;
+            # also lowercase-rekey any cased Speaker{N} keys.
             legacy = data.get("speakers", {})
             self._profiles = {}
             for speaker_id, profile in legacy.items():
                 emb = profile.get("embedding", [])
-                self._profiles[speaker_id] = {
+                norm_key = speaker_id.lower() if is_speaker_id(speaker_id) else speaker_id
+                self._profiles[norm_key] = {
                     "name": profile["name"],
                     "embeddings": [emb] if emb else [],
                     "preferred_language": "",
                 }
+            self._last_greeted = {
+                k.lower() if is_speaker_id(k) else k: v for k, v in self._last_greeted.items()
+            }
             if self._profiles:
-                logger.info("Migrated %d v2 profiles to v5", len(self._profiles))
+                logger.info("Migrated %d v2 profiles to v6 (lowercase keys)", len(self._profiles))
                 self._save()
         else:
             # v1 → v5: name-keyed → Speaker{N}-keyed + multi-embedding + preferred_language
@@ -372,15 +406,19 @@ class SpeakerStore:
         return True
 
     def _mint_anon_speaker_id(self) -> str:
-        """Allocate the next canonical ``Speaker{N}`` id and advance the counter.
+        """Allocate the next canonical lowercase ``speaker{N}`` id and advance the counter.
 
         The counter is shared across BOTH named and anonymous enrollments — it
         is a monotonic allocator, not an anonymous-only count.  Counter monotonicity
         guarantees uniqueness, so no collision-guard loop is needed.
 
+        The id is always lowercase (``"speaker0"``, ``"speaker1"``, …) — the
+        canonical form for speaker node keys, profile keys, token ``speaker_id``
+        values, and training subjects.
+
         Caller MUST hold ``self._lock`` (counter mutation is not atomic).
         """
-        speaker_id = f"Speaker{self._next_anon_index}"
+        speaker_id = f"speaker{self._next_anon_index}"
         self._next_anon_index += 1
         return speaker_id
 
@@ -463,10 +501,10 @@ class SpeakerStore:
     def register_anonymous(self, embedding: list[float]) -> str:
         """Register or retrieve a canonical anonymous speaker ID for a voice embedding.
 
-        Promotes an unrecognized-voice speaker to a stable ``Speaker{N}`` identifier
-        so their sessions flow through extraction, graph storage, and adapter training.
-        The ``Speaker{N}`` format uses BPE-stable tokens matching the proven ``graph{N}``
-        indexed-key convention.
+        Promotes an unrecognized-voice speaker to a stable lowercase ``speaker{N}``
+        identifier so their sessions flow through extraction, graph storage, and
+        adapter training.  The ``speaker{N}`` format uses BPE-stable tokens matching
+        the proven ``graph{N}`` indexed-key convention.
 
         Algorithm:
         1. Call ``match(embedding)``: if a high-confidence (non-tentative) hit exists,
@@ -482,7 +520,7 @@ class SpeakerStore:
             embedding: L2-normalized voice embedding from STT.
 
         Returns:
-            Canonical speaker_id string (e.g. ``"Speaker0"``).
+            Canonical speaker_id string (e.g. ``"speaker0"``).
 
         Raises:
             Exception: Only if the underlying ``_save`` fails (disk full, permissions).
@@ -575,7 +613,7 @@ class SpeakerStore:
         guarded a non-raising dict lookup.
 
         Args:
-            speaker_id: The speaker's system id (e.g. ``"Speaker0"``).
+            speaker_id: The speaker's system id (e.g. ``"speaker0"``).
 
         Returns:
             Display name string when known and not anonymous; ``None`` otherwise.
@@ -590,9 +628,9 @@ class SpeakerStore:
     def is_anonymous(self, speaker_id: str | None) -> bool:
         """True if the profile is voice-promoted but not yet name-disclosed.
 
-        Anonymous profiles carry the canonical ``Speaker{N}`` form as both ID
-        and ``name`` — it is an internal handle, not a salutation. Callers
-        constructing user-facing text (greeting prefix, system-prompt
+        Anonymous profiles carry the canonical lowercase ``speaker{N}`` form as
+        both ID and ``name`` — it is an internal handle, not a salutation.
+        Callers constructing user-facing text (greeting prefix, system-prompt
         ``"You are speaking with X"`` strings) consult this to suppress the
         canonical token until self-introduction is processed.
         """
@@ -642,6 +680,31 @@ class SpeakerStore:
     @property
     def profile_count(self) -> int:
         return len(self._profiles)
+
+    def household_display_names(self) -> list[str]:
+        """Display names of non-anonymous household profiles.
+
+        Returns the ``name`` field for every profile whose ``enroll_method``
+        is NOT ``"anonymous_voice"``.  Anonymous profiles carry the canonical
+        ``speaker{N}`` id as their name — an internal token, not a salutation —
+        and are deliberately excluded so the sanitizer does not treat opaque
+        ids as personal referents.
+
+        Used by the inference layer to extend ``known_entities`` so that
+        enrolled household members' names are always recognised as personal
+        content by the cloud sanitizer, even after the id-as-subject refactor
+        moved display names out of the registry subjects.
+
+        Returns:
+            List of non-empty display name strings (may be empty when all
+            profiles are anonymous or the store has no profiles).
+        """
+        with self._lock:
+            return [
+                p["name"]
+                for p in self._profiles.values()
+                if p.get("enroll_method") != "anonymous_voice" and p.get("name")
+            ]
 
     @property
     def speaker_names(self) -> list[str]:

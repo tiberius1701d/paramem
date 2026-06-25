@@ -144,7 +144,7 @@ def test_list_profiles_legacy_default_method(store, sample_embedding):
 def test_enroll_and_exact_match(store, sample_embedding):
     speaker_id = store.enroll("Alice", sample_embedding)
     assert speaker_id is not None
-    assert speaker_id == "Speaker0"  # first enroll into empty store gets Speaker0
+    assert speaker_id == "speaker0"  # first enroll into empty store gets speaker0
     result = store.match(sample_embedding)
     assert result.speaker_id == speaker_id
     assert result.name == "Alice"
@@ -303,7 +303,7 @@ class TestResolveSpeakerName:
 
     def test_unknown_speaker_id_returns_none(self, tmp_path):
         store = SpeakerStore(tmp_path / "profiles.json")
-        assert store.resolve_speaker_name("Speaker99") is None
+        assert store.resolve_speaker_name("speaker99") is None
 
     def test_anonymous_profile_returns_none(self, tmp_path, sample_embedding):
         """Anonymous profiles must NOT surface their speaker_id as a display name."""
@@ -323,7 +323,7 @@ class TestResolveSpeakerName:
         store = SpeakerStore(tmp_path / "profiles.json")
         # None-like inputs, missing keys, empty string — all return None safely.
         assert store.resolve_speaker_name("nonexistent") is None
-        assert store.resolve_speaker_name("Speaker0") is None
+        assert store.resolve_speaker_name("speaker0") is None
         assert store.resolve_speaker_name("") is None
 
 
@@ -357,7 +357,7 @@ def test_file_created_on_first_enroll(tmp_path, sample_embedding):
     store.enroll("Alice", sample_embedding)
     assert path.exists()
     data = json.loads(path.read_text())
-    assert data["version"] == 5
+    assert data["version"] == 6
     assert len(data["speakers"]) == 1
     profile = list(data["speakers"].values())[0]
     assert "embeddings" in profile
@@ -365,7 +365,7 @@ def test_file_created_on_first_enroll(tmp_path, sample_embedding):
 
 
 def test_legacy_v1_migration(tmp_path, sample_embedding):
-    """Legacy v1 name-keyed format is auto-migrated to v5 with Speaker{N} ids."""
+    """Legacy v1 name-keyed format is auto-migrated to v6 with speaker{N} ids."""
     path = tmp_path / "profiles.json"
     legacy_data = {"speakers": {"Alice": sample_embedding}}
     path.write_text(json.dumps(legacy_data))
@@ -377,15 +377,15 @@ def test_legacy_v1_migration(tmp_path, sample_embedding):
 
     result = store.match(sample_embedding)
     assert result.name == "Alice"
-    assert result.speaker_id == "Speaker0"
+    assert result.speaker_id == "speaker0"
 
     data = json.loads(path.read_text())
-    assert data["version"] == 5
+    assert data["version"] == 6
     assert all("name" in v and "embeddings" in v for v in data["speakers"].values())
 
 
 def test_legacy_v2_migration(tmp_path, sample_embedding):
-    """v2 single-embedding format is auto-migrated to v5 multi-embedding."""
+    """v2 single-embedding format is auto-migrated to v6 multi-embedding."""
     path = tmp_path / "profiles.json"
     v2_data = {
         "speakers": {"abc12345": {"name": "Alice", "embedding": sample_embedding}},
@@ -402,11 +402,62 @@ def test_legacy_v2_migration(tmp_path, sample_embedding):
     assert result.speaker_id == "abc12345"
 
     data = json.loads(path.read_text())
-    assert data["version"] == 5
+    assert data["version"] == 6
     profile = data["speakers"]["abc12345"]
     assert "embeddings" in profile
     assert "embedding" not in profile
     assert len(profile["embeddings"]) == 1
+
+
+def test_legacy_v3_migration_lowercases_speaker_keys(tmp_path, sample_embedding):
+    """v3 store with cased 'Speaker0' key is rekeyed to lowercase 'speaker0' on load.
+
+    v3/v4 migrations call _save() which writes _PROFILE_VERSION=6; the v5→v6
+    rekey branch only fires for version==5 stores.  The fix applies the same
+    lowercase rekey in the v3 branch so no cased Speaker{N} key reaches v6.
+    """
+    import json
+
+    path = tmp_path / "profiles.json"
+    v3_payload = {
+        "version": 3,
+        "next_anon_index": 1,
+        "last_greeted": {"Speaker0": "2026-01-01T00:00:00+00:00"},
+        "speakers": {
+            "Speaker0": {
+                "name": "Alice",
+                "embeddings": [sample_embedding],
+                "preferred_language": "en",
+            },
+        },
+    }
+    path.write_text(json.dumps(v3_payload))
+
+    from paramem.server.speaker import SpeakerStore
+
+    store = SpeakerStore(path)
+
+    # Profile key must be lowercase after migration.
+    assert "speaker0" in store._profiles, (
+        f"Expected 'speaker0' key after v3→v6 migration; keys: {list(store._profiles)}"
+    )
+    assert "Speaker0" not in store._profiles
+
+    # Embeddings are value data — must survive unchanged.
+    assert store._profiles["speaker0"]["embeddings"] == [sample_embedding]
+    assert store._profiles["speaker0"]["name"] == "Alice"
+
+    # last_greeted key must also be lowercased.
+    assert "speaker0" in store._last_greeted, (
+        f"Expected 'speaker0' in last_greeted; keys: {list(store._last_greeted)}"
+    )
+    assert "Speaker0" not in store._last_greeted
+
+    # Disk must be written as v6 with lowercase keys.
+    data = json.loads(path.read_text())
+    assert data["version"] == 6
+    assert "speaker0" in data["speakers"]
+    assert "Speaker0" not in data["speakers"]
 
 
 # --- Multi-embedding / centroid ---
@@ -657,10 +708,10 @@ class TestRegisterAnonymous:
     """Tests for SpeakerStore.register_anonymous."""
 
     def test_first_registration_returns_speaker0(self, tmp_path, sample_embedding):
-        """First unrecognized voice gets Speaker0."""
+        """First unrecognized voice gets speaker0."""
         store = SpeakerStore(tmp_path / "profiles.json")
         anon_id = store.register_anonymous(sample_embedding)
-        assert anon_id == "Speaker0"
+        assert anon_id == "speaker0"
 
     def test_second_distinct_embedding_gets_speaker1(
         self, tmp_path, sample_embedding, different_embedding
@@ -669,8 +720,8 @@ class TestRegisterAnonymous:
         store = SpeakerStore(tmp_path / "profiles.json")
         id0 = store.register_anonymous(sample_embedding)
         id1 = store.register_anonymous(different_embedding)
-        assert id0 == "Speaker0"
-        assert id1 == "Speaker1"
+        assert id0 == "speaker0"
+        assert id1 == "speaker1"
 
     def test_same_embedding_returns_same_id(self, tmp_path, sample_embedding):
         """Re-registering the same embedding is idempotent (centroid match)."""
@@ -699,20 +750,20 @@ class TestRegisterAnonymous:
         store2_strict = SpeakerStore(path, high_threshold=0.90, low_threshold=0.80)
         emb3 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
         id_new = store2_strict.register_anonymous(emb3)
-        assert id_new == "Speaker2"
+        assert id_new == "speaker2"
 
-    def test_disk_has_version5_and_next_anon_index(self, tmp_path, sample_embedding):
-        """JSON on disk has version: 5 and next_anon_index field after registration."""
+    def test_disk_has_version6_and_next_anon_index(self, tmp_path, sample_embedding):
+        """JSON on disk has version: 6 and next_anon_index field after registration."""
         path = tmp_path / "profiles.json"
         store = SpeakerStore(path)
         store.register_anonymous(sample_embedding)
         data = json.loads(path.read_text())
-        assert data["version"] == 5
+        assert data["version"] == 6
         assert "next_anon_index" in data
         assert data["next_anon_index"] == 1
 
     def test_v4_migration_sets_next_anon_index_zero(self, tmp_path, sample_embedding):
-        """Loading a v4-format file sets next_anon_index=0 and bumps version to 5."""
+        """Loading a v4-format file sets next_anon_index=0 and bumps version to 6."""
         path = tmp_path / "profiles.json"
         # Craft a valid v4 store.
         v4_data = {
@@ -732,9 +783,9 @@ class TestRegisterAnonymous:
         store = SpeakerStore(path)
         # Migration sets the counter to 0.
         assert store._next_anon_index == 0
-        # Disk is rewritten as v5 immediately on load.
+        # Disk is rewritten as v6 immediately on load.
         data = json.loads(path.read_text())
-        assert data["version"] == 5
+        assert data["version"] == 6
         assert data.get("next_anon_index") == 0
 
     def test_empty_embedding_raises(self, tmp_path):
@@ -813,19 +864,19 @@ class TestEnrollUpgradesAnonymous:
     """enroll() must upgrade anonymous Speaker{N} profiles rather than reject."""
 
     def test_enroll_after_register_anonymous_upgrades_profile(self, tmp_path, sample_embedding):
-        """After register_anonymous creates Speaker0, enrolling with the same voice
-        and a real name returns Speaker0 (not a new UUID), upgrades the name, and
+        """After register_anonymous creates speaker0, enrolling with the same voice
+        and a real name returns speaker0 (not a new UUID), upgrades the name, and
         sets enroll_method to the requested method.
         """
         store = SpeakerStore(tmp_path / "profiles.json")
         anon_id = store.register_anonymous(sample_embedding)
-        assert anon_id == "Speaker0"
+        assert anon_id == "speaker0"
 
         result_id = store.enroll("Alice", sample_embedding)
-        assert result_id == "Speaker0", "enroll() must return the existing anonymous ID"
-        assert store.get_name("Speaker0") == "Alice"
+        assert result_id == "speaker0", "enroll() must return the existing anonymous ID"
+        assert store.get_name("speaker0") == "Alice"
         profiles = {p["id"]: p for p in store.list_profiles()}
-        assert profiles["Speaker0"]["enroll_method"] == "self_introduced"
+        assert profiles["speaker0"]["enroll_method"] == "self_introduced"
         # Profile count must not increase — upgrade in-place only.
         assert store.profile_count == 1
 
@@ -871,7 +922,6 @@ class TestRegisterAnonymousTentative:
 
         [1,0,0,0] and [0.7,0.7,0,0] have cosine similarity ≈ 0.707.
         """
-        import math
 
         a = [1.0, 0.0, 0.0, 0.0]
         b_raw = [0.7, 0.7, 0.0, 0.0]
@@ -889,11 +939,11 @@ class TestRegisterAnonymousTentative:
         emb_a, emb_b = self._make_tentative_pair()
 
         id_a = store.register_anonymous(emb_a)
-        assert id_a == "Speaker0"
+        assert id_a == "speaker0"
 
-        # emb_b is tentatively similar to emb_a / Speaker0 (anonymous).
+        # emb_b is tentatively similar to emb_a / speaker0 (anonymous).
         id_b = store.register_anonymous(emb_b)
-        assert id_b == "Speaker0", (
+        assert id_b == "speaker0", (
             "Tentative match against anonymous profile must reuse the existing ID"
         )
         # Counter must not advance — no new profile created.
@@ -908,16 +958,16 @@ class TestRegisterAnonymousTentative:
         emb_a, emb_b = self._make_tentative_pair()
 
         # Enroll emb_a as a named speaker — now uses the shared counter, so
-        # Alice gets Speaker0 and the counter advances to 1.
+        # Alice gets speaker0 and the counter advances to 1.
         alice_id = store.enroll("Alice", emb_a)
         assert alice_id is not None
-        assert alice_id == "Speaker0"
+        assert alice_id == "speaker0"
 
         # emb_b is tentative against Alice's profile — must not contaminate it.
         # register_anonymous falls through and allocates the next counter slot.
         anon_id = store.register_anonymous(emb_b)
         assert anon_id != alice_id
-        assert anon_id == "Speaker1"
+        assert anon_id == "speaker1"
         # Alice's profile must remain unchanged.
         assert store.get_name(alice_id) == "Alice"
         profiles = {p["id"]: p for p in store.list_profiles()}
@@ -950,7 +1000,6 @@ class TestEnrollTentativeUpgrade:
         )
 
     def _make_tentative_pair(self) -> tuple[list[float], list[float]]:
-        import math
 
         a = [1.0, 0.0, 0.0, 0.0]
         b_raw = [0.7, 0.7, 0.0, 0.0]
@@ -970,17 +1019,17 @@ class TestEnrollTentativeUpgrade:
         emb_a, emb_b = self._make_tentative_pair()
 
         anon_id = store.register_anonymous(emb_a)
-        assert anon_id == "Speaker0"
+        assert anon_id == "speaker0"
 
-        # emb_b is tentative against Speaker0 (anonymous).  After the fix,
-        # enroll should upgrade Speaker0 in-place (not mint a new id).
+        # emb_b is tentative against speaker0 (anonymous).  After the fix,
+        # enroll should upgrade speaker0 in-place (not mint a new id).
         result_id = store.enroll("Alice", emb_b)
-        assert result_id == "Speaker0", (
-            "enroll() with a tentative anonymous match must return the existing Speaker{N}, "
+        assert result_id == "speaker0", (
+            "enroll() with a tentative anonymous match must return the existing speaker{N}, "
             "not a new id — the anonymous→named identity split is the root-cause bug"
         )
-        assert store.get_name("Speaker0") == "Alice"
-        assert store.is_anonymous("Speaker0") is False
+        assert store.get_name("speaker0") == "Alice"
+        assert store.is_anonymous("speaker0") is False
         # Upgrade in-place: no new profile created, counter did NOT advance again.
         assert store.profile_count == 1
         assert store._next_anon_index == 1
@@ -988,12 +1037,12 @@ class TestEnrollTentativeUpgrade:
     def test_two_new_enrollments_get_sequential_speaker_ids(
         self, tmp_path, sample_embedding, different_embedding
     ):
-        """Two new named enrollments (no prior match) get sequential Speaker{N} ids."""
+        """Two new named enrollments (no prior match) get sequential speaker{N} ids."""
         store = SpeakerStore(tmp_path / "profiles.json", high_threshold=0.90, low_threshold=0.70)
         alice_id = store.enroll("Alice", sample_embedding)
         bob_id = store.enroll("Bob", different_embedding)
-        assert alice_id == "Speaker0"
-        assert bob_id == "Speaker1"
+        assert alice_id == "speaker0"
+        assert bob_id == "speaker1"
         assert alice_id != bob_id
         assert store.profile_count == 2
 
@@ -1009,13 +1058,13 @@ class TestEnrollTentativeUpgrade:
         emb_a, emb_b = self._make_tentative_pair()
 
         alice_id = store.enroll("Alice", emb_a)
-        assert alice_id == "Speaker0"
+        assert alice_id == "speaker0"
 
         # emb_b is tentative against Alice's named profile — must mint a NEW id.
         bob_id = store.enroll("Bob", emb_b)
         assert bob_id is not None
         assert bob_id != alice_id
-        assert bob_id == "Speaker1"
+        assert bob_id == "speaker1"
         # Alice's profile must be unchanged.
         assert store.get_name(alice_id) == "Alice"
         assert store.is_anonymous(alice_id) is False
@@ -1030,3 +1079,278 @@ class TestEnrollTentativeUpgrade:
         result = store.enroll("Bob", sample_embedding)
         assert result is None
         assert store.profile_count == 1
+
+
+# ---------------------------------------------------------------------------
+# _mint_anon_speaker_id — lowercase guarantee
+# ---------------------------------------------------------------------------
+
+
+class TestMintAnonSpeakerId:
+    """_mint_anon_speaker_id must return lowercase speaker{N}."""
+
+    def test_mint_returns_lowercase(self, tmp_path):
+        """First minted id is 'speaker0' (lowercase)."""
+        store = SpeakerStore(tmp_path / "sp.json")
+        with store._lock:
+            sid = store._mint_anon_speaker_id()
+        assert sid == "speaker0", f"Expected 'speaker0', got {sid!r}"
+
+    def test_mint_increments_counter(self, tmp_path):
+        """Successive mints produce 'speaker0', 'speaker1', …"""
+        store = SpeakerStore(tmp_path / "sp.json")
+        ids = []
+        with store._lock:
+            for _ in range(3):
+                ids.append(store._mint_anon_speaker_id())
+        assert ids == ["speaker0", "speaker1", "speaker2"], ids
+
+
+# ---------------------------------------------------------------------------
+# v5 → v6 migration: profile and last_greeted keys lowercased
+# ---------------------------------------------------------------------------
+
+
+class TestSpeakerStoreMigrationV5ToV6:
+    """v5 → v6 migration: profile and last_greeted keys must be lowercased.
+
+    Uses a synthetic v5 fixture written directly to disk.  Embeddings and
+    display names are VALUE data — only the dict keys change.  _rebuild_centroids
+    rekeys _centroids transitively (iterates self._profiles.items()).
+    """
+
+    def test_v5_profile_keys_lowercased_on_load(self, tmp_path):
+        """A v5 store with cased 'Speaker0' profile key is rekeyed to 'speaker0'."""
+        import json
+
+        store_path = tmp_path / "sp.json"
+        emb = [1.0, 0.0, 0.0]
+        v5_payload = {
+            "version": 5,
+            "next_anon_index": 2,
+            "last_greeted": {
+                "Speaker0": "2026-01-01T00:00:00+00:00",
+            },
+            "speakers": {
+                "Speaker0": {
+                    "name": "Tobias",
+                    "embeddings": [emb],
+                    "preferred_language": "en",
+                    "enroll_method": "self_introduced",
+                },
+                "Speaker9": {
+                    "name": "Speaker9",
+                    "embeddings": [emb],
+                    "preferred_language": "",
+                    "enroll_method": "anonymous_voice",
+                },
+            },
+        }
+        store_path.write_text(json.dumps(v5_payload))
+
+        store = SpeakerStore(store_path)
+
+        # Profile keys must be lowercase.
+        assert "speaker0" in store._profiles, (
+            f"Expected 'speaker0' key after v5→v6 migration; keys: {list(store._profiles)}"
+        )
+        assert "Speaker0" not in store._profiles
+        assert "speaker9" in store._profiles
+        assert "Speaker9" not in store._profiles
+
+        # Embeddings must be preserved (value data unchanged).
+        assert store._profiles["speaker0"]["embeddings"] == [emb]
+        assert store._profiles["speaker0"]["name"] == "Tobias"
+
+        # last_greeted keys must also be lowercased.
+        assert "speaker0" in store._last_greeted, (
+            f"Expected 'speaker0' in last_greeted; keys: {list(store._last_greeted)}"
+        )
+        assert "Speaker0" not in store._last_greeted
+
+        # _centroids must be keyed by lowercase (rebuilt transitively).
+        assert "speaker0" in store._centroids
+        assert "Speaker0" not in store._centroids
+
+    def test_v6_store_not_re_migrated(self, tmp_path):
+        """A v6 store (already lowercase) is loaded without modification."""
+        import json
+
+        store_path = tmp_path / "sp.json"
+        emb = [1.0, 0.0, 0.0]
+        v6_payload = {
+            "version": 6,
+            "next_anon_index": 1,
+            "last_greeted": {"speaker0": "2026-01-01T00:00:00+00:00"},
+            "speakers": {
+                "speaker0": {
+                    "name": "Tobias",
+                    "embeddings": [emb],
+                    "preferred_language": "en",
+                    "enroll_method": "self_introduced",
+                }
+            },
+        }
+        store_path.write_text(json.dumps(v6_payload))
+
+        store = SpeakerStore(store_path)
+
+        assert "speaker0" in store._profiles
+        assert store._profiles["speaker0"]["name"] == "Tobias"
+
+
+# ---------------------------------------------------------------------------
+# Ingest safety-net: _normalize_extraction lowercases speaker-id tokens
+# ---------------------------------------------------------------------------
+
+
+class TestIngestSafetyNet:
+    """_normalize_extraction lowercases speaker-id tokens at the ingest boundary.
+
+    This is a scoped exception to the 'extraction only .strip()s' rule: ONLY
+    tokens matching is_speaker_id() are lowercased; display names are untouched.
+    """
+
+    def test_entity_name_speaker0_lowercased(self):
+        """Entity with name='Speaker0' is lowercased to 'speaker0'."""
+        from paramem.graph.extractor import _normalize_extraction
+
+        data = {
+            "entities": [{"name": "Speaker0", "entity_type": "person"}],
+            "relations": [],
+        }
+        result = _normalize_extraction(data)
+        assert result["entities"][0]["name"] == "speaker0", (
+            f"Ingest safety-net must lowercase 'Speaker0' → 'speaker0'; "
+            f"got {result['entities'][0]['name']!r}"
+        )
+
+    def test_entity_name_display_not_lowercased(self):
+        """Non-speaker-id entity names (display names) are NOT lowercased."""
+        from paramem.graph.extractor import _normalize_extraction
+
+        data = {
+            "entities": [{"name": "Tobias Becker", "entity_type": "person"}],
+            "relations": [],
+        }
+        result = _normalize_extraction(data)
+        # Display name must be preserved verbatim (only .strip() applied).
+        assert result["entities"][0]["name"] == "Tobias Becker"
+
+    def test_relation_subject_speaker0_lowercased(self):
+        """Relation subject='Speaker0' is lowercased to 'speaker0'."""
+        from paramem.graph.extractor import _normalize_extraction
+
+        data = {
+            "entities": [],
+            "relations": [
+                {
+                    "subject": "Speaker0",
+                    "predicate": "works_at",
+                    "object": "Acme",
+                    "relation_type": "factual",
+                    "confidence": 1.0,
+                }
+            ],
+        }
+        result = _normalize_extraction(data)
+        assert result["relations"][0]["subject"] == "speaker0", (
+            f"Ingest safety-net must lowercase subject 'Speaker0' → 'speaker0'; "
+            f"got {result['relations'][0]['subject']!r}"
+        )
+
+    def test_relation_object_speaker_lowercased(self):
+        """Relation object='Speaker1' is lowercased to 'speaker1'."""
+        from paramem.graph.extractor import _normalize_extraction
+
+        data = {
+            "entities": [],
+            "relations": [
+                {
+                    "subject": "Acme",
+                    "predicate": "employs",
+                    "object": "Speaker1",
+                    "relation_type": "factual",
+                    "confidence": 1.0,
+                }
+            ],
+        }
+        result = _normalize_extraction(data)
+        assert result["relations"][0]["object"] == "speaker1"
+
+    def test_already_lowercase_passthrough(self):
+        """Already-lowercase speaker0 is a no-op (idempotent)."""
+        from paramem.graph.extractor import _normalize_extraction
+
+        data = {
+            "entities": [{"name": "speaker0", "entity_type": "person"}],
+            "relations": [
+                {
+                    "subject": "speaker0",
+                    "predicate": "works_at",
+                    "object": "Acme",
+                    "relation_type": "factual",
+                    "confidence": 1.0,
+                }
+            ],
+        }
+        result = _normalize_extraction(data)
+        assert result["entities"][0]["name"] == "speaker0"
+        assert result["relations"][0]["subject"] == "speaker0"
+
+
+# ---------------------------------------------------------------------------
+# Phase B — household_display_names (B5)
+# ---------------------------------------------------------------------------
+
+
+class TestHouseholdDisplayNames:
+    """SpeakerStore.household_display_names() returns display names of
+    non-anonymous profiles only.
+    """
+
+    def _make_store(self, tmp_path) -> SpeakerStore:
+        return SpeakerStore(tmp_path / "profiles.json")
+
+    def test_empty_store_returns_empty(self, tmp_path) -> None:
+        store = self._make_store(tmp_path)
+        assert store.household_display_names() == []
+
+    def test_enrolled_name_returned(self, tmp_path) -> None:
+        store = self._make_store(tmp_path)
+        embedding = [0.1] * 192
+        store.enroll("Alice", embedding)
+        names = store.household_display_names()
+        assert "Alice" in names
+
+    def test_anonymous_excluded(self, tmp_path) -> None:
+        """Anonymous profiles (enroll_method == 'anonymous_voice') are NOT returned."""
+        store = self._make_store(tmp_path)
+        embedding = [0.1] * 192
+        anon_id = store.register_anonymous(embedding)
+        names = store.household_display_names()
+        # The anonymous speaker's id is stored as its name; must not appear.
+        assert anon_id not in names
+        assert names == []
+
+    def test_mixed_returns_only_named(self, tmp_path) -> None:
+        """Mix of enrolled + anonymous: only enrolled names returned."""
+        store = self._make_store(tmp_path)
+        embedding = [0.1] * 192
+        store.enroll("Alice", embedding)
+        embedding2 = [0.2] * 192
+        store.register_anonymous(embedding2)
+        names = store.household_display_names()
+        assert "Alice" in names
+        assert len(names) == 1
+
+    def test_multiple_enrolled_all_returned(self, tmp_path) -> None:
+        store = self._make_store(tmp_path)
+        # Use orthogonal embeddings so the second enroll is not rejected as a
+        # duplicate of the first (cosine similarity near 0 avoids the dedup gate).
+        emb1 = [1.0] + [0.0] * 191
+        emb2 = [0.0, 1.0] + [0.0] * 190
+        store.enroll("Alice", emb1)
+        store.enroll("Bob", emb2)
+        names = store.household_display_names()
+        assert set(names) == {"Alice", "Bob"}

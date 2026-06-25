@@ -692,15 +692,18 @@ class TestMergerContradictionPrompt:
 class TestSpeakerDirectiveFile:
     """Contract tests for ``configs/prompts/speaker_directive.txt``.
 
-    The file holds two sentinel-delimited sections consumed by separate callers:
+    The file holds sentinel-delimited sections consumed by separate callers:
 
     * ``EXTRACTION-DIRECTIVE`` — loaded by ``build_speaker_context`` and
       injected into the extraction user prompt via ``{speaker_context}``.
-    * ``INFERENCE-IDENTITY`` — loaded by ``_build_speaker_prefix`` (local
-      inference path only; SOTA path is excluded for privacy).
+    * ``THIRD-PARTY-DESCRIPTOR`` — loaded at module import by ``inference.py``
+      as the neutral label for unresolvable ``speaker{N}`` tokens (e.g.
+      anonymous or unknown profiles).
 
-    Tests verify the section-split loader, slot rendering, and the
-    SOTA-privacy invariant.
+    ``INFERENCE-IDENTITY`` was deleted in Phase B (speaker-identity refactor):
+    id-to-name resolution is now handled at the fact-render boundary via
+    ``entry_fact_text(resolve=...)`` / ``MemoryStore.probe(speaker_resolver=...)``,
+    not via a prompt injection.  Tests verify the new section layout.
     """
 
     def test_file_exists(self):
@@ -708,37 +711,45 @@ class TestSpeakerDirectiveFile:
         path = _DEFAULT_PROMPT_DIR / "speaker_directive.txt"
         assert path.exists(), f"speaker_directive.txt not found at {path}"
 
-    def test_section_split_returns_both_sections(self):
-        """_load_speaker_directive_section returns both named sections without error."""
+    def test_inference_identity_deleted_raises_key_error(self):
+        """INFERENCE-IDENTITY section is deleted; loading it must raise KeyError."""
+        import pytest
+
+        from paramem.graph.prompts import _load_speaker_directive_section
+
+        with pytest.raises(KeyError, match="INFERENCE-IDENTITY"):
+            _load_speaker_directive_section("INFERENCE-IDENTITY")
+
+    def test_third_party_descriptor_loads_non_empty(self):
+        """THIRD-PARTY-DESCRIPTOR section loads successfully and is non-empty."""
+        from paramem.graph.prompts import _load_speaker_directive_section
+
+        descriptor = _load_speaker_directive_section("THIRD-PARTY-DESCRIPTOR")
+        assert descriptor, "THIRD-PARTY-DESCRIPTOR section must be non-empty"
+
+    def test_third_party_descriptor_value(self):
+        """THIRD-PARTY-DESCRIPTOR must be 'another speaker'."""
+        from paramem.graph.prompts import _load_speaker_directive_section
+
+        descriptor = _load_speaker_directive_section("THIRD-PARTY-DESCRIPTOR")
+        assert descriptor == "another speaker"
+
+    def test_extraction_directive_intact(self):
+        """EXTRACTION-DIRECTIVE section is intact and non-empty after refactor."""
         from paramem.graph.prompts import _load_speaker_directive_section
 
         extraction = _load_speaker_directive_section("EXTRACTION-DIRECTIVE")
-        inference = _load_speaker_directive_section("INFERENCE-IDENTITY")
         assert extraction, "EXTRACTION-DIRECTIVE section must be non-empty"
-        assert inference, "INFERENCE-IDENTITY section must be non-empty"
-        # The two sections must differ.
-        assert extraction != inference
 
     def test_extraction_directive_renders_slots(self):
         """EXTRACTION-DIRECTIVE section renders {speaker_id} and {speaker_name} slots."""
         from paramem.graph.prompts import _load_speaker_directive_section
 
         tmpl = _load_speaker_directive_section("EXTRACTION-DIRECTIVE")
-        rendered = tmpl.format(speaker_id="Speaker0", speaker_name="Alice")
-        assert "Speaker0" in rendered
+        rendered = tmpl.format(speaker_id="speaker0", speaker_name="Alice")
+        assert "speaker0" in rendered
         assert "Alice" in rendered
         # No unrendered slot tokens remain.
-        assert "{speaker_id}" not in rendered
-        assert "{speaker_name}" not in rendered
-
-    def test_inference_identity_renders_slots(self):
-        """INFERENCE-IDENTITY section renders {speaker_id} and {speaker_name} slots."""
-        from paramem.graph.prompts import _load_speaker_directive_section
-
-        tmpl = _load_speaker_directive_section("INFERENCE-IDENTITY")
-        rendered = tmpl.format(speaker_id="Speaker0", speaker_name="Alice")
-        assert "Speaker0" in rendered
-        assert "Alice" in rendered
         assert "{speaker_id}" not in rendered
         assert "{speaker_name}" not in rendered
 

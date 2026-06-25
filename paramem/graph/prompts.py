@@ -17,17 +17,25 @@ _SPEAKER_DIRECTIVE_SENTINEL = "==="
 def _load_speaker_directive_section(section_name: str) -> str:
     """Load a named section from ``configs/prompts/speaker_directive.txt``.
 
-    The file contains two sentinel-delimited sections::
+    The file contains sentinel-delimited sections::
 
         === EXTRACTION-DIRECTIVE ===
         ...directive text...
 
-        === INFERENCE-IDENTITY ===
-        ...mapping text...
+        === THIRD-PARTY-DESCRIPTOR ===
+        ...descriptor text...
+
+    Sections are loaded individually by name.  Currently defined:
+
+    * ``EXTRACTION-DIRECTIVE`` — loaded by ``build_speaker_context`` for
+      the extraction user prompt.
+    * ``THIRD-PARTY-DESCRIPTOR`` — loaded at module import by
+      ``inference.py`` as the fallback label when a ``speaker{N}`` token
+      has no display name (e.g. anonymous or unknown profile).
 
     Args:
-        section_name: One of ``"EXTRACTION-DIRECTIVE"`` or
-            ``"INFERENCE-IDENTITY"``.  The sentinel format is
+        section_name: Name of the section to load (e.g.
+            ``"EXTRACTION-DIRECTIVE"``).  The sentinel format is
             ``=== <NAME> ===`` (leading/trailing ``===`` with spaces).
 
     Returns:

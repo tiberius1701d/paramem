@@ -131,6 +131,7 @@ import logging
 import threading
 from collections.abc import Iterator
 
+from paramem.graph.name_match import is_speaker_id
 from paramem.training.key_registry import KeyRegistry
 
 logger = logging.getLogger(__name__)
@@ -336,7 +337,18 @@ class MemoryStore:
         reset the counters the caller did not supply.**
 
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
-        manufacture a content cache hit."""
+        manufacture a content cache hit.
+
+        ``speaker_id`` is normalized to lowercase when it matches the
+        ``speaker{N}`` pattern (``is_speaker_id``).  This makes the probe
+        speaker-filter casing invariant hold for BOTH legacy-loaded and
+        runtime-set data: legacy cased ``Speaker0`` from ``key_metadata.json``
+        is silently coerced to ``speaker0`` at boot via the
+        :meth:`load_bookkeeping_from_disk` → :meth:`set_bookkeeping` path,
+        self-healing on the next save.  Empty strings and non-speaker values
+        pass through unchanged."""
+        if is_speaker_id(speaker_id):
+            speaker_id = speaker_id.lower()
         if not speaker_id and not allow_empty_speaker:
             raise ValueError(
                 f"set_bookkeeping: empty speaker_id for key {key!r} without "
@@ -854,6 +866,7 @@ class MemoryStore:
         source=None,
         speaker_id: str | None = None,
         memoize: bool = True,
+        speaker_resolver=None,
     ) -> dict[str, dict | None]:
         """Resolve *keys_by_adapter* to flat ``{key → result | None}``.
 
@@ -884,6 +897,14 @@ class MemoryStore:
         confidence=1.0, fact_text, raw_output}``.  Misses (or
         source-failure dicts carrying ``failure_reason``) pass through
         unrendered.
+
+        *speaker_resolver* is an optional callable ``(str) -> str`` that maps
+        raw subject/object tokens to display names at the fact-render boundary.
+        Applied in BOTH render paths (cache-hit via ``entry_fact_text`` +
+        source passthrough via re-render before storing the result).  The
+        memoized stash is SPO-only (no ``fact_text``) so a later cache hit
+        always re-renders with the then-current resolver — no stale-name
+        caching.  ``None`` (default) → byte-identical behaviour.
 
         **speaker_id asymmetry (do not remove this comment):**
         The CACHE-HIT branch reads ``speaker_id`` from ``_bookkeeping`` (the
@@ -982,7 +1003,7 @@ class MemoryStore:
                 "speaker_id": spk,
                 "first_seen_cycle": bk.get("first_seen_cycle", 0),
                 "confidence": rendered_confidence,
-                "fact_text": entry_fact_text({**base, "speaker_id": spk}),
+                "fact_text": entry_fact_text({**base, "speaker_id": spk}, resolve=speaker_resolver),
                 "raw_output": _json.dumps(base),
             }
 
@@ -1067,6 +1088,14 @@ class MemoryStore:
                         if src_confidence is not None:
                             src = dict(src)
                             src["confidence"] = src_confidence
+                    # SOURCE-RESULT speaker resolver — when speaker_resolver is set,
+                    # re-render fact_text from SPO through entry_fact_text so
+                    # display names replace raw speaker{N} tokens.  The memoized
+                    # stash below is SPO-only (no fact_text) so a later cache hit
+                    # re-renders with the then-current resolver — no stale caching.
+                    if speaker_resolver is not None and isinstance(src, dict):
+                        src = dict(src)
+                        src["fact_text"] = entry_fact_text(src, resolve=speaker_resolver)
                     results[key] = src
                     if memoize and isinstance(src, dict):
                         # Stash the raw SPO entry back into the cache (content only).

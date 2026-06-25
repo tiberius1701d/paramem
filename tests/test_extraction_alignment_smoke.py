@@ -33,7 +33,7 @@ def _make_graph_from_spec(
             object=o,
             relation_type="factual",
             confidence=1.0,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         for s, p, o in relations
     ]
@@ -133,7 +133,7 @@ class TestAlignmentSmoke:
                 _SMOKE_TRANSCRIPT,
                 MagicMock(),
                 MagicMock(),
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
             )
@@ -182,7 +182,7 @@ class TestAlignmentSmoke:
                 _SMOKE_TRANSCRIPT,
                 MagicMock(),
                 MagicMock(),
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
             )
@@ -210,7 +210,7 @@ class TestAlignmentSmoke:
                 _SMOKE_TRANSCRIPT,
                 None,
                 None,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="off",
             )
 

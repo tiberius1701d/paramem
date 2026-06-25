@@ -9,10 +9,10 @@ On-disk schema (one mandatory tier, no optional buckets):
 .. code-block:: json
 
     {
-        "version": 1,
+        "version": 2,
         "tokens": {
             "<sha256hex>": {
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
                 "label": "Alice iPad",
                 "created": "<iso8601 utc>",
                 "revoked": false,
@@ -62,7 +62,7 @@ from paramem.graph.name_match import is_speaker_id
 
 logger = logging.getLogger(__name__)
 
-_STORE_VERSION = 1
+_STORE_VERSION = 2
 _ALLOWED_SCOPES = ("admin", "chat")
 _DEFAULT_SCOPE = "chat"
 
@@ -120,7 +120,23 @@ class UserTokenStore:
             logger.warning("Failed to load user-token store: %s", exc)
             return
 
+        version = data.get("version", 1)
         self._tokens = data.get("tokens", {})
+        if version < _STORE_VERSION:
+            # v1 → v2: lowercase every token's speaker_id if it is a speaker id.
+            # Live tokens confirmed to carry cased "Speaker0" — must rekey so that
+            # probe-filter comparisons (speaker_id != bk_spk) remain valid after
+            # the speaker profile store is also rekeyed to lowercase (A2 / v6).
+            for entry in self._tokens.values():
+                sid = entry.get("speaker_id")
+                if sid is not None and is_speaker_id(sid):
+                    entry["speaker_id"] = sid.lower()
+            logger.info(
+                "Migrated user-token store v%d → v%d (lowercase speaker_id)",
+                version,
+                _STORE_VERSION,
+            )
+            self._save()
         logger.info("Loaded user-token store: %d entries", len(self._tokens))
 
     def _current_mtime(self) -> int | None:
@@ -226,11 +242,11 @@ class UserTokenStore:
         Parameters
         ----------
         speaker_id:
-            The speaker this token authenticates.  MUST be a ``Speaker{N}``
-            id (e.g. ``"Speaker0"``), or ``None`` for an unattributed token
+            The speaker this token authenticates.  MUST be a ``speaker{N}``
+            id (e.g. ``"speaker0"``), or ``None`` for an unattributed token
             (shared device that identifies speakers by voice embedding at
             request time).  A non-``None`` id that does not match the
-            ``Speaker{N}`` form raises :exc:`ValueError` — all minted tokens
+            ``speaker{N}`` form raises :exc:`ValueError` — all minted tokens
             must reference a canonical id so they can participate in
             graph-side speaker resolution.
         label:
@@ -252,7 +268,7 @@ class UserTokenStore:
         ------
         ValueError
             If *scope* is not one of the allowed values, or if *speaker_id*
-            is a non-``None`` string that does not conform to ``Speaker{N}``.
+            is a non-``None`` string that does not conform to ``speaker{N}``.
         RuntimeError
             In Security ON mode only: if a key-eviction race causes the store
             to be written in plaintext (see :meth:`_save`).
@@ -261,8 +277,8 @@ class UserTokenStore:
             raise ValueError(f"Invalid scope {scope!r}; must be one of {_ALLOWED_SCOPES}")
         if speaker_id is not None and not is_speaker_id(speaker_id):
             raise ValueError(
-                f"mint: speaker_id={speaker_id!r} is not a canonical Speaker{{N}} id. "
-                "Tokens must reference a canonical Speaker{N} id (e.g. 'Speaker0') or "
+                f"mint: speaker_id={speaker_id!r} is not a canonical speaker{{N}} id. "
+                "Tokens must reference a canonical speaker{N} id (e.g. 'speaker0') or "
                 "pass speaker_id=None for an unattributed shared-device token."
             )
         token = secrets.token_urlsafe(32)

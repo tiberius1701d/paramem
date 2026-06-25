@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.evaluation.recall import generate_answer
-from paramem.graph.name_match import is_speaker_id, speaker_ref_matches
+from paramem.graph.name_match import is_speaker_id
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Entity, SessionGraph
@@ -468,17 +468,17 @@ def build_speaker_context(
 
     The display name is injected as COMPREHENSION CONTEXT so the model
     can map self-references ("I", "my name is Alice", etc.) onto the
-    stable ``Speaker{N}`` id while keeping any same-named third party
-    separate.  The subject of every extracted speaker-fact must be
+    stable lowercase ``speaker{N}`` id while keeping any same-named third
+    party separate.  The subject of every extracted speaker-fact must be
     ``speaker_id``, not the display name.
 
     Args:
-        speaker_id: System speaker id (e.g. ``"Speaker0"``).  When
+        speaker_id: System speaker id (e.g. ``"speaker0"``).  When
             empty or ``None``, the directive is suppressed entirely.
         speaker_name: Display name resolved from the speaker store (e.g.
-            ``"Alice"``).  ``None`` when unknown or anonymous (P3
-            semantics); the directive uses the id string in place of the
-            display name so the model still binds onto the id.
+            ``"Alice"``).  ``None`` when unknown or anonymous; the
+            directive uses the id string in place of the display name so
+            the model still binds onto the id.
     """
     if not speaker_id:
         return ""
@@ -1299,22 +1299,21 @@ def _stamp_speaker_entity(
     """Stamp ``speaker_id`` on speaker-id entities in the extracted graph.
 
     Under the id-as-subject convention the extraction prompt instructs the
-    model to emit ``Speaker{N}`` (the system speaker id) as the entity name
-    and relation subject for the session speaker.  This post-processor walks
-    the entity list and sets ``entity.speaker_id`` on every entity whose name
-    is structurally a speaker id (``is_speaker_id(entity.name)`` is ``True``):
+    model to emit ``speaker{N}`` (lowercase) as the entity name and relation
+    subject.  The ingest safety-net in :func:`_normalize_extraction` ensures
+    the entity name is already lowercase before this function is called.
+    This post-processor walks the entity list and sets ``entity.speaker_id``
+    on every entity whose name passes :func:`~paramem.graph.name_match.is_speaker_id`:
 
-    * **Session speaker** — when ``speaker_ref_matches(entity.name, speaker_id)``
-      is ``True``, the entity IS the session speaker.  Its ``speaker_id`` field
-      is set to the authoritative cased value supplied by the caller
-      (``speaker_id``, e.g. ``"Speaker0"``), guaranteeing the node key and
-      the cased id attribute are always consistent.
+    * **Session speaker** — when ``ent.name == speaker_id.lower()`` the entity
+      IS the session speaker.  Its ``speaker_id`` field is set to
+      ``speaker_id.lower()`` (the authoritative lowercase id from the caller),
+      preserving the authoritative-id pin.  This guards against the model
+      emitting the wrong digit (e.g. ``speaker1`` in a ``speaker0`` session).
 
-    * **Other speaker reference** — when a different ``Speaker{N}`` id appears
-      (e.g. the model extracted a third-party speaker who is also a registered
-      participant), ``entity.speaker_id`` is normalised to the canonical cased
-      form (``"Speaker{digits}"``) regardless of how the model emitted the id,
-      so the attribute is always ``"Speaker0"``, never ``"speaker0"``.
+    * **Other speaker reference** — when a different ``speaker{N}`` id appears
+      (e.g. a third-party speaker), ``entity.speaker_id`` is set to
+      ``ent.name`` (already lowercase via the ingest safety-net).
 
     Non-speaker entities (display names like ``"Tobias Becker"``, places, orgs)
     are left untouched: ``is_speaker_id`` returns ``False`` for them.
@@ -1329,8 +1328,8 @@ def _stamp_speaker_entity(
         speaker_name: Display name of the session speaker (e.g. ``"Tobias"``).
             Accepted but not used for matching — kept for call-site API
             compatibility.
-        speaker_id: Authoritative cased speaker id (e.g. ``"Speaker0"``).
-            Stamped onto the session-speaker entity.
+        speaker_id: Authoritative speaker id (e.g. ``"speaker0"``).  Used as
+            the authoritative-pin guard to detect wrong-digit model emissions.
 
     Returns:
         Updated ``SessionGraph`` with ``speaker_id`` set on all speaker-id
@@ -1342,16 +1341,15 @@ def _stamp_speaker_entity(
     for ent in graph.entities:
         if not is_speaker_id(ent.name):
             continue
-        if speaker_ref_matches(ent.name, speaker_id):
+        if ent.name == speaker_id.lower():
             # This entity IS the session speaker — stamp the authoritative id.
-            ent.speaker_id = speaker_id
+            # Both values are lowercase; the explicit pin preserves the
+            # authoritative-id guard (model may emit wrong digit).
+            ent.speaker_id = speaker_id.lower()
         else:
             # A different registered speaker referenced in this session.
-            # Normalise to canonical cased form ("Speaker{N}") regardless of
-            # how the model emitted the id — the model may casefold to
-            # "speaker0" even when the few-shots show "Speaker0".
-            digits = ent.name.lower().removeprefix("speaker")
-            ent.speaker_id = f"Speaker{digits}"
+            # ent.name is already lowercase via the ingest safety-net.
+            ent.speaker_id = ent.name
 
     return graph
 
@@ -1544,6 +1542,13 @@ def _normalize_extraction(data: dict) -> dict:
             if isinstance(raw_name, list):
                 raw_name = raw_name[0] if raw_name else "unknown"
             norm["name"] = str(raw_name).strip()
+            # Ingest safety-net: lowercase any speaker-id token at the single
+            # normalization boundary.  Extraction prompts instruct the model to
+            # emit lowercase speaker{N} directly; this coerces any residual cased
+            # form (e.g. "Speaker0") a model emits despite the instruction.
+            # ONLY speaker-id tokens are lowercased — display names are untouched.
+            if is_speaker_id(norm["name"]):
+                norm["name"] = norm["name"].lower()
             raw_type = ent.get("entity_type") or ent.get("type", "concept")
             if isinstance(raw_type, list):
                 raw_type = raw_type[0] if raw_type else "concept"
@@ -1594,6 +1599,11 @@ def _normalize_extraction(data: dict) -> dict:
                 raw_obj = raw_obj[0] if raw_obj else "unknown"
             subject = str(raw_subj).strip()
             obj = str(raw_obj).strip()
+            # Ingest safety-net: lowercase any speaker-id token at this boundary.
+            if is_speaker_id(subject):
+                subject = subject.lower()
+            if is_speaker_id(obj):
+                obj = obj.lower()
 
             # Filter self-loops (e.g. "KIT studied at KIT")
             if subject.lower() == obj.lower():

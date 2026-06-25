@@ -22,6 +22,7 @@ re-exported here so callers can import them from either module.
 import hashlib
 import json
 import logging
+from collections.abc import Callable
 
 from paramem.training.dataset import SYSTEM_PROMPT, _tokenize_with_prompt_masking
 
@@ -427,7 +428,10 @@ def finalize_recalled(
 # --- Fact-text helper ---
 
 
-def entry_fact_text(entry: dict) -> str:
+def entry_fact_text(
+    entry: dict,
+    resolve: Callable[[str], str] | None = None,
+) -> str:
     """Render a recalled entry as a human-readable fact string.
 
     Converts the predicate from snake_case to space-separated words (predicates
@@ -440,12 +444,23 @@ def entry_fact_text(entry: dict) -> str:
     Args:
         entry: Dict containing at minimum ``subject``, ``predicate``, and
             ``object`` keys.
+        resolve: Optional callable that maps a raw subject/object token to its
+            display form.  When provided, ``entry["subject"]`` and
+            ``entry["object"]`` are passed through it before assembly.  ``None``
+            (the default) preserves byte-identical behaviour — the raw SPO
+            tokens are used verbatim.  The resolver must be a pure function
+            (no side-effects) and must never raise; returning the token
+            unchanged for unrecognised inputs is the expected contract.
+            Typical use: resolve ``speaker{N}`` ids to display names at the
+            fact-render boundary (household-wide name injection).
 
     Returns:
         Human-readable fact string, e.g. ``"Alex lives in Heilbronn"``.
     """
+    subject = resolve(entry["subject"]) if resolve is not None else entry["subject"]
+    obj = resolve(entry["object"]) if resolve is not None else entry["object"]
     predicate_spaced = " ".join(entry["predicate"].replace("_", " ").split())
-    return f"{entry['subject']} {predicate_spaced} {entry['object']}"
+    return f"{subject} {predicate_spaced} {obj}"
 
 
 # --- Registry persistence (re-exported for convenience) ---

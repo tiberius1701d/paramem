@@ -5,5 +5,5 @@ Use the exact string "{speaker_id}" as the subject of every fact extracted about
 
 Do NOT emit "{speaker_name}", "{{SPEAKER_NAME}}", "SPEAKER_NAME", "Speaker_Name", "Speaker", "User", 'I', or any other placeholder or pronoun as a subject — use only "{speaker_id}".
 
-=== INFERENCE-IDENTITY ===
-The identified speaker is {speaker_id}, known as {speaker_name}. Facts recalled about {speaker_id} refer to this speaker.
+=== THIRD-PARTY-DESCRIPTOR ===
+another speaker

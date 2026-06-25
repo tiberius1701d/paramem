@@ -31,7 +31,7 @@ def _make_graph(relations, entities=None):
             object=r[2],
             relation_type=r[3] if len(r) > 3 else "factual",
             confidence=r[4] if len(r) > 4 else 1.0,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         for r in relations
     ]
@@ -336,7 +336,7 @@ class TestParseExtractionShapes:
             '[{"subject": "Alice", "predicate": "lives_in", "object": "Berlin", '
             '"relation_type": "factual", "confidence": 1.0}]'
         )
-        g = _parse_extraction(raw, "session1", speaker_id="Speaker0")
+        g = _parse_extraction(raw, "session1", speaker_id="speaker0")
         assert len(g.relations) == 1
         assert g.relations[0].subject == "Alice"
         assert g.relations[0].object == "Berlin"
@@ -344,7 +344,7 @@ class TestParseExtractionShapes:
     def test_empty_list(self):
         from paramem.graph.extractor import _parse_extraction
 
-        g = _parse_extraction("[]", "session1", speaker_id="Speaker0")
+        g = _parse_extraction("[]", "session1", speaker_id="speaker0")
         assert len(g.relations) == 0
         assert len(g.entities) == 0
 
@@ -1139,7 +1139,7 @@ class TestSOTANoiseFilter:
         )
         # No ANTHROPIC_API_KEY → skips gracefully
         with patch.dict("os.environ", {}, clear=True):
-            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
+            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
             # Should return original graph unchanged
             assert len(result.relations) == 1
 
@@ -1201,7 +1201,7 @@ class TestSOTANoiseFilter:
                 "Alex lives in Millfield",
                 None,
                 None,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="off",
             )
         # With plausibility_judge="off", fallback runs the residual-placeholder sweep only.
@@ -1246,7 +1246,7 @@ class TestSOTANoiseFilter:
             ),
         ):
             with pytest.raises(ExtractionFailed) as excinfo:
-                _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
+                _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
         assert excinfo.value.phase == "sota_enrich"
 
     def test_pipeline_enriched_facts_get_deanonymized(self):
@@ -1277,7 +1277,7 @@ class TestSOTANoiseFilter:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
+            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
 
         # Both enriched relations survive and get de-anonymized
         assert len(result.relations) == 2
@@ -1318,7 +1318,7 @@ class TestSOTANoiseFilter:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(graph, transcript, None, None, speaker_id="Speaker0")
+            result = _sota_pipeline(graph, transcript, None, None, speaker_id="speaker0")
 
         # Composite strings must be de-anonymized, not dropped
         subjects = {r.subject for r in result.relations}
@@ -1712,7 +1712,7 @@ class TestSOTANoiseFilter:
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
         ):
             result = _sota_pipeline(
-                graph, "Alex lives in Millfield.", None, None, speaker_id="Speaker0"
+                graph, "Alex lives in Millfield.", None, None, speaker_id="speaker0"
             )
 
         assert len(filter_calls) == 1, "SOTA was not called after repair"
@@ -1766,7 +1766,7 @@ class TestSOTANoiseFilter:
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
         ):
-            _sota_pipeline(graph, "Alex mentioned something.", None, None, speaker_id="Speaker0")
+            _sota_pipeline(graph, "Alex mentioned something.", None, None, speaker_id="speaker0")
 
         # SOTA WAS called — the deterministic builder substituted
         # ``Ghost`` to its placeholder before verify ran, so no leak
@@ -1984,14 +1984,14 @@ class TestApplyBindings:
 
         graph = SessionGraph(
             session_id="s1",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             timestamp="2026-05-09T13:00:00Z",
         )
         graph.entities.append(
             Entity(
                 name="Alex",
                 entity_type="person",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 attributes={
                     "last_name": "Walker",
                     "email": "alex.walker@example.com",
@@ -2080,9 +2080,9 @@ class TestSpeakerContextInjection:
         """Directive pins speaker_id as subject and injects display name as context."""
         from paramem.graph.extractor import build_speaker_context
 
-        out = build_speaker_context("Speaker0", "Ye Jie")
+        out = build_speaker_context("speaker0", "Ye Jie")
         # Speaker id must appear as the required subject.
-        assert "Speaker0" in out
+        assert "speaker0" in out
         # Display name must appear as comprehension context.
         assert "Ye Jie" in out
         # Must forbid generic fallback strings so the model cannot emit them.
@@ -2099,8 +2099,8 @@ class TestSpeakerContextInjection:
         """Anonymous speaker: id used for both subject and context; no KeyError."""
         from paramem.graph.extractor import build_speaker_context
 
-        out = build_speaker_context("Speaker0", None)
-        assert "Speaker0" in out
+        out = build_speaker_context("speaker0", None)
+        assert "speaker0" in out
         assert "{speaker_id}" not in out
         assert "{speaker_name}" not in out
 
@@ -2324,7 +2324,7 @@ class TestPlausibilityAnon:
                 "Alex lives in Millfield.",
                 None,
                 None,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="claude",
                 plausibility_stage="anon",
             )
@@ -2390,7 +2390,7 @@ class TestPlausibilityDeanon:
                 "Alex lives in Millfield.",
                 MagicMock(),
                 MagicMock(),
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
             )
@@ -2496,7 +2496,7 @@ class TestResidualLeakDropsReferencingTriples:
                 transcript,
                 None,
                 None,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="off",
                 ner_check=True,
             )
@@ -2550,7 +2550,7 @@ class TestAnonFailureFallback:
                 side_effect=fake_fallback,
             ),
         ):
-            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
+            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
 
         assert fallback_calls == ["anon_failed"], (
             "fallback must be triggered with reason=anon_failed"
@@ -2600,7 +2600,7 @@ class TestSotaEnrichmentFailureRaises:
             ),
         ):
             try:
-                _sota_pipeline(graph, "transcript", None, None, speaker_id="Speaker0")
+                _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
             except ExtractionFailed as exc:
                 assert exc.phase == "sota_enrich"
                 assert exc.reason
@@ -2673,7 +2673,7 @@ class TestAllDroppedSafetyNet:
                 "Alex lives in Millfield.",
                 MagicMock(),  # non-None model so deanon-stage plausibility runs
                 MagicMock(),  # non-None tokenizer so deanon-stage plausibility runs
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
             )
@@ -2726,7 +2726,7 @@ class TestEntityTypePreservation:
                 "Alex lives in Frankfurt and listens to Music.",
                 None,
                 None,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="off",
             )
 
@@ -2768,7 +2768,7 @@ class TestEntityTypePreservation:
                 "Alex was born in Germany.",
                 None,
                 None,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="off",
             )
 
@@ -2824,7 +2824,7 @@ class TestEntityTypePreservation:
                 "Alex visited China.",
                 None,
                 None,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="off",
             )
 
@@ -2861,7 +2861,7 @@ class TestFallbackPlausibilityOnRawHelper:
             "Alex works at Acme.",
             None,
             None,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             reason="test_residual",
         )
         # City_1 is a placeholder token → the fact should be swept
@@ -2885,7 +2885,7 @@ class TestFallbackPlausibilityOnRawHelper:
             "Alex lives in Millfield.",
             None,
             None,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             reason="anon_failed",
         )
         assert result.diagnostics.get("fallback_path") == "anon_failed"
@@ -2966,7 +2966,7 @@ class TestExtractGraphNewKwargs:
                 None,
                 "transcript",
                 "sess1",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 noise_filter="anthropic",
                 ner_check=True,
                 ner_model="en_core_web_trf",
@@ -3056,7 +3056,7 @@ class TestExtractGraphNewKwargs:
                 "Alex lives in Millfield.",
                 None,
                 None,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 verify_anonymization=False,
                 plausibility_judge="off",
             )
@@ -3108,7 +3108,7 @@ class TestDiagnosticsKeys:
                 "Alex lives in Millfield.",
                 MagicMock(),
                 MagicMock(),
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
             )
@@ -3148,7 +3148,7 @@ class TestDiagnosticsKeys:
                 "Alex lives in Millfield.",
                 None,
                 None,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 plausibility_judge="off",
             )
 
@@ -3286,7 +3286,7 @@ class TestBuildAnonymizationMapping:
     def test_mints_placeholders_for_in_scope_entities(self):
         mapping = self._build(
             [
-                Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+                Entity(name="Alex", entity_type="person", speaker_id="speaker0"),
                 Entity(name="Berlin", entity_type="place"),
                 Entity(name="Globex", entity_type="organization"),
             ],
@@ -3303,7 +3303,7 @@ class TestBuildAnonymizationMapping:
                 Entity(
                     name="Alex",
                     entity_type="person",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     attributes={
                         "last_name": "Walker",
                         "email": "alex.walker@example.com",
@@ -3357,7 +3357,7 @@ class TestBuildAnonymizationMapping:
 
     def test_speaker_name_already_in_entities_noop(self):
         mapping = self._build(
-            [Entity(name="Alex", entity_type="person", speaker_id="Speaker0")],
+            [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
             pii_scope={"person"},
             speaker_name="Alex",
         )
@@ -3365,16 +3365,16 @@ class TestBuildAnonymizationMapping:
         assert mapping == {"Alex": "Person_1"}
 
     def test_speaker_name_reuses_speaker_entity_placeholder(self):
-        """Anonymous→disclosed: graph still has anonymous ``Speaker0``
+        """Anonymous→disclosed: graph still has anonymous ``speaker0``
         as the entity name but runtime knows the display name as
         ``Alex``.  Both must share the same placeholder.
         """
         mapping = self._build(
-            [Entity(name="Speaker0", entity_type="person", speaker_id="Speaker0")],
+            [Entity(name="speaker0", entity_type="person", speaker_id="speaker0")],
             pii_scope={"person"},
             speaker_name="Alex",
         )
-        assert mapping["Speaker0"] == "Person_1"
+        assert mapping["speaker0"] == "Person_1"
         assert mapping["Alex"] == "Person_1", (
             "speaker_name must reuse the speaker entity's placeholder"
         )
@@ -3410,7 +3410,7 @@ class TestBuildAnonymizationMapping:
         mapping via the LLM hint merge.
         """
         mapping = self._build(
-            [Entity(name="Alex", entity_type="person", speaker_id="Speaker0")],
+            [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
             llm_mapping={"Honda": "Product_1"},
             pii_scope={"person"},
         )
@@ -3422,7 +3422,7 @@ class TestBuildAnonymizationMapping:
         deterministic build mints ``Alex → Person_1``, the
         deterministic entry wins (we trust the graph)."""
         mapping = self._build(
-            [Entity(name="Alex", entity_type="person", speaker_id="Speaker0")],
+            [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
             llm_mapping={"Alex": "Person_2"},
             pii_scope={"person"},
         )
@@ -3440,7 +3440,7 @@ class TestBuildAnonymizationMapping:
                 Entity(
                     name="Alex",
                     entity_type="person",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     attributes={"last_name": "Walker"},
                 )
             ],
@@ -3458,7 +3458,7 @@ class TestBuildAnonymizationMapping:
                 Entity(
                     name="Alex",
                     entity_type="person",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     attributes={"last_name": "", "email": "   ", "phone": "+49 1"},
                 )
             ],
@@ -3475,7 +3475,7 @@ class TestBuildAnonymizationMapping:
         """
         mapping = self._build(
             [
-                Entity(name="Alex", entity_type="person", speaker_id="Speaker0"),
+                Entity(name="Alex", entity_type="person", speaker_id="speaker0"),
                 Entity(name="Berlin", entity_type="place"),
                 Entity(name="Globex", entity_type="organization"),
                 Entity(name="Volvo V70", entity_type="concept"),

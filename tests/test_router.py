@@ -956,3 +956,52 @@ class TestHR3Regression:
         )
         plan = router.route("Turn on the kitchen light", speaker_id="alice")
         assert plan.intent is Intent.COMMAND
+
+
+# ---------------------------------------------------------------------------
+# Contract: _speaker_key_index key casing matches route() lookup key casing
+# ---------------------------------------------------------------------------
+
+
+class TestSpeakerKeyIndexCasingContract:
+    """``_speaker_key_index`` keys and the ``route()`` lookup key must share casing.
+
+    Both are lowercase under the speaker-identity refactor.  A cased lookup
+    (``route(speaker_id="Speaker0")``) would miss a lowercase-indexed key
+    (``_speaker_key_index["speaker0"]``), producing an empty routing plan and
+    silently losing all that speaker's keys.
+
+    This test locks the invariant: the index keys match what ``route()`` receives.
+    """
+
+    def test_index_keys_are_lowercase(self):
+        """After reload, all _speaker_key_index keys are lowercase speaker{N} ids."""
+        router = _make_router_from_entries(
+            [
+                _make_entry("ep1", "Alex", "Berlin", speaker_id="speaker0", adapter_id="episodic"),
+                _make_entry("se1", "Alex", "Python", speaker_id="speaker0", adapter_id="semantic"),
+            ]
+        )
+        for key in router._speaker_key_index:
+            assert key == key.lower(), (
+                f"_speaker_key_index key {key!r} is not lowercase — "
+                "route(speaker_id=lowercase) would miss this speaker's keys."
+            )
+        assert "speaker0" in router._speaker_key_index, (
+            "_speaker_key_index must contain 'speaker0' after seeding lowercase speaker_id."
+        )
+
+    def test_lowercase_route_lookup_finds_indexed_keys(self):
+        """A lowercase route() speaker_id resolves the speaker's keys from the index."""
+        router = _make_router_from_entries(
+            [
+                _make_entry("ep1", "Alex", "Berlin", speaker_id="speaker0", adapter_id="episodic"),
+                _make_entry("se1", "Alex", "Python", speaker_id="speaker0", adapter_id="semantic"),
+            ]
+        )
+        # The index is keyed by lowercase 'speaker0'; the route() lookup must
+        # use the same casing so keys are not silently dropped.
+        assert router._speaker_key_index.get("speaker0") == {"ep1", "se1"}, (
+            "route(speaker_id='speaker0') must find both keys; "
+            "a cased 'Speaker0' lookup would return None and drop the facts."
+        )

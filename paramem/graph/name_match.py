@@ -10,19 +10,18 @@ Over-collapse boundary (GUARANTEED-identical-only):
   (superscript ``²``, full-width), honorifics, token subsets.  Those are
   layer-2 LLM SAME_AS coreference, out of scope here.
 
-Speaker-identity primitives (P1 / P2)
---------------------------------------
-Speaker nodes are keyed by the **casefolded** form of their system id
-(``canonical_speaker("Speaker0") == "speaker0"``).  All speaker-identity
-equality tests must route through :func:`speaker_ref_matches` — the single
-canonical comparison — so that a cased id (``"Speaker0"``) and a casefolded
-node key (``"speaker0"``) are always treated as the same identity.
-
-§0 invariant: every "is this the speaker?" or "do two speaker references
-match?" test is ``canonical(a) == canonical(b)`` via :func:`speaker_ref_matches`.
-There must be exactly ONE place in the codebase allowed to compare a
-``Relation.subject`` against a ``Relation.speaker_id``, and it MUST call this
-function.
+Speaker-identity
+----------------
+Speaker ids are ONE canonical lowercase form: ``speaker{N}``
+(e.g. ``"speaker0"``).  This is the form stored as the graph node key, the
+profile key in :class:`~paramem.server.speaker.SpeakerStore`, the
+``speaker_id`` attribute on graph nodes, and the ``speaker_id`` field on
+:class:`~paramem.graph.schema.Relation` and :class:`~paramem.memory.entry`
+objects.  Speaker equality is plain ``==`` — no bridging function is needed.
+:func:`is_speaker_id` is the structural gate for the ``speaker{N}`` format.
+The ingest safety-net in :func:`~paramem.graph.extractor._normalize_extraction`
+lowercases any matching token at the extraction boundary (a deliberate, scoped
+exception to the "extraction only `.strip()`s" rule for display entities).
 """
 
 import re
@@ -83,12 +82,14 @@ def canonical(s: str) -> str:
 
 
 def is_speaker_id(s: str) -> bool:
-    """Return ``True`` when *s* is a system speaker-id of the form ``Speaker{N}``.
+    """Return ``True`` when *s* is a speaker-id of the form ``speaker{N}``.
 
-    Accepts both the cased form emitted by the speaker store (``"Speaker0"``,
-    ``"Speaker12"``) and the casefolded node-key form (``"speaker0"``).  The
-    structural test is purely syntactic — it does NOT check whether the id
-    corresponds to a registered speaker.
+    The canonical stored form is lowercase (``"speaker0"``, ``"speaker12"``).
+    The regex keeps ``[Ss]`` so the ingest safety-net can also detect and
+    coerce any residual cased form (``"Speaker0"``) that a model emits — the
+    coercion output is ALWAYS lowercase.  The structural test is purely
+    syntactic — it does NOT check whether the id corresponds to a registered
+    speaker.
 
     Args:
         s: String to test.
@@ -100,9 +101,11 @@ def is_speaker_id(s: str) -> bool:
 
     Examples::
 
-        >>> is_speaker_id("Speaker0")
+        >>> is_speaker_id("speaker0")
         True
         >>> is_speaker_id("speaker12")
+        True
+        >>> is_speaker_id("Speaker0")
         True
         >>> is_speaker_id("Speaker")
         False
@@ -112,66 +115,3 @@ def is_speaker_id(s: str) -> bool:
     if not s:
         return False
     return bool(_SPEAKER_ID_RE.match(s))
-
-
-def speaker_ref_matches(a: str, b: str) -> bool:
-    """Return ``True`` when *a* and *b* refer to the same speaker identity.
-
-    This is the **single canonical comparison** for all speaker-identity
-    equality tests (§0 invariant).  It applies :func:`canonical` to both
-    sides so that a cased id (``"Speaker0"``) and the casefolded node key
-    (``"speaker0"``) are always treated as the same identity.
-
-    Every "is this the speaker?" test that compares two speaker-related
-    strings (e.g. ``Relation.subject`` vs ``Relation.speaker_id``) MUST
-    route through this function instead of raw ``==``.
-
-    Args:
-        a: First speaker reference (may be cased or casefolded).
-        b: Second speaker reference (may be cased or casefolded).
-
-    Returns:
-        ``True`` iff ``canonical(a) == canonical(b)``.
-
-    Examples::
-
-        >>> speaker_ref_matches("Speaker0", "speaker0")
-        True
-        >>> speaker_ref_matches("Speaker0", "Speaker1")
-        False
-        >>> speaker_ref_matches("Speaker12", "SPEAKER12")
-        True
-    """
-    return canonical(a) == canonical(b)
-
-
-def canonical_speaker(speaker_id: str) -> str:
-    """Map a speaker id to its graph node key (casefolded canonical form).
-
-    This is the **single function** that converts a speaker id to the node key
-    used in the graph.  It is idempotent: applying it to an already-casefolded
-    key returns the same key unchanged.
-
-    Node keys for speakers are always the casefolded form so that a
-    ``Speaker0`` Entity (from the entity path) and a ``Speaker0`` relation
-    endpoint (from the fallback path) always resolve to the same node key
-    (``"speaker0"``), preventing the casing-collision dup.
-
-    Args:
-        speaker_id: A speaker system id, either cased (``"Speaker0"``) or
-            already casefolded (``"speaker0"``).
-
-    Returns:
-        The casefolded node key (e.g. ``"speaker0"``).  Returns ``""`` for
-        empty input.
-
-    Examples::
-
-        >>> canonical_speaker("Speaker0")
-        'speaker0'
-        >>> canonical_speaker("speaker0")
-        'speaker0'
-        >>> canonical_speaker("Speaker12")
-        'speaker12'
-    """
-    return canonical(speaker_id)

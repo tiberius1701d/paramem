@@ -26,7 +26,6 @@ from paramem.graph.merger import GraphMerger
 from paramem.graph.name_match import (
     canonical,
     is_speaker_id,
-    speaker_ref_matches,
 )
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.qa_generator import (
@@ -2666,11 +2665,10 @@ class ConsolidationLoop:
                 if not (subj_canon and raw_pred and obj_canon):
                     continue
 
-                # BLOCKER-1: choose endpoint string per endpoint.
+                # Choose endpoint surface string per endpoint.
                 # Speaker endpoint (node carries speaker_id attribute): pass the node
-                # key (casefolded, e.g. "speaker0") — distinct from the cased
-                # speaker_id attribute ("Speaker0") — so _synth_speaker_entities can
-                # emit the correct Entity from the canonical key.
+                # key (lowercase canonical speaker{N} id) so _synth_speaker_entities
+                # can emit the correct Entity from the canonical key.
                 # Non-speaker endpoint: pass the display surface from node attributes.
                 def _endpoint_str(canon: str) -> str:
                     _n = graph.nodes.get(canon, {})
@@ -5173,7 +5171,13 @@ class ConsolidationLoop:
                 _rt_raw = _t_data.get("relation_type", _FALLBACK_RTYPE)
                 _rt: str = _rt_raw if _rt_raw in _VALID_RTYPES else _FALLBACK_RTYPE
 
-                # Resolve display names from node attributes["name"].
+                # Resolve endpoint surface from node attributes["name"].
+                # For speaker subjects: _endpoint_str returns the node key (lowercase
+                # speaker{N}); _synth_speaker_entities emits Entity(name=speaker_id)
+                # which refreshes attributes["name"] to the lowercase speaker_id during
+                # _merge_registry_relations.  So _subj_display yields the lowercase
+                # speaker_id for speaker subjects.
+                # For non-speaker subjects this yields the stored display name.
                 _subj_display = (
                     self.merger.graph.nodes[_t_subj].get("attributes", {}).get("name") or _t_subj
                 )
@@ -5572,24 +5576,15 @@ class ConsolidationLoop:
         """Synthesise :class:`~paramem.graph.schema.Entity` objects for speaker-attributed subjects.
 
         For each :class:`Relation` in *relations* whose ``speaker_id`` is non-empty
-        and whose ``subject`` canonically matches ``speaker_id`` (§0 invariant —
-        compared via :func:`~paramem.graph.name_match.speaker_ref_matches` so that a
-        casefolded node key ``"speaker0"`` and a cased id ``"Speaker0"`` are treated
-        as identical), emit one :class:`~paramem.graph.schema.Entity` with
-        ``entity_type="person"`` and the matching ``speaker_id``.  Deduplicates by
-        ``speaker_id`` so exactly one entity is produced per unique speaker.
+        and whose ``subject == speaker_id`` (plain equality — both are lowercase
+        ``speaker{N}`` under the lowercase-uniform design), emit one
+        :class:`~paramem.graph.schema.Entity` with ``entity_type="person"`` and
+        the matching ``speaker_id``.  Deduplicates by ``speaker_id`` so exactly
+        one entity is produced per unique speaker.
 
-        The canonical comparison (B1 fix) is load-bearing: after the merger casefoldes
-        speaker node keys (Step 2), the enrichment path produces ``Relation.subject``
-        as the casefolded key (``"speaker0"``) while ``Relation.speaker_id`` remains
-        the cased id (``"Speaker0"``).  A raw ``==`` would miss the entity and trigger
-        the dcf4189 regression (no ``speaker_id`` attribute stamped on the node, minted
-        keys fall back to ``speaker_id=""``).
-
-        Non-speaker subjects (``speaker_id == ""`` OR subject does not canonically
-        match ``speaker_id``) are skipped; their nodes retain no ``speaker_id``
-        attribute, which resolves to ``""`` in the keyed-walk (the correct default for
-        non-person nodes).
+        Non-speaker subjects (``speaker_id == ""`` OR ``subject != speaker_id``)
+        are skipped; their nodes retain no ``speaker_id`` attribute, which resolves
+        to ``""`` in the keyed-walk (the correct default for non-person nodes).
 
         Used by :meth:`_merge_registry_relations` so that
         :meth:`~paramem.graph.merger.GraphMerger._upsert_entity` stamps
@@ -5606,8 +5601,8 @@ class ConsolidationLoop:
         Returns:
             A :class:`list` of :class:`~paramem.graph.schema.Entity` objects, one
             per unique speaker subject found in *relations*.  May be empty when no
-            relation carries a non-empty ``speaker_id`` whose subject canonically
-            matches the speaker ID.
+            relation carries a non-empty ``speaker_id`` whose subject equals the
+            speaker ID.
         """
         from paramem.graph.schema import Entity as _Entity
 
@@ -5615,20 +5610,15 @@ class ConsolidationLoop:
         entities: list[_Entity] = []
         for _r in relations:
             if _r.speaker_id and _r.speaker_id not in _seen_speaker_ids:
-                # §0 invariant: compare canonically (B1 fix) — the subject may be the
-                # casefolded node key ("speaker0") while speaker_id is cased ("Speaker0").
-                # Raw == would fail; speaker_ref_matches(a, b) = canonical(a)==canonical(b).
-                # Non-speaker subjects are skipped; their nodes retain no speaker_id.
-                if speaker_ref_matches(_r.subject, _r.speaker_id):
+                # Both subject and speaker_id are lowercase speaker{N} — plain ==
+                # is sufficient.  Non-speaker subjects are skipped.
+                if _r.subject == _r.speaker_id:
                     entities.append(
                         _Entity(
-                            # Use the cased speaker_id as the display name (§0): node key
-                            # is the casefolded form ("speaker0"); the cased system id
-                            # ("Speaker0") is the correct display/training surface stored in
-                            # attributes["name"].  Using _r.subject here would write the
-                            # casefolded node key as the display name, clobbering the cased
-                            # surface via _upsert_entity's is_speaker refresh branch.
-                            name=_r.speaker_id,
+                            # Use _r.subject (== _r.speaker_id) as the entity name.
+                            # This refreshes attributes["name"] to the lowercase
+                            # speaker_id on the existing speaker node.
+                            name=_r.subject,
                             entity_type="person",
                             speaker_id=_r.speaker_id,
                         )

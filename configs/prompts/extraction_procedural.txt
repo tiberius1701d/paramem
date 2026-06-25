@@ -4,28 +4,28 @@ Two hard rules:
 - Every relation MUST set `relation_type` to `"preference"`.
 - A preference originates ONLY from the speaker's own utterances. Assistant turns are spelling-and-disambiguation context, NOT a source. If only the assistant said it, do NOT extract it.
 
-Use the speaker's system identifier from the directive above (e.g. `Speaker0`) as the entity name and relation subject for every extracted preference. Never emit a display name, pronoun, or the literal string `{{SPEAKER_NAME}}` as the subject.
+Use the speaker's system identifier from the directive above (e.g. `speaker0`) as the entity name and relation subject for every extracted preference. Never emit a display name, pronoun, or the literal string `{{SPEAKER_NAME}}` as the subject.
 
 
-POSITIVE example — speaker id is "Speaker0", transcript: "[user] Play some jazz. [user] Play jazz again."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "speaker0", transcript: "[user] Play some jazz. [user] Play jazz again."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Jazz", "entity_type": "preference", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker0", "predicate": "listens_to", "object": "Jazz", "relation_type": "preference", "confidence": 0.8}}],
- "summary": "Speaker0 listens to jazz (requested multiple times)."}}
+ "relations": [{{"subject": "speaker0", "predicate": "listens_to", "object": "Jazz", "relation_type": "preference", "confidence": 0.8}}],
+ "summary": "speaker0 listens to jazz (requested multiple times)."}}
 
 
-POSITIVE example — speaker id is "Speaker0", transcript: "[user] I love hiking on weekends."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "speaker0", transcript: "[user] I love hiking on weekends."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Hiking", "entity_type": "preference", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker0", "predicate": "enjoys", "object": "Hiking", "relation_type": "preference", "confidence": 0.95}}],
- "summary": "Speaker0 enjoys hiking on weekends."}}
+ "relations": [{{"subject": "speaker0", "predicate": "enjoys", "object": "Hiking", "relation_type": "preference", "confidence": 0.95}}],
+ "summary": "speaker0 enjoys hiking on weekends."}}
 
 
-POSITIVE example — speaker id is "Speaker0", transcript: "[user] I usually do yoga in the mornings before breakfast."
-{{"entities": [{{"name": "Speaker0", "entity_type": "person", "attributes": {{}}}},
+POSITIVE example — speaker id is "speaker0", transcript: "[user] I usually do yoga in the mornings before breakfast."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Yoga", "entity_type": "preference", "attributes": {{}}}}],
- "relations": [{{"subject": "Speaker0", "predicate": "practices", "object": "Yoga", "relation_type": "preference", "confidence": 0.9}}],
- "summary": "Speaker0 practices yoga in the mornings before breakfast."}}
+ "relations": [{{"subject": "speaker0", "predicate": "practices", "object": "Yoga", "relation_type": "preference", "confidence": 0.9}}],
+ "summary": "speaker0 practices yoga in the mornings before breakfast."}}
 
 
 NEGATIVE example — transcript: "[user] Play some music. [assistant] Playing on media_player.living_room."

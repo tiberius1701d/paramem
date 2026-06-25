@@ -84,6 +84,61 @@ class TestEntryFactText:
         # "_" → " ", " " → collapsed to one space
         assert "  " not in result
 
+    # --- Phase B: resolve callback ---
+
+    def test_resolve_none_byte_identical(self) -> None:
+        """resolve=None (default) is byte-identical to passing no resolver."""
+        entry = {"subject": "speaker0", "predicate": "lives_in", "object": "Berlin"}
+        assert entry_fact_text(entry) == entry_fact_text(entry, resolve=None)
+
+    def test_resolve_subject_position(self) -> None:
+        """resolver applied to subject when subject is a speaker{N} token."""
+        resolve = lambda t: "Dana" if t == "speaker9" else t  # noqa: E731
+        result = entry_fact_text(
+            {"subject": "speaker9", "predicate": "lives_in", "object": "Berlin"},
+            resolve=resolve,
+        )
+        assert result == "Dana lives in Berlin"
+
+    def test_resolve_object_position(self) -> None:
+        """resolver applied to object when object is a speaker{N} token."""
+        resolve = lambda t: "Dana" if t == "speaker9" else t  # noqa: E731
+        result = entry_fact_text(
+            {"subject": "speaker0", "predicate": "knows", "object": "speaker9"},
+            resolve=resolve,
+        )
+        assert "Dana" in result
+        assert "speaker9" not in result
+
+    def test_resolve_anon_returns_descriptor(self) -> None:
+        """When resolver returns THIRD_PARTY_DESCRIPTOR for anon, it appears in both positions."""
+        descriptor = "another speaker"
+        resolve = lambda t: descriptor if t.startswith("speaker") else t  # noqa: E731
+        result_subj = entry_fact_text(
+            {"subject": "speaker9", "predicate": "lives_in", "object": "Paris"},
+            resolve=resolve,
+        )
+        assert descriptor in result_subj
+        assert "speaker9" not in result_subj
+
+        result_obj = entry_fact_text(
+            {"subject": "speaker0", "predicate": "knows", "object": "speaker9"},
+            resolve=resolve,
+        )
+        assert descriptor in result_obj
+        assert "speaker9" not in result_obj
+
+    def test_resolve_non_speaker_passthrough(self) -> None:
+        """Non-speaker tokens are returned unchanged by a speaker-only resolver."""
+        from paramem.graph.name_match import is_speaker_id
+
+        resolve = lambda t: "RESOLVED" if is_speaker_id(t) else t  # noqa: E731
+        result = entry_fact_text(
+            {"subject": "Alex", "predicate": "knows", "object": "Bob"},
+            resolve=resolve,
+        )
+        assert result == "Alex knows Bob"
+
 
 # ---------------------------------------------------------------------------
 # probe_keys_grouped_by_adapter — should_abort cooperative abort

@@ -150,7 +150,7 @@ class TestMarkStaleKeys:
 
     def test_keys_removed_from_registry_and_saved(self, tmp_path, monkeypatch):
         """store.discard_keys called with mode='erase'; registry.save called for affected tier."""
-        speaker_id = "Speaker0"
+        speaker_id = "speaker0"
         keys = ["graph1", "graph3"]
         loop = _make_loop(speaker_id, keys)
         cfg = _make_config(tmp_path)
@@ -196,7 +196,7 @@ class TestMarkStaleKeys:
         (not a separate sidecar), so we verify the in-memory fingerprint map
         rather than a separate simhash_registry.json save.
         """
-        speaker_id = "Speaker0"
+        speaker_id = "speaker0"
         keys = ["graph2"]
         key = keys[0]
 
@@ -243,7 +243,7 @@ class TestMarkStaleKeys:
 
     def test_no_keys_no_registry_mutations(self, tmp_path, monkeypatch):
         """When iter_bookkeeping yields no keys for the speaker, discard_keys is not called."""
-        speaker_id = "Speaker0"
+        speaker_id = "speaker0"
         loop = _make_loop(speaker_id, [])
         state = _make_state(
             tmp_path,
@@ -274,7 +274,7 @@ class TestSpeakerProfileRemoval:
 
     def test_profile_found_and_removed(self, tmp_path, monkeypatch):
         """SpeakerStore.remove returns True → removed_speaker is True."""
-        speaker_id = "Speaker1"
+        speaker_id = "speaker1"
         loop = _make_loop(speaker_id, [])
         state = _make_state(
             tmp_path,
@@ -293,7 +293,7 @@ class TestSpeakerProfileRemoval:
 
     def test_profile_not_found(self, tmp_path, monkeypatch):
         """SpeakerStore.remove returns False → removed_speaker is False."""
-        speaker_id = "Speaker99"
+        speaker_id = "speaker99"
         loop = _make_loop(speaker_id, [])
         state = _make_state(
             tmp_path,
@@ -311,7 +311,7 @@ class TestSpeakerProfileRemoval:
 
     def test_no_speaker_store(self, tmp_path, monkeypatch):
         """When speaker_store is None (voice disabled), removed_speaker is False."""
-        speaker_id = "Speaker0"
+        speaker_id = "speaker0"
         loop = _make_loop(speaker_id, [])
         state = _make_state(
             tmp_path,
@@ -338,7 +338,7 @@ class TestPendingSessionDiscard:
 
     def test_pending_sessions_discarded(self, tmp_path, monkeypatch):
         """Sessions attributed to the speaker are discarded; ids in response."""
-        speaker_id = "Speaker0"
+        speaker_id = "speaker0"
         conv_ids = ["conv-a", "conv-b"]
         loop = _make_loop(speaker_id, [])
         buffer = _make_buffer(speaker_id, conv_ids)
@@ -359,10 +359,10 @@ class TestPendingSessionDiscard:
 
     def test_no_pending_sessions(self, tmp_path, monkeypatch):
         """When no pending sessions exist for the speaker, discarded_sessions is empty."""
-        speaker_id = "Speaker0"
+        speaker_id = "speaker0"
         loop = _make_loop(speaker_id, [])
         buffer = MagicMock()
-        buffer._sessions = {"other-conv": {"speaker_id": "Speaker1"}}
+        buffer._sessions = {"other-conv": {"speaker_id": "speaker1"}}
         state = _make_state(
             tmp_path,
             loop=loop,
@@ -380,8 +380,8 @@ class TestPendingSessionDiscard:
 
     def test_sessions_with_mixed_speakers_only_discards_target(self, tmp_path, monkeypatch):
         """Only sessions whose speaker_id matches the request are discarded."""
-        speaker_id = "Speaker0"
-        other_id = "Speaker1"
+        speaker_id = "speaker0"
+        other_id = "speaker1"
         loop = _make_loop(speaker_id, [])
         buffer = MagicMock()
         buffer._sessions = {
@@ -418,12 +418,12 @@ class TestErrorCases:
         state = _make_state(
             tmp_path,
             loop=None,
-            speaker_store=_make_speaker_store("Speaker0"),
+            speaker_store=_make_speaker_store("speaker0"),
             buffer=MagicMock(),
         )
 
         client = _make_client(monkeypatch, state)
-        resp = client.post("/speaker/forget", json={"speaker_id": "Speaker0"})
+        resp = client.post("/speaker/forget", json={"speaker_id": "speaker0"})
 
         assert resp.status_code == 503
         detail = resp.json().get("detail", {})
@@ -431,7 +431,7 @@ class TestErrorCases:
 
     def test_unsupported_strategy_returns_400(self, tmp_path, monkeypatch):
         """Requesting an unsupported strategy returns 400."""
-        speaker_id = "Speaker0"
+        speaker_id = "speaker0"
         loop = _make_loop(speaker_id, [])
         state = _make_state(
             tmp_path,
@@ -514,7 +514,7 @@ class TestLiveSlotManifestReStamp:
         tier_name = "episodic"
         key_to_forget = "graph1"
         key_to_keep = "graph2"
-        speaker_id = "Speaker0"
+        speaker_id = "speaker0"
 
         # Build a real KeyRegistry with both keys in the episodic tier.
         real_store = MemoryStore(replay_enabled=True)
@@ -618,7 +618,7 @@ class TestLiveSlotManifestReStamp:
         """
         tier_name = "episodic"
         key_to_forget = "graph1"
-        speaker_id = "Speaker0"
+        speaker_id = "speaker0"
 
         # Build a real KeyRegistry with the key.
         real_store = MemoryStore(replay_enabled=True)

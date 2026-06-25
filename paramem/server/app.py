@@ -43,6 +43,7 @@ from paramem.backup.backup import write as backup_write
 from paramem.backup.backup import write_bundle
 from paramem.backup.types import ArtifactKind
 from paramem.graph.extractor import ExtractionFailed
+from paramem.graph.name_match import is_speaker_id as _is_speaker_id
 from paramem.models.loader import load_base_model, switch_adapter, unload_model
 from paramem.server import calibrate as calibrate_module
 from paramem.server.active_store_migration import migrate
@@ -548,7 +549,7 @@ class SpeakerForgetRequest(BaseModel):
     Attributes
     ----------
     speaker_id:
-        The speaker ID to forget (e.g. ``"Speaker0"``).  Exact match.
+        The speaker ID to forget (e.g. ``"speaker0"``).  Exact match.
     strategy:
         Erasure strategy.  Only ``"mark_stale"`` is implemented; the field is
         a future extension point for a ``"discard_interim"`` strategy
@@ -2654,14 +2655,14 @@ class ResolvedSpeaker:
     Attributes
     ----------
     speaker_id:
-        Canonical speaker identifier (e.g. ``"Speaker0"``), or ``None``
+        Canonical speaker identifier (e.g. ``"speaker0"``), or ``None``
         when resolution failed or the caller is fully anonymous.
     speaker:
         Display name returned by the speaker store (used in ChatResponse).
     display_speaker:
         Anonymization-safe name for system-prompt injection and greeting.
         ``None`` when the speaker is anonymous (``is_anonymous`` is true)
-        so the robotic ``Speaker{N}`` label is suppressed until disclosure.
+        so the internal ``speaker{N}`` token is suppressed until disclosure.
     follow_up:
         Server-initiated follow-up prompt (e.g. "What's your name?") when
         the voice is unknown.  ``None`` after successful disclosure or for
@@ -2771,7 +2772,7 @@ async def _resolve_and_enroll_speaker(
                     reprompt_interval,
                 )
 
-            # Promote to a canonical Speaker{N} ID so facts flow through
+            # Promote to a canonical speaker{N} id so facts flow through
             # extraction and adapter training. Orthogonal to the enrollment
             # prompt above — that coordinates "what's your name?" prompts;
             # this ensures sessions are not silently discarded at consolidation.
@@ -2796,7 +2797,7 @@ async def _resolve_and_enroll_speaker(
     # fragility of pattern-matching introduction phrasings. Operates on
     # speaker_id directly so it works for both freshly-promoted voices
     # and returning anonymous speakers (whose unknown_speakers group is
-    # gone after the server restart that allocated their Speaker{N}).
+    # gone after the server restart that allocated their speaker{N}).
     try:
         if speaker_id and store and store.is_anonymous(speaker_id) and request.speaker_embedding:
             extracted = await _run_enrollment_for_speaker(
@@ -2833,11 +2834,11 @@ async def _resolve_and_enroll_speaker(
     else:
         effective_language = None
 
-    # User-facing salutation: suppress the canonical "Speaker{N}" token for
+    # User-facing salutation: suppress the internal speaker{N} token for
     # voice-promoted but undisclosed profiles. Internal speaker_id is kept
     # for attribution; only the display name is dropped so the greeting
     # prefix and the system-prompt "You are speaking with X" string skip the
-    # robotic label until the user introduces themselves.
+    # internal token until the user introduces themselves.
     display_speaker: str | None = speaker
     if speaker_id and store and store.is_anonymous(speaker_id):
         display_speaker = None
@@ -2905,7 +2906,7 @@ async def _run_chat_turn(
         ``None``.
     display_speaker:
         User-facing salutation: ``None`` when the speaker is anonymous (suppress
-        the canonical ``Speaker{N}`` token); otherwise same as *speaker*.
+        the internal ``speaker{N}`` token); otherwise same as *speaker*.
     history:
         Prior conversation turns to pass to ``handle_chat``, or ``None``.
     speaker_embedding:
@@ -2933,6 +2934,12 @@ async def _run_chat_turn(
 
     # Cloud-only mode — route via HA graph + SOTA, no local model.
     if _state["mode"] == "cloud-only":
+        _cloud_speaker_store = _state.get("speaker_store")
+        _cloud_known_entities: set[str] | None = None
+        if _cloud_speaker_store is not None:
+            _names = _cloud_speaker_store.household_display_names()
+            if _names:
+                _cloud_known_entities = {n.lower().strip() for n in _names if n}
         result = _cloud_only_route(
             text=text,
             speaker=display_speaker,
@@ -2942,6 +2949,7 @@ async def _run_chat_turn(
             ha_client=_state.get("ha_client"),
             sota_agent=_state.get("sota_agent"),
             language=language,
+            known_entities=_cloud_known_entities,
         )
         buffer.append(
             conversation_id,
@@ -3004,6 +3012,7 @@ async def _run_chat_turn(
                 # the source mode's store. None == use config.consolidation.mode.
                 effective_mode=_state.get("effective_mode"),
                 memory_store=_state["memory_store"],
+                speaker_store=_state.get("speaker_store"),
             ),
         )
 
@@ -6376,7 +6385,14 @@ async def speaker_forget(request: SpeakerForgetRequest):
         )
 
     config = _state["config"]
+    # Normalize the incoming speaker_id to lowercase so external cased input
+    # (e.g. "Speaker0") matches the internally stored canonical form ("speaker0")
+    # produced by set_bookkeeping's is_speaker_id gate.  Single normalization
+    # here covers all three comparisons below (bookkeeping, speaker_store.remove,
+    # session_meta match).
     speaker_id = request.speaker_id
+    if _is_speaker_id(speaker_id):
+        speaker_id = speaker_id.lower()
 
     # Locate keys for this speaker via the registry bookkeeping (source of
     # truth) rather than the resident merger.graph (which is cleared at
@@ -6566,6 +6582,12 @@ async def debug_probe(request: DebugProbeRequest):
 
     # Cloud-only mode mirrors /chat dispatch — no GPU lock, no model.
     if _state["mode"] == "cloud-only":
+        _cloud_speaker_store2 = _state.get("speaker_store")
+        _cloud_known_entities2: set[str] | None = None
+        if _cloud_speaker_store2 is not None:
+            _names2 = _cloud_speaker_store2.household_display_names()
+            if _names2:
+                _cloud_known_entities2 = {n.lower().strip() for n in _names2 if n}
         cloud_result = _cloud_only_route(
             text=request.text,
             speaker=speaker_name,
@@ -6575,6 +6597,7 @@ async def debug_probe(request: DebugProbeRequest):
             ha_client=_state.get("ha_client"),
             sota_agent=_state.get("sota_agent"),
             language=detected_language,
+            known_entities=_cloud_known_entities2,
         )
         return ChatResponse(text=cloud_result.text, escalated=True, speaker=speaker_name)
 
@@ -6608,6 +6631,7 @@ async def debug_probe(request: DebugProbeRequest):
                 language=detected_language,
                 effective_mode=_state.get("effective_mode"),
                 memory_store=_state["memory_store"],
+                speaker_store=_state.get("speaker_store"),
             ),
         )
 
@@ -11225,11 +11249,17 @@ def _cloud_only_route(
     ha_client=None,
     sota_agent=None,
     language: str | None = None,
+    known_entities: "set[str] | None" = None,
 ) -> ChatResult:
     """Route queries when the local model is unavailable (cloud-only mode).
 
     HA first (has tools for weather, time, devices), SOTA as fallback
     for reasoning. Mutual fallback: if one fails, try the other.
+
+    ``known_entities`` is the set of lowercased household display names.
+    Passed to ``sanitize_for_cloud`` and ``_escalate_to_sota`` so that a
+    household name typed directly by the user (e.g. "Where does Alex live?")
+    is recognised as personal content and redacted under ``cloud_mode=anonymize``.
     """
     from paramem.server.sanitizer import sanitize_for_cloud
 
@@ -11254,7 +11284,9 @@ def _cloud_only_route(
 
     # HA failed or unavailable → try SOTA for reasoning
     if sota_agent is not None:
-        sanitized, _ = sanitize_for_cloud(text, mode=config.sanitization.mode)
+        sanitized, _ = sanitize_for_cloud(
+            text, mode=config.sanitization.mode, known_entities=known_entities
+        )
         if sanitized is not None:
             logger.info("Cloud-only route: escalating to SOTA")
             result = _escalate_to_sota(
@@ -11264,6 +11296,7 @@ def _cloud_only_route(
                 speaker=speaker,
                 history=history,
                 language=language,
+                known_entities=known_entities,
             )
             if result.text:
                 logger.info("Cloud-only route: SOTA responded")
@@ -13890,7 +13923,7 @@ def _run_active_store_migration_sync() -> None:
 # --- Speaker enrollment (utterance-driven) ---
 #
 # When an unknown speaker talks, their voice embedding is stored alongside
-# each transcript turn and a canonical Speaker{N} ID is allocated. The
+# each transcript turn and a canonical speaker{N} id is allocated. The
 # chat handler then invokes _run_enrollment_for_group synchronously on
 # every anonymous turn so the LLM extractor and the follow-on
 # store.enroll / claim_sessions / cleanup run before the response is

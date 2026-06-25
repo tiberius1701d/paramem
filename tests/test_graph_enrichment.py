@@ -944,14 +944,14 @@ class TestInterimEnrichmentHook:
                     predicate="knows",
                     object="B",
                     relation_type="social",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
                 Relation(
                     subject="B",
                     predicate="knows",
                     object="A",
                     relation_type="social",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
         )
@@ -991,11 +991,11 @@ class TestInterimEnrichmentHook:
             patch("paramem.models.loader.save_adapter"),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
-            eps, proc = loop.extract_session("t", "s1", "Speaker0")
+            eps, proc = loop.extract_session("t", "s1", "speaker0")
             loop.run_consolidation_cycle(
                 eps,
                 proc,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="s1",
                 schedule="12h",
@@ -1040,11 +1040,11 @@ class TestInterimEnrichmentHook:
             patch("paramem.models.loader.save_adapter"),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
-            eps, proc = loop.extract_session("t", "s1", "Speaker0")
+            eps, proc = loop.extract_session("t", "s1", "speaker0")
             loop.run_consolidation_cycle(
                 eps,
                 proc,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="s1",
                 schedule="12h",
@@ -1088,11 +1088,11 @@ class TestInterimEnrichmentHook:
             patch("paramem.models.loader.save_adapter"),
             patch("paramem.adapters.manifest.build_manifest_for", return_value=None),
         ):
-            eps, proc = loop.extract_session("t", "s1", "Speaker0")
+            eps, proc = loop.extract_session("t", "s1", "speaker0")
             loop.run_consolidation_cycle(
                 eps,
                 proc,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="s1",
                 schedule="12h",
@@ -1137,11 +1137,11 @@ class TestInterimEnrichmentHook:
             existing_name: MagicMock(),
         }
 
-        eps, proc = loop.extract_session("t", "s1", "Speaker0")
+        eps, proc = loop.extract_session("t", "s1", "speaker0")
         result = loop.run_consolidation_cycle(
             eps,
             proc,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             mode="train",
             run_label="s1",
             schedule="12h",
@@ -1922,18 +1922,18 @@ class TestInterimKeyingSeams:
         # Route a speaker Relation through the real merger path — this stamps
         # speaker_id on the edge via A-1 (Case-3 net-new insert).
         alice_rel = Relation(
-            subject="Speaker0",
+            subject="speaker0",
             predicate="lives_in",
             object="Berlin",
             relation_type="factual",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         from paramem.graph.schema import Entity
 
         session = SessionGraph(
             session_id="s001",
             timestamp="2026-01-01T00:00:00+00:00",
-            entities=[Entity(name="Speaker0", entity_type="person", speaker_id="Speaker0")],
+            entities=[Entity(name="speaker0", entity_type="person", speaker_id="speaker0")],
             relations=[alice_rel],
         )
         loop.merger.merge(session)
@@ -1960,8 +1960,8 @@ class TestInterimKeyingSeams:
         assert len(deferred_writes) == 2, f"Expected 2 deferred writes; got {deferred_writes}"
 
         # Find speaker-attributed record by speaker_id.
-        speaker_rec = next((r for r in deferred_writes if r["speaker_id"] == "Speaker0"), None)
-        assert speaker_rec is not None, "No deferred record with speaker_id='Speaker0'"
+        speaker_rec = next((r for r in deferred_writes if r["speaker_id"] == "speaker0"), None)
+        assert speaker_rec is not None, "No deferred record with speaker_id='speaker0'"
 
         # Concept-node record must carry "".
         concept_rec = next((r for r in deferred_writes if r["speaker_id"] == ""), None)
@@ -1969,9 +1969,9 @@ class TestInterimKeyingSeams:
 
         # tier_keyed entries carry the same speaker_ids — uniform entry shape.
         speaker_entry = next(
-            (e for e in tier_keyed["episodic"] if e["speaker_id"] == "Speaker0"), None
+            (e for e in tier_keyed["episodic"] if e["speaker_id"] == "speaker0"), None
         )
-        assert speaker_entry is not None, "No tier_keyed entry for Speaker0"
+        assert speaker_entry is not None, "No tier_keyed entry for speaker0"
 
     def test_explicit_empty_speaker_id_not_overwritten_by_default(self, tmp_path):
         """C-1 invariant: concept node with no speaker_id attr → "" terminal fallback.
@@ -2074,7 +2074,7 @@ class TestInterimKeyingSeams:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        loop.merger.graph.add_node("frank", speaker_id="Speaker1", attributes={"name": "Frank"})
+        loop.merger.graph.add_node("frank", speaker_id="speaker1", attributes={"name": "Frank"})
         loop.merger.graph.add_node("hamburg", attributes={"name": "Hamburg"})
         loop.merger.graph.add_edge(
             "frank", "hamburg", predicate="works_in", relation_type="factual"
@@ -2100,7 +2100,7 @@ class TestInterimKeyingSeams:
 
         assert rec["tier"] == "episodic"
         assert rec["predicate"] == "works_in"
-        assert rec["speaker_id"] == "Speaker1"
+        assert rec["speaker_id"] == "speaker1"
         assert rec["relation_type"] == "factual"
 
         # entry must have key, subject, predicate, object.
@@ -2362,7 +2362,8 @@ class TestDeferredFlushAllowEmpty:
 
 def _seed_speaker_node(loop, speaker_id: str, display: str) -> None:
     """Seed a real speaker node via the merger (§0 invariant: node key is
-    the casefolded speaker_id, e.g. ``canonical_speaker("Speaker0") == "speaker0"``).
+    the lowercase speaker_id, e.g. ``"speaker0"`` — same as entity.speaker_id
+    verbatim under the lowercase-uniform speaker-identity design).
 
     Uses the real merger.merge path — no raw add_node shortcut — so the test
     exercises the same node-key convention as production.
@@ -2380,20 +2381,20 @@ def _seed_speaker_node(loop, speaker_id: str, display: str) -> None:
 
 
 class TestEnrichmentVerbatimSpeakerKeyResolution:
-    """Regression: SOTA echoes back the cased speaker id ('Speaker0'), which
+    """Regression: SOTA echoes back the cased speaker id ('speaker0'), which
     must resolve to the existing casefolded speaker node key ('speaker0') via
     P5 (canonical fallback).  No duplicate node is created.
 
     §0 invariant (Step 2): speaker node keys are the casefolded form of the
-    speaker_id.  resolve_to_node_key("Speaker0", in_graph) → canonical("Speaker0")
-    = "speaker0" (since "Speaker0" is not in the graph — the key is "speaker0").
+    speaker_id.  resolve_to_node_key("speaker0", in_graph) → canonical("speaker0")
+    = "speaker0" (since "speaker0" is not in the graph — the key is "speaker0").
     """
 
     def test_speaker_subject_resolves_to_verbatim_node_no_duplicate(self, tmp_path, monkeypatch):
-        """An enrichment relation whose subject is the cased speaker id 'Speaker0'
-        resolves to the existing casefolded speaker node ('speaker0') without
-        creating a second node.  The minted edge inherits speaker_id='Speaker0'
-        from the node attribute, NOT ''."""
+        """An enrichment relation whose subject is the lowercase speaker id 'speaker0'
+        resolves to the existing canonical speaker node without creating a second node.
+        The minted edge inherits speaker_id='speaker0' from the node attribute, NOT ''.
+        """
         from paramem.training.key_registry import KeyRegistry
 
         loop = _make_loop(tmp_path, replay_enabled=True)
@@ -2402,19 +2403,18 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             loop.store.load_registry(tier, KeyRegistry())
 
         # _seed_speaker_node creates the speaker node via the real merger, keyed
-        # by the casefolded speaker_id (§0): "speaker0".
-        _seed_speaker_node(loop, "Speaker0", "Alex")
+        # by the canonical speaker_id (§0): "speaker0".
+        _seed_speaker_node(loop, "speaker0", "Alex")
         # A concept node the speaker relates to.
         loop.merger.graph.add_node("mentoring", attributes={"name": "Mentoring"})
 
-        # Confirm §0 key convention: casefolded key only.
+        # Confirm §0 key convention: canonical lowercase key only.
         assert "speaker0" in loop.merger.graph.nodes
-        assert "Speaker0" not in loop.merger.graph.nodes
 
-        # SOTA echoes back the cased speaker id "Speaker0"; P5 resolves it to "speaker0".
+        # SOTA emits lowercase speaker id "speaker0" as the subject.
         rels = [
             {
-                "subject": "Speaker0",
+                "subject": "speaker0",
                 "predicate": "interested_in",
                 "object": "mentoring",
                 "relation_type": "preference",
@@ -2430,23 +2430,21 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             result = loop._run_graph_enrichment()
 
         assert not result["skipped"]
-        # Still exactly one speaker node — no cased duplicate created.
+        # Still exactly one speaker node — no duplicate created.
         assert "speaker0" in loop.merger.graph.nodes
-        assert "Speaker0" not in loop.merger.graph.nodes, (
-            "Only one speaker node should exist, keyed 'speaker0'; 'Speaker0' is a dup"
+        # The speaker node carries its speaker_id.  _synth_speaker_entities emits
+        # Entity(name="speaker0", speaker_id="speaker0") which refreshes
+        # attributes["name"] to "speaker0" (the canonical speaker_id).
+        node = loop.merger.graph.nodes["speaker0"]
+        assert node.get("speaker_id") == "speaker0", (
+            f"Speaker node must carry speaker_id='speaker0'; got {node.get('speaker_id')!r}"
         )
-        # B-1 fix: the display surface (attributes["name"]) must remain cased
-        # "Speaker0", not the casefolded node key "speaker0".  _upsert_entity's
-        # is_speaker refresh branch writes entity.name (= _r.speaker_id = "Speaker0"),
-        # which is correct.  If the B-1 fix were reverted to name=_r.subject the
-        # casefolded key "speaker0" would overwrite the display surface here.
-        speaker_name = loop.merger.graph.nodes["speaker0"]["attributes"].get("name")
-        assert speaker_name == "Speaker0", (
-            f"Speaker node display surface must stay cased 'Speaker0' (B-1 invariant); "
-            f"got {speaker_name!r}"
+        assert node["attributes"].get("name") == "speaker0", (
+            f"Speaker node attributes['name'] must be 'speaker0' after enrichment; "
+            f"got {node['attributes'].get('name')!r}"
         )
-        # The enrichment edge roots at the casefolded speaker node and carries
-        # speaker_id="Speaker0" (from the node's attribute).
+        # The enrichment edge roots at the canonical speaker node and carries
+        # speaker_id="speaker0" (from the node's attribute).
         enriched = [
             (u, v, d)
             for u, v, d in loop.merger.graph.edges(data=True)
@@ -2455,17 +2453,11 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         assert len(enriched) == 1, f"Expected 1 enrichment edge; got {enriched}"
         u, _v, d = enriched[0]
         assert u == "speaker0", f"Enrichment edge subject must be 'speaker0'; got {u!r}"
-        assert d.get("speaker_id") == "Speaker0", (
-            f"Edge speaker_id must be 'Speaker0' (cased, from the node attribute); "
+        assert d.get("speaker_id") == "speaker0", (
+            f"Edge speaker_id must be 'speaker0' (from the node attribute); "
             f"got {d.get('speaker_id')!r}"
         )
-        # B-1 fix: the TRAINING SUBJECT (entry["subject"]) for the minted
-        # indexed-key entry must be the cased display surface "Speaker0", not
-        # the casefolded node key "speaker0".  _build_all_edge_entries_into reads
-        # _subj_display from attributes["name"] — so this assertion is coupled to
-        # the B-1 display-surface invariant above.  If attributes["name"] were
-        # clobbered to "speaker0", the training subject would also be "speaker0",
-        # causing the model to learn the wrong (casefolded) subject string.
+        # The minted training subject reads attributes["name"] = "speaker0".
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         loop._build_all_edge_entries_into(tier_keyed)
         enrichment_entries = [
@@ -2477,17 +2469,16 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             f"Expected 1 minted entry for 'interested in'; got {enrichment_entries}"
         )
         minted_subject = enrichment_entries[0]["subject"]
-        assert minted_subject == "Speaker0", (
-            f"Minted indexed-key training subject must be cased 'Speaker0' (B-1 invariant); "
-            f"got {minted_subject!r}"
+        assert minted_subject == "speaker0", (
+            f"Minted indexed-key training subject must be 'speaker0'; got {minted_subject!r}"
         )
 
     def test_speaker_to_speaker_two_keys_distinct_speakers_router_filed(
         self, tmp_path, monkeypatch
     ):
         """Speaker↔speaker: enrichment emits BOTH directions of colleague_of
-        with symmetric=true; both endpoints are cased speaker ids → resolved to
-        casefolded keys → two directed keys mint with distinct speaker_ids, each
+        with symmetric=true; both endpoints are lowercase speaker ids → resolved to
+        canonical node keys → two directed keys mint with distinct speaker_ids, each
         filed under its own speaker in the router index."""
         from paramem.server.router import QueryRouter
         from paramem.training.key_registry import KeyRegistry
@@ -2497,29 +2488,27 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        _seed_speaker_node(loop, "Speaker0", "Alex")
-        _seed_speaker_node(loop, "Speaker1", "Robin")
+        _seed_speaker_node(loop, "speaker0", "Alex")
+        _seed_speaker_node(loop, "speaker1", "Robin")
 
-        # §0: speaker node keys are casefolded.
+        # §0: speaker node keys are lowercase canonical.
         assert "speaker0" in loop.merger.graph.nodes
         assert "speaker1" in loop.merger.graph.nodes
-        assert "Speaker0" not in loop.merger.graph.nodes
-        assert "Speaker1" not in loop.merger.graph.nodes
 
-        # SOTA emits BOTH directions, both symmetric=true, cased speaker ids.
+        # SOTA emits BOTH directions, both symmetric=true, lowercase speaker ids.
         rels = [
             {
-                "subject": "Speaker0",
+                "subject": "speaker0",
                 "predicate": "colleague_of",
-                "object": "Speaker1",
+                "object": "speaker1",
                 "relation_type": "social",
                 "confidence": 0.9,
                 "symmetric": True,
             },
             {
-                "subject": "Speaker1",
+                "subject": "speaker1",
                 "predicate": "colleague_of",
-                "object": "Speaker0",
+                "object": "speaker0",
                 "relation_type": "social",
                 "confidence": 0.9,
                 "symmetric": True,
@@ -2533,12 +2522,8 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             result = loop._run_graph_enrichment()
 
         assert not result["skipped"]
-        # No cased duplicates were created.
-        assert "Speaker0" not in loop.merger.graph.nodes
-        assert "Speaker1" not in loop.merger.graph.nodes
-
         # Both directed colleague_of edges survive (not collapsed — both_speakers gate).
-        # Edges root at casefolded keys after P5 resolution.
+        # Edges root at canonical lowercase keys.
         colleague_edges = [
             (u, v)
             for u, v, d in loop.merger.graph.edges(data=True)
@@ -2556,30 +2541,30 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         minted = [e for e in tier_keyed["episodic"] if e["predicate"] == "colleague of"]
         assert len(minted) == 2, f"Expected 2 minted colleague_of keys; got {minted}"
         sids = {e["speaker_id"] for e in minted}
-        assert sids == {"Speaker0", "Speaker1"}, (
-            f"Two keys must carry distinct speaker_ids (cased, from node attributes); got {sids}"
+        assert sids == {"speaker0", "speaker1"}, (
+            f"Two keys must carry distinct speaker_ids (lowercase canonical); got {sids}"
         )
 
         # Router index files each key under its own speaker.
         router = QueryRouter(adapter_dir=tmp_path, memory_store=loop.store)
         router.reload()
-        s0_keys = router._speaker_key_index.get("Speaker0", set())
-        s1_keys = router._speaker_key_index.get("Speaker1", set())
-        s0_minted = {e["key"] for e in minted if e["speaker_id"] == "Speaker0"}
-        s1_minted = {e["key"] for e in minted if e["speaker_id"] == "Speaker1"}
+        s0_keys = router._speaker_key_index.get("speaker0", set())
+        s1_keys = router._speaker_key_index.get("speaker1", set())
+        s0_minted = {e["key"] for e in minted if e["speaker_id"] == "speaker0"}
+        s1_minted = {e["key"] for e in minted if e["speaker_id"] == "speaker1"}
         assert s0_minted <= s0_keys, (
-            f"Speaker0's key must be filed under Speaker0; index={s0_keys}, key={s0_minted}"
+            f"speaker0's key must be filed under speaker0; index={s0_keys}, key={s0_minted}"
         )
         assert s1_minted <= s1_keys, (
-            f"Speaker1's key must be filed under Speaker1; index={s1_keys}, key={s1_minted}"
+            f"speaker1's key must be filed under speaker1; index={s1_keys}, key={s1_minted}"
         )
 
     def test_same_as_contracts_unbound_into_verbatim_speaker_node(self, tmp_path, monkeypatch):
-        """same_as ['Speaker0', 'alex'] contracts the unbound 'alex' concept node
+        """same_as ['speaker0', 'alex'] contracts the unbound 'alex' concept node
         INTO the casefolded speaker node 'speaker0'.
 
-        §0 invariant: keep="Speaker0" resolves via P5 to "speaker0" (canonical fallback;
-        "Speaker0" is NOT a live node key after Step 2 — key is "speaker0").
+        §0 invariant: keep="speaker0" resolves via P5 to "speaker0" (canonical fallback;
+        "speaker0" is NOT a live node key after Step 2 — key is "speaker0").
         drop="alex" resolves via membership shortcut (already in graph).  Contraction
         succeeds: "alex" is absorbed into "speaker0"."""
         from paramem.training.key_registry import KeyRegistry
@@ -2590,7 +2575,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             loop.store.load_registry(tier, KeyRegistry())
 
         # Casefolded speaker node ("speaker0") + an unbound concept node "alex".
-        _seed_speaker_node(loop, "Speaker0", "Alex")
+        _seed_speaker_node(loop, "speaker0", "Alex")
         loop.merger.graph.add_node(
             "alex",
             entity_type="person",
@@ -2607,10 +2592,10 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         assert "speaker0" in loop.merger.graph.nodes
         assert "alex" in loop.merger.graph.nodes
 
-        # SAME_AS keep="Speaker0" (cased; P5 resolves to "speaker0"), drop="alex".
-        # Patch surface gate to True (the opaque "Speaker0" shares no token with "alex").
+        # SAME_AS keep="speaker0" (cased; P5 resolves to "speaker0"), drop="alex".
+        # Patch surface gate to True (the opaque "speaker0" shares no token with "alex").
         rels: list = []
-        same_as = [["Speaker0", "alex"]]
+        same_as = [["speaker0", "alex"]]
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with (
             patch(
@@ -2625,13 +2610,10 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             result = loop._run_graph_enrichment()
 
         assert not result["skipped"]
-        # Contraction landed on the casefolded speaker node "speaker0";
+        # Contraction landed on the canonical speaker node "speaker0";
         # "alex" is gone (absorbed).
         assert "speaker0" in loop.merger.graph.nodes, (
-            "same_as must contract into the casefolded 'speaker0' speaker node"
-        )
-        assert "Speaker0" not in loop.merger.graph.nodes, (
-            "'Speaker0' must not appear as a separate cased node"
+            "same_as must contract into the canonical 'speaker0' speaker node"
         )
         assert "alex" not in loop.merger.graph.nodes, (
             "'alex' must be absorbed into the 'speaker0' node"
@@ -2666,23 +2648,23 @@ class TestUniqueSpeakerPredecessor:
         """Exactly one predecessor with a non-empty speaker_id → that sid."""
         loop = _make_loop(tmp_path)
         loop.merger.graph.add_node(
-            "Speaker0",
+            "speaker0",
             entity_type="person",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         loop.merger.graph.add_node("concept", attributes={})
-        loop.merger.graph.add_edge("Speaker0", "concept", predicate="held role")
+        loop.merger.graph.add_edge("speaker0", "concept", predicate="held role")
 
-        assert loop._unique_speaker_predecessor("concept") == "Speaker0"
+        assert loop._unique_speaker_predecessor("concept") == "speaker0"
 
     def test_two_speaker_predecessors_returns_empty(self, tmp_path):
         """Two distinct speakers → '' (ambiguous — never mis-attribute)."""
         loop = _make_loop(tmp_path)
-        loop.merger.graph.add_node("Speaker0", speaker_id="Speaker0")
-        loop.merger.graph.add_node("Speaker1", speaker_id="Speaker1")
+        loop.merger.graph.add_node("speaker0", speaker_id="speaker0")
+        loop.merger.graph.add_node("speaker1", speaker_id="speaker1")
         loop.merger.graph.add_node("concept", attributes={})
-        loop.merger.graph.add_edge("Speaker0", "concept", predicate="held role")
-        loop.merger.graph.add_edge("Speaker1", "concept", predicate="held role")
+        loop.merger.graph.add_edge("speaker0", "concept", predicate="held role")
+        loop.merger.graph.add_edge("speaker1", "concept", predicate="held role")
 
         assert loop._unique_speaker_predecessor("concept") == ""
 
@@ -2690,10 +2672,10 @@ class TestUniqueSpeakerPredecessor:
         """Chain A(speaker_id='S0') → B(concept) → C(concept): query on C returns ''
         because B carries no speaker_id — inheritance is 1-hop only."""
         loop = _make_loop(tmp_path)
-        loop.merger.graph.add_node("Speaker0", speaker_id="Speaker0")
+        loop.merger.graph.add_node("speaker0", speaker_id="speaker0")
         loop.merger.graph.add_node("B", attributes={})
         loop.merger.graph.add_node("C", attributes={})
-        loop.merger.graph.add_edge("Speaker0", "B", predicate="held role")
+        loop.merger.graph.add_edge("speaker0", "B", predicate="held role")
         loop.merger.graph.add_edge("B", "C", predicate="related to")
 
         # B is C's predecessor, but B has no speaker_id → does not propagate.
@@ -2727,9 +2709,9 @@ class TestSpeakerPredecessorInheritance:
     def test_gap_filled_single_speaker_predecessor(self, tmp_path, monkeypatch):
         """Role-concept attribute edge inherits speaker_id from the unique speaker.
 
-        Graph: Speaker0 →held_role→ 'Senior PM', 'Senior PM' →achievement→ 'Award X'
+        Graph: speaker0 →held_role→ 'Senior PM', 'Senior PM' →achievement→ 'Award X'
         (both via SOTA canned result).  After enrichment + mint, the minted key for
-        'achievement' must carry speaker_id='Speaker0' and be filed under Speaker0
+        'achievement' must carry speaker_id='speaker0' and be filed under speaker0
         in a rebuilt router index.
         """
         from paramem.server.router import QueryRouter
@@ -2740,14 +2722,14 @@ class TestSpeakerPredecessorInheritance:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        # Real speaker node via the merger (verbatim key "Speaker0").
-        _seed_speaker_node(loop, "Speaker0", "Alex")
+        # Real speaker node via the merger (verbatim key "speaker0").
+        _seed_speaker_node(loop, "speaker0", "Alex")
 
         # SOTA emits: bridge edge + role-concept attribute edge.
         # The role concept node ("Senior PM") has no speaker_id of its own.
         rels = [
             {
-                "subject": "Speaker0",
+                "subject": "speaker0",
                 "predicate": "held_role",
                 "object": "Senior PM",
                 "relation_type": "factual",
@@ -2777,7 +2759,7 @@ class TestSpeakerPredecessorInheritance:
         )
 
         # Confirm the speaker node is a predecessor of "senior pm" (bridge edge present).
-        # §0: speaker node key is casefolded ("speaker0"), not "Speaker0".
+        # §0: speaker node key is casefolded ("speaker0"), not "speaker0".
         preds = list(loop.merger.graph.predecessors("senior pm"))
         assert "speaker0" in preds, (
             f"Bridge edge speaker0 →held_role→ 'senior pm' must be in graph; predecessors={preds}"
@@ -2796,23 +2778,23 @@ class TestSpeakerPredecessorInheritance:
         ]
         assert achievement_keys, "No minted key found for the 'achievement' edge"
         key = achievement_keys[0]["key"]
-        assert achievement_keys[0]["speaker_id"] == "Speaker0", (
-            f"Minted achievement key must carry speaker_id='Speaker0' via fallback; "
+        assert achievement_keys[0]["speaker_id"] == "speaker0", (
+            f"Minted achievement key must carry speaker_id='speaker0' via fallback; "
             f"got {achievement_keys[0]['speaker_id']!r}"
         )
 
         bk = loop.store.bookkeeping_for_key(key)
         assert bk is not None
-        assert bk["speaker_id"] == "Speaker0", (
-            f"Bookkeeping speaker_id must be 'Speaker0'; got {bk['speaker_id']!r}"
+        assert bk["speaker_id"] == "speaker0", (
+            f"Bookkeeping speaker_id must be 'speaker0'; got {bk['speaker_id']!r}"
         )
 
-        # Router index must file the key under Speaker0.
+        # Router index must file the key under speaker0.
         router = QueryRouter(adapter_dir=tmp_path, memory_store=loop.store)
         router.reload()
-        s0_keys = router._speaker_key_index.get("Speaker0", set())
+        s0_keys = router._speaker_key_index.get("speaker0", set())
         assert key in s0_keys, (
-            f"Achievement key must be in router._speaker_key_index['Speaker0']; "
+            f"Achievement key must be in router._speaker_key_index['speaker0']; "
             f"index={s0_keys}, key={key!r}"
         )
 
@@ -2820,7 +2802,7 @@ class TestSpeakerPredecessorInheritance:
         """Two speakers both hold the same role concept → attribute key mints with ''
         (ambiguous — must not be attributed to either speaker).
 
-        Graph: Speaker0 →held_role→ 'Engineer', Speaker1 →held_role→ 'Engineer',
+        Graph: speaker0 →held_role→ 'Engineer', Speaker1 →held_role→ 'Engineer',
         'Engineer' →attr→ 'Y'.  Fallback sees 2 distinct predecessors → ''.
         """
         from paramem.server.router import QueryRouter
@@ -2831,19 +2813,19 @@ class TestSpeakerPredecessorInheritance:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        _seed_speaker_node(loop, "Speaker0", "Alex")
-        _seed_speaker_node(loop, "Speaker1", "Robin")
+        _seed_speaker_node(loop, "speaker0", "Alex")
+        _seed_speaker_node(loop, "speaker1", "Robin")
 
         rels = [
             {
-                "subject": "Speaker0",
+                "subject": "speaker0",
                 "predicate": "held_role",
                 "object": "Engineer",
                 "relation_type": "factual",
                 "confidence": 0.9,
             },
             {
-                "subject": "Speaker1",
+                "subject": "speaker1",
                 "predicate": "held_role",
                 "object": "Engineer",
                 "relation_type": "factual",
@@ -2885,16 +2867,16 @@ class TestSpeakerPredecessorInheritance:
         router = QueryRouter(adapter_dir=tmp_path, memory_store=loop.store)
         router.reload()
         attr_key = attr_keys[0]["key"]
-        s0_keys = router._speaker_key_index.get("Speaker0", set())
-        s1_keys = router._speaker_key_index.get("Speaker1", set())
-        assert attr_key not in s0_keys, "Ambiguous key must NOT appear under Speaker0"
-        assert attr_key not in s1_keys, "Ambiguous key must NOT appear under Speaker1"
+        s0_keys = router._speaker_key_index.get("speaker0", set())
+        s1_keys = router._speaker_key_index.get("speaker1", set())
+        assert attr_key not in s0_keys, "Ambiguous key must NOT appear under speaker0"
+        assert attr_key not in s1_keys, "Ambiguous key must NOT appear under speaker1"
 
     def test_never_overwrites_working_attribution(self, tmp_path, monkeypatch):
         """Fallback must NOT fire when attribution already resolves correctly.
 
         Sub-case (a): speaker-rooted enrichment — subject IS the speaker node.
-        The subject node carries speaker_id='Speaker0', so the node-attr branch
+        The subject node carries speaker_id='speaker0', so the node-attr branch
         resolves before the fallback.
 
         Sub-case (b): extraction edge with a non-empty edge-level speaker_id.
@@ -2910,12 +2892,12 @@ class TestSpeakerPredecessorInheritance:
             loop.store.load_registry(tier, KeyRegistry())
 
         # Seed a real speaker node.
-        _seed_speaker_node(loop, "Speaker0", "Alex")
+        _seed_speaker_node(loop, "speaker0", "Alex")
 
         # Sub-case (a): speaker-rooted enrichment (subject = speaker node).
         rels_a = [
             {
-                "subject": "Speaker0",
+                "subject": "speaker0",
                 "predicate": "likes",
                 "object": "Coffee",
                 "relation_type": "preference",
@@ -2943,14 +2925,14 @@ class TestSpeakerPredecessorInheritance:
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         loop._build_all_edge_entries_into(tier_keyed)
 
-        # The 'likes' edge's subject is "Speaker0" which carries speaker_id —
+        # The 'likes' edge's subject is "speaker0" which carries speaker_id —
         # node-attr branch resolves, fallback must NOT be reached.
-        assert "Speaker0" not in called_for, (
-            f"_unique_speaker_predecessor must NOT be called for 'Speaker0' "
+        assert "speaker0" not in called_for, (
+            f"_unique_speaker_predecessor must NOT be called for 'speaker0' "
             f"(already has speaker_id); was called for: {called_for}"
         )
 
-        # Minted 'likes' key carries speaker_id='Speaker0' (came from node-attr).
+        # Minted 'likes' key carries speaker_id='speaker0' (came from node-attr).
         likes_entries = [
             e
             for tier in ("episodic", "procedural")
@@ -2958,8 +2940,8 @@ class TestSpeakerPredecessorInheritance:
             if e.get("predicate") == "likes"
         ]
         assert likes_entries, "Expected a minted 'likes' key"
-        assert likes_entries[0]["speaker_id"] == "Speaker0", (
-            f"Speaker-rooted edge must carry speaker_id='Speaker0' (via node-attr); "
+        assert likes_entries[0]["speaker_id"] == "speaker0", (
+            f"Speaker-rooted edge must carry speaker_id='speaker0' (via node-attr); "
             f"got {likes_entries[0]['speaker_id']!r}"
         )
 
@@ -2974,7 +2956,7 @@ class TestSpeakerPredecessorInheritance:
             "work_item",
             predicate="tracks",
             relation_type="factual",
-            speaker_id="Speaker0",  # edge-level stamp
+            speaker_id="speaker0",  # edge-level stamp
             confidence=0.9,
         )
         loop.merger.graph.add_node("concept_x", attributes={"name": "Concept X"})
@@ -2993,8 +2975,8 @@ class TestSpeakerPredecessorInheritance:
             if e.get("predicate") == "tracks"
         ]
         assert tracks_entries, "Expected a minted 'tracks' key"
-        assert tracks_entries[0]["speaker_id"] == "Speaker0", (
-            f"Edge-stamped edge must carry speaker_id='Speaker0' (via edge attr); "
+        assert tracks_entries[0]["speaker_id"] == "speaker0", (
+            f"Edge-stamped edge must carry speaker_id='speaker0' (via edge attr); "
             f"got {tracks_entries[0]['speaker_id']!r}"
         )
 
@@ -3012,7 +2994,7 @@ class TestSpeakerPredecessorInheritance:
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 
-        _seed_speaker_node(loop, "Speaker0", "Alex")
+        _seed_speaker_node(loop, "speaker0", "Alex")
 
         # SOTA emits an attribute edge whose SUBJECT is a brand-new concept node
         # with no speaker predecessor (no bridge edge into it).
@@ -3066,32 +3048,32 @@ class TestSpeakerPredecessorInheritance:
 
         # Speaker node with speaker_id (simulates a real speaker in the graph).
         loop.merger.graph.add_node(
-            "Speaker0",
+            "speaker0",
             entity_type="person",
-            speaker_id="Speaker0",
-            attributes={"name": "Speaker0"},
+            speaker_id="speaker0",
+            attributes={"name": "speaker0"},
         )
 
         # Concept node that the speaker is the UNIQUE predecessor of
-        # (e.g. "Acme Corp" — Speaker0 has a works_at edge into it).
+        # (e.g. "Acme Corp" — speaker0 has a works_at edge into it).
         loop.merger.graph.add_node(
             "acme corp",
             entity_type="organization",
             attributes={"name": "Acme Corp"},
         )
         loop.merger.graph.add_edge(
-            "Speaker0",
+            "speaker0",
             "acme corp",
             predicate="works at",
             relation_type="factual",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             confidence=1.0,
             # NOTE: no edge_source here (extraction edge, not enrichment).
         )
 
         # Extraction concept-edge: Acme Corp →is_located_in→ Germany.
         # No edge_source (extraction), no speaker_id on the edge, no speaker_id
-        # on the subject node.  Even though Speaker0 is the unique predecessor
+        # on the subject node.  Even though speaker0 is the unique predecessor
         # of "acme corp", the fallback must NOT fire — deliberate unattributed fact.
         loop.merger.graph.add_node(
             "germany", entity_type="location", attributes={"name": "Germany"}
