@@ -15,8 +15,8 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install ruff
-      - run: ruff check paramem/ tests/ experiments/
-      - run: ruff format --check paramem/ tests/ experiments/
+      - run: ruff check paramem/ tests/ experiments/ scripts/
+      - run: ruff format --check paramem/ tests/ experiments/ scripts/
 
   test:
     runs-on: ubuntu-latest

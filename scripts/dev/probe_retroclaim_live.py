@@ -50,6 +50,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.test_harness import BENCHMARK_MODELS, setup_logging  # noqa: E402
+from paramem.memory.store import MemoryStore  # noqa: E402
 from paramem.models.loader import load_base_model  # noqa: E402
 from paramem.server.session_buffer import SessionBuffer  # noqa: E402
 from paramem.server.speaker import SpeakerStore  # noqa: E402
@@ -98,6 +99,7 @@ def _build_buffer_and_store(tmp_dir: Path) -> tuple[SpeakerStore, SessionBuffer]
     )
     buffer = SessionBuffer(
         session_dir=tmp_dir / "sessions",
+        state_dir=tmp_dir / "state",
         retain_sessions=False,
         debug=False,
     )
@@ -240,10 +242,10 @@ def run_gpu_phases(out_dir: Path) -> dict:
         episodic_adapter_config=_tier_cfg(),
         semantic_adapter_config=_tier_cfg(),
         procedural_adapter_config=_tier_cfg(),
+        memory_store=MemoryStore(replay_enabled=False),
         wandb_config=None,
         output_dir=out_dir,
         save_cycle_snapshots=False,
-        persist_graph=False,
         extraction_stt_correction=False,
         extraction_ha_validation=False,
         extraction_noise_filter="off",
