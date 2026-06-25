@@ -57,7 +57,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
-from paramem.backup.key_store import DAILY_KEY_PATH_DEFAULT, daily_identity_loadable
 from paramem.graph.name_match import is_speaker_id
 
 logger = logging.getLogger(__name__)
@@ -197,7 +196,9 @@ class UserTokenStore:
             {"version": _STORE_VERSION, "tokens": self._tokens},
             indent=2,
         ).encode("utf-8")
-        key_was_loadable = daily_identity_loadable(DAILY_KEY_PATH_DEFAULT)
+        from paramem.backup import key_store as _ks  # late-bind: honours monkeypatch overrides
+
+        key_was_loadable = _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT)
         write_infra_bytes(self.store_path, payload)
         # TOCTOU guard: if the daily key was loadable at pre-write check, verify
         # the written file is an age envelope.  A key eviction between the two
