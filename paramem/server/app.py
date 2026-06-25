@@ -6911,6 +6911,11 @@ async def calibrate_normalize_route(req: calibrate_module.CalibrateNormalizeRequ
     return calibrate_module.calibrate_normalize(_state, req)
 
 
+@app.post("/calibrate/name", dependencies=[Depends(require_admin)])
+async def calibrate_name_route(req: calibrate_module.CalibrateNameRequest):
+    return calibrate_module.calibrate_name(_state, req)
+
+
 @app.post(
     "/scheduled-tick",
     response_model=ConsolidateResponse,
@@ -13899,56 +13904,18 @@ def _extract_name_via_llm(
     model,
     tokenizer,
 ) -> str | None:
-    """Use the local LLM to extract a speaker's self-introduced name from transcript.
+    """Extract a speaker's self-introduced name using the external-prompt module.
 
-    The LLM reasons about context to distinguish the speaker's own name
-    from other names mentioned in conversation. Returns the name or None.
+    Thin shim so the existing ``_run_enrollment_for_speaker`` call site does
+    not need to change.  Delegates entirely to
+    :func:`paramem.graph.name_extraction.extract_name_via_llm`, which loads
+    prompts from ``configs/prompts/name_extraction{,_system}.txt`` and filters
+    the transcript to user turns only (assistant salutation leak fix).
     """
-    from paramem.evaluation.recall import generate_answer
+    from paramem.graph.name_extraction import extract_name_via_llm
 
-    lines = []
-    for turn in turns:
-        role = turn.get("role", "unknown")
-        text = turn.get("text", "")
-        lines.append(f"{role}: {text}")
-    transcript_text = "\n".join(lines)
-
-    system_msg = (
-        "You extract speaker names from conversation transcripts. "
-        "Return ONLY the first name the speaker claims as their own identity, "
-        "or NONE if they did not introduce themselves. "
-        "Do NOT extract names of other people mentioned in conversation."
-    )
-    user_msg = (
-        "Extract the speaker's self-introduced name from this transcript.\n\n"
-        "Examples:\n"
-        'Transcript: "user: My name is Alex. What time is it?"\n'
-        "Answer: Alex\n\n"
-        'Transcript: "user: Tell me about John Smith\'s schedule"\n'
-        "Answer: NONE\n\n"
-        'Transcript: "user: Stop playing music"\n'
-        "Answer: NONE\n\n"
-        f"Transcript:\n{transcript_text}\n\n"
-        "Answer:"
-    )
-
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_msg},
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    result = generate_answer(model, tokenizer, prompt, max_new_tokens=64, temperature=0.0)
-    result = result.strip().strip('"').strip("'").strip(".")
-
-    if not result or result.upper() == "NONE" or len(result) > 30:
-        return None
-
-    words = result.split()
-    if len(words) > 3 or len(words) == 0:
-        return None
-
-    return result
+    name, _raw = extract_name_via_llm(turns, model, tokenizer)
+    return name
 
 
 async def _run_enrollment_for_speaker(

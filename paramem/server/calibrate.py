@@ -161,6 +161,29 @@ class CalibrateNormalizeRequest(BaseModel):
     params: CalibrateParams = Field(default_factory=CalibrateParams)
 
 
+class CalibrateNameRequest(BaseModel):
+    """Run the name-extraction LLM on an explicit turn list.
+
+    ``turns`` is a list of ``{"role": str, "text": str}`` dicts — the same
+    shape the production enrollment path receives from
+    ``_run_enrollment_for_speaker``.  When ``user_turns_only`` is ``True``
+    (default, mirrors production), only ``role == "user"`` turns are fed to
+    the model; assistant turns are silently excluded so salutations like
+    "Good evening, user" cannot be mis-classified as name introductions.
+
+    ``name_prompt_filename`` and ``name_system_prompt_filename`` default to
+    the production prompt files.  Override to point at a scratch copy for
+    live prompt iteration.
+    """
+
+    turns: list[dict]
+    prompts_dir: str | None = None
+    name_prompt_filename: str | None = None
+    name_system_prompt_filename: str | None = None
+    user_turns_only: bool = True
+    params: CalibrateParams = Field(default_factory=CalibrateParams)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -281,6 +304,130 @@ def _cudnn_deterministic():
 
 
 # ---------------------------------------------------------------------------
+# Shared measurement primitives (Seam A and Seam B)
+# ---------------------------------------------------------------------------
+
+
+class _Measurement:
+    """Timing and VRAM snapshot captured around a single calibration call."""
+
+    __slots__ = ("vram_before", "vram_after", "elapsed")
+
+    def __init__(self) -> None:
+        self.vram_before: dict | None = None
+        self.vram_after: dict | None = None
+        self.elapsed: float = 0.0
+
+
+@contextmanager
+def _measured_local_call():
+    """Context manager that wraps the GPU lock and timing for every local stage.
+
+    Captures ``vram_before``, acquires ``gpu_lock_sync()`` and
+    ``_cudnn_deterministic()``, then records ``elapsed`` and ``vram_after``
+    on exit.  All five calibration handlers must use this wrapper so the
+    "every local stage takes the GPU lock" invariant is enforced in a single
+    place.
+
+    Yields a :class:`_Measurement` object whose attributes are populated on
+    context exit.  Usage::
+
+        with _measured_local_call() as m:
+            result = do_gpu_work(...)
+        # m.elapsed, m.vram_before, m.vram_after are now set.
+    """
+    m = _Measurement()
+    m.vram_before = _vram_block()
+    t0 = time.perf_counter()
+    with gpu_lock_sync(), _cudnn_deterministic():
+        yield m
+    m.elapsed = time.perf_counter() - t0
+    m.vram_after = _vram_block()
+
+
+def _build_calibrate_response(
+    *,
+    stage: str,
+    prompts: list[dict],
+    raw_output: Any,
+    parsed: dict,
+    input_prompt_text: str,
+    measurement: _Measurement,
+    params: CalibrateParams,
+    state: dict,
+    supports_seed: bool = True,
+    raw_output_for_tokens: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Assemble the uniform 9-key tail shared by every calibration stage.
+
+    Each handler builds only the per-stage parts (``prompts`` list,
+    ``raw_output``, ``parsed``) and delegates the common envelope to this
+    function.  The per-stage parts are legitimately different and must NOT
+    be pushed into this builder.
+
+    The ``n_output_tokens`` field counts tokens in *raw_output_for_tokens*
+    when supplied (used by ``calibrate_normalize``, whose ``raw_output`` is a
+    ``{"filter": …, "merge": …}`` dict).  For all other stages the field is
+    derived from ``raw_output`` directly, using ``-1`` when it is falsy or
+    non-string.
+
+    Args:
+        stage: Stage identifier string (``"extract"``, ``"anonymize"``, …).
+        prompts: List of prompt dicts with ``role``/``path``/``sha``/``content``.
+        raw_output: The verbatim model string(s) before post-processing.
+            May be a dict for stages that run two LLM calls (normalize).
+        parsed: Stage-specific parsed result dict.
+        input_prompt_text: The prompt text to count for ``n_input_tokens``.
+        measurement: Populated :class:`_Measurement` from
+            :func:`_measured_local_call`.
+        params: The :class:`CalibrateParams` from the request.
+        state: The live server state dict (provides ``model_id``).
+        supports_seed: ``True`` for local stages, ``False`` for SOTA stages
+            (mirrors the existing ``_effective_params`` convention).
+        raw_output_for_tokens: When provided, token counting uses this string
+            instead of ``raw_output``.  Pass the primary model string for
+            stages where ``raw_output`` is a dict (e.g. normalize's
+            ``raw_filter``).  Defaults to ``raw_output`` when ``None``.
+        **extra: Additional keys to merge into the response (e.g.
+            ``phases=`` for the extract stage).
+
+    Returns:
+        Complete calibration response dict ready for JSON serialisation.
+    """
+    tokenizer = state.get("tokenizer")
+    n_in = _count_tokens(tokenizer, input_prompt_text) if tokenizer else -1
+    # n_output_tokens: prefer the caller-supplied string; fall back to raw_output
+    # when it is a plain string.  Returns -1 for empty/non-string values.
+    count_str: str
+    if raw_output_for_tokens is not None:
+        count_str = raw_output_for_tokens
+    elif isinstance(raw_output, str):
+        count_str = raw_output
+    else:
+        count_str = ""
+    n_out = _count_tokens(tokenizer, count_str) if (tokenizer and count_str) else -1
+
+    model_id = getattr(state.get("model_id"), "name", state.get("model_id", "unknown"))
+
+    response: dict[str, Any] = {
+        "stage": stage,
+        "prompts": prompts,
+        "raw_output": raw_output,
+        "parsed": parsed,
+        "n_input_tokens": n_in,
+        "n_output_tokens": n_out,
+        "wall_clock_seconds": measurement.elapsed,
+        "model": model_id,
+        "params_effective": _effective_params(params, supports_seed=supports_seed),
+        "vram_before": measurement.vram_before,
+        "vram_after": measurement.vram_after,
+    }
+    response.update(extra)
+    return response
+
+
+# ---------------------------------------------------------------------------
 # Pre-flight gate (shared by every endpoint)
 # ---------------------------------------------------------------------------
 
@@ -354,7 +501,6 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
         )
         state["consolidation_loop"] = loop
         state["model"] = loop.model
-    tokenizer = state["tokenizer"]
 
     # Resolve prompt files for transparency: even though the actual read
     # happens inside extract_graph via ``_load_prompt``, we surface the
@@ -390,17 +536,13 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
     # NOTE: top_p, top_k do not flow through extract_graph's signature.
     # Document the limitation in params_effective.
 
-    vram_before = _vram_block()
-    t0 = time.perf_counter()
-    with gpu_lock_sync(), _cudnn_deterministic():
+    with _measured_local_call() as m:
         graph = loop.extraction.run(
             req.transcript,
             req.session_id,
             source_type=req.source_type,
             **overrides,
         )
-    elapsed = time.perf_counter() - t0
-    vram_after = _vram_block()
 
     parsed = graph.model_dump(mode="json") if hasattr(graph, "model_dump") else {}
     # Per-phase trace — every prompt-touching step of the pipeline records
@@ -418,9 +560,9 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
     )
     raw_output = (local_extract or {}).get("raw_output") or ""
 
-    return {
-        "stage": "extract",
-        "prompts": [
+    return _build_calibrate_response(
+        stage="extract",
+        prompts=[
             {
                 "role": "system",
                 "path": sys_prompt_path,
@@ -434,17 +576,15 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
                 "content": user_prompt_content,
             },
         ],
-        "raw_output": raw_output,
-        "parsed": parsed,
-        "phases": phase_records,
-        "n_input_tokens": _count_tokens(tokenizer, user_prompt_content),
-        "n_output_tokens": _count_tokens(tokenizer, raw_output) if raw_output else -1,
-        "wall_clock_seconds": elapsed,
-        "model": getattr(state.get("model_id"), "name", state.get("model_id", "unknown")),
-        "params_effective": _effective_params(req.params, supports_seed=True),
-        "vram_before": vram_before,
-        "vram_after": vram_after,
-    }
+        raw_output=raw_output,
+        parsed=parsed,
+        input_prompt_text=user_prompt_content,
+        measurement=m,
+        params=req.params,
+        state=state,
+        supports_seed=True,
+        phases=phase_records,
+    )
 
 
 def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str, Any]:
@@ -468,9 +608,7 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
         ) from exc
 
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
-    vram_before = _vram_block()
-    t0 = time.perf_counter()
-    with gpu_lock_sync(), _cudnn_deterministic():
+    with _measured_local_call() as m:
         anon_facts, mapping, anon_transcript, raw_output = anonymize_with_local_model(
             graph,
             model,
@@ -479,8 +617,6 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
             max_tokens=max_tokens,
             seed=req.params.seed,
         )
-    elapsed = time.perf_counter() - t0
-    vram_after = _vram_block()
 
     parsed: dict[str, Any] = {
         "anonymized_facts": anon_facts,
@@ -488,21 +624,19 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
         "anonymized_transcript": anon_transcript,
     }
 
-    return {
-        "stage": "anonymize",
-        "prompts": [
+    return _build_calibrate_response(
+        stage="anonymize",
+        prompts=[
             {"role": "user", "path": prompt_path, "sha": prompt_sha, "content": prompt_content},
         ],
-        "raw_output": raw_output,
-        "parsed": parsed,
-        "n_input_tokens": _count_tokens(tokenizer, prompt_content),
-        "n_output_tokens": _count_tokens(tokenizer, raw_output) if raw_output else -1,
-        "wall_clock_seconds": elapsed,
-        "model": state.get("model_id", "unknown"),
-        "params_effective": _effective_params(req.params, supports_seed=True),
-        "vram_before": vram_before,
-        "vram_after": vram_after,
-    }
+        raw_output=raw_output,
+        parsed=parsed,
+        input_prompt_text=prompt_content,
+        measurement=m,
+        params=req.params,
+        state=state,
+        supports_seed=True,
+    )
 
 
 def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> dict[str, Any]:
@@ -519,9 +653,7 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     temperature = req.params.temperature if req.params.temperature is not None else 0.0
 
-    vram_before = _vram_block()
-    t0 = time.perf_counter()
-    with gpu_lock_sync(), _cudnn_deterministic():
+    with _measured_local_call() as m:
         kept, raw_output = local_plausibility_filter(
             req.facts,
             req.transcript,
@@ -531,8 +663,6 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
             temperature=temperature,
             seed=req.params.seed,
         )
-    elapsed = time.perf_counter() - t0
-    vram_after = _vram_block()
 
     dropped = [f for f in req.facts if f not in (kept or [])]
     parsed: dict[str, Any] = {
@@ -543,21 +673,19 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
         "dropped_count": len(dropped),
     }
 
-    return {
-        "stage": "plausibility",
-        "prompts": [
+    return _build_calibrate_response(
+        stage="plausibility",
+        prompts=[
             {"role": "user", "path": prompt_path, "sha": prompt_sha, "content": prompt_content},
         ],
-        "raw_output": raw_output,
-        "parsed": parsed,
-        "n_input_tokens": _count_tokens(tokenizer, prompt_content),
-        "n_output_tokens": _count_tokens(tokenizer, raw_output) if raw_output else -1,
-        "wall_clock_seconds": elapsed,
-        "model": state.get("model_id", "unknown"),
-        "params_effective": _effective_params(req.params, supports_seed=True),
-        "vram_before": vram_before,
-        "vram_after": vram_after,
-    }
+        raw_output=raw_output,
+        parsed=parsed,
+        input_prompt_text=prompt_content,
+        measurement=m,
+        params=req.params,
+        state=state,
+        supports_seed=True,
+    )
 
 
 def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str, Any]:
@@ -636,12 +764,9 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     temperature = req.params.temperature if req.params.temperature is not None else 0.0
 
-    vram_before = _vram_block()
-    t0 = time.perf_counter()
-
     from peft import PeftModel as _PeftModel
 
-    with gpu_lock_sync(), _cudnn_deterministic():
+    with _measured_local_call() as m:
         if isinstance(model, _PeftModel):
             with model.disable_adapter():
                 surviving, diag = dedup_synonym_predicates_local(
@@ -666,9 +791,6 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
                 seed=req.params.seed,
             )
 
-    elapsed = time.perf_counter() - t0
-    vram_after = _vram_block()
-
     raw_filter = diag.pop("raw_filter", "")
     raw_merge = diag.pop("raw_merge", "")
     parsed: dict[str, Any] = {
@@ -678,9 +800,9 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
         **diag,
     }
 
-    return {
-        "stage": "normalize",
-        "prompts": [
+    return _build_calibrate_response(
+        stage="normalize",
+        prompts=[
             {
                 "role": "filter",
                 "path": filter_path,
@@ -694,16 +816,96 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
                 "content": merge_content,
             },
         ],
-        "raw_output": {"filter": raw_filter, "merge": raw_merge},
-        "parsed": parsed,
-        "n_input_tokens": _count_tokens(tokenizer, filter_content),
-        "n_output_tokens": _count_tokens(tokenizer, raw_filter) if raw_filter else -1,
-        "wall_clock_seconds": elapsed,
-        "model": state.get("model_id", "unknown"),
-        "params_effective": _effective_params(req.params, supports_seed=True),
-        "vram_before": vram_before,
-        "vram_after": vram_after,
+        raw_output={"filter": raw_filter, "merge": raw_merge},
+        parsed=parsed,
+        input_prompt_text=filter_content,
+        measurement=m,
+        params=req.params,
+        state=state,
+        supports_seed=True,
+        raw_output_for_tokens=raw_filter,
+    )
+
+
+def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
+    """Run the name-extraction LLM on an explicit turn list.
+
+    Routes through :func:`paramem.graph.name_extraction.extract_name_via_llm`
+    (the same function the production enrollment path uses).  The
+    ``prompts_dir`` / filename fields let the calibration operator point at
+    scratch copies of the prompt files; the module re-reads from disk on
+    every call (no restart needed).
+
+    ``user_turns_only`` mirrors the production default (``True``) — only
+    user turns reach the model; set to ``False`` to include assistant turns
+    and reproduce the original (buggy) context-scoping behaviour for
+    comparative testing.
+
+    Returns the uniform calibration shape: ``stage``, ``prompts``,
+    ``raw_output`` (the verbatim model string BEFORE post-filters, so
+    calibration sees what the model actually emitted), ``parsed``
+    (``{"name": <str|None>}``), ``params_effective``, VRAM block, and
+    wall-clock time.
+    """
+    _preflight(state)
+    from paramem.graph.name_extraction import extract_name_via_llm
+
+    model = state["model"]
+    tokenizer = state["tokenizer"]
+
+    # Resolve filenames with the same None-default + or-fallback convention
+    # used by the other stages.
+    sys_filename = req.name_system_prompt_filename or "name_extraction_system.txt"
+    user_filename = req.name_prompt_filename or "name_extraction.txt"
+
+    # Surface the prompt files for provenance — same approach as other stages.
+    sys_path, sys_sha, sys_content = _read_prompt(req.prompts_dir, sys_filename)
+    user_path, user_sha, user_content = _read_prompt(req.prompts_dir, user_filename)
+
+    inference_params = {
+        "temperature": req.params.temperature,
+        "seed": req.params.seed,
+        "max_tokens": req.params.max_tokens,
     }
+
+    with _measured_local_call() as m:
+        extracted, raw_output = extract_name_via_llm(
+            req.turns,
+            model,
+            tokenizer,
+            prompts_dir=req.prompts_dir,
+            prompt_filename=user_filename,
+            system_filename=sys_filename,
+            user_turns_only=req.user_turns_only,
+            params=inference_params,
+        )
+
+    parsed: dict[str, Any] = {"name": extracted}
+
+    return _build_calibrate_response(
+        stage="name",
+        prompts=[
+            {
+                "role": "system",
+                "path": sys_path,
+                "sha": sys_sha,
+                "content": sys_content,
+            },
+            {
+                "role": "user",
+                "path": user_path,
+                "sha": user_sha,
+                "content": user_content,
+            },
+        ],
+        raw_output=raw_output,
+        parsed=parsed,
+        input_prompt_text=user_content,
+        measurement=m,
+        params=req.params,
+        state=state,
+        supports_seed=True,
+    )
 
 
 def _effective_params(params: CalibrateParams, *, supports_seed: bool) -> dict:

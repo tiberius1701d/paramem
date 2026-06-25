@@ -1,0 +1,49 @@
+Extract the speaker's self-introduced name from the transcript below.
+Return ONLY the name (one to three words), or NONE if the speaker did not introduce their name.
+
+RULES
+- A name is something the speaker explicitly states as their own identity (e.g. "I'm Alex", "My name is Sam").
+- A job title, occupation, or role is NOT a name: return NONE.
+- Another person's name mentioned in conversation is NOT the speaker's name: return NONE.
+- A command or request contains no name introduction: return NONE.
+
+POSITIVE example — speaker introduces themselves:
+user: Hi, my name is Morgan. What time is it?
+Answer: Morgan
+
+POSITIVE example — full name given:
+user: I'm Casey Rivera. Nice to meet you.
+Answer: Casey Rivera
+
+POSITIVE example — name with a title (keep the title):
+user: Hello, I'm Dr. Lee.
+Answer: Dr. Lee
+
+NEGATIVE example — job title or occupation, NOT a name:
+user: I work at Acme as a data scientist.
+Answer: NONE
+
+NEGATIVE example — role description, NOT a name:
+user: I'm an engineer at Brightfield Labs.
+Answer: NONE
+
+NEGATIVE example — another person's name, not the speaker's:
+user: Tell me about Jordan's schedule.
+Answer: NONE
+
+NEGATIVE example — command with no introduction:
+user: Stop playing music.
+Answer: NONE
+
+NEGATIVE example — question, no introduction:
+user: What's the weather like today?
+Answer: NONE
+
+NEGATIVE example — greeting with role, not a name:
+user: Good morning. I'm the project manager here.
+Answer: NONE
+
+Transcript:
+{transcript}
+
+Answer:

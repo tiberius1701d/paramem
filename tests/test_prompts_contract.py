@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from paramem.graph.extractor import (
     _DEFAULT_ANONYMIZATION_PROMPT,
     _DEFAULT_ENRICHMENT_PROMPT,
@@ -73,6 +75,25 @@ class TestLoadPromptPerModelResolution:
         """When no file exists anywhere, the hardcoded default is returned."""
         result = _load_prompt("no_such_file.txt", "hardcoded-default", tmp_path, model="qwen3-4b")
         assert result == "hardcoded-default"
+
+    def test_required_true_raises_file_not_found_when_absent(self, tmp_path):
+        """required=True raises FileNotFoundError when file is absent from all search dirs."""
+        with pytest.raises(FileNotFoundError) as exc_info:
+            _load_prompt("missing_prompt.txt", prompts_dir=tmp_path, required=True)
+        msg = str(exc_info.value)
+        assert "missing_prompt.txt" in msg
+        assert "Searched" in msg
+
+    def test_required_true_succeeds_when_file_present(self, tmp_path):
+        """required=True returns content normally when file is found."""
+        (tmp_path / "present.txt").write_text("hello")
+        result = _load_prompt("present.txt", prompts_dir=tmp_path, required=True)
+        assert result == "hello"
+
+    def test_required_false_default_returns_empty_when_absent(self, tmp_path):
+        """required=False (default) returns the default value when file is absent."""
+        result = _load_prompt("absent.txt", "fallback", tmp_path)
+        assert result == "fallback"
 
     def test_qwen3_4b_extraction_txt_resolved_from_real_prompts_dir(self):
         """Sanity: the real qwen3-4b/extraction.txt is found under _DEFAULT_PROMPT_DIR."""
@@ -861,3 +882,100 @@ class TestB2AnonymizerPrivacy:
         assert "Speaker0" in forward
         # No crash; result is a valid mapping.
         assert isinstance(forward, dict)
+
+
+class TestNameExtractionPrompt:
+    """Contract tests for the name-extraction prompt files.
+
+    Guards against:
+    - Missing or broken ``{transcript}`` slot (would cause KeyError at render time).
+    - Absence of NONE keyword (would break the parser that rejects the sentinel).
+    - Absence of role/occupation negative teaching (the root cause of the
+      "data scientist" false-positive bug).
+    - No inline prompt remaining in app.py (verified separately by the
+      no-inline-prompt grep test below).
+    """
+
+    def _load_system(self) -> str:
+        from paramem.graph.prompts import _load_prompt
+
+        return _load_prompt("name_extraction_system.txt", "")
+
+    def _load_user(self) -> str:
+        from paramem.graph.prompts import _load_prompt
+
+        return _load_prompt("name_extraction.txt", "")
+
+    def test_system_file_exists_and_is_non_empty(self):
+        """name_extraction_system.txt must exist and be non-empty."""
+        content = self._load_system()
+        assert content, "name_extraction_system.txt must be non-empty"
+
+    def test_user_file_exists_and_renders_transcript_slot(self):
+        """name_extraction.txt must render with {transcript} slot without KeyError."""
+        tmpl = self._load_user()
+        rendered = tmpl.format(transcript="user: Hi, I'm Alex.")
+        assert "{transcript}" not in rendered
+        assert "Alex" in rendered
+
+    def test_user_file_no_format_errors_with_empty_transcript(self):
+        """Rendering with an empty transcript must not raise."""
+        tmpl = self._load_user()
+        rendered = tmpl.format(transcript="")
+        assert "{transcript}" not in rendered
+
+    def test_none_keyword_present(self):
+        """Both files must teach the NONE sentinel — the post-filter keys on it."""
+        system = self._load_system()
+        user = self._load_user()
+        assert "NONE" in system or "NONE" in user, (
+            "Name extraction prompts must contain the NONE sentinel."
+        )
+
+    def test_role_occupation_negative_present(self):
+        """The user prompt must explicitly state that a job title / role is NOT a name.
+
+        This is the root-cause fix for the 'data scientist' false-positive:
+        the original inline prompt had no negative teaching for occupations.
+        The file must contain model-driven negative teaching (few-shot or
+        explicit rule), not a static denylist.
+        """
+        tmpl = self._load_user()
+        lower = tmpl.lower()
+        # At least one of these phrases must appear to teach the occupation negative.
+        occupation_negatives = [
+            "job title",
+            "occupation",
+            "role",
+            "data scientist",
+            "engineer",
+        ]
+        hits = [phrase for phrase in occupation_negatives if phrase in lower]
+        assert len(hits) >= 2, (
+            f"Name extraction prompt must teach that a job title / occupation / role "
+            f"is NOT a name (model-driven negatives). "
+            f"Found only: {hits!r} out of {occupation_negatives!r}"
+        )
+
+    def test_no_inline_name_prompt_in_app_py(self):
+        """Confirm app.py no longer contains the old inline name-extraction prompt strings.
+
+        The inline prompt was the root cause of: (a) no occupation negatives,
+        (b) no user-turn filtering.  Its removal is load-bearing — this test
+        guards the regression.
+        """
+        from pathlib import Path
+
+        app_src = (
+            Path(__file__).resolve().parents[1] / "paramem" / "server" / "app.py"
+        ).read_text()
+        # The old system_msg verbatim fragment that's now gone.
+        assert "You extract speaker names from conversation transcripts." not in app_src, (
+            "Inline name-extraction system prompt detected in app.py — "
+            "it must be removed and loaded from name_extraction_system.txt instead."
+        )
+        # The old user_msg verbatim fragment.
+        assert "Extract the speaker's self-introduced name from this transcript." not in app_src, (
+            "Inline name-extraction user prompt detected in app.py — "
+            "it must be removed and loaded from name_extraction.txt instead."
+        )

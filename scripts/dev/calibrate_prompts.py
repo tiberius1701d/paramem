@@ -551,6 +551,8 @@ _STAGE_FILENAME = {
     "plausibility": "sota_plausibility.txt",
     "normalize_filter": "graph_dedup_filter.txt",
     "normalize_merge": "graph_dedup_merge.txt",
+    "name_user": "name_extraction.txt",
+    "name_system": "name_extraction_system.txt",
 }
 
 
@@ -658,6 +660,15 @@ def main(argv: list[str] | None = None) -> int:
             "deanon_plausibility. Default: run full pipeline."
         ),
     )
+    parser.add_argument(
+        "--turns-jsonl",
+        default=None,
+        help=(
+            'JSONL file of conversation turns ({"role": str, "text": str} per line). '
+            "Required when --stages includes 'name'. Cannot be combined with "
+            "chunk stages (extract, anonymize, enrich, plausibility)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
@@ -704,6 +715,7 @@ def main(argv: list[str] | None = None) -> int:
         "enrich": [_STAGE_FILENAME["enrich"]],
         "plausibility": [_STAGE_FILENAME["plausibility"]],
         "normalize": [_STAGE_FILENAME["normalize_filter"], _STAGE_FILENAME["normalize_merge"]],
+        "name": [_STAGE_FILENAME["name_user"], _STAGE_FILENAME["name_system"]],
     }
 
     def _run_baseline_for(stage: str) -> bool:
@@ -726,6 +738,20 @@ def main(argv: list[str] | None = None) -> int:
     if "normalize" in stages and not args.snapshot:
         raise SystemExit(
             "Error: --stages normalize requires --snapshot <graph_merged_snapshot.json>"
+        )
+    # Guard: name cannot be combined with chunk stages (it uses --turns-jsonl,
+    # not --input).  Mirror the normalize mutual-exclusion pattern.
+    if "name" in stages and stages != ["name"]:
+        raise SystemExit(
+            "Error: 'name' cannot be combined with other stages "
+            "(extract, anonymize, enrich, plausibility, normalize). "
+            "Run name in a separate invocation: --stages name --turns-jsonl <file.jsonl>"
+        )
+    # Guard: name requires --turns-jsonl (a JSONL file of {role, text} dicts).
+    if "name" in stages and not getattr(args, "turns_jsonl", None):
+        raise SystemExit(
+            "Error: --stages name requires --turns-jsonl <file.jsonl> "
+            '(a JSONL file of {"role": str, "text": str} dicts).'
         )
 
     invocation = {
@@ -926,6 +952,43 @@ def main(argv: list[str] | None = None) -> int:
         if len(seeds) > 1:
             out_blob["variance"] = _variance_report("normalize", normalize_runs)
         (dump_dir / "05_normalize.json").write_text(json.dumps(out_blob, indent=2, default=str))
+
+    # ----- name stage (standalone — requires --turns-jsonl) ----------------
+    if "name" in stages:
+        turns_path = Path(args.turns_jsonl)
+        with turns_path.open(encoding="utf-8") as _f:
+            turns_data = [json.loads(line) for line in _f if line.strip()]
+        name_user_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['name_user']}"
+        name_sys_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['name_system']}"
+        name_user_override = name_user_calib if (prompts_dir / name_user_calib).exists() else None
+        name_sys_override = name_sys_calib if (prompts_dir / name_sys_calib).exists() else None
+        name_runs: list[dict] = []
+        for seed in seeds:
+            params = dict(params_base)
+            params["seed"] = seed
+            name_result = _post_stage(
+                args.server,
+                "name",
+                {
+                    "turns": turns_data,
+                    "prompts_dir": args.prompts_dir,
+                    "name_prompt_filename": name_user_override or _STAGE_FILENAME["name_user"],
+                    "name_system_prompt_filename": (
+                        name_sys_override or _STAGE_FILENAME["name_system"]
+                    ),
+                    "user_turns_only": True,
+                    "params": {k: v for k, v in params.items() if v is not None},
+                },
+            )
+            name_runs.append({"seed": seed, **name_result})
+        out_blob_name: dict[str, Any] = {
+            "stage": "name",
+            "turns_jsonl": str(turns_path),
+            "candidate_runs": name_runs,
+        }
+        if len(seeds) > 1:
+            out_blob_name["variance"] = _variance_report("name", name_runs)
+        (dump_dir / "06_name.json").write_text(json.dumps(out_blob_name, indent=2, default=str))
 
     print(f"Calibration complete.  Dump: {dump_dir}")
     return 0

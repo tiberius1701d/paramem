@@ -72,9 +72,11 @@ def _load_speaker_directive_section(section_name: str) -> str:
 
 def _load_prompt(
     filename: str,
-    default: str,
+    default: str = "",
     prompts_dir: Path | None = None,
     model: str | None = None,
+    *,
+    required: bool = False,
 ) -> str:
     """Load a prompt file, falling back to hardcoded default.
 
@@ -101,6 +103,13 @@ def _load_prompt(
     model-independent by design and always call this function with
     ``model=None``.
 
+    When *required* is ``True`` and the file is not found in any search
+    directory, raises :exc:`FileNotFoundError` with the searched paths
+    listed in the message.  When *required* is ``False`` (default),
+    returns *default* unchanged.  Use ``required=True`` for production
+    enrollment paths where a missing prompt file must surface immediately
+    rather than silently yielding an empty prompt.
+
     Before editing any file under ``configs/prompts/`` — or adding a new
     template slot here — note the empirical rules that govern these files:
     few-shot examples carry the schema; verbatim taxonomy slots like
@@ -120,4 +129,9 @@ def _load_prompt(
         path = d / filename
         if path.exists():
             return path.read_text().strip()
+    if required:
+        searched = ", ".join(str(d / filename) for d in search_dirs)
+        raise FileNotFoundError(
+            f"Required prompt file {filename!r} not found. Searched: {searched}"
+        )
     return default
