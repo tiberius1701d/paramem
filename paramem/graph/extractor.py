@@ -735,6 +735,7 @@ def extract_graph(
     noise_filter: str = "",
     noise_filter_model: str = "claude-sonnet-4-6",
     noise_filter_endpoint: str | None = None,
+    sota_enabled: bool = False,
     speaker_name: str | None = None,
     ner_check: bool = False,
     ner_model: str = "en_core_web_sm",
@@ -913,7 +914,9 @@ def extract_graph(
             # own block via phase_trace from inside _sota_pipeline.
             # ``stop_phase`` is forwarded so _sota_pipeline can
             # short-circuit at any sub-phase boundary.
-            if validate and noise_filter and graph.relations:
+            # ``sota_enabled`` is the master gate; ``noise_filter`` is the
+            # provider identity.  Both must be set for the SOTA pipeline.
+            if validate and sota_enabled and noise_filter and graph.relations:
                 graph = _sota_pipeline(
                     graph,
                     transcript,

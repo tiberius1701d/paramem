@@ -228,8 +228,9 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  interim_refinement: "off"   # whole-graph normalization pass (interim scope) — OFF (experimental/unreliable on the local model; wired for later iteration; "light" re-enables). Independent of Case-1 dedup + Case-2 cardinality, which stay on.
-  fold_refinement: "off"      # whole-graph normalization pass (full-fold scope) — OFF. Same status as interim_refinement.
+  sota_enabled: true            # dev-test posture: exercise SOTA code paths (cloud calls fall through when API key unset)
+  refinement_enrichment: "on"   # graph-stage SOTA enrichment — on in tests; requires sota_enabled:true
+  refinement_normalization: "off"  # graph-stage predicate-synonym collapse — OFF (experimental/unreliable on local model)
   contradiction_detection: true  # Case-2 same-(subject,predicate)/different-object cardinality at ingest + interim; per-conflict in the merger, unaffected by the normalization knobs above.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
   consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
@@ -312,13 +313,7 @@ consolidation:
   quiet_hours_start: "07:00"
   quiet_hours_end: "22:00"
   entity_similarity_threshold: 85.0        # rapidfuzz token_sort_ratio minimum (0-100)
-  cross_predicate_contradiction: false     # cross-predicate contradiction detection; off by default (over-removes multi-valued facts)
-  # --- Graph-level SOTA enrichment (Task #10) ---
-  # Post-merge enrichment pass over the cumulative knowledge graph at every full
-  # consolidation. Captures cross-transcript second-order relations and resolves
-  # entity coreference (same_as pairs) that per-transcript enrichment cannot see.
-  # Reuses the extraction_noise_filter SOTA credentials — no new provider config.
-  graph_enrichment_enabled: true             # dev-test posture: exercise enrichment code paths
+  # --- Graph-level SOTA enrichment neighborhood knobs ---
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
   graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
   # RAM-mode checkpointing. Mirrors server.yaml.example (same values required

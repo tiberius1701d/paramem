@@ -87,6 +87,7 @@ class ExtractionConfig:
     noise_filter: str = "anthropic"
     noise_filter_model: str = "claude-sonnet-4-6"
     noise_filter_endpoint: str | None = None
+    sota_enabled: bool = False  # master gate for ALL SOTA; mirrors ConsolidationConfig.sota_enabled
     ner_check: bool = False
     ner_model: str = "en_core_web_sm"
     plausibility_judge: str = "auto"
@@ -240,6 +241,7 @@ class ExtractionPipeline:
             noise_filter=pick("noise_filter", cfg.noise_filter),
             noise_filter_model=pick("noise_filter_model", cfg.noise_filter_model),
             noise_filter_endpoint=pick("noise_filter_endpoint", cfg.noise_filter_endpoint),
+            sota_enabled=pick("sota_enabled", cfg.sota_enabled),
             speaker_name=overrides.get("speaker_name"),
             ner_check=pick("ner_check", cfg.ner_check),
             ner_model=pick("ner_model", cfg.ner_model),

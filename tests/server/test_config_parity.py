@@ -131,7 +131,9 @@ _ALLOWED_VALUE_DIVERGENCE = frozenset(
         "agents.sota_providers.google.enabled",
         "agents.sota_providers.openai.enabled",
         "consolidation.extraction_noise_filter",  # SOTA noise filter ON in tests
-        "consolidation.graph_enrichment_enabled",  # graph-tier SOTA ON in tests
+        "consolidation.sota_enabled",  # SOTA master gate ON in tests, OFF in shipped default
+        "consolidation.refinement_enrichment",  # enrichment ON in tests, OFF in shipped default
+        "consolidation.contradiction_detection",  # true in tests, false in shipped default
         # ON in tests + live deployment; example ships OFF (default-OFF rollout posture).
         "consolidation.recall_early_stopping",
         # MMS/VITS TTS on GPU in tests + live deployment (worth the VRAM); example

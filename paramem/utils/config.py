@@ -20,11 +20,9 @@ from typing import Optional
 
 import yaml
 
-# Valid values for interim_refinement and fold_refinement.
+# Valid values for refinement_enrichment and refinement_normalization.
 # Shared between utils.config and server.config (server.config imports this).
-# off=additive accumulation only; light=whole-graph model-driven normalization
-# (synonym-predicate dedup); full=light + second-order SOTA enrichment.
-_REFINEMENT_LEVELS: frozenset[str] = frozenset({"off", "light", "full"})
+_REFINEMENT_TOGGLES: frozenset[str] = frozenset({"off", "on"})
 
 
 @dataclass
@@ -129,9 +127,6 @@ class GraphConfig:
     extraction_temperature: float = 0.3
     max_extraction_tokens: int = 1024
     entity_similarity_threshold: float = 85.0
-    # Cross-predicate contradiction detection; off by default —
-    # over-removes multi-valued/independent facts (observed in live use).
-    cross_predicate_contradiction: bool = False
 
 
 @dataclass
@@ -139,18 +134,11 @@ class ConsolidationConfig:
     promotion_threshold: int = 3
     decay_window: int = 10
     indexed_key_replay: bool = True
-    # Refinement level for the interim mini-fold (one interim adapter slot per
-    # consolidation cycle).  Grammar shared with fold_refinement:
-    # "off" = additive accumulation only — exact-(s,p,o) dedup, no model calls.
-    # "light" = whole-graph model-driven normalization pass (synonym-predicate
-    #           dedup).  Default OFF: unreliable on the local model at scale; the
-    #           code is wired and re-enabled by setting "light".
-    # "full" = light + second-order SOTA enrichment (cloud; HELD until cross-doc
-    #          probe quantifies value and known inflation/fabrication is remedied).
-    interim_refinement: str = "off"  # Literal["off", "light", "full"]
-    # Refinement level for the full fold (consolidate_interim_adapters).  Same
-    # grammar as interim_refinement.  Defaults to "off"; "full" is HELD.
-    fold_refinement: str = "off"  # Literal["off", "light", "full"]
+    # Ship-safe posture: base defaults OFF (no SOTA, no refinement). Operator
+    # YAMLs (fixture/local) opt in explicitly.
+    sota_enabled: bool = False  # master gate for ALL SOTA (transcript pipeline + graph enrichment)
+    refinement_enrichment: str = "off"  # graph-stage _run_graph_enrichment (SOTA-only). off|on
+    refinement_normalization: str = "off"  # graph-stage predicate-synonym collapse. off|on
     # Whether the merger resolves same-predicate/different-object cardinality
     # conflicts (Case-2 COEXIST/REPLACE) at ingest and interim cycles.  Applied
     # wherever a NEW-vs-OLD temporal partition supplies the recency signal:
@@ -170,16 +158,13 @@ class ConsolidationConfig:
 
     def __post_init__(self) -> None:
         """Validate field values at construction time."""
-        if self.interim_refinement not in _REFINEMENT_LEVELS:
-            raise ValueError(
-                f"ConsolidationConfig.interim_refinement must be one of "
-                f"{sorted(_REFINEMENT_LEVELS)!r}; got {self.interim_refinement!r}"
-            )
-        if self.fold_refinement not in _REFINEMENT_LEVELS:
-            raise ValueError(
-                f"ConsolidationConfig.fold_refinement must be one of "
-                f"{sorted(_REFINEMENT_LEVELS)!r}; got {self.fold_refinement!r}"
-            )
+        for _toggle_field in ("refinement_enrichment", "refinement_normalization"):
+            _val = getattr(self, _toggle_field)
+            if _val not in _REFINEMENT_TOGGLES:
+                raise ValueError(
+                    f"ConsolidationConfig.{_toggle_field} must be one of "
+                    f"{sorted(_REFINEMENT_TOGGLES)!r}; got {_val!r}"
+                )
         if not (0.0 < self.recall_sanity_threshold <= 1.0):
             raise ValueError(
                 f"ConsolidationConfig.recall_sanity_threshold must be in (0.0, 1.0]; "

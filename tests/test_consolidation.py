@@ -319,7 +319,8 @@ class TestInterimRefinementGate:
         self,
         monkeypatch,
         tmp_path,
-        interim_refinement: str = "off",
+        sota_enabled: bool = False,
+        refinement_enrichment: str = "off",
         contradiction_detection: bool = True,
     ):
         from unittest.mock import MagicMock
@@ -366,7 +367,8 @@ class TestInterimRefinementGate:
             model=model,
             tokenizer=MagicMock(),
             consolidation_config=ConsolidationConfig(
-                interim_refinement=interim_refinement,
+                sota_enabled=sota_enabled,
+                refinement_enrichment=refinement_enrichment,
                 contradiction_detection=contradiction_detection,
             ),
             training_config=TrainingConfig(),
@@ -378,11 +380,13 @@ class TestInterimRefinementGate:
         )
         return loop
 
-    def test_merge_called_when_interim_refinement_full(self, monkeypatch, tmp_path):
-        """interim_refinement='full': merger.merge is called once with the session graph."""
+    def test_merge_called_when_refinement_enrichment_on(self, monkeypatch, tmp_path):
+        """refinement_enrichment='on': merger.merge is called once with the session graph."""
         from unittest.mock import patch
 
-        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="full")
+        loop = self._build_loop(
+            monkeypatch, tmp_path, refinement_enrichment="on", sota_enabled=True
+        )
         initial_nodes = loop.merger.graph.number_of_nodes()
         initial_edges = loop.merger.graph.number_of_edges()
 
@@ -393,7 +397,7 @@ class TestInterimRefinementGate:
         assert (
             loop.merger.graph.number_of_nodes() > initial_nodes
             or loop.merger.graph.number_of_edges() > initial_edges
-        ), "Expected merger.graph to grow after extract_session with interim_refinement='full'"
+        ), "Expected merger.graph to grow after extract_session with refinement_enrichment='on'"
 
     def test_merge_called_non_contradiction_when_contradiction_detection_off(
         self, monkeypatch, tmp_path
@@ -402,7 +406,7 @@ class TestInterimRefinementGate:
         from unittest.mock import patch
 
         loop = self._build_loop(
-            monkeypatch, tmp_path, interim_refinement="off", contradiction_detection=False
+            monkeypatch, tmp_path, refinement_enrichment="off", contradiction_detection=False
         )
         initial_nodes = loop.merger.graph.number_of_nodes()
         initial_edges = loop.merger.graph.number_of_edges()
@@ -423,19 +427,21 @@ class TestInterimRefinementGate:
             or loop.merger.graph.number_of_edges() > initial_edges
         ), "Expected merger.graph to grow after extract_session with contradiction_detection=False"
 
-    def test_episodic_rels_identical_regardless_of_interim_refinement(self, monkeypatch, tmp_path):
-        """Returned (episodic_rels, procedural_rels) are identical regardless of interim_refinement.
+    def test_episodic_rels_identical_regardless_of_enrichment_setting(self, monkeypatch, tmp_path):
+        """episodic_rels/procedural_rels are identical regardless of refinement_enrichment.
 
         Keying is derived from session_graph, not from the cumulative graph,
         so the setting must not affect what facts are returned to the caller.
         """
         from unittest.mock import patch
 
-        loop_a = self._build_loop(monkeypatch, tmp_path / "a", interim_refinement="full")
+        loop_a = self._build_loop(
+            monkeypatch, tmp_path / "a", refinement_enrichment="on", sota_enabled=True
+        )
         with patch.object(loop_a.extraction, "run", return_value=self._session_graph):
             rels_a, proc_a = loop_a.extract_session("t", "s_gate", speaker_id="spk0")
 
-        loop_b = self._build_loop(monkeypatch, tmp_path / "b", interim_refinement="off")
+        loop_b = self._build_loop(monkeypatch, tmp_path / "b", refinement_enrichment="off")
         with patch.object(loop_b.extraction, "run", return_value=self._session_graph):
             rels_b, proc_b = loop_b.extract_session("t", "s_gate", speaker_id="spk0")
 
@@ -443,7 +449,7 @@ class TestInterimRefinementGate:
             return (d.get("subject"), d.get("predicate"), d.get("object"))
 
         assert sorted(map(_key, rels_a)) == sorted(map(_key, rels_b)), (
-            "episodic_rels differ between interim_refinement='full' and 'off'"
+            "episodic_rels differ between refinement_enrichment='on' and 'off'"
         )
         assert proc_a == proc_b == []
 
@@ -491,7 +497,7 @@ class TestInterimRefinementGate:
             ],
         )
         loop = self._build_loop(
-            monkeypatch, tmp_path, interim_refinement="off", contradiction_detection=False
+            monkeypatch, tmp_path, refinement_enrichment="off", contradiction_detection=False
         )
 
         with patch.object(loop.extraction, "run", side_effect=[sg1, sg2]):
@@ -558,7 +564,7 @@ class TestInterimRefinementGate:
             ],
         )
         loop = self._build_loop(
-            monkeypatch, tmp_path, interim_refinement="off", contradiction_detection=True
+            monkeypatch, tmp_path, refinement_enrichment="off", contradiction_detection=True
         )
 
         # Inject a non-None model on the merger so Case-2 fires (the loop's
@@ -595,12 +601,12 @@ class TestInterimRefinementGate:
             )
 
     def test_off_pending_session_content_reaches_extra_relations(self, monkeypatch, tmp_path):
-        """interim_refinement='off': run_consolidation_cycle passes the session's
+        """refinement_enrichment='off': run_consolidation_cycle passes the session's
         edges as a non-empty extra_relations kwarg to _materialize_consolidation_graph.
 
         Guards gate #3 — the unconditional _pending_relations capture inside
         run_consolidation_cycle (consolidation.py).  The test FAILS if an
-        ``if self.config.interim_refinement != "off":`` guard is reintroduced
+        ``if self.config.refinement_enrichment != "off":`` guard is reintroduced
         around the capture, because extra_relations would then be None/[] and the
         assertion below would reject it.
 
@@ -612,7 +618,7 @@ class TestInterimRefinementGate:
         """
         from unittest.mock import patch
 
-        loop = self._build_loop(monkeypatch, tmp_path, interim_refinement="off")
+        loop = self._build_loop(monkeypatch, tmp_path, refinement_enrichment="off")
         # replay_enabled=True is required so run_consolidation_cycle passes guard #2.
         loop.store._replay_enabled = True
 
@@ -654,7 +660,7 @@ class TestInterimRefinementGate:
         extra = call_kwargs.get("extra_relations")
         assert extra is not None and len(extra) > 0, (
             "extra_relations passed to _materialize_consolidation_graph must be "
-            f"non-empty when interim_refinement='off'; got {extra!r}"
+            f"non-empty when refinement_enrichment='off'; got {extra!r}"
         )
 
         # The X→Y 'knows' edge extracted from the session must be present.
@@ -668,11 +674,11 @@ class TestInterimRefinementGate:
         )
 
 
-class TestInterimRefinementConfigRoundtrip:
-    """Loading YAML with interim_refinement propagates through the property chain."""
+class TestRefinementConfigRoundtrip:
+    """Loading YAML with refinement knobs propagates through the property chain."""
 
-    def test_yaml_interim_refinement_full_propagates(self, tmp_path):
-        """YAML interim_refinement: full propagates to schedule and consolidation_config."""
+    def test_yaml_sota_enabled_propagates(self, tmp_path):
+        """YAML sota_enabled: true propagates to schedule and consolidation_config."""
         from paramem.server.config import load_server_config
 
         yaml_text = """
@@ -680,43 +686,21 @@ model:
   name: "mistralai/Mistral-7B-Instruct-v0.3"
 consolidation:
   refresh_cadence: "12h"
-  interim_refinement: full
+  sota_enabled: true
 """
-        cfg_path = tmp_path / "server_interim_refinement_full.yaml"
+        cfg_path = tmp_path / "server_sota_enabled.yaml"
         cfg_path.write_text(yaml_text)
         cfg = load_server_config(str(cfg_path))
 
-        assert cfg.consolidation.interim_refinement == "full", (
-            "ServerConfig.consolidation.interim_refinement should be 'full'"
+        assert cfg.consolidation.sota_enabled is True, (
+            "ServerConfig.consolidation.sota_enabled should be True"
         )
-        assert cfg.consolidation_config.interim_refinement == "full", (
-            "consolidation_config.interim_refinement should be 'full'"
-        )
-
-    def test_yaml_interim_refinement_off_propagates(self, tmp_path):
-        """YAML interim_refinement: "off" propagates to schedule and consolidation_config."""
-        from paramem.server.config import load_server_config
-
-        yaml_text = """
-model:
-  name: "mistralai/Mistral-7B-Instruct-v0.3"
-consolidation:
-  refresh_cadence: "12h"
-  interim_refinement: "off"
-"""
-        cfg_path = tmp_path / "server_interim_refinement_off.yaml"
-        cfg_path.write_text(yaml_text)
-        cfg = load_server_config(str(cfg_path))
-
-        assert cfg.consolidation.interim_refinement == "off", (
-            "ServerConfig.consolidation.interim_refinement should be 'off'"
-        )
-        assert cfg.consolidation_config.interim_refinement == "off", (
-            "consolidation_config.interim_refinement should be 'off'"
+        assert cfg.consolidation_config.sota_enabled is True, (
+            "consolidation_config.sota_enabled should be True"
         )
 
-    def test_yaml_interim_refinement_defaults_to_off(self, tmp_path):
-        """YAML without interim_refinement defaults to 'off' in both schedule and config."""
+    def test_yaml_sota_defaults_to_false(self, tmp_path):
+        """YAML without sota_enabled defaults to False."""
         from paramem.server.config import load_server_config
 
         yaml_text = """
@@ -725,19 +709,62 @@ model:
 consolidation:
   refresh_cadence: "12h"
 """
-        cfg_path = tmp_path / "server_no_interim_refinement.yaml"
+        cfg_path = tmp_path / "server_no_sota.yaml"
         cfg_path.write_text(yaml_text)
         cfg = load_server_config(str(cfg_path))
 
-        assert cfg.consolidation.interim_refinement == "off", (
-            "ServerConfig.consolidation.interim_refinement should default to 'off'"
+        assert cfg.consolidation.sota_enabled is False, (
+            "ServerConfig.consolidation.sota_enabled should default to False"
         )
-        assert cfg.consolidation_config.interim_refinement == "off", (
-            "consolidation_config.interim_refinement should default to 'off'"
+        assert cfg.consolidation_config.sota_enabled is False, (
+            "consolidation_config.sota_enabled should default to False"
         )
 
-    def test_invalid_interim_refinement_value_raises(self, tmp_path):
-        """An invalid interim_refinement value raises ValueError from dataclass validation."""
+    def test_yaml_refinement_enrichment_on_propagates(self, tmp_path):
+        """YAML refinement_enrichment: "on" propagates to schedule and consolidation_config."""
+        from paramem.server.config import load_server_config
+
+        yaml_text = """
+model:
+  name: "mistralai/Mistral-7B-Instruct-v0.3"
+consolidation:
+  refresh_cadence: "12h"
+  refinement_enrichment: "on"
+"""
+        cfg_path = tmp_path / "server_refinement_enrichment_on.yaml"
+        cfg_path.write_text(yaml_text)
+        cfg = load_server_config(str(cfg_path))
+
+        assert cfg.consolidation.refinement_enrichment == "on", (
+            "ServerConfig.consolidation.refinement_enrichment should be 'on'"
+        )
+        assert cfg.consolidation_config.refinement_enrichment == "on", (
+            "consolidation_config.refinement_enrichment should be 'on'"
+        )
+
+    def test_yaml_refinement_enrichment_defaults_to_off(self, tmp_path):
+        """YAML without refinement_enrichment defaults to 'off'."""
+        from paramem.server.config import load_server_config
+
+        yaml_text = """
+model:
+  name: "mistralai/Mistral-7B-Instruct-v0.3"
+consolidation:
+  refresh_cadence: "12h"
+"""
+        cfg_path = tmp_path / "server_no_refinement_enrichment.yaml"
+        cfg_path.write_text(yaml_text)
+        cfg = load_server_config(str(cfg_path))
+
+        assert cfg.consolidation.refinement_enrichment == "off", (
+            "ServerConfig.consolidation.refinement_enrichment should default to 'off'"
+        )
+        assert cfg.consolidation_config.refinement_enrichment == "off", (
+            "consolidation_config.refinement_enrichment should default to 'off'"
+        )
+
+    def test_invalid_refinement_enrichment_value_raises(self, tmp_path):
+        """An invalid refinement_enrichment value raises ValueError from dataclass validation."""
         import pytest
 
         from paramem.server.config import load_server_config
@@ -747,25 +774,25 @@ model:
   name: "mistralai/Mistral-7B-Instruct-v0.3"
 consolidation:
   refresh_cadence: "12h"
-  interim_refinement: daily
+  refinement_enrichment: full
 """
-        cfg_path = tmp_path / "server_invalid_refinement.yaml"
+        cfg_path = tmp_path / "server_invalid_refinement_enrichment.yaml"
         cfg_path.write_text(yaml_text)
 
-        with pytest.raises(ValueError, match="interim_refinement"):
+        with pytest.raises(ValueError, match="refinement_enrichment"):
             load_server_config(str(cfg_path))
 
-    def test_consolidation_config_invalid_value_raises(self):
-        """ConsolidationConfig rejects an invalid interim_refinement value directly."""
+    def test_consolidation_config_invalid_refinement_enrichment_raises(self):
+        """ConsolidationConfig rejects an invalid refinement_enrichment value directly."""
         import pytest
 
         from paramem.utils.config import ConsolidationConfig
 
-        with pytest.raises(ValueError, match="interim_refinement"):
-            ConsolidationConfig(interim_refinement="daily")
+        with pytest.raises(ValueError, match="refinement_enrichment"):
+            ConsolidationConfig(refinement_enrichment="full")
 
-    def test_invalid_fold_refinement_value_raises(self, tmp_path):
-        """An invalid fold_refinement value raises ValueError from dataclass validation."""
+    def test_invalid_refinement_normalization_value_raises(self, tmp_path):
+        """An invalid refinement_normalization value raises ValueError from dataclass validation."""
         import pytest
 
         from paramem.server.config import load_server_config
@@ -775,22 +802,22 @@ model:
   name: "mistralai/Mistral-7B-Instruct-v0.3"
 consolidation:
   refresh_cadence: "12h"
-  fold_refinement: daily
+  refinement_normalization: light
 """
-        cfg_path = tmp_path / "server_invalid_fold_refinement.yaml"
+        cfg_path = tmp_path / "server_invalid_refinement_normalization.yaml"
         cfg_path.write_text(yaml_text)
 
-        with pytest.raises(ValueError, match="fold_refinement"):
+        with pytest.raises(ValueError, match="refinement_normalization"):
             load_server_config(str(cfg_path))
 
-    def test_consolidation_config_invalid_fold_refinement_raises(self):
-        """ConsolidationConfig rejects an invalid fold_refinement value directly."""
+    def test_consolidation_config_invalid_refinement_normalization_raises(self):
+        """ConsolidationConfig rejects an invalid refinement_normalization value directly."""
         import pytest
 
         from paramem.utils.config import ConsolidationConfig
 
-        with pytest.raises(ValueError, match="fold_refinement"):
-            ConsolidationConfig(fold_refinement="daily")
+        with pytest.raises(ValueError, match="refinement_normalization"):
+            ConsolidationConfig(refinement_normalization="light")
 
 
 # ---------------------------------------------------------------------------
@@ -1432,7 +1459,6 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
         cfg.key_metadata_path = tmp_path / "key_metadata.json"
         cfg.adapters.procedural.enabled = True
         cfg.consolidation.extraction_max_tokens = 256
-        cfg.consolidation.graph_enrichment_enabled = False
         cfg.consolidation.graph_enrichment_neighborhood_hops = 1
         cfg.consolidation.graph_enrichment_max_entities_per_pass = 5
         # ThermalPolicy.from_consolidation_config reads training_temp_limit
@@ -4702,12 +4728,13 @@ class TestDriftIntendedRemoval:
         recon_g["Dave"]["London"][eid_ok][_IK_KEY_ATTR] = "key_ok"
 
         loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
-        # fold_refinement="full" is required for _run_graph_enrichment to be called;
-        # default is "light" which skips enrichment.
+        # refinement_enrichment="on" + sota_enabled=True required for _run_graph_enrichment
+        # to be called; base defaults (off/False) skip enrichment.
         loop.config = loop.config.__class__(
             min_tier_key_floor=0,
             tier_fast_start=False,
-            fold_refinement="full",
+            refinement_enrichment="on",
+            sota_enabled=True,
         )
         loop.merger = GraphMerger(model=None)
 
@@ -8163,7 +8190,8 @@ class TestMaterializeInterimExtraRelations:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            interim_refinement="off",  # default; tests override per scenario
+            # base defaults: sota_enabled=False, refinement_enrichment="off",
+            # refinement_normalization="off" — tests override per scenario
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -8192,7 +8220,6 @@ class TestMaterializeInterimExtraRelations:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
         # Real GraphMerger (no model) so merge/reset_graph run correctly.
@@ -8595,7 +8622,7 @@ class TestInterimKeyedWalk:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            interim_refinement="off",
+            # base defaults: sota_enabled=False, refinement_enrichment="off"
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -8624,7 +8651,6 @@ class TestInterimKeyedWalk:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
         loop.merger = GraphMerger(model=None)
@@ -8788,7 +8814,7 @@ class TestMergeRegistryRelationsUnification:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            interim_refinement="off",
+            # base defaults: sota_enabled=False, refinement_enrichment="off"
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -8817,7 +8843,6 @@ class TestMergeRegistryRelationsUnification:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
         loop.merger = GraphMerger(model=None)
@@ -9457,7 +9482,6 @@ class TestSubtractiveRemovalsHelperInterim:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
         merger = GraphMerger(model=None)
@@ -9749,7 +9773,6 @@ class TestSubtractiveRemovalsHelperFold:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
         merger = GraphMerger(model=None)
@@ -9969,8 +9992,7 @@ class TestRunGraphNormalizationApply:
         loop.tokenizer.apply_chat_template.return_value = "formatted_prompt"
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            interim_refinement="light",
-            fold_refinement="light",
+            refinement_normalization="on",
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -9999,7 +10021,6 @@ class TestRunGraphNormalizationApply:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.graph_enrichment_neighborhood_hops = 2
@@ -10488,7 +10509,6 @@ class TestSubtractiveRemovalsDuplicateMerge:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
 
         merger = GraphMerger(model=None)
@@ -10634,24 +10654,23 @@ class TestNormalizationDebugSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# Level gating — normalize flag for interim_refinement / fold_refinement
+# Level gating — normalize/enrich booleans for refinement_normalization / sota_enabled
 # ---------------------------------------------------------------------------
 
 
 class TestNormalizationLevelGating:
-    """_refine_consolidation_graph gates _run_graph_normalization on normalize flag.
+    """_refine_consolidation_graph gates _run_graph_normalization/enrichment on bool flags.
 
     Tests:
-    - LG-1: interim_refinement='off' → normalize=False → normalization NOT called.
-    - LG-2: interim_refinement='light' → normalize=True → normalization IS called.
-    - LG-3: interim_refinement='full' → normalize=True AND enrich=True.
-    - LG-4: fold_refinement='off' → normalize=False.
-    - LG-5: fold_refinement='light' → normalize=True, enrich=False.
-    - LG-6: fold_refinement='full' → normalize=True, enrich=True.
+    - LG-1: normalize=False → normalization NOT called.
+    - LG-2: normalize=True, enrich=False → normalization IS called, enrichment NOT.
+    - LG-3: normalize=True, enrich=True → both called.
     """
 
     @staticmethod
-    def _make_loop_for_refine(tmp_path, *, interim_refinement="off", fold_refinement="off"):
+    def _make_loop_for_refine(
+        tmp_path, *, refinement_normalization="off", refinement_enrichment="off", sota_enabled=False
+    ):
         """Build a minimal loop for _refine_consolidation_graph gating tests."""
         from paramem.graph.merger import GraphMerger
         from paramem.memory.store import MemoryStore
@@ -10664,8 +10683,9 @@ class TestNormalizationLevelGating:
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
             indexed_key_replay=True,
-            interim_refinement=interim_refinement,
-            fold_refinement=fold_refinement,
+            refinement_normalization=refinement_normalization,
+            refinement_enrichment=refinement_enrichment,
+            sota_enabled=sota_enabled,
         )
         loop.training_config = TrainingConfig(
             num_epochs=1,
@@ -10694,7 +10714,6 @@ class TestNormalizationLevelGating:
         loop._procedural_tentative_next_index = 1
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
-        loop.graph_enrichment_enabled = False
         loop.full_consolidation_period_string = ""
         loop.graph_enrichment_max_entities_per_pass = 50
         loop.graph_enrichment_neighborhood_hops = 2
@@ -10715,13 +10734,11 @@ class TestNormalizationLevelGating:
         "edges_retired": 0,
     }
 
-    # -- Interim scope --
-
-    def test_interim_off_normalization_not_called(self, tmp_path):
-        """LG-1: interim_refinement='off' → normalize=False → normalization not called."""
+    def test_normalize_false_normalization_not_called(self, tmp_path):
+        """LG-1: normalize=False → normalization not called."""
         from unittest.mock import patch
 
-        loop = self._make_loop_for_refine(tmp_path, interim_refinement="off")
+        loop = self._make_loop_for_refine(tmp_path, refinement_normalization="off")
         with (
             patch.object(
                 loop, "_run_graph_normalization", return_value={"skipped": True}
@@ -10730,16 +10747,16 @@ class TestNormalizationLevelGating:
         ):
             loop._refine_consolidation_graph(
                 [],
-                normalize=(loop.config.interim_refinement != "off"),
-                enrich=(loop.config.interim_refinement == "full"),
+                normalize=loop.config.refinement_normalization == "on",
+                enrich=loop.config.refinement_enrichment == "on" and loop.config.sota_enabled,
             )
         mock_norm.assert_not_called()
 
-    def test_interim_light_normalization_called_enrichment_not_called(self, tmp_path):
-        """LG-2: interim_refinement='light' → normalize=True, enrich=False."""
+    def test_normalize_true_enrich_false_normalization_called_only(self, tmp_path):
+        """LG-2: normalize=True, enrich=False → normalization IS called, enrichment NOT."""
         from unittest.mock import patch
 
-        loop = self._make_loop_for_refine(tmp_path, interim_refinement="light")
+        loop = self._make_loop_for_refine(tmp_path, refinement_normalization="on")
         with (
             patch.object(
                 loop,
@@ -10752,17 +10769,22 @@ class TestNormalizationLevelGating:
         ):
             loop._refine_consolidation_graph(
                 [],
-                normalize=(loop.config.interim_refinement != "off"),
-                enrich=(loop.config.interim_refinement == "full"),
+                normalize=loop.config.refinement_normalization == "on",
+                enrich=loop.config.refinement_enrichment == "on" and loop.config.sota_enabled,
             )
         mock_norm.assert_called_once()
         mock_enrich.assert_not_called()
 
-    def test_interim_full_both_called(self, tmp_path):
-        """LG-3: interim_refinement='full' → normalize=True, enrich=True."""
+    def test_normalize_true_enrich_true_both_called(self, tmp_path):
+        """LG-3: normalize=True, enrich=True → both normalization and enrichment called."""
         from unittest.mock import patch
 
-        loop = self._make_loop_for_refine(tmp_path, interim_refinement="full")
+        loop = self._make_loop_for_refine(
+            tmp_path,
+            refinement_normalization="on",
+            refinement_enrichment="on",
+            sota_enabled=True,
+        )
         with (
             patch.object(
                 loop,
@@ -10782,81 +10804,8 @@ class TestNormalizationLevelGating:
         ):
             loop._refine_consolidation_graph(
                 [],
-                normalize=(loop.config.interim_refinement != "off"),
-                enrich=(loop.config.interim_refinement == "full"),
-            )
-        mock_norm.assert_called_once()
-        mock_enrich.assert_called_once()
-
-    # -- Fold scope --
-
-    def test_fold_off_normalization_not_called(self, tmp_path):
-        """LG-4: fold_refinement='off' → normalize=False → normalization not called."""
-        from unittest.mock import patch
-
-        loop = self._make_loop_for_refine(tmp_path, fold_refinement="off")
-        with (
-            patch.object(
-                loop, "_run_graph_normalization", return_value={"skipped": True}
-            ) as mock_norm,
-            patch.object(loop, "_run_graph_enrichment", return_value={"skipped": True}),
-        ):
-            loop._refine_consolidation_graph(
-                [],
-                normalize=(loop.config.fold_refinement != "off"),
-                enrich=(loop.config.fold_refinement == "full"),
-            )
-        mock_norm.assert_not_called()
-
-    def test_fold_light_normalization_called_enrichment_not_called(self, tmp_path):
-        """LG-5: fold_refinement='light' → normalize=True, enrich=False."""
-        from unittest.mock import patch
-
-        loop = self._make_loop_for_refine(tmp_path, fold_refinement="light")
-        with (
-            patch.object(
-                loop,
-                "_run_graph_normalization",
-                return_value=self._NORM_RETURN,
-            ) as mock_norm,
-            patch.object(
-                loop, "_run_graph_enrichment", return_value={"skipped": True}
-            ) as mock_enrich,
-        ):
-            loop._refine_consolidation_graph(
-                [],
-                normalize=(loop.config.fold_refinement != "off"),
-                enrich=(loop.config.fold_refinement == "full"),
-            )
-        mock_norm.assert_called_once()
-        mock_enrich.assert_not_called()
-
-    def test_fold_full_both_called(self, tmp_path):
-        """LG-6: fold_refinement='full' → normalize=True, enrich=True."""
-        from unittest.mock import patch
-
-        loop = self._make_loop_for_refine(tmp_path, fold_refinement="full")
-        with (
-            patch.object(
-                loop,
-                "_run_graph_normalization",
-                return_value=self._NORM_RETURN,
-            ) as mock_norm,
-            patch.object(
-                loop,
-                "_run_graph_enrichment",
-                return_value={
-                    "skipped": False,
-                    "chunks": 0,
-                    "new_edges": 0,
-                    "same_as_merges": 0,
-                },
-            ) as mock_enrich,
-        ):
-            loop._refine_consolidation_graph(
-                [],
-                normalize=(loop.config.fold_refinement != "off"),
-                enrich=(loop.config.fold_refinement == "full"),
+                normalize=loop.config.refinement_normalization == "on",
+                enrich=loop.config.refinement_enrichment == "on" and loop.config.sota_enabled,
             )
         mock_norm.assert_called_once()
         mock_enrich.assert_called_once()
@@ -11499,7 +11448,6 @@ class TestThreeWayGate:
         loop.store.replay_enabled = True
         loop.store.all_active_keys.return_value = []
         loop.cycle_count = 0
-        loop.graph_enrichment_enabled = False
         loop._current_interim_stamp = None
         loop.run_id = "test_s5"
         loop._debug_writer = MagicMock()

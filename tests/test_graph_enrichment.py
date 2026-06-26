@@ -52,7 +52,7 @@ def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
     # fires.  Callers that need enrichment hooks to fire pass replay_enabled=True.
     replay_enabled = defaults.pop("replay_enabled", False)
     # Allow callers to supply a pre-built ConsolidationConfig so tests can set
-    # fields like interim_refinement without touching the loop's other knobs.
+    # fields like refinement_enrichment/sota_enabled without touching other knobs.
     consolidation_config = defaults.pop("consolidation_config", ConsolidationConfig())
 
     from paramem.memory.store import MemoryStore as _MS
@@ -653,10 +653,14 @@ class TestFloorSkipsSmallGraphs:
 
 
 class TestDisabledIsNoop:
-    """enabled=False must leave the graph byte-identical."""
+    """enrich=False must not call _run_graph_enrichment at all."""
 
-    def test_no_change_when_disabled(self, tmp_path, monkeypatch):
-        loop = _make_loop(tmp_path, graph_enrichment_enabled=False)
+    def test_no_change_when_enrich_false(self, tmp_path, monkeypatch):
+        """_refine_consolidation_graph(enrich=False) must not call _run_graph_enrichment
+        and must leave the graph byte-identical."""
+        loop = _make_loop(
+            tmp_path, consolidation_config=ConsolidationConfig(refinement_enrichment="off")
+        )
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
@@ -664,14 +668,10 @@ class TestDisabledIsNoop:
         pre_nodes = set(graph.nodes)
         pre_edges = set((u, v) for u, v, _ in graph.edges(data=True))
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        call_spy = MagicMock()
-        with patch("paramem.training.consolidation._graph_enrich_with_sota", call_spy):
-            result = loop._run_graph_enrichment()
+        with patch.object(loop, "_run_graph_enrichment") as enrich_spy:
+            loop._refine_consolidation_graph([], normalize=False, enrich=False)
 
-        assert result["skipped"] is True
-        assert result["skip_reason"] == "disabled"
-        call_spy.assert_not_called()
+        enrich_spy.assert_not_called()
 
         post_nodes = set(graph.nodes)
         post_edges = set((u, v) for u, v, _ in graph.edges(data=True))
@@ -956,14 +956,14 @@ class TestInterimEnrichmentHook:
             ],
         )
 
-    def test_interim_full_enrichment_calls_run_graph_enrichment(self, tmp_path):
-        """interim_refinement='full' → _run_graph_enrichment called via refine stage."""
+    def test_refinement_enrichment_on_calls_run_graph_enrichment(self, tmp_path):
+        """refinement_enrichment='on' + sota_enabled=True → _run_graph_enrichment called."""
         from paramem.training.key_registry import KeyRegistry
         from paramem.utils.config import ConsolidationConfig
 
         loop = _make_loop(
             tmp_path,
-            consolidation_config=ConsolidationConfig(interim_refinement="full"),
+            consolidation_config=ConsolidationConfig(refinement_enrichment="on", sota_enabled=True),
             replay_enabled=True,
         )
         for tier in ("episodic", "semantic", "procedural"):
@@ -1005,14 +1005,16 @@ class TestInterimEnrichmentHook:
 
         loop._run_graph_enrichment.assert_called_once()
 
-    def test_interim_light_does_not_enrich(self, tmp_path):
-        """interim_refinement='light' → _run_graph_enrichment NOT called by refine."""
+    def test_refinement_normalization_only_does_not_enrich(self, tmp_path):
+        """refinement_normalization='on' only → _run_graph_enrichment NOT called by refine."""
         from paramem.training.key_registry import KeyRegistry
         from paramem.utils.config import ConsolidationConfig
 
         loop = _make_loop(
             tmp_path,
-            consolidation_config=ConsolidationConfig(interim_refinement="light"),
+            consolidation_config=ConsolidationConfig(
+                refinement_normalization="on", refinement_enrichment="off"
+            ),
             replay_enabled=True,
         )
         for tier in ("episodic", "semantic", "procedural"):
@@ -1054,15 +1056,15 @@ class TestInterimEnrichmentHook:
 
         loop._run_graph_enrichment.assert_not_called()
 
-    def test_interim_off_does_not_enrich(self, tmp_path):
-        """interim_refinement='off' → _run_graph_enrichment NOT called by refine."""
+    def test_refinement_off_does_not_enrich(self, tmp_path):
+        """refinement_enrichment='off' (default) → _run_graph_enrichment NOT called by refine."""
         from paramem.training.key_registry import KeyRegistry
 
         loop = _make_loop(
             tmp_path,
             replay_enabled=True,
         )
-        # interim_refinement defaults to "off" in _make_loop (ConsolidationConfig default).
+        # refinement_enrichment defaults to "off" in ConsolidationConfig default.
         for tier in ("episodic", "semantic", "procedural"):
             loop.store.load_registry(tier, KeyRegistry())
 

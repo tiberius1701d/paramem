@@ -989,15 +989,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # entity_similarity_threshold mirrors GraphConfig (paramem/utils/config.py);
     # bridged into GraphMerger construction via ServerConfig.graph_config.
     entity_similarity_threshold: float = 85.0
-    # Cross-predicate contradiction detection; off by default —
-    # over-removes multi-valued/independent facts (observed in live use).
-    # Mirrors GraphConfig.cross_predicate_contradiction; bridged via graph_config.
-    cross_predicate_contradiction: bool = False
-    # --- Graph-level SOTA enrichment (Task #10) ---
-    # Runs at full consolidation over the cumulative graph to capture
-    # cross-transcript second-order relations that per-transcript enrichment
-    # cannot see. Reuses the noise-filter SOTA credentials.
-    graph_enrichment_enabled: bool = True
+    # --- Graph-level SOTA enrichment neighborhood knobs ---
     graph_enrichment_neighborhood_hops: int = 2
     graph_enrichment_max_entities_per_pass: int = 50
     # RAM-mode checkpointing: when > 0, train_adapter writes checkpoints to
@@ -1586,7 +1578,7 @@ class ServerConfig:
     def consolidation_config(self) -> ConsolidationConfig:
         """Build ConsolidationConfig for ConsolidationLoop.
 
-        All three-axis knobs (interim_refinement, fold_refinement,
+        New flat knobs (sota_enabled, refinement_enrichment, refinement_normalization,
         contradiction_detection) are threaded through here so ConsolidationLoop
         reads them from config rather than from direct attribute access.
         """
@@ -1594,8 +1586,9 @@ class ServerConfig:
             promotion_threshold=self.consolidation.promotion_threshold,
             indexed_key_replay=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
-            interim_refinement=self.consolidation.interim_refinement,
-            fold_refinement=self.consolidation.fold_refinement,
+            sota_enabled=self.consolidation.sota_enabled,
+            refinement_enrichment=self.consolidation.refinement_enrichment,
+            refinement_normalization=self.consolidation.refinement_normalization,
             contradiction_detection=self.consolidation.contradiction_detection,
             recall_sanity_threshold=self.consolidation.recall_sanity_threshold,
             min_tier_key_floor=self.consolidation.min_tier_key_floor,
@@ -1606,12 +1599,10 @@ class ServerConfig:
     def graph_config(self) -> GraphConfig:
         """Build GraphConfig for GraphMerger construction.
 
-        Mirrors ``entity_similarity_threshold`` and
-        ``cross_predicate_contradiction`` from ``self.consolidation``.
+        Mirrors ``entity_similarity_threshold`` from ``self.consolidation``.
         """
         return GraphConfig(
             entity_similarity_threshold=self.consolidation.entity_similarity_threshold,
-            cross_predicate_contradiction=self.consolidation.cross_predicate_contradiction,
         )
 
 

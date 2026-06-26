@@ -71,8 +71,16 @@ def test_extraction_noise_filter_empty_by_default(example_config):
     assert example_config.consolidation.extraction_noise_filter == ""
 
 
-def test_graph_enrichment_disabled_by_default(example_config):
-    assert example_config.consolidation.graph_enrichment_enabled is False
+def test_sota_disabled_by_default(example_config):
+    assert example_config.consolidation.sota_enabled is False
+
+
+def test_refinement_enrichment_off_by_default(example_config):
+    assert example_config.consolidation.refinement_enrichment == "off"
+
+
+def test_contradiction_detection_false_by_default(example_config):
+    assert example_config.consolidation.contradiction_detection is False
 
 
 def test_headless_boot_disabled_by_default(example_config):

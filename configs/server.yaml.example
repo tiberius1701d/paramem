@@ -194,9 +194,10 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  interim_refinement: "off"   # whole-graph normalization pass (interim scope). off = disabled. EXPERIMENTAL/unreliable on the local model — kept wired but OFF pending reliability work; "light" re-enables it for iteration, "full" also runs cloud enrichment (held). Independent of Case-1 dedup + Case-2 cardinality below, which stay on.
-  fold_refinement: "off"      # whole-graph normalization pass (full-fold scope). Same status as interim_refinement.
-  contradiction_detection: true  # Case-2 same-(subject,predicate)/different-object cardinality (COEXIST/REPLACE) at ingest + interim. Per-conflict in the merger; unaffected by the normalization knobs above.
+  sota_enabled: false           # master gate for ALL SOTA (transcript pipeline + graph enrichment). false = ship default (off)
+  refinement_enrichment: "off"  # graph-stage SOTA enrichment pass. off|on. Requires sota_enabled:true to fire.
+  refinement_normalization: "off"  # graph-stage predicate-synonym collapse. off|on.
+  contradiction_detection: false  # Case-2 same-(subject,predicate)/different-object cardinality (COEXIST/REPLACE) at ingest + interim. Per-conflict in the merger; unaffected by the normalization knobs above.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
   consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
   # Floor below which a tier's keys park in episodic (the always-trained large
@@ -323,13 +324,7 @@ consolidation:
   quiet_hours_start: "07:00"
   quiet_hours_end: "22:00"
   entity_similarity_threshold: 85.0        # rapidfuzz token_sort_ratio minimum (0-100)
-  cross_predicate_contradiction: false     # cross-predicate contradiction detection; off by default (over-removes multi-valued facts)
-  # --- Graph-level SOTA enrichment (Task #10) ---
-  # Post-merge enrichment pass over the cumulative knowledge graph at every full
-  # consolidation. Captures cross-transcript second-order relations and resolves
-  # entity coreference (same_as pairs) that per-transcript enrichment cannot see.
-  # Reuses the extraction_noise_filter SOTA credentials — no new provider config.
-  graph_enrichment_enabled: false             # ship default — uses SOTA, needs an API key
+  # --- Graph-level SOTA enrichment neighborhood knobs ---
   graph_enrichment_neighborhood_hops: 2      # N-hop ego-graph radius per focal entity
   graph_enrichment_max_entities_per_pass: 50 # max nodes per SOTA chunk call
   # RAM-mode checkpointing: when > 0, train_adapter writes HF Trainer checkpoints

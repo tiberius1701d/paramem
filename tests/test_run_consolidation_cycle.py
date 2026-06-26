@@ -121,9 +121,9 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     _real_graph.add_node("object2", attributes={"name": "Object2"})
     _real_graph.add_edge("subject2", "object2", predicate="knows", relation_type="factual")
     loop.merger.graph = _real_graph
-    # Graph-enrichment knobs. Default to disabled for these unit tests so the
-    # hook stays inert and we don't need to stub _run_graph_enrichment.
-    loop.graph_enrichment_enabled = False
+    # Graph-enrichment knobs. Default neighborhood hops for these unit tests.
+    # Enrichment is off by default (refinement_enrichment="off", sota_enabled=False in
+    # ConsolidationConfig base defaults) so _run_graph_enrichment is never reached.
     loop.graph_enrichment_neighborhood_hops = 2
     loop.graph_enrichment_max_entities_per_pass = 50
 
@@ -937,7 +937,7 @@ class TestRecallFailedSessionStaysPending:
     - Assert result["recall_failed_session_ids"] and downstream behavior.
 
     W4 / R2 caveat:
-    Under interim_refinement="off", _pending_relations is None so the
+    Under refinement_normalization="off", _pending_relations is None so the
     pending-session relations may not enter the merge graph and new episodic
     keys may not be minted.  The "off" arm asserts conditionally:
     if no new keys are minted, recall_failed_session_ids must be [] (the
@@ -961,7 +961,7 @@ class TestRecallFailedSessionStaysPending:
         tmp_path: Path,
         *,
         session_id: str = "real-session-001",
-        interim_refinement: str = "light",
+        refinement_normalization: str = "off",
     ):
         """Build a loop whose merger.graph has a keyless edge with a real session id.
 
@@ -971,7 +971,7 @@ class TestRecallFailedSessionStaysPending:
         loop = _make_mock_loop(tmp_path)
         loop.config = loop.config.__class__(
             indexed_key_replay=True,
-            interim_refinement=interim_refinement,
+            refinement_normalization=refinement_normalization,
         )
         real_graph = nx.MultiDiGraph()
         real_graph.add_node("alice", speaker_id="Speaker0", attributes={"name": "Alice"})
@@ -1045,7 +1045,7 @@ class TestRecallFailedSessionStaysPending:
         """
         session_id = "real-session-alpha"
         loop = self._make_loop_with_session_edge(
-            tmp_path, session_id=session_id, interim_refinement="light"
+            tmp_path, session_id=session_id, refinement_normalization="on"
         )
 
         # Override probe so it fails ALL new keys (empty passing set for new keys).
@@ -1076,7 +1076,7 @@ class TestRecallFailedSessionStaysPending:
         """
         session_id = "real-session-sim"
         loop = self._make_loop_with_session_edge(
-            tmp_path, session_id=session_id, interim_refinement="light"
+            tmp_path, session_id=session_id, refinement_normalization="on"
         )
         # Even with a failing probe, simulate admits all without the gate.
         loop._probe_passing_keys = lambda adapter_name, entries: set()
@@ -1088,9 +1088,9 @@ class TestRecallFailedSessionStaysPending:
         )
 
     def test_off_refinement_episodic_arm_conditional(self, tmp_path: Path) -> None:
-        """Under interim_refinement='off', assert conditionally per W4/R2 caveat.
+        """Under refinement_normalization='off', assert conditionally per W4/R2 caveat.
 
-        If no new episodic keys are minted (pending-sessions path absent in "off"),
+        If no new episodic keys are minted (pending-sessions path absent under off),
         recall_failed_session_ids is [] — the bug cannot manifest; no assertion
         beyond that.  If keys ARE minted (not expected from static analysis, but
         defensive), we assert the failing key's session is collected.
@@ -1101,7 +1101,7 @@ class TestRecallFailedSessionStaysPending:
         """
         session_id = "real-session-off"
         loop = self._make_loop_with_session_edge(
-            tmp_path, session_id=session_id, interim_refinement="off"
+            tmp_path, session_id=session_id, refinement_normalization="off"
         )
         loop._probe_passing_keys = lambda adapter_name, entries: set()
 
@@ -1245,7 +1245,7 @@ class TestRecallFailedSessionStaysPending:
         """
         session_id = "inv-session-001"
         loop = self._make_loop_with_session_edge(
-            tmp_path, session_id=session_id, interim_refinement="light"
+            tmp_path, session_id=session_id, refinement_normalization="on"
         )
         loop._probe_passing_keys = lambda adapter_name, entries: set()
 
@@ -1275,7 +1275,7 @@ class TestRecallFailedSessionStaysPending:
         loop = _make_mock_loop(tmp_path)
         loop.config = loop.config.__class__(
             indexed_key_replay=True,
-            interim_refinement="light",
+            refinement_normalization="on",
         )
         real_graph = nx.MultiDiGraph()
         real_graph.add_node("alice", speaker_id="Speaker0", attributes={"name": "Alice"})

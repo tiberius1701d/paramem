@@ -200,8 +200,8 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     # The materialize diagnostic is covered in TestMaterializeInterimExtraRelations.
     loop._materialize_consolidation_graph = lambda **kw: (set(), [])
 
-    # Enrichment flags — disabled to keep tests deterministic.
-    loop.graph_enrichment_enabled = False
+    # Enrichment is off by default (refinement_enrichment="off", sota_enabled=False
+    # in ConsolidationConfig base defaults) — no attribute assignment needed.
     loop.full_consolidation_period_string = ""
 
     return loop
@@ -842,16 +842,14 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
 
     Attributes set:
       - ``output_dir`` — used as the adapter_dir root.
-      - ``graph_enrichment_enabled`` — False so ``_run_graph_enrichment`` no-ops.
       - ``merger`` — a model-free ``GraphMerger`` so the merge topology
         can run without a GPU or loaded model (``merger.model=None`` means the
         model-gated Case-2 branch is skipped; production-correct for simulate mode).
       - ``save_cycle_snapshots`` — False so ``_debug_writer`` gates to no-op.
       - ``_debug_base`` — None so ``_debug_writer._active_base()`` returns None.
-      - ``config`` — minimal ``ConsolidationConfig`` with ``fold_refinement="off"`` so
-        ``consolidate_simulate_fold`` can read ``config.fold_refinement``
-        without a full server config; enrichment is suppressed (matches the intent of
-        the ``graph_enrichment_enabled=False`` attribute above).
+      - ``config`` — minimal ``ConsolidationConfig`` with base defaults
+        (sota_enabled=False, refinement_enrichment="off", refinement_normalization="off")
+        so enrichment and normalization are suppressed without explicit flags.
 
     All other attributes are left unset; any unintended access will raise
     AttributeError rather than silently returning a MagicMock value.
@@ -860,7 +858,6 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
 
     loop = ConsolidationLoop.__new__(ConsolidationLoop)
     loop.output_dir = tmp_path
-    loop.graph_enrichment_enabled = False
     loop.merger = GraphMerger(model=None)
     # model/tokenizer None: the whole-graph normalization pass reads self.model and
     # cleanly skips (skip_reason="no_model") — production-correct for simulate mode,
@@ -869,7 +866,7 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     loop.tokenizer = None
     loop.save_cycle_snapshots = False
     loop._debug_base = None
-    loop.config = ConsolidationConfig(fold_refinement="off")
+    loop.config = ConsolidationConfig()
     return loop
 
 
@@ -1233,9 +1230,9 @@ class TestConsolidateSimulateFold:
         from paramem.memory.persistence import iter_entries, load_memory_from_disk
 
         loop = _make_bare_loop(tmp_path)
-        # fold_refinement="full" is required so consolidate_simulate_fold
-        # calls _run_graph_enrichment; default "off" (set by _make_bare_loop) skips it.
-        loop.config = ConsolidationConfig(fold_refinement="full")
+        # refinement_enrichment="on" + sota_enabled=True so consolidate_simulate_fold
+        # calls _run_graph_enrichment; base defaults (off/False) would skip it.
+        loop.config = ConsolidationConfig(refinement_enrichment="on", sota_enabled=True)
 
         # Seed one interim slot so there is merged content to coexist with.
         _write_interim_graph(
@@ -1396,7 +1393,6 @@ class TestBuildTierDelta:
 
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
         loop.output_dir = tmp_path
-        loop.graph_enrichment_enabled = False
         loop.save_cycle_snapshots = False
         loop._debug_base = None
         loop.config = None
@@ -2062,7 +2058,6 @@ class TestDebugSnapshotOnTierDelta:
 
         loop = ConsolidationLoop.__new__(ConsolidationLoop)
         loop.output_dir = tmp_path
-        loop.graph_enrichment_enabled = False
         loop.save_cycle_snapshots = True
         loop._debug_base = tmp_path / "debug"
         loop._current_interim_stamp = None

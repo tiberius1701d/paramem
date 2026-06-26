@@ -161,7 +161,7 @@ def create_consolidation_loop(
         prompts_dir=config.prompts_dir,
         model_name=config.model_name,
         graph_config=config.graph_config,
-        graph_enrichment_enabled=config.consolidation.graph_enrichment_enabled,
+        sota_enabled=config.consolidation.sota_enabled,
         graph_enrichment_neighborhood_hops=config.consolidation.graph_enrichment_neighborhood_hops,
         graph_enrichment_max_entities_per_pass=config.consolidation.graph_enrichment_max_entities_per_pass,
         # Same `cloud_scope` knob as inference-time cloud egress: the SOTA

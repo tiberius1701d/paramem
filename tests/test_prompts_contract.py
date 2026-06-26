@@ -24,7 +24,7 @@ from paramem.graph.extractor import (
     build_speaker_context,
     load_anonymization_prompt,
 )
-from paramem.graph.merger import _COEXISTENCE_PROMPT, _CONTRADICTION_PROMPT
+from paramem.graph.merger import _COEXISTENCE_PROMPT
 from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
 from paramem.graph.schema_config import (
     format_entity_types,
@@ -633,60 +633,6 @@ class TestCheckPredicateCoexistenceParser:
         """Unrecognised model output → 'COEXIST' safer default."""
         verdict = self._call_with_mock_output("MAYBE")
         assert verdict == "COEXIST"
-
-
-class TestMergerContradictionPrompt:
-    """Contract tests for the merger contradiction prompt.
-
-    The parser in ``detect_contradiction_with_model`` keys on the literal strings
-    ``CONTRADICTS`` and ``NO_CONTRADICTION`` (``merger.py`` line that checks
-    ``output.startswith("CONTRADICTS")``).  Removing either keyword from the
-    prompt would silently break contradiction detection.
-    """
-
-    def test_renders_without_leftover_slots(self):
-        """All four slots fill without KeyError; no leftover ``{slot}`` tokens."""
-        tmpl = _load_prompt("merger_contradiction.txt", _CONTRADICTION_PROMPT)
-        rendered = tmpl.format(
-            existing_facts="- Alex | lives_in | Munich",
-            subject="Alex",
-            predicate="moved_to",
-            object="Berlin",
-        )
-        assert "{existing_facts}" not in rendered
-        assert "{subject}" not in rendered
-        assert "{predicate}" not in rendered
-        assert "{object}" not in rendered
-
-    def test_contradicts_keyword_present(self):
-        """``CONTRADICTS`` must survive rendering — the parser keys on this literal."""
-        tmpl = _load_prompt("merger_contradiction.txt", _CONTRADICTION_PROMPT)
-        rendered = tmpl.format(
-            existing_facts="- Alex | lives_in | Munich",
-            subject="Alex",
-            predicate="moved_to",
-            object="Berlin",
-        )
-        assert "CONTRADICTS" in rendered
-
-    def test_no_contradiction_keyword_present(self):
-        """``NO_CONTRADICTION`` must survive rendering — the parser keys on this literal."""
-        tmpl = _load_prompt("merger_contradiction.txt", _CONTRADICTION_PROMPT)
-        rendered = tmpl.format(
-            existing_facts="- Alex | lives_in | Munich",
-            subject="Alex",
-            predicate="moved_to",
-            object="Berlin",
-        )
-        assert "NO_CONTRADICTION" in rendered
-
-    def test_file_byte_equivalent_to_inline_default(self):
-        """The prompt file must be byte-equivalent to ``_CONTRADICTION_PROMPT`` after
-        ``.strip()`` so the fallback and the file produce identical model inputs.
-        """
-        file_path = _DEFAULT_PROMPT_DIR / "merger_contradiction.txt"
-        assert file_path.exists(), f"Prompt file not found: {file_path}"
-        assert file_path.read_text().strip() == _CONTRADICTION_PROMPT
 
 
 class TestSpeakerDirectiveFile:

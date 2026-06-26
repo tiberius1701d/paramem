@@ -222,9 +222,10 @@ class FoldScope:
         tag_new: Forwarded as the ``tag_new`` flag to
             :meth:`~ConsolidationLoop._build_all_edge_entries_into`.  ``True``
             for the interim slot (new-entry tracking); ``False`` for the full fold.
-        level: Refinement level forwarded to
-            :meth:`~ConsolidationLoop._refine_consolidation_graph` (``"off"`` |
-            ``"light"`` | ``"full"``).
+        normalize: When ``True``, run the whole-graph normalization pass via
+            :meth:`~ConsolidationLoop._refine_consolidation_graph`.
+        enrich: When ``True``, run SOTA graph enrichment via
+            :meth:`~ConsolidationLoop._refine_consolidation_graph`.
         promote: When ``True``, call
             :meth:`~ConsolidationLoop._promote_mature_keys_inline` after the
             Refine stage.  ``True`` for the full-fold train path only — the
@@ -256,7 +257,8 @@ class FoldScope:
     tag_new: bool = False
 
     # --- refine gate ---
-    level: "Literal['off', 'light', 'full']" = "off"
+    normalize: bool = False
+    enrich: bool = False
 
     # --- spine stage gates ---
     promote: bool = False
@@ -343,7 +345,7 @@ class ConsolidationLoop:
         extraction_verify_anonymization: bool = True,
         extraction_pii_scope: set[str] | frozenset[str] | None = None,
         graph_config: Optional[GraphConfig] = None,
-        graph_enrichment_enabled: bool = True,
+        sota_enabled: bool = False,
         graph_enrichment_neighborhood_hops: int = 2,
         graph_enrichment_max_entities_per_pass: int = 50,
         state_provider=None,
@@ -434,20 +436,19 @@ class ConsolidationLoop:
                 plausibility_stage=extraction_plausibility_stage,
                 verify_anonymization=extraction_verify_anonymization,
                 pii_scope=extraction_pii_scope,
+                sota_enabled=sota_enabled,
             ),
             prompts_dir=prompts_dir,
             model_name=model_name,
         )
 
         # Graph-level SOTA enrichment knobs (Task #10).
-        self.graph_enrichment_enabled = graph_enrichment_enabled
         self.graph_enrichment_neighborhood_hops = graph_enrichment_neighborhood_hops
         self.graph_enrichment_max_entities_per_pass = graph_enrichment_max_entities_per_pass
 
         gc = graph_config or GraphConfig()
         self.merger = GraphMerger(
             similarity_threshold=gc.entity_similarity_threshold,
-            cross_predicate_contradiction=gc.cross_predicate_contradiction,
             prompts_dir=self.prompts_dir,
         )
         self.last_session_graph = None
@@ -2098,8 +2099,8 @@ class ConsolidationLoop:
            keying surface (pending-session relations from ``merger.graph`` are
            passed as ``extra_relations`` so they survive the graph reset).
         8c. Refine: call :meth:`_refine_consolidation_graph` with
-           ``enrich=(interim_refinement=="full")`` so SOTA enrichment is
-           level-gated.  The recurrence-bump runs at every level.
+           ``enrich=(refinement_enrichment=="on" and sota_enabled)`` so SOTA
+           enrichment is gated.  The recurrence-bump runs at every level.
         9. Build interim key list via graph-walk (episodic + procedural entries).
            The interim slot holds BOTH factual (episodic) and preference
            (procedural) keys, trained with the attention-only episodic adapter
@@ -2281,7 +2282,8 @@ class ConsolidationLoop:
                 extra_relations_source="pending",
                 defer=True,
                 tag_new=True,
-                level=self.config.interim_refinement,
+                normalize=(self.config.refinement_normalization == "on"),
+                enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
                 promote=False,
                 tier_floor=False,
                 subtractive_scope="interim",
@@ -2417,7 +2419,6 @@ class ConsolidationLoop:
         NetworkX-reserved ``"source"`` field, so the tag survives persist).
 
         Early-return conditions (all return ``skipped=True``):
-        - ``graph_enrichment_enabled`` is ``False``.
         - Graph has fewer than 10 nodes (floor — too little signal).
         - ``extraction_noise_filter`` is empty (no SOTA provider configured).
         - Provider env-var is absent (API key not set).
@@ -2445,10 +2446,6 @@ class ConsolidationLoop:
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         _empty = {"chunks": 0, "new_edges": 0, "same_as_merges": 0}
-
-        if not self.graph_enrichment_enabled:
-            logger.info("graph_enrichment: disabled — skipping")
-            return {**_empty, "skipped": True, "skip_reason": "disabled"}
 
         graph = self.merger.graph
         node_count = graph.number_of_nodes()
@@ -3608,8 +3605,8 @@ class ConsolidationLoop:
                 _after_merge_count = self.merger.graph.number_of_edges()
                 self._refine_consolidation_graph(
                     [],
-                    normalize=(scope.level != "off"),
-                    enrich=(scope.level == "full"),
+                    normalize=scope.normalize,
+                    enrich=scope.enrich,
                 )
 
                 # Write merger.graph directly (not tier_keyed).
@@ -3731,8 +3728,8 @@ class ConsolidationLoop:
                 # --- Refine ---
                 self._refine_consolidation_graph(
                     recon_relations,
-                    normalize=(scope.level != "off"),
-                    enrich=(scope.level == "full"),
+                    normalize=scope.normalize,
+                    enrich=scope.enrich,
                 )
 
                 # --- Build keyed training set ---
@@ -4063,8 +4060,8 @@ class ConsolidationLoop:
                 )
                 self._refine_consolidation_graph(
                     recon_relations,
-                    normalize=(scope.level != "off"),
-                    enrich=(scope.level == "full"),
+                    normalize=scope.normalize,
+                    enrich=scope.enrich,
                 )
 
                 # --- Inline promotion (scope-gated) ---
@@ -4902,7 +4899,8 @@ class ConsolidationLoop:
                 extra_relations_source="disk",
                 defer=False,
                 tag_new=False,
-                level=self.config.fold_refinement,
+                normalize=(self.config.refinement_normalization == "on"),
+                enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
                 promote=False,
                 tier_floor=False,
                 subtractive_scope="fold",
@@ -5993,14 +5991,13 @@ class ConsolidationLoop:
 
         1. Optionally run the whole-graph local-model normalization pass via
            :meth:`_run_graph_normalization` (predicate alignment + entity merge +
-           semantic dedup).  Runs when *normalize* is ``True`` (level ``light``
-           or ``full`` at both interim and fold scopes).  Uses the local model;
+           semantic dedup).  Runs when ``normalize`` is ``True``.  Local model;
            no cloud dependency.
         2. Optionally run SOTA graph enrichment via :meth:`_run_graph_enrichment`
-           (additive second-order discovery).  Runs when *enrich* is ``True``
-           (level ``full`` only).  Cloud dependency; HELD at production defaults.
+           (additive second-order discovery).  Runs when ``enrich`` is ``True``.
+           Cloud dependency.
         3. Emit a debug snapshot ("enriched") after the refine step (or immediately
-           when both stages are skipped at level ``off``).
+           when both stages are skipped).
         4. If ``recon_relations`` is non-empty, scan ``merger.reinforcements`` for
            Case-1 duplicate-SPO collapses and call
            :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
@@ -6016,11 +6013,13 @@ class ConsolidationLoop:
                 will be empty too).
             normalize: When ``True``, run :meth:`_run_graph_normalization`
                 (local-model predicate alignment + entity merge + dedup).
-                Callers pass ``normalize=(level != "off")`` for both scopes.
-                Default ``False`` (level ``off``).
+                Callers pass ``normalize=scope.normalize``.
+                Default ``False``.
             enrich: When ``True``, run :meth:`_run_graph_enrichment` (cloud-SOTA
-                additive discovery).  Callers pass ``enrich=(level == "full")``.
-                Default ``False`` (HELD at production defaults).
+                additive discovery).  Callers pass ``enrich=scope.enrich`` (the
+                scope field is set at construction to
+                ``refinement_enrichment=="on" and sota_enabled``).
+                Default ``False``.
         """
         # --- Whole-graph local-model normalization (predicate align + entity merge + dedup) ---
         # Runs at level light+ for BOTH interim and fold scopes (time-invariant).
@@ -6227,7 +6226,8 @@ class ConsolidationLoop:
                 extra_relations_source="pending" if consume_pending else "none",
                 defer=False,
                 tag_new=False,
-                level=self.config.fold_refinement,
+                normalize=(self.config.refinement_normalization == "on"),
+                enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
                 promote=True,
                 tier_floor=True,
                 subtractive_scope="fold",

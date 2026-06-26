@@ -9,10 +9,6 @@ Contradiction resolution:
 - REPLACE: new value supersedes old (single-valued predicate); old edge removed.
   With ``resolve_contradictions=False`` (fold-only path), REPLACE is skipped — the
   fold is old-vs-old consolidation with no recency signal, so no edge is removed.
-- Cross-predicate contradiction detection (REPLACE across different predicates):
-  OFF by default (``cross_predicate_contradiction=False``) because it over-removes
-  legitimate multi-valued and independent facts (observed over-removing valid facts in live use).
-  Enable only when the operator has verified it is safe for their knowledge domain.
 - When no model is present (experiments, after release): all triples coexist (no removal).
 """
 
@@ -52,100 +48,6 @@ New value: {new_value}
 Reply with EXACTLY one of:
 - COEXIST
 - REPLACE"""
-
-_CONTRADICTION_PROMPT = """\
-You are checking if a new fact contradicts any existing fact about a person.
-
-Existing facts:
-{existing_facts}
-
-New fact: {subject} | {predicate} | {object}
-
-Does the new fact contradict or update any existing fact? A contradiction means \
-the new fact makes an old fact no longer true (e.g. "moved to Berlin" contradicts \
-"lives in Munich").
-
-Reply with EXACTLY one of:
-- CONTRADICTS <subject> | <predicate> | <object> (the old fact it replaces)
-- NO_CONTRADICTION"""
-
-
-def detect_contradiction_with_model(
-    subject: str,
-    predicate: str,
-    obj: str,
-    existing_triples: list[tuple[str, str, str]],
-    model,
-    tokenizer,
-    prompt: str = _CONTRADICTION_PROMPT,
-) -> tuple[str, str, str] | None:
-    """Use the model to detect if a new triple contradicts an existing one.
-
-    Args:
-        subject: Subject of the new triple.
-        predicate: Predicate of the new triple.
-        obj: Object of the new triple.
-        existing_triples: All triples currently in the graph.
-        model: LLM to use for contradiction detection.
-        tokenizer: Tokenizer paired with *model*.
-        prompt: Prompt template with ``{existing_facts}``, ``{subject}``,
-            ``{predicate}``, and ``{object}`` slots.  Defaults to
-            ``_CONTRADICTION_PROMPT``; pass a custom string (e.g. loaded via
-            ``_load_prompt``) to override without code changes.
-
-    Returns the contradicted (subject, predicate, object) triple, or None.
-    """
-    from paramem.evaluation.recall import generate_answer
-    from paramem.models.loader import adapt_messages
-
-    if not existing_triples:
-        return None
-
-    # Filter to triples about the same subject
-    relevant = [(s, p, o) for s, p, o in existing_triples if s.lower() == subject.lower()]
-    if not relevant:
-        return None
-
-    facts_str = "\n".join(f"- {s} | {p} | {o}" for s, p, o in relevant)
-    prompt = prompt.format(
-        existing_facts=facts_str,
-        subject=subject,
-        predicate=predicate,
-        object=obj,
-    )
-
-    messages = adapt_messages(
-        [
-            {"role": "system", "content": "You detect contradictions between facts."},
-            {"role": "user", "content": prompt},
-        ],
-        tokenizer,
-    )
-    formatted = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    output = generate_answer(
-        model,
-        tokenizer,
-        formatted,
-        max_new_tokens=64,
-        temperature=0.0,
-    )
-
-    output = output.strip()
-    if output.startswith("CONTRADICTS"):
-        # Parse "CONTRADICTS subject | predicate | object"
-        parts = output[len("CONTRADICTS") :].strip().split("|")
-        if len(parts) == 3:
-            old_s = parts[0].strip()
-            old_p = parts[1].strip()
-            old_o = parts[2].strip()
-            return (old_s, old_p, old_o)
-        logger.warning("Could not parse contradiction response: %s", output)
-    return None
 
 
 def check_predicate_coexistence(
@@ -238,12 +140,9 @@ class GraphMerger:
         similarity_threshold: float = 85.0,
         model=None,
         tokenizer=None,
-        cross_predicate_contradiction: bool = False,
         prompts_dir: str | Path | None = None,
     ):
         """Initialize merger.
-
-        Contradiction resolution operates in two independent layers:
 
         Same-predicate, different-object cardinality resolution: always-on when
         a model is present.  The cardinality of each predicate (single-valued →
@@ -253,13 +152,6 @@ class GraphMerger:
         pairs coexist (no removal) — this is the experiment path and the
         post-release state.
 
-        Cross-predicate contradiction detection: OFF by default
-        (``cross_predicate_contradiction=False``) because it over-removes
-        legitimate multi-valued facts (multiple valid values for one relation)
-        and independent facts expressed under different predicates.  Set
-        ``cross_predicate_contradiction=True`` only after verifying it is safe
-        for a specific knowledge domain.
-
         Args:
             similarity_threshold: Minimum rapidfuzz token_sort_ratio score (0–100)
                 for the fuzzy tier of entity resolution.
@@ -267,14 +159,9 @@ class GraphMerger:
                 When set, this merger is a BASE-MODEL HOLDER; call
                 :meth:`release` to drop the reference.
             tokenizer: Tokenizer paired with *model*.
-            cross_predicate_contradiction: Enable cross-predicate contradiction
-                detection via ``detect_contradiction_with_model``.  Default OFF
-                — over-removes legitimate multi-valued/independent facts.
-                Same-predicate cardinality resolution is unaffected by this flag.
-            prompts_dir: Optional directory to load ``merger_coexistence.txt`` and
-                ``merger_contradiction.txt`` from.  Falls back to
-                ``configs/prompts/`` in the project root, then to the inline
-                constants ``_COEXISTENCE_PROMPT`` / ``_CONTRADICTION_PROMPT``.
+            prompts_dir: Optional directory to load ``merger_coexistence.txt``
+                from.  Falls back to ``configs/prompts/`` in the project root,
+                then to the inline constant ``_COEXISTENCE_PROMPT``.
                 Resolved once at construction so a config edit takes effect at the
                 next consolidation cycle (when a new merger instance is created).
         """
@@ -282,7 +169,6 @@ class GraphMerger:
         self.graph = nx.MultiDiGraph()
         self.model = model
         self.tokenizer = tokenizer
-        self.cross_predicate_contradiction = cross_predicate_contradiction
         self.contradictions_resolved = []  # log of resolved contradictions
         # Per-merge/fold output lists — also initialised here so _upsert_relation
         # is safe to call without a preceding merge() call (e.g. in unit tests).
@@ -300,7 +186,7 @@ class GraphMerger:
         # accounting and future contradiction observability).  Reset in
         # reset_graph(), NOT in merge() — must survive the fold's
         # reset_graph→re-merge→enrich→classify span.
-        # reason ∈ {"dedup", "contradiction_same_pred", "contradiction_cross_pred",
+        # reason ∈ {"dedup", "contradiction_same_pred",
         #            "enrichment_same_as", "predicate_synonym_collapse", "semantic_dedup"}
         self.removal_ledger: dict[str, dict] = {}
         # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
@@ -308,9 +194,6 @@ class GraphMerger:
         # Resolve prompts once at construction so a file edit takes effect next cycle.
         _pd = Path(prompts_dir) if prompts_dir else None
         self._coexistence_prompt = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT, _pd)
-        self._contradiction_prompt = _load_prompt(
-            "merger_contradiction.txt", _CONTRADICTION_PROMPT, _pd
-        )
 
     def merge(
         self,
@@ -745,8 +628,6 @@ class GraphMerger:
         # is old-vs-old consolidation with no recency signal, so no removal is
         # made; fall through to new-edge insertion.
         # When no model is present, fall through to new-edge insertion (coexist-all).
-        graph_resolved = False
-
         if resolve_contradictions and self.model is not None and self.graph.has_node(subject):
             for old_obj in list(self.graph.successors(subject)):
                 if old_obj == obj:
@@ -820,79 +701,7 @@ class GraphMerger:
                             obj,
                             session_id,
                         )
-                    graph_resolved = True
                 # COEXIST: fall through to new-edge insertion.
-
-        # --- Cross-predicate contradiction detection (model-based) ---
-        # Catches cases like moved_to vs lives_in that same-predicate matching misses.
-        # Gated by self.cross_predicate_contradiction (default False) because it
-        # over-removes legitimate multi-valued and independent facts (observed in
-        # live use).  Same-predicate cardinality resolution above is unaffected by this flag.
-        if (
-            self.cross_predicate_contradiction
-            and not graph_resolved
-            and self.model is not None
-            and self.graph.has_node(subject)
-        ):
-            existing_triples = []
-            for succ in self.graph.successors(subject):
-                for _, data in self.graph[subject][succ].items():
-                    existing_triples.append((subject, data["predicate"], succ))
-
-            if existing_triples:
-                contradicted = detect_contradiction_with_model(
-                    subject,
-                    normalized_pred,
-                    obj,
-                    existing_triples,
-                    self.model,
-                    self.tokenizer,
-                    self._contradiction_prompt,
-                )
-                if contradicted is not None:
-                    old_s, old_p, old_o = contradicted
-                    # Find and remove the contradicted edge
-                    old_p_norm = canonical_id(old_p)
-                    for old_obj in list(self.graph.successors(subject)):
-                        keys_to_remove = [
-                            key
-                            for key, data in self.graph[subject][old_obj].items()
-                            if data.get("predicate") == old_p_norm
-                        ]
-                        for key in keys_to_remove:
-                            _removed_ik = (
-                                self.graph.get_edge_data(subject, old_obj, key=key) or {}
-                            ).get(_IK_KEY_ATTR)
-                            if _removed_ik:
-                                self.removal_ledger[_removed_ik] = {
-                                    "reason": "contradiction_cross_pred",
-                                    "old_object": old_obj,
-                                    "old_predicate": old_p_norm,
-                                    "new_object": obj,
-                                    "new_predicate": normalized_pred,
-                                }
-                            self.graph.remove_edge(subject, old_obj, key=key)
-                            self.contradictions_resolved.append(
-                                {
-                                    "method": "model",
-                                    "subject": subject,
-                                    "old_predicate": old_p_norm,
-                                    "old_object": old_obj,
-                                    "new_predicate": normalized_pred,
-                                    "new_object": obj,
-                                    "session": session_id,
-                                }
-                            )
-                            logger.info(
-                                "Contradiction resolved (model): "
-                                "%s | %s | %s → %s | %s (session %s)",
-                                subject,
-                                old_p_norm,
-                                old_obj,
-                                normalized_pred,
-                                obj,
-                                session_id,
-                            )
 
         # --- Case 3: New-edge insertion ---
         # After contradiction cleanup, alignment check, or when no same-pred edge exists.

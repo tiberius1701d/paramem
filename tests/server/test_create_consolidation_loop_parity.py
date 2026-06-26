@@ -97,7 +97,7 @@ SCENARIOS = [
             "consolidation.extraction_noise_filter_model": "claude-sonnet-4-6",
             "consolidation.extraction_plausibility_judge": "off",
             "consolidation.extraction_verify_anonymization": False,
-            "consolidation.graph_enrichment_enabled": True,
+            "consolidation.sota_enabled": True,
             "consolidation.graph_enrichment_neighborhood_hops": 1,
             "consolidation.graph_enrichment_max_entities_per_pass": 400,
             "adapters.episodic.rank": 8,
@@ -190,7 +190,7 @@ def test_factory_threads_every_config_knob(
 
     # --- Graph and enrichment knobs ---
     assert captured["graph_config"] == cfg.graph_config
-    assert captured["graph_enrichment_enabled"] == cfg.consolidation.graph_enrichment_enabled
+    assert captured["sota_enabled"] == cfg.consolidation.sota_enabled
     assert (
         captured["graph_enrichment_neighborhood_hops"]
         == cfg.consolidation.graph_enrichment_neighborhood_hops

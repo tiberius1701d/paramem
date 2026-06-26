@@ -117,10 +117,11 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.quiet_hours_start": Tier.PIPELINE_ALTERING,
     "consolidation.quiet_hours_end": Tier.PIPELINE_ALTERING,
     "consolidation.entity_similarity_threshold": Tier.PIPELINE_ALTERING,
-    "consolidation.graph_enrichment_enabled": Tier.PIPELINE_ALTERING,
     "consolidation.graph_enrichment_neighborhood_hops": Tier.PIPELINE_ALTERING,
     "consolidation.graph_enrichment_max_entities_per_pass": Tier.PIPELINE_ALTERING,
-    "consolidation.fold_refinement": Tier.PIPELINE_ALTERING,
+    "consolidation.sota_enabled": Tier.PIPELINE_ALTERING,
+    "consolidation.refinement_enrichment": Tier.PIPELINE_ALTERING,
+    "consolidation.refinement_normalization": Tier.PIPELINE_ALTERING,
     "consolidation.contradiction_detection": Tier.PIPELINE_ALTERING,
     # --- agents.sota ---
     "agents.sota.enabled": Tier.PIPELINE_ALTERING,

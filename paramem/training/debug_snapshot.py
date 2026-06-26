@@ -234,7 +234,7 @@ class DebugSnapshotWriter:
         Writes ``<base>/fold/removal_ledger.json`` via the plaintext
         atomic writer.  The ledger maps each removed edge's ``ik_key``
         to a dict carrying ``"reason"`` (one of ``"dedup"``,
-        ``"contradiction_same_pred"``, ``"contradiction_cross_pred"``,
+        ``"contradiction_same_pred"``,
         ``"enrichment_same_as"``) and per-reason detail fields.
 
         Called once per fold AFTER the drift classifier has consumed the

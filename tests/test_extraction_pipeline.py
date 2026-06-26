@@ -2967,6 +2967,7 @@ class TestExtractGraphNewKwargs:
                 "transcript",
                 "sess1",
                 speaker_id="speaker0",
+                sota_enabled=True,
                 noise_filter="anthropic",
                 ner_check=True,
                 ner_model="en_core_web_trf",

@@ -193,13 +193,9 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     loop._thermal_policy = None
     # _bg_trainer is wired by the server lifespan; None in tests (experiment path).
     loop._bg_trainer = None
-    # consolidate_interim_adapters calls _run_graph_enrichment(), which reads
-    # self.graph_enrichment_enabled.  The bare __new__ loop never ran __init__,
-    # so this attribute is absent and the call raises AttributeError (swallowed,
-    # but the half-run enrichment perturbs the per-tier flow).  Disable enrichment
-    # explicitly so it early-returns skipped — the no-enrichment behavior these
-    # ordering/registry tests assume.
-    loop.graph_enrichment_enabled = False
+    # consolidate_interim_adapters calls _run_graph_enrichment() via _refine_consolidation_graph
+    # when scope.enrich is True.  The config default (refinement_enrichment="off",
+    # sota_enabled=False) yields enrich=False — no enrichment runs in these ordering tests.
     # Admit-all probe stub for the registration fail-safe: when no recall verdict is
     # available, _reset_main_tier_registries_and_simhashes runs _probe_passing_keys,
     # whose real evaluate_indexed_recall feeds the MagicMock model into re.sub and
