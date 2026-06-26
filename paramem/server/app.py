@@ -12847,7 +12847,7 @@ def _extract_and_start_training():
     # procedural.  Freshness-wins router order: probing the newest interim
     # before main means recently
     # learned facts surface ahead of the stale main snapshot.
-    if not loop.config.indexed_key_replay_enabled:
+    if not loop.config.indexed_key_replay:
         logger.warning("Indexed key replay disabled — skipping training")
         session_buffer.mark_consolidated(
             _completed_session_ids(),

@@ -291,7 +291,7 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         warmup_ratio=0.0,
     )
     consolidation_cfg = ConsolidationConfig(
-        indexed_key_replay_enabled=False,
+        indexed_key_replay=False,
         promotion_threshold=3,
     )
     loop = ConsolidationLoop(

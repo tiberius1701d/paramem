@@ -1,7 +1,7 @@
 """Server consolidation — thin wrapper around ConsolidationLoop.
 
 Uses the same ConsolidationLoop that powers Tests 1-8, with
-indexed_key_replay_enabled=True. The graph is transient (RAM-only).
+indexed_key_replay=True. The graph is transient (RAM-only).
 Promotion is key-level: per-key session counts persisted in
 key_metadata.json (no personal data on disk).
 

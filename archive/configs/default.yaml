@@ -77,15 +77,11 @@ consolidation:
   quiet_hours_end: "07:00"            # wraps past midnight when end < start
   promotion_threshold: 3       # cycles before episodic -> semantic
   decay_window: 10             # cycles before unreinforced memories fade
-  procedural_detection_window: 5
   episodic_new_weight: 0.7     # weight for new material in episodic objective
   semantic_replay_weight: 0.5  # weight for replay in semantic objective
   curriculum_enabled: false    # probe recall before replay sampling
   min_exposure_cycles: 5       # minimum training exposures before decay allowed
   key_replay_enabled: false    # use key-addressable replay (adapter weights as source of truth)
-  max_active_keys: 50          # cap on simultaneous active keys
-  key_retirement_threshold: 0.1  # retire key when fidelity drops below this
-  key_retirement_cycles: 3     # must fail threshold for N consecutive cycles
   entity_replay_enabled: false   # entity-keyed NL replay (replaces key replay)
   max_active_entities: 50        # cap on tracked entities
   entity_retirement_threshold: 0.1  # retire entity when fidelity drops below this

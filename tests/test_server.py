@@ -60,7 +60,7 @@ class TestConfig:
     def test_consolidation_config(self):
         config = ServerConfig()
         cc = config.consolidation_config
-        assert cc.indexed_key_replay_enabled is True
+        assert cc.indexed_key_replay is True
         assert cc.promotion_threshold == 3
 
     def test_missing_config_file_returns_defaults(self):

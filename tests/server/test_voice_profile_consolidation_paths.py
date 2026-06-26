@@ -33,7 +33,7 @@ def _make_loop_no_qa():
     """Loop that returns empty QA so the no-facts early exit fires."""
     loop = MagicMock()
     loop.shutdown_requested = False
-    loop.config.indexed_key_replay_enabled = True
+    loop.config.indexed_key_replay = True
     loop.config.consolidation.mode = "train"
     # extract_session returns empty lists — no QA extracted.
     loop.extract_session.return_value = ([], [])

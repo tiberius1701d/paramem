@@ -8162,7 +8162,7 @@ class TestMaterializeInterimExtraRelations:
         )
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
-            indexed_key_replay_enabled=True,
+            indexed_key_replay=True,
             interim_refinement="off",  # default; tests override per scenario
         )
         loop.training_config = TrainingConfig(
@@ -8594,7 +8594,7 @@ class TestInterimKeyedWalk:
         )
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
-            indexed_key_replay_enabled=True,
+            indexed_key_replay=True,
             interim_refinement="off",
         )
         loop.training_config = TrainingConfig(
@@ -8787,7 +8787,7 @@ class TestMergeRegistryRelationsUnification:
         )
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
-            indexed_key_replay_enabled=True,
+            indexed_key_replay=True,
             interim_refinement="off",
         )
         loop.training_config = TrainingConfig(
@@ -9429,7 +9429,7 @@ class TestSubtractiveRemovalsHelperInterim:
         loop = object.__new__(ConsolidationLoop)
         loop.model = MagicMock()
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+        loop.config = ConsolidationConfig(indexed_key_replay=True)
         loop.training_config = TrainingConfig(
             num_epochs=1,
             gradient_checkpointing=False,
@@ -9721,7 +9721,7 @@ class TestSubtractiveRemovalsHelperFold:
         loop = object.__new__(ConsolidationLoop)
         loop.model = MagicMock()
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+        loop.config = ConsolidationConfig(indexed_key_replay=True)
         loop.training_config = TrainingConfig(
             num_epochs=1,
             gradient_checkpointing=False,
@@ -9968,7 +9968,7 @@ class TestRunGraphNormalizationApply:
         loop.tokenizer = MagicMock()
         loop.tokenizer.apply_chat_template.return_value = "formatted_prompt"
         loop.config = ConsolidationConfig(
-            indexed_key_replay_enabled=True,
+            indexed_key_replay=True,
             interim_refinement="light",
             fold_refinement="light",
         )
@@ -10460,7 +10460,7 @@ class TestSubtractiveRemovalsDuplicateMerge:
         loop = object.__new__(ConsolidationLoop)
         loop.model = MagicMock()
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+        loop.config = ConsolidationConfig(indexed_key_replay=True)
         loop.training_config = TrainingConfig(
             num_epochs=1,
             gradient_checkpointing=False,
@@ -10581,7 +10581,7 @@ class TestNormalizationDebugSnapshot:
         from paramem.utils.config import ConsolidationConfig
 
         loop = object.__new__(ConsolidationLoop)
-        loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+        loop.config = ConsolidationConfig(indexed_key_replay=True)
         loop.save_cycle_snapshots = save_cycle_snapshots
         loop._current_interim_stamp = None  # type: ignore[assignment]
         loop.cycle_count = 0
@@ -10663,7 +10663,7 @@ class TestNormalizationLevelGating:
         loop.model = MagicMock()
         loop.tokenizer = MagicMock()
         loop.config = ConsolidationConfig(
-            indexed_key_replay_enabled=True,
+            indexed_key_replay=True,
             interim_refinement=interim_refinement,
             fold_refinement=fold_refinement,
         )
@@ -11476,7 +11476,7 @@ class TestThreeWayGate:
         model.peft_config = {}
         loop.model = model
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+        loop.config = ConsolidationConfig(indexed_key_replay=True)
         loop.training_config = TrainingConfig(
             num_epochs=1,
             gradient_checkpointing=False,

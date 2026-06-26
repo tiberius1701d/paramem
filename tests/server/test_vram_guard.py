@@ -608,7 +608,7 @@ class TestPerChunkOOMSkip:
         loop = MagicMock()
         loop.shutdown_requested = False
         loop.config = MagicMock()
-        loop.config.indexed_key_replay_enabled = False
+        loop.config.indexed_key_replay = False
 
         from paramem.server.vram_guard import VramExhausted as _Exh
 
@@ -753,7 +753,7 @@ class TestExtractionFailedAbortsCycle:
         loop = MagicMock()
         loop.shutdown_requested = False
         loop.config = MagicMock()
-        loop.config.indexed_key_replay_enabled = False
+        loop.config.indexed_key_replay = False
 
         def _extract(transcript, sid, **kwargs):
             if sid == "doc-bbb":

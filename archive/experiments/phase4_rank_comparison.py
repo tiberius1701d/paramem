@@ -404,7 +404,6 @@ def run_single_rank(
     consolidation_config = ConsolidationConfig(
         promotion_threshold=config.consolidation.promotion_threshold,
         decay_window=config.consolidation.decay_window,
-        procedural_detection_window=config.consolidation.procedural_detection_window,
         episodic_new_weight=config.consolidation.episodic_new_weight,
         semantic_replay_weight=config.consolidation.semantic_replay_weight,
         entity_replay_enabled=True,

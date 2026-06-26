@@ -117,7 +117,7 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
 
     loop.model = model
     loop.tokenizer = MagicMock()
-    loop.config = ConsolidationConfig(indexed_key_replay_enabled=True)
+    loop.config = ConsolidationConfig(indexed_key_replay=True)
     loop.training_config = TrainingConfig(
         num_epochs=1,
         gradient_checkpointing=False,

@@ -189,13 +189,9 @@ def main():
     consolidation_config = ConsolidationConfig(
         promotion_threshold=config.consolidation.promotion_threshold,
         decay_window=config.consolidation.decay_window,
-        procedural_detection_window=config.consolidation.procedural_detection_window,
         episodic_new_weight=config.consolidation.episodic_new_weight,
         semantic_replay_weight=config.consolidation.semantic_replay_weight,
         key_replay_enabled=True,
-        max_active_keys=config.consolidation.max_active_keys,
-        key_retirement_threshold=config.consolidation.key_retirement_threshold,
-        key_retirement_cycles=config.consolidation.key_retirement_cycles,
     )
 
     training_config = TrainingConfig(

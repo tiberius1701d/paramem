@@ -10,7 +10,6 @@ import yaml
 
 from paramem.backup.types import FatalConfigError
 from paramem.utils.config import (
-    _REFINEMENT_LEVELS,
     AdapterConfig,
     ConsolidationConfig,
     GraphConfig,
@@ -834,7 +833,7 @@ class VoiceConfig:
 
 
 @dataclass
-class ConsolidationScheduleConfig:
+class ConsolidationScheduleConfig(ConsolidationConfig):
     # The interim refresh cadence — the only scheduling knob the operator sets.
     # Every refresh_cadence a new episodic_interim_<stamp> adapter is minted
     # (subject to the activity gate). Full consolidation fires every
@@ -845,34 +844,7 @@ class ConsolidationScheduleConfig:
         "12h"  # default: one new interim every 12h → 84h full consolidation at count=7
     )
     mode: str = "train"  # "train" = full pipeline, "simulate" = extract only
-    promotion_threshold: int = 3
     retain_sessions: bool = True
-    indexed_key_replay: bool = True  # indexed key training mechanism
-    decay_window: int = 10  # cycles before unreinforced keys decay
-    # Refinement level for the interim mini-fold (one interim adapter slot per
-    # consolidation cycle).  Grammar shared with fold_refinement:
-    # "off" = additive accumulation only — exact-(s,p,o) dedup, no model calls.
-    # "light" = whole-graph model-driven normalization pass (synonym-predicate
-    #           dedup).  Default OFF: unreliable on the local model at scale; the
-    #           code is wired and re-enabled by setting "light".
-    # "full" = light + second-order SOTA enrichment (cloud; HELD until cross-doc
-    #          probe quantifies value and known inflation/fabrication is remedied).
-    interim_refinement: str = "off"  # Literal["off", "light", "full"]
-    # Refinement level for the full fold (consolidate_interim_adapters).  Same
-    # grammar as interim_refinement.  Defaults to "off"; "full" is HELD.
-    fold_refinement: str = "off"  # Literal["off", "light", "full"]
-    # Whether the merger resolves same-predicate/different-object cardinality
-    # conflicts (Case-2 COEXIST/REPLACE) at ingest and interim cycles.  Applied
-    # wherever a NEW-vs-OLD temporal partition supplies the recency signal.
-    # OFF at the full fold (old-vs-old consolidation, no recency) until per-edge
-    # timestamps are introduced.
-    contradiction_detection: bool = True
-    # Minimum recall fraction (0, 1] that every recall gate must reach before the
-    # adapter fold is accepted.  Applied to: post-save disk-integrity probes,
-    # interim-cycle training, full-fold training, housekeeping re-train, and
-    # simulate→train migration.  1.0 = sharp recall (all keys must be recalled).
-    # Lower only with empirical evidence and explicit operator acknowledgment.
-    recall_sanity_threshold: float = 1.0
     # Maximum number of interim cycles a session can be held pending because
     # of a recall-gate failure or DEGENERATE outcome.  When the counter
     # reaches this cap the session is released (no longer pinned), a
@@ -881,24 +853,6 @@ class ConsolidationScheduleConfig:
     # genuine encoding failures count.  Must be a positive integer (> 0).
     # Read at SessionBuffer construction (app.py).
     consolidation_retry_cap: int = 3
-    # Floor below which a tier's keys park in episodic until the tier's own
-    # population reaches this count.  30 is the conservative default (Test 19:
-    # set size is the lever — 10 near-dup keys score 7/10 isolated, 51/51 when
-    # diluted into a larger set).  semantic/procedural keys accumulate in
-    # episodic and graduate to their own tier once this floor is crossed.
-    min_tier_key_floor: int = 30
-    # Graduation strategy when a parked tier first crosses min_tier_key_floor.
-    # True (DEFAULT): copy the episodic adapter's LoRA weights into the
-    #   graduating tier and rebook the registry — training-free fast-start.
-    #   The copied adapter recalls its keys at episodic's fidelity (0.960 disk-
-    #   verify on 183 keys, above the 0.95 gate) and the 0.95 disk gate still
-    #   runs; if it ever fails the tier falls back to train-from-scratch for
-    #   that cycle.  Opt out (false) for the scientifically clean baseline.
-    # False (OPT-OUT): train the tier from scratch on its own now-large (>= floor)
-    #   key set — every adapter is honestly trained on its own keys, no
-    #   inherited weights.  The principled baseline and always-available safety net.
-    # Governs semantic/procedural graduation only; episodic always trains from scratch.
-    tier_fast_start: bool = True
     # Maximum LoRA training epochs per consolidation cycle. None = use the
     # validated 30 default (Test 17 floor) for 100% indexed-key recall on the
     # validated models.
@@ -1098,6 +1052,7 @@ class ConsolidationScheduleConfig:
         - judge="off"   + any stage  → plausibility disabled, no cloud exposure
         - judge=<cloud> + stage="anon" → cloud judge on anonymized data only
         """
+        super().__post_init__()
         if self.training_save_steps_ram < 0:
             raise ValueError(
                 f"consolidation.training_save_steps_ram must be >= 0; "
@@ -1129,23 +1084,6 @@ class ConsolidationScheduleConfig:
                 f"extraction_plausibility_stage='deanon' would send REAL NAMES to a "
                 f"cloud API. Use stage='anon' for cloud judges, or judge='auto' for "
                 f"local judging."
-            )
-
-        if self.interim_refinement not in _REFINEMENT_LEVELS:
-            raise ValueError(
-                f"consolidation.interim_refinement must be one of "
-                f"{sorted(_REFINEMENT_LEVELS)!r}; got {self.interim_refinement!r}"
-            )
-        if self.fold_refinement not in _REFINEMENT_LEVELS:
-            raise ValueError(
-                f"consolidation.fold_refinement must be one of "
-                f"{sorted(_REFINEMENT_LEVELS)!r}; got {self.fold_refinement!r}"
-            )
-
-        if not (0.0 < self.recall_sanity_threshold <= 1.0):
-            raise ValueError(
-                f"consolidation.recall_sanity_threshold must be in (0.0, 1.0]; "
-                f"got {self.recall_sanity_threshold!r}"
             )
 
         if self.consolidation_retry_cap < 1:
@@ -1654,7 +1592,7 @@ class ServerConfig:
         """
         return ConsolidationConfig(
             promotion_threshold=self.consolidation.promotion_threshold,
-            indexed_key_replay_enabled=self.consolidation.indexed_key_replay,
+            indexed_key_replay=self.consolidation.indexed_key_replay,
             decay_window=self.consolidation.decay_window,
             interim_refinement=self.consolidation.interim_refinement,
             fold_refinement=self.consolidation.fold_refinement,

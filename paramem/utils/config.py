@@ -138,11 +138,7 @@ class GraphConfig:
 class ConsolidationConfig:
     promotion_threshold: int = 3
     decay_window: int = 10
-    procedural_detection_window: int = 5
-    max_active_keys: int = 100000  # no practical limit
-    key_retirement_threshold: float = 0.1
-    key_retirement_cycles: int = 3
-    indexed_key_replay_enabled: bool = False
+    indexed_key_replay: bool = True
     # Refinement level for the interim mini-fold (one interim adapter slot per
     # consolidation cycle).  Grammar shared with fold_refinement:
     # "off" = additive accumulation only — exact-(s,p,o) dedup, no model calls.

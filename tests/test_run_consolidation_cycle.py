@@ -50,7 +50,7 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
     from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
     cons_config = ConsolidationConfig(
-        indexed_key_replay_enabled=True,
+        indexed_key_replay=True,
     )
     training_config = TrainingConfig(
         num_epochs=1,
@@ -970,7 +970,7 @@ class TestRecallFailedSessionStaysPending:
         """
         loop = _make_mock_loop(tmp_path)
         loop.config = loop.config.__class__(
-            indexed_key_replay_enabled=True,
+            indexed_key_replay=True,
             interim_refinement=interim_refinement,
         )
         real_graph = nx.MultiDiGraph()
@@ -1274,7 +1274,7 @@ class TestRecallFailedSessionStaysPending:
         # Add TWO edges with different sessions to the graph.
         loop = _make_mock_loop(tmp_path)
         loop.config = loop.config.__class__(
-            indexed_key_replay_enabled=True,
+            indexed_key_replay=True,
             interim_refinement="light",
         )
         real_graph = nx.MultiDiGraph()

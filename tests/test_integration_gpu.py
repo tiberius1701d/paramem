@@ -679,7 +679,7 @@ class TestBatchConsolidationE2E:
         loop = ConsolidationLoop(
             model=model,
             tokenizer=tokenizer,
-            consolidation_config=ConsolidationConfig(indexed_key_replay_enabled=True),
+            consolidation_config=ConsolidationConfig(indexed_key_replay=True),
             training_config=TrainingConfig(num_epochs=2),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
