@@ -230,8 +230,8 @@ consolidation:
   decay_window: 10             # cycles before unreinforced keys decay
   sota_enabled: true            # dev-test posture: exercise SOTA code paths (cloud calls fall through when API key unset)
   refinement_enrichment: "on"   # graph-stage SOTA enrichment — on in tests; requires sota_enabled:true
-  refinement_normalization: "off"  # graph-stage predicate-synonym collapse — OFF (experimental/unreliable on local model)
-  contradiction_detection: true  # Case-2 same-(subject,predicate)/different-object cardinality at ingest + interim; per-conflict in the merger, unaffected by the normalization knobs above.
+  refinement_normalization: "off"  # full-fold predicate-synonym collapse (per-group cluster model call) — OFF (experimental/unreliable on local 7B)
+  refinement_contradiction: "on"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
   consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
   min_tier_key_floor: 30

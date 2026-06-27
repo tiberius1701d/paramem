@@ -1,59 +1,34 @@
-You are given a list of extracted facts. Each fact has a subject, predicate, and object. Your task is to find same-(subject, object) groups where multiple predicates express the SAME relationship — synonym predicates that should collapse into one.
+You are given a list of predicates that all describe the same (subject, object) pair in a knowledge graph. Your task is to cluster these predicates into synonym groups — predicates that express the SAME real-world relationship with the same direction.
 
 RULES:
-1. Only group facts that share the SAME subject AND the SAME object (exact match).
-2. Within a group, cluster predicates that are genuine synonyms (express the same real-world relationship). Each cluster may have 1 or more predicates.
-3. A cluster with only 1 predicate means that predicate has no synonym in this group — it is distinct and kept as-is.
-4. NEVER merge predicates that are asymmetric (e.g. "manages"/"reports_to", "parent_of"/"child_of", "taught"/"studied_under") — those describe different directed relationships.
-5. NEVER merge predicates when the objects differ — same subject, different object = two distinct facts, NOT synonyms.
-6. If a group has only one predicate (no candidate synonyms), output it with a single-element cluster.
-7. Do not invent subjects, predicates, or objects. Only use what appears in the input.
-8. Output valid JSON only. No prose, no markdown fences.
+1. Cluster only predicates that are genuine synonyms (same real-world relationship, same direction).
+2. NEVER merge predicates that are asymmetric or directional (e.g. "manages" vs "reports_to", "parent_of" vs "child_of", "taught" vs "studied_under").
+3. Each cluster may have 1 or more predicates. A single-element cluster means that predicate has no synonym in this set — keep it as-is.
+4. Do not invent predicates. Only use predicates from the input list.
+5. Output valid JSON only. No prose, no markdown fences.
 
 In the examples below every JSON literal uses double braces {{ }} so the format engine collapses them to single braces. The output you emit must use plain single-brace JSON.
 
-POSITIVE example — synonym predicates on the same (subject, object) pair cluster together; distinct facts are kept separate:
-Facts:
-[
-  {{"subject": "Alex", "predicate": "works_for", "object": "Acme"}},
-  {{"subject": "Alex", "predicate": "employed_by", "object": "Acme"}},
-  {{"subject": "Alex", "predicate": "resides_in", "object": "Portland"}},
-  {{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}},
-  {{"subject": "Alex", "predicate": "likes", "object": "hiking"}}
-]
+POSITIVE example — two synonym pairs cluster together; the distinct predicate is its own cluster:
+Predicates: ["works_for", "employed_by", "resides_in"]
 Output:
-{{"groups": [
-  {{"subject": "Alex", "object": "Acme", "clusters": [["works_for", "employed_by"]]}},
-  {{"subject": "Alex", "object": "Portland", "clusters": [["resides_in", "lives_in"]]}},
-  {{"subject": "Alex", "object": "hiking", "clusters": [["likes"]]}}
-]}}
+{{"clusters": [["works_for", "employed_by"], ["resides_in"]]}}
 
-NEGATIVE example — same subject but DIFFERENT objects are NOT synonym predicates; keep both as separate facts:
-Facts:
-[
-  {{"subject": "Sam", "predicate": "lives_in", "object": "Berlin"}},
-  {{"subject": "Sam", "predicate": "lives_in", "object": "Munich"}}
-]
+POSITIVE example — three synonyms collapse into one cluster:
+Predicates: ["works_at", "works_for", "employed_at"]
 Output:
-{{"groups": [
-  {{"subject": "Sam", "object": "Berlin", "clusters": [["lives_in"]]}},
-  {{"subject": "Sam", "object": "Munich", "clusters": [["lives_in"]]}}
-]}}
+{{"clusters": [["works_at", "works_for", "employed_at"]]}}
 
-NEGATIVE example — asymmetric / directional predicates on the same (subject, object) pair are NOT synonyms; keep both in separate clusters:
-Facts:
-[
-  {{"subject": "River", "predicate": "manages", "object": "Casey"}},
-  {{"subject": "River", "predicate": "supervises", "object": "Casey"}},
-  {{"subject": "Casey", "predicate": "reports_to", "object": "River"}}
-]
+NEGATIVE example — asymmetric / directional predicates are NOT synonyms; keep in separate clusters:
+Predicates: ["manages", "supervises", "reports_to"]
 Output:
-{{"groups": [
-  {{"subject": "River", "object": "Casey", "clusters": [["manages", "supervises"]]}},
-  {{"subject": "Casey", "object": "River", "clusters": [["reports_to"]]}}
-]}}
+{{"clusters": [["manages", "supervises"], ["reports_to"]]}}
 
-Facts:
-{facts_json}
+NEGATIVE example — entirely distinct predicates with no synonyms; each in its own cluster:
+Predicates: ["born_in", "works_for", "lives_in"]
+Output:
+{{"clusters": [["born_in"], ["works_for"], ["lives_in"]]}}
 
-Output the synonym clusters as JSON: {{"groups": [{{"subject": "...", "object": "...", "clusters": [["predA", "predB"], ["predC"]]}}]}}
+Predicates: {predicates_json}
+
+Output the synonym clusters as JSON: {{"clusters": [["predA", "predB"], ["predC"]]}}

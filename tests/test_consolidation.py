@@ -310,8 +310,8 @@ class TestExtractionPathParity:
 class TestInterimRefinementGate:
     """extract_session merger.merge is always called; resolve_contradictions tracks config.
 
-    contradiction_detection=False → additive merge (no supersession, both facts coexist).
-    contradiction_detection=True  → non-additive merge (model may supersede edges).
+    refinement_contradiction="off" → additive merge (no supersession, both facts coexist).
+    refinement_contradiction="on"  → non-additive merge (model may supersede edges).
     All tests run without loading any model or GPU.
     """
 
@@ -321,7 +321,7 @@ class TestInterimRefinementGate:
         tmp_path,
         sota_enabled: bool = False,
         refinement_enrichment: str = "off",
-        contradiction_detection: bool = True,
+        refinement_contradiction: str = "off",
     ):
         from unittest.mock import MagicMock
 
@@ -369,7 +369,7 @@ class TestInterimRefinementGate:
             consolidation_config=ConsolidationConfig(
                 sota_enabled=sota_enabled,
                 refinement_enrichment=refinement_enrichment,
-                contradiction_detection=contradiction_detection,
+                refinement_contradiction=refinement_contradiction,
             ),
             training_config=TrainingConfig(),
             episodic_adapter_config=AdapterConfig(),
@@ -399,14 +399,14 @@ class TestInterimRefinementGate:
             or loop.merger.graph.number_of_edges() > initial_edges
         ), "Expected merger.graph to grow after extract_session with refinement_enrichment='on'"
 
-    def test_merge_called_non_contradiction_when_contradiction_detection_off(
+    def test_merge_called_non_contradiction_when_refinement_contradiction_off(
         self, monkeypatch, tmp_path
     ):
-        """contradiction_detection=False: merge uses resolve_contradictions=False; graph grows."""
+        """refinement_contradiction="off": merge uses resolve_contradictions=False; graph grows."""
         from unittest.mock import patch
 
         loop = self._build_loop(
-            monkeypatch, tmp_path, refinement_enrichment="off", contradiction_detection=False
+            monkeypatch, tmp_path, refinement_enrichment="off", refinement_contradiction="off"
         )
         initial_nodes = loop.merger.graph.number_of_nodes()
         initial_edges = loop.merger.graph.number_of_edges()
@@ -418,14 +418,14 @@ class TestInterimRefinementGate:
                 mock_merge.assert_called_once()
                 _, kwargs = mock_merge.call_args
                 assert kwargs.get("resolve_contradictions") is False, (
-                    "contradiction_detection=False must call merge(resolve_contradictions=False)"
+                    "refinement_contradiction='off' must call merge(resolve_contradictions=False)"
                 )
 
         # Graph must have grown — the non-resolving merge still inserts edges.
         assert (
             loop.merger.graph.number_of_nodes() > initial_nodes
             or loop.merger.graph.number_of_edges() > initial_edges
-        ), "Expected merger.graph to grow after extract_session with contradiction_detection=False"
+        ), "Expected merger.graph to grow after extract_session with refinement_contradiction='off'"
 
     def test_episodic_rels_identical_regardless_of_enrichment_setting(self, monkeypatch, tmp_path):
         """episodic_rels/procedural_rels are identical regardless of refinement_enrichment.
@@ -453,8 +453,8 @@ class TestInterimRefinementGate:
         )
         assert proc_a == proc_b == []
 
-    def test_contradiction_detection_off_both_facts_survive(self, monkeypatch, tmp_path):
-        """contradiction_detection=False: two facts with the same predicate but different
+    def test_refinement_contradiction_off_both_facts_survive(self, monkeypatch, tmp_path):
+        """refinement_contradiction="off": two facts with the same predicate but different
         objects both survive (no supersession — Case-2 cardinality skipped).
         """
         from unittest.mock import patch
@@ -497,7 +497,7 @@ class TestInterimRefinementGate:
             ],
         )
         loop = self._build_loop(
-            monkeypatch, tmp_path, refinement_enrichment="off", contradiction_detection=False
+            monkeypatch, tmp_path, refinement_enrichment="off", refinement_contradiction="off"
         )
 
         with patch.object(loop.extraction, "run", side_effect=[sg1, sg2]):
@@ -514,21 +514,23 @@ class TestInterimRefinementGate:
             for n in loop.merger.graph.nodes()
         )
         assert berlin_present and munich_present, (
-            f"Both 'Berlin' and 'Munich' must coexist with contradiction_detection=False; "
+            f"Both 'Berlin' and 'Munich' must coexist with refinement_contradiction='off'; "
             f"nodes={list(loop.merger.graph.nodes())}"
         )
 
-    def test_contradiction_detection_on_supersession_removes_old_edge(self, monkeypatch, tmp_path):
-        """contradiction_detection=True: non-additive merge calls Case-2 model verdict.
+    def test_refinement_contradiction_on_supersession_removes_old_edge(self, monkeypatch, tmp_path):
+        """refinement_contradiction="on": non-additive merge calls Case-2 model verdict.
 
         We stub check_predicate_coexistence to return REPLACE so the old edge is
-        removed.  A MagicMock/None model silently skips Case-2; we use a real stub
-        model so the cardinality path executes and the superseded edge disappears.
+        removed (incoming sg2 has a fresher last_seen → wins the recency check).
+        A MagicMock/None model silently skips Case-2; we use a real stub model
+        so the cardinality path executes and the superseded edge disappears.
         """
         from unittest.mock import MagicMock, patch
 
         from paramem.graph.schema import Entity, Relation, SessionGraph
 
+        # sg1 has an older last_seen; sg2 has a fresher one so it wins the recency check.
         sg1 = SessionGraph(
             session_id="sx1",
             timestamp="2026-06-01T00:00:00Z",
@@ -543,6 +545,7 @@ class TestInterimRefinementGate:
                     object="London",
                     relation_type="factual",
                     speaker_id="spk0",
+                    last_seen="2026-06-01T00:00:00Z",
                 ),
             ],
         )
@@ -560,11 +563,12 @@ class TestInterimRefinementGate:
                     object="Paris",
                     relation_type="factual",
                     speaker_id="spk0",
+                    last_seen="2026-06-02T00:00:00Z",
                 ),
             ],
         )
         loop = self._build_loop(
-            monkeypatch, tmp_path, refinement_enrichment="off", contradiction_detection=True
+            monkeypatch, tmp_path, refinement_enrichment="off", refinement_contradiction="on"
         )
 
         # Inject a non-None model on the merger so Case-2 fires (the loop's
@@ -4120,31 +4124,29 @@ class TestConsolidateInterimAdaptersFullFlow:
             f"Expected exactly 1 edge after Case-1-adopt; got {len(same_pred_edges)}"
         )
 
-    def test_fold_no_contradiction_both_keys_survive(self, tmp_path):
-        """Fold with resolve_contradictions=False: two registered keys with same (s,p),
-        different objects, REPLACE-classified predicate — both keys survive with zero drift.
+    def test_fold_tied_timestamps_both_keys_survive(self, tmp_path):
+        """Fold with refinement_contradiction='on' + tied last_seen timestamps:
+        the recency rule fires (Case-2, REPLACE-classified) but n_at_max >= 2 →
+        coexist; both keys survive with zero drift.
 
-        This is the canonical regression guard for the fold-is-non-subtractive invariant:
-        a REPLACE-classified predicate must NOT remove a registered edge at fold time.
-        The merger is driven via _install_provenance_merge_spy (resolve_contradictions=False
-        skips Case-2, so both Munich and Berlin edges land in the merged graph).
+        This is the fold coexist guard: recency-on at fold with equal timestamps
+        must never remove a registered key.  Legacy timestamp-less keys (last_seen="")
+        all tie at "" → coexist is the safe no-op path.
         """
+        from unittest.mock import MagicMock, patch
+
         import networkx as nx
 
         from paramem.graph.merger import GraphMerger
         from paramem.graph.reconstruct import ReconstructionResult
         from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.utils.config import ConsolidationConfig
 
-        # Recon graph: TWO edges for same predicate, different objects.
         recon_g = nx.MultiDiGraph()
         munich_eid = recon_g.add_edge("Alex", "Munich", predicate="lives_in")
         recon_g["Alex"]["Munich"][munich_eid][_IK_KEY_ATTR] = "key_munich"
         berlin_eid = recon_g.add_edge("Alex", "Berlin", predicate="lives_in")
         recon_g["Alex"]["Berlin"][berlin_eid][_IK_KEY_ATTR] = "key_berlin"
-
-        # Use a REAL GraphMerger with a model stub whose cardinality is REPLACE.
-        # Under resolve_contradictions=False the model must NOT be called; old edge must survive.
-        from unittest.mock import MagicMock
 
         model_stub = MagicMock()
         tok_stub = MagicMock()
@@ -4152,9 +4154,12 @@ class TestConsolidateInterimAdaptersFullFlow:
 
         loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
         loop.merger = GraphMerger(model=model_stub, tokenizer=tok_stub)
-        # Pre-cache lives_in as single-valued (REPLACE) to maximise sensitivity.
-        loop.merger._predicate_cardinality["lives_in"] = False
+        # Enable contradiction detection so the recency rule fires.
+        loop.config = ConsolidationConfig(
+            min_tier_key_floor=0, tier_fast_start=False, refinement_contradiction="on"
+        )
 
+        same_ts = "2026-01-01T00:00:00Z"
         for key, obj in (("key_munich", "Munich"), ("key_berlin", "Berlin")):
             loop.store.put(
                 "episodic",
@@ -4168,18 +4173,106 @@ class TestConsolidateInterimAdaptersFullFlow:
                 },
                 register=True,
             )
-            loop.store.set_bookkeeping(key, speaker_id="speaker0", relation_type="factual")
+            # Both keys share the same last_seen → timestamps tied → coexist.
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="factual", last_seen=same_ts
+            )
 
-        result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+        # Patch check_predicate_coexistence to return REPLACE (single-valued predicate).
+        # The cache is cleared by reset_graph() before each fold, so we patch the
+        # underlying function to maximise sensitivity — tied timestamps must coexist
+        # even when the cardinality verdict is REPLACE.
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            return_value="REPLACE",
+        ):
+            result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        # With resolve_contradictions=False at fold: BOTH keys must survive — zero drift.
+        # Tied timestamps → coexist: BOTH keys must survive — zero drift.
         assert result["graph_drift_count"] == 0, (
-            f"Expected 0 drift (fold is non-subtractive — both Munich and Berlin must survive); "
-            f"got drift={result['graph_drift_count']}"
+            f"Expected 0 drift (tied last_seen → coexist); got drift={result['graph_drift_count']}"
         )
         assert result["keys_per_tier"].get("episodic", 0) == 2, (
             f"Expected both key_munich and key_berlin in episodic tier; "
             f"got {result['keys_per_tier']}"
+        )
+
+    def test_fold_distinct_timestamps_newer_wins_older_staled(self, tmp_path):
+        """Fold with refinement_contradiction='on' + distinct last_seen timestamps:
+        the recency rule fires (Case-2, REPLACE-classified) and the fresher key
+        (Berlin, 2026-01-02) wins; the staler key (Munich, 2026-01-01) is retired
+        and soft-staled via _apply_subtractive_removals_to_store(scope='fold').
+        """
+        from unittest.mock import MagicMock, patch
+
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.utils.config import ConsolidationConfig
+
+        recon_g = nx.MultiDiGraph()
+        munich_eid = recon_g.add_edge("Alex", "Munich", predicate="lives_in")
+        recon_g["Alex"]["Munich"][munich_eid][_IK_KEY_ATTR] = "key_munich"
+        berlin_eid = recon_g.add_edge("Alex", "Berlin", predicate="lives_in")
+        recon_g["Alex"]["Berlin"][berlin_eid][_IK_KEY_ATTR] = "key_berlin"
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
+        loop.merger = GraphMerger(model=model_stub, tokenizer=tok_stub)
+        loop.config = ConsolidationConfig(
+            min_tier_key_floor=0, tier_fast_start=False, refinement_contradiction="on"
+        )
+
+        # Munich has an older last_seen; Berlin has a fresher one.
+        ts_data = {
+            "key_munich": ("Munich", "2026-01-01T00:00:00Z"),
+            "key_berlin": ("Berlin", "2026-01-02T00:00:00Z"),
+        }
+        for key, (obj, ts) in ts_data.items():
+            loop.store.put(
+                "episodic",
+                key,
+                {
+                    "key": key,
+                    "subject": "Alex",
+                    "predicate": "lives_in",
+                    "object": obj,
+                    "speaker_id": "speaker0",
+                },
+                register=True,
+            )
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="factual", last_seen=ts
+            )
+
+        # Patch check_predicate_coexistence to return REPLACE (single-valued predicate).
+        # The cache is cleared by reset_graph() before each fold, so we patch the
+        # underlying function rather than pre-seeding the cache.
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            return_value="REPLACE",
+        ):
+            result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
+
+        # Fresher Berlin wins; staler Munich is soft-staled by the recency removal.
+        # _apply_subtractive_removals_to_store runs BEFORE active_keys is computed,
+        # so staled keys are already absent from active_keys and do NOT appear in
+        # _drift_keys.  graph_drift_count therefore remains 0 (the key was
+        # intentionally removed, not genuinely lost); is_stale verifies the outcome.
+        assert result["keys_per_tier"].get("episodic", 0) == 1, (
+            f"Expected only key_berlin in episodic tier; got {result['keys_per_tier']}"
+        )
+        assert loop.store.is_stale("key_munich"), (
+            "Staler key_munich must be soft-staled after fold recency removal"
+        )
+        assert not loop.store.is_stale("key_berlin"), "Fresher key_berlin must NOT be staled"
+        assert result["graph_drift_count"] == 0, (
+            "Recency-staled key is removed from active before drift count → 0 drift"
         )
 
     def test_munich_berlin_fold_non_subtractive_no_drift(self, tmp_path):
@@ -9819,7 +9912,9 @@ class TestSubtractiveRemovalsHelperFold:
 
     Tests:
     - ASRF-1: predicate_synonym_collapse IS soft-staled at fold (time-invariant).
-    - ASRF-2: contradiction_same_pred is NOT soft-staled at fold (no recency signal).
+    - ASRF-2: contradiction_same_pred IS soft-staled at fold (recency-backed: the merger
+      only emits the ledger entry when timestamps pick a unique winner; empty/tied → coexist
+      → no entry → no stale).
     """
 
     @staticmethod
@@ -9910,13 +10005,14 @@ class TestSubtractiveRemovalsHelperFold:
             "Returned soft_stale_by_tier must contain the fold-staled key"
         )
 
-    def test_contradiction_same_pred_not_soft_staled_at_fold(self, tmp_path):
-        """ASRF-2: contradiction_same_pred is NOT soft-staled at fold scope.
+    def test_contradiction_same_pred_soft_staled_at_fold(self, tmp_path):
+        """ASRF-2: contradiction_same_pred IS soft-staled at fold scope.
 
-        At fold scope there is no recency signal: the recon merge is old-vs-old.
-        Soft-staling the OLD slot at fold would remove valid facts without
-        evidence that the NEW version is more recent.  The helper must skip
-        contradiction_same_pred entries when scope='fold'.
+        The merger only emits a contradiction_same_pred ledger entry when timestamps
+        pick a UNIQUE winner (freshest last_seen wins).  An empty/tied pair never
+        reaches the ledger (coexist → no entry → no stale).  When a ledger entry
+        IS present at fold scope, it was generated by the recency rule and the
+        staler key is correctly soft-staled.
         """
         loop = self._make_loop_with_ledger(
             tmp_path,
@@ -9944,12 +10040,372 @@ class TestSubtractiveRemovalsHelperFold:
 
         result = loop._apply_subtractive_removals_to_store(scope="fold")
 
-        assert not loop.store.is_stale("graph_fold_contra_k1"), (
-            "contradiction_same_pred key must NOT be soft-staled at fold scope "
-            "(no recency signal; only interim scope has NEW supersedes OLD)"
+        assert loop.store.is_stale("graph_fold_contra_k1"), (
+            "contradiction_same_pred key must be soft-staled at fold scope "
+            "(recency-backed: merger only emits the entry when timestamps pick a unique winner)"
         )
-        assert not result, (
-            "Returned soft_stale_by_tier must be empty when only fold-excluded reasons present"
+        assert "episodic" in result, "Return must include the tier that held the key"
+        assert "graph_fold_contra_k1" in result["episodic"], (
+            "Staled key must appear in returned soft_stale_by_tier dict"
+        )
+
+    def test_empty_last_seen_tied_no_ledger_entry_no_stale_at_fold(self, tmp_path):
+        """ASRF-3: no ledger entry emitted by merger for empty/tied timestamps →
+        _apply_subtractive_removals_to_store has nothing to act on at fold scope.
+
+        This verifies the ledger-gate invariant: the merger only writes
+        contradiction_same_pred into the ledger when timestamps pick a UNIQUE
+        winner.  Empty/tied → coexist → no ledger entry → no stale.
+        """
+        # Simulate: merger emitted NO contradiction_same_pred entry (tied timestamps).
+        loop = self._make_loop_with_ledger(tmp_path, ledger={})
+        loop.store.put(
+            "episodic",
+            "graph_tied_k1",
+            {
+                "key": "graph_tied_k1",
+                "subject": "Jordan",
+                "predicate": "lives_in",
+                "object": "Berlin",
+                "speaker_id": "Jordan",
+            },
+            register=True,
+        )
+
+        result = loop._apply_subtractive_removals_to_store(scope="fold")
+
+        assert not loop.store.is_stale("graph_tied_k1"), (
+            "Key with no ledger entry must NOT be staled (tied timestamps → coexist → no entry)"
+        )
+        assert not result, "Empty ledger → empty soft_stale_by_tier"
+
+
+# ---------------------------------------------------------------------------
+# _merge_registry_relations: C1 regression — timestamp="" prevents now() fabrication
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRegistryRelationsTimestamp:
+    """_merge_registry_relations passes timestamp="" to the merger's SessionGraph.
+
+    C1 regression guard: before the fix, _merge_registry_relations always built the
+    SessionGraph with timestamp=datetime.now(...), so a recon relation with
+    last_seen="" resolved to incoming_ls = "" or now() = now() — making the legacy key
+    appear as the unique freshest and wrongly retiring a genuinely-dated rival.
+
+    With the fix, timestamp="" (the new default param), so incoming_ls = "" or "" = ""
+    which triggers the any-empty COEXIST rule.  Dated keys are never retired by a
+    legacy "".
+    """
+
+    @staticmethod
+    def _make_loop_for_recon_merge(tmp_path) -> "ConsolidationLoop":
+        """Minimal ConsolidationLoop with a mock-model GraphMerger for _merge_registry_relations."""
+        from unittest.mock import MagicMock
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = None  # no gradient-checkpointing guard needed
+        loop.tokenizer = None
+        loop.config = ConsolidationConfig(
+            min_tier_key_floor=0,
+            tier_fast_start=False,
+            refinement_contradiction="on",  # enable Case-2 so the bug can trigger
+        )
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.full_consolidation_period_string = ""
+
+        # GraphMerger with a mock model so Case-2 fires.
+        merger = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
+        # Pre-cache "lives in" as single-valued (REPLACE) to skip the model call.
+        merger._predicate_cardinality["lives in"] = False
+        loop.merger = merger
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+        return loop
+
+    def test_mixed_dated_legacy_recon_coexist_c1_regression(self, tmp_path):
+        """C1 fix: mixed registry (one dated key, one legacy "") through recon merge.
+
+        Simulates a fold _merge_registry_relations call with:
+          - Relation A (lives in → munich), last_seen="2026-01-01T00:00:00Z" (dated)
+          - Relation B (lives in → berlin), last_seen="" (legacy — no timestamp in bookkeeping)
+
+        Both share the same (subject=alex, predicate=lives in) so Case-2 fires.
+
+        Before C1 fix: timestamp=now() was passed to the SessionGraph; the merger
+        evaluated incoming_ls = "" or now() = now() for the legacy relation, making it
+        the unique freshest → the dated munich key was wrongly retired.
+
+        After C1 fix: timestamp="" (default) → incoming_ls = "" → any-empty rule →
+        COEXIST.  Both edges survive and the removal_ledger is empty.
+        """
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop_for_recon_merge(tmp_path)
+
+        relations = [
+            Relation(
+                subject="alex",
+                predicate="lives_in",
+                object="munich",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="speaker0",
+                indexed_key="key_munich_dated",
+                last_seen="2026-01-01T00:00:00Z",
+            ),
+            Relation(
+                subject="alex",
+                predicate="lives_in",
+                object="berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="speaker0",
+                indexed_key="key_berlin_legacy",
+                last_seen="",  # legacy: no timestamp in bookkeeping
+            ),
+        ]
+
+        # Call with resolve_contradictions=True (config is "on") and default timestamp="".
+        loop._merge_registry_relations(
+            relations,
+            session_id="__full_consolidation_recon__",
+            log_label="test recon triples",
+            resolve_contradictions=True,
+        )
+
+        lives_in_objects = [
+            obj
+            for obj in loop.merger.graph.successors("alex")
+            for _, d in loop.merger.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
+        ]
+        assert "munich" in lives_in_objects, (
+            "C1 regression: dated munich key must NOT be retired by a legacy '' relation"
+        )
+        assert "berlin" in lives_in_objects, "Legacy berlin relation must be inserted (coexist)"
+        # No removal_ledger entry: any-empty → coexist → no ledger write.
+        assert not loop.merger.removal_ledger, (
+            f"No removal_ledger entry expected for any-empty coexist; "
+            f"got {loop.merger.removal_ledger}"
+        )
+
+    def test_capture_pending_propagates_last_seen(self, tmp_path):
+        """_capture_pending_relations carries the edge last_seen onto the captured Relation.
+
+        Pending graph edges are stamped with the real ingest-time last_seen by the
+        merger's Case-3 path (merger.py:821).  Without this propagation the captured
+        Relation would carry last_seen="" and the any-empty COEXIST rule would
+        prevent a newer pending fact from superseding an older dated rival.
+        """
+        loop = self._make_loop_for_recon_merge(tmp_path)
+        loop.merger.graph.add_node("alex")
+        loop.merger.graph.add_node("berlin")
+        loop.merger.graph.add_edge(
+            "alex",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            sessions=["s_ingest"],
+            last_seen="2026-01-02T00:00:00Z",
+        )
+
+        pending = loop._capture_pending_relations()
+
+        assert len(pending) == 1, f"Expected 1 pending relation; got {len(pending)}"
+        assert pending[0].last_seen == "2026-01-02T00:00:00Z", (
+            f"last_seen must be propagated from edge; got {pending[0].last_seen!r}"
+        )
+
+    def test_pending_dated_supersedes_older_dated_rival(self, tmp_path):
+        """Pending relation with newer dated last_seen supersedes an older dated rival.
+
+        Scenario (interim/consume-pending path):
+          - Registry-true recon: (alex, lives in → munich), last_seen="2026-01-01" (OLDER)
+          - Pending capture: (alex, lives in → berlin), last_seen="2026-01-02" (NEWER)
+          - resolve_contradictions=True, single-valued predicate
+
+        With _capture_pending_relations now propagating last_seen, the pending relation
+        carries its genuine recency.  The all-dated path fires: incoming_ls="2026-01-02"
+        > rival_ls="2026-01-01" → munich retired, berlin inserted.
+
+        Without the fix (last_seen=""), incoming_ls="" → any-empty COEXIST → munich
+        survives (regression: NEW never supersedes OLD).
+        """
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop_for_recon_merge(tmp_path)
+
+        # Step 1: merge the registry-true recon relation (munich, older dated).
+        recon_relations = [
+            Relation(
+                subject="alex",
+                predicate="lives_in",
+                object="munich",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="speaker0",
+                indexed_key="key_munich_old",
+                last_seen="2026-01-01T00:00:00Z",
+            )
+        ]
+        loop._merge_registry_relations(
+            recon_relations,
+            session_id="__full_consolidation_recon__",
+            log_label="recon triples (test)",
+            resolve_contradictions=False,  # recon is old-vs-old for this step
+        )
+
+        # Stamp ik_key onto the munich edge so ledger capture fires on retirement.
+        _alex_successors = list(loop.merger.graph.successors("alex"))
+        for _succ in _alex_successors:
+            for _eid, _edata in loop.merger.graph["alex"][_succ].items():
+                if _edata.get("predicate") == "lives in":
+                    _edata[_IK_KEY_ATTR] = "key_munich_old"
+
+        # Step 2: merge the pending relation (berlin, newer dated) with resolve=True.
+        pending_relations = [
+            Relation(
+                subject="alex",
+                predicate="lives_in",
+                object="berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="speaker0",
+                indexed_key="key_berlin_new",
+                last_seen="2026-01-02T00:00:00Z",  # NEWER — as propagated from edge
+            )
+        ]
+        loop._merge_registry_relations(
+            pending_relations,
+            session_id="__interim_pending_sessions__",
+            log_label="pending relations (test)",
+            resolve_contradictions=True,
+        )
+
+        lives_in_objects = [
+            obj
+            for obj in loop.merger.graph.successors("alex")
+            for _, d in loop.merger.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
+        ]
+        assert "berlin" in lives_in_objects, (
+            "Newer pending Berlin must be inserted (supersedes older Munich)"
+        )
+        assert "munich" not in lives_in_objects, (
+            "Older registry-true Munich must be retired by newer pending Berlin"
+        )
+        assert "key_munich_old" in loop.merger.removal_ledger, (
+            "Retired Munich key must appear in removal_ledger"
+        )
+        assert loop.merger.removal_ledger["key_munich_old"]["reason"] == "contradiction_same_pred"
+
+    def test_pending_dated_vs_legacy_empty_rival_coexist(self, tmp_path):
+        """Pending dated relation vs legacy "" registry-true rival → COEXIST (any-empty rule).
+
+        A pending fact with a real last_seen must NOT retire a legacy "" registry key —
+        the any-empty COEXIST rule protects them.
+        """
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop_for_recon_merge(tmp_path)
+
+        # Step 1: merge the registry-true recon relation (munich, legacy last_seen="").
+        recon_relations = [
+            Relation(
+                subject="alex",
+                predicate="lives_in",
+                object="munich",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="speaker0",
+                indexed_key="key_munich_legacy",
+                last_seen="",  # legacy: no timestamp in bookkeeping
+            )
+        ]
+        loop._merge_registry_relations(
+            recon_relations,
+            session_id="__full_consolidation_recon__",
+            log_label="recon triples (test)",
+            resolve_contradictions=False,
+        )
+
+        # Stamp ik_key onto the munich edge.
+        for _succ in list(loop.merger.graph.successors("alex")):
+            for _eid, _edata in loop.merger.graph["alex"][_succ].items():
+                if _edata.get("predicate") == "lives in":
+                    _edata[_IK_KEY_ATTR] = "key_munich_legacy"
+
+        # Step 2: merge the pending relation (berlin, dated) with resolve=True.
+        pending_relations = [
+            Relation(
+                subject="alex",
+                predicate="lives_in",
+                object="berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="speaker0",
+                indexed_key="key_berlin_new",
+                last_seen="2026-01-02T00:00:00Z",  # dated pending
+            )
+        ]
+        loop._merge_registry_relations(
+            pending_relations,
+            session_id="__interim_pending_sessions__",
+            log_label="pending relations (test)",
+            resolve_contradictions=True,
+        )
+
+        lives_in_objects = [
+            obj
+            for obj in loop.merger.graph.successors("alex")
+            for _, d in loop.merger.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
+        ]
+        assert "berlin" in lives_in_objects, "Dated pending Berlin must be inserted"
+        assert "munich" in lives_in_objects, (
+            "Legacy '' Munich must survive (any-empty COEXIST: rival has last_seen='')"
+        )
+        assert not loop.merger.removal_ledger, (
+            f"No removal for any-empty coexist; got {loop.merger.removal_ledger}"
         )
 
 
@@ -10028,34 +10484,31 @@ class TestExtractJsonBlockRelationsEnvelope:
 class TestRunGraphNormalizationApply:
     """Integration tests for the whole-graph normalization apply path.
 
-    The model is stubbed to return a known JSON payload via generate_answer.
+    The model is stubbed via generate_answer (patched in paramem.graph.extractor).
     All assertions are on graph-edge changes and removal_ledger entries.
     The factory builds graphs large enough to pass the 10-node floor
     (node_count=15 default).
 
-    The model output uses the relations-envelope schema:
-    ``{"relations": [{"subject": "...", "predicate": "...", "object": "..."}]}``.
-    The apply logic performs SAME-(subject, object) collapse only:
-    - Groups with 2+ distinct predicates where the model returned fewer predicates
-      than the input → retire non-kept predicates, union provenance onto survivor.
-    - Single-predicate groups are NEVER touched even if model omits them.
-    - Output relations not in the input (hallucinated s/o/pred) are ignored.
+    The model output uses the clusters schema (one call per candidate (s,o) group):
+    ``{"clusters": [["predA", "predB"], ...]}``.
+    The apply logic picks the MAX reinforcement_count edge as survivor; retired edges
+    have their provenance unioned onto the survivor.  Ledger reason is
+    ``"predicate_synonym_collapse"``.
 
     Tests:
-    - NDA-1: two keyed synonym predicates for same (s,o) — model keeps one →
-             non-kept keyed edge removed + removal_ledger 'duplicate_merge'.
-    - NDA-2: two keyless synonym predicates — model keeps one → retired edge
-             removed, no ledger entry (no ik_key).
+    - NDA-1: two keyed synonym predicates for same (s,o) — model returns cluster →
+             lower-rec keyed edge removed + removal_ledger 'predicate_synonym_collapse'.
+    - NDA-2: two keyless synonym predicates — lower-rec edge removed, no ledger entry.
     - NDA-3: provenance (sessions union, recurrence sum, max confidence) is
-             carried onto the survivor edge before the retired edges are removed.
-    - NDA-4: output relation with predicate not in input for that (s,o) ignored.
-    - NDA-5: model returns all predicates unchanged → no-op (graph unchanged).
+             carried onto the survivor (MAX rec) before retired edges are removed.
+    - NDA-4: single-predicate (s,o) group → no model call; graph unchanged.
+    - NDA-5: model returns empty clusters → no-op (graph unchanged).
     - NDA-6: model=None → skipped=True, graph unchanged.
     - NDA-7: graph < 10 nodes → skipped=True (floor).
     - NDA-8: mixed keyed + keyless — keyed retired → ledger; keyless retired → no ledger;
-             survivor (keyed graph42) intact; result counts correct.
-    - NDA-9: single-predicate (s,o) group not touched even if model omits it.
-    - NDA-10: output relation with (s,o) not in input at all is silently ignored.
+             MAX-rec survivor intact; result counts correct.
+    - NDA-9: single-predicate (s,o) group not touched even when another group is collapsed.
+    - NDA-10: multi-predicate group collapsed; graph updated correctly.
     """
 
     # ---------------------------------------------------------------------------
@@ -10170,27 +10623,29 @@ class TestRunGraphNormalizationApply:
         graph.add_node(obj, reinforcement_count=1, attributes={"name": obj})
         graph.add_edge(subj, obj, **attrs)
 
-    # Prompt stub: only {fact_lines} placeholder (matches prompt schema).
-    _PROMPT_STUB = "dummy {fact_lines}"
+    # Prompt stub: only {predicates_json} placeholder (matches dedup_synonym_predicates).
+    _PROMPT_STUB = "dummy {predicates_json}"
 
-    def _relations_response(self, relations: list[dict]) -> str:
-        """Encode a relations-envelope model response."""
+    def _cluster_response(self, clusters: list[list[str]]) -> str:
+        """Encode a clusters-schema model response for dedup_synonym_predicates."""
         import json
 
-        return json.dumps({"relations": relations})
+        return json.dumps({"clusters": clusters})
 
     # ---------------------------------------------------------------------------
     # Tests
     # ---------------------------------------------------------------------------
 
     def test_keyed_synonym_retired_and_ledgered(self, tmp_path):
-        """NDA-1: two keyed synonym predicates for same (s,o) — model keeps one.
+        """NDA-1: two keyed synonym predicates for same (s,o) — model returns cluster.
 
-        Graph: jordan → techcorp with keyed edges 'works_for' (graph42) and
-        'employed_by' (graph87).  Model returns only works_for for (jordan, techcorp).
+        Graph: jordan -> techcorp with keyed edges 'works_for' (graph42, rec=1) and
+        'employed_by' (graph87, rec=2).  Model returns cluster [works_for, employed_by].
+        Survivor = MAX rec = graph87 (employed_by, rec=2).
         After apply:
-        - graph87 (non-kept) removed + in removal_ledger with reason 'duplicate_merge'.
-        - graph42 (survivor) still in graph.
+        - graph42 (lower-rec) removed + in removal_ledger with reason
+          'predicate_synonym_collapse'.
+        - graph87 (survivor) still in graph.
         - result["edges_retired"]==1, result["groups_collapsed"]==1.
         """
         from unittest.mock import patch
@@ -10205,33 +10660,33 @@ class TestRunGraphNormalizationApply:
             graph, "jordan", "techcorp", "employed_by", "graph87", sessions=["s2"], recurrence=2
         )
 
-        model_response = self._relations_response(
-            [{"subject": "jordan", "predicate": "works_for", "object": "techcorp"}]
-        )
+        # Cluster: both predicates are synonyms; MAX rec (graph87, rec=2) survives.
+        cluster_response = self._cluster_response([["works for", "employed by"]])
 
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
         all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
-        assert "graph87" not in all_keys, "graph87 (non-kept) must be removed"
-        assert "graph42" in all_keys, "graph42 (survivor) must remain"
-        assert "graph87" in loop.merger.removal_ledger
-        assert loop.merger.removal_ledger["graph87"]["reason"] == "duplicate_merge"
-        assert "graph42" not in loop.merger.removal_ledger, "survivor must NOT be ledgered"
+        assert "graph42" not in all_keys, "graph42 (lower-rec) must be removed"
+        assert "graph87" in all_keys, "graph87 (MAX-rec survivor) must remain"
+        assert "graph42" in loop.merger.removal_ledger
+        assert loop.merger.removal_ledger["graph42"]["reason"] == "predicate_synonym_collapse"
+        assert "graph87" not in loop.merger.removal_ledger, "survivor must NOT be ledgered"
 
         assert result["edges_retired"] == 1
         assert result["groups_collapsed"] == 1
         assert result["skipped"] is False
 
     def test_keyless_synonym_retired_no_ledger(self, tmp_path):
-        """NDA-2: two keyless synonym predicates — retired edge removed, no ledger entry.
+        """NDA-2: two keyless synonym predicates — lower-rec edge removed, no ledger entry.
 
         Fresh-ingest case: facts arrive keyless.  Graph has two keyless edges for
-        (jordan, techcorp): 'works_for' and 'employed_by'.  Model keeps only
-        'works_for'.  After apply: 'employed_by' edge removed; removal_ledger empty.
+        (jordan, techcorp): 'works_for' (rec=1) and 'employed_by' (rec=3).
+        Survivor = MAX rec = employed_by (rec=3).
+        After apply: 'works_for' (lower-rec) removed; removal_ledger empty.
         """
         from unittest.mock import patch
 
@@ -10245,12 +10700,10 @@ class TestRunGraphNormalizationApply:
             graph, "jordan", "techcorp", "employed_by", sessions=["s2"], recurrence=3
         )
 
-        model_response = self._relations_response(
-            [{"subject": "jordan", "predicate": "works_for", "object": "techcorp"}]
-        )
+        cluster_response = self._cluster_response([["works for", "employed by"]])
 
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
@@ -10258,9 +10711,9 @@ class TestRunGraphNormalizationApply:
         remaining_preds = {
             edata["predicate"] for _, _, edata in graph.edges(data=True) if edata.get("predicate")
         }
-        # canonical() folds underscores to spaces.
-        assert "employed by" not in remaining_preds, "retired edge must be removed"
-        assert "works for" in remaining_preds, "survivor edge must remain"
+        # canonical() folds underscores to spaces.  employed_by (rec=3) survives.
+        assert "works for" not in remaining_preds, "lower-rec edge must be removed"
+        assert "employed by" in remaining_preds, "MAX-rec survivor must remain"
         assert not loop.merger.removal_ledger, "no ledger entry for keyless retirements"
 
         assert result["edges_retired"] == 1
@@ -10269,11 +10722,11 @@ class TestRunGraphNormalizationApply:
     def test_provenance_unioned_onto_survivor(self, tmp_path):
         """NDA-3: sessions, recurrence, and confidence are unioned onto the survivor.
 
-        Graph: morgan → germany with 'born_in' (graph12, sessions=['s1'], rec=1)
+        Graph: morgan -> germany with 'born_in' (graph12, sessions=['s1'], rec=1)
         and 'birthplace' (graph34, sessions=['s2'], rec=2, confidence=0.95).
-        Model keeps only 'born_in'.
-        After apply: graph12 survivor has sessions=['s1','s2'], recurrence>=3,
-        confidence>=0.95; graph34 retired and in ledger.
+        Survivor = MAX rec = graph34 (birthplace, rec=2).
+        After apply: graph34 survivor has sessions=['s2','s1'], recurrence>=3,
+        confidence>=0.95; graph12 retired and in ledger with 'predicate_synonym_collapse'.
         """
         from unittest.mock import patch
 
@@ -10293,29 +10746,28 @@ class TestRunGraphNormalizationApply:
             if edata.get(_IK_KEY_ATTR) == "graph34":
                 edata["confidence"] = 0.95
 
-        model_response = self._relations_response(
-            [{"subject": "morgan", "predicate": "born_in", "object": "germany"}]
-        )
+        cluster_response = self._cluster_response([["born in", "birthplace"]])
 
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
-        assert "graph34" in loop.merger.removal_ledger
-        assert loop.merger.removal_ledger["graph34"]["reason"] == "duplicate_merge"
-        assert "graph12" not in loop.merger.removal_ledger, "survivor must not be ledgered"
+        assert "graph12" in loop.merger.removal_ledger
+        assert loop.merger.removal_ledger["graph12"]["reason"] == "predicate_synonym_collapse"
+        assert "graph34" not in loop.merger.removal_ledger, "survivor must not be ledgered"
 
+        # graph34 (birthplace, MAX rec=2) is the survivor.
         survivor = [
-            edata for _, _, edata in graph.edges(data=True) if edata.get(_IK_KEY_ATTR) == "graph12"
+            edata for _, _, edata in graph.edges(data=True) if edata.get(_IK_KEY_ATTR) == "graph34"
         ]
-        assert survivor, "graph12 survivor must remain in graph"
+        assert survivor, "graph34 survivor must remain in graph"
         e = survivor[0]
-        assert "s1" in e.get("sessions", []), "s1 must be retained"
-        assert "s2" in e.get("sessions", []), "s2 from retired edge must be unioned"
-        assert e.get("reinforcement_count", 0) >= 3, "recurrence must be summed (1+2=3)"
-        assert e.get("confidence", 0) >= 0.95, "max confidence from retired edge must be applied"
+        assert "s2" in e.get("sessions", []), "s2 must be retained on survivor"
+        assert "s1" in e.get("sessions", []), "s1 from retired edge must be unioned"
+        assert e.get("reinforcement_count", 0) >= 3, "recurrence must be summed (2+1=3)"
+        assert e.get("confidence", 0) >= 0.95, "max confidence must be applied"
 
         assert result["edges_retired"] == 1
         assert result["groups_collapsed"] == 1
@@ -10324,6 +10776,8 @@ class TestRunGraphNormalizationApply:
         """NDA-3b: last_seen on the survivor edge equals max(survivor, retired).
 
         INVARIANT: whenever edges collapse into a survivor, last_seen = freshest.
+        Both edges have rec=1; last_seen tiebreaker selects graph34 (newer) as
+        survivor.  The survivor's last_seen must equal the max across both edges.
         """
         from unittest.mock import patch
 
@@ -10334,39 +10788,37 @@ class TestRunGraphNormalizationApply:
 
         self._add_keyed_edge(graph, "morgan", "germany", "born_in", "graph12", sessions=["s1"])
         self._add_keyed_edge(graph, "morgan", "germany", "birthplace", "graph34", sessions=["s2"])
-        # Patch last_seen directly: survivor (graph12) older, retired (graph34) newer.
+        # Patch last_seen: graph12 older, graph34 newer.  Both have default rec=1 so
+        # last_seen is the tiebreaker -> graph34 survives.
         for _, _, edata in graph.edges(data=True):
             if edata.get(_IK_KEY_ATTR) == "graph12":
                 edata["last_seen"] = "2026-05-01T08:00:00Z"
             elif edata.get(_IK_KEY_ATTR) == "graph34":
                 edata["last_seen"] = "2026-06-20T14:00:00Z"
 
-        model_response = self._relations_response(
-            [{"subject": "morgan", "predicate": "born_in", "object": "germany"}]
-        )
+        cluster_response = self._cluster_response([["born in", "birthplace"]])
 
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
         ):
             loop._run_graph_normalization()
 
+        # graph34 (birthplace, newer last_seen) survives.
         survivor = [
-            edata for _, _, edata in graph.edges(data=True) if edata.get(_IK_KEY_ATTR) == "graph12"
+            edata for _, _, edata in graph.edges(data=True) if edata.get(_IK_KEY_ATTR) == "graph34"
         ]
-        assert survivor, "graph12 survivor must remain in graph"
+        assert survivor, "graph34 (newer last_seen) must survive"
         assert survivor[0].get("last_seen") == "2026-06-20T14:00:00Z", (
             "Survivor last_seen must be the freshest (max) across survivor + retired; "
             f"got {survivor[0].get('last_seen')!r}"
         )
 
-    def test_output_predicate_not_in_input_ignored(self, tmp_path):
-        """NDA-4: model output with predicate not in the input for that (s,o) is ignored.
+    def test_single_predicate_group_no_model_call(self, tmp_path):
+        """NDA-4: single-predicate (s,o) group is never a candidate — no model call.
 
-        Graph: morgan → germany with only 'born_in' (graph12).  Model emits
-        'birthplace' for (morgan, germany) — predicate not in input for that pair.
-        The group has only one input predicate so it is never a candidate anyway;
-        additionally the hallucinated predicate is rejected by the grounding check.
+        Graph: morgan -> germany with only 'born_in' (graph12).  The group has only
+        one predicate so it never reaches dedup_synonym_predicates as a candidate.
         After apply: graph12 survives, ledger empty.
         """
         from unittest.mock import patch
@@ -10378,13 +10830,12 @@ class TestRunGraphNormalizationApply:
 
         self._add_keyed_edge(graph, "morgan", "germany", "born_in", "graph12", sessions=["s1"])
 
-        # Model invents 'birthplace' — not in input for (morgan, germany).
-        model_response = self._relations_response(
-            [{"subject": "morgan", "predicate": "birthplace", "object": "germany"}]
-        )
-
+        # generate_answer must not be called for a single-predicate group.
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch(
+                "paramem.graph.extractor.generate_answer",
+                side_effect=Exception("should not be called"),
+            ),
             patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
@@ -10394,12 +10845,14 @@ class TestRunGraphNormalizationApply:
         assert not loop.merger.removal_ledger, "Ledger must be empty"
         assert result["edges_retired"] == 0
         assert result["groups_collapsed"] == 0
+        assert result["chunks"] == 0, "no model calls for single-predicate group"
 
-    def test_model_keeps_all_predicates_is_noop(self, tmp_path):
-        """NDA-5: model returns all input predicates for a group → no retirement.
+    def test_empty_clusters_response_is_noop(self, tmp_path):
+        """NDA-5: model returns empty clusters for a group → no retirement.
 
-        Graph: jordan → techcorp with 'works_for' (graph42) and 'employed_by' (graph87).
-        Model keeps BOTH predicates.  After apply: both edges survive, ledger empty.
+        Graph: jordan -> techcorp with 'works_for' (graph42) and 'employed_by' (graph87).
+        Model returns {"clusters": []} — predicates are NOT synonyms.
+        After apply: both edges survive, ledger empty.
         """
         from unittest.mock import patch
 
@@ -10411,16 +10864,11 @@ class TestRunGraphNormalizationApply:
         self._add_keyed_edge(graph, "jordan", "techcorp", "works_for", "graph42")
         self._add_keyed_edge(graph, "jordan", "techcorp", "employed_by", "graph87")
 
-        # Model keeps both predicates — no collapse.
-        model_response = self._relations_response(
-            [
-                {"subject": "jordan", "predicate": "works_for", "object": "techcorp"},
-                {"subject": "jordan", "predicate": "employed_by", "object": "techcorp"},
-            ]
-        )
+        # Model returns no clusters — predicates are not synonyms; no collapse.
+        cluster_response = self._cluster_response([])
 
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
@@ -10454,16 +10902,16 @@ class TestRunGraphNormalizationApply:
         assert result["skip_reason"] == "floor"
 
     def test_mixed_keyed_and_keyless_correct_ledger(self, tmp_path):
-        """NDA-8: mixed keyed + keyless — keyed retired → ledger; keyless retired → no ledger.
+        """NDA-8: mixed keyed + keyless — keyed retired -> ledger; keyless retired -> no ledger.
 
-        Graph: jordan → techcorp with three edges:
-        - 'works_for', keyed graph42 (survivor)
-        - 'employed_by', keyed graph87 (to be retired)
-        - 'is_employed_at', keyless (to be retired)
+        Graph: jordan -> techcorp with three edges (all rec=1):
+        - 'works_for', keyed graph42 (survivor — first in cluster, tiebreaker)
+        - 'employed_by', keyed graph87 (retired)
+        - 'is_employed_at', keyless (retired)
 
-        Model keeps only 'works_for'.
+        Cluster response puts 'works for' first -> graph42 (rec=1 tie, first) wins.
         After apply:
-        - graph87 removed + in removal_ledger.
+        - graph87 removed + in removal_ledger with reason 'predicate_synonym_collapse'.
         - keyless 'is_employed_at' removed, NOT in ledger.
         - graph42 survives.
         - result["edges_retired"]==2, result["groups_collapsed"]==1.
@@ -10479,12 +10927,11 @@ class TestRunGraphNormalizationApply:
         self._add_keyed_edge(graph, "jordan", "techcorp", "employed_by", "graph87", sessions=["s2"])
         self._add_keyless_edge(graph, "jordan", "techcorp", "is_employed_at", sessions=["s3"])
 
-        model_response = self._relations_response(
-            [{"subject": "jordan", "predicate": "works_for", "object": "techcorp"}]
-        )
+        # 'works for' first in cluster -> MAX rec tie broken in favour of first -> graph42 survives.
+        cluster_response = self._cluster_response([["works for", "employed by", "is employed at"]])
 
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
@@ -10493,19 +10940,19 @@ class TestRunGraphNormalizationApply:
         assert "graph87" not in all_keys, "graph87 (keyed) must be removed"
         assert "graph42" in all_keys, "graph42 must survive"
         assert "graph87" in loop.merger.removal_ledger
-        assert loop.merger.removal_ledger["graph87"]["reason"] == "duplicate_merge"
+        assert loop.merger.removal_ledger["graph87"]["reason"] == "predicate_synonym_collapse"
         assert len(loop.merger.removal_ledger) == 1, "keyless retirement must not add ledger entry"
 
         assert result["edges_retired"] == 2
         assert result["groups_collapsed"] == 1
 
-    def test_single_predicate_group_untouched_even_if_model_omits_it(self, tmp_path):
-        """NDA-9: single-predicate (s,o) group untouched even when model omits it.
+    def test_single_predicate_group_untouched_when_other_group_collapsed(self, tmp_path):
+        """NDA-9: single-predicate (s,o) group is not touched when another group is collapsed.
 
-        Graph: sam → berlin with only 'lives_in' (graph99).  A separate two-predicate
-        group (jordan/techcorp works_for/employed_by) is present so the model IS called.
-        Model returns ONLY the jordan/techcorp relation and omits sam→berlin entirely.
-        sam→berlin must survive (model omission must not delete a fact).
+        Graph: sam -> berlin with only 'lives_in' (graph99) — single predicate, not a
+        candidate.  jordan -> techcorp has 'works_for' (graph42) and 'employed_by' (graph87)
+        — two-predicate candidate.  Model returns cluster for jordan/techcorp only.
+        sam -> berlin must survive; jordan/techcorp group collapses (graph87 retired).
         """
         from unittest.mock import patch
 
@@ -10518,30 +10965,29 @@ class TestRunGraphNormalizationApply:
         self._add_keyed_edge(graph, "jordan", "techcorp", "works_for", "graph42", sessions=["s2"])
         self._add_keyed_edge(graph, "jordan", "techcorp", "employed_by", "graph87", sessions=["s3"])
 
-        # Model returns only one relation for the multi-predicate group; omits sam→berlin.
-        model_response = self._relations_response(
-            [{"subject": "jordan", "predicate": "works_for", "object": "techcorp"}]
-        )
+        # Cluster for the jordan/techcorp group; 'works for' first -> graph42 survives.
+        cluster_response = self._cluster_response([["works for", "employed by"]])
 
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
         all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
-        assert "graph99" in all_keys, "single-predicate (s,o) must survive model omission"
+        assert "graph99" in all_keys, "single-predicate (s,o) must not be touched"
+        assert "graph42" in all_keys, "graph42 must survive (first in cluster, rec tie)"
         assert result["edges_retired"] == 1, "only graph87 retired (the jordan/techcorp group)"
         assert result["groups_collapsed"] == 1
 
-    def test_hallucinated_subject_object_ignored(self, tmp_path):
-        """NDA-10: model output with (s,o) pair not in input is silently discarded.
+    def test_max_rec_survivor_selected(self, tmp_path):
+        """NDA-10: MAX reinforcement_count edge survives; lower-rec edge retired.
 
-        Graph: morgan → germany with 'born_in' (graph12) and 'birthplace' (graph34) —
-        a valid two-predicate group.  Model also returns a hallucinated relation
-        (alex, lives_in, paris) that has no corresponding input edge.
-        After apply: graph12/graph34 group collapsed normally; hallucinated relation
-        produces no new edge in the graph.
+        Graph: morgan -> germany with 'born_in' (graph12, rec=1) and
+        'birthplace' (graph34, rec=2).  Cluster collapses both.
+        Survivor = MAX rec = graph34 (birthplace, rec=2).
+        After apply: graph12 retired, graph34 survives.
+        No new edges (hallucinated subjects are impossible in the cluster schema).
         """
         from unittest.mock import patch
 
@@ -10557,48 +11003,48 @@ class TestRunGraphNormalizationApply:
             graph, "morgan", "germany", "birthplace", "graph34", sessions=["s2"], recurrence=2
         )
 
-        model_response = self._relations_response(
-            [
-                {"subject": "morgan", "predicate": "born_in", "object": "germany"},
-                # Hallucinated (s,o) not in graph input:
-                {"subject": "alex", "predicate": "lives_in", "object": "paris"},
-            ]
-        )
+        cluster_response = self._cluster_response([["born in", "birthplace"]])
 
         with (
-            patch("paramem.evaluation.recall.generate_answer", return_value=model_response),
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
         all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
-        assert "graph34" not in all_keys, "birthplace edge must be retired"
-        assert "graph12" in all_keys, "born_in survivor must remain"
-
-        # Hallucinated edge must not exist in graph.
-        subjects_in_graph = {u for u, _v in graph.edges()}
-        assert "alex" not in subjects_in_graph, "hallucinated subject must not appear"
+        assert "graph12" not in all_keys, "graph12 (lower-rec born_in) must be retired"
+        assert "graph34" in all_keys, "graph34 (MAX-rec birthplace) must survive"
+        assert "graph12" in loop.merger.removal_ledger
+        assert loop.merger.removal_ledger["graph12"]["reason"] == "predicate_synonym_collapse"
 
         assert result["edges_retired"] == 1
         assert result["groups_collapsed"] == 1
 
 
 # ---------------------------------------------------------------------------
-# _apply_subtractive_removals_to_store — duplicate_merge reason
+# SOTA engine wiring in _run_graph_normalization
 # ---------------------------------------------------------------------------
 
 
-class TestSubtractiveRemovalsDuplicateMerge:
-    """_apply_subtractive_removals_to_store soft-stales 'duplicate_merge' at both scopes.
+class TestRunGraphNormalizationSotaEngine:
+    """_run_graph_normalization SOTA wiring and fail-loud tests.
 
     Tests:
-    - DM-1: duplicate_merge is soft-staled at interim scope.
-    - DM-2: duplicate_merge is soft-staled at fold scope.
+    - SOTA-1: sota_enabled=True + provider + api_key in env → dedup_synonym_predicates
+              called with ``sota=`` kwarg, NOT ``model=``.
+    - SOTA-2: sota_enabled=True + provider present but NO api_key in env → local
+              fallback: dedup_synonym_predicates called with ``model=`` kwarg.
+    - DBG-1: after retirement, on_normalization receives non-empty raw_outputs list
+             and non-empty decisions list.
+    - FL-1:  FileNotFoundError raised when graph_dedup_filter.txt is missing
+             (graph ≥ 10 nodes, model present).
     """
 
     @staticmethod
-    def _make_loop_with_ledger(tmp_path, *, ledger: dict):
-        """Minimal ConsolidationLoop with a seeded removal_ledger and replay store."""
+    def _make_loop(tmp_path, *, sota_enabled: bool = False, node_count: int = 15):
+        """Build a minimal ConsolidationLoop for normalization engine tests."""
+        import networkx as nx
+
         from paramem.graph.merger import GraphMerger
         from paramem.memory.store import MemoryStore
         from paramem.training.consolidation import ConsolidationLoop
@@ -10608,7 +11054,12 @@ class TestSubtractiveRemovalsDuplicateMerge:
         loop = object.__new__(ConsolidationLoop)
         loop.model = MagicMock()
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(indexed_key_replay=True)
+        loop.tokenizer.apply_chat_template.return_value = "formatted_prompt"
+        loop.config = ConsolidationConfig(
+            indexed_key_replay=True,
+            refinement_normalization="on",
+            sota_enabled=sota_enabled,
+        )
         loop.training_config = TrainingConfig(
             num_epochs=1,
             gradient_checkpointing=False,
@@ -10637,10 +11088,23 @@ class TestSubtractiveRemovalsDuplicateMerge:
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
         loop.full_consolidation_period_string = ""
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.graph_enrichment_neighborhood_hops = 2
+
+        # Extraction pipeline mock — config.noise_filter used for SOTA engine resolution.
+        ext_mock = MagicMock()
+        ext_mock.config.noise_filter = "anthropic"
+        ext_mock.config.noise_filter_model = "claude-sonnet-4-6"
+        ext_mock.config.noise_filter_endpoint = None
+        loop.extraction = ext_mock
 
         merger = GraphMerger(model=None)
-        merger.removal_ledger = dict(ledger)
         loop.merger = merger
+
+        g = nx.MultiDiGraph()
+        for i in range(node_count):
+            g.add_node(f"node{i}", reinforcement_count=0, attributes={"name": f"node{i}"})
+        loop.merger.graph = g
 
         store = MemoryStore(replay_enabled=True)
         for tier in ("episodic", "semantic", "procedural"):
@@ -10649,60 +11113,158 @@ class TestSubtractiveRemovalsDuplicateMerge:
         return loop
 
     @staticmethod
-    def _put_key(loop, key: str) -> None:
-        """Register key as active in the episodic tier."""
-        loop.store.put(
-            "episodic",
-            key,
-            {
-                "key": key,
-                "subject": "Jordan",
-                "predicate": "works for",
-                "object": "TechCorp",
-                "speaker_id": "Jordan",
-                "sessions": ["s1"],
-                "relation_type": "factual",
-            },
+    def _add_keyed_edge(graph, subj, obj, predicate, ik_key, *, sessions=None, recurrence=1):
+        from paramem.graph.name_match import canonical as _can
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        subj = _can(subj)
+        obj = _can(obj)
+        predicate = _can(predicate)
+        attrs = {
+            "predicate": predicate,
+            "relation_type": "factual",
+            "sessions": sessions or ["sess1"],
+            "reinforcement_count": recurrence,
+            "confidence": 0.9,
+            _IK_KEY_ATTR: ik_key,
+        }
+        graph.add_node(subj, reinforcement_count=1, attributes={"name": subj})
+        graph.add_node(obj, reinforcement_count=1, attributes={"name": obj})
+        graph.add_edge(subj, obj, **attrs)
+
+    _PROMPT_STUB = "dummy {predicates_json}"
+
+    def test_sota_engine_selected_when_enabled_with_api_key(self, tmp_path, monkeypatch):
+        """SOTA-1: sota_enabled=True + provider + env api_key → primitive gets sota=."""
+
+        from unittest.mock import patch
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
+        loop = self._make_loop(tmp_path, sota_enabled=True)
+        graph = loop.merger.graph
+        self._add_keyed_edge(graph, "morgan", "acme", "works_for", "g1", recurrence=1)
+        self._add_keyed_edge(graph, "morgan", "acme", "employed_by", "g2", recurrence=2)
+
+        # Capture the kwargs that dedup_synonym_predicates receives.
+        captured: dict = {}
+
+        def _fake_dedup(relations, *, filter_prompt, **kwargs):
+            captured.update(kwargs)
+            return {}, {
+                "raw_outputs": [],
+                "groups_examined": 0,
+                "candidate_groups": 0,
+                "groups_with_clusters": 0,
+                "model_calls": 0,
+                "discards": [],
+            }
+
+        with (
+            patch(
+                "paramem.training.consolidation.dedup_synonym_predicates",
+                side_effect=_fake_dedup,
+            ),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            loop._run_graph_normalization()
+
+        assert "sota" in captured, (
+            "dedup_synonym_predicates must receive sota= kwarg "
+            "when sota_enabled=True and api_key present"
+        )
+        assert "model" not in captured, "model= must NOT be passed when SOTA engine is selected"
+        assert captured["sota"]["provider"] == "anthropic"
+        assert captured["sota"]["api_key"] == "sk-test-key"
+
+    def test_local_fallback_when_api_key_absent(self, tmp_path, monkeypatch):
+        """SOTA-2: sota_enabled=True but NO api_key → local fallback (model= kwarg)."""
+        from unittest.mock import patch
+
+        # Ensure the env var is absent.
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        loop = self._make_loop(tmp_path, sota_enabled=True)
+        graph = loop.merger.graph
+        self._add_keyed_edge(graph, "morgan", "acme", "works_for", "g1", recurrence=1)
+        self._add_keyed_edge(graph, "morgan", "acme", "employed_by", "g2", recurrence=2)
+
+        captured: dict = {}
+
+        def _fake_dedup(relations, *, filter_prompt, **kwargs):
+            captured.update(kwargs)
+            return {}, {
+                "raw_outputs": [],
+                "groups_examined": 0,
+                "candidate_groups": 0,
+                "groups_with_clusters": 0,
+                "model_calls": 0,
+                "discards": [],
+            }
+
+        with (
+            patch(
+                "paramem.training.consolidation.dedup_synonym_predicates",
+                side_effect=_fake_dedup,
+            ),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            loop._run_graph_normalization()
+
+        assert "model" in captured, (
+            "dedup_synonym_predicates must receive model= kwarg when api_key is absent"
+        )
+        assert "sota" not in captured, (
+            "sota= must NOT be passed when api_key is absent (local fallback)"
         )
 
-    def test_duplicate_merge_soft_staled_at_interim(self, tmp_path):
-        """DM-1: duplicate_merge reason is soft-staled at interim scope."""
-        loop = self._make_loop_with_ledger(
-            tmp_path,
-            ledger={
-                "graph87": {
-                    "reason": "duplicate_merge",
-                    "merged_into": "graph42",
-                },
-            },
-        )
-        self._put_key(loop, "graph87")
+    def test_on_normalization_receives_nonempty_raw_outputs_and_decisions(self, tmp_path):
+        """DBG-1: after retirement, on_normalization receives non-empty raw_outputs
+        and non-empty decisions — the debug snapshot has real data to write."""
+        import json
+        from unittest.mock import patch
 
-        loop._apply_subtractive_removals_to_store(scope="interim")
+        loop = self._make_loop(tmp_path, sota_enabled=False)
+        graph = loop.merger.graph
+        self._add_keyed_edge(graph, "morgan", "acme", "works_for", "g1", recurrence=1)
+        self._add_keyed_edge(graph, "morgan", "acme", "employed_by", "g2", recurrence=2)
 
-        # Key must now be stale (not active): is_stale returns True once moved to stale partition.
-        registry = loop.store._registry["episodic"]
-        assert registry.is_stale("graph87"), (
-            "duplicate_merge key must be soft-staled at interim scope"
-        )
+        cluster_raw = json.dumps({"clusters": [["works for", "employed by"]]})
 
-    def test_duplicate_merge_soft_staled_at_fold(self, tmp_path):
-        """DM-2: duplicate_merge reason is soft-staled at fold scope."""
-        loop = self._make_loop_with_ledger(
-            tmp_path,
-            ledger={
-                "graph87": {
-                    "reason": "duplicate_merge",
-                    "merged_into": "graph42",
-                },
-            },
-        )
-        self._put_key(loop, "graph87")
+        on_norm_calls: list = []
 
-        loop._apply_subtractive_removals_to_store(scope="fold")
+        def _spy_on_normalization(raw_outputs, decisions, applied, **kwargs):
+            on_norm_calls.append(
+                {
+                    "raw_outputs": raw_outputs,
+                    "decisions": decisions,
+                    "applied": applied,
+                }
+            )
 
-        registry = loop.store._registry["episodic"]
-        assert registry.is_stale("graph87"), "duplicate_merge key must be soft-staled at fold scope"
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_raw),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch.object(loop._debug_writer, "on_normalization", side_effect=_spy_on_normalization),
+        ):
+            loop._run_graph_normalization()
+
+        assert on_norm_calls, "on_normalization must be called"
+        call = on_norm_calls[0]
+        assert call["raw_outputs"], "raw_outputs must be non-empty after a model call"
+        assert call["decisions"], "decisions must be non-empty when clusters were produced"
+
+    def test_fail_loud_when_prompt_missing(self, tmp_path):
+        """FL-1: FileNotFoundError raised when graph_dedup_filter.txt is missing."""
+        from unittest.mock import patch
+
+        import pytest
+
+        loop = self._make_loop(tmp_path, sota_enabled=False)
+
+        with (
+            patch("paramem.graph.prompts._load_prompt", return_value=""),
+            pytest.raises(FileNotFoundError, match="graph_dedup_filter.txt"),
+        ):
+            loop._run_graph_normalization()
 
 
 # ---------------------------------------------------------------------------
@@ -12948,11 +13510,11 @@ class TestConsumePendingFullFold:
         g.add_edge("Alice", "Moon", predicate="orbits", relation_type="factual", sessions=[])
 
         loop = self._make_loop(tmp_path, merger_graph=g)
-        # Explicitly set contradiction_detection=True on the loop's training-layer config.
+        # Explicitly set refinement_contradiction="on" on the loop's training-layer config.
         loop.config = ConsolidationConfig(
             min_tier_key_floor=0,
             tier_fast_start=False,
-            contradiction_detection=True,
+            refinement_contradiction="on",
         )
 
         _result, materialize_calls = self._run_full_fold_with_materialize_spy(
@@ -12963,8 +13525,13 @@ class TestConsumePendingFullFold:
         materialize_call = materialize_calls[0]
         assert materialize_call.get("resolve_contradictions_extra") is True
 
-    def test_full_fold_resolve_contradictions_extra_false_when_not_consume_pending(self, tmp_path):
-        """Full fold passes resolve_contradictions_extra=False for non-consume full fold."""
+    def test_full_fold_resolve_contradictions_extra_from_config_default_off(self, tmp_path):
+        """Full fold passes resolve_contradictions_extra driven by config (default="off"→False).
+
+        The value is always config-driven — not gated by consume_pending.  This test
+        confirms the default ConsolidationConfig (refinement_contradiction="off") produces
+        False regardless of consume_pending.
+        """
         import networkx as nx
 
         g = nx.MultiDiGraph()

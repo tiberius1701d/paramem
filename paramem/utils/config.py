@@ -140,12 +140,14 @@ class ConsolidationConfig:
     refinement_enrichment: str = "off"  # graph-stage _run_graph_enrichment (SOTA-only). off|on
     refinement_normalization: str = "off"  # graph-stage predicate-synonym collapse. off|on
     # Whether the merger resolves same-predicate/different-object cardinality
-    # conflicts (Case-2 COEXIST/REPLACE) at ingest and interim cycles.  Applied
-    # wherever a NEW-vs-OLD temporal partition supplies the recency signal:
-    # ingest (later statement supersedes earlier within a session) and interim
-    # (NEW pending vs OLD slot — new supersedes old).  OFF at the full fold
-    # (old-vs-old consolidation, no recency) until per-edge timestamps land.
-    contradiction_detection: bool = True
+    # conflicts (Case-2 COEXIST/REPLACE) at ingest, interim, and fold.
+    # Unified recency rule (REPLACE cardinality): if ANY candidate last_seen is ""
+    # → coexist (covers legacy keys and mixed dated/legacy registries).  Otherwise
+    # all are dated: strictly-older rivals retired; ties coexist; incoming loses if
+    # strictly older.  The model determines the cardinality axis (COEXIST vs REPLACE);
+    # recency fires only when REPLACE is returned.  Applied uniformly at ingest,
+    # interim, and fold; no positional fork.  off|on.
+    refinement_contradiction: str = "off"
     # Minimum recall fraction (0, 1] that every recall gate must reach before the
     # adapter fold is accepted.  Applied to: post-save disk-integrity probes
     # (_verify_saved_adapter_from_disk), interim-cycle training
@@ -158,7 +160,11 @@ class ConsolidationConfig:
 
     def __post_init__(self) -> None:
         """Validate field values at construction time."""
-        for _toggle_field in ("refinement_enrichment", "refinement_normalization"):
+        for _toggle_field in (
+            "refinement_enrichment",
+            "refinement_normalization",
+            "refinement_contradiction",
+        ):
             _val = getattr(self, _toggle_field)
             if _val not in _REFINEMENT_TOGGLES:
                 raise ValueError(

@@ -1,12 +1,18 @@
-"""Tests for dedup_synonym_predicates_local (paramem/graph/extractor.py).
+"""Tests for dedup_synonym_predicates (paramem/graph/extractor.py).
 
 Uses a MagicMock model that returns canned JSON — no real GPU required.
 Verifies:
-- single-predicate groups pass through untouched
-- synonym clusters collapse to the survivor
-- hallucinated / ungrounded model output is ignored
-- empty input returns empty output
-- grounding guard: cross-group predicate in model output is discarded
+- empty input returns empty clusters_by_so
+- single-predicate groups pass through untouched (no model call)
+- synonym clusters returned correctly for candidate groups
+- distinct predicates on different (s,o) pairs are not clustered
+- hallucinated predicates in model output are silently discarded
+- clusters with <2 grounded members are dropped
+- parse failure yields no clusters (never deletes)
+- gradient_checkpointing is always re-enabled even when generate_answer raises
+- SOTA branch: _sota_call receives raw (non-chat-templated) prompt
+- SOTA branch: None return from _sota_call is a no-op (no cluster, no deletion)
+- SOTA branch: apply_chat_template / generate_answer are NOT used on SOTA path
 """
 
 from __future__ import annotations
@@ -16,61 +22,59 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from paramem.graph.extractor import dedup_synonym_predicates_local
+from paramem.graph.extractor import dedup_synonym_predicates
 
 
-def _make_model_tokenizer(filter_raw: str, merge_raw: str):
+def _make_model_tokenizer(raw_outputs: list[str]):
     """Return a (model, tokenizer) MagicMock pair that produces the given
-    raw strings from two sequential generate_answer calls."""
+    raw strings from sequential generate_answer calls (one per candidate group)."""
     model = MagicMock()
     model.gradient_checkpointing_disable = MagicMock()
     model.gradient_checkpointing_enable = MagicMock()
     tokenizer = MagicMock()
     tokenizer.apply_chat_template = MagicMock(return_value="<formatted>")
-    return model, tokenizer, [filter_raw, merge_raw]
+    return model, tokenizer
 
 
-FILTER_PROMPT = "filter {facts_json}"
-MERGE_PROMPT = "merge {clusters_json}"
+FILTER_PROMPT = "filter {predicates_json}"
 
 
 def _run(
     relations: list[dict],
-    filter_raw: str,
-    merge_raw: str,
-) -> tuple[list[dict], dict]:
-    model, tokenizer, side_effects = _make_model_tokenizer(filter_raw, merge_raw)
+    raw_outputs: list[str],
+) -> tuple[dict, dict]:
+    """Run dedup_synonym_predicates with mocked generate_answer side-effects."""
+    model, tokenizer = _make_model_tokenizer(raw_outputs)
     with patch(
         "paramem.graph.extractor.generate_answer",
-        side_effect=side_effects,
+        side_effect=raw_outputs,
     ):
-        return dedup_synonym_predicates_local(
+        return dedup_synonym_predicates(
             relations,
-            model,
-            tokenizer,
+            model=model,
+            tokenizer=tokenizer,
             filter_prompt=FILTER_PROMPT,
-            merge_prompt=MERGE_PROMPT,
         )
 
 
 class TestEmptyInput:
-    def test_empty_returns_empty(self):
+    def test_empty_returns_empty_clusters(self):
         model = MagicMock()
         tokenizer = MagicMock()
-        surviving, diag = dedup_synonym_predicates_local(
+        clusters_by_so, diag = dedup_synonym_predicates(
             [],
-            model,
-            tokenizer,
+            model=model,
+            tokenizer=tokenizer,
             filter_prompt=FILTER_PROMPT,
-            merge_prompt=MERGE_PROMPT,
         )
-        assert surviving == []
+        assert clusters_by_so == {}
         assert diag["groups_examined"] == 0
-        assert diag["predicates_retired"] == 0
+        assert diag["candidate_groups"] == 0
+        assert diag["model_calls"] == 0
 
 
 class TestSinglePredicateGroupPassthrough:
-    def test_single_predicate_group_survives_untouched(self):
+    def test_single_predicate_group_no_model_call(self):
         """A (subject, object) group with only one predicate passes through
         without any model call (candidate_keys is empty)."""
         relations = [
@@ -81,68 +85,51 @@ class TestSinglePredicateGroupPassthrough:
         model.gradient_checkpointing_disable = MagicMock()
         model.gradient_checkpointing_enable = MagicMock()
         tokenizer = MagicMock()
-        # If generate_answer were called, the side_effect would be empty and raise.
+        # If generate_answer were called, the side_effect would raise.
         with patch(
             "paramem.graph.extractor.generate_answer",
             side_effect=Exception("should not be called"),
         ):
-            surviving, diag = dedup_synonym_predicates_local(
+            clusters_by_so, diag = dedup_synonym_predicates(
                 relations,
-                model,
-                tokenizer,
+                model=model,
+                tokenizer=tokenizer,
                 filter_prompt=FILTER_PROMPT,
-                merge_prompt=MERGE_PROMPT,
             )
-        assert len(surviving) == 2
+        assert clusters_by_so == {}
         assert diag["candidate_groups"] == 0
-        assert diag["predicates_retired"] == 0
+        assert diag["model_calls"] == 0
 
 
-class TestSynonymCollapseToSurvivor:
-    def test_synonym_pair_collapses(self):
-        """Two synonym predicates on same (s, o) → only the kept one survives."""
+class TestSynonymClusters:
+    def test_synonym_pair_returns_cluster(self):
+        """Two synonym predicates on same (s, o) → cluster returned."""
         relations = [
             {"subject": "Alex", "predicate": "works_for", "object": "Acme"},
             {"subject": "Alex", "predicate": "employed_by", "object": "Acme"},
         ]
-        filter_raw = json.dumps(
-            {
-                "groups": [
-                    {
-                        "subject": "Alex",
-                        "object": "Acme",
-                        "clusters": [["works_for", "employed_by"]],
-                    }
-                ]
-            }
-        )
-        merge_raw = json.dumps(
-            {
-                "merges": [
-                    {
-                        "subject": "Alex",
-                        "object": "Acme",
-                        "keep": "works_for",
-                        "drop": ["employed_by"],
-                    }
-                ]
-            }
-        )
-        surviving, diag = _run(relations, filter_raw, merge_raw)
-        preds = {r["predicate"] for r in surviving}
-        assert preds == {"works_for"}
-        assert diag["predicates_retired"] == 1
-        assert diag["groups_collapsed"] == 1
+        # One candidate group → one model call.
+        raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
+        clusters_by_so, diag = _run(relations, [raw])
 
-    def test_distinct_predicate_not_retired(self):
-        """A predicate with a different object is NOT retired even if the model
-        mistakenly lumps it with a synonym cluster."""
+        from paramem.graph.name_match import canonical
+
+        key = (canonical("Alex"), canonical("Acme"))
+        assert key in clusters_by_so, "Candidate group must appear in clusters_by_so"
+        group_clusters = clusters_by_so[key]
+        assert len(group_clusters) == 1
+        assert len(group_clusters[0]) == 2
+        assert diag["candidate_groups"] == 1
+        assert diag["groups_with_clusters"] == 1
+        assert diag["model_calls"] == 1
+
+    def test_distinct_predicates_different_objects_no_cluster(self):
+        """Same predicate but different objects — two distinct (s,o) groups,
+        each single-predicate — no candidate group → no model call."""
         relations = [
             {"subject": "Alex", "predicate": "lives_in", "object": "Berlin"},
             {"subject": "Alex", "predicate": "lives_in", "object": "Munich"},
         ]
-        # Both have the same predicate but DIFFERENT objects — two distinct groups,
-        # one predicate each, so candidate_keys is empty.
         model = MagicMock()
         model.gradient_checkpointing_disable = MagicMock()
         model.gradient_checkpointing_enable = MagicMock()
@@ -151,146 +138,79 @@ class TestSynonymCollapseToSurvivor:
             "paramem.graph.extractor.generate_answer",
             side_effect=Exception("should not be called"),
         ):
-            surviving, diag = dedup_synonym_predicates_local(
+            clusters_by_so, diag = dedup_synonym_predicates(
                 relations,
-                model,
-                tokenizer,
+                model=model,
+                tokenizer=tokenizer,
                 filter_prompt=FILTER_PROMPT,
-                merge_prompt=MERGE_PROMPT,
             )
-        assert len(surviving) == 2
-        assert diag["predicates_retired"] == 0
+        assert clusters_by_so == {}
+        assert diag["candidate_groups"] == 0
+
+    def test_two_candidate_groups_two_model_calls(self):
+        """Two distinct (s,o) groups each with 2 predicates → two model calls."""
+        relations = [
+            {"subject": "Alex", "predicate": "works_for", "object": "Acme"},
+            {"subject": "Alex", "predicate": "employed_by", "object": "Acme"},
+            {"subject": "Sam", "predicate": "lives_in", "object": "Berlin"},
+            {"subject": "Sam", "predicate": "resides_in", "object": "Berlin"},
+        ]
+        raw1 = json.dumps({"clusters": [["works_for", "employed_by"]]})
+        raw2 = json.dumps({"clusters": [["lives_in", "resides_in"]]})
+        clusters_by_so, diag = _run(relations, [raw1, raw2])
+        assert diag["candidate_groups"] == 2
+        assert diag["model_calls"] == 2
+        assert diag["groups_with_clusters"] == 2
+        assert len(clusters_by_so) == 2
 
 
 class TestGroundingGuard:
-    def test_hallucinated_predicate_in_drop_is_ignored(self):
-        """A predicate in merge.drop that does not appear in the input for
-        that (s, o) group is silently discarded."""
+    def test_hallucinated_predicate_in_cluster_discarded(self):
+        """A predicate in the model's cluster that does not appear in the input
+        for that (s, o) group is silently discarded.  If only 1 grounded member
+        remains, the cluster is dropped (not a valid ≥2-member cluster)."""
         relations = [
             {"subject": "Jordan", "predicate": "works_for", "object": "TechCo"},
             {"subject": "Jordan", "predicate": "employed_by", "object": "TechCo"},
         ]
-        filter_raw = json.dumps(
-            {
-                "groups": [
-                    {
-                        "subject": "Jordan",
-                        "object": "TechCo",
-                        "clusters": [["works_for", "employed_by"]],
-                    }
-                ]
-            }
-        )
-        # Model hallucinates "is_staff_at" in drop — not in input.
-        merge_raw = json.dumps(
-            {
-                "merges": [
-                    {
-                        "subject": "Jordan",
-                        "object": "TechCo",
-                        "keep": "works_for",
-                        "drop": ["employed_by", "is_staff_at"],
-                    }
-                ]
-            }
-        )
-        surviving, diag = _run(relations, filter_raw, merge_raw)
-        preds = {r["predicate"] for r in surviving}
-        # "employed_by" grounded and retired; "is_staff_at" hallucinated → discarded.
-        assert preds == {"works_for"}
-        assert diag["predicates_retired"] == 1
-        assert any(d["reason"] == "hallucinated_drop" for d in diag["discards"])
+        # Model returns cluster with "is_staff_at" hallucinated; 2 grounded remain.
+        raw = json.dumps({"clusters": [["works_for", "employed_by", "is_staff_at"]]})
+        clusters_by_so, diag = _run(relations, [raw])
 
-    def test_hallucinated_keep_predicate_discards_entire_entry(self):
-        """When the model's keep predicate is not in the input, the entire
-        merge entry is discarded (grounding guard) — nothing is retired."""
+        from paramem.graph.name_match import canonical
+
+        key = (canonical("Jordan"), canonical("TechCo"))
+        # Grounded cluster has 2 members (hallucinated "is_staff_at" dropped).
+        assert key in clusters_by_so
+        grounded = clusters_by_so[key][0]
+        assert len(grounded) == 2
+        assert canonical("is_staff_at") not in grounded
+        assert any(d["reason"] == "hallucinated_predicate" for d in diag["discards"])
+
+    def test_all_hallucinated_cluster_dropped(self):
+        """When all cluster members are hallucinated, the cluster is dropped
+        and no entry appears in clusters_by_so."""
         relations = [
             {"subject": "Sam", "predicate": "works_for", "object": "Corp"},
             {"subject": "Sam", "predicate": "employed_by", "object": "Corp"},
         ]
-        filter_raw = json.dumps(
-            {
-                "groups": [
-                    {
-                        "subject": "Sam",
-                        "object": "Corp",
-                        "clusters": [["works_for", "employed_by"]],
-                    }
-                ]
-            }
-        )
-        # Model invents "member_of" as the keep predicate — not in input.
-        merge_raw = json.dumps(
-            {
-                "merges": [
-                    {
-                        "subject": "Sam",
-                        "object": "Corp",
-                        "keep": "member_of",
-                        "drop": ["works_for", "employed_by"],
-                    }
-                ]
-            }
-        )
-        surviving, diag = _run(relations, filter_raw, merge_raw)
-        # Entire entry discarded — both original predicates survive.
-        assert len(surviving) == 2
-        assert diag["predicates_retired"] == 0
-        assert any(d["reason"] == "hallucinated_keep" for d in diag["discards"])
+        # Model returns an entirely hallucinated cluster.
+        raw = json.dumps({"clusters": [["ghost_pred", "phantom_pred"]]})
+        clusters_by_so, diag = _run(relations, [raw])
+        assert clusters_by_so == {}, "Entirely hallucinated cluster must be dropped"
+        assert diag["groups_with_clusters"] == 0
 
-    def test_ungrounded_group_in_filter_output_is_discarded(self):
-        """A group in stage-1 output whose (subject, object) does not match
-        any candidate group is discarded before stage-2."""
+    def test_parse_failure_yields_no_clusters(self):
+        """When model returns unparseable JSON, no clusters are returned."""
         relations = [
             {"subject": "Alex", "predicate": "works_for", "object": "Acme"},
             {"subject": "Alex", "predicate": "employed_by", "object": "Acme"},
         ]
-        filter_raw = json.dumps(
-            {
-                "groups": [
-                    # Valid group.
-                    {
-                        "subject": "Alex",
-                        "object": "Acme",
-                        "clusters": [["works_for", "employed_by"]],
-                    },
-                    # Hallucinated group — (Ghost, Corp) not in input.
-                    {
-                        "subject": "Ghost",
-                        "object": "Corp",
-                        "clusters": [["invented_pred"]],
-                    },
-                ]
-            }
-        )
-        merge_raw = json.dumps(
-            {
-                "merges": [
-                    {
-                        "subject": "Alex",
-                        "object": "Acme",
-                        "keep": "works_for",
-                        "drop": ["employed_by"],
-                    }
-                ]
-            }
-        )
-        surviving, diag = _run(relations, filter_raw, merge_raw)
-        preds = {r["predicate"] for r in surviving}
-        assert preds == {"works_for"}
-        assert diag["predicates_retired"] == 1
-        assert any(d["reason"] == "ungrounded_group" for d in diag["discards"])
-
-    def test_parse_failure_leaves_all_relations_intact(self):
-        """When model returns unparseable JSON, no relations are retired."""
-        relations = [
-            {"subject": "Alex", "predicate": "works_for", "object": "Acme"},
-            {"subject": "Alex", "predicate": "employed_by", "object": "Acme"},
-        ]
-        surviving, diag = _run(relations, "not valid json at all", "also not json")
-        # Both survive because parsing failed.
-        assert len(surviving) == 2
-        assert diag["predicates_retired"] == 0
+        clusters_by_so, diag = _run(relations, ["not valid json at all"])
+        assert clusters_by_so == {}
+        assert diag["groups_with_clusters"] == 0
+        # The model call was still made.
+        assert diag["model_calls"] == 1
 
     def test_gradient_checkpointing_always_reenabled(self):
         """gradient_checkpointing_enable is called in the finally block even
@@ -309,11 +229,113 @@ class TestGroundingGuard:
             side_effect=RuntimeError("GPU exploded"),
         ):
             with pytest.raises(RuntimeError, match="GPU exploded"):
-                dedup_synonym_predicates_local(
+                dedup_synonym_predicates(
                     relations,
-                    model,
-                    tokenizer,
+                    model=model,
+                    tokenizer=tokenizer,
                     filter_prompt=FILTER_PROMPT,
-                    merge_prompt=MERGE_PROMPT,
                 )
         model.gradient_checkpointing_enable.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# SOTA branch tests
+# ---------------------------------------------------------------------------
+
+
+class TestSotaBranch:
+    """dedup_synonym_predicates SOTA path: _sota_call receives raw prompt,
+    generate_answer/apply_chat_template are NOT used, None return is a no-op."""
+
+    _FILTER_PROMPT = "filter {predicates_json}"
+
+    _SOTA_CFG = {
+        "api_key": "sk-test",
+        "provider": "anthropic",
+        "filter_model": "claude-sonnet-4-6",
+        "endpoint": None,
+        "system_prompt": "You identify synonym predicate clusters. Output valid JSON only.",
+    }
+
+    def test_sota_call_receives_raw_prompt(self):
+        """On the SOTA branch _sota_call receives the RAW rendered prompt —
+        no chat template wrapping, no [INST] markers."""
+        import json
+        from unittest.mock import patch
+
+        relations = [
+            {"subject": "Jordan", "predicate": "works_for", "object": "TechCo"},
+            {"subject": "Jordan", "predicate": "employed_by", "object": "TechCo"},
+        ]
+        cluster_raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
+        with patch("paramem.graph.extractor._sota_call", return_value=cluster_raw) as mock_sota:
+            clusters_by_so, diag = dedup_synonym_predicates(
+                relations,
+                sota=self._SOTA_CFG,
+                filter_prompt=self._FILTER_PROMPT,
+            )
+
+        assert mock_sota.called, "_sota_call must be invoked on the SOTA path"
+        actual_prompt = mock_sota.call_args[0][0]
+        # Raw rendered: the filter prompt with predicates_json substituted.
+        assert "{predicates_json}" not in actual_prompt, (
+            "Slot must be filled before passing to _sota_call"
+        )
+        # No chat-template markers — this is a raw string, not a formatted chat.
+        assert "[INST]" not in actual_prompt
+        assert "<|user|>" not in actual_prompt
+        # Verify the cluster is parsed correctly.
+        from paramem.graph.name_match import canonical
+
+        key = (canonical("Jordan"), canonical("TechCo"))
+        assert key in clusters_by_so
+        assert diag["model_calls"] == 1
+
+    def test_sota_none_return_is_noop(self):
+        """_sota_call returning None (network / parse failure) must leave
+        clusters_by_so empty and never trigger any deletion."""
+        from unittest.mock import patch
+
+        relations = [
+            {"subject": "Jordan", "predicate": "works_for", "object": "TechCo"},
+            {"subject": "Jordan", "predicate": "employed_by", "object": "TechCo"},
+        ]
+        with patch("paramem.graph.extractor._sota_call", return_value=None):
+            clusters_by_so, diag = dedup_synonym_predicates(
+                relations,
+                sota=self._SOTA_CFG,
+                filter_prompt=self._FILTER_PROMPT,
+            )
+
+        assert clusters_by_so == {}, "None return must produce no clusters"
+        assert diag["groups_with_clusters"] == 0
+        # model_calls is NOT incremented for a None return (raw_outputs gets "").
+        assert diag["model_calls"] == 0
+
+    def test_sota_path_does_not_use_local_model(self):
+        """On the SOTA branch apply_chat_template and generate_answer must not
+        be called — the local model is not consulted."""
+        import json
+        from unittest.mock import MagicMock, patch
+
+        relations = [
+            {"subject": "Jordan", "predicate": "works_for", "object": "TechCo"},
+            {"subject": "Jordan", "predicate": "employed_by", "object": "TechCo"},
+        ]
+        fake_tokenizer = MagicMock()
+        cluster_raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
+        with (
+            patch("paramem.graph.extractor._sota_call", return_value=cluster_raw),
+            patch(
+                "paramem.graph.extractor.generate_answer",
+                side_effect=AssertionError("generate_answer must not be called on SOTA path"),
+            ),
+        ):
+            # Pass a tokenizer; the SOTA path must ignore it.
+            dedup_synonym_predicates(
+                relations,
+                sota=self._SOTA_CFG,
+                filter_prompt=self._FILTER_PROMPT,
+            )
+
+        fake_tokenizer.apply_chat_template.assert_not_called()

@@ -2,13 +2,22 @@
 
 Contradiction resolution:
 - Same-predicate, different-object cardinality resolution: the model returns one of two
-  verdicts (COEXIST / REPLACE) for each same-(subject, predicate)/different-object pair.
+  verdicts (COEXIST / REPLACE) for each same-(subject, predicate)/different-object group.
   Cardinality judgment is cached per predicate (one model call per unique predicate).
   Active whenever a model is present and ``resolve_contradictions=True``.
 - COEXIST: both values are independent and multi-valued; keep both edges.
-- REPLACE: new value supersedes old (single-valued predicate); old edge removed.
-  With ``resolve_contradictions=False`` (fold-only path), REPLACE is skipped — the
-  fold is old-vs-old consolidation with no recency signal, so no edge is removed.
+- REPLACE (single-valued): recency selection over ``{incoming} ∪ rivals``.
+  Rule (applied uniformly at ingest, interim, and fold; no positional fork):
+  1. ANY candidate ``last_seen`` is empty (``""``) → COEXIST: insert incoming, remove
+     nothing.  Covers legacy timestamp-less keys at fold (all ""), and mixed registries
+     where one side is a dated key and the other is a legacy "".
+  2. All candidates have datestamps: ``max_ls = max(candidates)``.  Strictly-older rivals
+     (``last_seen < max_ls``) are retired and ledgered.  Ties at ``max_ls`` coexist.
+     Incoming: if ``incoming_ls == max_ls`` → insert (fall through to Case-3);
+     if ``incoming_ls < max_ls`` → incoming loses → NOT inserted, ledgered.
+  At fold, the session ``timestamp`` passed to the merger is ``""`` so the fallback
+  ``relation.last_seen or timestamp`` yields ``""`` for legacy relations — they hit
+  rule 1 (coexist) rather than fabricating a NOW value.
 - When no model is present (experiments, after release): all triples coexist (no removal).
 """
 
@@ -207,14 +216,17 @@ class GraphMerger:
             session_graph: The per-session graph to merge in.
             resolve_contradictions: When ``True`` (default), Case-2
                 same-predicate/different-object cardinality resolution fires
-                when a model is present — the model returns COEXIST or REPLACE,
-                and REPLACE removes the superseded edge.  Applied at ingest and
-                interim cycles where a NEW-vs-OLD temporal partition supplies the
-                recency signal (new statement supersedes older).
-                When ``False`` (fold-only path), Case-2 is short-circuited — no
-                model call, no edge removal.  The fold operates on old-vs-old
-                stored knowledge with no recency signal, so contradiction
-                detection is structurally off when no recency signal is available.
+                when a model is present — the model returns COEXIST or REPLACE.
+                For REPLACE (single-valued), recency selection fires: if ANY
+                candidate ``last_seen`` is ``""`` → coexist (no removal).
+                Otherwise ``max_ls = max(candidates)``; strictly-older rivals
+                retired; ties at ``max_ls`` coexist; incoming loses if strictly
+                older than ``max_ls`` (NOT inserted).  Applied uniformly at
+                ingest, interim, and fold (no positional fork).  At fold the
+                session timestamp is ``""`` so legacy relations (``last_seen=""``
+                ) coexist rather than fabricating a NOW recency value.
+                When ``False``, Case-2 is short-circuited: no model call, no
+                edge removal.
 
         Returns the updated cumulative graph.
 
@@ -498,16 +510,21 @@ class GraphMerger:
            recurrence.  Case-1-adopt: if the existing edge has no ``ik_key`` and
            the incoming ``relation.indexed_key`` is set, adopt the key onto the
            existing edge (fold-only provenance carry-through).
-        2. Same (subject, predicate) but different object — 2-way cardinality
-           resolution when a model is present and ``resolve_contradictions=True``
-           (ingest and interim paths where new supersedes old):
+        2. Same (subject, predicate) but different object — cardinality resolution
+           when a model is present and ``resolve_contradictions=True``:
 
-           - ``COEXIST``: both values are independent; both edges kept.
-           - ``REPLACE``: new value supersedes old; old edge removed.
+           - ``COEXIST``: both values are independent; all edges kept.
+           - ``REPLACE`` (single-valued): recency selection over
+             ``{incoming} ∪ rivals``.  If ANY candidate ``last_seen`` is ``""``
+             → COEXIST (no removal; covers legacy fold keys and mixed
+             dated/legacy registries).  Otherwise all are dated: strictly-older
+             rivals retired + ledgered; ties at ``max_ls`` coexist; incoming
+             NOT inserted (returns ``None``) and ledgered when strictly older
+             than ``max_ls``.  ``incoming_ls = relation.last_seen or timestamp``
+             (``timestamp=""`` at fold/recon/simulate; ``now()`` at ingest).
 
-           When ``resolve_contradictions=False`` (fold-only), Case-2 is
-           short-circuited: no model call, no edge removal.  The fold operates
-           on old-vs-old stored knowledge with no recency signal.
+           When ``resolve_contradictions=False``, Case-2 is short-circuited:
+           no model call, no edge removal.
 
            Cardinality (COEXIST vs REPLACE axis) is cached per predicate.
         3. New (subject, predicate, object) — net-new edge insertion.  The
@@ -621,41 +638,46 @@ class GraphMerger:
             return None
 
         # --- Case 2: Same-predicate, different-object cardinality resolution ---
-        # At ingest/interim (resolve_contradictions=True): ask the model for a
-        # 2-way verdict (COEXIST / REPLACE).  Cardinality judgment is cached per
-        # predicate.  Requires a model to be present.
-        # At fold time (resolve_contradictions=False): skip entirely — the fold
-        # is old-vs-old consolidation with no recency signal, so no removal is
-        # made; fall through to new-edge insertion.
-        # When no model is present, fall through to new-edge insertion (coexist-all).
+        # When no model is present or resolve_contradictions=False, fall through
+        # to Case-3 insertion (coexist-all / short-circuit).
+        # When a model is present and resolve_contradictions=True:
+        #   1. Gather ALL rival edges (same subject+predicate, different object).
+        #   2. Run ONE cardinality verdict (cached per predicate).
+        #   3. COEXIST → fall through.
+        #   4. REPLACE → recency selection across {incoming} ∪ rivals:
+        #      - incoming_ls = relation.last_seen or timestamp (never empty)
+        #      - rival_ls  = each rival's stored last_seen (may be "")
+        #      - max_ls = lexicographic max across the full set
+        #      - n_at_max >= 2 (empty or tied) → coexist; fall through, no removal
+        #      - incoming uniquely freshest → retire ALL rivals, fall through
+        #      - rival uniquely freshest → that rival survives; other rivals retired;
+        #        incoming is NOT inserted (return None after ledgering its key)
         if resolve_contradictions and self.model is not None and self.graph.has_node(subject):
+            # Gather all rival (obj, edge_key, edge_data) triples.
+            rivals: list[tuple[str, int, dict]] = []
             for old_obj in list(self.graph.successors(subject)):
                 if old_obj == obj:
                     continue
-                old_edges_with_pred = [
-                    (key, data)
-                    for key, data in self.graph[subject][old_obj].items()
-                    if data.get("predicate") == normalized_pred
-                ]
-                if not old_edges_with_pred:
-                    continue
+                for key, data in self.graph[subject][old_obj].items():
+                    if data.get("predicate") == normalized_pred:
+                        rivals.append((old_obj, key, data))
 
+            if rivals:
                 # Determine cardinality (cached per predicate).
                 if normalized_pred not in self._predicate_cardinality:
                     verdict = check_predicate_coexistence(
                         subject,
                         normalized_pred,
-                        old_obj,
+                        rivals[0][0],  # first rival object as old_value
                         obj,
                         self.model,
                         self.tokenizer,
                         self._coexistence_prompt,
                     )
-                    # Cache the COEXIST/REPLACE axis (True = multi-valued).
+                    # Cache: True = multi-valued (COEXIST), False = single-valued (REPLACE).
                     if verdict == "REPLACE":
                         self._predicate_cardinality[normalized_pred] = False
                     else:
-                        # COEXIST → multi-valued axis
                         self._predicate_cardinality[normalized_pred] = True
                     _card_label = (
                         "multi-valued"
@@ -670,38 +692,96 @@ class GraphMerger:
                     )
 
                 if not self._predicate_cardinality[normalized_pred]:
-                    # Single-valued (REPLACE): remove old edges, insert new one below.
-                    for key, _ in old_edges_with_pred:
-                        _removed_ik = (
-                            self.graph.get_edge_data(subject, old_obj, key=key) or {}
-                        ).get(_IK_KEY_ATTR)
-                        if _removed_ik:
-                            self.removal_ledger[_removed_ik] = {
-                                "reason": "contradiction_same_pred",
-                                "old_object": old_obj,
-                                "new_object": obj,
-                            }
-                        self.graph.remove_edge(subject, old_obj, key=key)
-                        self.contradictions_resolved.append(
-                            {
-                                "method": "model_cardinality",
-                                "subject": subject,
-                                "old_predicate": normalized_pred,
-                                "old_object": old_obj,
-                                "new_predicate": normalized_pred,
-                                "new_object": obj,
-                                "session": session_id,
-                            }
+                    # Single-valued (REPLACE): recency selection.
+                    # incoming_ls: use the relation's own last_seen when set; falls back to
+                    # session timestamp ("" at fold/recon/simulate; now() at live ingest).
+                    incoming_ls = relation.last_seen or timestamp
+                    rival_ls_list = [data.get("last_seen", "") for _, _, data in rivals]
+
+                    if any(ls == "" for ls in [incoming_ls, *rival_ls_list]):
+                        # ANY candidate last_seen is empty (unknown recency) → COEXIST.
+                        # Covers: legacy timestamp-less keys at fold (all ""), and mixed
+                        # registries where a legacy "" key is a rival of a dated incoming
+                        # (or vice versa).  Safe no-op: insert incoming, remove nothing.
+                        pass
+                    else:
+                        # All candidates have datestamps; freshest wins.
+                        # Strictly-older rivals (last_seen < max_ls) are retired.
+                        # Ties at max_ls coexist (rivals AND incoming if at max_ls).
+                        max_ls = max([incoming_ls, *rival_ls_list])
+                        # winner_obj: representative "superseded by" pointer for ledger
+                        # entries on retired edges.  When incoming also wins (at max_ls)
+                        # use obj; when incoming loses, use the first rival at max_ls.
+                        winner_obj = (
+                            obj
+                            if incoming_ls == max_ls
+                            else next(
+                                rv for rv, _, rd in rivals if rd.get("last_seen", "") == max_ls
+                            )
                         )
-                        logger.info(
-                            "Contradiction resolved (cardinality): %s | %s | %s → %s (session %s)",
-                            subject,
-                            normalized_pred,
-                            old_obj,
-                            obj,
-                            session_id,
-                        )
-                # COEXIST: fall through to new-edge insertion.
+                        for rival_obj, rival_key, rival_data in rivals:
+                            if rival_data.get("last_seen", "") >= max_ls:
+                                continue  # at max_ls — coexist (tied rivals kept)
+                            _removed_ik = rival_data.get(_IK_KEY_ATTR)
+                            if _removed_ik:
+                                self.removal_ledger[_removed_ik] = {
+                                    "reason": "contradiction_same_pred",
+                                    "old_object": rival_obj,
+                                    "new_object": winner_obj,
+                                }
+                            self.graph.remove_edge(subject, rival_obj, key=rival_key)
+                            self.contradictions_resolved.append(
+                                {
+                                    "method": "model_cardinality",
+                                    "subject": subject,
+                                    "old_predicate": normalized_pred,
+                                    "old_object": rival_obj,
+                                    "new_predicate": normalized_pred,
+                                    "new_object": winner_obj,
+                                    "session": session_id,
+                                }
+                            )
+                            logger.info(
+                                "Contradiction resolved (recency): %s | %s | %s"
+                                " → %s wins (session %s)",
+                                subject,
+                                normalized_pred,
+                                rival_obj,
+                                winner_obj,
+                                session_id,
+                            )
+                        if incoming_ls < max_ls:
+                            # Incoming loses to a rival at max_ls; skip Case-3 insertion.
+                            if relation.indexed_key:
+                                self.removal_ledger[relation.indexed_key] = {
+                                    "reason": "contradiction_same_pred",
+                                    "old_object": obj,
+                                    "new_object": winner_obj,
+                                }
+                            self.contradictions_resolved.append(
+                                {
+                                    "method": "model_cardinality",
+                                    "subject": subject,
+                                    "old_predicate": normalized_pred,
+                                    "old_object": obj,
+                                    "new_predicate": normalized_pred,
+                                    "new_object": winner_obj,
+                                    "session": session_id,
+                                }
+                            )
+                            logger.info(
+                                "Contradiction resolved (recency): rival %s | %s | %s"
+                                " wins over incoming %s (session %s)",
+                                subject,
+                                normalized_pred,
+                                winner_obj,
+                                obj,
+                                session_id,
+                            )
+                            return None  # Skip Case-3: incoming is not inserted.
+                        # incoming_ls == max_ls: incoming ties or is the unique freshest.
+                        # Fall through to Case-3: incoming is inserted.
+                # COEXIST: fall through to Case-3 insertion.
 
         # --- Case 3: New-edge insertion ---
         # After contradiction cleanup, alignment check, or when no same-pred edge exists.

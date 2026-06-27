@@ -550,7 +550,6 @@ _STAGE_FILENAME = {
     "enrich": "sota_enrichment.txt",
     "plausibility": "sota_plausibility.txt",
     "normalize_filter": "graph_dedup_filter.txt",
-    "normalize_merge": "graph_dedup_merge.txt",
     "name_user": "name_extraction.txt",
     "name_system": "name_extraction_system.txt",
 }
@@ -714,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
         "anonymize": [_STAGE_FILENAME["anonymize"]],
         "enrich": [_STAGE_FILENAME["enrich"]],
         "plausibility": [_STAGE_FILENAME["plausibility"]],
-        "normalize": [_STAGE_FILENAME["normalize_filter"], _STAGE_FILENAME["normalize_merge"]],
+        "normalize": [_STAGE_FILENAME["normalize_filter"]],
         "name": [_STAGE_FILENAME["name_user"], _STAGE_FILENAME["name_system"]],
     }
 
@@ -925,9 +924,7 @@ def main(argv: list[str] | None = None) -> int:
     # ----- normalize stage (graph-level, runs outside the chunk loop) -------
     if "normalize" in stages:
         filter_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['normalize_filter']}"
-        merge_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['normalize_merge']}"
         filter_override = filter_calib if (prompts_dir / filter_calib).exists() else None
-        merge_override = merge_calib if (prompts_dir / merge_calib).exists() else None
         normalize_runs: list[dict] = []
         for seed in seeds:
             params = dict(params_base)
@@ -938,7 +935,6 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "snapshot_path": args.snapshot,
                     "filter_prompt_filename": filter_override,
-                    "merge_prompt_filename": merge_override,
                     "prompts_dir": args.prompts_dir,
                     "params": {k: v for k, v in params.items() if v is not None},
                 },

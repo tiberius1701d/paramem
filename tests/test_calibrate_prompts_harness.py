@@ -26,9 +26,7 @@ import calibrate_prompts  # noqa: E402 (scripts/dev is not a package)
 
 _CANNED_NORMALIZE_RESPONSE = {
     "filtered": [],
-    "merged": [],
     "filter_prompt_used": "normalize_filter.txt",
-    "merge_prompt_used": "normalize_merge.txt",
     "raw_output": "[]",
 }
 

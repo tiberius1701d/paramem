@@ -17,8 +17,8 @@ Purpose-keyed graph snapshot vocabulary (BINDING):
 
 - ``reconstructed`` (fold only): ``graph_reconstructed_snapshot.json``
 - ``merged`` (fold + interim): ``graph_merged_snapshot.json``
-  Fold: after re-merge (resolve_contradictions=False); interim: after per-session merge,
-  before enrichment.
+  Fold: after registry-true re-merge (resolve_contradictions driven by config); interim:
+  after per-session merge, before enrichment.
 - ``enriched`` (fold + interim): ``graph_enriched_snapshot.json``
 - ``keyed`` (fold only): ``graph_keyed_snapshot.json``
 

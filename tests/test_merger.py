@@ -810,7 +810,8 @@ class TestModelContradictionAndRelease:
 
     def test_single_valued_contradiction_resolved_with_model(self):
         """With a model present, same-(s,p)/different-o for a single-valued
-        predicate removes the old edge and inserts the new one."""
+        predicate removes the old edge (older last_seen) and inserts the new one
+        (fresher last_seen).  The recency rule picks the incoming as the winner."""
         from unittest.mock import patch
 
         model_stub, tok_stub, coexist_fn = self._build_stub_model(is_single_valued=True)
@@ -820,6 +821,7 @@ class TestModelContradictionAndRelease:
             side_effect=coexist_fn,
         ):
             m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+            # sg1 carries an older last_seen so sg2's relation wins under the recency rule.
             sg1 = SessionGraph(
                 session_id="s1",
                 timestamp="2026-01-01T00:00:00Z",
@@ -834,6 +836,7 @@ class TestModelContradictionAndRelease:
                         object="Munich",
                         relation_type="factual",
                         speaker_id="speaker0",
+                        last_seen="2026-01-01T00:00:00Z",
                     )
                 ],
             )
@@ -851,6 +854,7 @@ class TestModelContradictionAndRelease:
                         object="Berlin",
                         relation_type="factual",
                         speaker_id="speaker0",
+                        last_seen="2026-01-02T00:00:00Z",
                     )
                 ],
             )
@@ -1391,12 +1395,9 @@ class TestReinforcementTracking:
         # Key was adopted onto the existing edge.
         assert m.graph["alice"]["berlin"][existing_eid].get(_IK_KEY_ATTR) == "graph5"
 
-    def test_fold_non_subtractive_short_circuits_replace_both_edges_survive(self):
-        """resolve_contradictions=False short-circuits Case-2: even when check_predicate_coexistence
-        returns REPLACE, the old edge is NOT removed and both keys survive.
-
-        This is the regression guard for the fold-is-non-subtractive invariant: no model call,
-        no edge removal, no registered fact lost at fold time.
+    def test_resolve_contradictions_false_short_circuits_both_edges_survive(self):
+        """resolve_contradictions=False short-circuits Case-2: no model call and both edges survive,
+        regardless of distinct last_seen timestamps.
         """
         from unittest.mock import MagicMock, patch
 
@@ -1409,11 +1410,9 @@ class TestReinforcementTracking:
         tok_stub.apply_chat_template.return_value = "formatted"
 
         m = GraphMerger(model=model_stub, tokenizer=tok_stub)
-        # Pre-seed with canonical node keys and canonical predicate form.
         m.graph.add_node("alex", attributes={"name": "Alex"})
         m.graph.add_node("munich", attributes={"name": "Munich"})
 
-        # Pre-seed with the first edge carrying ik_key='key_munich'.
         eid_old = m.graph.add_edge(
             "alex",
             "munich",
@@ -1421,13 +1420,13 @@ class TestReinforcementTracking:
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
-            last_seen="s1",
+            last_seen="2026-01-01T00:00:00Z",
             reinforcement_count=1,
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
 
-        # Incoming relation: same predicate, different object (Berlin).
+        # Incoming has a FRESHER last_seen — but resolve_contradictions=False must skip.
         incoming = Relation(
             subject="alex",
             predicate="lives_in",
@@ -1436,9 +1435,9 @@ class TestReinforcementTracking:
             confidence=1.0,
             speaker_id="speaker0",
             indexed_key="key_berlin",
+            last_seen="2026-01-02T00:00:00Z",
         )
 
-        # Even though the model would say REPLACE, resolve_contradictions=False must skip it.
         with patch(
             "paramem.graph.merger.check_predicate_coexistence",
             return_value="REPLACE",
@@ -1451,11 +1450,8 @@ class TestReinforcementTracking:
                 "2026-01-02T00:00:00Z",
                 resolve_contradictions=False,
             )
-            # check_predicate_coexistence must NOT have been called (short-circuit).
             mock_coexist.assert_not_called()
 
-        # Both edges must survive: munich (old) and berlin (new).
-        # Node keys are canonical: "alex", "munich", "berlin"
         lives_in_objects = [
             obj
             for obj in m.graph.successors("alex")
@@ -1469,7 +1465,6 @@ class TestReinforcementTracking:
             "New edge (Berlin) must be inserted even when resolve_contradictions=False"
         )
 
-        # Both ik_keys must be stamped on their respective edges.
         munich_key = next(
             d.get(_IK_KEY_ATTR)
             for _, d in m.graph["alex"]["munich"].items()
@@ -1482,6 +1477,158 @@ class TestReinforcementTracking:
         )
         assert munich_key == "key_munich", f"Expected key_munich on old edge; got {munich_key!r}"
         assert berlin_key == "key_berlin", f"Expected key_berlin on new edge; got {berlin_key!r}"
+
+    def test_recency_distinct_timestamps_winner_survives_loser_removed(self):
+        """resolve_contradictions=True + REPLACE verdict + distinct last_seen timestamps:
+        the fresher rival is retained and the staler one is retired.
+
+        Incoming (Berlin, 2026-01-02) vs rival (Munich, 2026-01-01) → incoming wins;
+        Munich edge is removed and ledgered.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+        m.graph.add_node("alex", attributes={"name": "Alex"})
+        m.graph.add_node("munich", attributes={"name": "Munich"})
+
+        eid_old = m.graph.add_edge(
+            "alex",
+            "munich",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s1",
+            last_seen="2026-01-01T00:00:00Z",
+            reinforcement_count=1,
+            sessions=["s1"],
+        )
+        m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
+        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
+
+        incoming = Relation(
+            subject="alex",
+            predicate="lives_in",
+            object="berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+            indexed_key="key_berlin",
+            last_seen="2026-01-02T00:00:00Z",
+        )
+
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            return_value="REPLACE",
+        ):
+            m._upsert_relation(
+                "alex",
+                "berlin",
+                incoming,
+                "s2",
+                "2026-01-02T00:00:00Z",
+                resolve_contradictions=True,
+            )
+
+        # Munich (older) must be gone; Berlin (fresher) must survive.
+        lives_in_objects = [
+            obj
+            for obj in m.graph.successors("alex")
+            for _, d in m.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
+        ]
+        assert "munich" not in lives_in_objects, (
+            "Staler Munich edge must be retired when incoming is uniquely freshest"
+        )
+        assert "berlin" in lives_in_objects, "Fresher Berlin edge must survive"
+
+        assert "key_munich" in m.removal_ledger, "Retired rival key must be in removal_ledger"
+        assert m.removal_ledger["key_munich"]["reason"] == "contradiction_same_pred"
+        assert m.removal_ledger["key_munich"]["old_object"] == "munich"
+        assert m.removal_ledger["key_munich"]["new_object"] == "berlin"
+
+    def test_recency_tied_timestamps_both_edges_survive(self):
+        """resolve_contradictions=True + REPLACE verdict + equal NON-EMPTY last_seen:
+        tied datestamps → coexist; both edges survive, no ledger entry.
+
+        Covers the within-session tie case (shared real timestamp).  Empty/legacy
+        keys are a separate rule (any-empty → coexist) tested in TestRecencyAnyEmpty.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+        m.graph.add_node("alex", attributes={"name": "Alex"})
+        m.graph.add_node("munich", attributes={"name": "Munich"})
+
+        same_ts = "2026-01-01T00:00:00Z"
+        eid_old = m.graph.add_edge(
+            "alex",
+            "munich",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s1",
+            last_seen=same_ts,
+            reinforcement_count=1,
+            sessions=["s1"],
+        )
+        m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
+        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
+
+        incoming = Relation(
+            subject="alex",
+            predicate="lives_in",
+            object="berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+            indexed_key="key_berlin",
+            last_seen=same_ts,  # tied timestamp
+        )
+
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            return_value="REPLACE",
+        ):
+            m._upsert_relation(
+                "alex",
+                "berlin",
+                incoming,
+                "s1",
+                same_ts,
+                resolve_contradictions=True,
+            )
+
+        # Tied → coexist: both edges survive.
+        lives_in_objects = [
+            obj
+            for obj in m.graph.successors("alex")
+            for _, d in m.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
+        ]
+        assert "munich" in lives_in_objects, "Munich edge must survive (tied timestamp → coexist)"
+        assert "berlin" in lives_in_objects, (
+            "Berlin edge must be inserted (tied timestamp → coexist)"
+        )
+
+        # No removal_ledger entry for either key.
+        assert "key_munich" not in m.removal_ledger, "Tied key must NOT be ledgered"
+        assert "key_berlin" not in m.removal_ledger, "Incoming tied key must NOT be ledgered"
 
 
 class TestRemovalLedger:
@@ -1560,12 +1707,11 @@ class TestRemovalLedger:
         assert "key_survivor" not in m.removal_ledger, "Surviving key must not be in removal_ledger"
 
     def test_same_pred_replace_writes_to_ledger(self):
-        """Same-(s,p)/different-o single-valued (REPLACE) contradiction writes the
-        removed edge's ik_key to removal_ledger with reason='contradiction_same_pred'.
+        """Same-(s,p)/different-o single-valued (REPLACE) + incoming fresher:
+        removed rival's ik_key goes to removal_ledger with reason='contradiction_same_pred'.
 
-        The path is dormant under resolve_contradictions=False (fold path); we use
-        resolve_contradictions=True (live ingest) with a patched
-        check_predicate_coexistence that returns REPLACE.
+        Uses resolve_contradictions=True with distinct last_seen so the recency rule
+        picks the incoming (Berlin, 2026-01-02) over the rival (Munich, 2026-01-01).
         Pre-seed the first edge with an ik_key directly on the graph.
         """
         from unittest.mock import patch
@@ -1579,7 +1725,7 @@ class TestRemovalLedger:
 
         m = GraphMerger(model=object(), tokenizer=object())  # non-None to trigger Case-2
 
-        # Merge the first session (Munich) — normal ingest, no indexed_key.
+        # Merge the first session (Munich) with an older last_seen.
         sg1 = SessionGraph(
             session_id="s1",
             timestamp="2026-01-01T00:00:00Z",
@@ -1592,6 +1738,7 @@ class TestRemovalLedger:
                     relation_type="factual",
                     confidence=1.0,
                     speaker_id="speaker0",
+                    last_seen="2026-01-01T00:00:00Z",
                 )
             ],
         )
@@ -1605,7 +1752,7 @@ class TestRemovalLedger:
                 _edata[_IK_KEY_ATTR] = "key_munich_old"
                 break
 
-        # Merge the second session (Berlin) — REPLACE fires, Munich edge is removed.
+        # Merge the second session (Berlin) with a fresher last_seen → incoming wins.
         sg2 = SessionGraph(
             session_id="s2",
             timestamp="2026-01-02T00:00:00Z",
@@ -1618,24 +1765,112 @@ class TestRemovalLedger:
                     relation_type="factual",
                     confidence=1.0,
                     speaker_id="speaker0",
+                    last_seen="2026-01-02T00:00:00Z",
                 )
             ],
         )
         with patch("paramem.graph.merger.check_predicate_coexistence", side_effect=_always_replace):
             m.merge(sg2)
 
-        # "munich" must be gone.
+        # "munich" must be gone (incoming is fresher).
         assert "munich" not in list(m.graph.successors("alex")), (
-            "Old Munich edge must have been removed by REPLACE"
+            "Older Munich edge must have been removed by REPLACE+recency"
         )
-        # Ledger must record the removed key.
+        # Ledger must record the removed rival key.
         assert "key_munich_old" in m.removal_ledger, (
-            f"Removed key must be in removal_ledger; keys={list(m.removal_ledger.keys())}"
+            f"Removed rival key must be in removal_ledger; keys={list(m.removal_ledger.keys())}"
         )
         assert m.removal_ledger["key_munich_old"]["reason"] == "contradiction_same_pred", (
             f"Expected reason='contradiction_same_pred'; "
             f"got {m.removal_ledger['key_munich_old']['reason']!r}"
         )
+        assert m.removal_ledger["key_munich_old"]["old_object"] == "munich"
+        assert m.removal_ledger["key_munich_old"]["new_object"] == "berlin"
+
+    def test_incoming_loses_when_rival_is_fresher(self):
+        """Same-(s,p)/different-o REPLACE + rival has fresher last_seen:
+        rival survives, incoming is NOT inserted, incoming's indexed_key is ledgered.
+
+        This is the new incoming-loses path introduced by the unified recency rule.
+        rival (Munich, 2026-01-02) vs incoming (Berlin, 2026-01-01) → Munich wins.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+        m.graph.add_node("alex", attributes={"name": "Alex"})
+        m.graph.add_node("munich", attributes={"name": "Munich"})
+
+        eid_old = m.graph.add_edge(
+            "alex",
+            "munich",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s1",
+            last_seen="2026-01-02T00:00:00Z",  # FRESHER than incoming
+            reinforcement_count=1,
+            sessions=["s1"],
+        )
+        m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
+        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
+
+        # Incoming (Berlin) has an OLDER last_seen → loses to Munich.
+        incoming = Relation(
+            subject="alex",
+            predicate="lives_in",
+            object="berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+            indexed_key="key_berlin_old",
+            last_seen="2026-01-01T00:00:00Z",  # OLDER → loses
+        )
+
+        return_value = None
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            return_value="REPLACE",
+        ):
+            return_value = m._upsert_relation(
+                "alex",
+                "berlin",
+                incoming,
+                "s2",
+                "2026-01-01T00:00:00Z",
+                resolve_contradictions=True,
+            )
+
+        # Return value must be None (incoming is not inserted).
+        assert return_value is None, "_upsert_relation must return None when incoming loses"
+
+        # Munich (fresher rival) must survive; Berlin (older incoming) must NOT be inserted.
+        lives_in_objects = [
+            obj
+            for obj in m.graph.successors("alex")
+            for _, d in m.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
+        ]
+        assert "munich" in lives_in_objects, "Fresher rival Munich must survive"
+        assert "berlin" not in lives_in_objects, "Older incoming Berlin must NOT be inserted"
+
+        # Incoming's indexed_key must be in the removal_ledger.
+        assert "key_berlin_old" in m.removal_ledger, (
+            f"Incoming loser key must be ledgered; keys={list(m.removal_ledger.keys())}"
+        )
+        assert m.removal_ledger["key_berlin_old"]["reason"] == "contradiction_same_pred"
+        assert m.removal_ledger["key_berlin_old"]["old_object"] == "berlin"
+        assert m.removal_ledger["key_berlin_old"]["new_object"] == "munich"
+
+        # Munich's key must NOT be in the removal_ledger (it won).
+        assert "key_munich" not in m.removal_ledger, "Winner key must NOT be ledgered"
 
     def test_reset_graph_clears_removal_ledger(self):
         """reset_graph() clears removal_ledger alongside collapsed and reinforcements."""
@@ -1787,6 +2022,258 @@ class TestRemovalLedger:
             f"surviving predicate must be the space-normalized 'lives in'; got "
             f"{pre.get('surviving', {}).get('predicate')!r}"
         )
+
+
+class TestRecencyAnyEmpty:
+    """Recency rule: ANY empty last_seen among candidates → COEXIST (no removal).
+
+    Covers:
+    - incoming last_seen="" with a dated rival → coexist (C1 regression test)
+    - dated incoming with a rival last_seen="" → coexist
+    - both incoming and rival last_seen="" → coexist
+    - 3+ dated rivals with a unique max → strictly-older pair retired, max survives
+    - 3+ dated rivals with a top tie → strictly-older retired, tied pair coexist
+    """
+
+    @staticmethod
+    def _make_graph_with_rival(rival_last_seen: str) -> "GraphMerger":
+        """Return a GraphMerger with a single (alex, lives in, munich) rival edge."""
+        from unittest.mock import MagicMock
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        model_stub = MagicMock()
+        tok_stub = MagicMock()
+        tok_stub.apply_chat_template.return_value = "formatted"
+
+        m = GraphMerger(model=model_stub, tokenizer=tok_stub)
+        m.graph.add_node("alex", attributes={"name": "Alex"})
+        m.graph.add_node("munich", attributes={"name": "Munich"})
+        eid = m.graph.add_edge(
+            "alex",
+            "munich",
+            predicate="lives in",
+            relation_type="factual",
+            confidence=1.0,
+            first_seen="s1",
+            last_seen=rival_last_seen,
+            reinforcement_count=1,
+            sessions=["s1"],
+        )
+        m.graph["alex"]["munich"][eid][_IK_KEY_ATTR] = "key_munich"
+        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
+        return m
+
+    @staticmethod
+    def _upsert_berlin(m: "GraphMerger", incoming_last_seen: str) -> None:
+        """Insert (alex, lives in, berlin) with the given last_seen."""
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        incoming = Relation(
+            subject="alex",
+            predicate="lives_in",
+            object="berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+            indexed_key="key_berlin",
+            last_seen=incoming_last_seen,
+        )
+        with patch(
+            "paramem.graph.merger.check_predicate_coexistence",
+            return_value="REPLACE",
+        ):
+            m._upsert_relation(
+                "alex",
+                "berlin",
+                incoming,
+                "__recon__",
+                "",  # timestamp="" — fold/recon path; must NOT fabricate now()
+                resolve_contradictions=True,
+            )
+
+    def _get_lives_in_objects(self, m: "GraphMerger") -> "list[str]":
+
+        return [
+            obj
+            for obj in m.graph.successors("alex")
+            for _, d in m.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
+        ]
+
+    def test_incoming_empty_rival_dated_coexist(self):
+        """C1 regression: incoming last_seen="" vs dated rival → COEXIST.
+
+        Before C1 fix, timestamp=now() was passed to the merger's SessionGraph so
+        the merger evaluated incoming_ls = "" or now() = now(), making the legacy key
+        appear as the unique freshest → the dated rival was wrongly retired.
+        With the fix, timestamp="" so incoming_ls = "" → any-empty rule → COEXIST.
+        """
+        m = self._make_graph_with_rival(rival_last_seen="2026-01-01T00:00:00Z")
+        self._upsert_berlin(m, incoming_last_seen="")  # legacy incoming
+
+        objects = self._get_lives_in_objects(m)
+        assert "munich" in objects, (
+            "Dated rival Munich must survive — C1: legacy incoming must NOT beat a dated rival"
+        )
+        assert "berlin" in objects, "Legacy incoming Berlin must be inserted (coexist)"
+        assert not m.removal_ledger, (
+            f"No ledger entry for any-empty coexist; got {m.removal_ledger}"
+        )
+
+    def test_rival_empty_incoming_dated_coexist(self):
+        """Dated incoming vs rival last_seen="" → COEXIST (any-empty rule)."""
+        m = self._make_graph_with_rival(rival_last_seen="")  # legacy rival
+        self._upsert_berlin(m, incoming_last_seen="2026-01-02T00:00:00Z")  # dated incoming
+
+        objects = self._get_lives_in_objects(m)
+        assert "munich" in objects, "Legacy rival Munich must survive (any-empty → coexist)"
+        assert "berlin" in objects, "Dated incoming Berlin must be inserted (coexist)"
+        assert not m.removal_ledger, (
+            f"No ledger entry for any-empty coexist; got {m.removal_ledger}"
+        )
+
+    def test_both_empty_coexist(self):
+        """Both incoming and rival last_seen="" → COEXIST (any-empty rule covers all-empty)."""
+        m = self._make_graph_with_rival(rival_last_seen="")
+        self._upsert_berlin(m, incoming_last_seen="")
+
+        objects = self._get_lives_in_objects(m)
+        assert "munich" in objects, "Legacy rival Munich must survive"
+        assert "berlin" in objects, "Legacy incoming Berlin must be inserted"
+        assert not m.removal_ledger, (
+            f"No ledger entry for all-empty coexist; got {m.removal_ledger}"
+        )
+
+    def test_three_rivals_unique_max_retires_two_older(self):
+        """3 rivals all dated, unique max: two strictly-older rivals retired, max kept.
+
+        rivals: vienna="2026-01-01", paris="2026-01-02" (max), madrid="2026-01-01"
+        incoming: berlin="2026-01-03" (newest) → berlin wins, paris is retired too.
+
+        Actually, berlin is uniquely freshest: all rivals are < berlin.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        m = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
+        m._predicate_cardinality["lives in"] = False
+        for city, ts, key in [
+            ("vienna", "2026-01-01T00:00:00Z", "key_vienna"),
+            ("paris", "2026-01-02T00:00:00Z", "key_paris"),
+            ("madrid", "2026-01-01T00:00:00Z", "key_madrid"),
+        ]:
+            m.graph.add_node(city, attributes={"name": city})
+            eid = m.graph.add_edge(
+                "alex",
+                city,
+                predicate="lives in",
+                relation_type="factual",
+                confidence=1.0,
+                first_seen="s0",
+                last_seen=ts,
+                reinforcement_count=1,
+                sessions=["s0"],
+            )
+            m.graph["alex"][city][eid][_IK_KEY_ATTR] = key
+
+        incoming = Relation(
+            subject="alex",
+            predicate="lives_in",
+            object="berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+            indexed_key="key_berlin",
+            last_seen="2026-01-03T00:00:00Z",
+        )
+        with patch("paramem.graph.merger.check_predicate_coexistence", return_value="REPLACE"):
+            m._upsert_relation("alex", "berlin", incoming, "__r__", "", resolve_contradictions=True)
+
+        objects = [
+            obj
+            for obj in m.graph.successors("alex")
+            for _, d in m.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
+        ]
+        assert "berlin" in objects, "Incoming (uniquely freshest) must survive"
+        assert "vienna" not in objects, "Strictly-older vienna must be retired"
+        assert "paris" not in objects, "Strictly-older paris must be retired"
+        assert "madrid" not in objects, "Strictly-older madrid must be retired"
+        assert "key_vienna" in m.removal_ledger
+        assert "key_paris" in m.removal_ledger
+        assert "key_madrid" in m.removal_ledger
+
+    def test_three_rivals_top_tie_older_retired_tied_pair_coexist(self):
+        """3 rivals, two at max, one strictly-older: strictly-older retired, tied pair coexist.
+
+        rivals: vienna="2026-01-01" (older), paris="2026-01-02" (max), madrid="2026-01-02" (max)
+        incoming: berlin="2026-01-01" (older than tied max) → berlin NOT inserted,
+        vienna retired, paris and madrid survive.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        m = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
+        m._predicate_cardinality["lives in"] = False
+        for city, ts, key in [
+            ("vienna", "2026-01-01T00:00:00Z", "key_vienna"),
+            ("paris", "2026-01-02T00:00:00Z", "key_paris"),
+            ("madrid", "2026-01-02T00:00:00Z", "key_madrid"),
+        ]:
+            m.graph.add_node(city, attributes={"name": city})
+            eid = m.graph.add_edge(
+                "alex",
+                city,
+                predicate="lives in",
+                relation_type="factual",
+                confidence=1.0,
+                first_seen="s0",
+                last_seen=ts,
+                reinforcement_count=1,
+                sessions=["s0"],
+            )
+            m.graph["alex"][city][eid][_IK_KEY_ATTR] = key
+
+        incoming = Relation(
+            subject="alex",
+            predicate="lives_in",
+            object="berlin",
+            relation_type="factual",
+            confidence=1.0,
+            speaker_id="speaker0",
+            indexed_key="key_berlin",
+            last_seen="2026-01-01T00:00:00Z",
+        )
+        with patch("paramem.graph.merger.check_predicate_coexistence", return_value="REPLACE"):
+            result = m._upsert_relation(
+                "alex", "berlin", incoming, "__r__", "", resolve_contradictions=True
+            )
+
+        objects = [
+            obj
+            for obj in m.graph.successors("alex")
+            for _, d in m.graph["alex"][obj].items()
+            if d.get("predicate") == "lives in"
+        ]
+        assert result is None, "Incoming (older than tied max) must NOT be inserted"
+        assert "berlin" not in objects, "Strictly-older incoming Berlin must not be inserted"
+        assert "paris" in objects, "Tied-max Paris must survive"
+        assert "madrid" in objects, "Tied-max Madrid must survive"
+        assert "vienna" not in objects, "Strictly-older Vienna must be retired"
+        assert "key_vienna" in m.removal_ledger, "Strictly-older Vienna key must be ledgered"
+        assert "key_berlin" in m.removal_ledger, "Loser incoming key must be ledgered"
+        assert "key_paris" not in m.removal_ledger, "Winner Paris key must NOT be ledgered"
+        assert "key_madrid" not in m.removal_ledger, "Winner Madrid key must NOT be ledgered"
 
 
 class TestObjectVariantDedup:

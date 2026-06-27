@@ -158,22 +158,24 @@ class TestProceduralPromptRender:
         assert "preference" in rendered
 
 
-class TestGraphNormalizationPromptRender:
-    """The whole-graph normalization prompt is .format()-ed with fact_lines at
-    runtime (consolidation._run_graph_normalization).  Its JSON example literals
-    MUST be double-escaped ({{ }}) or .format() raises KeyError on the first
-    '{"relations"' token (regression guard).  Only {fact_lines} is a format field."""
+class TestGraphDedupFilterPromptRender:
+    """The per-group predicate-dedup prompt is .format()-ed with predicates_json
+    at runtime (dedup_synonym_predicates).  Its JSON example literals MUST be
+    double-escaped ({{ }}) or .format() raises KeyError.  Only {predicates_json}
+    is a format field."""
 
     def _load(self):
         from paramem.graph.prompts import _load_prompt
 
-        return _load_prompt("graph_normalization.txt", "", None)
+        return _load_prompt("graph_dedup_filter.txt", "", None)
 
     def test_renders_without_exception(self):
+        import json
+
         prompt = self._load()
-        assert prompt, "graph_normalization.txt must exist and be non-empty"
-        # Must not raise KeyError (the {"relations"} brace-escape regression).
-        rendered = prompt.format(fact_lines="[0]: A | x | B")
+        assert prompt, "graph_dedup_filter.txt must exist and be non-empty"
+        # Must not raise KeyError (brace-escape regression guard).
+        rendered = prompt.format(predicates_json=json.dumps(["works_for", "employed_by"]))
         assert isinstance(rendered, str)
 
     def test_only_expected_format_fields(self):
@@ -181,19 +183,22 @@ class TestGraphNormalizationPromptRender:
 
         prompt = self._load()
         fields = {f for _, f, _, _ in string.Formatter().parse(prompt) if f}
-        assert fields == {"fact_lines"}, (
+        assert fields == {"predicates_json"}, (
             f"Unexpected format fields (JSON braces likely unescaped): {sorted(fields)}"
         )
 
     def test_json_examples_render_to_valid_single_brace(self):
+        import json
+
         prompt = self._load()
-        rendered = prompt.format(fact_lines="A | x | B")
-        # The escaped relations envelope collapses to real single-brace JSON.
-        assert '{"relations":' in rendered
-        assert "A | x | B" in rendered
+        rendered = prompt.format(predicates_json=json.dumps(["works_for", "employed_by"]))
+        # Double-brace escape collapses to real single-brace JSON in examples.
+        assert '{"clusters":' in rendered
 
     def test_no_leftover_placeholders(self):
+        import json
+
         prompt = self._load()
-        rendered = prompt.format(fact_lines="[0]: A | x | B")
+        rendered = prompt.format(predicates_json=json.dumps(["works_for"]))
         leftover = _LEFTOVER_PLACEHOLDER.findall(rendered)
         assert leftover == [], f"Leftover placeholders after render: {leftover}"

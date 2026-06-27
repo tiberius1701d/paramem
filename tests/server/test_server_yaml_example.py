@@ -79,8 +79,8 @@ def test_refinement_enrichment_off_by_default(example_config):
     assert example_config.consolidation.refinement_enrichment == "off"
 
 
-def test_contradiction_detection_false_by_default(example_config):
-    assert example_config.consolidation.contradiction_detection is False
+def test_refinement_contradiction_off_by_default(example_config):
+    assert example_config.consolidation.refinement_contradiction == "off"
 
 
 def test_headless_boot_disabled_by_default(example_config):

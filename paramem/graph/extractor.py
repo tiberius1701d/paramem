@@ -1381,10 +1381,9 @@ _JSON_ENVELOPE_KEYS = frozenset(
         "add",
         "modify",
         "bindings",
-        # Synonym-predicate dedup envelopes (dedup_synonym_predicates_local):
-        # filter output `{"groups": [...]}` and merge output `{"merges": [...]}`.
-        "groups",
-        "merges",
+        # Synonym-predicate dedup envelope (dedup_synonym_predicates):
+        # single-stage output `{"clusters": [["predA", "predB"], ...]}`.
+        "clusters",
     )
 )
 
@@ -4784,79 +4783,85 @@ def local_plausibility_filter(
 # ---------------------------------------------------------------------------
 
 
-def dedup_synonym_predicates_local(
+def dedup_synonym_predicates(
     relations: list[dict],
-    model,
-    tokenizer,
     *,
+    model=None,
+    tokenizer=None,
+    sota: dict | None = None,
     filter_prompt: str,
-    merge_prompt: str,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = 0.0,
     seed: int | None = None,
-) -> tuple[list[dict], dict]:
-    """Subtractive synonym-predicate dedup over same-(subject,object) groups.
+) -> tuple[dict[tuple[str, str], list[list[str]]], dict]:
+    """Backend-agnostic synonym-predicate clustering over same-(subject,object) groups.
 
-    Stateless: receives a flat list of relation dicts (each with at minimum
-    ``subject``, ``predicate``, ``object`` keys) and returns the surviving
-    subset plus a diagnostics dict.  Caller owns any ledger/store apply.
+    Groups ``relations`` by ``(canonical(subject), canonical(object))``.  Candidate
+    groups are those with **≥2 distinct canonical predicates**.  Single-predicate
+    groups pass through untouched with no model call.
 
-    The dedup is a two-stage model-driven pipeline:
+    For each candidate group exactly ONE model call is made — with the predicate
+    list for that group only (entities are never sent to the model).  The returned
+    ``{"clusters": [...]}`` output is grounded against the group's actual input
+    predicates; clusters with fewer than 2 grounded members are discarded.
 
-    * **Stage 1 (filter):** a single ``generate_answer`` call asks the model
-      to cluster same-(subject, object) predicates into synonym groups.
-    * **Stage 2 (merge):** a single ``generate_answer`` call asks the model
-      to pick one surviving predicate per synonym cluster.
+    Two irreducible backend branches:
 
-    Only predicates appearing in the original ``relations`` for their exact
-    canonical (subject, object) pair are retired.  Model hallucinations and
-    cross-group edits are silently discarded (grounding guard).
-    Single-predicate groups always pass through untouched.
+    * ``sota is None`` → LOCAL: ``model`` and ``tokenizer`` are required.
+      Gradient checkpointing is disabled once before the candidate loop and
+      re-enabled in ``finally``.  Each call is wrapped in
+      ``vram_scope("dedup")``.
+    * ``sota`` dict → CLOUD: ``_sota_call`` receives the RAW rendered prompt
+      (no ``apply_chat_template``); a ``None`` return (network or parse
+      failure) yields empty clusters for that group — facts are never deleted
+      on failure.
 
-    ``filter_prompt`` and ``merge_prompt`` are the already-read prompt
-    *contents* (not file paths).  The caller reads them via
-    :func:`paramem.server.calibrate._read_prompt` so the calibrate
-    wrapper can surface prompt provenance in the response.
+    ``filter_prompt`` is the already-read prompt template string containing a
+    single ``{predicates_json}`` slot.
 
-    ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the
-    default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
+    ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the default
+    ``temperature=0.0`` (greedy decoding) it is a strict no-op.
 
-    Returns
-    -------
-    surviving_relations : list[dict]
-        Input relations minus grounded retirements.  Order is preserved;
-        retired relations are removed in-place from the input list (by
-        canonical predicate match).
-    diagnostics : dict
-        ``groups_examined`` — total (canonical s, canonical o) groups
-        ``candidate_groups`` — groups with >=2 distinct canonical predicates
-        ``groups_collapsed`` — groups where at least one predicate was retired
-        ``predicates_retired`` — total predicate occurrences retired
-        ``raw_filter`` — raw model output from stage 1
-        ``raw_merge`` — raw model output from stage 2
-        ``discards`` — list of model-proposed retirements rejected by the
-            grounding guard (hallucinated or cross-group)
+    Args:
+        relations: Flat list of relation dicts (``subject``, ``predicate``,
+            ``object`` keys at minimum).
+        model: Local inference model.  Required when ``sota`` is ``None``.
+        tokenizer: Local tokenizer.  Required when ``sota`` is ``None``.
+        sota: Cloud backend configuration dict with keys ``api_key``,
+            ``provider``, ``filter_model``, ``endpoint``, ``system_prompt``.
+            When ``None`` the local branch is used.
+        filter_prompt: The already-read prompt template string.  Must contain
+            a single ``{predicates_json}`` slot.
+        max_tokens: Maximum new tokens for each model call.
+        temperature: Sampling temperature (0.0 = greedy).
+        seed: RNG seed forwarded to :func:`generate_answer`.  No-op at
+            ``temperature=0.0``.
 
-    FUTURE: production may call this to replace the unreliable whole-graph
-    ``_run_graph_normalization`` — keep it merger/ledger-free.
+    Returns:
+        clusters_by_so: ``dict[(canonical_s, canonical_o) -> list[list[str]]]``
+            mapping each candidate group to its non-trivial synonym clusters
+            (≥2 grounded members each).  Groups where the model returned no
+            valid cluster are absent.  Caller owns any graph-apply and ledger
+            operations.
+        diagnostics: ``dict`` with keys ``groups_examined``,
+            ``candidate_groups``, ``groups_with_clusters``, ``model_calls``,
+            ``raw_outputs`` (list of per-group raw model strings), ``discards``.
     """
     from paramem.graph.name_match import canonical
 
+    clusters_by_so: dict[tuple[str, str], list[list[str]]] = {}
+
     if not relations:
-        return [], {
+        return clusters_by_so, {
             "groups_examined": 0,
             "candidate_groups": 0,
-            "groups_collapsed": 0,
-            "predicates_retired": 0,
-            "raw_filter": "",
-            "raw_merge": "",
+            "groups_with_clusters": 0,
+            "model_calls": 0,
+            "raw_outputs": [],
             "discards": [],
         }
 
     # --- Build canonical grouping -------------------------------------------
-    # Map (canonical_subject, canonical_object) → list of input relation dicts
-    # in input order. A single relation may appear multiple times if the caller
-    # passes duplicates; the grounding guard handles that.
     groups: dict[tuple[str, str], list[dict]] = {}
     for rel in relations:
         s = str(rel.get("subject", ""))
@@ -4864,221 +4869,132 @@ def dedup_synonym_predicates_local(
         key = (canonical(s), canonical(o))
         groups.setdefault(key, []).append(rel)
 
-    # Candidate groups: >=2 distinct canonical predicates on the same (s, o).
-    # Single-predicate groups pass through untouched (never retired).
-    candidate_keys: set[tuple[str, str]] = set()
-    for key, rels in groups.items():
-        distinct_preds = {canonical(str(r.get("predicate", ""))) for r in rels}
-        if len(distinct_preds) >= 2:
-            candidate_keys.add(key)
+    # Candidate groups: ≥2 distinct canonical predicates on the same (s, o).
+    # Single-predicate groups pass through untouched (no model call).
+    candidate_keys: list[tuple[str, str]] = [
+        key
+        for key, rels in groups.items()
+        if len({canonical(str(r.get("predicate", ""))) for r in rels}) >= 2
+    ]
 
     diagnostics: dict = {
         "groups_examined": len(groups),
         "candidate_groups": len(candidate_keys),
-        "groups_collapsed": 0,
-        "predicates_retired": 0,
-        "raw_filter": "",
-        "raw_merge": "",
+        "groups_with_clusters": 0,
+        "model_calls": 0,
+        "raw_outputs": [],
         "discards": [],
     }
 
     if not candidate_keys:
-        # Nothing to deduplicate.
-        return list(relations), diagnostics
+        return clusters_by_so, diagnostics
 
-    # --- Build the fact list the model will see (candidate groups only) ------
-    candidate_facts: list[dict] = []
-    for key in candidate_keys:
-        for rel in groups[key]:
-            candidate_facts.append(
-                {
-                    "subject": str(rel.get("subject", "")),
-                    "predicate": str(rel.get("predicate", "")),
-                    "object": str(rel.get("object", "")),
-                }
-            )
+    local_mode = sota is None
+    if local_mode:
+        model.gradient_checkpointing_disable()
 
-    # --- Stage 1: filter — cluster synonym predicates per group --------------
-    model.gradient_checkpointing_disable()
     try:
-        filter_rendered = filter_prompt.format(facts_json=json.dumps(candidate_facts, indent=2))
-        filter_messages = [
-            {
-                "role": "system",
-                "content": "You identify synonym predicate clusters. Output valid JSON only.",
-            },
-            {"role": "user", "content": filter_rendered},
-        ]
-        filter_formatted = tokenizer.apply_chat_template(
-            adapt_messages(filter_messages, tokenizer),
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        with vram_scope("dedup_filter"):
-            raw_filter = generate_answer(
-                model,
-                tokenizer,
-                filter_formatted,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                seed=seed,
-            )
-        diagnostics["raw_filter"] = raw_filter
-        logger.debug("dedup_filter raw: %s", raw_filter[:500])
+        for key in candidate_keys:
+            rels_for_group = groups[key]
+            # Build canonical → first-seen surface predicate map.
+            pred_surface: dict[str, str] = {}
+            for rel in rels_for_group:
+                can_pred = canonical(str(rel.get("predicate", "")))
+                if can_pred not in pred_surface:
+                    pred_surface[can_pred] = str(rel.get("predicate", ""))
+            preds_to_send = list(pred_surface.values())
 
-        # --- Parse stage-1 output -------------------------------------------
-        # Expected: {"groups": [{"subject":..., "object":..., "clusters":[["predA","predB"],...]}]}
-        filter_groups: list[dict] = []
-        try:
-            filter_json_str = _extract_json_block(raw_filter)
-            filter_data = json.loads(filter_json_str)
-            if isinstance(filter_data, dict) and "groups" in filter_data:
-                raw_g = filter_data["groups"]
-                filter_groups = raw_g if isinstance(raw_g, list) else []
-        except (json.JSONDecodeError, ValueError) as exc:
-            logger.warning("dedup_filter stage-1 parse failed: %s", exc)
+            rendered = filter_prompt.format(predicates_json=json.dumps(preds_to_send))
 
-        # --- Stage 2: merge — pick survivor per multi-predicate cluster ------
-        # Build the multi-element clusters to pass to stage 2.
-        # Grounding: only pass clusters whose predicates are grounded in input.
-        grounded_clusters: list[dict] = []
-        for group_entry in filter_groups:
-            if not isinstance(group_entry, dict):
-                continue
-            g_subj = str(group_entry.get("subject", ""))
-            g_obj = str(group_entry.get("object", ""))
-            key = (canonical(g_subj), canonical(g_obj))
-            if key not in candidate_keys:
-                # Cross-group or hallucinated group — discard.
-                diagnostics["discards"].append(
+            if local_mode:
+                messages = [
                     {
-                        "reason": "ungrounded_group",
-                        "subject": g_subj,
-                        "object": g_obj,
-                    }
+                        "role": "system",
+                        "content": (
+                            "You identify synonym predicate clusters. Output valid JSON only."
+                        ),
+                    },
+                    {"role": "user", "content": rendered},
+                ]
+                formatted = tokenizer.apply_chat_template(
+                    adapt_messages(messages, tokenizer),
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
-                continue
-            input_preds_canonical = {canonical(str(r.get("predicate", ""))) for r in groups[key]}
-            clusters = group_entry.get("clusters", [])
-            if not isinstance(clusters, list):
-                continue
-            grounded_c: list[list[str]] = []
-            for cluster in clusters:
+                with vram_scope("dedup"):
+                    raw = generate_answer(
+                        model,
+                        tokenizer,
+                        formatted,
+                        max_new_tokens=max_tokens,
+                        temperature=temperature,
+                        seed=seed,
+                    )
+            else:
+                raw = _sota_call(
+                    rendered,
+                    api_key=sota["api_key"],
+                    provider=sota["provider"],
+                    filter_model=sota["filter_model"],
+                    endpoint=sota["endpoint"],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system_prompt=sota["system_prompt"],
+                )
+                if raw is None:
+                    diagnostics["raw_outputs"].append("")
+                    continue
+
+            diagnostics["model_calls"] += 1
+            diagnostics["raw_outputs"].append(raw)
+            logger.debug("dedup group %r raw: %s", key, raw[:300] if raw else "")
+
+            # Parse {"clusters": [["predA", "predB"], ...]} schema.
+            raw_clusters: list = []
+            try:
+                json_str = _extract_json_block(raw)
+                data = json.loads(json_str)
+                if isinstance(data, dict):
+                    raw_clusters = data.get("clusters", [])
+                if not isinstance(raw_clusters, list):
+                    raw_clusters = []
+            except (json.JSONDecodeError, ValueError) as exc:
+                logger.warning("dedup parse failed for group %r: %s", key, exc)
+
+            # Ground cluster members against input predicates for this group.
+            input_can_preds = set(pred_surface.keys())
+            grounded_clusters: list[list[str]] = []
+            for cluster in raw_clusters:
                 if not isinstance(cluster, list):
                     continue
-                grounded_preds = [p for p in cluster if canonical(str(p)) in input_preds_canonical]
-                if grounded_preds:
-                    grounded_c.append(grounded_preds)
-            if grounded_c:
-                grounded_clusters.append(
-                    {"subject": g_subj, "object": g_obj, "clusters": grounded_c}
-                )
-
-        merge_rendered = merge_prompt.format(clusters_json=json.dumps(grounded_clusters, indent=2))
-        merge_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You pick the best predicate to keep per synonym cluster. "
-                    "Output valid JSON only."
-                ),
-            },
-            {"role": "user", "content": merge_rendered},
-        ]
-        merge_formatted = tokenizer.apply_chat_template(
-            adapt_messages(merge_messages, tokenizer),
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        with vram_scope("dedup_merge"):
-            raw_merge = generate_answer(
-                model,
-                tokenizer,
-                merge_formatted,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                seed=seed,
-            )
-        diagnostics["raw_merge"] = raw_merge
-        logger.debug("dedup_merge raw: %s", raw_merge[:500])
-
-        # --- Parse stage-2 output and apply grounding guard -----------------
-        # Expected: {"merges": [{"subject":..., "object":..., "keep":"predA", "drop":["predB"]}]}
-        retire_set: dict[tuple[str, str], set[str]] = {}
-        try:
-            merge_json_str = _extract_json_block(raw_merge)
-            merge_data = json.loads(merge_json_str)
-            if isinstance(merge_data, dict) and "merges" in merge_data:
-                for merge_entry in merge_data.get("merges", []):
-                    if not isinstance(merge_entry, dict):
-                        continue
-                    m_subj = str(merge_entry.get("subject", ""))
-                    m_obj = str(merge_entry.get("object", ""))
-                    key = (canonical(m_subj), canonical(m_obj))
-                    if key not in candidate_keys:
+                grounded = [
+                    can_p
+                    for p in cluster
+                    for can_p in (canonical(str(p)),)
+                    if can_p in input_can_preds
+                ]
+                # Always record hallucinated predicates (those not in input) in
+                # discards — regardless of whether the cluster passes the ≥2
+                # grounded check.
+                for p in cluster:
+                    can_p = canonical(str(p))
+                    if can_p not in input_can_preds and p:
                         diagnostics["discards"].append(
                             {
-                                "reason": "ungrounded_merge_group",
-                                "subject": m_subj,
-                                "object": m_obj,
+                                "reason": "hallucinated_predicate",
+                                "predicate": str(p),
+                                "group": list(key),
                             }
                         )
-                        continue
-                    input_preds_canonical = {
-                        canonical(str(r.get("predicate", ""))) for r in groups[key]
-                    }
-                    keep_raw = str(merge_entry.get("keep", ""))
-                    keep_can = canonical(keep_raw)
-                    if keep_can not in input_preds_canonical:
-                        # Hallucinated keep predicate — discard entire entry.
-                        diagnostics["discards"].append(
-                            {
-                                "reason": "hallucinated_keep",
-                                "subject": m_subj,
-                                "object": m_obj,
-                                "keep": keep_raw,
-                            }
-                        )
-                        continue
-                    drop_raw = merge_entry.get("drop", [])
-                    if not isinstance(drop_raw, list):
-                        continue
-                    for dropped in drop_raw:
-                        d_can = canonical(str(dropped))
-                        if d_can not in input_preds_canonical:
-                            diagnostics["discards"].append(
-                                {
-                                    "reason": "hallucinated_drop",
-                                    "subject": m_subj,
-                                    "object": m_obj,
-                                    "drop": dropped,
-                                }
-                            )
-                            continue
-                        if d_can == keep_can:
-                            # Model listed the kept predicate in drop — skip.
-                            continue
-                        retire_set.setdefault(key, set()).add(d_can)
-        except (json.JSONDecodeError, ValueError) as exc:
-            logger.warning("dedup_merge stage-2 parse failed: %s", exc)
+                if len(grounded) >= 2:
+                    grounded_clusters.append(grounded)
 
-        # --- Apply retirements ----------------------------------------------
-        surviving: list[dict] = []
-        for rel in relations:
-            s = str(rel.get("subject", ""))
-            o = str(rel.get("object", ""))
-            p = str(rel.get("predicate", ""))
-            key = (canonical(s), canonical(o))
-            retired_preds = retire_set.get(key, set())
-            if canonical(p) in retired_preds:
-                diagnostics["predicates_retired"] += 1
-            else:
-                surviving.append(rel)
-
-        # Count collapsed groups (groups where at least one predicate retired).
-        diagnostics["groups_collapsed"] = sum(1 for v in retire_set.values() if v)
-
-        return surviving, diagnostics
+            if grounded_clusters:
+                clusters_by_so[key] = grounded_clusters
+                diagnostics["groups_with_clusters"] += 1
 
     finally:
-        model.gradient_checkpointing_enable()
+        if local_mode:
+            model.gradient_checkpointing_enable()
+
+    return clusters_by_so, diagnostics

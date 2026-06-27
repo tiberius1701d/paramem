@@ -193,15 +193,9 @@ class TestCalibrateNormalize:
     def test_neither_relations_nor_snapshot_400(self, tmp_path):
         """Providing neither relations nor snapshot_path raises 400."""
         state = _state_enabled()
-        # Write minimal prompt files so _read_prompt doesn't raise first.
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {facts_json}")
-        (prompts_dir / "graph_dedup_merge.txt").write_text("merge {clusters_json}")
         req = CalibrateNormalizeRequest(
             relations=None,
             snapshot_path=None,
-            prompts_dir=str(prompts_dir),
         )
         with pytest.raises(HTTPException) as exc:
             calibrate_normalize(state, req)
@@ -211,14 +205,9 @@ class TestCalibrateNormalize:
     def test_both_relations_and_snapshot_400(self, tmp_path):
         """Providing both relations and snapshot_path raises 400."""
         state = _state_enabled()
-        prompts_dir = tmp_path / "prompts"
-        prompts_dir.mkdir()
-        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {facts_json}")
-        (prompts_dir / "graph_dedup_merge.txt").write_text("merge {clusters_json}")
         req = CalibrateNormalizeRequest(
             relations=[{"subject": "A", "predicate": "p", "object": "B"}],
             snapshot_path="/some/path.json",
-            prompts_dir=str(prompts_dir),
         )
         with pytest.raises(HTTPException) as exc:
             calibrate_normalize(state, req)
@@ -242,22 +231,19 @@ class TestCalibrateNormalize:
 
         prompts_dir = tmp_path / "prompts"
         prompts_dir.mkdir()
-        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {facts_json}")
-        (prompts_dir / "graph_dedup_merge.txt").write_text("merge {clusters_json}")
+        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {predicates_json}")
 
         state = _state_enabled()
-        # Stub the model to return empty JSON so the primitive completes.
+        # One candidate group (Alex/Acme with works_for + employed_by) → one model call.
         import json as _json
-
-        filter_raw = _json.dumps({"groups": []})
-        merge_raw = _json.dumps({"merges": []})
-        state["model"].generate = MagicMock()
-        # generate_answer is called via tokenizer + model; mock at the module level.
         import unittest.mock as _mock
+
+        filter_raw = _json.dumps({"clusters": [["works_for", "employed_by"]]})
+        state["model"].gradient_checkpointing_disable = MagicMock()
 
         with _mock.patch(
             "paramem.graph.extractor.generate_answer",
-            side_effect=[filter_raw, merge_raw],
+            side_effect=[filter_raw],
         ):
             result = calibrate_normalize(
                 state,
@@ -271,28 +257,24 @@ class TestCalibrateNormalize:
         # Two grounded links (third has no predicate and is skipped).
         assert parsed["input_count"] == 2
         assert result["stage"] == "normalize"
+        # raw_output is a string (single-stage shape).
+        assert isinstance(result["raw_output"], str)
 
     def test_n_output_tokens_positive_for_nonempty_filter_output(self, tmp_path):
-        """normalize n_output_tokens counts raw_filter tokens (not -1).
-
-        Regression guard for BLOCKING-1: _build_calibrate_response received
-        raw_output={"filter":..., "merge":...} (a dict), so without
-        raw_output_for_tokens it would always return -1.
+        """normalize n_output_tokens counts raw output tokens (not -1).
 
         Two relations on the SAME (subject, object) pair with DIFFERENT
-        predicates are required: dedup_synonym_predicates_local only calls
+        predicates are required: dedup_synonym_predicates only calls
         generate_answer when it finds at least one candidate group (≥2 distinct
         predicates on the same s/o pair).  A single relation produces no
-        candidate group → early return with raw_filter="" → n_output_tokens=-1
-        regardless of the builder fix.
+        candidate group → early return with empty raw_outputs → n_output_tokens=-1.
         """
         import json
         import unittest.mock as _mock
 
         prompts_dir = tmp_path / "prompts"
         prompts_dir.mkdir()
-        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {facts_json}")
-        (prompts_dir / "graph_dedup_merge.txt").write_text("merge {clusters_json}")
+        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {predicates_json}")
 
         state = _state_enabled()
         # Tokenizer mock: _count_tokens calls tokenizer(text)["input_ids"]; the
@@ -302,28 +284,21 @@ class TestCalibrateNormalize:
         tok.apply_chat_template.return_value = "formatted-prompt"
         state["tokenizer"] = tok
 
-        # model.gradient_checkpointing_disable() is called inside dedup stage-1.
+        # model.gradient_checkpointing_disable() is called inside dedup primitive.
         state["model"].gradient_checkpointing_disable = MagicMock()
 
-        filter_raw = json.dumps(
-            {
-                "groups": [
-                    {"subject": "A", "object": "B", "clusters": [["works_for", "employed_by"]]}
-                ]
-            }
-        )
-        merge_raw = json.dumps({"merges": []})
+        filter_raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
 
         with _mock.patch(
             "paramem.graph.extractor.generate_answer",
-            side_effect=[filter_raw, merge_raw],
+            side_effect=[filter_raw],
         ):
             result = calibrate_normalize(
                 state,
                 CalibrateNormalizeRequest(
                     # Two relations on identical (A, B) pair with distinct predicates
                     # → forms one candidate group → generate_answer is called →
-                    # diagnostics["raw_filter"] is non-empty.
+                    # raw_outputs is non-empty → n_output_tokens > 0.
                     relations=[
                         {"subject": "A", "predicate": "works_for", "object": "B"},
                         {"subject": "A", "predicate": "employed_by", "object": "B"},
@@ -332,12 +307,10 @@ class TestCalibrateNormalize:
                 ),
             )
 
-        # n_output_tokens must reflect the filter output, not be -1.
+        # n_output_tokens must reflect the model output, not be -1.
         assert result["n_output_tokens"] != -1, (
-            "n_output_tokens must be a positive token count from raw_filter, not -1. "
-            "BLOCKING-1 regression: raw_output is a dict so the builder must use "
-            "raw_output_for_tokens=raw_filter. Also verify the relations list forms "
-            "a candidate group so generate_answer is actually called."
+            "n_output_tokens must be a positive token count from raw model output, not -1. "
+            "Verify the relations list forms a candidate group so generate_answer is called."
         )
         assert result["n_output_tokens"] > 0
 

@@ -148,15 +148,13 @@ class CalibrateNormalizeRequest(BaseModel):
       flattened to ``{subject, predicate, object}`` dicts; edges missing a
       ``predicate`` key are skipped.
 
-    ``filter_prompt_filename`` and ``merge_prompt_filename`` default to
-    ``graph_dedup_filter.txt`` and ``graph_dedup_merge.txt`` respectively.
+    ``filter_prompt_filename`` defaults to ``graph_dedup_filter.txt``.
     ``prompts_dir`` defaults to the project's ``configs/prompts/`` directory.
     """
 
     relations: list[dict] | None = None
     snapshot_path: str | None = None
     filter_prompt_filename: str | None = None
-    merge_prompt_filename: str | None = None
     prompts_dir: str | None = None
     params: CalibrateParams = Field(default_factory=CalibrateParams)
 
@@ -367,16 +365,13 @@ def _build_calibrate_response(
     be pushed into this builder.
 
     The ``n_output_tokens`` field counts tokens in *raw_output_for_tokens*
-    when supplied (used by ``calibrate_normalize``, whose ``raw_output`` is a
-    ``{"filter": …, "merge": …}`` dict).  For all other stages the field is
-    derived from ``raw_output`` directly, using ``-1`` when it is falsy or
-    non-string.
+    when supplied.  For all other stages the field is derived from
+    ``raw_output`` directly, using ``-1`` when it is falsy or non-string.
 
     Args:
         stage: Stage identifier string (``"extract"``, ``"anonymize"``, …).
         prompts: List of prompt dicts with ``role``/``path``/``sha``/``content``.
-        raw_output: The verbatim model string(s) before post-processing.
-            May be a dict for stages that run two LLM calls (normalize).
+        raw_output: The verbatim model string before post-processing.
         parsed: Stage-specific parsed result dict.
         input_prompt_text: The prompt text to count for ``n_input_tokens``.
         measurement: Populated :class:`_Measurement` from
@@ -386,9 +381,7 @@ def _build_calibrate_response(
         supports_seed: ``True`` for local stages, ``False`` for SOTA stages
             (mirrors the existing ``_effective_params`` convention).
         raw_output_for_tokens: When provided, token counting uses this string
-            instead of ``raw_output``.  Pass the primary model string for
-            stages where ``raw_output`` is a dict (e.g. normalize's
-            ``raw_filter``).  Defaults to ``raw_output`` when ``None``.
+            instead of ``raw_output``.  Defaults to ``raw_output`` when ``None``.
         **extra: Additional keys to merge into the response (e.g.
             ``phases=`` for the extract stage).
 
@@ -689,12 +682,13 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
 
 
 def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str, Any]:
-    """Run the two-stage synonym-predicate dedup on an explicit relation list
+    """Run single-stage synonym-predicate clustering on an explicit relation list
     or a graph snapshot.
 
-    Routes through :func:`paramem.graph.extractor.dedup_synonym_predicates_local`
+    Routes through :func:`paramem.graph.extractor.dedup_synonym_predicates`
     (the graph-layer primitive).  No merger/ledger state is modified — this is
-    a read-only probe.
+    a read-only probe.  A code survivor (first grounded cluster member) is
+    applied locally to produce ``surviving_relations`` for inspection.
 
     The GPU lock and cuDNN deterministic flags are acquired here (not inside
     the primitive) so production callers can apply their own locking policy.
@@ -713,15 +707,14 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
             ),
         )
 
-    from paramem.graph.extractor import dedup_synonym_predicates_local
+    from paramem.graph.extractor import dedup_synonym_predicates
+    from paramem.graph.name_match import canonical as _can
 
     model = state["model"]
     tokenizer = state["tokenizer"]
 
     filter_filename = req.filter_prompt_filename or "graph_dedup_filter.txt"
-    merge_filename = req.merge_prompt_filename or "graph_dedup_merge.txt"
     filter_path, filter_sha, filter_content = _read_prompt(req.prompts_dir, filter_filename)
-    merge_path, merge_sha, merge_content = _read_prompt(req.prompts_dir, merge_filename)
 
     if has_relations:
         relations: list[dict] = req.relations  # type: ignore[assignment]
@@ -769,30 +762,49 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
     with _measured_local_call() as m:
         if isinstance(model, _PeftModel):
             with model.disable_adapter():
-                surviving, diag = dedup_synonym_predicates_local(
+                clusters_by_so, diag = dedup_synonym_predicates(
                     relations,
-                    model,
-                    tokenizer,
+                    model=model,
+                    tokenizer=tokenizer,
                     filter_prompt=filter_content,
-                    merge_prompt=merge_content,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     seed=req.params.seed,
                 )
         else:
-            surviving, diag = dedup_synonym_predicates_local(
+            clusters_by_so, diag = dedup_synonym_predicates(
                 relations,
-                model,
-                tokenizer,
+                model=model,
+                tokenizer=tokenizer,
                 filter_prompt=filter_content,
-                merge_prompt=merge_content,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 seed=req.params.seed,
             )
 
-    raw_filter = diag.pop("raw_filter", "")
-    raw_merge = diag.pop("raw_merge", "")
+    # Apply code survivor (first grounded cluster member) to produce
+    # surviving_relations for read-only inspection.
+    # NOTE: production uses MAX reinforcement_count as survivor, not first-in-cluster;
+    # surviving_relations illustrates which predicates cluster, not which would survive
+    # in production.
+    retire_set: dict[tuple[str, str], set[str]] = {}
+    for (can_s, can_o), group_clusters in clusters_by_so.items():
+        for cluster in group_clusters:
+            if len(cluster) >= 2:
+                for retired_pred in cluster[1:]:
+                    retire_set.setdefault((can_s, can_o), set()).add(retired_pred)
+
+    surviving = [
+        rel
+        for rel in relations
+        if _can(str(rel.get("predicate", "")))
+        not in retire_set.get(
+            (_can(str(rel.get("subject", ""))), _can(str(rel.get("object", "")))), set()
+        )
+    ]
+
+    raw_outputs = diag.pop("raw_outputs", [])
+    raw_output_str = "\n---\n".join(raw_outputs) if raw_outputs else ""
     parsed: dict[str, Any] = {
         "surviving_relations": surviving,
         "input_count": len(relations),
@@ -809,21 +821,14 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
                 "sha": filter_sha,
                 "content": filter_content,
             },
-            {
-                "role": "merge",
-                "path": merge_path,
-                "sha": merge_sha,
-                "content": merge_content,
-            },
         ],
-        raw_output={"filter": raw_filter, "merge": raw_merge},
+        raw_output=raw_output_str,
         parsed=parsed,
         input_prompt_text=filter_content,
         measurement=m,
         params=req.params,
         state=state,
         supports_seed=True,
-        raw_output_for_tokens=raw_filter,
     )
 
 

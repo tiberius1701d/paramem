@@ -122,7 +122,7 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.sota_enabled": Tier.PIPELINE_ALTERING,
     "consolidation.refinement_enrichment": Tier.PIPELINE_ALTERING,
     "consolidation.refinement_normalization": Tier.PIPELINE_ALTERING,
-    "consolidation.contradiction_detection": Tier.PIPELINE_ALTERING,
+    "consolidation.refinement_contradiction": Tier.PIPELINE_ALTERING,
     # --- agents.sota ---
     "agents.sota.enabled": Tier.PIPELINE_ALTERING,
     "agents.sota.provider": Tier.PIPELINE_ALTERING,
