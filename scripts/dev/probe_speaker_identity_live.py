@@ -418,7 +418,6 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         mem_store.set_bookkeeping(
             entry_a["key"],
             speaker_id=alex_id,
-            first_seen_cycle=1,
             relation_type="factual",
             allow_empty_speaker=False,
         )
@@ -433,7 +432,6 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         mem_store.set_bookkeeping(
             entry_b["key"],
             speaker_id=alex_id,
-            first_seen_cycle=1,
             relation_type="social",
             allow_empty_speaker=False,
         )
@@ -488,7 +486,6 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         mem_store.set_bookkeeping(
             entry_anon["key"],
             speaker_id="",
-            first_seen_cycle=1,
             relation_type="factual",
             allow_empty_speaker=True,
         )

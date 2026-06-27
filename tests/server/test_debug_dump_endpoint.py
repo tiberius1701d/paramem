@@ -86,8 +86,8 @@ class TestDebugDumpHappyPath:
         """Under preload_cache=False: entries is empty, bookkeeping_total is N."""
         # Bookkeeping present but no content entries (cache-off scenario).
         fake_bk = {
-            "k1": {"speaker_id": "alice", "first_seen_cycle": 1},
-            "k2": {"speaker_id": "alice", "first_seen_cycle": 2},
+            "k1": {"speaker_id": "alice"},
+            "k2": {"speaker_id": "alice"},
         }
         state = _make_state(tmp_path, store_items=[])
         state["memory_store"] = _FakeStore([], bookkeeping=fake_bk)
@@ -159,9 +159,9 @@ class TestDebugDumpHappyPath:
             "graph1": {
                 "speaker_id": "alice",
                 "relation_type": "factual",
-                "first_seen_cycle": 3,
-                "last_seen_cycle": 5,
-                "recurrence_count": 2,
+                "last_reinforced_cycle": 5,
+                "reinforcement_count": 2,
+                "last_seen": "",
             }
         }
         state = _make_state(tmp_path, store_items=items)
@@ -175,9 +175,8 @@ class TestDebugDumpHappyPath:
         # Bookkeeping values must win over the stale entry payload values.
         assert row["speaker_id"] == "alice", "speaker_id must come from bookkeeping_for_key"
         assert row["relation_type"] == "factual", "relation_type must come from bookkeeping_for_key"
-        assert row["first_seen_cycle"] == 3
-        assert row["last_seen_cycle"] == 5
-        assert row["recurrence_count"] == 2
+        assert row["last_reinforced_cycle"] == 5
+        assert row["reinforcement_count"] == 2
 
     def test_bookkeeping_fields_absent_when_no_bookkeeping_record(self, tmp_path, monkeypatch):
         """When a key has no bookkeeping record, the row omits bookkeeping fields

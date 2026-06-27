@@ -23,7 +23,7 @@ class TestTemplateGeneration:
                 "object": "Heilbronn",
                 "relation_type": "factual",
                 "confidence": 1.0,
-                "recurrence_count": 3,
+                "reinforcement_count": 3,
             },
         ]
         qa = generate_qa_from_relations(relations)
@@ -39,7 +39,7 @@ class TestTemplateGeneration:
                 "object": "Heilbronn",
                 "relation_type": "factual",
                 "confidence": 1.0,
-                "recurrence_count": 1,
+                "reinforcement_count": 1,
             },
         ]
         qa = generate_qa_from_relations(relations)
@@ -54,7 +54,7 @@ class TestTemplateGeneration:
                 "object": "Luna",
                 "relation_type": "factual",
                 "confidence": 1.0,
-                "recurrence_count": 1,
+                "reinforcement_count": 1,
             },
         ]
         qa = generate_qa_from_relations(relations)
@@ -68,7 +68,7 @@ class TestTemplateGeneration:
                 "object": "Heilbronn",
                 "relation_type": "factual",
                 "confidence": 1.0,
-                "recurrence_count": 1,
+                "reinforcement_count": 1,
             },
             {
                 "subject": "Alex",
@@ -76,7 +76,7 @@ class TestTemplateGeneration:
                 "object": "AutoMate",
                 "relation_type": "factual",
                 "confidence": 1.0,
-                "recurrence_count": 1,
+                "reinforcement_count": 1,
             },
         ]
         qa = generate_qa_from_relations(relations)
@@ -90,7 +90,7 @@ class TestTemplateGeneration:
                 "object": "a new algorithm",
                 "relation_type": "factual",
                 "confidence": 1.0,
-                "recurrence_count": 1,
+                "reinforcement_count": 1,
             },
         ]
         qa = generate_qa_from_relations(relations)
@@ -105,7 +105,7 @@ class TestTemplateGeneration:
                 "object": "Python",
                 "relation_type": "preference",
                 "confidence": 0.9,
-                "recurrence_count": 2,
+                "reinforcement_count": 2,
             },
         ]
         qa = generate_qa_from_relations(relations)
@@ -144,7 +144,7 @@ class TestTemplateGeneration:
                     "object": "something",
                     "relation_type": "factual",
                     "confidence": 1.0,
-                    "recurrence_count": 1,
+                    "reinforcement_count": 1,
                 },
             ]
             qa = generate_qa_from_relations(relations)

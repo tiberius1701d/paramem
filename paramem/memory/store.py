@@ -43,18 +43,17 @@ cache miss.  Under ``inference.preload_cache=False`` the entries are empty by
 design → every key is a clean miss → the source is always probed → restores
 the documented contract.
 
-The per-key bookkeeping fields ``speaker_id``, ``first_seen_cycle``, and
-``relation_type`` live in :attr:`MemoryStore._bookkeeping` — a flat
-``{key → {speaker_id, first_seen_cycle, relation_type}}`` dict SEPARATE from
-``_entries``.  Populated by :meth:`load_bookkeeping_from_disk` at boot
-(unconditionally; entry-independent).  Never enters
-:meth:`KeyRegistry.save_bytes`, :meth:`snapshot`, or any hash path.
+The per-key bookkeeping fields live in :attr:`MemoryStore._bookkeeping` — a flat
+``{key → {speaker_id, relation_type, reinforcement_count, last_reinforced_cycle,
+last_seen}}`` dict SEPARATE from ``_entries``.  Populated by
+:meth:`load_bookkeeping_from_disk` at boot (unconditionally; entry-independent).
+Never enters :meth:`KeyRegistry.save_bytes`, :meth:`snapshot`, or any hash path.
 
 **ARCHITECTURAL NOTE — save-path working entries:**
 The "pure content cache" rule binds the INFERENCE cache (boot preload +
 on-miss memoize).  The consolidation cycle's own TRAIN/SIMULATE working
 entries — written by :meth:`put` at ``consolidation.py:1488,2555,2785,2874``
-from ``_cache_entry`` — DO legitimately carry ``speaker_id``/``first_seen_cycle``.
+from ``_cache_entry`` — DO legitimately carry ``speaker_id``.
 They are working entries consumed by :func:`persistence.build_graph_for_tier`
 within the same cycle.  A future reader must NOT "purify" save-path entries by
 stripping those fields — that would break ``build_graph_for_tier``.
@@ -167,7 +166,9 @@ class MemoryStore:
         # exists.  SimHash fingerprints live ON the registry (not on MemoryStore).
         self._registry: dict[str, KeyRegistry] = {}
         # Per-key provenance bookkeeping — SEPARATE from _entries.
-        # key -> {"speaker_id": str, "first_seen_cycle": int, "relation_type": str}
+        # key -> {"speaker_id": str, "relation_type": str,
+        #         "reinforcement_count": int, "last_reinforced_cycle": int,
+        #         "last_seen": str}
         # Populated by load_bookkeeping_from_disk at boot.  Never enters
         # snapshot/restore or KeyRegistry.save_bytes — stays out of the
         # hash-frozen slot-identity path.
@@ -283,7 +284,8 @@ class MemoryStore:
                 self._registry.setdefault(tier, KeyRegistry()).add(key)
 
     # ------------------------------------------------------------------
-    # Per-key bookkeeping — speaker_id / first_seen_cycle / relation_type
+    # Per-key bookkeeping — speaker_id / relation_type / reinforcement_count
+    #                       / last_reinforced_cycle / last_seen
     # SEPARATE from _entries; never in snapshot or KeyRegistry.save_bytes.
     # ------------------------------------------------------------------
     def set_bookkeeping(
@@ -291,35 +293,36 @@ class MemoryStore:
         key: str,
         *,
         speaker_id: str,
-        first_seen_cycle: int,
         relation_type: str,
-        recurrence_count: int = 1,
-        last_seen_cycle: int = 0,
+        reinforcement_count: int = 1,
+        last_reinforced_cycle: int = 0,
+        last_seen: str = "",
         allow_empty_speaker: bool = False,
     ) -> None:
         """Store or update the bookkeeping record for *key*.
 
         All five fields are mandatory in the persisted schema (one mandatory
-        tier, zero optional buckets).  The ``recurrence_count`` and
-        ``last_seen_cycle`` params carry Python defaults solely as a
-        legacy-fill convenience for new-key sites and boot-reload callers that
-        do not yet know the values — exactly mirroring the ``relation_type``
-        handling.  The stored dict always contains all five keys.
+        tier, zero optional buckets).  The ``reinforcement_count``,
+        ``last_reinforced_cycle``, and ``last_seen`` params carry Python
+        defaults solely as a legacy-fill convenience for new-key sites and
+        boot-reload callers that do not yet know the values.  The stored dict
+        always contains all five keys.
 
         ``speaker_id``: the speaker who first introduced this key.
-        ``first_seen_cycle``: the consolidation cycle this key was first minted.
         ``relation_type``: the model-assigned relation type from extraction
         (e.g. ``"factual"``, ``"preference"``, ``"temporal"``, ``"social"``).
         Legacy keys that pre-date this field are upgraded in-memory to
         ``"unknown"`` by :meth:`load_bookkeeping_from_disk`; the correct value
         is stamped at ingestion on the next consolidation cycle.
-        ``recurrence_count``: how many times the underlying fact has been
+        ``reinforcement_count``: how many times the underlying fact has been
         re-seen (via intra-fold duplicate-SPO collapse) since the key was
         minted.  Default 1 (a new key has been seen once).
-        ``last_seen_cycle``: the most recent consolidation cycle at which this
-        key's fact survived into ``tier_keyed``.  Default 0 (unknown — upgraded
-        to ``first_seen_cycle`` by :meth:`load_bookkeeping_from_disk` for
-        legacy keys).
+        ``last_reinforced_cycle``: the most recent consolidation cycle at which
+        this key's fact was reinforced (cycle counter; drives promotion/decay).
+        Default 0 (unknown).
+        ``last_seen``: ISO 8601 wall-clock timestamp of the most recent session
+        that contained this fact.  Drives contradiction detection and temporal
+        reasoning.  Default ``""`` (unknown).
         ``allow_empty_speaker``: when ``True``, suppresses the empty-speaker_id
         guard and allows ``speaker_id=""`` to be stored.  Required for reload
         paths (legacy keys on disk may not carry a speaker) and for keyless
@@ -332,9 +335,9 @@ class MemoryStore:
                 is ``False`` — unattributed keys are not recallable by speaker.
 
         **Callers that need to update ONE field on an existing key must use
-        :meth:`bump_recurrence` (for recurrence/last_seen updates) rather than
-        calling this method, which overwrites ALL five fields and would silently
-        reset the counters the caller did not supply.**
+        :meth:`bump_recurrence` (for reinforcement/last_seen updates) rather
+        than calling this method, which overwrites ALL five fields and would
+        silently reset the counters the caller did not supply.**
 
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit.
@@ -358,51 +361,61 @@ class MemoryStore:
         with self._lock:
             self._bookkeeping[key] = {
                 "speaker_id": speaker_id,
-                "first_seen_cycle": first_seen_cycle,
                 "relation_type": relation_type,
-                "recurrence_count": recurrence_count,
-                "last_seen_cycle": last_seen_cycle,
+                "reinforcement_count": reinforcement_count,
+                "last_reinforced_cycle": last_reinforced_cycle,
+                "last_seen": last_seen,
             }
 
-    def bump_recurrence(self, key: str, *, cycle: int) -> None:
-        """Increment ``recurrence_count`` and refresh ``last_seen_cycle`` for *key*.
+    def bump_recurrence(self, key: str, *, cycle: int, timestamp: str = "") -> None:
+        """Increment ``reinforcement_count`` and refresh cycle/timestamp for *key*.
 
-        This is the ONLY correct way to update the recurrence counter on an
+        This is the ONLY correct way to update the reinforcement counter on an
         existing bookkeeping record without resetting unrelated fields.  Callers
         that use :meth:`set_bookkeeping` to update a single field would silently
-        overwrite ``speaker_id`` / ``first_seen_cycle`` with defaults.
+        overwrite ``speaker_id`` / ``relation_type`` with defaults.
 
         When *key* has no bookkeeping record yet the call creates a minimal
-        record (``recurrence_count=1``) — this is a defensive no-op for callers
-        that may race with a first registration; normal flow is that
+        record (``reinforcement_count=1``) — this is a defensive no-op for
+        callers that may race with a first registration; normal flow is that
         :meth:`set_bookkeeping` is called first.
 
         Args:
             key: The indexed-key string (e.g. ``"graph42"``).
             cycle: Current consolidation cycle number.  Written to
-                ``last_seen_cycle`` unconditionally (the fact was re-seen
-                this cycle).
+                ``last_reinforced_cycle`` unconditionally (the fact was
+                re-seen this cycle).
+            timestamp: ISO 8601 wall-clock timestamp of the session that
+                triggered this reinforcement.  When non-empty, sets
+                ``last_seen = max(existing_last_seen, timestamp)`` — ISO-8601
+                strings sort lexicographically so ``max`` is chronological;
+                this never regresses an existing newer value.  When empty,
+                ``last_seen`` is preserved unchanged.  Pass the real session
+                timestamp from the boundary that has it; do NOT fabricate a
+                ``now()`` here.
         """
         with self._lock:
             existing = self._bookkeeping.get(key)
             if existing is None:
                 self._bookkeeping[key] = {
                     "speaker_id": "",
-                    "first_seen_cycle": cycle,
                     "relation_type": "unknown",
-                    "recurrence_count": 1,
-                    "last_seen_cycle": cycle,
+                    "reinforcement_count": 1,
+                    "last_reinforced_cycle": cycle,
+                    "last_seen": timestamp,
                 }
                 return
-            existing["recurrence_count"] = existing.get("recurrence_count", 1) + 1
-            existing["last_seen_cycle"] = cycle
+            existing["reinforcement_count"] = existing.get("reinforcement_count", 1) + 1
+            existing["last_reinforced_cycle"] = cycle
+            if timestamp:
+                existing["last_seen"] = max(existing.get("last_seen", ""), timestamp)
 
     def bookkeeping_for_key(self, key: str) -> dict | None:
         """Return the bookkeeping record for *key*, or ``None`` when absent.
 
         Returns a plain dict with five fields:
-        ``{"speaker_id", "first_seen_cycle", "relation_type",
-        "recurrence_count", "last_seen_cycle"}``
+        ``{"speaker_id", "relation_type", "reinforcement_count",
+        "last_reinforced_cycle", "last_seen"}``
         when present, ``None`` when the key has never been bookkept.
         Callers may use ``bk = store.bookkeeping_for_key(k) or {}`` as a
         boundary default (compliant with the is-None / empty-is-valid rule)."""
@@ -410,7 +423,7 @@ class MemoryStore:
             return self._bookkeeping.get(key)
 
     def iter_bookkeeping(self):
-        """Yield ``(key, {"speaker_id": ..., "first_seen_cycle": ...})`` pairs.
+        """Yield ``(key, {"speaker_id": ..., "relation_type": ..., ...})`` pairs.
 
         Preload-independent — populated by :meth:`load_bookkeeping_from_disk`
         at boot regardless of ``inference.preload_cache``.  Used by
@@ -893,7 +906,7 @@ class MemoryStore:
         upstream.
 
         Returns the canonical inference result shape per hit:
-        ``{key, subject, predicate, object, speaker_id, first_seen_cycle,
+        ``{key, subject, predicate, object, speaker_id,
         confidence=1.0, fact_text, raw_output}``.  Misses (or
         source-failure dicts carrying ``failure_reason``) pass through
         unrendered.
@@ -966,7 +979,7 @@ class MemoryStore:
             return verify_confidence(candidate, {key: fp})
 
         def _render(key: str, entry: dict) -> dict | None:
-            # speaker_id / first_seen_cycle come from _bookkeeping — the single
+            # speaker_id / relation_type come from _bookkeeping — the single
             # authoritative source.  Entries hold SPO only (inference cache
             # contract); save-path working entries carry them for build_graph_for_tier
             # but those are consumed within the cycle, not at inference time.
@@ -1001,7 +1014,6 @@ class MemoryStore:
             return {
                 **base,
                 "speaker_id": spk,
-                "first_seen_cycle": bk.get("first_seen_cycle", 0),
                 "confidence": rendered_confidence,
                 "fact_text": entry_fact_text({**base, "speaker_id": spk}, resolve=speaker_resolver),
                 "raw_output": _json.dumps(base),
@@ -1116,15 +1128,14 @@ class MemoryStore:
                         # consolidation cycle.
                         if self.bookkeeping_for_key(key) is None:
                             src_spk = src.get("speaker_id", "")
-                            src_fsc = src.get("first_seen_cycle", 0)
-                            if src_spk or src_fsc:
+                            if src_spk:
                                 self.set_bookkeeping(
                                     key,
                                     speaker_id=src_spk,
-                                    first_seen_cycle=src_fsc,
                                     relation_type=src.get("relation_type", "unknown"),
-                                    recurrence_count=1,
-                                    last_seen_cycle=src_fsc,
+                                    reinforcement_count=1,
+                                    last_reinforced_cycle=0,
+                                    last_seen=src.get("last_seen", ""),
                                     allow_empty_speaker=True,
                                 )
 
@@ -1235,18 +1246,17 @@ class MemoryStore:
         that created payload-less stub entries has been removed.  Bookkeeping
         presence MUST NOT manufacture a content cache hit.
 
-        Fields loaded: ``speaker_id``, ``first_seen_cycle``, ``relation_type``,
-        ``recurrence_count``, ``last_seen_cycle``.
+        Fields loaded: ``speaker_id``, ``relation_type``, ``reinforcement_count``,
+        ``last_reinforced_cycle``, ``last_seen``.
         Keys absent from every tier registry (orphans — slot wiped or never
         existed) are skipped but counted in the return dict.  Pre-refactor
         files that lack any field are upgraded in-memory with defaults
         (``legacy_upgraded`` counter):
         - ``speaker_id``: ``""``
-        - ``first_seen_cycle``: ``0``
         - ``relation_type``: ``"unknown"``
-        - ``recurrence_count``: ``1``  (a legacy key has been seen at least once)
-        - ``last_seen_cycle``: ``first_seen_cycle`` (a legacy key that was never
-          re-seen was last seen when first minted)
+        - ``reinforcement_count``: ``1``  (a legacy key has been seen at least once)
+        - ``last_reinforced_cycle``: ``0``
+        - ``last_seen``: ``""``
         Keys with ``relation_type="unknown"`` will be assigned the correct type
         on the next consolidation cycle when the triple is re-encountered.
 
@@ -1272,23 +1282,21 @@ class MemoryStore:
             if tier is None:
                 orphaned += 1
                 continue
-            _fsc = key_meta.get("first_seen_cycle", 0)
             if (
                 "speaker_id" not in key_meta
-                or "first_seen_cycle" not in key_meta
                 or "relation_type" not in key_meta
-                or "recurrence_count" not in key_meta
-                or "last_seen_cycle" not in key_meta
+                or "reinforcement_count" not in key_meta
+                or "last_reinforced_cycle" not in key_meta
+                or "last_seen" not in key_meta
             ):
                 legacy_upgraded += 1
             self.set_bookkeeping(
                 key,
                 speaker_id=key_meta.get("speaker_id", ""),
-                first_seen_cycle=_fsc,
                 relation_type=key_meta.get("relation_type", "unknown"),
-                recurrence_count=key_meta.get("recurrence_count", 1),
-                # Legacy default: last_seen == first_seen (key never re-seen).
-                last_seen_cycle=key_meta.get("last_seen_cycle", _fsc),
+                reinforcement_count=key_meta.get("reinforcement_count", 1),
+                last_reinforced_cycle=key_meta.get("last_reinforced_cycle", 0),
+                last_seen=key_meta.get("last_seen", ""),
                 allow_empty_speaker=True,
             )
             loaded += 1

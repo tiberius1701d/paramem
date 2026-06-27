@@ -92,7 +92,7 @@ def _populate_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None:
             name,
             entity_type="person",
             attributes={"name": f"Person{i}"},
-            recurrence_count=i + 1,
+            reinforcement_count=i + 1,
             sessions=[f"s{i:03d}"],
             first_seen=f"s{i:03d}",
             last_seen=f"s{i:03d}",
@@ -103,7 +103,7 @@ def _populate_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None:
         org,
         entity_type="organization",
         attributes={"name": "AcmeCorp"},
-        recurrence_count=n_persons,
+        reinforcement_count=n_persons,
         sessions=["s000"],
         first_seen="s000",
         last_seen="s000",
@@ -266,7 +266,7 @@ class TestSameAsContractsNodes:
             "alice",
             entity_type="person",
             attributes={"name": "Alice"},
-            recurrence_count=3,
+            reinforcement_count=3,
             sessions=["s010"],
             first_seen="s010",
             last_seen="s010",
@@ -275,7 +275,7 @@ class TestSameAsContractsNodes:
             "alicia",
             entity_type="person",
             attributes={"name": "Alicia"},
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s011"],
             first_seen="s011",
             last_seen="s011",
@@ -357,7 +357,7 @@ class TestSameAsSurnameMismatchRejected:
                 name,
                 entity_type="person",
                 attributes={},
-                recurrence_count=2,
+                reinforcement_count=2,
                 sessions=["s020"],
                 first_seen="s020",
                 last_seen="s020",
@@ -391,7 +391,7 @@ class TestSameAsDedupAcrossChunks:
             "yang ming",
             entity_type="person",
             attributes={"name": "Yang Ming"},
-            recurrence_count=3,
+            reinforcement_count=3,
             sessions=["s030"],
             first_seen="s030",
             last_seen="s030",
@@ -400,7 +400,7 @@ class TestSameAsDedupAcrossChunks:
             "mr. yang",
             entity_type="person",
             attributes={"name": "Mr. Yang"},
-            recurrence_count=2,
+            reinforcement_count=2,
             sessions=["s031"],
             first_seen="s031",
             last_seen="s031",
@@ -462,7 +462,7 @@ class TestSymmetricPredicateCanonicalized:
                 name,
                 entity_type="person",
                 attributes={},
-                recurrence_count=2,
+                reinforcement_count=2,
                 sessions=["s040"],
                 first_seen="s040",
                 last_seen="s040",
@@ -521,7 +521,7 @@ class TestSymmetricPredicateCanonicalized:
                 name,
                 entity_type="person",
                 attributes={},
-                recurrence_count=2,
+                reinforcement_count=2,
                 sessions=["s041"],
                 first_seen="s041",
                 last_seen="s041",
@@ -562,7 +562,7 @@ class TestCorefRemapBeforeEdgeInsert:
             "alexander",
             entity_type="person",
             attributes={"name": "Alexander"},
-            recurrence_count=3,
+            reinforcement_count=3,
             sessions=["s050"],
             first_seen="s050",
             last_seen="s050",
@@ -571,7 +571,7 @@ class TestCorefRemapBeforeEdgeInsert:
             "alex",
             entity_type="person",
             attributes={"name": "Alex"},
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s051"],
             first_seen="s051",
             last_seen="s051",
@@ -580,7 +580,7 @@ class TestCorefRemapBeforeEdgeInsert:
             "acme",
             entity_type="organization",
             attributes={"name": "Acme"},
-            recurrence_count=5,
+            reinforcement_count=5,
             sessions=["s050"],
             first_seen="s050",
             last_seen="s050",
@@ -636,7 +636,7 @@ class TestFloorSkipsSmallGraphs:
                 f"Tiny{i}",
                 entity_type="concept",
                 attributes={},
-                recurrence_count=1,
+                reinforcement_count=1,
                 sessions=[],
                 first_seen="s000",
                 last_seen="s000",
@@ -745,7 +745,7 @@ class TestChunkCapRespected:
             org,
             entity_type="organization",
             attributes={},
-            recurrence_count=25,
+            reinforcement_count=25,
             sessions=[],
             first_seen="s000",
             last_seen="s000",
@@ -756,7 +756,7 @@ class TestChunkCapRespected:
                 name,
                 entity_type="person",
                 attributes={},
-                recurrence_count=i + 1,
+                reinforcement_count=i + 1,
                 sessions=[],
                 first_seen=f"s{i:03d}",
                 last_seen=f"s{i:03d}",
@@ -1217,15 +1217,14 @@ class TestRefineConsolidationGraph:
         loop.store.set_bookkeeping(
             "graph42",
             speaker_id="",
-            first_seen_cycle=0,
             relation_type="factual",
-            recurrence_count=1,
-            last_seen_cycle=0,
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
             allow_empty_speaker=True,
         )
 
         # Simulate a Case-1 collision: merger.reinforcements contains the surviving key.
-        loop.merger.reinforcements = ["graph42"]
+        loop.merger.reinforcements = {"graph42": "2026-01-01T00:00:00Z"}
 
         from paramem.graph.schema import Relation
 
@@ -1239,8 +1238,8 @@ class TestRefineConsolidationGraph:
         loop._run_graph_enrichment.assert_not_called()
         bk = loop.store.bookkeeping_for_key("graph42")
         assert bk is not None
-        assert bk["recurrence_count"] == 2, (
-            f"Recurrence should have been bumped to 2; got {bk['recurrence_count']}"
+        assert bk["reinforcement_count"] == 2, (
+            f"Recurrence should have been bumped to 2; got {bk['reinforcement_count']}"
         )
 
     def test_recurrence_bump_runs_when_enrich_true(self, tmp_path):
@@ -1259,13 +1258,12 @@ class TestRefineConsolidationGraph:
         loop.store.set_bookkeeping(
             "graph7",
             speaker_id="",
-            first_seen_cycle=0,
             relation_type="factual",
-            recurrence_count=3,
-            last_seen_cycle=0,
+            reinforcement_count=3,
+            last_reinforced_cycle=0,
             allow_empty_speaker=True,
         )
-        loop.merger.reinforcements = ["graph7"]
+        loop.merger.reinforcements = {"graph7": "2026-01-01T00:00:00Z"}
 
         from paramem.graph.schema import Relation
 
@@ -1279,14 +1277,15 @@ class TestRefineConsolidationGraph:
         loop._run_graph_enrichment.assert_called_once()
         bk = loop.store.bookkeeping_for_key("graph7")
         assert bk is not None
-        assert bk["recurrence_count"] == 4, (
-            f"Recurrence should have been bumped to 4; got {bk['recurrence_count']}"
+        assert bk["reinforcement_count"] == 4, (
+            f"Recurrence should have been bumped to 4; got {bk['reinforcement_count']}"
         )
 
     def test_empty_recon_relations_is_safe_noop_for_bump(self, tmp_path):
         """Empty recon_relations → recurrence-bump loop does not run; no crash."""
         loop = _make_loop(tmp_path)
-        loop.merger.reinforcements = ["graph99"]  # would be bumped if guard failed
+        # graph99 would be bumped if the empty-recon guard failed.
+        loop.merger.reinforcements = {"graph99": "2026-01-01T00:00:00Z"}
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
 
         bump_spy = MagicMock()
@@ -1368,9 +1367,8 @@ class TestHarvestKeylessEdges:
 
         bk = loop.store.bookkeeping_for_key(key)
         assert bk is not None
-        assert bk["recurrence_count"] == 1
-        assert bk["first_seen_cycle"] == loop.cycle_count
-        assert bk["last_seen_cycle"] == loop.cycle_count
+        assert bk["reinforcement_count"] == 1
+        assert bk["last_reinforced_cycle"] == loop.cycle_count
         assert bk["relation_type"] == "factual"
         assert bk["speaker_id"] == ""
 
@@ -1692,7 +1690,7 @@ class TestHarvestApplySplit:
         # Bookkeeping is present.
         bk = loop.store.bookkeeping_for_key(key)
         assert bk is not None
-        assert bk["recurrence_count"] == 1
+        assert bk["reinforcement_count"] == 1
         assert bk["relation_type"] == "factual"
 
         # Counter advanced by 1.
@@ -1773,7 +1771,7 @@ class TestEnrichmentRemovalLedger:
             "alice",
             entity_type="person",
             attributes={"name": "Alice"},
-            recurrence_count=3,
+            reinforcement_count=3,
             sessions=["s010"],
             first_seen="s010",
             last_seen="s010",
@@ -1782,7 +1780,7 @@ class TestEnrichmentRemovalLedger:
             "alicia",
             entity_type="person",
             attributes={"name": "Alicia"},
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s011"],
             first_seen="s011",
             last_seen="s011",
@@ -1839,7 +1837,7 @@ class TestEnrichmentRemovalLedger:
             "badkeep",
             entity_type="person",
             attributes={},
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s020"],
             first_seen="s020",
             last_seen="s020",
@@ -1848,7 +1846,7 @@ class TestEnrichmentRemovalLedger:
             "baddrop",
             entity_type="person",
             attributes={},
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s021"],
             first_seen="s021",
             last_seen="s021",
@@ -2206,7 +2204,7 @@ class TestEnrichmentThroughMergerComposition:
                 name,
                 entity_type="person",
                 attributes={"name": name.capitalize()},
-                recurrence_count=2,
+                reinforcement_count=2,
                 sessions=["s099"],
                 first_seen="s099",
                 last_seen="s099",
@@ -2254,7 +2252,7 @@ class TestEnrichmentThroughMergerComposition:
                 name,
                 entity_type="person",
                 attributes={"name": name.capitalize()},
-                recurrence_count=1,
+                reinforcement_count=1,
                 sessions=["s001"],
                 first_seen="s001",
                 last_seen="s001",
@@ -2267,7 +2265,7 @@ class TestEnrichmentThroughMergerComposition:
             confidence=0.9,
             first_seen="s001",
             last_seen="s001",
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s001"],
         )
         edges_before = loop.merger.graph.number_of_edges()
@@ -2346,10 +2344,9 @@ class TestDeferredFlushAllowEmpty:
         loop.store.set_bookkeeping(
             key,
             speaker_id=rec["speaker_id"],
-            first_seen_cycle=0,
             relation_type=rec["relation_type"],
-            recurrence_count=1,
-            last_seen_cycle=0,
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
             allow_empty_speaker=(rec["speaker_id"] == ""),
         )
         bk = loop.store.bookkeeping_for_key(key)
@@ -2582,7 +2579,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             "alex",
             entity_type="person",
             attributes={"name": "Alex"},
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s200"],
             first_seen="s200",
             last_seen="s200",

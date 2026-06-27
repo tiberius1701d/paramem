@@ -406,7 +406,7 @@ def _prepare_smoke_shim(run_dir: Path, loop) -> Path:
 
     quads.json is written from the store (``loop.store.iter_entries()``).
     Each entry already carries the canonical fields (subject, predicate,
-    object, speaker_id, first_seen_cycle; question/answer in QA mode).
+    object, speaker_id; question/answer in QA mode).
 
     Args:
         run_dir: The probe run directory (contains episodic/ adapter subdir).

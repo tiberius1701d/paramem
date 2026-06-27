@@ -31,7 +31,6 @@ def _entry_pair(
     obj: str,
     *,
     speaker_id: str = "spk1",
-    first_seen_cycle: int = 1,
 ) -> dict:
     return {
         "key": key,
@@ -39,7 +38,6 @@ def _entry_pair(
         "predicate": predicate,
         "object": obj,
         "speaker_id": speaker_id,
-        "first_seen_cycle": first_seen_cycle,
     }
 
 

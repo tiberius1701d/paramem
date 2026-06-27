@@ -6862,8 +6862,8 @@ async def debug_dump():
 
     Each entry dict is the entry payload as stored, with ``tier`` and
     ``key`` fields added inline for flat consumption.  Per-key
-    ``speaker_id``, ``relation_type``, ``first_seen_cycle``,
-    ``last_seen_cycle``, and ``recurrence_count`` are sourced from
+    ``speaker_id``, ``relation_type``, ``reinforcement_count``,
+    ``last_reinforced_cycle``, and ``last_seen`` are sourced from
     ``store.bookkeeping_for_key(key)`` (authoritative ``_bookkeeping``
     dict) rather than the entry payload, which may be stale or absent.
     When a key has no bookkeeping record the fields are omitted rather
@@ -6890,9 +6890,9 @@ async def debug_dump():
         if bk is not None:
             row["speaker_id"] = bk["speaker_id"]
             row["relation_type"] = bk["relation_type"]
-            row["first_seen_cycle"] = bk["first_seen_cycle"]
-            row["last_seen_cycle"] = bk["last_seen_cycle"]
-            row["recurrence_count"] = bk["recurrence_count"]
+            row["reinforcement_count"] = bk["reinforcement_count"]
+            row["last_reinforced_cycle"] = bk["last_reinforced_cycle"]
+            row["last_seen"] = bk["last_seen"]
         entries.append(row)
         tiers[tier] = tiers.get(tier, 0) + 1
 
@@ -8903,13 +8903,13 @@ async def _run_base_swap_orchestration(
 
         # ── Promotion carry-over ─────────────────────────────────────────────
         # The migration never writes key_metadata.json, so it still holds the
-        # PREVIOUS model's promotion state (per-key recurrence_count + promoted_keys).
+        # PREVIOUS model's promotion state (per-key reinforcement_count + promoted_keys).
         # loop_b was created against the empty live store (the base-swap preload
         # gate skips loading the old registry), so its construction-time seed
         # orphan-dropped every key.  Now that Phase B has retrained the SAME keys
         # (stable via graph.json ``ik_key``) and repopulated the store, re-seed
         # from the preserved key_metadata.json so promotion momentum carries
-        # across the swap — a key at recurrence_count=N does not reset to 0, and the
+        # across the swap — a key at reinforcement_count=N does not reset to 0, and the
         # already-promoted set is restored.  Without this, the next consolidation's
         # _save_key_metadata would overwrite the on-disk counts with loop_b's empty
         # in-memory state.  seed_key_metadata SETs (not increments) so it is

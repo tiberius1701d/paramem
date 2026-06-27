@@ -172,7 +172,7 @@ class GraphMerger:
         self.contradictions_resolved = []  # log of resolved contradictions
         # Per-merge/fold output lists — also initialised here so _upsert_relation
         # is safe to call without a preceding merge() call (e.g. in unit tests).
-        self.reinforcements: list[str] = []
+        self.reinforcements: dict[str, str] = {}
         # collapsed: incoming ik_keys that were deduplicated away in a Case-1
         # duplicate-SPO collapse.  Parallel to reinforcements (which records the
         # surviving key); collapsed records the drifting key.  Used by the
@@ -214,17 +214,20 @@ class GraphMerger:
                 When ``False`` (fold-only path), Case-2 is short-circuited — no
                 model call, no edge removal.  The fold operates on old-vs-old
                 stored knowledge with no recency signal, so contradiction
-                detection is structurally off until per-edge timestamps land.
+                detection is structurally off when no recency signal is available.
 
         Returns the updated cumulative graph.
 
-        ``self.reinforcements`` is a list of surviving ``ik_key`` strings for
-        each Case-1 exact-duplicate collapse that fired during this merge — i.e.
-        every fold where an incoming ``Relation.indexed_key`` matched an
-        existing edge with an ``ik_key`` already stamped.  The surviving key is
-        the existing edge's key (the incoming duplicate drifts).  Only populated
-        when ``Relation.indexed_key`` is set on the incoming relation (fold-only
-        path); always empty during normal live ingest where
+        ``self.reinforcements`` is a ``dict[ik_key, last_seen]`` of surviving
+        keys for each Case-1 exact-duplicate collapse that fired during this
+        merge — i.e. every fold where an incoming ``Relation.indexed_key``
+        matched an existing edge with an ``ik_key`` already stamped.  The
+        surviving key is the existing edge's key (the incoming duplicate
+        drifts); the value is the freshest (``max``) ``last_seen`` timestamp
+        after the collapse.  The bump_recurrence site reads this value to
+        advance bookkeeping without fabricating ``now()``.  Only populated
+        when ``Relation.indexed_key`` is set on the incoming relation
+        (fold-only path); always empty during normal live ingest where
         ``Relation.indexed_key is None``.
 
         ``self.collapsed`` is the parallel list of INCOMING ``ik_key`` strings
@@ -234,7 +237,7 @@ class GraphMerger:
         ``consolidate_interim_adapters`` to distinguish intended dedup (fact
         preserved under the twin key) from genuine reconstruction loss.
         """
-        self.reinforcements: list[str] = []
+        self.reinforcements: dict[str, str] = {}
         self.collapsed: list[str] = []
 
         session_id = session_graph.session_id
@@ -291,9 +294,7 @@ class GraphMerger:
                         name,
                         entity_type="concept",
                         attributes={"name": _endpoint_display[name]},
-                        first_seen=session_id,
-                        last_seen=session_id,
-                        recurrence_count=1,
+                        reinforcement_count=1,
                         sessions=[session_id],
                     )
                 elif name in _endpoint_display:
@@ -429,8 +430,7 @@ class GraphMerger:
 
         if node_key in self.graph:
             node = self.graph.nodes[node_key]
-            node["recurrence_count"] = node.get("recurrence_count", 0) + 1
-            node["last_seen"] = session_id
+            node["reinforcement_count"] = node.get("reinforcement_count", 0) + 1
             sessions = node.get("sessions", [])
             if session_id not in sessions:
                 sessions.append(session_id)
@@ -473,9 +473,7 @@ class GraphMerger:
             node_kwargs: dict = dict(
                 entity_type=entity.entity_type,
                 attributes=attributes,
-                first_seen=session_id,
-                last_seen=session_id,
-                recurrence_count=1,
+                reinforcement_count=1,
                 sessions=[session_id],
             )
             if is_speaker:
@@ -548,8 +546,8 @@ class GraphMerger:
 
         if existing_key is not None:
             edge = self.graph[subject][obj][existing_key]
-            edge["recurrence_count"] = edge.get("recurrence_count", 0) + 1
-            edge["last_seen"] = session_id
+            edge["reinforcement_count"] = edge.get("reinforcement_count", 0) + 1
+            edge["last_seen"] = max(edge.get("last_seen", ""), relation.last_seen or timestamp)
             edge["confidence"] = max(edge.get("confidence", 0), relation.confidence)
             sessions = edge.get("sessions", [])
             if session_id not in sessions:
@@ -575,7 +573,9 @@ class GraphMerger:
             elif relation.indexed_key and edge.get(_IK_KEY_ATTR):
                 surviving_ik = edge.get(_IK_KEY_ATTR)
                 if surviving_ik:
-                    self.reinforcements.append(surviving_ik)
+                    # Record surviving key → freshest last_seen so bump_recurrence
+                    # can advance bookkeeping without fabricating now().
+                    self.reinforcements[surviving_ik] = edge.get("last_seen", "")
                 # Record the incoming (drifting) key so the drift-accounting site
                 # in consolidate_interim_adapters can distinguish intended dedup
                 # (fact preserved under the surviving twin) from genuine loss.
@@ -719,11 +719,10 @@ class GraphMerger:
             predicate=normalized_pred,
             relation_type=relation.relation_type,
             confidence=relation.confidence,
-            first_seen=session_id,
-            last_seen=session_id,
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=_initial_sessions,
         )
+        self.graph[subject][obj][new_eid]["last_seen"] = relation.last_seen or timestamp
         if relation.indexed_key:
             self.graph[subject][obj][new_eid][_IK_KEY_ATTR] = relation.indexed_key
         # A-1 + B-4: stamp speaker_id unconditionally (net-new edge has no prior value)
@@ -758,7 +757,7 @@ class GraphMerger:
         self.graph = nx.MultiDiGraph()
         self._predicate_cardinality = {}
         self.contradictions_resolved = []
-        self.reinforcements = []
+        self.reinforcements = {}
         self.collapsed = []
         self.removal_ledger = {}
 

@@ -151,7 +151,6 @@ def _synthetic_entries(n: int) -> list[dict]:
                 "object": objects[(i // (len(subjects) * len(predicates))) % len(objects)]
                 + str(i // (len(subjects) * len(predicates) * len(objects))),
                 "speaker_id": "bench",
-                "first_seen_cycle": 1,
             }
         )
     return entries
@@ -457,7 +456,6 @@ def load_baseline(baseline_dir: Path, model, tokenizer):
             "predicate": r["predicate"],
             "object": r["object"],
             "speaker_id": r.get("speaker_id", ""),
-            "first_seen_cycle": 1,
         }
         for i, r in enumerate(rels)
     ]

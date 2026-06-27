@@ -54,7 +54,7 @@ def build_chunks(
     """Mirror ConsolidationLoop._run_graph_enrichment chunking exactly."""
     nodes_by_recurrence = sorted(
         graph.nodes(data=True),
-        key=lambda nd: nd[1].get("recurrence_count", 0),
+        key=lambda nd: nd[1].get("reinforcement_count", 0),
         reverse=True,
     )
     undirected = graph.to_undirected(as_view=True)

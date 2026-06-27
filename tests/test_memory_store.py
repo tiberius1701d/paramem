@@ -24,7 +24,6 @@ def _entry(
         "predicate": predicate,
         "object": obj,
         "speaker_id": "spk-alice",
-        "first_seen_cycle": 1,
     }
 
 
@@ -81,20 +80,18 @@ class TestQuadPayload:
         """set_bookkeeping then bookkeeping_for_key returns the correct fields.
 
         Replaces the deleted setdefault_entry test — bookkeeping is now the
-        canonical owner of speaker_id/first_seen_cycle/relation_type."""
+        canonical owner of speaker_id/relation_type/reinforcement_count/last_seen."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="spk-a", first_seen_cycle=5, relation_type="factual")
+        s.set_bookkeeping("graph1", speaker_id="spk-a", relation_type="factual")
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["speaker_id"] == "spk-a"
-        assert bk["first_seen_cycle"] == 5
+        assert bk["relation_type"] == "factual"
         # Second call must return updated values (idempotent overwrite).
-        s.set_bookkeeping(
-            "graph1", speaker_id="spk-b", first_seen_cycle=7, relation_type="preference"
-        )
+        s.set_bookkeeping("graph1", speaker_id="spk-b", relation_type="preference")
         bk2 = s.bookkeeping_for_key("graph1")
         assert bk2["speaker_id"] == "spk-b"
-        assert bk2["first_seen_cycle"] == 7
+        assert bk2["relation_type"] == "preference"
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +658,7 @@ class TestStats:
 
 
 # ---------------------------------------------------------------------------
-# Bookkeeping — speaker_id / first_seen_cycle owner
+# Bookkeeping — speaker_id / relation_type / reinforcement_count / last_seen
 # ---------------------------------------------------------------------------
 
 
@@ -672,7 +669,7 @@ class TestBookkeeping:
         Under preload_cache=False this is the key correctness invariant:
         bookkeeping presence must never mask a cache miss."""
         s = MemoryStore()
-        s.set_bookkeeping("k", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("k", speaker_id="alice", relation_type="factual")
         # No put — _entries is empty.
         assert s.get("k") is None
         results = s.probe({"episodic": ["k"]}, source=None)
@@ -681,11 +678,11 @@ class TestBookkeeping:
     def test_new_key_write_back_round_trips_speaker_id(self):
         """set_bookkeeping + bookkeeping_for_key round-trips all fields."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="bob", first_seen_cycle=3, relation_type="factual")
+        s.set_bookkeeping("graph1", speaker_id="bob", relation_type="factual")
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["speaker_id"] == "bob"
-        assert bk["first_seen_cycle"] == 3
+        assert bk["relation_type"] == "factual"
 
     def test_bookkeeping_absent_returns_none(self):
         s = MemoryStore()
@@ -693,8 +690,8 @@ class TestBookkeeping:
 
     def test_iter_bookkeeping_yields_all_keys(self):
         s = MemoryStore()
-        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
-        s.set_bookkeeping("k2", speaker_id="bob", first_seen_cycle=2, relation_type="preference")
+        s.set_bookkeeping("k1", speaker_id="alice", relation_type="factual")
+        s.set_bookkeeping("k2", speaker_id="bob", relation_type="preference")
         items = dict(s.iter_bookkeeping())
         assert items["k1"]["speaker_id"] == "alice"
         assert items["k2"]["speaker_id"] == "bob"
@@ -704,7 +701,7 @@ class TestBookkeeping:
         """store.delete must retire bookkeeping automatically."""
         s = MemoryStore()
         s.put("episodic", "graph1", _entry("graph1"))
-        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="factual")
         s.delete("graph1")
         assert s.bookkeeping_for_key("graph1") is None
 
@@ -733,12 +730,9 @@ class TestBookkeeping:
             "graph1",
             {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
         )
-        s.set_bookkeeping(
-            "graph1", speaker_id="spk-alice", first_seen_cycle=2, relation_type="factual"
-        )
+        s.set_bookkeeping("graph1", speaker_id="spk-alice", relation_type="factual")
         results = s.probe({"episodic": ["graph1"]}, source=_FakeSource())
         assert results["graph1"]["speaker_id"] == "spk-alice"
-        assert results["graph1"]["first_seen_cycle"] == 2
 
     def test_cache_off_empty_store_always_probes(self):
         """Under cache-off the store has no entries.  Every key must miss
@@ -756,8 +750,8 @@ class TestBookkeeping:
 
         s = MemoryStore()
         # Bookkeeping loaded but NO entries (cache-off scenario).
-        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
-        s.set_bookkeeping("k2", speaker_id="alice", first_seen_cycle=2, relation_type="factual")
+        s.set_bookkeeping("k1", speaker_id="alice", relation_type="factual")
+        s.set_bookkeeping("k2", speaker_id="alice", relation_type="factual")
         # Register keys in the registry so tier resolution works.
         from paramem.training.key_registry import KeyRegistry
 
@@ -773,7 +767,7 @@ class TestBookkeeping:
     def test_snapshot_excludes_bookkeeping(self):
         """_bookkeeping must not enter snapshot — it is boot-loaded from disk."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="factual")
         snap = s.snapshot()
         assert "_bookkeeping" not in snap
         assert "bookkeeping" not in snap
@@ -783,9 +777,7 @@ class TestBookkeeping:
     def test_relation_type_round_trips(self):
         """set_bookkeeping with relation_type='preference' → bookkeeping_for_key returns it."""
         s = MemoryStore()
-        s.set_bookkeeping(
-            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="preference"
-        )
+        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="preference")
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["relation_type"] == "preference"
@@ -793,10 +785,8 @@ class TestBookkeeping:
     def test_relation_type_overwrite_idempotent(self):
         """A second set_bookkeeping call updates relation_type in place."""
         s = MemoryStore()
-        s.set_bookkeeping("graph1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
-        s.set_bookkeeping(
-            "graph1", speaker_id="alice", first_seen_cycle=1, relation_type="preference"
-        )
+        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="factual")
+        s.set_bookkeeping("graph1", speaker_id="alice", relation_type="preference")
         bk = s.bookkeeping_for_key("graph1")
         assert bk is not None
         assert bk["relation_type"] == "preference"
@@ -811,9 +801,10 @@ class TestBookkeeping:
                 {
                     "keys": {
                         "graph1": {
-                            "recurrence_count": 1,
+                            "reinforcement_count": 1,
+                            "last_reinforced_cycle": 0,
+                            "last_seen": "",
                             "speaker_id": "alice",
-                            "first_seen_cycle": 2,
                             "relation_type": "preference",
                         }
                     }
@@ -844,10 +835,9 @@ class TestBookkeeping:
                 {
                     "keys": {
                         "graph1": {
-                            "recurrence_count": 1,
                             "speaker_id": "alice",
-                            "first_seen_cycle": 2,
-                            # relation_type deliberately absent (legacy file)
+                            # relation_type, reinforcement_count, last_reinforced_cycle,
+                            # last_seen deliberately absent (legacy file)
                         }
                     }
                 }
@@ -1178,11 +1168,11 @@ class TestConcurrencyContract:
     def test_iter_bookkeeping_snapshot_unaffected_by_subsequent_set(self):
         """iter_bookkeeping snapshot is taken before yielding."""
         s = MemoryStore()
-        s.set_bookkeeping("k1", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("k1", speaker_id="alice", relation_type="factual")
         it = s.iter_bookkeeping()
         snap = list(it)
         # Add a second key after the iterator is exhausted.
-        s.set_bookkeeping("k2", speaker_id="bob", first_seen_cycle=2, relation_type="factual")
+        s.set_bookkeeping("k2", speaker_id="bob", relation_type="factual")
         keys_in_snap = {k for k, _ in snap}
         assert "k1" in keys_in_snap
         assert "k2" not in keys_in_snap
@@ -1194,9 +1184,7 @@ class TestConcurrencyContract:
         state and the old keys are gone."""
         s = MemoryStore()
         s.put("episodic", "old_key", _entry("old_key"))
-        s.set_bookkeeping(
-            "old_key", speaker_id="alice", first_seen_cycle=1, relation_type="factual"
-        )
+        s.set_bookkeeping("old_key", speaker_id="alice", relation_type="factual")
 
         new_reg = KeyRegistry()
         new_reg.add("new_key")
@@ -1204,10 +1192,10 @@ class TestConcurrencyContract:
         new_bookkeeping: dict[str, dict] = {
             "new_key": {
                 "speaker_id": "bob",
-                "first_seen_cycle": 5,
                 "relation_type": "preference",
-                "recurrence_count": 1,
-                "last_seen_cycle": 5,
+                "reinforcement_count": 1,
+                "last_reinforced_cycle": 0,
+                "last_seen": "",
             }
         }
         s.swap(new_entries, {"semantic": new_reg}, new_bookkeeping)
@@ -1320,7 +1308,6 @@ class TestSetBookkeepingGuard:
             s.set_bookkeeping(
                 "graph1",
                 speaker_id="",
-                first_seen_cycle=0,
                 relation_type="factual",
             )
 
@@ -1330,7 +1317,6 @@ class TestSetBookkeepingGuard:
         s.set_bookkeeping(
             "graph2",
             speaker_id="",
-            first_seen_cycle=0,
             relation_type="factual",
             allow_empty_speaker=True,
         )
@@ -1347,7 +1333,6 @@ class TestSetBookkeepingGuard:
         s.set_bookkeeping(
             "graph3",
             speaker_id="Speaker0",
-            first_seen_cycle=1,
             relation_type="factual",
         )
         bk = s.bookkeeping_for_key("graph3")
@@ -1361,7 +1346,7 @@ class TestSetBookkeepingGuard:
         index receive the normalized form, eliminating the silent-drop regression
         where legacy key_metadata.json held cased ids."""
         s = MemoryStore()
-        s.set_bookkeeping("g1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("g1", speaker_id="Speaker0", relation_type="factual")
         bk = s.bookkeeping_for_key("g1")
         assert bk is not None
         assert bk["speaker_id"] == "speaker0", (
@@ -1374,7 +1359,6 @@ class TestSetBookkeepingGuard:
         s.set_bookkeeping(
             "g2",
             speaker_id="",
-            first_seen_cycle=1,
             relation_type="factual",
             allow_empty_speaker=True,
         )
@@ -1385,7 +1369,7 @@ class TestSetBookkeepingGuard:
     def test_non_speaker_value_passes_through_unchanged(self):
         """A non-speaker_id value that is non-empty passes through without lowercasing."""
         s = MemoryStore()
-        s.set_bookkeeping("g3", speaker_id="alice", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("g3", speaker_id="alice", relation_type="factual")
         bk = s.bookkeeping_for_key("g3")
         assert bk is not None
         assert bk["speaker_id"] == "alice"
@@ -1407,10 +1391,10 @@ class TestSetBookkeepingGuard:
                     "keys": {
                         "graph42": {
                             "speaker_id": "Speaker0",
-                            "first_seen_cycle": 3,
                             "relation_type": "factual",
-                            "recurrence_count": 1,
-                            "last_seen_cycle": 3,
+                            "reinforcement_count": 1,
+                            "last_reinforced_cycle": 0,
+                            "last_seen": "",
                         }
                     }
                 }
@@ -1464,9 +1448,7 @@ class TestProbeSpeakerResolver:
             "graph1",
             {"key": "graph1", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
         )
-        s.set_bookkeeping(
-            "graph1", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
-        )
+        s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual")
         results = s.probe({"episodic": ["graph1"]}, speaker_resolver=self._resolve)
         ft = results["graph1"]["fact_text"]
         assert "Alex" in ft
@@ -1480,9 +1462,7 @@ class TestProbeSpeakerResolver:
             "graph2",
             {"key": "graph2", "subject": "speaker0", "predicate": "knows", "object": "speaker9"},
         )
-        s.set_bookkeeping(
-            "graph2", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
-        )
+        s.set_bookkeeping("graph2", speaker_id="speaker0", relation_type="factual")
         results = s.probe({"episodic": ["graph2"]}, speaker_resolver=self._resolve)
         ft = results["graph2"]["fact_text"]
         assert "Dana" in ft
@@ -1496,9 +1476,7 @@ class TestProbeSpeakerResolver:
             "graph3",
             {"key": "graph3", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
         )
-        s.set_bookkeeping(
-            "graph3", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual"
-        )
+        s.set_bookkeeping("graph3", speaker_id="speaker0", relation_type="factual")
         results = s.probe({"episodic": ["graph3"]})
         ft = results["graph3"]["fact_text"]
         assert "speaker0" in ft
@@ -1538,9 +1516,7 @@ class TestProbeSpeakerResolver:
             "graphX",
             {"key": "graphX", "subject": "speaker5", "predicate": "visited", "object": "Rome"},
         )
-        s.set_bookkeeping(
-            "graphX", speaker_id="speaker5", first_seen_cycle=1, relation_type="factual"
-        )
+        s.set_bookkeeping("graphX", speaker_id="speaker5", relation_type="factual")
         results = s.probe({"episodic": ["graphX"]}, speaker_resolver=self._resolve)
         ft = results["graphX"]["fact_text"]
         assert descriptor in ft
@@ -1605,7 +1581,7 @@ class TestProbeFilterLowercaseInvariant:
             "k1",
             {"key": "k1", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
         )
-        s.set_bookkeeping("k1", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("k1", speaker_id="speaker0", relation_type="factual")
 
         results = s.probe({"episodic": ["k1"]}, speaker_id="speaker0")
         assert results.get("k1") is not None, (
@@ -1627,7 +1603,7 @@ class TestProbeFilterLowercaseInvariant:
             "k2",
             {"key": "k2", "subject": "speaker0", "predicate": "lives_in", "object": "Berlin"},
         )
-        s.set_bookkeeping("k2", speaker_id="speaker0", first_seen_cycle=1, relation_type="factual")
+        s.set_bookkeeping("k2", speaker_id="speaker0", relation_type="factual")
 
         # A cased 'Speaker0' reaching the filter would trigger a mismatch warning
         # and return None — documenting why the upstream must always emit lowercase.

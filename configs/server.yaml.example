@@ -190,7 +190,7 @@ consolidation:
                                # 12h + max_interim_count=7 → full cycle every 84h (derived).
                                # At max_interim_count=0: full cycle every refresh_cadence itself.
   mode: train                  # "train" persists to LoRA weights; "simulate" persists graph.json under adapter_dir/<tier>/ (no weight training)
-  promotion_threshold: 3       # recurrence_count threshold for key promotion to semantic
+  promotion_threshold: 3       # reinforcement_count threshold for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay

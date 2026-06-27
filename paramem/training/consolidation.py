@@ -617,8 +617,9 @@ class ConsolidationLoop:
         Per the wipe invariant (2026-05-14): ``key_metadata.json`` is
         bookkeeping, not a recovery source.
 
-        Per-key ``speaker_id`` / ``first_seen_cycle`` are owned by
-        :attr:`MemoryStore._bookkeeping` and loaded by
+        Per-key bookkeeping (``speaker_id``, ``relation_type``,
+        ``reinforcement_count``, ``last_reinforced_cycle``, ``last_seen``) is
+        owned by :attr:`MemoryStore._bookkeeping` and loaded by
         :meth:`MemoryStore.load_bookkeeping_from_disk` at lifespan boot.
         This method does NOT touch the store's bookkeeping — that was the
         ``setdefault_entry`` parasitic write that created payload-less stubs
@@ -705,7 +706,6 @@ class ConsolidationLoop:
         predicate: str,
         object: str,
         speaker_id: str,
-        first_seen_cycle: int,
         relation_type: str = "factual",
         question: Optional[str] = None,
         answer: Optional[str] = None,
@@ -727,7 +727,6 @@ class ConsolidationLoop:
             predicate: Triple predicate.
             object: Triple object.
             speaker_id: Speaker scope.
-            first_seen_cycle: Cycle count at first insertion.
             relation_type: Model-assigned relation type from extraction
                 (e.g. ``"factual"``, ``"preference"``, ``"temporal"``,
                 ``"social"``).  Defaults to ``"factual"`` for legacy callers
@@ -744,7 +743,6 @@ class ConsolidationLoop:
             "predicate": predicate,
             "object": object,
             "speaker_id": speaker_id,
-            "first_seen_cycle": first_seen_cycle,
             "relation_type": relation_type,
         }
         if question is not None:
@@ -792,12 +790,11 @@ class ConsolidationLoop:
         fallback when ``probe_entries`` / ``probe_key`` fails (typically when
         the adapter isn't mountable due to a hash mismatch).
 
-        The boot-time ``seed_key_metadata`` populates the store with
-        partial entries (``speaker_id`` + ``first_seen_cycle`` only — no
-        subject/predicate/object).  Treating those entries as usable
-        crashes the cycle with ``KeyError: 'subject'``.  This helper
-        returns ``None`` for partial entries so the caller can skip them
-        cleanly.
+        The boot-time ``seed_key_metadata`` populates the store with partial
+        entries (``speaker_id`` only — no subject/predicate/object).  Treating
+        those entries as usable crashes the cycle with ``KeyError: 'subject'``.
+        This helper returns ``None`` for partial entries so the caller can skip
+        them cleanly.
         """
         qa = self.store.get(key)
         if qa is None:
@@ -1464,7 +1461,6 @@ class ConsolidationLoop:
                 predicate=kp["predicate"],
                 object=kp["object"],
                 speaker_id=sid,
-                first_seen_cycle=self.cycle_count,
                 relation_type=rel.get("relation_type", "factual"),
             )
             if tag_new:
@@ -2424,7 +2420,7 @@ class ConsolidationLoop:
         - Provider env-var is absent (API key not set).
 
         Chunking strategy:
-        Entities are ranked by ``recurrence_count`` descending.  For each
+        Entities are ranked by ``reinforcement_count`` descending.  For each
         focal entity an N-hop ego-graph is built (``radius=neighborhood_hops``).
         Chunks are deduplicated by node frozenset so overlapping ego-graphs do
         not re-send the same payload.  The number of chunks is capped at
@@ -2482,10 +2478,10 @@ class ConsolidationLoop:
         max_entities = max(1, self.graph_enrichment_max_entities_per_pass)
         hops = max(1, self.graph_enrichment_neighborhood_hops)
 
-        # Rank nodes by recurrence descending.
+        # Rank nodes by reinforcement descending.
         nodes_by_recurrence = sorted(
             graph.nodes(data=True),
-            key=lambda nd: nd[1].get("recurrence_count", 0),
+            key=lambda nd: nd[1].get("reinforcement_count", 0),
             reverse=True,
         )
 
@@ -2867,7 +2863,7 @@ class ConsolidationLoop:
         3. If the model kept FEWER predicates than the input had for that ``(s, o)``
            AND at least one kept predicate is an input predicate for that ``(s, o)``
            (a survivor exists):
-           a. Union the ``sessions`` and sum the ``recurrence_count`` (and max
+           a. Union the ``sessions`` and sum the ``reinforcement_count`` (and max
               ``confidence``) of the retired edges onto the survivor edge's attributes
               BEFORE removal (mirrors the merger Case-1 provenance pattern).
            b. Retire each non-kept input edge: always ``graph.remove_edge``; write to
@@ -3017,23 +3013,26 @@ class ConsolidationLoop:
 
             # Union provenance from retired edges onto the survivor BEFORE removal.
             _surv_sessions: list[str] = list(_survivor_edata.get("sessions", []))
-            _surv_recurrence: int = _survivor_edata.get("recurrence_count", 1)
+            _surv_recurrence: int = _survivor_edata.get("reinforcement_count", 1)
             _surv_confidence: float = _survivor_edata.get("confidence", 0.0)
+            _surv_last_seen: str = _survivor_edata.get("last_seen", "")
 
             for _ret_pred in retired_preds:
                 for _ret_info in pred_map[_ret_pred]:
                     for _sid in _ret_info["edata"].get("sessions", []):
                         if _sid not in _surv_sessions:
                             _surv_sessions.append(_sid)
-                    _surv_recurrence += _ret_info["edata"].get("recurrence_count", 1)
+                    _surv_recurrence += _ret_info["edata"].get("reinforcement_count", 1)
                     _surv_confidence = max(
                         _surv_confidence, _ret_info["edata"].get("confidence", 0.0)
                     )
+                    _surv_last_seen = max(_surv_last_seen, _ret_info["edata"].get("last_seen", ""))
 
             # Write unioned provenance back onto the survivor edge.
             _survivor_edata["sessions"] = _surv_sessions
-            _survivor_edata["recurrence_count"] = _surv_recurrence
+            _survivor_edata["reinforcement_count"] = _surv_recurrence
             _survivor_edata["confidence"] = _surv_confidence
+            _survivor_edata["last_seen"] = _surv_last_seen
 
             # Retire each non-kept edge.
             group_retired = 0
@@ -3768,10 +3767,10 @@ class ConsolidationLoop:
                         self.store.set_bookkeeping(
                             _key,
                             speaker_id=rec["speaker_id"],
-                            first_seen_cycle=self.cycle_count,
                             relation_type=rec["relation_type"],
-                            recurrence_count=1,
-                            last_seen_cycle=self.cycle_count,
+                            reinforcement_count=1,
+                            last_reinforced_cycle=self.cycle_count,
+                            last_seen=rec.get("last_seen", ""),
                             allow_empty_speaker=(rec["speaker_id"] == ""),
                         )
                     self._indexed_next_index += len(new_keyed_episodic)
@@ -3875,10 +3874,10 @@ class ConsolidationLoop:
                         self.store.set_bookkeeping(
                             _key,
                             speaker_id=rec["speaker_id"],
-                            first_seen_cycle=self.cycle_count,
                             relation_type=rec["relation_type"],
-                            recurrence_count=1,
-                            last_seen_cycle=self.cycle_count,
+                            reinforcement_count=1,
+                            last_reinforced_cycle=self.cycle_count,
+                            last_seen=rec.get("last_seen", ""),
                             allow_empty_speaker=(rec["speaker_id"] == ""),
                         )
                         if rec["tier"] == "procedural":
@@ -4259,7 +4258,7 @@ class ConsolidationLoop:
                 for _surviving_key in _all_keyed:
                     _sbk = self.store.bookkeeping_for_key(_surviving_key)
                     if _sbk is not None:
-                        _sbk["last_seen_cycle"] = self.cycle_count
+                        _sbk["last_reinforced_cycle"] = self.cycle_count
 
                 _subtractive_stale_by_tier = self._apply_subtractive_removals_to_store(
                     scope=scope.subtractive_scope
@@ -4976,7 +4975,7 @@ class ConsolidationLoop:
             )
 
     def _promote_mature_keys_inline(self) -> list[str]:
-        """Promote episodic keys whose recurrence_count has reached the promotion threshold.
+        """Promote episodic keys whose reinforcement_count has reached the promotion threshold.
 
         Mirrors the logic of the removed ``server.consolidation._promote_mature_keys``
         helper but runs INSIDE the fold (``consolidate_interim_adapters``), AFTER the
@@ -4994,10 +4993,10 @@ class ConsolidationLoop:
         1. Iterate ``self.store.all_active_keys()``.
         2. Skip keys already in ``self.promoted_keys`` (already promoted or
            already in the ``has_simhash("semantic")`` branch from a prior fold).
-        3. Promote keys whose ``recurrence_count`` >= ``self.config.promotion_threshold``
+        3. Promote keys whose ``reinforcement_count`` >= ``self.config.promotion_threshold``
            by calling ``self.store.move(key, "semantic")`` then
            ``self.promoted_keys.add(key)``.
-        4. Log decay candidates (keys whose ``last_seen_cycle`` is more than
+        4. Log decay candidates (keys whose ``last_reinforced_cycle`` is more than
            ``self.config.decay_window`` cycles old) without deleting them
            (passive-fade policy — no fact loss).
 
@@ -5012,8 +5011,8 @@ class ConsolidationLoop:
 
         for key in self.store.all_active_keys():
             bk = self.store.bookkeeping_for_key(key) or {}
-            rec = bk.get("recurrence_count", 1)
-            last = bk.get("last_seen_cycle", bk.get("first_seen_cycle", 0))
+            rec = bk.get("reinforcement_count", 1)
+            last = bk.get("last_reinforced_cycle", 0)
 
             if key in self.promoted_keys:
                 continue
@@ -5025,7 +5024,7 @@ class ConsolidationLoop:
                     newly_promoted.append(key)
                     logger.info(
                         "_promote_mature_keys_inline: key=%s promoted to semantic "
-                        "(recurrence_count=%d >= threshold=%d)",
+                        "(reinforcement_count=%d >= threshold=%d)",
                         key,
                         rec,
                         threshold,
@@ -5042,7 +5041,7 @@ class ConsolidationLoop:
                 # no-active-delete policy).
                 logger.info(
                     "_promote_mature_keys_inline: key=%s decay candidate "
-                    "(last_seen_cycle=%d, current_cycle=%d, window=%d)",
+                    "(last_reinforced_cycle=%d, current_cycle=%d, window=%d)",
                     key,
                     last,
                     current_cycle,
@@ -5136,7 +5135,8 @@ class ConsolidationLoop:
               Each record has: ``"entry"``, ``"tier"``, ``"canon_subj"``,
               ``"canon_obj"``, ``"predicate"``, ``"relation_type"``, ``"speaker_id"``,
               ``"session_ids"`` (sorted list of real contributing session ids,
-              synthetic fold sentinels excluded).
+              synthetic fold sentinels excluded), ``"last_seen"`` (ISO 8601
+              wall-clock from the merged edge; ``""`` when unavailable).
 
             Mutates *tier_keyed* in-place.  When ``defer=False``, also mutates
             the :class:`~paramem.memory.store.MemoryStore` and advances
@@ -5275,6 +5275,10 @@ class ConsolidationLoop:
                     "relation_type": _rt,
                     "speaker_id": _subj_sid,
                     "session_ids": _rec_session_ids,
+                    # Real session wall-clock carried from the edge; sourced from
+                    # session_graph.timestamp at ingest via merger._upsert_relation.
+                    # Never fabricate now() here.
+                    "last_seen": _t_data.get("last_seen", ""),
                 }
 
                 if not defer:
@@ -5288,10 +5292,10 @@ class ConsolidationLoop:
                     self.store.set_bookkeeping(
                         minted_key,
                         speaker_id=_subj_sid,
-                        first_seen_cycle=self.cycle_count,
                         relation_type=_rt,
-                        recurrence_count=1,
-                        last_seen_cycle=self.cycle_count,
+                        reinforcement_count=1,
+                        last_reinforced_cycle=self.cycle_count,
+                        last_seen=_t_data.get("last_seen", ""),
                         allow_empty_speaker=(_subj_sid == ""),
                     )
                     # Advance the committed counter for the chosen tier.
@@ -5491,16 +5495,10 @@ class ConsolidationLoop:
         registry-true (subject, predicate, object) content rather than the
         lossy reconstruction result.
 
-        For each key the content is sourced in priority order:
-
-        1. ``store.get(key)`` — the content cache entry (subject/predicate/object).
-        2. ``store.bookkeeping_for_key(key)`` — hydration-miss fallback: when
-           ``store.get`` returns ``None`` for a LIVE active key (e.g. under
-           ``boot_degraded``), but bookkeeping carries non-empty SPO, the key is
-           still present and must NOT be silently dropped.  Log a warning; source
-           SPO from bookkeeping.
-        3. If both are absent or empty-SPO: skip and log (true orphan; the
-           drift-orphan classification at the drift-partition site will bucket it).
+        For each key the content is sourced from the store entry
+        (``store.get(key)``).  When the entry is absent (hydration miss on a
+        LIVE active key, e.g. under ``boot_degraded``), the key is logged as
+        an orphan and skipped.  Bookkeeping never carries SPO.
 
         ``relation_type`` and ``speaker_id`` always come from bookkeeping (never
         from the entry payload which carries the merge-time value).
@@ -5528,23 +5526,12 @@ class ConsolidationLoop:
                 obj = entry.get("object", "")
             else:
                 # Hydration-miss — entry cache is empty for this live key.
-                # Attempt bookkeeping SPO fallback before treating as orphan.
-                subj = bk.get("subject", "")
-                pred = bk.get("predicate", "")
-                obj = bk.get("object", "")
-                if subj or pred or obj:
-                    logger.warning(
-                        "_build_registry_true_relations: key=%s entry=None but "
-                        "bookkeeping has SPO — sourcing from bookkeeping (boot_degraded?)",
-                        key,
-                    )
-                else:
-                    logger.debug(
-                        "_build_registry_true_relations: key=%s has no entry and "
-                        "no bookkeeping SPO — skipping (orphan)",
-                        key,
-                    )
-                    continue
+                # Bookkeeping never carries SPO; log and skip (orphan).
+                logger.debug(
+                    "_build_registry_true_relations: key=%s has no entry — skipping (orphan)",
+                    key,
+                )
+                continue
 
             if not pred:
                 # No predicate: not keyable — skip.
@@ -5566,6 +5553,7 @@ class ConsolidationLoop:
                     confidence=1.0,
                     speaker_id=spk,
                     indexed_key=key,
+                    last_seen=bk.get("last_seen", ""),
                 )
             )
         return relations
@@ -6061,18 +6049,24 @@ class ConsolidationLoop:
         self._debug_writer.on_fold_graph(self.merger, label="enriched")
 
         if recon_relations:
-            # --- Recurrence bump: Case-1 duplicate-SPO collapses ---
+            # --- Reinforcement bump: Case-1 duplicate-SPO collapses ---
             # merger.reinforcements contains the surviving ik_key for every Case-1
             # collision fired during the re-merge.  A collision means two active keys
             # shared the same (s,p,o) — the incoming key drifts and the existing
-            # edge's key is the survivor.  The survivor's recurrence_count represents
-            # how many times this fact was independently extracted (and re-keyed)
-            # across sessions before this fold collapsed the duplicates.
-            _reinforced: set[str] = set()
-            for _rein_key in getattr(self.merger, "reinforcements", []):
-                if _rein_key and _rein_key not in _reinforced:
-                    self.store.bump_recurrence(_rein_key, cycle=self.cycle_count)
-                    _reinforced.add(_rein_key)
+            # edge's key is the survivor.  The survivor's reinforcement_count
+            # represents how many times this fact was independently extracted
+            # (and re-keyed) across sessions before this fold collapsed the duplicates.
+            # merger.reinforcements is now dict[ik_key, last_seen] — the freshest
+            # timestamp is carried directly from the edge so bump_recurrence can
+            # advance last_seen without fabricating now().
+            _reinforcements: dict[str, str] = getattr(self.merger, "reinforcements", {})
+            for _rein_key, _rein_ts in _reinforcements.items():
+                if _rein_key:
+                    self.store.bump_recurrence(
+                        _rein_key,
+                        cycle=self.cycle_count,
+                        timestamp=_rein_ts,
+                    )
                     logger.debug(
                         "consolidate_interim_adapters: bumped recurrence for key=%s "
                         "(intra-fold duplicate-SPO collapse)",

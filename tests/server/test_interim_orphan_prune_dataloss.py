@@ -46,7 +46,7 @@ def _write_key_metadata(path: Path, keys: list[str]) -> None:
     payload = {
         "cycle_count": 1,
         "promoted_keys": [],
-        "keys": {k: {"recurrence_count": 1, "speaker_id": "Speaker0"} for k in keys},
+        "keys": {k: {"reinforcement_count": 1, "speaker_id": "Speaker0"} for k in keys},
     }
     from paramem.backup.encryption import write_infra_bytes
 
@@ -136,8 +136,8 @@ class TestInterimOrphanPruneDataLoss:
             "cycle_count": 1,
             "promoted_keys": [],
             "keys": {
-                "live0": {"recurrence_count": 1, "speaker_id": "Speaker0"},
-                "stale0": {"recurrence_count": 1, "speaker_id": "Speaker0"},
+                "live0": {"reinforcement_count": 1, "speaker_id": "Speaker0"},
+                "stale0": {"reinforcement_count": 1, "speaker_id": "Speaker0"},
             },
         }
         write_infra_bytes(path, json.dumps(payload, indent=2).encode("utf-8"))
@@ -185,18 +185,18 @@ class TestSoftStaleBookkeepingRetention:
             "promoted_keys": [],
             "keys": {
                 "active1": {
-                    "recurrence_count": 1,
+                    "reinforcement_count": 1,
                     "speaker_id": "Speaker0",
-                    "first_seen_cycle": 1,
                     "relation_type": "factual",
-                    "last_seen_cycle": 1,
+                    "last_reinforced_cycle": 1,
+                    "last_seen": "",
                 },
                 "stale1": {
-                    "recurrence_count": 1,
+                    "reinforcement_count": 1,
                     "speaker_id": "Speaker0",
-                    "first_seen_cycle": 1,
                     "relation_type": "factual",
-                    "last_seen_cycle": 1,
+                    "last_reinforced_cycle": 1,
+                    "last_seen": "",
                 },
             },
         }
@@ -237,12 +237,8 @@ class TestSoftStaleBookkeepingRetention:
             {"subject": "Bob", "predicate": "works_at", "object": "Acme"},
             register=True,
         )
-        store.set_bookkeeping(
-            "active1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="factual"
-        )
-        store.set_bookkeeping(
-            "stale1", speaker_id="Speaker0", first_seen_cycle=1, relation_type="preference"
-        )
+        store.set_bookkeeping("active1", speaker_id="Speaker0", relation_type="factual")
+        store.set_bookkeeping("stale1", speaker_id="Speaker0", relation_type="preference")
         # Soft-stale stale1 via the registry.
         store.discard_keys(["stale1"], mode="stale")
 

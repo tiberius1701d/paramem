@@ -263,7 +263,7 @@ Platform-specific notes for Blackwell GPUs and WSL2 live under [Platform notes](
 4. **Assign keys:** Each fact gets a unique key (`graph1`, `graph2`, ...) for addressable recall
 5. **Train:** LoRA adapters learn the key→fact mapping via chat-template formatted training
 6. **Verify:** SimHash registry detects hallucination with continuous confidence scoring
-7. **Promote:** Keys whose per-key recurrence_count reaches the promotion threshold move from the episodic to the semantic adapter at the consolidation fold
+7. **Promote:** Keys whose per-key reinforcement_count reaches the promotion threshold move from the episodic to the semantic adapter at the consolidation fold
 8. **Decay:** Unreinforced facts fade after configurable window
 
 ## Prompt Engineering

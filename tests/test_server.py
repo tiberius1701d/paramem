@@ -423,8 +423,8 @@ class TestKeyMetadata:
             "cycle_count": 5,
             "promoted_keys": ["graph1", "graph2"],
             "keys": {
-                "graph1": {"recurrence_count": 3},
-                "graph3": {"recurrence_count": 1},
+                "graph1": {"reinforcement_count": 3},
+                "graph3": {"reinforcement_count": 1},
             },
         }
         path = tmp_path / "key_metadata.json"
@@ -433,7 +433,7 @@ class TestKeyMetadata:
         loaded = _load_key_metadata(path)
         assert loaded["cycle_count"] == 5
         assert "graph1" in loaded["promoted_keys"]
-        assert loaded["keys"]["graph3"]["recurrence_count"] == 1
+        assert loaded["keys"]["graph3"]["reinforcement_count"] == 1
 
     def test_voice_prompt_from_file(self, tmp_path):
         from paramem.server.config import VoiceConfig

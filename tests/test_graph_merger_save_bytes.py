@@ -17,7 +17,7 @@ class TestGraphMergerSaveBytes:
         # Add a node and edge to give the graph some content.
         merger.graph.add_node("Alice", entity_type="person", attributes={})
         merger.graph.add_node("London", entity_type="location", attributes={})
-        merger.graph.add_edge("Alice", "London", key=0, predicate="lives_in", recurrence_count=1)
+        merger.graph.add_edge("Alice", "London", key=0, predicate="lives_in", reinforcement_count=1)
 
         # save_graph to a temp file.
         graph_file = tmp_path / "graph.json"

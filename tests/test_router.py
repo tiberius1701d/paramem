@@ -29,7 +29,6 @@ def _make_entry(
     question: str = "Q?",
     answer: str = "A.",
     predicate: str = "related_to",
-    first_seen_cycle: int = 1,
     adapter_id: str = "episodic",
 ) -> dict:
     """Return a canonical :class:`MemoryStore` entry dict for use in router tests."""
@@ -41,7 +40,6 @@ def _make_entry(
         "predicate": predicate,
         "object": obj,
         "speaker_id": speaker_id,
-        "first_seen_cycle": first_seen_cycle,
         "_adapter_id": adapter_id,  # internal: consumed by _make_router_from_entries
     }
 
@@ -70,13 +68,11 @@ def _make_router_from_entries(
         # Mirror the production write: new-key store.put is always paired with
         # set_bookkeeping so the router's iter_bookkeeping() finds the speaker.
         spk = payload.get("speaker_id", "")
-        fsc = payload.get("first_seen_cycle", 0)
         rtype = payload.get("relation_type", "factual")
-        if spk or fsc:
+        if spk:
             store.set_bookkeeping(
                 key,
                 speaker_id=spk,
-                first_seen_cycle=fsc,
                 relation_type=rtype,
                 allow_empty_speaker=(spk == ""),
             )
@@ -864,9 +860,7 @@ class TestPreloadIndependence:
     def test_metadata_only_entries_populate_speaker_index(self):
         store = MemoryStore(replay_enabled=True)
         # Simulate load_bookkeeping_from_disk: no SPO in _entries, just bookkeeping.
-        store.set_bookkeeping(
-            "k_meta_only", speaker_id="alice", first_seen_cycle=1, relation_type="factual"
-        )
+        store.set_bookkeeping("k_meta_only", speaker_id="alice", relation_type="factual")
         # Register the key so _tier_keys resolves it.
         from paramem.training.key_registry import KeyRegistry
 
@@ -881,9 +875,7 @@ class TestPreloadIndependence:
         _stub_intent(monkeypatch, Intent.PERSONAL)
         store = MemoryStore(replay_enabled=True)
         # Seed bookkeeping only — no content entry.
-        store.set_bookkeeping(
-            "k_pref", speaker_id="alice", first_seen_cycle=1, relation_type="preference"
-        )
+        store.set_bookkeeping("k_pref", speaker_id="alice", relation_type="preference")
         from paramem.training.key_registry import KeyRegistry
 
         reg = KeyRegistry()
@@ -900,9 +892,7 @@ class TestPreloadIndependence:
         store = MemoryStore(replay_enabled=True)
         for i in range(3):
             key = f"graph{i}"
-            store.set_bookkeeping(
-                key, speaker_id="charlie", first_seen_cycle=i, relation_type="factual"
-            )
+            store.set_bookkeeping(key, speaker_id="charlie", relation_type="factual")
         assert len(store) == 0  # _entries empty
         router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
         assert "charlie" in router._speaker_key_index

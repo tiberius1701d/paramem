@@ -442,7 +442,6 @@ def _migrate_tier_train_to_simulate(
                 continue
             bk = loop.store.bookkeeping_for_key(ik_key) or {}
             data["speaker_id"] = bk.get("speaker_id", "")
-            data["first_seen_cycle"] = bk.get("first_seen_cycle", 0)
         slot_root.mkdir(parents=True, exist_ok=True)
         save_memory_to_disk(graph, target_graph)
 
@@ -577,7 +576,6 @@ def _migrate_tier_simulate_to_train(
             predicate=kp.get("predicate", ""),
             object=kp.get("object", ""),
             speaker_id=kp.get("speaker_id", ""),
-            first_seen_cycle=kp.get("first_seen_cycle", 0),
             question=kp.get("question"),
             answer=kp.get("answer"),
         )

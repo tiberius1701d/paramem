@@ -110,7 +110,7 @@ def create_consolidation_loop(
 
     Graph is transient (RAM-only). Key metadata is seeded
     from key_metadata.json to restore cycle count, promoted keys, and
-    per-key bookkeeping (recurrence_count, last_seen_cycle) across restarts.
+    per-key bookkeeping (reinforcement_count, last_reinforced_cycle, last_seen) across restarts.
 
     Parameters
     ----------
@@ -421,10 +421,10 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
         bk = loop.store.bookkeeping_for_key(key) or {}
         keys_payload[key] = {
             "speaker_id": bk.get("speaker_id", ""),
-            "first_seen_cycle": bk.get("first_seen_cycle", 0),
             "relation_type": bk.get("relation_type", "unknown"),
-            "recurrence_count": bk.get("recurrence_count", 1),
-            "last_seen_cycle": bk.get("last_seen_cycle", bk.get("first_seen_cycle", 0)),
+            "reinforcement_count": bk.get("reinforcement_count", 1),
+            "last_reinforced_cycle": bk.get("last_reinforced_cycle", 0),
+            "last_seen": bk.get("last_seen", ""),
         }
     metadata = {
         "cycle_count": loop.cycle_count,

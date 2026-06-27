@@ -412,7 +412,7 @@ The yield increase accelerated progress toward 500 keys. At the new rate (~20-30
 
 ### Cohort tracking
 
-Per-key `first_seen_cycle` and `source_character` metadata enables post-hoc analysis of:
+Test 8 captured per-key `first_seen_cycle` (since retired in the temporal-field refactor) and `source_character` metadata for post-hoc analysis of:
 - Catastrophic forgetting (do early keys degrade as new ones are added?)
 - Per-character recall (do some characters' facts train better than others?)
 - Cross-character entity collision (does graph merging across characters cause issues?)

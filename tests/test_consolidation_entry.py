@@ -54,7 +54,6 @@ def _make_entry_kp(**overrides) -> dict:
         "predicate": "lives_in",
         "object": "Berlin",
         "speaker_id": "Speaker0",
-        "first_seen_cycle": 1,
     }
     base.update(overrides)
     return base
@@ -70,7 +69,6 @@ def _make_qa_kp(**overrides) -> dict:
         "predicate": "lives_in",
         "object": "Berlin",
         "speaker_id": "Speaker0",
-        "first_seen_cycle": 1,
     }
     base.update(overrides)
     return base
@@ -90,7 +88,6 @@ class TestCacheEntry:
             predicate="lives_in",
             object="Berlin",
             speaker_id="Speaker0",
-            first_seen_cycle=1,
         )
         # Canonical fields present; source_* aliases NOT present
         assert entry["subject"] == "Alice"
@@ -112,7 +109,6 @@ class TestCacheEntry:
             predicate="works_at",
             object="ACME",
             speaker_id="Speaker1",
-            first_seen_cycle=3,
         )
         assert entry["subject"] == "Bob"
         assert entry["predicate"] == "works_at"
@@ -130,7 +126,6 @@ class TestCacheEntry:
             predicate="p",
             object="B",
             speaker_id="s",
-            first_seen_cycle=1,
         )
         assert "question" not in entry
         assert "answer" not in entry

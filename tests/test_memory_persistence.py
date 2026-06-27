@@ -30,8 +30,8 @@ from paramem.memory.persistence import (
     save_memory_to_disk,
 )
 
-# Canonical entry schema (current shape: six-field quadruple).
-KEYED_ENTRY_FIELDS = ("key", "subject", "predicate", "object", "speaker_id", "first_seen_cycle")
+# Canonical entry schema (current shape: five-field quintuple).
+KEYED_ENTRY_FIELDS = ("key", "subject", "predicate", "object", "speaker_id")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,7 +41,6 @@ _EDGE_DATA = {
     "key": "graph1",
     "predicate": "lives_in",
     "speaker_id": "Speaker0",
-    "first_seen_cycle": 3,
 }
 
 _SUBJECT = "Alice"
@@ -56,7 +55,6 @@ def _add_keyed_edge(
     indexed_key: str,
     predicate: str,
     speaker_id: str,
-    first_seen_cycle: int,
 ) -> None:
     """Test-local wrapper around memory_persistence._add_keyed_edge.
 
@@ -75,7 +73,6 @@ def _add_keyed_edge(
         indexed_key=indexed_key,
         predicate=predicate,
         speaker_id=speaker_id,
-        first_seen_cycle=first_seen_cycle,
     )
 
 
@@ -96,7 +93,6 @@ def _make_simple_graph(
         indexed_key=indexed_key,
         predicate=edge_data["predicate"],
         speaker_id=edge_data["speaker_id"],
-        first_seen_cycle=edge_data["first_seen_cycle"],
     )
     return g
 
@@ -142,7 +138,6 @@ class TestRoundTrip:
         assert q["object"] == _OBJECT
         assert q["predicate"] == "lives_in"
         assert q["speaker_id"] == "Speaker0"
-        assert q["first_seen_cycle"] == 3
 
         # Also verify the internal attribute is present in raw edge data.
         edges = list(g2.edges(keys=True, data=True))
@@ -161,7 +156,6 @@ class TestRoundTrip:
             indexed_key="graph1",
             predicate="lives_in",
             speaker_id="S0",
-            first_seen_cycle=1,
         )
         _add_keyed_edge(
             g,
@@ -170,7 +164,6 @@ class TestRoundTrip:
             indexed_key="graph2",
             predicate="has_job",
             speaker_id="S1",
-            first_seen_cycle=2,
         )
         path = tmp_path / "graph.json"
         save_memory_to_disk(g, path)
@@ -272,10 +265,14 @@ class TestIterEntriesSkipsKeylessEdges:
             indexed_key="graph1",
             predicate="lives_in",
             speaker_id="S0",
-            first_seen_cycle=1,
         )
         # Edge WITHOUT key — direct add_edge, no 'key' attribute in data.
-        g.add_edge("Alice", "Paris", predicate="visited", speaker_id="S0", first_seen_cycle=2)
+        g.add_edge(
+            "Alice",
+            "Paris",
+            predicate="visited",
+            speaker_id="S0",
+        )
         entries = list(iter_entries(g))
         assert len(entries) == 1
         assert entries[0]["key"] == "graph1"
@@ -287,7 +284,12 @@ class TestIterEntriesSkipsKeylessEdges:
     def test_graph_with_no_keyed_edges_yields_nothing(self):
         """A graph where no edges carry 'key' yields no items."""
         g = nx.MultiDiGraph()
-        g.add_edge("A", "B", predicate="related", speaker_id="S0", first_seen_cycle=1)
+        g.add_edge(
+            "A",
+            "B",
+            predicate="related",
+            speaker_id="S0",
+        )
         assert list(iter_entries(g)) == []
 
 
@@ -314,7 +316,6 @@ class TestIterEntriesShape:
             indexed_key="graph99",
             predicate="p",
             speaker_id="S",
-            first_seen_cycle=0,
         )
         q = list(iter_entries(g))[0]
         assert q["subject"] == "SubjectNode"
@@ -331,7 +332,6 @@ class TestIterEntriesShape:
                 indexed_key=f"graph{i}",
                 predicate="p",
                 speaker_id="S",
-                first_seen_cycle=i,
             )
         for entry in iter_entries(g):
             assert set(entry.keys()) == set(KEYED_ENTRY_FIELDS)
@@ -353,7 +353,6 @@ class TestEntryByKey:
         assert result["object"] == _OBJECT
         assert result["predicate"] == "lives_in"
         assert result["speaker_id"] == "Speaker0"
-        assert result["first_seen_cycle"] == 3
 
     def test_miss_returns_none(self):
         """entry_by_key returns None when the key is absent."""
@@ -369,12 +368,8 @@ class TestEntryByKey:
     def test_returns_first_matching_edge(self):
         """When multiple edges share the same key, the first one is returned."""
         g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g, "A", "B", indexed_key="graph1", predicate="p1", speaker_id="S0", first_seen_cycle=1
-        )
-        _add_keyed_edge(
-            g, "C", "D", indexed_key="graph1", predicate="p2", speaker_id="S1", first_seen_cycle=2
-        )
+        _add_keyed_edge(g, "A", "B", indexed_key="graph1", predicate="p1", speaker_id="S0")
+        _add_keyed_edge(g, "C", "D", indexed_key="graph1", predicate="p2", speaker_id="S1")
         result = entry_by_key(g, "graph1")
         assert result is not None
         assert result["key"] == "graph1"
@@ -396,7 +391,6 @@ class TestKeysForEntity:
             indexed_key="graph1",
             predicate="lives_in",
             speaker_id="S0",
-            first_seen_cycle=1,
         )
         # Lowercase query should match capitalised "Alice".
         result = keys_for_entity(g, "alice")
@@ -412,7 +406,6 @@ class TestKeysForEntity:
             indexed_key="graph2",
             predicate="knows",
             speaker_id="S0",
-            first_seen_cycle=1,
         )
         # The object "alice" should match the query "alice".
         result = keys_for_entity(g, "alice")
@@ -434,7 +427,6 @@ class TestKeysForEntity:
             indexed_key="graph1",
             predicate="lives_in",
             speaker_id="S0",
-            first_seen_cycle=1,
         )
         _add_keyed_edge(
             g,
@@ -443,7 +435,6 @@ class TestKeysForEntity:
             indexed_key="graph2",
             predicate="has_job",
             speaker_id="S0",
-            first_seen_cycle=2,
         )
         _add_keyed_edge(
             g,
@@ -452,7 +443,6 @@ class TestKeysForEntity:
             indexed_key="graph3",
             predicate="knows",
             speaker_id="S0",
-            first_seen_cycle=3,
         )
         result = keys_for_entity(g, "alice")
         assert result == {"graph1", "graph2", "graph3"}
@@ -492,7 +482,6 @@ class TestBuildTierGraphFromStore:
                     "predicate": "lives_in",
                     "object": "Berlin",
                     "speaker_id": "Speaker0",
-                    "first_seen_cycle": 3,
                 }
             },
         )
@@ -506,7 +495,6 @@ class TestBuildTierGraphFromStore:
         assert q["object"] == "Berlin"
         assert q["predicate"] == "lives_in"
         assert q["speaker_id"] == "Speaker0"
-        assert q["first_seen_cycle"] == 3
 
     def test_happy_path_multiple_keys(self):
         """All keys in the simhash registry are added to the graph."""
@@ -519,7 +507,6 @@ class TestBuildTierGraphFromStore:
                     "predicate": "lives_in",
                     "object": "Berlin",
                     "speaker_id": "S0",
-                    "first_seen_cycle": 1,
                 },
                 "graph2": {
                     "key": "graph2",
@@ -527,7 +514,6 @@ class TestBuildTierGraphFromStore:
                     "predicate": "has_job",
                     "object": "Engineer",
                     "speaker_id": "S0",
-                    "first_seen_cycle": 2,
                 },
             },
         )
@@ -554,7 +540,6 @@ class TestBuildTierGraphFromStore:
                     "predicate": "q",
                     "object": "Y",
                     "speaker_id": "S",
-                    "first_seen_cycle": 0,
                 },
             },
             tier="semantic",
@@ -611,7 +596,6 @@ class TestBuildTierGraphStaleProjection:
                 "predicate": "lives_in",
                 "object": "Berlin",
                 "speaker_id": "S0",
-                "first_seen_cycle": 1,
             },
             simhash=0xAAAA1111,
             register=True,
@@ -675,7 +659,6 @@ class TestBuildTierGraphStaleProjection:
                 "predicate": "has_job",
                 "object": "Engineer",
                 "speaker_id": "S0",
-                "first_seen_cycle": 0,
             },
             register=False,
         )

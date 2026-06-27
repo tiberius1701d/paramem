@@ -213,7 +213,6 @@ class TestMarkStaleKeys:
         real_store.set_bookkeeping(
             key,
             speaker_id=speaker_id,
-            first_seen_cycle=1,
             relation_type="factual",
         )
 
@@ -549,7 +548,6 @@ class TestLiveSlotManifestReStamp:
         real_store.set_bookkeeping(
             key_to_forget,
             speaker_id=speaker_id,
-            first_seen_cycle=1,
             relation_type="factual",
         )
 
@@ -629,7 +627,6 @@ class TestLiveSlotManifestReStamp:
         real_store.set_bookkeeping(
             key_to_forget,
             speaker_id=speaker_id,
-            first_seen_cycle=1,
             relation_type="factual",
         )
 

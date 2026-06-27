@@ -130,7 +130,7 @@ class TestPredicateNormalization:
         assert len(edges) == 1
         # canonical() folds underscore → space; predicate stored in canonical form
         assert edges[0]["predicate"] == "works at"
-        assert edges[0]["recurrence_count"] == 2
+        assert edges[0]["reinforcement_count"] == 2
 
 
 class TestEntityResolution:
@@ -139,7 +139,7 @@ class TestEntityResolution:
         merger.merge(session_graph_2)
         # "Alex" node key is canonical("Alex") == "alex" (node-key model A)
         assert "alex" in merger.graph.nodes
-        assert merger.graph.nodes["alex"]["recurrence_count"] == 2
+        assert merger.graph.nodes["alex"]["reinforcement_count"] == 2
 
     def test_fuzzy_match(self, merger):
         g1 = SessionGraph(
@@ -226,7 +226,7 @@ class TestEdgeAggregation:
         # Node keys are canonical: "a", "b"
         edges = list(merger.graph["a"]["b"].values())
         assert len(edges) == 1
-        assert edges[0]["recurrence_count"] == 2
+        assert edges[0]["reinforcement_count"] == 2
         assert len(edges[0]["sessions"]) == 2
 
     def test_different_predicates(self, merger):
@@ -483,7 +483,7 @@ class TestSpeakerIdDedup:
         m.merge(sg2)
         assert m.graph.number_of_nodes() == 1
         # Node key is canonical: canonical("Portland") == "portland"
-        assert m.graph.nodes["portland"]["recurrence_count"] == 2
+        assert m.graph.nodes["portland"]["reinforcement_count"] == 2
 
     def test_speaker_attributes_merged_from_later_session(self):
         """Attributes from a later session (e.g. has_last_name disclosure) must
@@ -1111,7 +1111,7 @@ class TestIkKeyProvenance:
             confidence=1.0,
             first_seen="s1",
             last_seen="s1",
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s1"],
         )
         m.graph["alex"]["cat"][eid_old][_IK_KEY_ATTR] = "g1"
@@ -1157,7 +1157,7 @@ class TestReinforcementTracking:
     """Tests for merger.reinforcements (Case-1 duplicate-SPO collapse tracking)."""
 
     def test_reinforcements_empty_after_merge_no_duplicate(self):
-        """A merge with no duplicate SPO produces an empty reinforcements list."""
+        """A merge with no duplicate SPO produces an empty reinforcements dict."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation, SessionGraph
 
@@ -1179,11 +1179,11 @@ class TestReinforcementTracking:
             ],
         )
         m.merge(session, resolve_contradictions=False)
-        assert m.reinforcements == [], "No duplicate → reinforcements must be empty"
+        assert m.reinforcements == {}, "No duplicate → reinforcements must be empty"
 
     def test_reinforcements_populated_on_duplicate_spo_collapse(self):
         """Two recon edges with same (s,p,o) but different ik_keys: Case-1 fires and
-        the surviving key appears in reinforcements."""
+        the surviving key appears in reinforcements with its last_seen timestamp."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation, SessionGraph
 
@@ -1206,7 +1206,7 @@ class TestReinforcementTracking:
             ],
         )
         m.merge(s1, resolve_contradictions=False)
-        assert m.reinforcements == [], "First merge is net-new — no reinforcement yet"
+        assert m.reinforcements == {}, "First merge is net-new — no reinforcement yet"
 
         # Second merge: same (s,p,o), different ik_key → Case-1 → reinforcement.
         s2 = SessionGraph(
@@ -1231,8 +1231,13 @@ class TestReinforcementTracking:
             f"Duplicate-SPO collapse must produce 1 reinforcement entry; got {m.reinforcements}"
         )
         # The survivor is the EXISTING edge's key (graph1), not the incoming (graph2).
-        assert m.reinforcements[0] == "graph1", (
-            f"Surviving key must be graph1 (existing edge); got {m.reinforcements[0]!r}"
+        assert "graph1" in m.reinforcements, (
+            f"Surviving key must be graph1 (existing edge); got keys={list(m.reinforcements)}"
+        )
+        # The carried last_seen is the freshest (max) of both edges' timestamps.
+        assert m.reinforcements["graph1"] == "2026-01-02T00:00:00Z", (
+            "last_seen must be the freshest timestamp (s2.timestamp); "
+            f"got {m.reinforcements['graph1']!r}"
         )
 
     def test_reinforcements_reset_graph_clears_reinforcements(self):
@@ -1240,9 +1245,9 @@ class TestReinforcementTracking:
         from paramem.graph.merger import GraphMerger
 
         m = GraphMerger()
-        m.reinforcements = ["graph_stale"]
+        m.reinforcements = {"graph_stale": "2026-01-01T00:00:00Z"}
         m.reset_graph()
-        assert m.reinforcements == [], "reset_graph must clear reinforcements"
+        assert m.reinforcements == {}, "reset_graph must clear reinforcements"
 
     def test_collapsed_populated_on_duplicate_spo_collapse(self):
         """Two recon edges with same (s,p,o) but different ik_keys: Case-1 fires and
@@ -1303,8 +1308,8 @@ class TestReinforcementTracking:
             f"Collapsed key must be graph2 (the incoming key); got {m.collapsed[0]!r}"
         )
         # The surviving key must still be in reinforcements.
-        assert m.reinforcements[0] == "graph1", (
-            f"Surviving key must be graph1 (existing edge); got {m.reinforcements[0]!r}"
+        assert "graph1" in m.reinforcements, (
+            f"Surviving key must be graph1 (existing edge); got keys={list(m.reinforcements)}"
         )
 
     def test_collapsed_reset_graph_clears_collapsed(self):
@@ -1327,7 +1332,7 @@ class TestReinforcementTracking:
         m.graph.add_node("Alice")
         m._predicate_cardinality["foo"] = True
         m.contradictions_resolved.append({"method": "model"})
-        m.reinforcements.append("k2")
+        m.reinforcements["k2"] = "2026-01-01T00:00:00Z"
         m.collapsed.append("k3")
         m.removal_ledger["k3"] = {"reason": "dedup", "surviving_twin": "k2"}
 
@@ -1336,7 +1341,7 @@ class TestReinforcementTracking:
         assert m.graph.number_of_nodes() == 0, "reset_graph must empty the graph"
         assert m._predicate_cardinality == {}, "reset_graph must clear cardinality cache"
         assert m.contradictions_resolved == [], "reset_graph must clear contradictions_resolved"
-        assert m.reinforcements == [], "reset_graph must clear reinforcements"
+        assert m.reinforcements == {}, "reset_graph must clear reinforcements"
         assert m.collapsed == [], "reset_graph must clear collapsed"
         assert m.removal_ledger == {}, "reset_graph must clear removal_ledger"
 
@@ -1362,7 +1367,7 @@ class TestReinforcementTracking:
             confidence=1.0,
             first_seen="s0",
             last_seen="s0",
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s0"],
         )
         # Keyless existing edge.
@@ -1380,7 +1385,7 @@ class TestReinforcementTracking:
         m._upsert_relation("alice", "berlin", incoming, "s1", "2026-01-01T00:00:00Z")
 
         # Adopt path: no reinforcement (the existing edge had no key to preserve).
-        assert m.reinforcements == [], (
+        assert m.reinforcements == {}, (
             "Case-1-adopt must NOT produce a reinforcement (existing was keyless)"
         )
         # Key was adopted onto the existing edge.
@@ -1417,7 +1422,7 @@ class TestReinforcementTracking:
             confidence=1.0,
             first_seen="s1",
             last_seen="s1",
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
@@ -1846,8 +1851,8 @@ class TestObjectVariantDedup:
         )
         edges = list(m.graph["paramem"]["execution speed"].values())
         assert len(edges) == 1
-        assert edges[0]["recurrence_count"] == 2, (
-            "Collapsed edge must have recurrence_count=2 (one per session)"
+        assert edges[0]["reinforcement_count"] == 2, (
+            "Collapsed edge must have reinforcement_count=2 (one per session)"
         )
 
     def test_display_name_preserved_in_node_attributes(self):
@@ -2119,7 +2124,7 @@ class TestMergerEdgeStamps:
             confidence=1.0,
             first_seen="s0",
             last_seen="s0",
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s0"],
         )
         # Existing edge has no speaker_id.
@@ -2156,7 +2161,7 @@ class TestMergerEdgeStamps:
             confidence=1.0,
             first_seen="s0",
             last_seen="s0",
-            recurrence_count=1,
+            reinforcement_count=1,
             sessions=["s0"],
             speaker_id="OriginalSpeaker",
         )
@@ -2418,4 +2423,112 @@ class TestStampedSpeakerMergerIntegration:
         )
         assert m.graph.has_edge("speaker1", "speaker0"), (
             "speaker1→speaker0 edge must survive (both_speakers guard active)"
+        )
+
+
+class TestLastSeenTimestampFlow:
+    """_upsert_relation must maintain the freshest last_seen across reinforcements.
+
+    INVARIANT: whenever edges collapse into a survivor the survivor's
+    ``last_seen`` = the FRESHEST (max) timestamp across all affected edges.
+    ISO-8601 UTC strings compare lexicographically = chronologically; ``""``
+    sorts before any real timestamp so ``max("", real) == real``.
+
+    Rules:
+
+    - Case-1 (reinforce): ``edge["last_seen"] = max(existing, carry-or-timestamp)``
+      — never regress; advance to the freshest value.
+    - Case-3 (new edge): ``self.graph[...]["last_seen"] = relation.last_seen or
+      timestamp`` — net-new edge, nothing to max against yet.
+
+    No ``datetime.now()`` is ever fabricated: only the real
+    ``session_graph.timestamp`` at ingest or the carry-slot populated by
+    ``_build_registry_true_relations`` reaches the edge.
+    """
+
+    def _make_rel(self, last_seen: str = "") -> Relation:
+        return Relation(
+            subject="alice",
+            predicate="lives in",
+            object="berlin",
+            relation_type="factual",
+            speaker_id="speaker0",
+            last_seen=last_seen,
+        )
+
+    def _first_edge_data(self, m: "GraphMerger", subject: str, obj: str) -> dict:
+        edges = list(m.graph[subject][obj].values())
+        assert edges, f"No edge found between {subject!r} and {obj!r}"
+        return edges[0]
+
+    def test_new_edge_takes_timestamp_when_relation_last_seen_empty(self):
+        """Case-3: new edge gets last_seen from the session timestamp param."""
+        m = GraphMerger(similarity_threshold=85.0)
+        rel = self._make_rel(last_seen="")
+        m._upsert_relation("alice", "berlin", rel, "s001", "2026-06-01T12:00:00Z")
+
+        data = self._first_edge_data(m, "alice", "berlin")
+        assert data.get("last_seen") == "2026-06-01T12:00:00Z", (
+            f"Case-3: expected last_seen from timestamp param; got {data.get('last_seen')!r}"
+        )
+
+    def test_new_edge_prefers_relation_last_seen_over_timestamp(self):
+        """Case-3: when relation.last_seen is set it takes priority over timestamp."""
+        m = GraphMerger(similarity_threshold=85.0)
+        rel = self._make_rel(last_seen="2026-05-15T08:00:00Z")
+        m._upsert_relation("alice", "berlin", rel, "s001", "2026-06-01T12:00:00Z")
+
+        data = self._first_edge_data(m, "alice", "berlin")
+        assert data.get("last_seen") == "2026-05-15T08:00:00Z", (
+            "Case-3: relation.last_seen must win over timestamp param; "
+            f"got {data.get('last_seen')!r}"
+        )
+
+    def test_reinforce_updates_last_seen_to_newer_session(self):
+        """Case-1: re-inserting an identical triple updates last_seen to the new timestamp."""
+        m = GraphMerger(similarity_threshold=85.0)
+        rel = self._make_rel(last_seen="")
+        # First insertion — edge created with initial timestamp.
+        m._upsert_relation("alice", "berlin", rel, "s001", "2026-06-01T12:00:00Z")
+        # Second identical insertion (same predicate/object) — should reinforce.
+        m._upsert_relation("alice", "berlin", rel, "s002", "2026-06-10T09:00:00Z")
+
+        data = self._first_edge_data(m, "alice", "berlin")
+        assert data.get("last_seen") == "2026-06-10T09:00:00Z", (
+            "Case-1: last_seen must advance to the newer session timestamp after reinforce; "
+            f"got {data.get('last_seen')!r}"
+        )
+
+    def test_reinforce_does_not_regress_last_seen(self):
+        """Case-1: a re-merge with an OLDER carry-slot timestamp does NOT regress
+        an existing newer last_seen on the edge."""
+        m = GraphMerger(similarity_threshold=85.0)
+        rel = self._make_rel(last_seen="")
+        # First insertion sets a newer timestamp.
+        m._upsert_relation("alice", "berlin", rel, "s001", "2026-06-20T12:00:00Z")
+        # Re-merge (fold path) carries an OLDER value.
+        older_carry = self._make_rel(last_seen="2026-05-01T08:00:00Z")
+        m._upsert_relation("alice", "berlin", older_carry, "s-recon", "2026-05-01T08:00:00Z")
+
+        data = self._first_edge_data(m, "alice", "berlin")
+        assert data.get("last_seen") == "2026-06-20T12:00:00Z", (
+            "Case-1: an older incoming timestamp must not regress an existing newer last_seen; "
+            f"got {data.get('last_seen')!r}"
+        )
+
+    def test_reinforce_max_picks_freshest_over_existing(self):
+        """Case-1: when the incoming timestamp is NEWER than the existing edge,
+        last_seen advances to the newer value."""
+        m = GraphMerger(similarity_threshold=85.0)
+        rel = self._make_rel(last_seen="")
+        # First insertion sets an older timestamp.
+        m._upsert_relation("alice", "berlin", rel, "s001", "2026-05-01T08:00:00Z")
+        # Re-merge carries a newer carry-slot (e.g. a later session's recon).
+        newer_carry = self._make_rel(last_seen="2026-06-20T12:00:00Z")
+        m._upsert_relation("alice", "berlin", newer_carry, "s-recon", "2026-05-01T08:00:00Z")
+
+        data = self._first_edge_data(m, "alice", "berlin")
+        assert data.get("last_seen") == "2026-06-20T12:00:00Z", (
+            "Case-1: a newer carry-slot must advance last_seen on the existing edge; "
+            f"got {data.get('last_seen')!r}"
         )

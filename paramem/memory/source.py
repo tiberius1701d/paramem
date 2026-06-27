@@ -22,9 +22,9 @@ Naming
 ------
 ``entry`` is the shape-agnostic term for "one keyed record".  Today the
 schema is ``{subject, predicate, object, speaker_id}`` with the canonical
-fields ``{key, subject, predicate, object, speaker_id, first_seen_cycle,
-confidence, fact_text, raw_output}``.  If the schema evolves the source's
-contract still holds.
+fields ``{key, subject, predicate, object, speaker_id, confidence,
+fact_text, raw_output}``.  If the schema evolves the source's contract
+still holds.
 """
 
 from __future__ import annotations
@@ -203,7 +203,6 @@ class DiskMemorySource:
                     "predicate": entry.get("predicate", ""),
                     "object": entry.get("object", ""),
                     "speaker_id": entry.get("speaker_id", ""),
-                    "first_seen_cycle": entry.get("first_seen_cycle", 0),
                     "confidence": 1.0,
                     "fact_text": entry_fact_text(entry),
                     "raw_output": json.dumps(

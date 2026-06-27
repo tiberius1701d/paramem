@@ -1063,7 +1063,6 @@ class TestCommitTierSlotVerifyCallback:
                 "predicate": "lives_in",
                 "object": "Berlin",
                 "speaker_id": "sp1",
-                "first_seen_cycle": 0,
             },
             register=False,
         )
@@ -1232,7 +1231,6 @@ class TestCommitTierSlotVerifyCallback:
                         "predicate": "lives_in",
                         "object": "Berlin",
                         "speaker_id": "sp1",
-                        "first_seen_cycle": 0,
                     }
                 ],
                 output_dir=tmp_path,

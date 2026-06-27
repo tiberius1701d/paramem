@@ -41,7 +41,6 @@ class TestRouterReadsFromLoopCache:
                 store.set_bookkeeping(
                     k,
                     speaker_id=spk,
-                    first_seen_cycle=q.get("first_seen_cycle", 0),
                     relation_type=q.get("relation_type", "factual"),
                 )
         return store
@@ -62,7 +61,6 @@ class TestRouterReadsFromLoopCache:
                 "predicate": "lives_in",
                 "object": "London",
                 "speaker_id": "spk1",
-                "first_seen_cycle": 1,
             }
         }
         store = self._make_store_with_cache(cache)

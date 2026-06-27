@@ -411,8 +411,8 @@ class TestCrossConsistency:
         cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
             "keys": {
-                "key1": {"speaker_id": "speaker0", "first_seen_cycle": 0},
-                "orphan_key": {"speaker_id": "speaker0", "first_seen_cycle": 1},
+                "key1": {"speaker_id": "speaker0"},
+                "orphan_key": {"speaker_id": "speaker0"},
             }
         }
         cfg.key_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
@@ -446,7 +446,7 @@ class TestCrossConsistency:
 
         # key_metadata only has key1 — key2 is absent (that's fine)
         cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        metadata = {"keys": {"key1": {"speaker_id": "speaker0", "first_seen_cycle": 0}}}
+        metadata = {"keys": {"key1": {"speaker_id": "speaker0"}}}
         cfg.key_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
 
         store = MemoryStore(replay_enabled=True)
@@ -558,8 +558,8 @@ class TestStaleKeyCrossConsistency:
         cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
             "keys": {
-                "key1": {"speaker_id": "spk0", "first_seen_cycle": 0},
-                "proc52": {"speaker_id": "spk0", "first_seen_cycle": 1},
+                "key1": {"speaker_id": "spk0"},
+                "proc52": {"speaker_id": "spk0"},
             }
         }
         cfg.key_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
@@ -591,8 +591,8 @@ class TestStaleKeyCrossConsistency:
         cfg.key_metadata_path.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
             "keys": {
-                "key1": {"speaker_id": "spk0", "first_seen_cycle": 0},
-                "ghost_key": {"speaker_id": "spk0", "first_seen_cycle": 1},
+                "key1": {"speaker_id": "spk0"},
+                "ghost_key": {"speaker_id": "spk0"},
             }
         }
         cfg.key_metadata_path.write_text(json.dumps(metadata), encoding="utf-8")

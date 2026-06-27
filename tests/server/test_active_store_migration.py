@@ -72,7 +72,6 @@ def _write_simulate_graph(simulate_dir: Path, tier: str, entries: list[dict]) ->
                 _IK_KEY_ATTR: entry["key"],
                 "predicate": entry.get("predicate", "related_to"),
                 "speaker_id": entry.get("speaker_id", "Speaker0"),
-                "first_seen_cycle": entry.get("first_seen_cycle", 1),
             },
         )
     save_memory_to_disk(graph, graph_path, encrypted=False)
@@ -103,14 +102,13 @@ def _write_adapter_slot_dir(adapter_dir: Path, tier: str, slot_ts: str) -> Path:
 
 
 def _full_quad(key: str, predicate: str = "related_to") -> dict:
-    """Return a full 6-field entry dict for migration test fixtures."""
+    """Return a full 5-field entry dict for migration test fixtures."""
     return {
         "key": key,
         "subject": "Subject",
         "predicate": predicate,
         "object": "Object",
         "speaker_id": "Speaker0",
-        "first_seen_cycle": 1,
     }
 
 
@@ -325,7 +323,6 @@ def _make_loop_train_to_simulate(
                 "predicate": "related_to",
                 "object": "Object",
                 "speaker_id": "Speaker0",
-                "first_seen_cycle": 1,
             },
         )
     loop.store = store
@@ -473,13 +470,11 @@ class TestMigrateTierTrainToSimulate:
         assert not (cfg.adapter_dir / "episodic" / "graph.json").exists()
 
     def test_edge_decoration_uses_indexed_key_cache(self, tmp_path):
-        """speaker_id and first_seen_cycle from indexed_key_cache appear on graph edges."""
+        """speaker_id from bookkeeping appears on graph edges after train→simulate."""
         cfg = _make_config(tmp_path, mode="simulate")
         keys = ["g0"]
         loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
-        loop.store.set_bookkeeping(
-            "g0", speaker_id="spk-alice", first_seen_cycle=7, relation_type="factual"
-        )
+        loop.store.set_bookkeeping("g0", speaker_id="spk-alice", relation_type="factual")
 
         reconstruction = self._make_graph_result("episodic", keys)
 
@@ -496,7 +491,6 @@ class TestMigrateTierTrainToSimulate:
         entries = list(iter_entries(loaded))
         assert len(entries) == 1
         assert entries[0]["speaker_id"] == "spk-alice"
-        assert entries[0]["first_seen_cycle"] == 7
 
 
 # ---------------------------------------------------------------------------
@@ -813,7 +807,6 @@ class TestMigrateTierSimulateToTrain:
             predicate,
             object,
             speaker_id,
-            first_seen_cycle,
             question=None,
             answer=None,
         ):
@@ -823,7 +816,6 @@ class TestMigrateTierSimulateToTrain:
                 "predicate": predicate,
                 "object": object,
                 "speaker_id": speaker_id,
-                "first_seen_cycle": first_seen_cycle,
             }
             if question is not None:
                 entry["question"] = question
@@ -1589,7 +1581,6 @@ def _write_simulate_graph_at(slot_root: Path, entries: list[dict]) -> Path:
                 _IK_KEY_ATTR: entry["key"],
                 "predicate": entry.get("predicate", "related_to"),
                 "speaker_id": entry.get("speaker_id", "Speaker0"),
-                "first_seen_cycle": entry.get("first_seen_cycle", 1),
             },
         )
     save_memory_to_disk(graph, graph_path, encrypted=False)

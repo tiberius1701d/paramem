@@ -123,7 +123,7 @@ Session Transcript
   → Graph Extractor (LLM structured output → JSON graph)
   → Graph Merger (resolve entities, reinforce duplicate edges, count recurrence)
   → Consolidation Loop (per-adapter: compress + optimize)
-  → Fold-time promotion (recurrence_count ≥ threshold: episodic→semantic) + passive decay
+  → Fold-time promotion (reinforcement_count ≥ threshold: episodic→semantic) + passive decay
 ```
 
 The knowledge graph is the intermediate representation. Adapters never see raw transcripts — they train on graph-derived signals. This separation makes ablation straightforward (swap graph input for raw input and compare).
@@ -154,7 +154,7 @@ A **fallback path** runs local plausibility on the raw extraction when the prima
 
 ### AD-15: Indexed Key Consolidation Loop (Phase 4)
 
-The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → during the full consolidation fold (`consolidate_interim_adapters`), keys whose per-key `recurrence_count` meets the promotion threshold are promoted episodic→semantic; `store.move(key, "semantic")` moves the registry entry and SimHash — so promotion happens before tier assignment.
+The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → during the full consolidation fold (`consolidate_interim_adapters`), keys whose per-key `reinforcement_count` meets the promotion threshold are promoted episodic→semantic; `store.move(key, "semantic")` moves the registry entry and SimHash — so promotion happens before tier assignment.
 
 **Transcript-stage boundary (§4.S architectural symmetry).** The consolidation fold has two modes sharing an identical grooming pipeline — they diverge ONLY in their persistence tail:
 - **`train` mode**: source = reconstruct-from-adapter-weights; sink = retrain PEFT adapters.

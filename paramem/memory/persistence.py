@@ -32,11 +32,10 @@ canonical entry shape.
 
 The public entry schema is:
 
-    ``key``, ``subject``, ``predicate``, ``object``,
-    ``speaker_id``, ``first_seen_cycle``
+    ``key``, ``subject``, ``predicate``, ``object``, ``speaker_id``
 
 where ``subject`` and ``object`` are the graph node endpoints and the
-remaining four fields come from edge attributes.  ``entry`` is the
+remaining fields come from edge attributes.  ``entry`` is the
 shape-agnostic term for "one keyed record" — if the schema grows fields,
 the on-disk format accommodates them as additional edge attributes
 without rename.
@@ -158,8 +157,7 @@ def iter_entries(graph: nx.MultiDiGraph) -> Iterator[dict]:
 
     Each yielded dict has exactly the canonical entry fields:
 
-        ``key``, ``subject``, ``predicate``, ``object``,
-        ``speaker_id``, ``first_seen_cycle``
+        ``key``, ``subject``, ``predicate``, ``object``, ``speaker_id``
 
     where ``subject`` and ``object`` are taken from the graph topology (the
     source and target node names of the edge) and ``key`` is mapped from the
@@ -184,7 +182,6 @@ def iter_entries(graph: nx.MultiDiGraph) -> Iterator[dict]:
             "predicate": data.get("predicate", ""),
             "object": object_,
             "speaker_id": data.get("speaker_id", ""),
-            "first_seen_cycle": data.get("first_seen_cycle", 0),
         }
 
 
@@ -237,7 +234,6 @@ def _add_keyed_edge(
     indexed_key: str,
     predicate: str,
     speaker_id: str,
-    first_seen_cycle: int,
 ) -> None:
     """Add an edge to *graph* with the indexed-memory key in the ``"ik_key"`` attribute.
 
@@ -256,7 +252,6 @@ def _add_keyed_edge(
         indexed_key: The indexed-memory key string (e.g. ``"graph1"``).
         predicate: Relation predicate.
         speaker_id: Speaker scope.
-        first_seen_cycle: Cycle count at first insertion.
     """
     graph.add_edge(
         subject,
@@ -265,7 +260,6 @@ def _add_keyed_edge(
             _IK_KEY_ATTR: indexed_key,
             "predicate": predicate,
             "speaker_id": speaker_id,
-            "first_seen_cycle": first_seen_cycle,
         },
     )
 
@@ -281,8 +275,8 @@ def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
 
     Reads the matching entry from the store to add an edge
     ``(subject → object)`` with edge-data
-    ``{ik_key, predicate, speaker_id, first_seen_cycle}`` (the indexed-memory
-    key is stored as ``"ik_key"`` to avoid the NetworkX ``"key"`` collision;
+    ``{ik_key, predicate, speaker_id}`` (the indexed-memory key is stored as
+    ``"ik_key"`` to avoid the NetworkX ``"key"`` collision;
     :func:`iter_entries` maps it back to ``"key"`` for callers).
 
     The caller is responsible for persisting the returned graph with
@@ -314,7 +308,6 @@ def build_tier_graph_from_store(store, tier: str) -> nx.MultiDiGraph:
             indexed_key=indexed_key,
             predicate=entry.get("predicate", ""),
             speaker_id=entry.get("speaker_id", ""),
-            first_seen_cycle=entry.get("first_seen_cycle", 0),
         )
     return graph
 
@@ -568,7 +561,6 @@ def commit_tier_slot(
                         indexed_key=kp["key"],
                         predicate=kp.get("predicate", ""),
                         speaker_id=kp.get("speaker_id", ""),
-                        first_seen_cycle=kp.get("first_seen_cycle", 0),
                     )
             else:
                 # Caller passed [] — re-project from the canonical store.

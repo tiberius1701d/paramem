@@ -250,8 +250,6 @@ class TestSimulateTrainParity:
     Covered invariants:
       - speaker_id default tagging — every entry gets the caller's id
         when none was present on the relation.
-      - first_seen_cycle preservation — re-running the same relations
-        a second time leaves existing entries' first_seen_cycle unchanged.
       - per-tier scope — active_keys_in_tier returns identical sorted
         key lists in both modes.
       - Equality: tier_simhashes, store entries, and on-disk
@@ -349,87 +347,6 @@ class TestSimulateTrainParity:
                     assert entry["speaker_id"] == "", (
                         f"Explicit empty speaker_id overwritten in {key}: {entry['speaker_id']!r}"
                     )
-
-    def test_first_seen_cycle_preserved_on_second_run(self, loop_sim, loop_train, tmp_path):
-        """Existing entries retain first_seen_cycle on re-run.
-
-        Run the same fixture twice on each loop using the SAME stamp so that
-        _resolve_target_slot returns the same adapter slot and
-        _run_fold enters the existing-key reconstruction branch.
-        Entries from cycle 1 must keep first_seen_cycle=1 after cycle 2.
-
-        Using the same stamp is deliberate: this exercises the preservation
-        branch (not just the fresh-slot path) that retains first_seen_cycle.
-        """
-        self._run_sim(loop_sim)
-        self._run_train(loop_train)
-
-        # Record first_seen_cycle after cycle 1.
-        sim_fsc_1 = {
-            key: entry["first_seen_cycle"] for _tier, key, entry in loop_sim.store.iter_entries()
-        }
-        train_fsc_1 = {
-            key: entry["first_seen_cycle"] for _tier, key, entry in loop_train.store.iter_entries()
-        }
-
-        # Record cycle-1 keys; used below to verify they survive into cycle 2.
-        sim_keys_1 = set(key for _tier, key, _entry in loop_sim.store.iter_entries())
-        train_keys_1 = set(key for _tier, key, _entry in loop_train.store.iter_entries())
-
-        # Run again with the SAME stamp to exercise the existing-key reconstruction
-        # branch in _run_fold (same adapter slot, existing keys reconstructed).
-        loop_sim.run_consolidation_cycle(
-            list(_EPISODIC_RELS),
-            list(_PROCEDURAL_RELS),
-            speaker_id=_SPEAKER_ID,
-            mode="simulate",
-            run_label="parity2",
-            stamp=_STAMP,  # same stamp as cycle 1
-        )
-        patches = _patches_for_train_mode()
-        with patches[0], patches[1], patches[2], patches[3]:
-            loop_train.run_consolidation_cycle(
-                list(_EPISODIC_RELS),
-                list(_PROCEDURAL_RELS),
-                speaker_id=_SPEAKER_ID,
-                mode="train",
-                run_label="parity2",
-                stamp=_STAMP,  # same stamp as cycle 1
-            )
-
-        # Existing entries must not have their first_seen_cycle bumped.
-        for key, fsc in sim_fsc_1.items():
-            entry = loop_sim.store.get(key)
-            if entry is not None:
-                assert entry["first_seen_cycle"] == fsc, (
-                    f"Simulate: first_seen_cycle changed for {key}: "
-                    f"{fsc} → {entry['first_seen_cycle']}"
-                )
-
-        for key, fsc in train_fsc_1.items():
-            entry = loop_train.store.get(key)
-            if entry is not None:
-                assert entry["first_seen_cycle"] == fsc, (
-                    f"Train: first_seen_cycle changed for {key}: "
-                    f"{fsc} → {entry['first_seen_cycle']}"
-                )
-
-        # All keys from cycle 1 (episodic graph* AND procedural proc*) must
-        # survive into cycle 2.  Per-session procedural sp_index-driven retirement
-        # Per-session procedural sp_index-driven retirement has been removed; procedural
-        # contradictions are now resolved at full consolidation by the
-        # model-bearing GraphMerger.  Duplicate procedural keys from a same-
-        # preference re-run are tolerated in the interim.
-        sim_keys_2 = set(key for _tier, key, _entry in loop_sim.store.iter_entries())
-        train_keys_2 = set(key for _tier, key, _entry in loop_train.store.iter_entries())
-        sim_keys_1_all = sim_keys_1
-        train_keys_1_all = train_keys_1
-        assert sim_keys_1_all.issubset(sim_keys_2), (
-            f"Simulate: cycle-1 keys dropped after re-run: {sim_keys_1_all - sim_keys_2}"
-        )
-        assert train_keys_1_all.issubset(train_keys_2), (
-            f"Train: cycle-1 keys dropped after re-run: {train_keys_1_all - train_keys_2}"
-        )
 
     def test_active_keys_in_tier_match(self, loop_sim, loop_train):
         """active_keys_in_tier returns identical sorted lists in both modes."""
@@ -673,7 +590,6 @@ def _write_graph(path, quads: list[dict]) -> None:
                 _IK_KEY_ATTR: quad["key"],
                 "predicate": quad.get("predicate", ""),
                 "speaker_id": quad.get("speaker_id", ""),
-                "first_seen_cycle": quad.get("first_seen_cycle", 0),
             },
         )
     save_memory_to_disk(graph, path, encrypted=False)
@@ -702,7 +618,6 @@ class TestProbeKeysFromGraph:
                     "predicate": "lives_in",
                     "object": "Berlin",
                     "speaker_id": "",
-                    "first_seen_cycle": 0,
                 }
             ],
         )
@@ -724,7 +639,6 @@ class TestProbeKeysFromGraph:
                     "predicate": "works_at",
                     "object": "Acme",
                     "speaker_id": "",
-                    "first_seen_cycle": 0,
                 }
             ],
         )
@@ -742,7 +656,6 @@ class TestProbeKeysFromGraph:
                     "predicate": "likes",
                     "object": "Tea",
                     "speaker_id": "",
-                    "first_seen_cycle": 0,
                 }
             ],
         )
@@ -765,7 +678,6 @@ class TestProbeKeysFromGraph:
                     "predicate": "p",
                     "object": "Y",
                     "speaker_id": "",
-                    "first_seen_cycle": 0,
                 }
             ],
         )
@@ -789,7 +701,6 @@ class TestProbeKeysFromGraph:
                     "predicate": "lives_in",
                     "object": "Munich",
                     "speaker_id": "",
-                    "first_seen_cycle": 0,
                 }
             ],
         )
@@ -807,7 +718,6 @@ class TestProbeKeysFromGraph:
             "predicate": "knows",
             "object": "Bob",
             "speaker_id": "",
-            "first_seen_cycle": 0,
         }
 
         graph_sim_dir = tmp_path / "sim"
@@ -821,7 +731,6 @@ class TestProbeKeysFromGraph:
             "predicate",
             "object",
             "speaker_id",
-            "first_seen_cycle",
             "confidence",
             "fact_text",
             "raw_output",
@@ -877,7 +786,7 @@ def _write_interim_graph(adapter_dir: Path, stamp: str, triples: list[dict]) -> 
         adapter_dir: The loop's output_dir.
         stamp: Sub-interval stamp, e.g. ``"20260101T0000"``.
         triples: List of dicts with ``key``, ``subject``, ``predicate``,
-            ``object``, and optionally ``speaker_id`` / ``first_seen_cycle``.
+            ``object``, and optionally ``speaker_id``.
 
     Returns:
         The interim directory path.
@@ -893,7 +802,6 @@ def _write_interim_graph(adapter_dir: Path, stamp: str, triples: list[dict]) -> 
                 _IK_KEY_ATTR: t["key"],
                 "predicate": t.get("predicate", ""),
                 "speaker_id": t.get("speaker_id", ""),
-                "first_seen_cycle": t.get("first_seen_cycle", 0),
             },
         )
     from paramem.memory.persistence import save_memory_to_disk as _save
@@ -1261,7 +1169,6 @@ class TestConsolidateSimulateFold:
                     _IK_KEY_ATTR: SENTINEL_KEY,
                     "predicate": "enriched_by",
                     "speaker_id": "",
-                    "first_seen_cycle": 0,
                 },
             )
             return {
@@ -1846,11 +1753,10 @@ def _make_loop_for_commit(tmp_path: Path) -> ConsolidationLoop:
             "predicate": "lives_in",
             "object": "Berlin",
             "speaker_id": "sp1",
-            "first_seen_cycle": 0,
         },
         register=False,
     )
-    store.set_bookkeeping("graph1", speaker_id="sp1", first_seen_cycle=0, relation_type="factual")
+    store.set_bookkeeping("graph1", speaker_id="sp1", relation_type="factual")
     loop.store = store
     return loop
 
@@ -1907,7 +1813,6 @@ class TestCommitTierSlotCleanup:
                 "predicate": "lives_in",
                 "object": "Berlin",
                 "speaker_id": "sp1",
-                "first_seen_cycle": 0,
             }
         ]
 
