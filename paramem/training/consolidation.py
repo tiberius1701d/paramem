@@ -2811,13 +2811,8 @@ class ConsolidationLoop:
             )
             return {**_empty, "skipped": True, "skip_reason": "floor"}
 
-        # Load the filter prompt — FAIL LOUD if missing (misconfiguration, not transient).
-        filter_prompt = _load_prompt("graph_dedup_filter.txt", "", None)
-        if not filter_prompt:
-            raise FileNotFoundError(
-                "graph_normalization: graph_dedup_filter.txt prompt file missing — "
-                "cannot run normalization pass (set refinement_normalization=off to skip)"
-            )
+        # Load the filter prompt — fail loud if missing (misconfiguration, not transient).
+        filter_prompt = _load_prompt("graph_dedup_filter.txt", required=True)
 
         # Build flat relation list and per-(s,o) group index.
         # Each _info entry: {u, v, eid, edata, ik_key, can_s, can_o, can_pred}

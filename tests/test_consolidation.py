@@ -11265,7 +11265,12 @@ class TestRunGraphNormalizationSotaEngine:
         loop = self._make_loop(tmp_path, sota_enabled=False)
 
         with (
-            patch("paramem.graph.prompts._load_prompt", return_value=""),
+            patch(
+                "paramem.graph.prompts._load_prompt",
+                side_effect=FileNotFoundError(
+                    "Required prompt file 'graph_dedup_filter.txt' not found. Searched: ..."
+                ),
+            ),
             pytest.raises(FileNotFoundError, match="graph_dedup_filter.txt"),
         ):
             loop._run_graph_normalization()
