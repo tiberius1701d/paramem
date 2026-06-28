@@ -351,6 +351,8 @@ class TestPrivacyRouting:
         config.registry_path = MagicMock()
         config.registry_path.exists.return_value = False
         config.voice.load_prompt.return_value = "You are a helper."
+        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
+        config.vram.cooldown_gate_threshold_c = 0
         with (
             patch(
                 "paramem.memory.probe.probe_keys_grouped_by_adapter",
@@ -582,6 +584,8 @@ class TestPrivacyRouting:
         config.registry_path.exists.return_value = False
         config.sanitization.mode = "off"
         config.voice.load_prompt.return_value = "You are a helper."
+        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
+        config.vram.cooldown_gate_threshold_c = 0
 
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA would fail if called
@@ -644,6 +648,8 @@ class TestPrivacyRouting:
         config.registry_path.exists.return_value = False
         config.sanitization.mode = "off"
         config.voice.load_prompt.return_value = "You are a helper."
+        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown inference gate.
+        config.vram.cooldown_gate_threshold_c = 0
 
         ha_client = MagicMock()
         ha_client.conversation_process.return_value = None  # HA fallback fails

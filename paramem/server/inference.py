@@ -37,6 +37,7 @@ from paramem.server.escalation import detect_escalation
 from paramem.server.router import Intent, RoutingPlan
 from paramem.server.sanitizer import sanitize_for_cloud
 from paramem.server.tools.ha_client import HAClient
+from paramem.training.thermal_throttle import wait_for_cooldown as _wait_for_cooldown
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +359,17 @@ def handle_chat(
         if is_personal and plan is not None and plan.steps:
             routing_diags["paths_attempted"].append("personal")
             routing_diags["exit_via"] = "personal_probe"
+            # T2c: pre-task GPU cooldown gate — wait until GPU is cool before
+            # the local-PA probe + reason burst.  Placed here (after routing
+            # has committed to the local PA path) so HA/SOTA-routed requests
+            # never wait.  Bounded by cooldown_gate_max_wait_inference_s
+            # (default 30 s) — the caller proceeds with a WARNING on timeout.
+            _wait_for_cooldown(
+                config.vram.cooldown_gate_threshold_c,
+                config.vram.cooldown_gate_max_wait_inference_s,
+                config.vram.cooldown_gate_poll_s,
+                label="inference",
+            )
             return _probe_and_reason(
                 text,
                 plan,

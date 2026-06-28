@@ -776,6 +776,23 @@ vram:
   stt_workspace_factor: 1.1            # CT2 / faster-whisper activation+workspace overhead multiplier (calibrated against distil-large-v3 int8).
   tts_piper_ort_context_mib: 300       # Shared ONNX Runtime CUDA context (counted once across all Piper voices).
   peft_overhead_per_adapter_mib: 10    # PEFT residual per adapter beyond pure A+B tensors (calibrated for [q,v,k,o] rank=8).
+  # CUDA fail-fast crash-loop guard. Coupled to systemd StartLimitBurst=3 /
+  # StartLimitIntervalSec=600 in paramem-server.service — change both together.
+  # cuda_crashloop_burst is ONE BELOW the systemd burst (2 < 3) so the process
+  # degrades to cloud-only on the last restart rather than exiting and tripping
+  # the systemd limiter, which would leave the unit dead.
+  cuda_crashloop_burst: 2
+  cuda_fault_history_window_s: 600
+  # Pre-task GPU cooldown gate (Tier-2 TDR-prevention). Waits until GPU temp
+  # <= cooldown_gate_threshold_c before each GPU-intense burst (boot preload,
+  # training fold, inference generate). 52 °C matches the gpu-cooldown.sh
+  # everyday-working threshold; the device idles ~48–50 °C so the gate is
+  # instant in steady state. Set cooldown_gate_threshold_c=0 to disable.
+  cooldown_gate_threshold_c: 52
+  cooldown_gate_poll_s: 5
+  cooldown_gate_max_wait_boot_s: 60    # < systemd TimeoutStartSec=120
+  cooldown_gate_max_wait_fold_s: 300
+  cooldown_gate_max_wait_inference_s: 30
 
 # ============================================================================
 # SECURITY

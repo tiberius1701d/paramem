@@ -88,6 +88,50 @@ def _is_cuda_driver_fault(exc: BaseException) -> bool:
     return any(marker in msg for marker in _CUDA_DRIVER_FAULT_MARKERS)
 
 
+# Sticky, process-fatal CUDA faults. Per CUDA semantics, once one of these is
+# raised the device context is poisoned: every subsequent GPU call in the
+# process returns the same error until the process exits. The ONLY recovery is
+# a process restart. Distinct from:
+#   - VramExhausted / torch.cuda.OutOfMemoryError: NOT fatal — handled by
+#     apply_process_cap + vram_scope; the context survives, the cycle aborts.
+#   - _CUDA_DRIVER_FAULT_MARKERS ("device not ready"): treated as VRAM
+#     exhaustion, also non-fatal.
+_FATAL_CUDA_FAULT_MARKERS = (
+    "illegal memory access",
+    "device-side assert",
+    "misaligned address",
+    "an illegal instruction",
+    "context is destroyed",  # context-lost / unrecoverable
+)
+
+
+def is_fatal_cuda_fault(exc: BaseException) -> bool:
+    """True if *exc* is a sticky, process-fatal CUDA context fault.
+
+    Recovery is os._exit + process restart — NEVER an in-process release
+    (safe_empty_cache→synchronize re-raises the sticky error).
+
+    Fail-safe rule: OOM is excluded first (different type, non-fatal), then
+    ANY torch.AcceleratorError is fatal (the CUDA-runtime-error category is
+    sticky by nature). The message markers are an ADDITIVE net for the case
+    where the fault surfaces as a bare RuntimeError rather than
+    AcceleratorError — they never DOWNGRADE an AcceleratorError to non-fatal.
+    """
+    # OOM is non-fatal and a sibling type, not an AcceleratorError — exclude
+    # explicitly so a future reorder can't misclassify it.
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return False
+    if _is_cuda_driver_fault(exc):  # "device not ready" → VRAM class, non-fatal
+        return False
+    AcceleratorError = getattr(torch, "AcceleratorError", None)
+    if AcceleratorError is not None and isinstance(exc, AcceleratorError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        return any(m in msg for m in _FATAL_CUDA_FAULT_MARKERS)
+    return False
+
+
 @contextmanager
 def vram_scope(label: str) -> Iterator[None]:
     """Wrap a VRAM-allocating phase with hygiene + OOM containment.

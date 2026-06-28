@@ -21,6 +21,7 @@ from paramem.server.vram_guard import (
     VramExhausted,
     apply_process_cap,
     check_vram_headroom,
+    is_fatal_cuda_fault,
     vram_scope,
 )
 
@@ -862,3 +863,69 @@ class TestExtractionFailedAbortsCycle:
         finally:
             for k, v in prior_state.items():
                 app_module._state[k] = v
+
+
+class TestIsFatalCudaFault:
+    """Unit tests for the sticky-CUDA-context classifier.
+
+    All cases run CPU-only — exception types are constructed in-process.
+    """
+
+    def test_accelerator_error_is_fatal(self):
+        """torch.AcceleratorError (any message) → True (type-first rule)."""
+        AcceleratorError = getattr(torch, "AcceleratorError", None)
+        if AcceleratorError is None:
+            pytest.skip("torch.AcceleratorError not available in this torch build")
+        exc = AcceleratorError("CUDA error: an illegal memory access was encountered")
+        assert is_fatal_cuda_fault(exc) is True
+
+    def test_bare_runtimeerror_with_marker_is_fatal(self):
+        """RuntimeError matching a _FATAL_CUDA_FAULT_MARKERS substring → True."""
+        exc = RuntimeError("CUDA error: an illegal memory access was encountered")
+        assert is_fatal_cuda_fault(exc) is True
+
+    def test_device_side_assert_marker_is_fatal(self):
+        """'device-side assert' marker → True."""
+        assert is_fatal_cuda_fault(RuntimeError("CUDA error: device-side assert triggered")) is True
+
+    def test_context_is_destroyed_marker_is_fatal(self):
+        """'context is destroyed' marker → True."""
+        assert is_fatal_cuda_fault(RuntimeError("CUDA error: context is destroyed")) is True
+
+    def test_oom_is_not_fatal(self):
+        """OOM is non-fatal — different type, sibling of AcceleratorError."""
+        exc = torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 1 GiB")
+        assert is_fatal_cuda_fault(exc) is False
+
+    def test_device_not_ready_is_not_fatal(self):
+        """'device not ready' is a VRAM-class driver fault, not a sticky fault."""
+        assert is_fatal_cuda_fault(RuntimeError("device not ready")) is False
+
+    def test_value_error_is_not_fatal(self):
+        """Non-RuntimeError/AcceleratorError types are never fatal."""
+        assert is_fatal_cuda_fault(ValueError("nonsense")) is False
+
+    def test_benign_runtime_error_is_not_fatal(self):
+        """Benign RuntimeError whose message matches no marker → False."""
+        assert is_fatal_cuda_fault(RuntimeError("shape mismatch in matmul")) is False
+
+    def test_accelerator_error_absent_falls_back_to_markers(self):
+        """When torch has no AcceleratorError attribute, the marker-string fallback still works.
+
+        Monkeypatches torch to simulate an older torch build without AcceleratorError.
+        """
+        import paramem.server.vram_guard as vg
+
+        orig_getattr = getattr(torch, "AcceleratorError", None)
+        try:
+            if hasattr(torch, "AcceleratorError"):
+                delattr(torch, "AcceleratorError")
+            # Marker-bearing RuntimeError must still be classified as fatal.
+            assert vg.is_fatal_cuda_fault(RuntimeError("illegal memory access")) is True
+            # OOM must remain non-fatal.
+            assert vg.is_fatal_cuda_fault(torch.cuda.OutOfMemoryError("oom")) is False
+            # Benign RuntimeError must remain non-fatal.
+            assert vg.is_fatal_cuda_fault(RuntimeError("benign")) is False
+        finally:
+            if orig_getattr is not None:
+                torch.AcceleratorError = orig_getattr  # type: ignore[attr-defined]

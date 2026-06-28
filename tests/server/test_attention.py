@@ -483,6 +483,23 @@ def test_boot_degraded_missing_key_no_item():
     assert items == []
 
 
+def test_boot_degraded_level_is_info_for_partial_miss():
+    """The boot_degraded item is level='info' for a recoverable partial cache miss.
+
+    Locks the level contract: a fatal CUDA context loss is handled by boot
+    fail-fast (os._exit or cloud-only degrade) and never reaches boot_degraded.
+    Only the recoverable cold-cache / partial-miss case produces this item, so
+    it must always be 'info', never 'warning' or 'error'.
+    """
+    state = _live_state(boot_degraded={"reason": "preload_partial", "hits": 10, "total": 20})
+    items = _collect_boot_degraded_items(state)
+    assert len(items) == 1
+    assert items[0].level == "info", (
+        "boot_degraded must be level='info' (recoverable partial miss only); "
+        f"got {items[0].level!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _collect_integrity_cleanup_items
 # ---------------------------------------------------------------------------

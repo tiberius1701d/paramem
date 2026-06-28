@@ -78,6 +78,7 @@ from paramem.server.vram_guard import (
     VramExhausted,
     apply_process_cap,
     check_vram_headroom,
+    is_fatal_cuda_fault,
     safe_empty_cache,
     vram_measure,
     vram_scope,
@@ -91,7 +92,7 @@ from paramem.server.vram_validator import (
     format_baseline_fit,
 )
 from paramem.training.consolidation import AbortedDuringConsolidation
-from paramem.training.thermal_throttle import ThermalPolicy
+from paramem.training.thermal_throttle import ThermalPolicy, wait_for_cooldown
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,8 @@ _state = {
     "config_path": None,
     "config_drift_task": None,
     "mode": "local",  # "local" or "cloud-only"
-    "cloud_only_reason": None,  # "explicit", "training", "gpu_conflict", or None
+    # "explicit", "training", "gpu_conflict", "cuda_fault_persistent", or None
+    "cloud_only_reason": None,
     "cloud_only_startup": False,  # set by --cloud-only CLI flag before app start
     "defer_model": False,  # set by --defer-model CLI flag before app start
     "ha_graph": None,  # HAEntityGraph built from HA states/services at startup
@@ -266,7 +268,8 @@ class StatusResponse(BaseModel):
     model_id: str | None = None
     model_device: str | None = None  # cuda / cpu / None (cloud-only)
     mode: str  # "local" or "cloud-only"
-    cloud_only_reason: str | None  # "explicit", "training", "gpu_conflict", or None
+    # "explicit", "training", "gpu_conflict", "cuda_fault_persistent", or None
+    cloud_only_reason: str | None
     adapter_loaded: bool  # legacy: True when episodic main adapter is loaded
     # Rank of the episodic LoRA adapter (load-bearing for indexed-key recall).
     # None when no adapter is configured (cloud-only or all kinds disabled).
@@ -1702,6 +1705,136 @@ def _build_user_token_store(config) -> "UserTokenStore | None":
     return _UserTokenStore(config.paths.data / "user_tokens.json")
 
 
+# ---------------------------------------------------------------------------
+# CUDA fail-fast helpers — boot-time sticky-context detection and recovery
+# ---------------------------------------------------------------------------
+
+
+def _degrade_to_cloud_only(reason: str) -> None:
+    """Release the base model and enter the cloud-only degraded state.
+
+    Factors out the inline degrade block originally at app.py:2062-2067.
+    Called from two sites:
+      1. The post-load VRAM budget gate (reason='insufficient_vram').
+      2. The persistent-CUDA-fault crash-loop guard (reason='cuda_fault_persistent').
+
+    Sets ``cloud_only_reason`` in ``_state``; the caller is responsible for
+    updating any lifespan-frame ``cloud_only`` local.  On 'cuda_fault_persistent'
+    the reason is in ``permanent_cloud_only`` (app.py:1929), so the GPU is never
+    auto-reclaimed (re-entering would re-poison the context).
+    """
+    _release_base_model_in_process()
+    _state["cloud_only_reason"] = reason
+    _state["model"] = None
+    _state["tokenizer"] = None
+    notify_server(SERVER_CLOUD_ONLY)
+
+
+def _record_cuda_fatal_exit() -> None:
+    """Append the current timestamp to the in-state-dir crash-loop history file.
+
+    Follows the trial_state atomic-write idiom: write to a .pending/ subdir then
+    rename into the final path.  Prunes entries older than
+    ``config.vram.cuda_fault_history_window_s`` on each write so the file never
+    grows unboundedly.
+
+    Best-effort boundary I/O — a filesystem error must NOT prevent os._exit from
+    running.  Callers catch all exceptions.
+    """
+    config = _state.get("config")
+    if config is None:
+        return
+    state_dir = (config.paths.data / "state").resolve()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    history_file = state_dir / "cuda_fault_history.json"
+    pending_dir = state_dir / ".pending"
+    pending_dir.mkdir(exist_ok=True)
+
+    now_ts = time.time()
+    window_s: int = config.vram.cuda_fault_history_window_s
+
+    # Read existing history, prune stale entries.
+    history: list[float] = []
+    if history_file.exists():
+        try:
+            history = json.loads(history_file.read_text(encoding="utf-8"))
+        except Exception:
+            history = []
+    history = [ts for ts in history if (now_ts - ts) < window_s]
+    history.append(now_ts)
+
+    payload = json.dumps(history).encode("utf-8")
+    pending_file = pending_dir / "cuda_fault_history.json"
+    pending_file.write_bytes(payload)
+    os.rename(pending_file, history_file)
+
+
+def _cuda_crashloop_exhausted() -> bool:
+    """True when fatal CUDA exits within the history window have reached the burst limit.
+
+    Reads ``<state>/cuda_fault_history.json``; returns False on any read error
+    (prefer os._exit retry over wrongly sticking cloud-only on a disk error).
+    """
+    config = _state.get("config")
+    if config is None:
+        return False
+    state_dir = (config.paths.data / "state").resolve()
+    history_file = state_dir / "cuda_fault_history.json"
+    if not history_file.exists():
+        return False
+    try:
+        history: list[float] = json.loads(history_file.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    now_ts = time.time()
+    window_s: int = config.vram.cuda_fault_history_window_s
+    burst: int = config.vram.cuda_crashloop_burst
+    recent = [ts for ts in history if (now_ts - ts) < window_s]
+    return len(recent) >= burst
+
+
+def _cuda_liveness_canary() -> None:
+    """Force the CUDA context to surface a latent sticky fault.
+
+    Runs an UNGUARDED torch.cuda.synchronize() so a poisoned context raises
+    before the 'ready' log is emitted.  Unlike safe_empty_cache (vram_guard.py,
+    which swallows synchronize failures — DEFECT D documented in the plan),
+    this propagates the error so the lifespan fail-fast handler can act on it
+    BEFORE advertising server-ready.  No-op when CUDA is unavailable or no
+    model is loaded.
+    """
+    if not torch.cuda.is_available() or _state.get("model") is None:
+        return
+    torch.cuda.synchronize()  # UNGUARDED — must raise on a sticky context
+
+
+def _fail_fast_cuda(exc: BaseException, phase: str) -> None:
+    """Record the fatal CUDA exit and os._exit(1), or degrade cloud-only if exhausted.
+
+    NEVER calls _release_base_model_in_process — that calls safe_empty_cache →
+    synchronize, which re-hits the sticky error on a poisoned context.  Recovery
+    is os._exit(1) ONLY (systemd Restart=on-failure → fresh CUDA context) unless
+    the crash-loop guard says retries are exhausted, in which case the server
+    degrades to cloud-only and continues serving.
+    """
+    logger.critical("FATAL CUDA fault during %s — %s", phase, exc)
+    if _cuda_crashloop_exhausted():
+        logger.critical(
+            "CUDA crash-loop guard: burst exhausted — degrading to persistent cloud-only "
+            "instead of restarting (reason='cuda_fault_persistent')"
+        )
+        _degrade_to_cloud_only("cuda_fault_persistent")
+        return  # stays up, cloud-only, ~0 GiB
+    try:
+        _record_cuda_fatal_exit()
+    except Exception:
+        logger.exception("_fail_fast_cuda: could not record fault history (best-effort)")
+    logger.critical(
+        "FATAL CUDA fault — calling os._exit(1) for a fresh context via systemd restart"
+    )
+    os._exit(1)  # systemd Restart=on-failure → fresh CUDA context
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
@@ -1924,9 +2057,16 @@ async def lifespan(app: FastAPI):
         _state["cloud_only_reason"] = "gpu_conflict"
 
     # Permanent cloud-only: the GPU pair will NEVER be loaded this process
-    # lifetime. explicit/gpu_conflict → no auto-reclaim. training (--defer-model)
-    # → auto-reclaim will load the GPU pair; reserve the bytes ahead of time.
-    permanent_cloud_only = _state.get("cloud_only_reason") in ("explicit", "gpu_conflict")
+    # lifetime. explicit/gpu_conflict/cuda_fault_persistent → no auto-reclaim.
+    # training (--defer-model) → auto-reclaim will load the GPU pair; reserve
+    # the bytes ahead of time. cuda_fault_persistent is included so a sticky
+    # CUDA context fault that lands the server cloud-only is never auto-reclaimed
+    # (re-entering the poisoned context would re-trigger the same fault).
+    permanent_cloud_only = _state.get("cloud_only_reason") in (
+        "explicit",
+        "gpu_conflict",
+        "cuda_fault_persistent",
+    )
 
     # Startup VRAM validation. Hoisted out of the ``if not cloud_only:`` branch
     # so --defer-model startups (cloud_only=True but GPU pair loaded later by
@@ -2035,7 +2175,14 @@ async def lifespan(app: FastAPI):
     # buffer is always rebuilt (rebuild_session_buffer=True, the default).
     # Note: _apply_config_in_progress is not set here (boot path); the re-probe gate
     # inside the routine treats a None/absent store as cold and runs the probe.
-    _build_config_derived_state(config, cloud_only=cloud_only)
+    try:
+        _build_config_derived_state(config, cloud_only=cloud_only)
+    except BaseException as _bcs_exc:
+        if is_fatal_cuda_fault(_bcs_exc):
+            _fail_fast_cuda(_bcs_exc, "preload")
+            cloud_only = True  # on the exhausted-burst path: _degrade ran, stays up
+        else:
+            raise
 
     # Post-load authoritative gate. Runs AFTER _build_config_derived_state so
     # the measured allocation includes the STT/TTS GPU footprint. On failure,
@@ -2059,12 +2206,8 @@ async def lifespan(app: FastAPI):
                 "headroom_gib": headroom_bytes / 2**30,
                 "reason": overflow_reason,
             }
-            _release_base_model_in_process()
-            _state["cloud_only_reason"] = "insufficient_vram"
-            _state["model"] = None
-            _state["tokenizer"] = None
+            _degrade_to_cloud_only("insufficient_vram")
             cloud_only = True
-            notify_server(SERVER_CLOUD_ONLY)
         elif base_pred is not None:
             delta_mib = (actual_bytes - base_pred) / (1024 * 1024)
             logger.info(
@@ -2317,6 +2460,18 @@ async def lifespan(app: FastAPI):
     # used by tresume's "defer to cloud-only" path.
     if _state.get("model") is not None:
         safe_empty_cache()
+
+    # Post-preload liveness canary: run an UNGUARDED synchronize() to surface
+    # any latent sticky CUDA context fault BEFORE advertising server-ready.
+    # safe_empty_cache (above) swallows synchronize failures; this does not.
+    try:
+        _cuda_liveness_canary()
+    except BaseException as _canary_exc:
+        if is_fatal_cuda_fault(_canary_exc):
+            _fail_fast_cuda(_canary_exc, "post-preload canary")
+            cloud_only = True  # on the exhausted-burst path: _degrade ran, stays up
+        else:
+            raise
 
     logger.info("ParaMem server ready — mode: %s, model: %s", _state["mode"], config.model_name)
 
@@ -4433,9 +4588,32 @@ def _build_store_contents(
                     len(_preload_keys_by_tier),
                     type(_source).__name__,
                 )
+                # T2a: pre-task GPU cooldown gate — wait until GPU is cool
+                # before the ~198-key generate burst.  Bounded by
+                # cooldown_gate_max_wait_boot_s (default 60 s <
+                # TimeoutStartSec=120) so boot cannot be SIGKILL-ed.
+                # Proceeds with a WARNING on timeout rather than hanging.
+                # Sits BEFORE the Tier-1-wrapped probe so the device settles
+                # before the fail-fast-guarded burst.
+                wait_for_cooldown(
+                    config.vram.cooldown_gate_threshold_c,
+                    config.vram.cooldown_gate_max_wait_boot_s,
+                    config.vram.cooldown_gate_poll_s,
+                    label="preload",
+                )
                 try:
                     _results = _source.probe(_preload_keys_by_tier, should_abort=should_abort)
-                except Exception:
+                except Exception as _probe_exc:
+                    if is_fatal_cuda_fault(_probe_exc):
+                        # Sticky context loss — do NOT swallow into boot_degraded.
+                        # Propagate so the lifespan fail-fast handler os._exit(1)s
+                        # into a fresh process (the only recovery).
+                        logger.critical(
+                            "preload_cache: FATAL CUDA context fault during probe "
+                            "— context poisoned, process restart required: %s",
+                            _probe_exc,
+                        )
+                        raise
                     logger.exception(
                         "preload_cache: source probe failed; store remains "
                         "empty for entries (queries will retry per-key on demand)"
@@ -4463,6 +4641,10 @@ def _build_store_contents(
                         },
                         "source": type(_source).__name__,
                     }
+                    # Recoverable partial cache miss only — a fatal CUDA context
+                    # loss is re-raised at the probe catch above and never reaches
+                    # this branch (the process would have os._exit'd or degraded
+                    # cloud-only via _fail_fast_cuda before arriving here).
                     logger.warning(
                         "boot_degraded: preload_cache could not materialise %d / %d "
                         "active keys via %s — recall self-heals via on-miss weight "
@@ -12119,6 +12301,16 @@ def _await_bg_cycle(
     _result_holder: dict = {}
 
     def _run() -> None:
+        # T2b (simulate-fold): pre-task GPU cooldown gate — same category as
+        # _run_interim_training and _run_full_cycle.  Simulate mode runs the
+        # same GPU extraction chain; only the persist sink differs (graph.json
+        # vs weights).  One call per fold kickoff on the BG worker thread.
+        wait_for_cooldown(
+            config.vram.cooldown_gate_threshold_c,
+            config.vram.cooldown_gate_max_wait_fold_s,
+            config.vram.cooldown_gate_poll_s,
+            label="fold",
+        )
         _result_holder["result"] = loop.run_consolidation_cycle(
             episodic_rels,
             procedural_rels,
@@ -12878,6 +13070,17 @@ def _extract_and_start_training():
         run the cross-cycle bookkeeping (promotion check, key-metadata save,
         session marking, router reload, state updates) after each cycle.
         """
+        # T2b: pre-task GPU cooldown gate — wait until GPU is cool before the
+        # training burst.  One call per interim-fold kickoff; NOT called
+        # per-session (that would invoke it inside the extraction loop).
+        # Bounded by cooldown_gate_max_wait_fold_s (default 300 s); the fold
+        # runs async off the event loop so a wait here does not block requests.
+        wait_for_cooldown(
+            config.vram.cooldown_gate_threshold_c,
+            config.vram.cooldown_gate_max_wait_fold_s,
+            config.vram.cooldown_gate_poll_s,
+            label="fold",
+        )
         try:
             # Callsite 4: BG-worker interim train.  Runs inside the BG worker
             # thread under ``gpu_lock_sync()`` (acquired by
@@ -13208,6 +13411,17 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
 
     def _run_full_cycle() -> None:
         """Run on the BG trainer worker thread under the GPU lock."""
+        # T2b: pre-task GPU cooldown gate — wait until GPU is cool before the
+        # full-cycle fold (extraction + training) burst.  One call per
+        # full-fold kickoff; NOT called inside the per-session extraction loop.
+        # Bounded by cooldown_gate_max_wait_fold_s (default 300 s); the fold
+        # runs async off the event loop so a wait here does not block requests.
+        wait_for_cooldown(
+            config.vram.cooldown_gate_threshold_c,
+            config.vram.cooldown_gate_max_wait_fold_s,
+            config.vram.cooldown_gate_poll_s,
+            label="fold",
+        )
         # Voice eviction: the standard full cycle (count > 0) collapses existing
         # interim slots (already-trained keys) into main — it does not run the
         # extraction chain, so the KV-cache spikes that motivate eviction do not

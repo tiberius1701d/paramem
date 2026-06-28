@@ -402,6 +402,12 @@ def _collect_boot_degraded_items(state: dict) -> list[AttentionItem]:
     un-cached keys until the cache re-warms.  Reported at ``info`` so the
     operator can see the cold-cache state and trigger a re-warm if desired.
 
+    This item represents ONLY the recoverable partial-miss case.  A fatal
+    CUDA context loss (sticky ``AcceleratorError`` / ``cudaErrorIllegalAddress``)
+    is handled by boot fail-fast (``_fail_fast_cuda`` → ``os._exit(1)`` or
+    cloud-only degrade) and is never surfaced here — the probe catch re-raises
+    before ``boot_degraded`` can be set.
+
     Parameters
     ----------
     state:

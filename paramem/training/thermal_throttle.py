@@ -120,6 +120,69 @@ def _gpu_temp() -> int | None:
     return None
 
 
+def wait_for_cooldown(
+    threshold_c: int,
+    max_wait_s: int,
+    poll_s: int = 5,
+    *,
+    label: str = "",
+) -> int | None:
+    """Block until GPU temp <= threshold_c, bounded by max_wait_s.
+
+    Mirrors gpu-cooldown.sh:wait_for_cooldown (gpu-cooldown.sh:218) using the
+    same _gpu_temp() reader the fold throttle uses.  Distinct from the
+    quiet-hours ThermalThrottleCallback (fan-noise control) — this is a
+    TDR-prevention pre-task gate.
+
+    No-op (returns immediately) when:
+
+    * ``threshold_c <= 0`` (gate disabled).
+    * ``_gpu_temp()`` returns ``None`` (sensor unavailable — never block GPU
+      work on a missing sensor; silently degrades to today's no-gate
+      behaviour).
+    * GPU is already at or below ``threshold_c``.
+
+    Bounded: on timeout it logs a WARNING and returns the still-hot temp so
+    the caller proceeds rather than hanging (boot SIGKILL / user-request
+    latency).  Returns the last observed temp (or ``None``).
+
+    Args:
+        threshold_c: Target temperature ceiling in °C.  0 disables the gate.
+        max_wait_s: Hard cap on how long to block in seconds.
+        poll_s: Seconds between successive temperature reads.
+        label: Optional site label for log messages (e.g. ``"preload"``,
+            ``"fold"``, ``"inference"``).
+    """
+    if threshold_c <= 0:
+        return None
+    temp = _gpu_temp()
+    if temp is None or temp <= threshold_c:
+        return temp
+    waited = 0
+    _tag = f" [{label}]" if label else ""
+    logger.info(
+        "cooldown gate%s: GPU %d°C > %d°C — waiting (cap %ds)",
+        _tag,
+        temp,
+        threshold_c,
+        max_wait_s,
+    )
+    while temp is not None and temp > threshold_c and waited < max_wait_s:
+        time.sleep(poll_s)
+        waited += poll_s
+        temp = _gpu_temp()
+    if temp is not None and temp > threshold_c:
+        logger.warning(
+            "cooldown gate%s: GPU still %d°C after %ds — proceeding",
+            _tag,
+            temp,
+            waited,
+        )
+    else:
+        logger.info("cooldown gate%s: GPU at %s°C — proceeding", _tag, temp)
+    return temp
+
+
 def _should_throttle_now(policy: ThermalPolicy, now: datetime | None = None) -> bool:
     """Whether the throttle is active right now under the policy's quiet-hours."""
     return is_thermal_policy_active(

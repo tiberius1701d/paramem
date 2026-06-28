@@ -61,6 +61,8 @@ def _make_hk_state(
     mock_config.consolidation.mode = consolidation_mode
     # Prevent ThermalPolicy.from_consolidation_config from comparing a MagicMock.
     mock_config.consolidation.training_temp_limit = 0
+    # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown fold gate.
+    mock_config.vram.cooldown_gate_threshold_c = 0
     # Ground incident/run-status I/O in a real path so the writes land in the
     # pytest tmp directory instead of creating a MagicMock/ tree at repo root.
     if tmp_path is not None:

@@ -1978,6 +1978,8 @@ class TestRunFullConsolidationSyncAccumulating:
         mock_config.consolidation.mode = "train"
         # training_temp_limit <= 0 → ThermalPolicy.from_consolidation_config returns None.
         mock_config.consolidation.training_temp_limit = 0
+        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown fold gate.
+        mock_config.vram.cooldown_gate_threshold_c = 0
         # Ground incident/run-status I/O in a real path so the writes land in
         # the pytest tmp directory instead of creating a MagicMock/ tree at
         # the repo root.
@@ -2137,6 +2139,8 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
         mock_config.consolidation.mode = "train"
         # training_temp_limit <= 0 prevents ThermalPolicy comparison with MagicMock.
         mock_config.consolidation.training_temp_limit = 0
+        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown fold gate.
+        mock_config.vram.cooldown_gate_threshold_c = 0
 
         mock_loop = MagicMock()
         mock_loop.model = MagicMock(name="model")
@@ -13705,6 +13709,8 @@ class TestRunFullCycleConsumePending:
         mock_config.consolidation.training_temp_limit = 0
         # VRAM config accessed in check_vram_headroom:
         mock_config.vram.vram_cache_headroom_gib = 0.5
+        # cooldown_gate_threshold_c <= 0 disables the wait_for_cooldown fold gate.
+        mock_config.vram.cooldown_gate_threshold_c = 0
         if tmp_path is not None:
             mock_config.paths.data = tmp_path
 

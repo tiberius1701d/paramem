@@ -638,6 +638,13 @@ vram:
   stt_workspace_factor: 1.1
   tts_piper_ort_context_mib: 300
   peft_overhead_per_adapter_mib: 10
+  cuda_crashloop_burst: 2
+  cuda_fault_history_window_s: 600
+  cooldown_gate_threshold_c: 52
+  cooldown_gate_poll_s: 5
+  cooldown_gate_max_wait_boot_s: 60
+  cooldown_gate_max_wait_fold_s: 300
+  cooldown_gate_max_wait_inference_s: 30
 
 # ============================================================================
 # SECURITY

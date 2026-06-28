@@ -347,6 +347,30 @@ class VramConfig:
     # ModulesToSave wrappers + adapter-config metadata + allocator alignment).
     # Larger target_modules sets shift this; re-measure if you extend to MLP.
     peft_overhead_per_adapter_mib: int = 10
+    # ── CUDA fail-fast crash-loop guard ─────────────────────────────────────
+    # In-process counter for consecutive fatal CUDA context faults (sticky
+    # cudaErrorIllegalAddress / AcceleratorError at boot).  Coupled to the
+    # systemd StartLimitBurst=3 / StartLimitIntervalSec=600 values in
+    # paramem-server.service: the in-process burst must be ONE BELOW the
+    # systemd burst so the process degrades to cloud-only on the last
+    # permitted restart rather than exiting (which would trip the systemd
+    # limiter and leave the unit dead instead of serving cloud-only).
+    # Change both together when tuning the restart policy.
+    cuda_crashloop_burst: int = 2
+    cuda_fault_history_window_s: int = 600
+    # ── Pre-task GPU cooldown gate (Tier-2 TDR-prevention) ──────────────────
+    # Before each GPU-intense burst (boot preload, training fold, inference
+    # generate) the server waits until GPU temp ≤ threshold_c.  Matches the
+    # gpu-cooldown.sh everyday-working threshold (52 °C); the device idles
+    # ~48–50 °C so the gate is instant in steady state and only blocks after a
+    # hot task.  Set threshold_c=0 to disable the gate entirely.
+    # Per-site max-wait caps prevent boot SIGKILL (< TimeoutStartSec=120),
+    # excessive fold delay, and indefinite user-request hangs.
+    cooldown_gate_threshold_c: int = 52
+    cooldown_gate_poll_s: int = 5
+    cooldown_gate_max_wait_boot_s: int = 60
+    cooldown_gate_max_wait_fold_s: int = 300
+    cooldown_gate_max_wait_inference_s: int = 30
 
     def __post_init__(self) -> None:
         if not (0.0 < self.process_cap_fraction <= 1.0):
@@ -377,6 +401,39 @@ class VramConfig:
             raise ValueError(
                 f"vram.peft_overhead_per_adapter_mib must be >= 0; "
                 f"got {self.peft_overhead_per_adapter_mib!r}"
+            )
+        if self.cuda_crashloop_burst < 1:
+            raise ValueError(
+                f"vram.cuda_crashloop_burst must be >= 1; got {self.cuda_crashloop_burst!r}"
+            )
+        if self.cuda_fault_history_window_s < 1:
+            raise ValueError(
+                f"vram.cuda_fault_history_window_s must be >= 1; "
+                f"got {self.cuda_fault_history_window_s!r}"
+            )
+        if self.cooldown_gate_threshold_c < 0:
+            raise ValueError(
+                f"vram.cooldown_gate_threshold_c must be >= 0 (0 = disabled); "
+                f"got {self.cooldown_gate_threshold_c!r}"
+            )
+        if self.cooldown_gate_poll_s < 1:
+            raise ValueError(
+                f"vram.cooldown_gate_poll_s must be >= 1; got {self.cooldown_gate_poll_s!r}"
+            )
+        if self.cooldown_gate_max_wait_boot_s < 0:
+            raise ValueError(
+                f"vram.cooldown_gate_max_wait_boot_s must be >= 0; "
+                f"got {self.cooldown_gate_max_wait_boot_s!r}"
+            )
+        if self.cooldown_gate_max_wait_fold_s < 0:
+            raise ValueError(
+                f"vram.cooldown_gate_max_wait_fold_s must be >= 0; "
+                f"got {self.cooldown_gate_max_wait_fold_s!r}"
+            )
+        if self.cooldown_gate_max_wait_inference_s < 0:
+            raise ValueError(
+                f"vram.cooldown_gate_max_wait_inference_s must be >= 0; "
+                f"got {self.cooldown_gate_max_wait_inference_s!r}"
             )
 
 
