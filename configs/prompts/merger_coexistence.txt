@@ -1,20 +1,27 @@
-Classify the relationship between two values for the predicate "{predicate}".
+Classify the cardinality of the predicate "{predicate}".
 
---- COEXIST ---
-Both values can be true simultaneously (multi-valued predicate).
-POSITIVE: Alex has_pet cat, and now Alex has_pet dog → COEXIST
-POSITIVE: Alex speaks German, and now Alex speaks French → COEXIST
+MULTI-VALUED → COEXIST (one subject can hold or do this with many different objects over time — creating, building, writing, owning, or knowing many things):
+- has_pet → COEXIST
+- developed → COEXIST
+- created → COEXIST
+- built → COEXIST
+- wrote → COEXIST
+- designed → COEXIST
+- speaks → COEXIST
+- visited → COEXIST
+- owns → COEXIST
+- worked_on → COEXIST
+- hobby → COEXIST
 
---- REPLACE ---
-The new value supersedes the old one (single-valued predicate).
-POSITIVE: Alex lives_in Munich, and now Alex lives_in Berlin → REPLACE
-POSITIVE: Alex date_of_birth 1990, and now Alex date_of_birth 1991 → REPLACE
+SINGLE-VALUED → REPLACE (a new value supersedes the old — only one can be current at a time):
+- date_of_birth → REPLACE
+- primary_residence → REPLACE
+- current_employer → REPLACE
+- lives_in → REPLACE
+- works_at → REPLACE
+- married_to → REPLACE
 
---- CLASSIFY ---
-Subject: {subject}
 Predicate: {predicate}
-Old value: {old_value}
-New value: {new_value}
 
 Reply with EXACTLY one of:
 - COEXIST

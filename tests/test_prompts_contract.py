@@ -24,7 +24,6 @@ from paramem.graph.extractor import (
     build_speaker_context,
     load_anonymization_prompt,
 )
-from paramem.graph.merger import _COEXISTENCE_PROMPT
 from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
 from paramem.graph.schema_config import (
     format_entity_types,
@@ -522,68 +521,48 @@ class TestMergerCoexistencePrompt:
     """Contract tests for the merger coexistence prompt.
 
     The 2-way parser in ``check_predicate_coexistence`` keys on the literal
-    strings ``COEXIST`` and ``REPLACE``.  The prompt must contain both keywords
-    and must render without leftover slots.
+    strings ``COEXIST`` and ``REPLACE``.  The prompt classifies the predicate
+    alone (no value pair) via a single ``{predicate}`` slot.
     """
 
+    def _load(self):
+        return _load_prompt("merger_coexistence.txt", required=True)
+
     def test_renders_without_leftover_slots(self):
-        """All four slots fill without KeyError; no leftover ``{slot}`` tokens."""
-        tmpl = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT)
-        rendered = tmpl.format(
-            predicate="owns_pet",
-            subject="Alex",
-            old_value="a cat",
-            new_value="a dog",
-        )
+        """The ``{predicate}`` slot fills; no leftover ``{slot}`` tokens remain."""
+        tmpl = self._load()
+        rendered = tmpl.format(predicate="owns_pet")
         assert "{predicate}" not in rendered
-        assert "{subject}" not in rendered
-        assert "{old_value}" not in rendered
-        assert "{new_value}" not in rendered
 
     def test_coexist_keyword_present(self):
         """``COEXIST`` must survive rendering — the parser keys on this literal."""
-        tmpl = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT)
-        rendered = tmpl.format(
-            predicate="owns_pet",
-            subject="Alex",
-            old_value="a cat",
-            new_value="a dog",
-        )
+        tmpl = self._load()
+        rendered = tmpl.format(predicate="owns_pet")
         assert "COEXIST" in rendered
 
     def test_replace_keyword_present(self):
         """``REPLACE`` must survive rendering — the parser keys on this literal."""
-        tmpl = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT)
-        rendered = tmpl.format(
-            predicate="owns_pet",
-            subject="Alex",
-            old_value="a cat",
-            new_value="a dog",
-        )
+        tmpl = self._load()
+        rendered = tmpl.format(predicate="owns_pet")
         assert "REPLACE" in rendered
 
     def test_aggregate_keyword_absent(self):
         """``AGGREGATE`` must NOT appear in the rendered prompt — the 2-way parser
         no longer expects or emits it; its presence would confuse the model.
         """
-        tmpl = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT)
-        rendered = tmpl.format(
-            predicate="speaks",
-            subject="Alex",
-            old_value="German",
-            new_value="English",
-        )
+        tmpl = self._load()
+        rendered = tmpl.format(predicate="speaks")
         assert "AGGREGATE" not in rendered, (
             "Prompt must not contain AGGREGATE — fold is now purely additive"
         )
 
-    def test_file_byte_equivalent_to_inline_default(self):
-        """The prompt file must be byte-equivalent to ``_COEXISTENCE_PROMPT`` after
-        ``.strip()`` so the fallback and the file produce identical model inputs.
-        """
-        file_path = _DEFAULT_PROMPT_DIR / "merger_coexistence.txt"
-        assert file_path.exists(), f"Prompt file not found: {file_path}"
-        assert file_path.read_text().strip() == _COEXISTENCE_PROMPT
+    def test_only_predicate_slot_present(self):
+        """The prompt must use only ``{predicate}`` — no value-pair slots."""
+        import re
+
+        tmpl = self._load()
+        slots = re.findall(r"\{(\w+)\}", tmpl)
+        assert set(slots) == {"predicate"}, f"Expected only {{predicate}} slot; found: {set(slots)}"
 
 
 class TestCheckPredicateCoexistenceParser:
@@ -616,7 +595,7 @@ class TestCheckPredicateCoexistenceParser:
                 return_value=[{"role": "user", "content": "test"}],
             ):
                 return check_predicate_coexistence(
-                    "Alex", "speaks", "German", "English", model, tokenizer
+                    "Alex", "speaks", model, tokenizer, "Classify {predicate}: COEXIST or REPLACE"
                 )
 
     def test_coexist_verdict_parsed(self):

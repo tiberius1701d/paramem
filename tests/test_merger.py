@@ -759,11 +759,11 @@ class TestMultiUserNameCollision:
 
 
 class TestPromptsDirOverride:
-    """Custom prompts_dir overrides the inline fallback constants."""
+    """Custom prompts_dir overrides the default prompt file."""
 
     def test_custom_prompts_dir_loaded_into_instance_attributes(self, tmp_path):
         """GraphMerger(prompts_dir=...) must resolve _coexistence_prompt from the
-        supplied directory, not from the inline _COEXISTENCE_PROMPT constant.
+        supplied directory rather than the default configs/prompts/ directory.
         """
         coexistence_content = "CUSTOM_COEXISTENCE_MARKER sentinel text"
         (tmp_path / "merger_coexistence.txt").write_text(coexistence_content)
@@ -771,20 +771,7 @@ class TestPromptsDirOverride:
         m = GraphMerger(prompts_dir=tmp_path)
 
         assert m._coexistence_prompt == coexistence_content.strip(), (
-            "Custom merger_coexistence.txt must override the inline fallback"
-        )
-
-    def test_missing_files_fall_back_to_inline_constants(self, tmp_path):
-        """A prompts_dir that lacks the prompt files must fall back to the
-        inline _COEXISTENCE_PROMPT constant.
-        """
-        from paramem.graph.merger import _COEXISTENCE_PROMPT
-
-        # tmp_path exists but contains no prompt files.
-        m = GraphMerger(prompts_dir=tmp_path)
-
-        assert m._coexistence_prompt == _COEXISTENCE_PROMPT, (
-            "Missing file must fall back to inline _COEXISTENCE_PROMPT"
+            "Custom merger_coexistence.txt must take precedence over the default directory"
         )
 
 
@@ -803,7 +790,7 @@ class TestModelContradictionAndRelease:
 
         verdict = "REPLACE" if is_single_valued else "COEXIST"
 
-        def _patched_coexistence(subject, predicate, old_value, new_value, mdl, tok, prompt=None):
+        def _patched_coexistence(subject, predicate, mdl, tok, prompt=None):
             return verdict
 
         return model, tokenizer, _patched_coexistence
@@ -1720,7 +1707,7 @@ class TestRemovalLedger:
         from paramem.graph.schema import Relation, SessionGraph
         from paramem.memory.persistence import _IK_KEY_ATTR
 
-        def _always_replace(subject, predicate, old_value, new_value, mdl, tok, prompt=None):
+        def _always_replace(subject, predicate, mdl, tok, prompt=None):
             return "REPLACE"
 
         m = GraphMerger(model=object(), tokenizer=object())  # non-None to trigger Case-2

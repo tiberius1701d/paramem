@@ -35,70 +35,44 @@ from paramem.graph.schema import Entity, Relation, SessionGraph
 
 logger = logging.getLogger(__name__)
 
-_COEXISTENCE_PROMPT = """\
-Classify the relationship between two values for the predicate "{predicate}".
-
---- COEXIST ---
-Both values can be true simultaneously (multi-valued predicate).
-POSITIVE: Alex has_pet cat, and now Alex has_pet dog → COEXIST
-POSITIVE: Alex speaks German, and now Alex speaks French → COEXIST
-
---- REPLACE ---
-The new value supersedes the old one (single-valued predicate).
-POSITIVE: Alex lives_in Munich, and now Alex lives_in Berlin → REPLACE
-POSITIVE: Alex date_of_birth 1990, and now Alex date_of_birth 1991 → REPLACE
-
---- CLASSIFY ---
-Subject: {subject}
-Predicate: {predicate}
-Old value: {old_value}
-New value: {new_value}
-
-Reply with EXACTLY one of:
-- COEXIST
-- REPLACE"""
-
 
 def check_predicate_coexistence(
     subject: str,
     predicate: str,
-    old_value: str,
-    new_value: str,
     model,
     tokenizer,
-    prompt: str = _COEXISTENCE_PROMPT,
+    prompt: str,
 ) -> str:
-    """Ask the model whether two values for the same predicate can coexist.
+    """Ask the model whether the predicate is single-valued (REPLACE) or multi-valued (COEXIST).
+
+    Classifies the *predicate* alone — no object values are sent to the model.
+    The verdict is cached per predicate by the caller so the model is called at
+    most once per unique predicate per merger instance.
 
     Returns the verdict string:
 
-    - ``"COEXIST"`` — values are independent; keep both edges.
-    - ``"REPLACE"`` — new value supersedes old; retire old edge.
+    - ``"COEXIST"`` — predicate is multi-valued; multiple objects can be held
+      simultaneously (e.g. ``speaks``, ``developed``, ``has_pet``).
+    - ``"REPLACE"`` — predicate is single-valued; a new value supersedes the old
+      (e.g. ``lives_in``, ``current_employer``, ``date_of_birth``).
 
     The default on an ambiguous response is ``"COEXIST"`` (safer —
     do not lose data).
 
     Args:
-        subject: Entity whose predicate cardinality is being judged.
-        predicate: The predicate shared by both values.
-        old_value: The existing object value for the predicate.
-        new_value: The incoming object value for the predicate.
+        subject: Entity whose predicate cardinality is being judged (used for
+            logging only; not injected into the prompt).
+        predicate: The predicate to classify.
         model: LLM to use for the cardinality judgment.
         tokenizer: Tokenizer paired with *model*.
-        prompt: Prompt template with ``{subject}``, ``{predicate}``,
-            ``{old_value}``, and ``{new_value}`` slots.  Defaults to
-            ``_COEXISTENCE_PROMPT``; pass a custom string (e.g. loaded via
-            ``_load_prompt``) to override without code changes.
+        prompt: Prompt template with a ``{predicate}`` slot.  Load from
+            ``merger_coexistence.txt`` via ``_load_prompt(..., required=True)``
+            and pass here — no inline fallback constant exists.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
 
-    prompt = prompt.format(
-        subject=subject,
-        predicate=predicate,
-        old_value=old_value,
-        new_value=new_value,
-    )
+    prompt = prompt.format(predicate=predicate)
 
     messages = adapt_messages(
         [
@@ -169,8 +143,8 @@ class GraphMerger:
                 :meth:`release` to drop the reference.
             tokenizer: Tokenizer paired with *model*.
             prompts_dir: Optional directory to load ``merger_coexistence.txt``
-                from.  Falls back to ``configs/prompts/`` in the project root,
-                then to the inline constant ``_COEXISTENCE_PROMPT``.
+                from.  Falls back to ``configs/prompts/`` in the project root.
+                The file is required; its absence raises :exc:`FileNotFoundError`.
                 Resolved once at construction so a config edit takes effect at the
                 next consolidation cycle (when a new merger instance is created).
         """
@@ -202,7 +176,9 @@ class GraphMerger:
         self._predicate_cardinality: dict[str, bool] = {}
         # Resolve prompts once at construction so a file edit takes effect next cycle.
         _pd = Path(prompts_dir) if prompts_dir else None
-        self._coexistence_prompt = _load_prompt("merger_coexistence.txt", _COEXISTENCE_PROMPT, _pd)
+        self._coexistence_prompt = _load_prompt(
+            "merger_coexistence.txt", prompts_dir=_pd, required=True
+        )
 
     def merge(
         self,
@@ -668,8 +644,6 @@ class GraphMerger:
                     verdict = check_predicate_coexistence(
                         subject,
                         normalized_pred,
-                        rivals[0][0],  # first rival object as old_value
-                        obj,
                         self.model,
                         self.tokenizer,
                         self._coexistence_prompt,
