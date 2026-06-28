@@ -56,8 +56,6 @@ class ExtractionFailed(RuntimeError):
         self.reason = reason
 
 
-_DEFAULT_EXTRACTION_SYSTEM = "You are a precise knowledge graph extractor. Output valid JSON only."
-
 # Single output-token budget for every LLM call in the extraction pipeline:
 # local extraction, anonymization, SOTA enrichment, plausibility (local +
 # cloud), graph-level enrichment. Threaded through extract_graph →
@@ -491,16 +489,6 @@ def build_speaker_context(
     return "\n" + template.format(speaker_id=speaker_id, speaker_name=effective_name) + "\n"
 
 
-_DEFAULT_EXTRACTION_PROMPT = """\
-Extract all entities and relations from this conversation transcript.{speaker_context}
-
-Extract as JSON with `entities` and `relations` arrays.
-
-Transcript:
-{transcript}
-"""
-
-
 def load_extraction_prompts(
     prompts_dir: str | Path | None = None,
     *,
@@ -539,26 +527,9 @@ def load_extraction_prompts(
         ``(system_prompt, extraction_prompt)`` tuple.
     """
     pd = Path(prompts_dir) if prompts_dir else None
-    system = _load_prompt(system_filename, _DEFAULT_EXTRACTION_SYSTEM, pd, model=model)
-    prompt = _load_prompt(user_filename, _DEFAULT_EXTRACTION_PROMPT, pd, model=model)
+    system = _load_prompt(system_filename, prompts_dir=pd, model=model, required=True)
+    prompt = _load_prompt(user_filename, prompts_dir=pd, model=model, required=True)
     return system, prompt
-
-
-_DEFAULT_PROCEDURAL_PROMPT = """\
-Extract preferences, habits, and routines from this conversation.{speaker_context}
-Only extract relation_type "preference". Return JSON.
-
-Transcript:
-{transcript}
-
-Return JSON with entities, relations, summary.
-"""
-
-# _DEFAULT_EXTRACTION_PROMPT and _DEFAULT_PROCEDURAL_PROMPT intentionally do
-# NOT include {entity_types} or {predicate_examples} placeholders — they are
-# self-contained fallbacks used only when the prompt files cannot be read.
-# The file-based prompts (extraction.txt, extraction_procedural.txt) carry
-# those placeholders and receive the formatted values via .format() kwargs.
 
 
 def load_procedural_prompt(
@@ -591,8 +562,8 @@ def load_procedural_prompt(
                order.  Only local-model extraction prompts are per-model.
     """
     pd = Path(prompts_dir) if prompts_dir else None
-    system = _load_prompt(system_filename, _DEFAULT_EXTRACTION_SYSTEM, pd, model=model)
-    prompt = _load_prompt(user_filename, _DEFAULT_PROCEDURAL_PROMPT, pd, model=model)
+    system = _load_prompt(system_filename, prompts_dir=pd, model=model, required=True)
+    prompt = _load_prompt(user_filename, prompts_dir=pd, model=model, required=True)
     return system, prompt
 
 
@@ -1792,116 +1763,11 @@ def _validate_with_ha_context(graph: SessionGraph, ha_context: dict) -> SessionG
     return graph
 
 
-_DEFAULT_ANONYMIZATION_PROMPT = """\
-Identify identifying names in the extracted personal facts and replace them \
-with type-prefixed placeholders. Each placeholder is `<Prefix>_<N>` where \
-`Prefix` is a PascalCase noun naming the entity's type (Person, City, Org, \
-Thing, University, Product, Project, Language, ... — pick the type-appropriate \
-one) and `N` is a positive integer. Each real name must map to a UNIQUE \
-placeholder; reuse the same placeholder for every occurrence of the same name.
-
-Rules:
-- Anonymize identifying names; leave common nouns and descriptive phrases \
-verbatim. When in doubt, leave verbatim.
-- Mapping totality: every placeholder in any anonymized fact MUST appear as \
-a value in `mapping`. Orphan placeholders cause the fact to be silently dropped.
-- Mapping direction: `real_name → placeholder`. Real name is the JSON KEY, \
-placeholder is the JSON VALUE.
-- Keep `predicate`, `relation_type`, and `confidence` of every fact unchanged.
-
-Facts to anonymize:
-{facts_json}
-
-Transcript (context only — do NOT echo or rewrite):
-{transcript}
-
-Return JSON only with exactly the keys `anonymized` and `mapping`. No prose, \
-no markdown, no extra keys.
-"""
-
 # Two-stage SOTA pipeline: enrichment first, then plausibility filtering.
 # Each stage has a single responsibility and a separate prompt — combining
 # them in one call (the previous "noise_filter" prompt) led to the LLM
 # expanding scope at the same time as filtering, producing inflated counts
 # and self-referential schema artifacts.
-
-_DEFAULT_ENRICHMENT_PROMPT = """\
-Review these extracted personal facts (anonymized — placeholders like Person_1). \
-Emit a small JSON delta naming only what to change. KEEP is the default; \
-unnamed input facts pass through untouched. Each input fact below carries its \
-zero-based index in square brackets — reference it via `modify` or `drop`.
-
-Tasks:
-1. Resolve coreference (e.g. "my wife" → `add` a `married_to` relation).
-2. Split compound facts: `drop` the compound index and `add` atomic facts.
-3. Symmetric predicates: for facts that hold in both directions (friend_of, married_to, \
-   sibling_of, colleague_of, neighbor_of, knows, met_with, ...), set `"symmetric": true` \
-   on the fact; the system canonicalizes direction. Asymmetric predicates (parent_of/child_of, \
-   manages/reports_to) omit the flag (or set false).
-4. Predicate dedup: per (subject, object) pair, emit at most one predicate via \
-   `drop` of the synonyms.
-
-You may mint new entities for things the extractor missed — use `{{Prefix_N}}` \
-braced placeholders and supply the matching span in `bindings`. Existing bare \
-placeholders (Person_1, City_1, Org_1, ...) stay bare; do NOT re-brace them.
-
-Conversation transcript (anonymized):
-{transcript}
-
-Extracted facts (anonymized, numbered):
-{facts_json}
-
-Return ONLY a JSON object with optional keys: `add` (array of new fact dicts), \
-`modify` (array of `{{"index": <int>, "fields": {{...}}}}`), `drop` (array of \
-integer indices), `bindings` (dict mapping new `Prefix_N` to exact transcript \
-spans). Empty `{{}}` if you have nothing to change.
-"""
-
-# NOTE: keep this template byte-equivalent to ``configs/prompts/sota_plausibility.txt``.
-# ``tests/test_prompts_contract.py::test_inline_default_matches_file`` enforces parity.
-# The file uses long markdown paragraphs; we preserve them via implicit string
-# concatenation so Ruff E501 doesn't force line-wraps that alter the rendered text.
-# fmt: off
-_DEFAULT_PLAUSIBILITY_PROMPT = (
-    "You are filtering enriched personal facts from a voice assistant conversation. For each numbered fact, choose one action:\n"  # noqa: E501
-    "- IGNORE it — keep the fact. Default action; when uncertain, IGNORE.\n"
-    "- ADD its index to the drop list — only when one of the rules R1-R6 below matches.\n"  # noqa: E501
-    "Ground every decision against the transcript. Never echo, modify, or add facts.\n"  # noqa: E501
-    "\n"
-    'Example — IGNORE: `{{"subject": "Alex", "predicate": "lives_in", "object": "Portland"}}` — supported by the transcript, so keep it.\n'  # noqa: E501
-    'Example — ADD: `{{"subject": "Person_1", "predicate": "has_name", "object": "Person_1"}}` — matches R1, so add its index to the drop list.\n'  # noqa: E501
-    "\n"
-    "## Drop rules — ADD a fact's index when any rule matches\n"
-    "\n"
-    "R1. Self-loop. `subject` and `object` are the same string, regardless of predicate\n"  # noqa: E501
-    "R2. Name-swap pair. Both `A has_name B` and `B has_name A` are present (also `named`, `is`, `equals`). Add both indices.\n"  # noqa: E501
-    "R3. Transcript contradiction. The transcript states a different value for the same subject and predicate.\n"  # noqa: E501
-    'R4. Conversation-role reference. Subject or object refers to a conversation-role label (e.g. "Assistant", "User", "Speaker", "the bot", "the model") rather than a real-world entity introduced by the transcript.\n'  # noqa: E501
-    'R5. Content-free object. Object provides no transcript-grounded claim — empty, whitespace-only, or a content-free placeholder (e.g. "Unknown", "None", "Various", "Something", "N/A").\n'  # noqa: E501
-    "R6. Namespaced system identifier. Subject or object is a system / automation identifier — a dot-separated or URI-shaped namespaced token (e.g. `media_player.sonos_office`, `sensor.temperature_kitchen`, `climate.kitchen_thermostat`) referring to a device, sensor, or service rather than a personal entity.\n"  # noqa: E501
-    "\n"
-    "## Input\n"
-    "\n"
-    "Each fact below is preceded by its zero-based index in square brackets. Use that index to refer to the fact in your output.\n"  # noqa: E501
-    "\n"
-    "Conversation transcript:\n"
-    "{transcript}\n"
-    "\n"
-    "Enriched facts (numbered):\n"
-    "{facts_json}\n"
-    "\n"
-    "## Output\n"
-    "\n"
-    'Return ONLY a single JSON object with the key "drop", whose value is an array of zero-based integer indices.\n'  # noqa: E501
-    "\n"
-    'Example with two drops: {{"drop": [3, 5]}}\n'
-    'Example for a clean input where nothing matches a rule: {{"drop": []}}\n'
-    "\n"
-    "Do NOT wrap the output in backticks, code fences, or any other prose.\n"
-    "Do NOT include the facts themselves. Do NOT modify any field of any fact. Do NOT emit the surviving (KEPT) indices — only the indices to drop.\n"  # noqa: E501
-)
-# fmt: on
-
 
 # Registry of SOTA plausibility validators that see only anonymized data.
 # Keyed by the provider name callers pass as `plausibility_judge`.
@@ -3739,7 +3605,7 @@ def load_anonymization_prompt() -> str:
     ``configs/prompts/anonymization.txt`` to tune; no code changes are
     needed.
     """
-    return _load_prompt("anonymization.txt", _DEFAULT_ANONYMIZATION_PROMPT)
+    return _load_prompt("anonymization.txt", required=True)
 
 
 def anonymize_with_local_model(
@@ -4150,7 +4016,7 @@ def _filter_with_sota(
     ``configs/prompts/sota_enrichment.txt`` to tune; no code changes are
     needed.
     """
-    enrichment_prompt = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
+    enrichment_prompt = _load_prompt("sota_enrichment.txt", required=True)
     prompt = enrichment_prompt.format(
         facts_json=_render_indexed_facts(anon_facts),
         transcript=anon_transcript or "(not available)",
@@ -4194,26 +4060,6 @@ _SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT = (
     "pairs for duplicate entities. Output valid JSON only."
 )
 
-_DEFAULT_GRAPH_ENRICHMENT_PROMPT = """\
-You are operating over a pre-merged, cross-transcript knowledge graph.
-Identify second-order cross-session relations implied by the input triples,
-and same_as pairs for nodes that refer to the same real-world entity.
-
-Rules:
-- Only emit relations with confidence >= 0.7.
-- Do NOT emit relations already in the input.
-- For symmetric predicates emit only ONE direction (subject < object, lexicographically).
-- relation_type must be one of: factual, temporal, preference, social.
-- subject and object must be node names from the input graph.
-
-Input triples (JSON):
-{triples_json}
-
-Return ONLY valid JSON:
-{{"relations": [{{"subject": "...", "predicate": "...", "object": "...",
-"relation_type": "...", "confidence": 0.0}}], "same_as": [["canonical", "variant"]]}}
-"""
-
 
 def _graph_enrich_with_sota(
     triples: list[dict],
@@ -4232,8 +4078,8 @@ def _graph_enrich_with_sota(
     - New cross-session second-order relations not already in the graph.
     - ``same_as`` pairs identifying duplicate nodes under different surface forms.
 
-    Loads ``sota_graph_enrichment.txt`` with ``_DEFAULT_GRAPH_ENRICHMENT_PROMPT``
-    as fallback. The prompt uses a ``{triples_json}`` placeholder.
+    Loads ``sota_graph_enrichment.txt`` (required). The prompt uses a
+    ``{triples_json}`` placeholder.
 
     Args:
         triples: List of ``{"subject", "predicate", "object", "relation_type"}``
@@ -4255,7 +4101,7 @@ def _graph_enrich_with_sota(
     ``configs/prompts/sota_graph_enrichment.txt`` to tune; no code changes
     are needed.
     """
-    enrichment_prompt = _load_prompt("sota_graph_enrichment.txt", _DEFAULT_GRAPH_ENRICHMENT_PROMPT)
+    enrichment_prompt = _load_prompt("sota_graph_enrichment.txt", required=True)
     try:
         prompt = enrichment_prompt.format(triples_json=json.dumps(triples, indent=2))
     except KeyError as exc:
@@ -4676,7 +4522,7 @@ def _plausibility_filter_with_sota(
     The prompt is external config — edit ``configs/prompts/sota_plausibility.txt``
     to tune; no code changes are needed.
     """
-    plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+    plaus_prompt = _load_prompt("sota_plausibility.txt", required=True)
     prompt = plaus_prompt.format(
         facts_json=_render_indexed_facts(enriched_anon_facts),
         transcript=anon_transcript or "(not available)",
@@ -4723,7 +4569,7 @@ def local_plausibility_filter(
     default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
     """
     _vram_snapshot(f"plaus_filter_entry n_facts={len(facts)}")
-    plaus_prompt = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+    plaus_prompt = _load_prompt("sota_plausibility.txt", required=True)
     prompt = plaus_prompt.format(
         facts_json=_render_indexed_facts(facts),
         transcript=transcript or "(not available)",

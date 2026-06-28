@@ -16,11 +16,6 @@ import re
 import pytest
 
 from paramem.graph.extractor import (
-    _DEFAULT_ANONYMIZATION_PROMPT,
-    _DEFAULT_ENRICHMENT_PROMPT,
-    _DEFAULT_EXTRACTION_PROMPT,
-    _DEFAULT_PLAUSIBILITY_PROMPT,
-    _DEFAULT_PROCEDURAL_PROMPT,
     build_speaker_context,
     load_anonymization_prompt,
 )
@@ -131,7 +126,7 @@ def _render(template: str, **values) -> str:
 
 class TestExtractionPrompt:
     def test_renders_with_speaker_context_empty(self):
-        tmpl = _load_prompt("extraction.txt", _DEFAULT_EXTRACTION_PROMPT)
+        tmpl = _load_prompt("extraction.txt", required=True)
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context(None, None),
@@ -146,7 +141,7 @@ class TestExtractionPrompt:
 
     def test_renders_with_speaker_context_set(self):
         """Directive pins Speaker0 as subject; display name injected as comprehension context."""
-        tmpl = _load_prompt("extraction.txt", _DEFAULT_EXTRACTION_PROMPT)
+        tmpl = _load_prompt("extraction.txt", required=True)
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context("Speaker0", "Alex"),
@@ -161,7 +156,7 @@ class TestExtractionPrompt:
 
     def test_renders_with_speaker_id_no_display_name(self):
         """Anonymous speaker: id used for both subject and context; no KeyError."""
-        tmpl = _load_prompt("extraction.txt", _DEFAULT_EXTRACTION_PROMPT)
+        tmpl = _load_prompt("extraction.txt", required=True)
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context("Speaker0", None),
@@ -177,7 +172,7 @@ class TestExtractionPrompt:
 class TestEnrichmentPromptContract:
     def test_renders_without_format_errors(self):
         """No stray single-brace placeholders that collide with .format()."""
-        tmpl = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
+        tmpl = _load_prompt("sota_enrichment.txt", required=True)
         # Must not raise KeyError — every literal brace pair escaped as
         # `{{` / `}}`.  ``str.format`` itself validates this.
         rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
@@ -190,7 +185,7 @@ class TestEnrichmentPromptContract:
         bare placeholders bare. Regressing the prompt to 'always emit braced'
         silently breaks de-anonymization.
         """
-        tmpl = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
+        tmpl = _load_prompt("sota_enrichment.txt", required=True)
         # Must instruct model to leave existing bare placeholders bare.
         # Specifically: not to re-brace incoming Person_1/City_1 tokens.
         keywords = ["bare", "leave", "existing", "NOT re-brace"]
@@ -212,7 +207,7 @@ class TestEnrichmentPromptContract:
         protocol — reconstructed locally from bindings + anon transcript)
         so the contract is now solely "facts ↔ bindings".
         """
-        tmpl = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
+        tmpl = _load_prompt("sota_enrichment.txt", required=True)
         # Bindings is the grounding contract; the prompt must name it.
         assert "bindings" in tmpl
         # Look for a hard requirement that braced placeholders appear in
@@ -246,7 +241,7 @@ class TestEnrichmentPromptContract:
         production graph snapshots (data/ha/debug/run_*/), even though
         the brace-binding contract itself is honoured for ``Event_*``.
         """
-        tmpl = _load_prompt("sota_enrichment.txt", _DEFAULT_ENRICHMENT_PROMPT)
+        tmpl = _load_prompt("sota_enrichment.txt", required=True)
         # Structural assertion: a Role_N braced placeholder must appear
         # in a positive-example block alongside multiple bound facts —
         # at minimum a date attribute and a company/location attribute.
@@ -280,7 +275,7 @@ class TestEnrichmentPromptContract:
 
 class TestPlausibilityPromptContract:
     def test_renders_without_format_errors(self):
-        tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+        tmpl = _load_prompt("sota_plausibility.txt", required=True)
         rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
         assert "{transcript}" not in rendered
         assert "{facts_json}" not in rendered
@@ -304,7 +299,7 @@ class TestPlausibilityPromptContract:
         Verify each rule's identifying substring still exists so a
         prompt edit that removes a rule is caught at unit-test time.
         """
-        tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+        tmpl = _load_prompt("sota_plausibility.txt", required=True)
         required_rules = [
             "self-loop",  # R1
             "name-swap",  # R2
@@ -327,7 +322,7 @@ class TestPlausibilityPromptContract:
         Surface wording — "Default action", "IGNORE", a "## KEEP" header — is
         free to evolve; the keep-by-default semantics and the ordering are not.
         """
-        tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+        tmpl = _load_prompt("sota_plausibility.txt", required=True)
         lower = tmpl.lower()
         # The default action must KEEP the fact (IGNORE), not drop it.
         assert "default action" in lower, (
@@ -362,7 +357,7 @@ class TestPlausibilityPromptContract:
         Regressing to "echo every fact" silently re-introduces the
         truncation failure mode, so this assertion locks the contract.
         """
-        tmpl = _load_prompt("sota_plausibility.txt", _DEFAULT_PLAUSIBILITY_PROMPT)
+        tmpl = _load_prompt("sota_plausibility.txt", required=True)
         # Must specify the drop-index-set object shape.
         assert '"drop"' in tmpl, (
             'Plausibility prompt must specify the drop-set output shape ({"drop": [<index>, ...]}).'
@@ -384,18 +379,6 @@ class TestPlausibilityPromptContract:
             "Mistral-7B EOS-mid-array truncation."
         )
 
-    def test_inline_default_matches_file(self):
-        """The inline ``_DEFAULT_PLAUSIBILITY_PROMPT`` is only used when the
-        file is missing. If it drifts from the file, production behaviour
-        silently flips on any deployment that loses ``configs/prompts/``.
-        Render both with the same inputs and require byte equality.
-        """
-        from pathlib import Path
-
-        file_tmpl = Path("configs/prompts/sota_plausibility.txt").read_text()
-        args = {"transcript": "Person_1 said hi.", "facts_json": "[]"}
-        assert _DEFAULT_PLAUSIBILITY_PROMPT.format(**args) == file_tmpl.format(**args)
-
 
 class TestProceduralPrompt:
     def test_renders_with_speaker_context_empty(self):
@@ -405,7 +388,7 @@ class TestProceduralPrompt:
         file-based prompt and collapses cleanly to an empty string so no
         dangling placeholder or extra blank lines remain.
         """
-        tmpl = _load_prompt("extraction_procedural.txt", _DEFAULT_PROCEDURAL_PROMPT)
+        tmpl = _load_prompt("extraction_procedural.txt", required=True)
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
             speaker_context=build_speaker_context(None, None),
@@ -425,7 +408,7 @@ class TestProceduralPrompt:
         main-extraction facts use the speaker id, creating two nodes for
         the same person.
         """
-        tmpl = _load_prompt("extraction_procedural.txt", _DEFAULT_PROCEDURAL_PROMPT)
+        tmpl = _load_prompt("extraction_procedural.txt", required=True)
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
             speaker_context=build_speaker_context("Speaker0", "Alex"),
@@ -457,8 +440,8 @@ class TestAnonymizationPrompt:
         )
 
     def test_default_renders_without_format_errors(self):
-        """_DEFAULT_ANONYMIZATION_PROMPT must render with all expected kwargs without KeyError."""
-        rendered = self._render(_DEFAULT_ANONYMIZATION_PROMPT)
+        """anonymization.txt must render with all expected kwargs without KeyError."""
+        rendered = self._render(_load_prompt("anonymization.txt", required=True))
         assert "{facts_json}" not in rendered
         assert "{transcript}" not in rendered
 
@@ -470,12 +453,12 @@ class TestAnonymizationPrompt:
         assert "{transcript}" not in rendered
 
     def test_shape_contract_present_in_default(self):
-        """The default prompt must teach the four parts of the shape contract:
+        """anonymization.txt must teach the four parts of the shape contract:
         well-formed shape, uniqueness, totality, direction."""
-        rendered = self._render(_DEFAULT_ANONYMIZATION_PROMPT)
+        rendered = self._render(_load_prompt("anonymization.txt", required=True))
         # Shape clause — `<Prefix>_<N>` or equivalent shape language.
         assert "PascalCase" in rendered or "Prefix" in rendered, (
-            "Default prompt must teach the placeholder shape (PascalCase + _<N>)."
+            "Anonymization prompt must teach the placeholder shape (PascalCase + _<N>)."
         )
         # Uniqueness clause.
         assert "UNIQUE" in rendered or "unique" in rendered
@@ -510,7 +493,7 @@ class TestAnonymizationPrompt:
         """After rendering, no stray {word} tokens should remain (only JSON literal braces)."""
         import re
 
-        rendered = self._render(_DEFAULT_ANONYMIZATION_PROMPT)
+        rendered = self._render(_load_prompt("anonymization.txt", required=True))
         # JSON literal braces are escaped as {{ }} in the template and appear as { } after render.
         # A simple check: no single { immediately followed by a letter (unrendered placeholder).
         stray = re.findall(r"(?<!\{)\{[a-z_]+\}", rendered)
