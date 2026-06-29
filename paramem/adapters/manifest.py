@@ -8,18 +8,13 @@ Schema history:
     Set at write time by the producer (interim or full-cycle path) and
     used by the Phase 4 full-cycle gate to decide "have we already
     consolidated the current window?" via stamp identity comparison.
-  * v3: added a now-retired field (silently dropped on load).
-  * v4: drops the v3 ``keyed_pairs_sha256`` field — knowledge lives solely in
-    the adapter weights.  v3 manifests on disk are read back transparently:
-    the legacy field is silently dropped and an INFO log is emitted once
-    per file.
+  * v3: retired — the ``keyed_pairs_sha256`` field it added is dropped on load.
+  * v4 (current): ``window_stamp`` is the only evolving field since v2.
 
-Forward-compat / auto-upgrade: ``_dict_to_manifest`` accepts v1–v3 manifests
-on read.  Absent ``window_stamp`` defaults to ``""``, and the legacy v3 fields
-are dropped on load.
-Empty ``window_stamp`` on the canonical main ``episodic`` slot is interpreted
-by the gate as "unknown window — first full cycle is due", so v1–v3 slots
-naturally trigger a re-consolidation that overwrites them with v4 on first run.
+Forward-compat: ``_dict_to_manifest`` accepts v1–v2 manifests on read.
+Absent ``window_stamp`` defaults to ``""``.  Empty ``window_stamp`` on the
+canonical main ``episodic`` slot is interpreted by the gate as "unknown
+window — first full cycle is due".
 ``synthesized`` retains the same forward-compat default of ``False`` when absent.
 
 On-disk layout
@@ -212,15 +207,13 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
 
     Schema-version handling:
       * v1 (legacy): auto-upgraded in-memory by defaulting ``window_stamp``
-        to ``""``. The on-disk file is left untouched until the next save,
-        which writes v2.  Empty ``window_stamp`` is interpreted by the
-        Phase 4 gate as "unknown window — first full cycle is due".
+        to ``""``. The on-disk file is left untouched until the next save.
+        Empty ``window_stamp`` is interpreted by the Phase 4 gate as
+        "unknown window — first full cycle is due".
       * v2: adds ``window_stamp``. v1 manifests have it absent; read back
         with ``window_stamp`` defaulted to ``""``.
-      * v3: adds a legacy hash field and a now-retired format field — both
-        silently dropped on load; an INFO log is emitted so operators can see
-        the upgrade in flight.
-      * v4 (current): drops the v3 legacy hash field.
+      * v3: legacy ``keyed_pairs_sha256`` field silently dropped on load.
+      * v4 (current): canonical schema.
       * Newer-than-current: rejected with ManifestSchemaError so callers
         do not silently downgrade.
 
@@ -248,13 +241,6 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
         raise ManifestSchemaError(
             f"schema_version={schema} is newer than supported "
             f"({MANIFEST_SCHEMA_VERSION}); refusing to downgrade silently."
-        )
-
-    # v3 → v4 back-compat: silently drop the legacy hash field if present.
-    if "keyed_pairs_sha256" in d:
-        logger.info(
-            "_dict_to_manifest: v3 manifest detected — dropping legacy "
-            "hash field (upgraded to v4 schema in memory)"
         )
 
     bm = d["base_model"]
@@ -288,8 +274,6 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
     window_stamp = d.get("window_stamp", "")
     if not isinstance(window_stamp, str):
         raise ManifestSchemaError(f"window_stamp must be str, got {type(window_stamp)!r}")
-
-    # v3 on-disk files may carry a retired format field; silently ignore it.
 
     return AdapterManifest(
         schema_version=d["schema_version"],

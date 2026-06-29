@@ -69,18 +69,18 @@ def _write_adapter_files(directory: Path, *, safetensors: bool = True) -> None:
 class TestCurrentInterimStamp:
     def test_stamp_matches_expected_format(self) -> None:
         """current_interim_stamp must return a string matching YYYYMMDDTHHMM."""
-        stamp = current_interim_stamp()
+        stamp = current_interim_stamp("every 1h")
         assert re.match(r"^\d{8}T\d{4}$", stamp), (
             f"Stamp {stamp!r} does not match YYYYMMDDTHHMM format"
         )
 
     def test_stamp_is_string(self) -> None:
         """current_interim_stamp must return a plain str."""
-        assert isinstance(current_interim_stamp(), str)
+        assert isinstance(current_interim_stamp("every 1h"), str)
 
     def test_stamp_length(self) -> None:
         """YYYYMMDDTHHMM is always exactly 13 characters."""
-        assert len(current_interim_stamp()) == 13
+        assert len(current_interim_stamp("every 1h")) == 13
 
 
 # ---------------------------------------------------------------------------
@@ -563,19 +563,11 @@ class TestCurrentInterimStampWithCadence:
         stamp = current_interim_stamp("03:00", _now=now)
         assert stamp == "20260418T0000"
 
-    def test_zero_arg_form_returns_current_minute(self) -> None:
-        """Zero-arg form (backward compat) returns floor-to-minute stamp."""
-        now = datetime(2026, 4, 18, 14, 47, 33)
-        stamp = current_interim_stamp(_now=now)
-        assert stamp == "20260418T1447"
-
     def test_off_variant_cadence_floors_to_nearest_hour(self) -> None:
         """Explicit off-variant ("off"/"disabled"/"none") falls back to 1-h boundaries.
 
         Callers that want to skip stamping entirely should take the
-        queue-branch earlier rather than rely on this fallback. Empty
-        string is reserved for the zero-arg form (raw minute, no
-        flooring — see ``test_zero_arg_form_returns_current_minute``).
+        queue-branch earlier rather than rely on this fallback.
         """
         now = datetime(2026, 4, 18, 14, 47, 0)
         for cadence in ("off", "disabled", "none"):

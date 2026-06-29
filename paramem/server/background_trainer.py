@@ -22,16 +22,8 @@ from pathlib import Path
 from typing import Callable
 
 from paramem.server.vram_guard import safe_empty_cache
-
-# Re-exported for ``paramem/server/app.py`` (/status endpoint) which imports
-# ``is_thermal_policy_active`` from this module by qualified name.  The
-# canonical home is now ``paramem.training.thermal_throttle``; the shim keeps
-# the existing import path working.
 from paramem.training.thermal_throttle import (
     ThermalPolicy,
-)
-from paramem.training.thermal_throttle import (
-    is_thermal_policy_active as is_thermal_policy_active,
 )
 from paramem.training.trainer import TrainingHooks
 from paramem.utils.config import AdapterConfig, TrainingConfig

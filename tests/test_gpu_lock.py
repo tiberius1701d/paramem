@@ -240,21 +240,21 @@ class TestQuietHoursPolicy:
     # --- Pure predicate ---
 
     def test_always_on_returns_true_ignoring_window(self):
-        from paramem.server.background_trainer import is_thermal_policy_active
+        from paramem.training.thermal_throttle import is_thermal_policy_active
 
         # Window strings are ignored in always_on mode.
         assert is_thermal_policy_active("always_on", "07:00", "22:00", self._dt(3)) is True
         assert is_thermal_policy_active("always_on", "07:00", "22:00", self._dt(15)) is True
 
     def test_always_off_returns_false_ignoring_window(self):
-        from paramem.server.background_trainer import is_thermal_policy_active
+        from paramem.training.thermal_throttle import is_thermal_policy_active
 
         assert is_thermal_policy_active("always_off", "00:00", "23:59", self._dt(3)) is False
         assert is_thermal_policy_active("always_off", "00:00", "23:59", self._dt(15)) is False
 
     def test_auto_daytime_window_work_laptop(self):
         """07:00–22:00 throttle — matches the server.yaml work-laptop profile."""
-        from paramem.server.background_trainer import is_thermal_policy_active
+        from paramem.training.thermal_throttle import is_thermal_policy_active
 
         # Inside window: at the desk, throttle on.
         assert is_thermal_policy_active("auto", "07:00", "22:00", self._dt(7, 0)) is True
@@ -267,7 +267,7 @@ class TestQuietHoursPolicy:
 
     def test_auto_nighttime_window_home_install(self):
         """22:00–07:00 throttle — matches the default.yaml home-install profile."""
-        from paramem.server.background_trainer import is_thermal_policy_active
+        from paramem.training.thermal_throttle import is_thermal_policy_active
 
         # Inside midnight-crossing window.
         assert is_thermal_policy_active("auto", "22:00", "07:00", self._dt(22, 0)) is True
@@ -281,14 +281,14 @@ class TestQuietHoursPolicy:
 
     def test_auto_malformed_window_falls_back_to_on(self):
         """Garbage HH:MM must not silently disable the throttle — prefer-silence default."""
-        from paramem.server.background_trainer import is_thermal_policy_active
+        from paramem.training.thermal_throttle import is_thermal_policy_active
 
         assert is_thermal_policy_active("auto", "not-a-time", "07:00", self._dt(15)) is True
         assert is_thermal_policy_active("auto", "", "", self._dt(15)) is True
 
     def test_auto_degenerate_zero_length_window(self):
         """start == end is a zero-length window — treat as silent always."""
-        from paramem.server.background_trainer import is_thermal_policy_active
+        from paramem.training.thermal_throttle import is_thermal_policy_active
 
         assert is_thermal_policy_active("auto", "12:00", "12:00", self._dt(12, 0)) is True
         assert is_thermal_policy_active("auto", "12:00", "12:00", self._dt(3, 0)) is True

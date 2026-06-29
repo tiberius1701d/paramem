@@ -45,7 +45,7 @@ def empty_adapter_router():
 
     router = MagicMock()
 
-    def route(text, speaker=None, speaker_id=None):
+    def route(text, speaker_id=None):
         # Non-personal probes ("What is the capital of France?") get
         # GENERAL so the abstention gate does not fire on them.
         if any(tok.lower() in {"i", "my", "me"} for tok in text.split()):

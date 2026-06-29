@@ -23,7 +23,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
-from paramem.graph.name_match import is_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -126,85 +125,13 @@ class SpeakerStore:
 
         if version >= _PROFILE_VERSION:
             self._profiles = data.get("speakers", {})
-        elif version == 5:
-            # v5 → v6: re-key profile dict and last_greeted dict from cased
-            # Speaker{N} keys to lowercase speaker{N} keys.  Voice embeddings
-            # and display names are VALUE data — only the dict keys change.
-            # _rebuild_centroids() called at the end of _load rekeys _centroids
-            # transitively because it iterates self._profiles.items().
-            legacy = data.get("speakers", {})
-            self._profiles = {k.lower() if is_speaker_id(k) else k: v for k, v in legacy.items()}
-            self._last_greeted = {
-                k.lower() if is_speaker_id(k) else k: v for k, v in self._last_greeted.items()
-            }
-            logger.info(
-                "Migrated speaker store v5 → v6 (%d profiles, lowercase keys)",
-                len(self._profiles),
-            )
-            self._save()
-        elif version == 4:
-            # v4 → v6: add next_anon_index field (defaulted to 0 above);
-            # also lowercase-rekey any cased Speaker{N} keys so they are not
-            # persisted as v6 with cased keys (v5→v6 branch fires only for
-            # version==5; v4 saves as v6 directly via _save()).
-            legacy = data.get("speakers", {})
-            self._profiles = {k.lower() if is_speaker_id(k) else k: v for k, v in legacy.items()}
-            self._last_greeted = {
-                k.lower() if is_speaker_id(k) else k: v for k, v in self._last_greeted.items()
-            }
-            logger.info("Migrated speaker store v4 → v6 (anonymous index, lowercase keys)")
-            self._save()
-        elif version == 3:
-            # v3 → v6: add preferred_language + next_anon_index fields;
-            # also lowercase-rekey any cased Speaker{N} keys.
-            legacy = data.get("speakers", {})
-            self._profiles = {k.lower() if is_speaker_id(k) else k: v for k, v in legacy.items()}
-            for profile in self._profiles.values():
-                profile.setdefault("preferred_language", "")
-            self._last_greeted = {
-                k.lower() if is_speaker_id(k) else k: v for k, v in self._last_greeted.items()
-            }
-            if self._profiles:
-                logger.info(
-                    "Migrated %d v3 profiles to v6 (language, anonymous index, lowercase keys)",
-                    len(self._profiles),
-                )
-                self._save()
-        elif version == 2:
-            # v2 → v6: single "embedding" → list "embeddings" + preferred_language;
-            # also lowercase-rekey any cased Speaker{N} keys.
-            legacy = data.get("speakers", {})
-            self._profiles = {}
-            for speaker_id, profile in legacy.items():
-                emb = profile.get("embedding", [])
-                norm_key = speaker_id.lower() if is_speaker_id(speaker_id) else speaker_id
-                self._profiles[norm_key] = {
-                    "name": profile["name"],
-                    "embeddings": [emb] if emb else [],
-                    "preferred_language": "",
-                }
-            self._last_greeted = {
-                k.lower() if is_speaker_id(k) else k: v for k, v in self._last_greeted.items()
-            }
-            if self._profiles:
-                logger.info("Migrated %d v2 profiles to v6 (lowercase keys)", len(self._profiles))
-                self._save()
         else:
-            # v1 → v5: name-keyed → Speaker{N}-keyed + multi-embedding + preferred_language
-            # _mint_anon_speaker_id() is safe here: _load runs single-threaded during
-            # __init__ before any other thread has access to this instance.
-            legacy = data.get("speakers", {})
-            self._profiles = {}
-            for name, embedding in legacy.items():
-                speaker_id = self._mint_anon_speaker_id()
-                self._profiles[speaker_id] = {
-                    "name": name,
-                    "embeddings": [embedding] if embedding else [],
-                    "preferred_language": "",
-                }
-            if self._profiles:
-                logger.info("Migrated %d v1 profiles to v5", len(self._profiles))
-                self._save()
+            raise ValueError(
+                f"Unsupported speaker store version {version!r} "
+                f"(expected >= {_PROFILE_VERSION}). "
+                "Migration rungs for v1–v5 have been removed. "
+                "Provide a v6 store or start fresh."
+            )
 
         # Back-fill enroll_method for profiles written before that field existed.
         # One-time migration, persisted on first load after the upgrade.

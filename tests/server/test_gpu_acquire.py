@@ -308,7 +308,6 @@ def test_apply_config_live_aborts_on_lock_timeout():
     mock_reload.assert_not_called()
     assert result["applied_live"] is False
     assert result["restart_required_reason"] == "lock_timeout"
-    assert result["auto_restart_scheduled"] is False
 
 
 def test_apply_config_live_aborts_when_consolidating():
@@ -339,7 +338,6 @@ def test_apply_config_live_aborts_when_consolidating():
     mock_reload.assert_not_called()
     assert result["applied_live"] is False
     assert result["restart_required_reason"] == "consolidating"
-    assert result["auto_restart_scheduled"] is False
 
 
 def test_apply_config_live_noop_skip_when_hash_unchanged():
@@ -440,15 +438,14 @@ def test_apply_config_live_rport_stt_carve_restart_eligible():
 
     mock_restart.assert_not_called()
     assert result["restart_required_reason"] == "stt_port_change"
-    # Server signals restart_eligible (CLI prompts); auto_restart_scheduled is always False.
+    # Server signals restart_eligible (CLI prompts); server does not fire restart.
     assert result["restart_eligible"] is True
-    assert result["auto_restart_scheduled"] is False
 
 
 def test_apply_config_live_rport_bind_failure_no_restart():
     """When the transient bind pre-flight raises OSError (port in use):
-    auto_restart_scheduled=False, port_in_use_reason is populated, and
-    _restart_service is NOT called (L1 constraint: caller fires restart).
+    port_in_use_reason is populated, and _restart_service is NOT called
+    (L1 constraint: caller fires restart).
     """
     import socket
     from pathlib import Path
@@ -491,14 +488,13 @@ def test_apply_config_live_rport_bind_failure_no_restart():
     mock_reload.assert_not_called()
     mock_restart.assert_not_called()
     assert result["applied_live"] is False
-    assert result["auto_restart_scheduled"] is False
     assert "port_in_use_reason" in result
     assert result["restart_required_reason"] == "stt_port_change"
 
 
 def test_apply_config_live_rpaths_carve_no_auto_restart():
     """A paths.sessions delta is classified as R-PATHS (paths_change);
-    auto_restart_scheduled=False (manual restart required, L1 constraint).
+    manual restart required (L1 constraint — server never self-fires restart).
     Config is NOT touched live; _live_reload_base_model IS still called (mixed
     delta: non-paths fields can be applied live, paths carve is signalled).
     """
@@ -535,7 +531,6 @@ def test_apply_config_live_rpaths_carve_no_auto_restart():
 
     mock_restart.assert_not_called()
     assert result["restart_required_reason"] == "paths_change"
-    assert result["auto_restart_scheduled"] is False
 
 
 # ════════════════════════════════════════════════════════════════════════════

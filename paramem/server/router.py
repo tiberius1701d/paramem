@@ -244,17 +244,13 @@ class QueryRouter:
     def route(
         self,
         text: str,
-        speaker: str | None = None,  # noqa: ARG002 — kept for API parity, see docstring
         speaker_id: str | None = None,
     ) -> RoutingPlan:
         """Route a query: classify intent, scope keys to the speaker.
 
         ``speaker_id`` is the privacy boundary — only the speaker's own
-        keys can reach ``plan.steps``.  ``speaker`` (display name) is
-        accepted for API back-compat with existing callers but is
-        intentionally NOT used for routing: the speaker's enrollment
-        must not drive intent classification.  Intent comes from the
-        query content via the encoder residual + HA-match fast path.
+        keys can reach ``plan.steps``.  Intent comes from the query
+        content via the encoder residual + HA-match fast path.
 
         Returns a :class:`RoutingPlan` with:
 

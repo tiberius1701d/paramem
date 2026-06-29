@@ -118,18 +118,6 @@ class TestCacheEntry:
         assert "source_predicate" not in entry
         assert "source_object" not in entry
 
-    def test_question_none_omitted(self):
-        loop = _make_loop()
-        entry = loop._cache_entry(
-            key="graph1",
-            subject="A",
-            predicate="p",
-            object="B",
-            speaker_id="s",
-        )
-        assert "question" not in entry
-        assert "answer" not in entry
-
 
 # ---------------------------------------------------------------------------
 # Tests: dedup_episodic

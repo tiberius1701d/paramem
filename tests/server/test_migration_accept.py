@@ -141,7 +141,6 @@ def _default_apply_stub():
         return {
             "applied_live": True,
             "restart_required_reason": None,
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": None,
         }
@@ -618,7 +617,7 @@ def _stub_apply(result: dict):
 
 
 class TestAcceptResponseContract:
-    """New response fields: applied_live, restart_required_reason, auto_restart_scheduled."""
+    """Response contract: applied_live and restart_required_reason fields."""
 
     def test_response_has_applied_live_field(self, tmp_path, monkeypatch):
         """AcceptResponse includes applied_live field."""
@@ -631,7 +630,6 @@ class TestAcceptResponseContract:
                 {
                     "applied_live": True,
                     "restart_required_reason": None,
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": None,
                 }
@@ -654,7 +652,6 @@ class TestAcceptResponseContract:
                 {
                     "applied_live": True,
                     "restart_required_reason": None,
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": None,
                 }
@@ -664,28 +661,6 @@ class TestAcceptResponseContract:
         resp = client.post("/migration/accept")
         body = resp.json()
         assert "restart_required_reason" in body
-
-    def test_response_has_auto_restart_scheduled_field(self, tmp_path, monkeypatch):
-        """AcceptResponse includes auto_restart_scheduled field."""
-        fresh = _make_state(tmp_path)
-        monkeypatch.setattr(app_module, "_state", fresh)
-        monkeypatch.setattr(
-            app_module,
-            "_apply_config_live",
-            _stub_apply(
-                {
-                    "applied_live": True,
-                    "restart_required_reason": None,
-                    "auto_restart_scheduled": False,
-                    "skipped": None,
-                    "cloud_only_reason": None,
-                }
-            ),
-        )
-        client = TestClient(app_module.app, raise_server_exceptions=False)
-        resp = client.post("/migration/accept")
-        body = resp.json()
-        assert "auto_restart_scheduled" in body
 
 
 class TestAcceptLiveApplySuccess:
@@ -702,7 +677,6 @@ class TestAcceptLiveApplySuccess:
                 {
                     "applied_live": True,
                     "restart_required_reason": None,
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": None,
                 }
@@ -726,7 +700,6 @@ class TestAcceptLiveApplySuccess:
                 {
                     "applied_live": True,
                     "restart_required_reason": None,
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": None,
                 }
@@ -757,7 +730,6 @@ class TestAcceptLiveApplySuccess:
             return {
                 "applied_live": True,
                 "restart_required_reason": None,
-                "auto_restart_scheduled": False,
                 "skipped": None,
                 "cloud_only_reason": None,
             }
@@ -787,7 +759,6 @@ class TestAcceptLiveApplyFailure:
                 {
                     "applied_live": False,
                     "restart_required_reason": None,
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": "apply_failed",
                 }
@@ -811,7 +782,6 @@ class TestAcceptLiveApplyFailure:
                 {
                     "applied_live": False,
                     "restart_required_reason": None,
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": "apply_failed",
                 }
@@ -839,7 +809,6 @@ class TestAcceptRPortCarve:
                 {
                     "applied_live": False,
                     "restart_required_reason": "stt_port_change",
-                    "auto_restart_scheduled": False,
                     "restart_eligible": True,
                     "skipped": None,
                     "cloud_only_reason": None,
@@ -854,7 +823,6 @@ class TestAcceptRPortCarve:
         body = resp.json()
         assert body["restart_required"] is True
         # The server never auto-fires a restart; restart_eligible signals the CLI to prompt.
-        assert body["auto_restart_scheduled"] is False
         assert body["restart_eligible"] is True
         assert body["restart_required_reason"] == "stt_port_change"
 
@@ -869,7 +837,6 @@ class TestAcceptRPortCarve:
                 {
                     "applied_live": False,
                     "restart_required_reason": "stt_port_change",
-                    "auto_restart_scheduled": False,
                     "restart_eligible": True,
                     "skipped": None,
                     "cloud_only_reason": None,
@@ -908,7 +875,7 @@ class TestAcceptRPortCarve:
         )
 
     def test_r_port_port_in_use_no_restart(self, tmp_path, monkeypatch):
-        """Port-in-use pre-flight result → auto_restart_scheduled=False, no restart."""
+        """Port-in-use pre-flight result — server does not fire restart."""
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
         monkeypatch.setattr(
@@ -918,7 +885,6 @@ class TestAcceptRPortCarve:
                 {
                     "applied_live": False,
                     "restart_required_reason": "stt_port_change",
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": None,
                     "port_in_use_reason": "stt.port=10300 is not bindable: already in use",
@@ -930,8 +896,6 @@ class TestAcceptRPortCarve:
         client = TestClient(app_module.app, raise_server_exceptions=False)
         resp = client.post("/migration/accept")
         assert resp.status_code == 200
-        body = resp.json()
-        assert body["auto_restart_scheduled"] is False
         # _restart_service must NOT have been called.
         assert not restart_calls, f"_restart_service was called unexpectedly: {restart_calls}"
 
@@ -940,7 +904,7 @@ class TestAcceptRPathsCarve:
     """R-PATHS carve: paths_change."""
 
     def test_r_paths_carve_manual_restart(self, tmp_path, monkeypatch):
-        """R-PATHS carve → restart_required=True, auto_restart_scheduled=False."""
+        """R-PATHS carve → restart_required=True, manual restart required."""
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
         monkeypatch.setattr(
@@ -950,7 +914,6 @@ class TestAcceptRPathsCarve:
                 {
                     "applied_live": False,
                     "restart_required_reason": "paths_change",
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": None,
                 }
@@ -963,7 +926,6 @@ class TestAcceptRPathsCarve:
         assert resp.status_code == 200
         body = resp.json()
         assert body["restart_required"] is True
-        assert body["auto_restart_scheduled"] is False
         assert body["restart_required_reason"] == "paths_change"
         assert not restart_calls, (
             f"_restart_service must NOT be called for R-PATHS: {restart_calls}"
@@ -980,7 +942,6 @@ class TestAcceptRPathsCarve:
                 {
                     "applied_live": False,
                     "restart_required_reason": "paths_change",
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": None,
                 }
@@ -1076,7 +1037,6 @@ class TestApplyConfigLiveRPathsShortCircuit:
         )
         assert result["applied_live"] is False
         assert result["restart_required_reason"] == "paths_change"
-        assert result["auto_restart_scheduled"] is False
         assert result["restart_eligible"] is False
 
     def test_paths_sessions_change_short_circuits_before_reload(self, tmp_path, monkeypatch):

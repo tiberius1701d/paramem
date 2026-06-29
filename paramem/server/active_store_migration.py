@@ -576,8 +576,6 @@ def _migrate_tier_simulate_to_train(
             predicate=kp.get("predicate", ""),
             object=kp.get("object", ""),
             speaker_id=kp.get("speaker_id", ""),
-            question=kp.get("question"),
-            answer=kp.get("answer"),
         )
         loop.store.put(name, key, entry)
 

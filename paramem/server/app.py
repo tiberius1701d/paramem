@@ -863,9 +863,6 @@ class AcceptResponse(BaseModel):
         ``"stt_port_change"``, ``"tts_port_change"``, ``"paths_change"``,
         ``"apply_failed"``, ``"lock_timeout"``, ``"consolidating"``, or
         ``None`` when no restart is needed.
-    auto_restart_scheduled:
-        Always ``False`` — the server never self-fires a restart.  Retained
-        for backward compatibility; use ``restart_eligible`` instead.
     restart_eligible:
         ``True`` when an R-PORT carve pre-flighted successfully and the CLI
         may trigger a prompted restart via the ``restart_hint`` command.
@@ -882,7 +879,6 @@ class AcceptResponse(BaseModel):
     pre_migration_backup_retained: bool
     applied_live: bool = False
     restart_required_reason: str | None = None
-    auto_restart_scheduled: bool = False
     restart_eligible: bool = False
 
 
@@ -909,9 +905,6 @@ class RollbackResponse(BaseModel):
         confirmed it was already applied).  ``False`` on apply failure.
     restart_required_reason:
         Named reason for ``restart_required=True``, or ``None``.
-    auto_restart_scheduled:
-        Always ``False`` — the server never self-fires a restart.  Retained
-        for backward compatibility; use ``restart_eligible`` instead.
     restart_eligible:
         ``True`` when an R-PORT carve pre-flighted successfully and the CLI
         may trigger a prompted restart via the ``restart_hint`` command.
@@ -925,7 +918,6 @@ class RollbackResponse(BaseModel):
     restart_hint: str
     applied_live: bool = False
     restart_required_reason: str | None = None
-    auto_restart_scheduled: bool = False
     restart_eligible: bool = False
 
 
@@ -3926,7 +3918,7 @@ async def status():
     # ``currently_throttling`` reflects the policy gate only; the actual throttle
     # additionally requires ``training_temp_limit > 0`` and temp above limit —
     # surfaced here is "would the policy allow throttling right now".
-    from paramem.server.background_trainer import is_thermal_policy_active
+    from paramem.training.thermal_throttle import is_thermal_policy_active
 
     thermal_policy = {
         "mode": config.consolidation.quiet_hours_mode,
@@ -5946,8 +5938,7 @@ def _apply_config_live() -> dict:
          reason.  On bind success returns ``restart_eligible=True`` so the
          CLI can prompt the operator and fire ``restart_hint`` via subprocess
          on consent.  ``_apply_config_live`` itself never calls
-         ``_restart_service``.  ``auto_restart_scheduled`` is always ``False``
-         (kept for backward compatibility; use ``restart_eligible`` instead).
+         ``_restart_service``.
        - ``paths.sessions`` / ``paths.data`` change → R-PATHS carve:
          short-circuits BEFORE any live reload.
          ``restart_required_reason="paths_change"``, ``restart_eligible=False``.
@@ -5993,7 +5984,6 @@ def _apply_config_live() -> dict:
             "applied_live": bool,
             "cloud_only_reason": str | None,
             "restart_required_reason": str | None,
-            "auto_restart_scheduled": bool,
             "restart_eligible": bool,
             "skipped": str | None,
         }``
@@ -6001,8 +5991,6 @@ def _apply_config_live() -> dict:
         ``restart_eligible`` is ``True`` when an R-PORT carve pre-flighted
         successfully and the CLI may trigger a prompted restart via
         ``restart_hint``.  The server never fires the restart itself.
-        ``auto_restart_scheduled`` is always ``False`` (kept for backward
-        compatibility).
     """
     import socket as _socket
 
@@ -6027,7 +6015,6 @@ def _apply_config_live() -> dict:
             "applied_live": False,
             "cloud_only_reason": _state.get("cloud_only_reason"),
             "restart_required_reason": "lock_timeout",
-            "auto_restart_scheduled": False,
             "restart_eligible": False,
             "skipped": None,
         }
@@ -6043,7 +6030,6 @@ def _apply_config_live() -> dict:
                 "applied_live": False,
                 "cloud_only_reason": _state.get("cloud_only_reason"),
                 "restart_required_reason": "consolidating",
-                "auto_restart_scheduled": False,
                 "restart_eligible": False,
                 "skipped": None,
             }
@@ -6081,7 +6067,6 @@ def _apply_config_live() -> dict:
                     "applied_live": True,
                     "cloud_only_reason": None,
                     "restart_required_reason": None,
-                    "auto_restart_scheduled": False,
                     "restart_eligible": False,
                     "skipped": "no_change",
                 }
@@ -6134,7 +6119,6 @@ def _apply_config_live() -> dict:
                     "applied_live": False,
                     "cloud_only_reason": _state.get("cloud_only_reason"),
                     "restart_required_reason": "paths_change",
-                    "auto_restart_scheduled": False,
                     "restart_eligible": False,
                     "skipped": None,
                 }
@@ -6179,7 +6163,6 @@ def _apply_config_live() -> dict:
                         "applied_live": False,
                         "cloud_only_reason": _state.get("cloud_only_reason"),
                         "restart_required_reason": carve_reason,
-                        "auto_restart_scheduled": False,
                         "restart_eligible": False,
                         "skipped": None,
                         "port_in_use_reason": port_in_use_reason,
@@ -6226,7 +6209,6 @@ def _apply_config_live() -> dict:
                         "applied_live": False,
                         "cloud_only_reason": _state.get("cloud_only_reason"),
                         "restart_required_reason": restart_required_reason,
-                        "auto_restart_scheduled": False,
                         "restart_eligible": True,
                         "skipped": None,
                     }
@@ -6277,7 +6259,6 @@ def _apply_config_live() -> dict:
             "applied_live": applied_live,
             "cloud_only_reason": _state.get("cloud_only_reason"),
             "restart_required_reason": restart_required_reason,
-            "auto_restart_scheduled": False,  # server never self-fires restart
             "restart_eligible": restart_eligible if applied_live else False,
             "skipped": None,
         }
@@ -9803,7 +9784,6 @@ async def migration_accept():
 
         applied_live: bool = apply_result.get("applied_live", False)
         apply_reason: str | None = apply_result.get("restart_required_reason")
-        auto_restart_scheduled: bool = False  # server never self-fires restart
         restart_eligible: bool = apply_result.get("restart_eligible", False)
 
         # c) Refresh config_drift AFTER the apply.
@@ -9888,7 +9868,6 @@ async def migration_accept():
             pre_migration_backup_retained=True,
             applied_live=applied_live,
             restart_required_reason=apply_reason,
-            auto_restart_scheduled=auto_restart_scheduled,
             restart_eligible=restart_eligible,
         )
 
@@ -10153,7 +10132,6 @@ async def migration_rollback():
                 restart_hint="",
                 applied_live=True,
                 restart_required_reason=None,
-                auto_restart_scheduled=False,
                 restart_eligible=False,
             )
 
@@ -10475,7 +10453,6 @@ async def migration_rollback():
                 "restart_hint": _RESTART_HINT,
                 "applied_live": applied_live,
                 "restart_required_reason": apply_reason,
-                "auto_restart_scheduled": False,
                 "restart_eligible": restart_eligible,
                 "archive_warning": {
                     "path": archive_path,
@@ -10499,7 +10476,6 @@ async def migration_rollback():
             restart_hint=_RESTART_HINT,
             applied_live=applied_live,
             restart_required_reason=apply_reason,
-            auto_restart_scheduled=False,
             restart_eligible=restart_eligible,
         )
 

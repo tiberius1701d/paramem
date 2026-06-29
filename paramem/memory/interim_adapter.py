@@ -8,10 +8,9 @@ consolidate_interim_adapters can call unload without importing app.py:
 
 It also provides timestamp and schedule helpers:
 
-  current_interim_stamp(schedule, max_interim_count) — returns the current
+  current_interim_stamp(refresh_cadence) — returns the current
       sub-interval stamp as ``YYYYMMDDTHHMM``, floored to the boundary of the
-      current sub-interval.  The zero-argument form (backward compat) uses the
-      current minute as the stamp.
+      current sub-interval.
   compute_schedule_period_seconds(schedule) — returns the full consolidation
       period in seconds for a schedule string.
 
@@ -172,7 +171,7 @@ def compute_schedule_period_seconds(schedule: str) -> int | None:
 
 
 def current_interim_stamp(
-    refresh_cadence: str = "",
+    refresh_cadence: str,
     *,
     _now: datetime | None = None,
 ) -> str:
@@ -184,26 +183,16 @@ def current_interim_stamp(
     within the same cadence window return the same stamp and a single
     interim adapter is reused for the entire window.
 
-    **When to call the zero-arg form.** Pass no arguments when you just
-    want the current minute — for example to generate a one-off stamp in a
-    test. The zero-arg form returns the raw current minute with no
-    flooring.
-
     Args:
         refresh_cadence: Interim refresh cadence (``"every 12h"``,
-            ``"every 30m"``, ``"daily"``, ``"HH:MM"``, etc.). An empty /
-            off-variant falls back to flooring to the nearest hour so
-            adapter names remain sensible boundaries even without a
-            configured cadence.
+            ``"every 30m"``, ``"daily"``, ``"HH:MM"``, etc.).  An off-variant
+            falls back to hourly flooring so adapter names remain sensible
+            boundaries even without a configured cadence.
 
     Returns:
         Timestamp string, e.g. ``"20260418T1430"`` for 2026-04-18 14:30 local.
     """
     now = _now if _now is not None else datetime.now()
-
-    # Zero-arg form: return current minute with no flooring.
-    if not refresh_cadence:
-        return now.strftime("%Y%m%dT%H%M")
 
     sub_interval = compute_schedule_period_seconds(refresh_cadence)
     if sub_interval is None:

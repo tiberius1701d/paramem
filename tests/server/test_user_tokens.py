@@ -726,25 +726,19 @@ class TestMintSpeakerIdValidation:
 
 
 # ---------------------------------------------------------------------------
-# v1 → v2 migration (rekey speaker_id to lowercase)
+# v1 store raises; v2 store loads normally
 # ---------------------------------------------------------------------------
 
 
 class TestTokenStoreMigrationV1ToV2:
-    """v1 → v2 migration: speaker_id values must be lowercased on load.
+    """v1 store raises ValueError (migration retired); v2 store loads normally."""
 
-    Uses a synthetic v1 fixture written directly to disk (bypasses _save so
-    no encryption is needed — the file is plaintext for simplicity, matching
-    the Security OFF mode that unit tests run under).
-    """
-
-    def test_v1_cased_speaker_id_lowercased_on_load(self, tmp_path):
-        """A v1 store with cased 'Speaker0' speaker_id is lowercased to 'speaker0' on load."""
+    def test_v1_store_raises(self, tmp_path):
+        """A v1 store raises ValueError — migration rung has been removed."""
         import json
 
         store_path = tmp_path / "tokens.json"
-        # Synthesize a v1 on-disk payload with cased Speaker0.
-        fake_hash = "a" * 64  # dummy sha256hex key
+        fake_hash = "a" * 64
         v1_payload = {
             "version": 1,
             "tokens": {
@@ -759,43 +753,13 @@ class TestTokenStoreMigrationV1ToV2:
         }
         store_path.write_text(json.dumps(v1_payload))
 
-        store = UserTokenStore(store_path)
+        import pytest
 
-        # After load+migration, the token's speaker_id must be lowercase.
-        entry = store._tokens.get(fake_hash)
-        assert entry is not None, "Token must survive migration"
-        assert entry["speaker_id"] == "speaker0", (
-            f"v1→v2 migration: expected 'speaker0', got {entry['speaker_id']!r}"
-        )
+        with pytest.raises(ValueError, match="Unsupported user-token store version"):
+            UserTokenStore(store_path)
 
-    def test_v1_none_speaker_id_unchanged(self, tmp_path):
-        """A v1 store with speaker_id=None passes through unchanged (unattributed token)."""
-        import json
-
-        store_path = tmp_path / "tokens.json"
-        fake_hash = "b" * 64
-        v1_payload = {
-            "version": 1,
-            "tokens": {
-                fake_hash: {
-                    "speaker_id": None,
-                    "label": "Shared Device",
-                    "created": "2026-01-01T00:00:00+00:00",
-                    "revoked": False,
-                    "scope": "chat",
-                }
-            },
-        }
-        store_path.write_text(json.dumps(v1_payload))
-
-        store = UserTokenStore(store_path)
-
-        entry = store._tokens.get(fake_hash)
-        assert entry is not None
-        assert entry["speaker_id"] is None, "None speaker_id must not be altered by migration"
-
-    def test_v2_store_not_re_migrated(self, tmp_path):
-        """A v2 store already has lowercase ids — migration must not run again."""
+    def test_v2_store_loads_normally(self, tmp_path):
+        """A v2 store loads without raising."""
         import json
 
         store_path = tmp_path / "tokens.json"

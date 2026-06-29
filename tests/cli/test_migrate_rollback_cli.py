@@ -33,7 +33,6 @@ _ROLLBACK_RESPONSE = {
     # No-op skip fields: rollback restored config A, memory already A.
     "applied_live": True,
     "restart_required_reason": None,
-    "auto_restart_scheduled": False,
     "skipped": "no_change",
 }
 

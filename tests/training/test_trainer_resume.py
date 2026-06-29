@@ -636,7 +636,6 @@ class TestStagingResumeCallbackOnSave:
             "training_config_fingerprint": fp_config,
             "ram_checkpoint_path": "",
             "disk_checkpoint_path": "",
-            "checkpoint_path": "",
             "started_at": "2026-06-21T00:00:00+00:00",
             "updated_at": "2026-06-21T00:00:00+00:00",
         }
@@ -728,7 +727,6 @@ class TestStagingResumeCallbackOnSave:
             "training_config_fingerprint": fp_config,
             "ram_checkpoint_path": "",
             "disk_checkpoint_path": str(ckpt_dir),
-            "checkpoint_path": "",
             "started_at": "2026-06-21T00:00:00+00:00",
             "updated_at": "2026-06-21T00:00:00+00:00",
         }
@@ -775,7 +773,6 @@ class TestStagingResumeCallbackOnSave:
             "training_config_fingerprint": fp_config,
             "ram_checkpoint_path": "",
             "disk_checkpoint_path": str(output_dir / "checkpoint-5"),  # dir absent
-            "checkpoint_path": "",
             "started_at": "2026-06-21T00:00:00+00:00",
             "updated_at": "2026-06-21T00:00:00+00:00",
         }
@@ -891,7 +888,6 @@ class TestFreshStartStaleCheckpointPurge:
             "training_config_fingerprint": fp_config + "_STALE",
             "ram_checkpoint_path": "",
             "disk_checkpoint_path": "",
-            "checkpoint_path": "",
             "started_at": "2026-01-01T00:00:00+00:00",
             "updated_at": "2026-01-01T00:00:00+00:00",
         }
@@ -1036,7 +1032,6 @@ class TestFreshStartStaleCheckpointPurge:
             "training_config_fingerprint": fp_config,
             "ram_checkpoint_path": "",
             "disk_checkpoint_path": str(valid_ckpt),
-            "checkpoint_path": "",
             "started_at": "2026-06-21T00:00:00+00:00",
             "updated_at": "2026-06-21T00:00:00+00:00",
         }

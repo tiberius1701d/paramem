@@ -71,9 +71,6 @@ _PARSE_ERROR = "parse_error"
 _SCHEMA_ERROR = "schema_error"
 _INCONSISTENT = "inconsistent"
 
-# Statuses that count as failures (used to build IntegrityReport.failures).
-_FAILURE_STATUSES = {_MISSING, _UNDECRYPTABLE, _PARSE_ERROR, _SCHEMA_ERROR, _INCONSISTENT}
-
 # Detail string used for the "no daily key" undecryptable case — the boot
 # wiring uses it to distinguish no-key from corruption.
 _DETAIL_NO_KEY = "daily identity not loaded"

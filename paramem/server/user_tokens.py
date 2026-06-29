@@ -120,22 +120,14 @@ class UserTokenStore:
             return
 
         version = data.get("version", 1)
-        self._tokens = data.get("tokens", {})
         if version < _STORE_VERSION:
-            # v1 → v2: lowercase every token's speaker_id if it is a speaker id.
-            # Live tokens confirmed to carry cased "Speaker0" — must rekey so that
-            # probe-filter comparisons (speaker_id != bk_spk) remain valid after
-            # the speaker profile store is also rekeyed to lowercase (A2 / v6).
-            for entry in self._tokens.values():
-                sid = entry.get("speaker_id")
-                if sid is not None and is_speaker_id(sid):
-                    entry["speaker_id"] = sid.lower()
-            logger.info(
-                "Migrated user-token store v%d → v%d (lowercase speaker_id)",
-                version,
-                _STORE_VERSION,
+            raise ValueError(
+                f"Unsupported user-token store version {version!r} "
+                f"(expected >= {_STORE_VERSION}). "
+                "Migration rung for v1 has been removed. "
+                "Provide a v2 store or start fresh."
             )
-            self._save()
+        self._tokens = data.get("tokens", {})
         logger.info("Loaded user-token store: %d entries", len(self._tokens))
 
     def _current_mtime(self) -> int | None:

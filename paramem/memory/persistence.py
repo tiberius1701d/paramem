@@ -355,27 +355,6 @@ def load_registry(path) -> dict:
     return json.loads(read_maybe_encrypted(_Path(path)).decode("utf-8"))
 
 
-def get_active_keys(registry: dict) -> list[str]:
-    """Return only active (non-stale) keys from an enriched registry.
-
-    Also handles the simple format (key → int) for backward compatibility.
-
-    Args:
-        registry: Either a simple ``{key: int}`` registry or an enriched
-            ``{key: {"status": str, ...}}`` registry.
-
-    Returns:
-        Sorted list of active key strings.
-    """
-    active = []
-    for key, entry in registry.items():
-        if isinstance(entry, int):
-            active.append(key)
-        elif isinstance(entry, dict) and entry.get("status", "active") == "active":
-            active.append(key)
-    return sorted(active)
-
-
 def commit_tier_slot(
     *,
     loop: "ConsolidationLoop",

@@ -337,7 +337,7 @@ def format_replacement_rules(path: str | None = None) -> str:
 _UNIVERSAL_PLACEHOLDER_RE = re.compile(r"^[A-Z][A-Za-z]*_\d+$")
 
 
-def anonymizer_placeholder_pattern(path: str | None = None) -> "re.Pattern[str]":
+def anonymizer_placeholder_pattern() -> "re.Pattern[str]":
     """Return the universal placeholder shape regex.
 
     The shape contract is ``<Prefix>_<N>`` where:
@@ -354,12 +354,6 @@ def anonymizer_placeholder_pattern(path: str | None = None) -> "re.Pattern[str]"
     * ``N`` is a positive integer; uniqueness is enforced by callers
       (the anonymizer prompt requires unique placeholders per real name,
       and ``_mapping_is_canonical`` validates).
-
-    The ``path`` argument is accepted for backward compatibility but
-    ignored — the shape is universal and does not depend on the
-    schema YAML.  The historical "configured-prefix-only" behavior was
-    retired when the entity_type schema went open (commit ``779c820``)
-    and the anonymizer prompt switched to a structural contract.
 
     Returns:
         A compiled ``re.Pattern`` matching the universal placeholder

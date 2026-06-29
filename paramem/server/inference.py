@@ -252,7 +252,7 @@ def handle_chat(
         # empty list and the branch was inert.  If we re-introduce
         # temporal queries, the writer side needs to be designed first.
         if router is not None:
-            plan = router.route(text, speaker=speaker, speaker_id=speaker_id)
+            plan = router.route(text, speaker_id=speaker_id)
         if plan is not None:
             routing_diags["intent"] = plan.intent.value
 

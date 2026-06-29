@@ -269,11 +269,9 @@ class TestPrivacyRouting:
         router = MagicMock()
         known = {e.lower() for e in (known_entities or [])}
 
-        def route(text, speaker=None, speaker_id=None):
+        def route(text, speaker_id=None):
             text_lower = text.lower()
             matched = [e for e in known if e in text_lower]
-            if speaker and speaker.lower() in known:
-                matched.append(speaker.lower())
             if matched:
                 return RoutingPlan(
                     steps=[
@@ -299,7 +297,7 @@ class TestPrivacyRouting:
 
         router = MagicMock()
 
-        def route(text, speaker=None, speaker_id=None):
+        def route(text, speaker_id=None):
             return RoutingPlan(
                 steps=[],
                 strategy="direct",
@@ -322,7 +320,7 @@ class TestPrivacyRouting:
 
         router = MagicMock()
 
-        def route(text, speaker=None, speaker_id=None):
+        def route(text, speaker_id=None):
             return RoutingPlan(
                 steps=[RoutingStep(adapter_name="episodic", keys_to_probe=["graph1"])],
                 strategy="targeted_probe",

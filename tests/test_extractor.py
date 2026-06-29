@@ -251,7 +251,7 @@ class TestStampSpeakerEntity:
                 Entity(name="Berlin", entity_type="place"),
             ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
         speaker_ent = next(e for e in result.entities if e.name == "speaker0")
         assert speaker_ent.speaker_id == "speaker0"
         berlin = next(e for e in result.entities if e.name == "Berlin")
@@ -265,7 +265,7 @@ class TestStampSpeakerEntity:
                 Entity(name="speaker0", entity_type="person"),
             ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
         third_party = next(e for e in result.entities if e.name == "Tobias Becker")
         assert third_party.speaker_id is None
         speaker_ent = next(e for e in result.entities if e.name == "speaker0")
@@ -281,7 +281,7 @@ class TestStampSpeakerEntity:
                 Entity(name="Vienna", entity_type="place"),
             ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
         s0 = next(e for e in result.entities if e.name == "speaker0")
         s1 = next(e for e in result.entities if e.name == "speaker1")
         assert s0.speaker_id == "speaker0"
@@ -292,13 +292,13 @@ class TestStampSpeakerEntity:
     def test_empty_entities_list_does_not_raise(self):
         """Empty entity list does not raise."""
         graph = self._make_graph(entities=[])
-        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
         assert result.entities == []
 
     def test_no_speaker_id_entity_returns_graph_unchanged(self):
         """When no entity has a speaker-id name, all speaker_id fields stay None."""
         graph = self._make_graph(entities=[Entity(name="Berlin", entity_type="place")])
-        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
         assert len(result.entities) == 1
         assert result.entities[0].speaker_id is None
 
@@ -310,7 +310,7 @@ class TestStampSpeakerEntity:
                 Entity(name="speaker0", entity_type="person"),
             ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name=None, speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
         ent = result.entities[0]
         # ent.name == "speaker0" == "speaker0".lower() → authoritative pin fires.
         assert ent.speaker_id == "speaker0"
@@ -323,19 +323,19 @@ class TestStampSpeakerEntity:
             ]
         )
         # Session speaker is speaker0; model emitted speaker1 — wrong digit.
-        result = _stamp_speaker_entity(graph, speaker_name=None, speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
         ent = result.entities[0]
         # ent.name ("speaker1") != "speaker0".lower() → falls to else branch.
         assert ent.speaker_id == "speaker1"
 
-    def test_speaker_name_none_still_stamps(self):
-        """speaker_name=None is accepted; stamping proceeds based on speaker_id only."""
+    def test_single_entity_stamped_by_speaker_id(self):
+        """Stamping proceeds based on speaker_id; entity receives authoritative id."""
         graph = self._make_graph(
             entities=[
                 Entity(name="speaker0", entity_type="person"),
             ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name=None, speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
         ent = result.entities[0]
         assert ent.speaker_id == "speaker0"
 
@@ -347,8 +347,8 @@ class TestStampSpeakerEntity:
                 Entity(name="Berlin", entity_type="place"),
             ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="speaker0")
-        result2 = _stamp_speaker_entity(result, speaker_name="Tobias", speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
+        result2 = _stamp_speaker_entity(result, speaker_id="speaker0")
         speaker_ent = next(e for e in result2.entities if e.name == "speaker0")
         assert speaker_ent.speaker_id == "speaker0"
         assert len(result2.entities) == 2
@@ -362,7 +362,7 @@ class TestStampSpeakerEntity:
                 Entity(name="speaker1", entity_type="person"),
             ]
         )
-        result = _stamp_speaker_entity(graph, speaker_name="Tobias", speaker_id="speaker0")
+        result = _stamp_speaker_entity(graph, speaker_id="speaker0")
         s0 = next(e for e in result.entities if e.name == "speaker0")
         s1 = next(e for e in result.entities if e.name == "speaker1")
         assert s0.speaker_id == "speaker0"

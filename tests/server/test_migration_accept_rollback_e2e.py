@@ -157,7 +157,6 @@ def _stub_apply_success():
         return {
             "applied_live": True,
             "restart_required_reason": None,
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": None,
         }
@@ -172,7 +171,6 @@ def _stub_apply_failure():
         return {
             "applied_live": False,
             "restart_required_reason": None,
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": "apply_failed",
         }
@@ -187,7 +185,6 @@ def _stub_apply_r_port():
         return {
             "applied_live": False,
             "restart_required_reason": "stt_port_change",
-            "auto_restart_scheduled": False,
             "restart_eligible": True,
             "skipped": None,
             "cloud_only_reason": None,
@@ -203,7 +200,6 @@ def _stub_apply_r_paths():
         return {
             "applied_live": False,
             "restart_required_reason": "paths_change",
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": None,
         }
@@ -226,7 +222,6 @@ def _stub_apply_reload_success_mutating():
         return {
             "applied_live": True,
             "restart_required_reason": None,
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": None,
         }
@@ -248,7 +243,6 @@ def _stub_apply_reload_failure_mutating():
         return {
             "applied_live": False,
             "restart_required_reason": None,
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": "apply_failed",
         }
@@ -434,7 +428,7 @@ class TestE2EAcceptPath:
         )
 
     def test_e2e_accept_r_port_carve_restart_eligible_fields(self, tmp_path, monkeypatch):
-        """E2E: R-PORT carve → restart_eligible=True, auto_restart_scheduled=False, named reason."""
+        """E2E: R-PORT carve → restart_eligible=True, named reason; server does not fire restart."""
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
         monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_r_port())
@@ -452,12 +446,11 @@ class TestE2EAcceptPath:
         body = resp.json()
         # Server signals restart_eligible (CLI prompts); it never fires the restart itself.
         assert body["restart_eligible"] is True
-        assert body["auto_restart_scheduled"] is False
         assert body["restart_required_reason"] == "stt_port_change"
         assert body["restart_required"] is True
 
     def test_e2e_accept_r_paths_carve_no_auto_restart(self, tmp_path, monkeypatch):
-        """E2E: R-PATHS carve → auto_restart_scheduled=False, DATA IS NOT MIGRATED banner."""
+        """E2E: R-PATHS carve → manual restart required, DATA IS NOT MIGRATED banner."""
         fresh = _make_state(tmp_path)
         monkeypatch.setattr(app_module, "_state", fresh)
         monkeypatch.setattr(app_module, "_apply_config_live", _stub_apply_r_paths())
@@ -473,7 +466,6 @@ class TestE2EAcceptPath:
         resp = client.post("/migration/accept")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["auto_restart_scheduled"] is False
         assert body["restart_required_reason"] == "paths_change"
         banners = fresh["migration"]["recovery_required"]
         assert any("DATA IS NOT MIGRATED" in b for b in banners), (
@@ -563,7 +555,6 @@ class TestE2ERollbackPath:
             lambda: {
                 "applied_live": True,
                 "restart_required_reason": None,
-                "auto_restart_scheduled": False,
                 "skipped": "no_change",
                 "cloud_only_reason": None,
             },
@@ -622,7 +613,6 @@ class TestE2ERollbackPath:
             lambda: {
                 "applied_live": True,
                 "restart_required_reason": None,
-                "auto_restart_scheduled": False,
                 "skipped": "no_change",
                 "cloud_only_reason": None,
             },

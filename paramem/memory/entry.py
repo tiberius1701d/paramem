@@ -14,9 +14,9 @@ Key properties:
   only guaranteed interface; natural-language questions are not trained.
 
 SimHash fingerprinting constants and helpers are defined directly in this
-module.  Registry-lifecycle helpers (``save_registry``, ``load_registry``,
-``get_active_keys``) are defined in :mod:`paramem.memory.persistence` and
-re-exported here so callers can import them from either module.
+module.  Registry-lifecycle helpers (``save_registry``, ``load_registry``)
+are defined in :mod:`paramem.memory.persistence` and re-exported here so
+callers can import them from either module.
 """
 
 import hashlib
@@ -474,7 +474,6 @@ def entry_fact_text(
 # persistence.py does NOT import entry.py → no import-time cycle.
 
 from paramem.memory.persistence import (  # noqa: E402, F401
-    get_active_keys,
     load_registry,
     save_registry,
 )

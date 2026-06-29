@@ -32,7 +32,6 @@ _ACCEPT_RESPONSE = {
     # Live-apply fields: applied_live=True on the normal accept path.
     "applied_live": True,
     "restart_required_reason": None,
-    "auto_restart_scheduled": False,
 }
 
 

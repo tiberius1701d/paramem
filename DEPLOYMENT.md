@@ -189,14 +189,14 @@ detection automatically.
 
 | Key | HF model id | VRAM notes |
 |-----|------------|------------|
-| `mistral` | `mistralai/Mistral-7B-Instruct-v0.3` | nf4, no cpu_offload — **deployment default in the example config** |
+| `mistral` | `mistralai/Mistral-7B-Instruct-v0.3` | nf4, no cpu_offload — **deployment default; current live-server model** |
 | `gemma` | `google/gemma-2-9b-it` | nf4, `cpu_offload=True`, `max_memory: {GPU: 7 GiB, CPU: 20 GiB}` — requires `llm_int8_enable_fp32_cpu_offload` |
 | `qwen3b` | `Qwen/Qwen2.5-3B-Instruct` | nf4, no cpu_offload — smallest model, fastest loads |
 | `qwen` | `Qwen/Qwen2.5-7B-Instruct` | nf4, no cpu_offload |
 | `ministral` | `mistralai/Ministral-8B-Instruct-2410` | nf4, no cpu_offload |
 | `llama` | `meta-llama/Llama-3.1-8B-Instruct` | nf4, no cpu_offload — gated model, requires `HF_TOKEN` |
 | `gemma4` | `principled-intelligence/gemma-4-E4B-it-text-only` | nf4, no cpu_offload |
-| `qwen3-4b` | `Qwen/Qwen3-4B-Instruct-2507` | nf4, no cpu_offload — current live-server model |
+| `qwen3-4b` | `Qwen/Qwen3-4B-Instruct-2507` | nf4, no cpu_offload |
 
 All entries verified against `MODEL_REGISTRY` in
 `paramem/server/config.py` lines 52–111.
@@ -959,14 +959,6 @@ Before editing any file under `configs/prompts/`:
 4. **Don't add a verbatim taxonomy slot or a long prose rule** unless a
    per-phase calibration measurement justifies it. The empirical record is
    that they make Mistral 7B worse, not better.
-5. **Inline-default parity is part of the contract.** Every prompt file
-   has a hardcoded fallback in `paramem/graph/extractor.py`
-   (`_DEFAULT_*_PROMPT` constants) that takes over when `configs/prompts/`
-   is missing (frozen container deployments).
-   `tests/test_prompts_contract.py::test_inline_default_matches_file`
-   enforces byte-for-byte parity. When you edit a prompt file, update
-   the matching inline default in the same commit — otherwise the test
-   goes red and operators with no `configs/prompts/` get a stale prompt.
 
 The phase-trace and calibration-loop machinery is documented inline in
 `paramem/graph/phase_trace.py` and `paramem/server/calibrate.py`.

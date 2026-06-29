@@ -449,34 +449,6 @@ class TestAnonymizerConfig:
         assert not pat.match("Person_"), "Pattern should NOT match 'Person_' (no digits)"
         assert not pat.match("Person_abc"), "Pattern should NOT match 'Person_abc' (non-digit)"
 
-    def test_pattern_independent_of_schema_yaml(self, tmp_path):
-        """The shape regex is universal — empty `anonymizer.prefixes` in
-        the schema YAML does NOT change the returned pattern.  This pins
-        the post-rewrite invariant: the `anonymizer.prefixes` block is
-        illustrative-only, not a gate.  Cross-cycle entity merge happens
-        on real names in :class:`paramem.graph.merger.GraphMerger`, not
-        on placeholder vocabulary."""
-        tmp = tmp_path / "empty_prefixes.yaml"
-        tmp.write_text(
-            "entity_types:\n  person: {anchor: 'schema:Person'}\n"
-            "fallback_entity_type: person\n"
-            "relation_types: [factual]\n"
-            "fallback_relation_type: factual\n"
-            "preferred_predicates: []\n"
-            "procedural_entity_types: [person]\n"
-            "procedural_predicate_groups: []\n"
-            "anonymizer:\n  prefixes: []\n"
-        )
-        reset_cache()
-        result = anonymizer_placeholder_pattern(path=str(tmp))
-        # Pattern is still the universal shape regex regardless of YAML content.
-        import re
-
-        assert isinstance(result, re.Pattern)
-        assert result.match("Person_1")
-        assert result.match("AnyType_1")  # invented prefix still accepted
-        reset_cache()
-
     def test_pattern_is_pattern_when_prefixes_nonempty(self):
         """Default config — must return a compiled Pattern (not None)."""
         import re

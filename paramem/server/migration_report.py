@@ -15,7 +15,6 @@ kwargs and are unit-testable without a running server.
 from __future__ import annotations
 
 import json
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -307,10 +306,9 @@ def build_comparison_report(
     pre_trial_graph: "Any | None" = None,
     trial_graph: "Any | None" = None,
 ) -> dict[str, Any]:
-    """Build the real comparison report for a TRIAL run.
+    """Build the comparison report for a TRIAL run.
 
-    Replaces :func:`build_comparison_report_placeholder`.  Schema version
-    is unchanged (1) — the additions (``pending``, ``pending_reason``,
+    Schema version is 1; the additions (``pending``, ``pending_reason``,
     ``sub_note``, ``sub_list``) are Optional additive-only fields.
 
     Parameters
@@ -359,39 +357,3 @@ def build_comparison_report(
         ],
         "operator_line": COMPARISON_REPORT_OPERATOR_LINE,
     }
-
-
-# ---------------------------------------------------------------------------
-# Backward-compat shim
-# ---------------------------------------------------------------------------
-
-
-def build_comparison_report_placeholder(gates_status: str) -> dict[str, Any]:
-    """Backward-compatible shim wrapping :func:`build_comparison_report`.
-
-    .. deprecated::
-        Use :func:`build_comparison_report` directly.  This shim will be
-        removed in a future slice.
-
-    Parameters
-    ----------
-    gates_status:
-        The current gates status string.  Passed through to the real
-        implementation as ``gates={"status": gates_status}``.
-
-    Returns
-    -------
-    dict[str, Any]
-        JSON-serialisable comparison report matching schema_version 1.
-    """
-    warnings.warn(
-        "build_comparison_report_placeholder is deprecated; "
-        "use build_comparison_report() directly.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return build_comparison_report(
-        gates={"status": gates_status},
-        pre_trial_graph_path=None,
-        trial_graph_path=None,
-    )

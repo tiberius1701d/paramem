@@ -505,7 +505,6 @@ class TestAcceptHandlerIsolation:
             return {
                 "applied_live": True,
                 "restart_required_reason": None,
-                "auto_restart_scheduled": False,
                 "skipped": None,
                 "cloud_only_reason": None,
                 "restart_eligible": False,
@@ -546,7 +545,6 @@ class TestAcceptHandlerIsolation:
             return {
                 "applied_live": False,
                 "restart_required_reason": None,
-                "auto_restart_scheduled": False,
                 "skipped": None,
                 "cloud_only_reason": "apply_failed",
                 "restart_eligible": False,
@@ -587,7 +585,6 @@ class TestAcceptHandlerIsolation:
             return {
                 "applied_live": True,
                 "restart_required_reason": None,
-                "auto_restart_scheduled": False,
                 "skipped": None,
                 "cloud_only_reason": None,
                 "restart_eligible": False,

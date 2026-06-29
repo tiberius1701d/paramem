@@ -1670,7 +1670,6 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     """Load server configuration from YAML file.
 
     Supports ${VAR_NAME} env var interpolation in all string values.
-    Accepts both new 'agents:' key and deprecated 'cloud:' key.
 
     Fresh-clone fallback: when ``path`` is the default operator-local
     location and the file does not exist (gitignored, never created), fall
@@ -1801,38 +1800,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
             f"    the factory defaults intentionally."
         )
 
-    # Consolidation — refresh_cadence is the single user-facing scheduling knob.
-    # Legacy configs carry `schedule` (the old full-period setting); translate
-    # with a WARNING so the operator can update their yaml.
     consolidation_raw = raw.get("consolidation", {})
-    legacy_schedule = consolidation_raw.pop("schedule", None)
-    if legacy_schedule is not None:
-        if "refresh_cadence" in consolidation_raw:
-            logger.warning(
-                "consolidation.schedule=%r and consolidation.refresh_cadence=%r both "
-                "present in yaml — using refresh_cadence, ignoring legacy schedule. "
-                "Remove `schedule` from your config.",
-                legacy_schedule,
-                consolidation_raw["refresh_cadence"],
-            )
-        else:
-            consolidation_raw["refresh_cadence"] = legacy_schedule
-            logger.warning(
-                "consolidation.schedule=%r is deprecated — rename to "
-                "consolidation.refresh_cadence. Effective full consolidation period "
-                "is now refresh_cadence × max_interim_count.",
-                legacy_schedule,
-            )
-    # Warn on legacy `simulate:` key rather than passing it to the dataclass
-    # constructor (which would raise TypeError).  The current API uses
-    # ``consolidation.mode: "simulate"`` as the authoritative knob.
-    _legacy_simulate = consolidation_raw.pop("simulate", None)
-    if _legacy_simulate is not None:
-        logger.warning(
-            "consolidation.simulate=%r is a legacy key — use "
-            "consolidation.mode='simulate' instead. The legacy key is ignored.",
-            _legacy_simulate,
-        )
     # Retired keys: training_save_strategy_bg and training_save_steps_bg were
     # removed when the override layer was unified into TrainingConfig directly.
     # Detect them and raise loud rather than silently dropping (dataclass

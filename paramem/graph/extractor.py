@@ -675,7 +675,7 @@ def extract_procedural_graph(
     # _stamp_speaker_entity runs on an already-validated graph; it cannot fail
     # on malformed model output and must not be swallowed by the parse guard.
     if speaker_id:
-        graph = _stamp_speaker_entity(graph, speaker_name=speaker_name, speaker_id=speaker_id)
+        graph = _stamp_speaker_entity(graph, speaker_id=speaker_id)
 
     if graph.relations and stt_correction:
         graph = _correct_entity_names(graph, transcript)
@@ -1253,7 +1253,7 @@ def _parse_extraction(
 
     # Post-process: stamp speaker_id on speaker-id entities.
     if speaker_id:
-        graph = _stamp_speaker_entity(graph, speaker_name=speaker_name, speaker_id=speaker_id)
+        graph = _stamp_speaker_entity(graph, speaker_id=speaker_id)
 
     logger.info(
         "Extracted graph: %d entities, %d relations (session=%s)",
@@ -1267,7 +1267,6 @@ def _parse_extraction(
 def _stamp_speaker_entity(
     graph: SessionGraph,
     *,
-    speaker_name: str | None,
     speaker_id: str,
 ) -> SessionGraph:
     """Stamp ``speaker_id`` on speaker-id entities in the extracted graph.
@@ -1292,16 +1291,9 @@ def _stamp_speaker_entity(
     Non-speaker entities (display names like ``"Tobias Becker"``, places, orgs)
     are left untouched: ``is_speaker_id`` returns ``False`` for them.
 
-    The ``speaker_name`` parameter is retained for call-site compatibility and
-    is passed to context-building helpers upstream; it is not used for entity
-    matching in this function.
-
     Args:
         graph: Parsed :class:`~paramem.graph.schema.SessionGraph` after
             schema validation.
-        speaker_name: Display name of the session speaker (e.g. ``"Tobias"``).
-            Accepted but not used for matching — kept for call-site API
-            compatibility.
         speaker_id: Authoritative speaker id (e.g. ``"speaker0"``).  Used as
             the authoritative-pin guard to detect wrong-digit model emissions.
 
@@ -3470,7 +3462,7 @@ def verify_anonymization_completeness(
     mapping: dict,
     anon_facts: list[dict],
     anon_transcript: str,
-    extra_pii_names: set[str] | dict[str, str] | None = None,
+    extra_pii_names: dict[str, str] | None = None,
     pii_scope: set[str] | frozenset[str] | None = None,
 ) -> list[str]:
     """Forward-path privacy guard — scope-driven.
@@ -3501,10 +3493,8 @@ def verify_anonymization_completeness(
     out-of-scope phrase.
 
     ``extra_pii_names``: names contributed by an independent NER pass
-    (see :func:`extract_pii_names_with_ner`).  When passed as a ``dict``
-    (the modern shape), it carries ``{name: type}`` and is filtered by
-    ``pii_scope``.  When passed as a ``set`` (back-compat), all names
-    are added unconditionally — caller is responsible for pre-filtering.
+    (see :func:`extract_pii_names_with_ner`).  Carries ``{name: type}``
+    and is filtered by ``pii_scope``.  Pass ``None`` to skip.
     """
     scope = _DEFAULT_PII_SCOPE if pii_scope is None else frozenset(pii_scope)
     if not scope:
@@ -3516,13 +3506,9 @@ def verify_anonymization_completeness(
         for n in (r.subject, r.object):
             if n and type_by_name.get(n) in scope:
                 real_names.add(n)
-    # Add externally-sourced names.  Dict form is filtered by scope;
-    # set form is added wholesale (caller must pre-filter).
+    # Add externally-sourced names filtered by scope.
     if extra_pii_names:
-        if isinstance(extra_pii_names, dict):
-            real_names |= {n for n, t in extra_pii_names.items() if n and t in scope}
-        else:
-            real_names |= {n for n in extra_pii_names if n}
+        real_names |= {n for n, t in extra_pii_names.items() if n and t in scope}
 
     # Case-insensitive set of all mapped strings for coverage check.
     # Mapping direction is technically {real_name: placeholder}, but models
@@ -3728,8 +3714,6 @@ _SOTA_PLAUSIBILITY_SYSTEM_PROMPT = (
     "You are a knowledge graph plausibility filter. "
     "Drop invalid facts only. Do NOT add or modify facts. Output valid JSON only."
 )
-# Backward-compatible alias for any external caller of the old name.
-_SOTA_SYSTEM_PROMPT = _SOTA_ENRICHMENT_SYSTEM_PROMPT
 
 
 # _DEFAULT_FILTER_MAX_TOKENS / _DEFAULT_FILTER_TEMPERATURE /

@@ -784,7 +784,6 @@ class TestStagingPromoteContract:
             "training_config_fingerprint": fp_cfg,
             "ram_checkpoint_path": "",
             "disk_checkpoint_path": str(ckpt_dir),
-            "checkpoint_path": "",
             "started_at": "2026-05-27T00:00:00+00:00",
             "updated_at": "2026-05-27T00:00:00+00:00",
         }
@@ -849,7 +848,6 @@ class TestStagingPromoteContract:
             "training_config_fingerprint": fp_cfg,
             "ram_checkpoint_path": str(ram_ckpt),
             "disk_checkpoint_path": str(disk_ckpt),
-            "checkpoint_path": "",
             "started_at": "2026-05-27T00:00:00+00:00",
             "updated_at": "2026-05-27T00:00:00+00:00",
         }

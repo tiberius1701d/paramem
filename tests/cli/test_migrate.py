@@ -713,7 +713,6 @@ class TestRenderApplyResult:
             {
                 "applied_live": True,
                 "restart_required_reason": None,
-                "auto_restart_scheduled": False,
                 "skipped": None,
                 "cloud_only_reason": None,
                 "restart_hint": "systemctl ...",
@@ -729,7 +728,6 @@ class TestRenderApplyResult:
             {
                 "applied_live": True,
                 "restart_required_reason": None,
-                "auto_restart_scheduled": False,
                 "skipped": "no_change",
                 "cloud_only_reason": None,
                 "restart_hint": "systemctl ...",
@@ -745,7 +743,6 @@ class TestRenderApplyResult:
             {
                 "applied_live": False,
                 "restart_required_reason": "paths_change",
-                "auto_restart_scheduled": False,
                 "skipped": None,
                 "cloud_only_reason": None,
                 "restart_hint": "systemctl ...",
@@ -761,7 +758,6 @@ class TestRenderApplyResult:
                 {
                     "applied_live": False,
                     "restart_required_reason": "paths_change",
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": None,
                     "restart_hint": "systemctl ...",
@@ -776,7 +772,6 @@ class TestRenderApplyResult:
                 {
                     "applied_live": False,
                     "restart_required_reason": "stt_port_change",
-                    "auto_restart_scheduled": False,
                     "skipped": None,
                     "cloud_only_reason": None,
                     "port_in_use_reason": "stt.port=10300 is not bindable",
@@ -811,7 +806,6 @@ class TestRenderApplyResult:
             {
                 "applied_live": False,
                 "restart_required_reason": "stt_port_change",
-                "auto_restart_scheduled": False,
                 "restart_eligible": True,
                 "skipped": None,
                 "cloud_only_reason": None,
@@ -830,7 +824,6 @@ class TestRenderApplyResult:
             {
                 "applied_live": False,
                 "restart_required_reason": None,
-                "auto_restart_scheduled": False,
                 "skipped": None,
                 "cloud_only_reason": "apply_failed",
                 "restart_hint": "systemctl --user restart paramem-server",
@@ -859,7 +852,6 @@ class TestRenderApplyResult:
         apply_result = {
             "applied_live": True,
             "restart_required_reason": None,
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": None,
             "restart_hint": "systemctl ...",
@@ -899,7 +891,6 @@ class TestMigrateAcceptSubcommandRendering:
         accept_result = {
             "applied_live": True,
             "restart_required_reason": None,
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": None,
             "restart_hint": "systemctl --user restart paramem-server",
@@ -917,7 +908,6 @@ class TestMigrateAcceptSubcommandRendering:
         accept_result = {
             "applied_live": True,
             "restart_required_reason": None,
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": None,
             "restart_hint": "systemctl ...",
@@ -938,7 +928,6 @@ class TestMigrateRollbackSubcommandRendering:
         rollback_result = {
             "applied_live": True,
             "restart_required_reason": None,
-            "auto_restart_scheduled": False,
             "skipped": "no_change",
             "cloud_only_reason": None,
             "restart_hint": "systemctl --user restart paramem-server",
@@ -961,7 +950,6 @@ class TestMigrateRollbackSubcommandRendering:
         rollback_result = {
             "applied_live": False,
             "restart_required_reason": "paths_change",
-            "auto_restart_scheduled": False,
             "skipped": None,
             "cloud_only_reason": None,
             "restart_hint": "systemctl --user restart paramem-server",

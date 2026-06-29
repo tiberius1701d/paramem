@@ -442,7 +442,6 @@ def _resolve_resume_checkpoint(
        the ``checkpoint-N`` dir written directly under ``output_dir`` by HF
        Trainer in the default ``save_steps_ram==0`` epoch-save mode.
        ``_StagingResumeCallback.on_save`` records whichever is present.
-    3. ``checkpoint_path`` — back-compat field for pre-existing files.
 
     Returns ``None`` when the file is absent, fingerprints mismatch, or no
     valid checkpoint directory is found.  A previously-recorded dir that was
@@ -464,8 +463,8 @@ def _resolve_resume_checkpoint(
         logger.debug("staging_resume.json config fingerprint mismatch — fresh start")
         return None
 
-    # 3-way preference: RAM → disk epoch mirror → legacy
-    for field_name in ("ram_checkpoint_path", "disk_checkpoint_path", "checkpoint_path"):
+    # 2-way preference: RAM → disk epoch mirror
+    for field_name in ("ram_checkpoint_path", "disk_checkpoint_path"):
         ckpt = state.get(field_name, "")
         if ckpt and Path(ckpt).is_dir():
             logger.info("Crash-resume: resolved checkpoint via %s → %s", field_name, ckpt)
@@ -817,7 +816,6 @@ def train_adapter(
             "training_config_fingerprint": _fingerprints["config"],
             "ram_checkpoint_path": "",
             "disk_checkpoint_path": "",
-            "checkpoint_path": "",
             "started_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }

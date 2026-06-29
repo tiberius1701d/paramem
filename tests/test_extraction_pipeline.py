@@ -3221,7 +3221,7 @@ class TestConsolidationScheduleConfigPrivacyGuard:
 
         minimal_yaml = tmp_path / "server.yaml"
         minimal_yaml.write_text(
-            "model: mistral\nconsolidation:\n  schedule: every 2h\n  mode: simulate\n"
+            "model: mistral\nconsolidation:\n  refresh_cadence: every 2h\n  mode: simulate\n"
         )
         config = load_server_config(minimal_yaml)
         # New fields must be present with defaults

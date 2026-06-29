@@ -8,10 +8,6 @@ paramem-server process lives in ``~/.config/gpu-guard/config.toml`` under
 This module only owns the paramem-internal contract for systemd env vars:
 stamping ``PARAMEM_HOLD_*`` on GPU acquire, and clearing them on release.
 
-Module-level ``consumer = adapter`` is kept as a backward-compatible alias so
-any caller still using ``--consumer paramem.gpu_consumer:consumer`` continues
-to get the env-stamp adapter (which is the correct behaviour — detection and
-release are now handled by the auto-loaded ConfigConsumer).
 """
 
 from __future__ import annotations
@@ -149,6 +145,3 @@ class ParamemEnvStampAdapter:
 
 # Module-level pre-instantiated adapter.
 adapter = ParamemEnvStampAdapter()
-
-# Backward-compatible alias for ``--consumer paramem.gpu_consumer:consumer``.
-consumer = adapter

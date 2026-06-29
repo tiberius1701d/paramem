@@ -20,8 +20,8 @@
 
 | Option | Pros | Cons | Decision |
 |--------|------|------|----------|
-| Qwen 2.5 3B | Best benchmarks at size, Apache 2.0, strong multilingual | Younger community than Llama | **Primary** — best quality, fully open license |
-| Llama 3.2 3B | Largest community, most tutorials, well-tested PEFT | Llama Community License (restrictions above 700M MAU) | **Secondary** — swap target for cross-architecture validation (design-supported; not empirically validated) |
+| Qwen 2.5 3B | Best benchmarks at size, Apache 2.0, strong multilingual | Younger community than Llama | **Historical** — initial validation platform; Mistral 7B is now the production default |
+| Llama 3.2 3B | Largest community, most tutorials, well-tested PEFT | Llama Community License (restrictions above 700M MAU) | **Candidate** — swap target for cross-architecture validation (design-supported; not empirically validated) |
 | Gemma 2 2B | Good quality, Google-backed | Smaller at 2B, Gemma license less permissive | Skip — 2B may underperform on graph extraction tasks |
 | Phi-3-mini (3.8B) | Excellent quality, MIT license | 3.8B tight on 8GB with QLoRA for training | Revisit if VRAM headroom allows |
 | SmolLM2 1.7B | HuggingFace native, Apache 2.0 | 1.7B likely too small for quality consolidation | Skip for primary; potential graph extractor |
@@ -51,7 +51,7 @@ All model-specific logic is isolated behind an abstraction that exposes:
 - `load_adapter(model, path, name) -> PeftModel`
 - `switch_adapter(model, name)`
 
-The consolidation loop, graph extractor, and evaluation harness operate against this interface, not against specific model implementations. Swapping Qwen for Llama requires changing one config value (design-supported, not empirically validated on Llama). Validated on three model families (Qwen 2.5 3B, Gemma 2 9B, Mistral 7B); broader validation pending.
+The consolidation loop, graph extractor, and evaluation harness operate against this interface, not against specific model implementations. Swapping models requires changing one config value. The production default is Mistral 7B Instruct v0.3. Validated on three model families (Qwen 2.5 3B, Gemma 2 9B, Mistral 7B); broader validation pending.
 
 ### AD-2: Multi-Adapter on Single Base Model
 

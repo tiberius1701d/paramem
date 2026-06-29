@@ -138,22 +138,6 @@ def resolve_to_node_key(
     return resolved
 
 
-@dataclass
-class CycleResult:
-    """Results from a single consolidation cycle."""
-
-    cycle_index: int
-    session_id: str
-    entities_extracted: int = 0
-    relations_extracted: int = 0
-    nodes_retained: int = 0
-    episodic_train_loss: Optional[float] = None
-    semantic_train_loss: Optional[float] = None
-    episodic_recall: Optional[float] = None
-    semantic_recall: Optional[float] = None
-    wall_clock_seconds: float = 0.0
-
-
 class TrialActiveError(RuntimeError):
     """Raised by ConsolidationLoop.guard_trial_state when a migration TRIAL is active.
 
@@ -708,14 +692,11 @@ class ConsolidationLoop:
         object: str,
         speaker_id: str,
         relation_type: str = "factual",
-        question: Optional[str] = None,
-        answer: Optional[str] = None,
     ) -> dict:
         """Build a uniform ``indexed_key_cache`` cache entry.
 
         Carries ``subject``/``predicate``/``object`` as the canonical triple
-        fields.  Optional ``question`` and ``answer`` are kept for callers that
-        carry them (e.g. boot-time seeders reading legacy disk shapes).
+        fields.
 
         Using this helper for every cache-write site ensures the uniform shape
         is maintained by construction — every downstream reader (promotion-match,
@@ -732,13 +713,11 @@ class ConsolidationLoop:
                 (e.g. ``"factual"``, ``"preference"``, ``"temporal"``,
                 ``"social"``).  Defaults to ``"factual"`` for legacy callers
                 that pre-date this field; pass explicitly at every new site.
-            question: Optional legacy question text; omit for entry-format keys.
-            answer: Optional legacy answer text; omit for entry-format keys.
 
         Returns:
             Dict with the canonical cache shape.
         """
-        entry: dict = {
+        return {
             "key": key,
             "subject": subject,
             "predicate": predicate,
@@ -746,11 +725,6 @@ class ConsolidationLoop:
             "speaker_id": speaker_id,
             "relation_type": relation_type,
         }
-        if question is not None:
-            entry["question"] = question
-        if answer is not None:
-            entry["answer"] = answer
-        return entry
 
     def _ensure_store(self) -> None:
         """Auto-create a :class:`MemoryStore` when the loop has no store yet.
@@ -765,52 +739,9 @@ class ConsolidationLoop:
 
             self.store = MemoryStore(replay_enabled=True)
 
-    # ------------------------------------------------------------------
-    # Per-tier registry helpers
-    # ------------------------------------------------------------------
-
-    def _tier_registry(self, tier: str) -> KeyRegistry:
-        """Return the per-tier registry, creating it lazily.
-
-        Raises ``RuntimeError`` when replay is disabled.  Thin passthrough to
-        :meth:`MemoryStore.registry` — kept on the loop because many internal
-        sites call it with a stable tier name.
-        """
-        if not self.store.replay_enabled:
-            raise RuntimeError("indexed_key_replay not enabled")
-        return self.store.registry(tier)
-
     def _all_active_keys(self) -> list[str]:
         """Every active key across every registered tier — order is tier-then-insertion."""
         return self.store.all_active_keys()
-
-    def _safe_kp_from_cache(self, key: str) -> dict | None:
-        """Return a training-ready keyed-pair from the in-RAM cache, or ``None``.
-
-        Used by the existing-key reconstruction loops as a last-resort
-        fallback when ``probe_entries`` / ``probe_key`` fails (typically when
-        the adapter isn't mountable due to a hash mismatch).
-
-        The boot-time ``seed_key_metadata`` populates the store with partial
-        entries (``speaker_id`` only — no subject/predicate/object).  Treating
-        those entries as usable crashes the cycle with ``KeyError: 'subject'``.
-        This helper returns ``None`` for partial entries so the caller can skip
-        them cleanly.
-        """
-        qa = self.store.get(key)
-        if qa is None:
-            return None
-        if not all(f in qa for f in ("subject", "predicate", "object")):
-            return None
-        return {
-            "key": key,
-            "subject": qa["subject"],
-            "predicate": qa["predicate"],
-            "object": qa["object"],
-        }
-        if not all(f in qa for f in ("question", "answer")):
-            return None
-        return {"key": key, "question": qa["question"], "answer": qa["answer"]}
 
     def _recall_passing_keys(
         self,
@@ -2021,9 +1952,9 @@ class ConsolidationLoop:
                 ``"episodic"``, ``"semantic"``, ``"procedural"``, or
                 ``"episodic_interim_<stamp>"``.
             interim_stamp: Optional YYYYMMDDTHHMM stamp passed directly by
-                ``run_consolidation_cycle``.  The ``_current_interim_stamp``
-                instance-attribute fallback is preserved for backward-compat but
-                is always ``None`` now that the attribute is never set.
+                ``run_consolidation_cycle``.  Falls back to the
+                ``_current_interim_stamp`` instance attribute when set (e.g.
+                during housekeeping folds).
 
         Returns:
             Absolute :class:`~pathlib.Path` to give HF Trainer.
@@ -6432,60 +6363,6 @@ class ConsolidationLoop:
             )
 
         return recall_rate
-
-    def _append_capacity_ceiling_log(
-        self,
-        *,
-        tier: str,
-        n_keys_pre: int,
-        n_keys_post: int,
-        recall_pre: float,
-        recall_post: float,
-        log_path: str | Path | None = None,
-    ) -> None:
-        """Append one JSONL row to the capacity-ceiling log.
-
-        Creates the parent directory if absent (idempotent).  Each row records
-        the tier, key counts, and recall rates at the time of a ceiling event so
-        operators can diagnose capacity degradation without re-running evals.
-
-        Args:
-            tier: The adapter tier that tripped the ceiling (``"episodic"`` etc.).
-            n_keys_pre: Number of keys in the tier before the rebuild attempt.
-            n_keys_post: Number of keys in the tier after the rebuild attempt.
-            recall_pre: Estimated recall rate before the rebuild (1.0 by default
-                when no pre-rebuild probe is available).
-            recall_post: Recall rate measured immediately after the rebuild.
-            log_path: Override path for the JSONL file.  Defaults to
-                ``outputs/capacity_ceiling.jsonl``.
-        """
-        import datetime
-        import json
-
-        if log_path is None:
-            log_path = Path("outputs") / "capacity_ceiling.jsonl"
-        log_path = Path(log_path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        row = {
-            "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
-            "tier": tier,
-            "n_keys_pre": n_keys_pre,
-            "n_keys_post": n_keys_post,
-            "recall_pre": recall_pre,
-            "recall_post": recall_post,
-        }
-        with open(log_path, "a") as f:
-            f.write(json.dumps(row) + "\n")
-
-        logger.warning(
-            "capacity_ceiling_event tier=%s recall_pre=%.3f recall_post=%.3f keys=%d log=%s",
-            tier,
-            recall_pre,
-            recall_post,
-            n_keys_post,
-            log_path,
-        )
 
     def _ensure_adapters(self):
         """Create production adapters that don't exist yet.

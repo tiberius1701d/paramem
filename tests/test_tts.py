@@ -368,8 +368,8 @@ def test_speaker_profile_v4_has_language(tmp_path):
     assert profile["preferred_language"] == ""
 
 
-def test_speaker_v3_migration_adds_language(tmp_path):
-    """V3 profiles are migrated to v4 with empty preferred_language."""
+def test_speaker_v3_load_raises(tmp_path):
+    """v3 store (retired migration) raises ValueError on load."""
     path = tmp_path / "profiles.json"
     v3_data = {
         "version": 3,
@@ -383,16 +383,12 @@ def test_speaker_v3_migration_adds_language(tmp_path):
     }
     path.write_text(json.dumps(v3_data))
 
+    import pytest
+
     from paramem.server.speaker import SpeakerStore
 
-    store = SpeakerStore(path)
-    assert store.get_preferred_language("abc123") is None
-
-    # After flush, file should be at the current version (v6 after Phase A migration).
-    store.flush()
-    data = json.loads(path.read_text())
-    assert data["version"] == 6
-    assert data["speakers"]["abc123"]["preferred_language"] == ""
+    with pytest.raises(ValueError, match="Unsupported speaker store version"):
+        SpeakerStore(path)
 
 
 # --- Engine registry ---

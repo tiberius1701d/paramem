@@ -364,28 +364,20 @@ def test_file_created_on_first_enroll(tmp_path, sample_embedding):
     assert len(profile["embeddings"]) == 1
 
 
-def test_legacy_v1_migration(tmp_path, sample_embedding):
-    """Legacy v1 name-keyed format is auto-migrated to v6 with speaker{N} ids."""
+def test_legacy_v1_load_raises(tmp_path, sample_embedding):
+    """v1 store (retired migration) raises ValueError on load."""
     path = tmp_path / "profiles.json"
     legacy_data = {"speakers": {"Alice": sample_embedding}}
     path.write_text(json.dumps(legacy_data))
 
-    store = SpeakerStore(path)
-    assert store.profile_count == 1
-    # One profile was minted via _mint_anon_speaker_id() during migration.
-    assert store._next_anon_index == 1
+    import pytest
 
-    result = store.match(sample_embedding)
-    assert result.name == "Alice"
-    assert result.speaker_id == "speaker0"
-
-    data = json.loads(path.read_text())
-    assert data["version"] == 6
-    assert all("name" in v and "embeddings" in v for v in data["speakers"].values())
+    with pytest.raises(ValueError, match="Unsupported speaker store version"):
+        SpeakerStore(path)
 
 
-def test_legacy_v2_migration(tmp_path, sample_embedding):
-    """v2 single-embedding format is auto-migrated to v6 multi-embedding."""
+def test_legacy_v2_load_raises(tmp_path, sample_embedding):
+    """v2 store (retired migration) raises ValueError on load."""
     path = tmp_path / "profiles.json"
     v2_data = {
         "speakers": {"abc12345": {"name": "Alice", "embedding": sample_embedding}},
@@ -393,36 +385,19 @@ def test_legacy_v2_migration(tmp_path, sample_embedding):
     }
     path.write_text(json.dumps(v2_data))
 
-    store = SpeakerStore(path)
-    assert store.profile_count == 1
-    assert store._next_anon_index == 0
+    import pytest
 
-    result = store.match(sample_embedding)
-    assert result.name == "Alice"
-    assert result.speaker_id == "abc12345"
-
-    data = json.loads(path.read_text())
-    assert data["version"] == 6
-    profile = data["speakers"]["abc12345"]
-    assert "embeddings" in profile
-    assert "embedding" not in profile
-    assert len(profile["embeddings"]) == 1
+    with pytest.raises(ValueError, match="Unsupported speaker store version"):
+        SpeakerStore(path)
 
 
-def test_legacy_v3_migration_lowercases_speaker_keys(tmp_path, sample_embedding):
-    """v3 store with cased 'Speaker0' key is rekeyed to lowercase 'speaker0' on load.
-
-    v3/v4 migrations call _save() which writes _PROFILE_VERSION=6; the v5→v6
-    rekey branch only fires for version==5 stores.  The fix applies the same
-    lowercase rekey in the v3 branch so no cased Speaker{N} key reaches v6.
-    """
-    import json
-
+def test_legacy_v3_load_raises(tmp_path, sample_embedding):
+    """v3 store (retired migration) raises ValueError on load."""
     path = tmp_path / "profiles.json"
     v3_payload = {
         "version": 3,
         "next_anon_index": 1,
-        "last_greeted": {"Speaker0": "2026-01-01T00:00:00+00:00"},
+        "last_greeted": {},
         "speakers": {
             "Speaker0": {
                 "name": "Alice",
@@ -433,31 +408,10 @@ def test_legacy_v3_migration_lowercases_speaker_keys(tmp_path, sample_embedding)
     }
     path.write_text(json.dumps(v3_payload))
 
-    from paramem.server.speaker import SpeakerStore
+    import pytest
 
-    store = SpeakerStore(path)
-
-    # Profile key must be lowercase after migration.
-    assert "speaker0" in store._profiles, (
-        f"Expected 'speaker0' key after v3→v6 migration; keys: {list(store._profiles)}"
-    )
-    assert "Speaker0" not in store._profiles
-
-    # Embeddings are value data — must survive unchanged.
-    assert store._profiles["speaker0"]["embeddings"] == [sample_embedding]
-    assert store._profiles["speaker0"]["name"] == "Alice"
-
-    # last_greeted key must also be lowercased.
-    assert "speaker0" in store._last_greeted, (
-        f"Expected 'speaker0' in last_greeted; keys: {list(store._last_greeted)}"
-    )
-    assert "Speaker0" not in store._last_greeted
-
-    # Disk must be written as v6 with lowercase keys.
-    data = json.loads(path.read_text())
-    assert data["version"] == 6
-    assert "speaker0" in data["speakers"]
-    assert "Speaker0" not in data["speakers"]
+    with pytest.raises(ValueError, match="Unsupported speaker store version"):
+        SpeakerStore(path)
 
 
 # --- Multi-embedding / centroid ---
@@ -762,10 +716,9 @@ class TestRegisterAnonymous:
         assert "next_anon_index" in data
         assert data["next_anon_index"] == 1
 
-    def test_v4_migration_sets_next_anon_index_zero(self, tmp_path, sample_embedding):
-        """Loading a v4-format file sets next_anon_index=0 and bumps version to 6."""
+    def test_v4_load_raises(self, tmp_path, sample_embedding):
+        """v4 store (retired migration) raises ValueError on load."""
         path = tmp_path / "profiles.json"
-        # Craft a valid v4 store.
         v4_data = {
             "speakers": {
                 "abc12345": {
@@ -780,13 +733,8 @@ class TestRegisterAnonymous:
         }
         path.write_text(json.dumps(v4_data))
 
-        store = SpeakerStore(path)
-        # Migration sets the counter to 0.
-        assert store._next_anon_index == 0
-        # Disk is rewritten as v6 immediately on load.
-        data = json.loads(path.read_text())
-        assert data["version"] == 6
-        assert data.get("next_anon_index") == 0
+        with pytest.raises(ValueError, match="Unsupported speaker store version"):
+            SpeakerStore(path)
 
     def test_empty_embedding_raises(self, tmp_path):
         """register_anonymous rejects an empty embedding."""
@@ -1107,20 +1055,15 @@ class TestMintAnonSpeakerId:
 
 
 # ---------------------------------------------------------------------------
-# v5 → v6 migration: profile and last_greeted keys lowercased
+# v5 and v6 store behaviour
 # ---------------------------------------------------------------------------
 
 
 class TestSpeakerStoreMigrationV5ToV6:
-    """v5 → v6 migration: profile and last_greeted keys must be lowercased.
+    """v5 store raises on load (migration retired); v6 loads without modification."""
 
-    Uses a synthetic v5 fixture written directly to disk.  Embeddings and
-    display names are VALUE data — only the dict keys change.  _rebuild_centroids
-    rekeys _centroids transitively (iterates self._profiles.items()).
-    """
-
-    def test_v5_profile_keys_lowercased_on_load(self, tmp_path):
-        """A v5 store with cased 'Speaker0' profile key is rekeyed to 'speaker0'."""
+    def test_v5_load_raises(self, tmp_path):
+        """A v5 store (retired migration) raises ValueError on load."""
         import json
 
         store_path = tmp_path / "sp.json"
@@ -1128,9 +1071,7 @@ class TestSpeakerStoreMigrationV5ToV6:
         v5_payload = {
             "version": 5,
             "next_anon_index": 2,
-            "last_greeted": {
-                "Speaker0": "2026-01-01T00:00:00+00:00",
-            },
+            "last_greeted": {"Speaker0": "2026-01-01T00:00:00+00:00"},
             "speakers": {
                 "Speaker0": {
                     "name": "Tobias",
@@ -1138,39 +1079,12 @@ class TestSpeakerStoreMigrationV5ToV6:
                     "preferred_language": "en",
                     "enroll_method": "self_introduced",
                 },
-                "Speaker9": {
-                    "name": "Speaker9",
-                    "embeddings": [emb],
-                    "preferred_language": "",
-                    "enroll_method": "anonymous_voice",
-                },
             },
         }
         store_path.write_text(json.dumps(v5_payload))
 
-        store = SpeakerStore(store_path)
-
-        # Profile keys must be lowercase.
-        assert "speaker0" in store._profiles, (
-            f"Expected 'speaker0' key after v5→v6 migration; keys: {list(store._profiles)}"
-        )
-        assert "Speaker0" not in store._profiles
-        assert "speaker9" in store._profiles
-        assert "Speaker9" not in store._profiles
-
-        # Embeddings must be preserved (value data unchanged).
-        assert store._profiles["speaker0"]["embeddings"] == [emb]
-        assert store._profiles["speaker0"]["name"] == "Tobias"
-
-        # last_greeted keys must also be lowercased.
-        assert "speaker0" in store._last_greeted, (
-            f"Expected 'speaker0' in last_greeted; keys: {list(store._last_greeted)}"
-        )
-        assert "Speaker0" not in store._last_greeted
-
-        # _centroids must be keyed by lowercase (rebuilt transitively).
-        assert "speaker0" in store._centroids
-        assert "Speaker0" not in store._centroids
+        with pytest.raises(ValueError, match="Unsupported speaker store version"):
+            SpeakerStore(store_path)
 
     def test_v6_store_not_re_migrated(self, tmp_path):
         """A v6 store (already lowercase) is loaded without modification."""
