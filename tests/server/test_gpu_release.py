@@ -1,4 +1,4 @@
-"""Tests for the POST /gpu/release endpoint and the _graceful_exit signal handler.
+"""Tests for the POST /gpu/release endpoint and the unified lifespan teardown.
 
 The endpoint is the canonical local→cloud-only release path used by
 external GPU consumers (gpu_guard ConfigConsumer / V1
@@ -17,18 +17,16 @@ so we avoid the heavy app lifespan). Behavior contract:
 - Auto-reclaim loop is started on success so the server reclaims the
   GPU once the external consumer goes away.
 
-_graceful_exit tests (Fix 1 — boot-drain producer side):
+Teardown ordering test:
 
-- SIGTERM: _release_base_model_in_process + safe_empty_cache called BEFORE
-  SystemExit; log line "graceful exit: GPU released" emitted.
-- SIGUSR1: same release + cache flush before os._exit(1).
-- Error in release: exception is caught (not re-raised), exit still proceeds.
+- Data-safety: save_snapshot and store.flush run BEFORE
+  _release_base_model_in_process so a SIGKILL-during-GPU-release does
+  not drop unconsolidated conversations or deferred speaker writes.
 """
 
 from __future__ import annotations
 
 import asyncio
-import signal
 from unittest.mock import MagicMock, patch
 
 from fastapi.responses import JSONResponse
@@ -271,42 +269,33 @@ def test_release_clears_intent_classifier_handle():
 
 
 # ---------------------------------------------------------------------------
-# Fix 1 — _graceful_exit: GPU release before process exit
+# Lifespan teardown ordering
 # ---------------------------------------------------------------------------
-# The signal handler is a closure defined inside lifespan.  We obtain a
-# reference to it by running the lifespan in cloud_only mode (skips GPU paths)
-# up to the signal registration point, then reading signal.getsignal().
-# The lifespan is then cancelled so no server actually starts.  This lets us
-# call the registered closure directly with mocks for both exit paths
-# (SIGTERM / SIGUSR1) and assert the call order without actually exiting.
 
 
-def _get_graceful_exit_handler(tmp_path):
-    """Run the lifespan in cloud_only mode to register signal handlers, then
-    return the registered SIGTERM handler (the same closure is used for both
-    SIGTERM and SIGUSR1).
+def test_lifespan_teardown_data_persisted_before_gpu_release(tmp_path):
+    """Lifespan teardown persists data BEFORE releasing the GPU.
 
-    cloud_only=True skips all CUDA/model-load paths so only minimal mocks
-    are needed.  The lifespan is stopped with GeneratorExit (cancel on the
-    asyncio task) before reaching the yield so the server never becomes ready.
-    Signal state is restored on exit.
+    Asserts call order: save_snapshot → store.flush → _release_base_model_in_process.
+
+    Rationale: if a SIGKILL arrives during the slow GPU release (which can
+    exceed TimeoutStopSec), both disk-only persistence ops must already be
+    complete so no unconsolidated conversations or deferred speaker writes
+    are dropped.
+
+    The lifespan is driven with cloud_only=True (via cloud_only_startup=True
+    so permanent_cloud_only=True, bypassing all CUDA/model-load paths) through
+    to the ``yield`` and then allowed to exit normally so the teardown block
+    executes.  _release_base_model_in_process, safe_empty_cache,
+    buffer.save_snapshot, and store.flush are all patched with order trackers.
     """
-    import asyncio
-
     from paramem.server import app as app_module
-    from paramem.server.config import PathsConfig, ServerConfig
-
-    class _Registered(Exception):
-        """Raised by the signal spy after both handlers are registered."""
-
-    from paramem.server.config import STTConfig, TTSConfig
+    from paramem.server.config import PathsConfig, ServerConfig, STTConfig, TTSConfig
 
     config = ServerConfig(model_name="mistral")
-    config.cloud_only = True  # explicit cloud-only → skips CUDA checks entirely
-    # Disable voice servers so Wyoming sockets are not bound during the test.
+    config.cloud_only = True
     config.stt = STTConfig(enabled=False)
     config.tts = TTSConfig(enabled=False)
-
     root = tmp_path / "data"
     config.paths = PathsConfig(
         data=root,
@@ -314,41 +303,50 @@ def _get_graceful_exit_handler(tmp_path):
         debug=root / "debug",
     )
 
+    call_order: list[str] = []
+
+    fake_buffer = MagicMock(name="session_buffer")
+    fake_store = MagicMock(name="speaker_store")
+    fake_buffer.save_snapshot.side_effect = lambda: call_order.append("save_snapshot")
+    fake_store.flush.side_effect = lambda: call_order.append("store.flush")
+
     saved_state = {
         key: app_module._state.get(key) for key in ("config", "cloud_only_startup", "defer_model")
     }
     app_module._state["config"] = config
-    app_module._state["cloud_only_startup"] = True  # explicit → no auto-reclaim task
+    # cloud_only_startup=True → cloud_only_reason="explicit" → permanent_cloud_only=True
+    app_module._state["cloud_only_startup"] = True
     app_module._state["defer_model"] = False
-
-    original_sigterm = signal.getsignal(signal.SIGTERM)
-    original_sigusr1 = signal.getsignal(signal.SIGUSR1)
-
-    # Short-circuit at detect_mode_switch, which is called AFTER the signal
-    # handlers are registered (signal registration is at lifespan ~line 1879,
-    # detect_mode_switch is called a few lines later).  _build_config_derived_state
-    # is called BEFORE signal registration and cannot be used as the cut point.
-    from paramem.server import active_store_migration as asm_module
-
-    def short_circuit(*args, **kwargs):
-        raise _Registered("handlers installed — stopping before migration detection")
 
     try:
         with (
             patch.object(app_module, "predict_base_bytes", return_value=None),
             patch.object(app_module, "_gpu_occupied", return_value=False),
             patch.object(app_module, "_build_config_derived_state"),
-            patch.object(asm_module, "detect_mode_switch", short_circuit),
+            patch.object(app_module, "_arm_active_store_migration", return_value=False),
+            patch.object(
+                app_module,
+                "_release_base_model_in_process",
+                side_effect=lambda: call_order.append("_release_base_model_in_process"),
+            ),
+            patch.object(app_module, "safe_empty_cache"),
+            patch.dict(
+                app_module._state,
+                {
+                    "session_buffer": fake_buffer,
+                    "speaker_store": fake_store,
+                    "reclaim_task": None,
+                    "config_drift_task": None,
+                },
+                clear=False,
+            ),
         ):
 
             async def _run():
                 async with app_module.lifespan(app_module.app):
-                    pass
+                    pass  # yield reached; exit context to run teardown
 
-            try:
-                asyncio.run(_run())
-            except _Registered:
-                pass
+            asyncio.run(_run())
     finally:
         for key, val in saved_state.items():
             if val is None:
@@ -356,117 +354,18 @@ def _get_graceful_exit_handler(tmp_path):
             else:
                 app_module._state[key] = val
 
-    handler = signal.getsignal(signal.SIGTERM)
-    # Restore original handlers so test isolation is maintained.
-    signal.signal(signal.SIGTERM, original_sigterm)
-    signal.signal(signal.SIGUSR1, original_sigusr1)
-
-    assert callable(handler) and handler not in (
-        signal.SIG_DFL,
-        signal.SIG_IGN,
-    ), "SIGTERM handler was not registered during lifespan startup"
-    return handler
-
-
-def test_graceful_exit_sigterm_releases_gpu_before_exit(tmp_path):
-    """SIGTERM path: _release_base_model_in_process then safe_empty_cache are
-    called BEFORE SystemExit is raised, and in that order.
-
-    The 'graceful exit: GPU released' log line must also be emitted.
-    """
-    from paramem.server import app as app_module
-
-    handler = _get_graceful_exit_handler(tmp_path)
-
-    call_order = []
-
-    def fake_release():
-        call_order.append("release")
-
-    def fake_cache():
-        call_order.append("cache")
-
-    with (
-        patch.object(app_module, "_release_base_model_in_process", fake_release),
-        patch.object(app_module, "safe_empty_cache", fake_cache),
-        patch.dict(app_module._state, {"session_buffer": None}, clear=False),
-    ):
-        try:
-            handler(signal.SIGTERM, None)
-        except SystemExit:
-            pass  # expected — SIGTERM raises SystemExit(0)
-
-    assert "release" in call_order, "_release_base_model_in_process not called on SIGTERM"
-    assert "cache" in call_order, "safe_empty_cache not called on SIGTERM"
-    release_idx = call_order.index("release")
-    cache_idx = call_order.index("cache")
-    assert release_idx < cache_idx, (
-        f"_release_base_model_in_process must come before safe_empty_cache; got order={call_order}"
+    assert "save_snapshot" in call_order, "buffer.save_snapshot not called in teardown"
+    assert "store.flush" in call_order, "store.flush not called in teardown"
+    assert "_release_base_model_in_process" in call_order, (
+        "_release_base_model_in_process not called in teardown"
     )
 
-
-def test_graceful_exit_sigusr1_releases_gpu_before_exit(tmp_path):
-    """SIGUSR1 path: _release_base_model_in_process then safe_empty_cache are
-    called BEFORE os._exit(1) is invoked.
-    """
-    from paramem.server import app as app_module
-
-    handler = _get_graceful_exit_handler(tmp_path)
-
-    call_order = []
-
-    def fake_release():
-        call_order.append("release")
-
-    def fake_cache():
-        call_order.append("cache")
-
-    def fake_os_exit(code):
-        call_order.append(f"os._exit({code})")
-
-    with (
-        patch.object(app_module, "_release_base_model_in_process", fake_release),
-        patch.object(app_module, "safe_empty_cache", fake_cache),
-        patch.object(app_module.os, "_exit", fake_os_exit),
-        patch.dict(app_module._state, {"session_buffer": None}, clear=False),
-    ):
-        handler(signal.SIGUSR1, None)
-
-    assert "release" in call_order, "_release_base_model_in_process not called on SIGUSR1"
-    assert "cache" in call_order, "safe_empty_cache not called on SIGUSR1"
-    assert "os._exit(1)" in call_order, "os._exit(1) not called on SIGUSR1"
-    release_idx = call_order.index("release")
-    cache_idx = call_order.index("cache")
-    exit_idx = call_order.index("os._exit(1)")
-    assert release_idx < cache_idx < exit_idx, (
-        f"Expected release → cache → os._exit; got order={call_order}"
+    snap_idx = call_order.index("save_snapshot")
+    flush_idx = call_order.index("store.flush")
+    release_idx = call_order.index("_release_base_model_in_process")
+    assert snap_idx < flush_idx, (
+        f"save_snapshot must come before store.flush; got order={call_order}"
     )
-
-
-def test_graceful_exit_release_error_does_not_prevent_exit(tmp_path):
-    """If _release_base_model_in_process raises, the exception must be caught
-    and the exit must still proceed (boundary error handling — the process is
-    exiting; a teardown error must not hang it).
-    """
-    from paramem.server import app as app_module
-
-    handler = _get_graceful_exit_handler(tmp_path)
-
-    exited = []
-
-    def raise_on_release():
-        raise RuntimeError("simulated release failure")
-
-    def fake_os_exit(code):
-        exited.append(code)
-
-    with (
-        patch.object(app_module, "_release_base_model_in_process", raise_on_release),
-        patch.object(app_module, "safe_empty_cache"),
-        patch.object(app_module.os, "_exit", fake_os_exit),
-        patch.dict(app_module._state, {"session_buffer": None}, clear=False),
-    ):
-        # SIGUSR1: error in release must NOT prevent os._exit(1)
-        handler(signal.SIGUSR1, None)
-
-    assert exited == [1], "os._exit(1) must still be called when release raises"
+    assert flush_idx < release_idx, (
+        f"store.flush must come before _release_base_model_in_process; got order={call_order}"
+    )

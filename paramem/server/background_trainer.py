@@ -327,11 +327,12 @@ class BackgroundTrainer:
             self._current_job = sentinel
             self._is_training = True
             # Reset per-job: _shutdown_requested may have been set True by a
-            # prior inference-abort or SIGTERM-on-a-different-job path.  For
-            # the singleton reuse case that flag means "abort THIS job" — reset
-            # it here so a stale flag from a previous job does not poison the
-            # current one.  (The one terminal path — SIGTERM — exits the process
-            # immediately, so this reset never runs in that case.)
+            # prior inference-abort or graceful-shutdown path.  For the
+            # singleton reuse case that flag means "abort THIS job" — reset it
+            # here so a stale flag from a previous job does not poison the
+            # current one.  (SIGTERM now initiates graceful shutdown, so this
+            # reset may run if a new job starts before the _WORKER_STOP
+            # sentinel is processed.)
             self._shutdown_requested = False
             try:
                 with gpu_lock_sync():

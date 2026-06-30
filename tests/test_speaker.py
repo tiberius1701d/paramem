@@ -238,6 +238,33 @@ def test_remove_nonexistent(store):
     assert not store.remove("nonexistent_id")
 
 
+def test_remove_clears_last_greeted(tmp_path, sample_embedding):
+    """remove() must prune the greeting timestamp so no orphan entry persists.
+
+    Regression for the bug where ``_last_greeted`` was never pruned on removal,
+    leaving a dangling timestamp keyed on the removed speaker_id.  The assertion
+    loads a fresh store from the same path to verify the persisted JSON is clean.
+    """
+    path = tmp_path / "profiles.json"
+    store = SpeakerStore(path)
+    sid = store.enroll("Alice", sample_embedding)
+
+    # Record a greeting timestamp for this speaker.
+    store.confirm_greeting(sid)
+    assert sid in store._last_greeted, "confirm_greeting must populate _last_greeted"
+
+    # Remove the speaker — the timestamp must be pruned from both in-memory state
+    # and the persisted file.
+    assert store.remove(sid)
+    assert sid not in store._last_greeted, "remove() must pop _last_greeted entry in-memory"
+
+    # Load a fresh store from the same path and verify nothing leaked to disk.
+    store2 = SpeakerStore(path)
+    assert sid not in store2._last_greeted, (
+        "remove() must not leave an orphan last_greeted entry in the persisted JSON"
+    )
+
+
 def test_multiple_speakers(store):
     emb_a = [1.0, 0.0, 0.0, 0.0]
     emb_b = [0.0, 1.0, 0.0, 0.0]

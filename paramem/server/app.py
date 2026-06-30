@@ -17,7 +17,6 @@ import logging
 import os
 import secrets
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -2310,52 +2309,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to reconcile backup timer — continuing without scheduled backups")
 
-    # Graceful shutdown: save encrypted session snapshot before exit.
-    # SIGUSR1 (GPU release for training) and SIGTERM (systemd stop) both
-    # trigger a snapshot so unconsolidated conversations survive restarts.
-    def _graceful_exit(signum, _frame):
-        sig_name = signal.Signals(signum).name
-        logger.info("Received %s — saving session snapshot before exit", sig_name)
-        # Signal training to stop at the next epoch boundary
-        consolidation_loop = _state.get("consolidation_loop")
-        if consolidation_loop is not None:
-            consolidation_loop.shutdown_requested = True
-            logger.info("Shutdown flag set — training will stop after current epoch")
-        bg_trainer = _state.get("background_trainer")
-        if bg_trainer is not None and bg_trainer.is_training:
-            bg_trainer._shutdown_requested = True
-            bg_trainer._is_training = False
-            logger.info("Background trainer stopped")
-        buffer = _state.get("session_buffer")
-        if buffer:
-            buffer.save_snapshot()
-        # Free all base-model holders before handing control back to the OS so
-        # the dying process does not pin the ~5 GiB base model on the device while
-        # systemd launches the replacement process.  (STT/TTS, ~1.5-2 GiB, remain
-        # until process exit reaps them — the successor's boot drain-wait keys on
-        # assessment.required_bytes, which includes the STT/TTS footprint, so it
-        # waits for that residual to reclaim too.)  Using _release_base_model_in_process
-        # (not bare unload_model) because consolidation_loop / bg_trainer /
-        # intent handles keep the model alive through their own references —
-        # plain unload_model would not drive the refcount to zero.
-        # The try/except is boundary handling (the process is exiting; a teardown
-        # error must not hang the exit) — it is NOT error-suppression of a logic bug.
-        try:
-            _release_base_model_in_process()
-            safe_empty_cache()
-            logger.info("graceful exit: GPU released")
-        except Exception:
-            logger.exception("graceful exit: error during GPU release — continuing with exit")
-        if signum == signal.SIGUSR1:
-            # GPU release: exit non-zero so systemd restarts (Restart=on-failure)
-            os._exit(1)
-        else:
-            # SIGTERM: intentional stop, don't restart
-            raise SystemExit(0)
-
-    signal.signal(signal.SIGUSR1, _graceful_exit)
-    signal.signal(signal.SIGTERM, _graceful_exit)
-
     _state["mode"] = "cloud-only" if cloud_only else "local"
     _state["event_loop"] = asyncio.get_running_loop()
 
@@ -2486,7 +2439,7 @@ async def lifespan(app: FastAPI):
     # enablement rule), so a wired-but-empty store logs ON-per-user (fail-closed)
     # rather than OFF.
     _posture_store = _state.get("user_token_store")
-    _n_user_tokens = len(_posture_store.list()) if _posture_store is not None else 0
+    _n_user_tokens = _posture_store.count_active() if _posture_store is not None else 0
     log_startup_posture(
         _api_token,
         n_user_tokens=_n_user_tokens,
@@ -2495,38 +2448,91 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown — flush deferred speaker profile writes
+    # Shutdown — data-safety-first order:
+    # 1. Signal training to stop (so in-flight cycles begin winding down).
+    # 2. Persist disk-only state (snapshot + speaker flush) before any GPU op —
+    #    if a SIGKILL arrives during the slow GPU release, both persistence ops
+    #    have already completed.
+    # 3. Release the base model (single owner: _release_base_model_in_process).
+    # 4. Wyoming / STT / TTS / HA teardown.
+    # 5. Final allocator mop-up.
+    _shutdown_t0 = time.perf_counter()
+
+    # Signal training to stop at the next epoch boundary so _release_base_model_in_process
+    # (via bt.release() join) waits as short as possible.
+    consolidation_loop = _state.get("consolidation_loop")
+    if consolidation_loop is not None:
+        consolidation_loop.shutdown_requested = True
+        logger.info("Shutdown flag set — training will stop after current epoch")
+    bg_trainer = _state.get("background_trainer")
+    if bg_trainer is not None and bg_trainer.is_training:
+        bg_trainer._shutdown_requested = True
+        bg_trainer._is_training = False
+        logger.info("Background trainer stopped")
+
+    # Persist in-memory session state before any GPU op so a SIGKILL-during-release
+    # does not drop unconsolidated conversations.
+    buffer = _state.get("session_buffer")
+    if buffer:
+        _t = time.perf_counter()
+        buffer.save_snapshot()
+        logger.info("shutdown timing: buffer.save_snapshot %.2fs", time.perf_counter() - _t)
+
+    # Flush deferred speaker profile writes — disk-only, must run before GPU release.
     store = _state.get("speaker_store")
     if store:
+        _t = time.perf_counter()
         store.flush()
+        logger.info("shutdown timing: store.flush %.2fs", time.perf_counter() - _t)
 
     if _state.get("reclaim_task"):
         _state["reclaim_task"].cancel()
     if _state.get("config_drift_task"):
         _state["config_drift_task"].cancel()
+
+    # Release the base model — single owner for base-model + bt/loop + intent-handle
+    # release. Replaces the former if _state["model"]: unload_model(...) branch,
+    # which was dead once _release_base_model_in_process ran from the signal handler.
+    _t = time.perf_counter()
+    _release_base_model_in_process()
+    logger.info("shutdown timing: _release_base_model_in_process %.2fs", time.perf_counter() - _t)
+
     wyoming_server = _state.get("wyoming_server")
     if wyoming_server is not None:
+        _t = time.perf_counter()
         wyoming_server.stop()
+        logger.info("shutdown timing: wyoming_server.stop %.2fs", time.perf_counter() - _t)
     wyoming_tts = _state.get("wyoming_tts_server")
     if wyoming_tts is not None:
+        _t = time.perf_counter()
         wyoming_tts.stop()
+        logger.info("shutdown timing: wyoming_tts.stop %.2fs", time.perf_counter() - _t)
     stt = _state.get("stt")
     if stt is not None:
+        _t = time.perf_counter()
         stt.unload()
+        logger.info("shutdown timing: stt.unload %.2fs", time.perf_counter() - _t)
     tts_manager = _state.get("tts_manager")
     if tts_manager is not None:
+        _t = time.perf_counter()
         tts_manager.unload_all()
+        logger.info("shutdown timing: tts_manager.unload_all %.2fs", time.perf_counter() - _t)
     if _state.get("ha_client"):
+        _t = time.perf_counter()
         _state["ha_client"].close()
-    if _state["model"]:
-        unload_model(_state["model"], _state["tokenizer"])
-        logger.info("Model unloaded")
+        logger.info("shutdown timing: ha_client.close %.2fs", time.perf_counter() - _t)
 
     # Final mop-up — covers cuBLAS workspaces / allocator slack the per-component
     # unloads couldn't reach while their frame-locals were still live. Without
     # this, the next paramem boot's _gpu_has_compute_processes() sees a [Not Found]
     # ghost PID and routes into permanent gpu_conflict (no auto-reclaim).
+    # Note: _release_base_model_in_process already calls safe_empty_cache internally;
+    # this second call is still required because STT/TTS unload after the release.
+    _t = time.perf_counter()
     safe_empty_cache()
+    logger.info("shutdown timing: safe_empty_cache %.2fs", time.perf_counter() - _t)
+    _total = time.perf_counter() - _shutdown_t0
+    logger.info("shutdown timing: total lifespan teardown %.2fs", _total)
 
 
 app = FastAPI(title="ParaMem", version="0.1.0", lifespan=lifespan)
@@ -4963,7 +4969,7 @@ def _build_config_derived_state(
     # Only on full_rebuild paths (boot + apply); plain reclaim keeps the live
     # buffer to avoid losing in-flight state.
     if full_rebuild and rebuild_session_buffer:
-        # Save snapshot on the OLD buffer FIRST (mirrors SIGTERM/SIGUSR1 path)
+        # Save snapshot on the OLD buffer FIRST (mirrors the shutdown-teardown snapshot)
         # so mid-turn _sessions state round-trips when an encryption key is
         # loaded (ensures mid-turn _sessions state round-trips on key-loaded deploys).
         # No-op on a no-key deployment.
@@ -5689,9 +5695,15 @@ def _live_reload_base_model(
 #    • Find every holder:   grep -rn "BASE-MODEL HOLDER" paramem/
 #    • Object / module-global holders  → drop them in this function.
 #    • Lifespan-frame locals           → drop them IN THE LIFESPAN. This
-#      function runs OUTSIDE the suspended ``@asynccontextmanager`` frame and
-#      CANNOT reach a frame local (same reason _load_model_into_state keeps the
-#      model out of its caller's frame).
+#      function is called from TWO contexts: (a) externally — ``/gpu/release``
+#      and ``_live_reload_base_model``, which run OUTSIDE the suspended
+#      ``@asynccontextmanager`` frame and CANNOT reach frame locals; (b) from
+#      inside the lifespan teardown (post-``yield`` block), where the frame IS
+#      resumed.  In BOTH cases no lifespan-frame locals hold the model
+#      (``_load_model_into_state`` keeps the model out of its caller's frame by
+#      design; the only lifespan locals that held the model — ``_source`` and
+#      ``_classifier_model`` — are nulled in their own subroutine frames before
+#      ``yield``).  The holder-registry audit is the same for both call sites.
 #    • ALWAYS verify a change with a LIVE  POST /gpu/release → nvidia-smi ~0.
 #      Unit tests mock this function and will NOT catch a leak.
 # ════════════════════════════════════════════════════════════════════════════
@@ -6314,7 +6326,7 @@ async def gpu_release():
     During an in-flight consolidation cycle the server returns 503; the
     caller may retry. Mid-cycle release would corrupt extraction state:
     the cycle re-extracts on next start, but losing partial-cycle work is
-    wasteful (the older SIGUSR1-exit release path had the same flaw).
+    wasteful (the older signal-exit release path had the same flaw).
 
     On success the response is synchronous — by the time the POST returns,
     the model is unloaded and ``_state["mode"]`` is ``"cloud-only"``. The
@@ -14622,6 +14634,7 @@ def main():
         port=config.server.port,
         log_level="info",
         log_config=None,
+        timeout_graceful_shutdown=5,
     )
 
 

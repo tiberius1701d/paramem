@@ -504,13 +504,18 @@ class SpeakerStore:
         return speaker_id
 
     def remove(self, speaker_id: str) -> bool:
-        """Remove a speaker profile by ID. Returns True if found and removed."""
+        """Remove a speaker profile by ID. Returns True if found and removed.
+
+        Clears the profile, centroid cache, and any persisted greeting
+        timestamp for *speaker_id* so no orphan entries remain after removal.
+        """
         with self._lock:
             if speaker_id not in self._profiles:
                 return False
             name = self._profiles[speaker_id]["name"]
             del self._profiles[speaker_id]
             self._centroids.pop(speaker_id, None)
+            self._last_greeted.pop(speaker_id, None)
             self._save()
         logger.info("Removed speaker profile: %s (id=%s)", name, speaker_id)
         return True

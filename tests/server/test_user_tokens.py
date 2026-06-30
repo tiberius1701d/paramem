@@ -290,6 +290,60 @@ class TestHasActiveTokens:
 
 
 # ---------------------------------------------------------------------------
+# count_active
+# ---------------------------------------------------------------------------
+
+
+class TestCountActive:
+    """count_active() returns only non-revoked token count (startup posture fix).
+
+    Regression: the startup log previously used ``len(store.list())`` which
+    counted revoked entries, inflating the "N active per-user token(s)" message.
+    """
+
+    def test_zero_when_empty(self, tmp_path, monkeypatch, store_path):
+        """count_active() returns 0 for an empty store."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        assert store.count_active() == 0
+
+    def test_counts_only_non_revoked(self, tmp_path, monkeypatch, store_path):
+        """count_active() excludes revoked entries from the total.
+
+        Mint 3 tokens, revoke 2 — count_active() must return 1, not 3.
+        """
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        t1 = store.mint("speaker0", "Device A")
+        t2 = store.mint("speaker0", "Device B")
+        store.mint("speaker1", "Device C")
+
+        # Revoke two of the three.
+        store.revoke_token(t1)
+        store.revoke_token(t2)
+
+        assert store.count_active() == 1
+
+    def test_equals_total_when_none_revoked(self, tmp_path, monkeypatch, store_path):
+        """count_active() equals total token count when none are revoked."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        store.mint("speaker0", "Device A")
+        store.mint("speaker1", "Device B")
+
+        assert store.count_active() == 2
+
+    def test_zero_after_all_revoked(self, tmp_path, monkeypatch, store_path):
+        """count_active() returns 0 after all tokens are revoked."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        store.mint("speaker0", "Device A")
+        store.revoke_speaker("speaker0")
+
+        assert store.count_active() == 0
+
+
+# ---------------------------------------------------------------------------
 # On-disk security guarantees
 # ---------------------------------------------------------------------------
 

@@ -1039,7 +1039,7 @@ class SessionBuffer:
     def save_snapshot(self) -> bool:
         """Write age-encrypted snapshot of in-memory state to disk.
 
-        Called on graceful shutdown (SIGUSR1, SIGTERM). Returns True on
+        Called on graceful shutdown (lifespan teardown). Returns True on
         success. When the daily identity is not loaded, returns False
         without writing — snapshot persistence requires a key so a restart
         on a fresh host with the key restored can read it back.

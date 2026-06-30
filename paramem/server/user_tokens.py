@@ -522,3 +522,13 @@ class UserTokenStore:
         """
         with self._lock:
             return any(not e["revoked"] for e in self._tokens.values())
+
+    def count_active(self) -> int:
+        """Return the number of non-revoked token entries.
+
+        Used by the startup posture log to report active (non-revoked) token
+        count.  Revoked entries are excluded so the log is not inflated by
+        historical revocations.
+        """
+        with self._lock:
+            return sum(1 for e in self._tokens.values() if not e["revoked"])
