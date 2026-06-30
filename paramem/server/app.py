@@ -23,7 +23,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal
 
@@ -198,6 +198,12 @@ _state = {
     # alongside ``encryption``; used by ``GET /integrity`` and the boot
     # integrity gate to distinguish no-key from corruption failures.
     "daily_loadable": False,
+    # Per-component VRAM ledger (bytes).  Populated at each component load;
+    # cleared at each component unload.  Keys: "base", "stt", "tts".
+    # Truthfulness invariant: every key must be cleared on the matching
+    # unload/release path — see _release_base_model_in_process and
+    # _set_voice_pipeline_profile('cpu').
+    "vram_components": {},
 }
 
 
@@ -405,6 +411,30 @@ class StatusResponse(BaseModel):
     # reclaim completed cleanly (or none has run yet).
     # Shape: {"at": <iso8601>, "error": <str>, "attempt_count": <int>}
     last_reclaim_error: dict | None = None
+    # Device-wide VRAM (in-process torch.cuda.mem_get_info — authoritative on
+    # WSL2 where nvidia-smi --query-gpu=memory.used returns 0).
+    # None when CUDA is unavailable or mem_get_info fails.
+    vram_used_mib: int | None = None
+    vram_total_mib: int | None = None
+    # Sum of the per-component ledger below (bytes → MiB), or None when no
+    # component has been measured yet.
+    vram_paramem_mib: int | None = None
+    # Per-component VRAM usage in MiB.  Keys present only for components that
+    # are currently resident ("base", "stt", "tts").  Empty when nothing is
+    # loaded or before the first load.
+    vram_components: dict[str, int] = {}
+    # Seconds until the next scheduled tick on which _is_full_cycle_due would
+    # evaluate to True.  None when cadence is disabled (manual-only), when no
+    # interim dirs exist yet, or when full_period is manual-only.
+    next_full_consolidation_seconds: int | None = None
+    # Active key count per store tier.  Keys are raw tier names
+    # (e.g. "episodic", "semantic", "procedural",
+    # "episodic_interim_<stamp>").  The renderer sums interim tiers.
+    tier_key_counts: dict[str, int] = {}
+    # Oldest un-folded interim stamp ("YYYYMMDDTHHMM") or None when the
+    # interim ring is empty.  Used by the renderer to show the deadline
+    # math for the next full consolidation.
+    oldest_interim_stamp: str | None = None
 
 
 class IntegrityCheckItem(BaseModel):
@@ -3846,12 +3876,18 @@ async def status():
     store = _state.get("memory_store")
     if store is not None and store.replay_enabled:
         keys_count = len(store.all_active_keys())
+        tier_key_counts = {
+            tier: len(store.active_keys_in_tier(tier)) for tier in store.tiers_with_registry()
+        }
     else:
         from paramem.memory.store import MemoryStore as _MemoryStore
 
         _cold = _MemoryStore(replay_enabled=True)
         _cold.load_registries_from_disk(config.adapter_dir)
         keys_count = len(_cold.all_active_keys())
+        tier_key_counts = {
+            tier: len(_cold.active_keys_in_tier(tier)) for tier in _cold.tiers_with_registry()
+        }
 
     # _live_loop is used by the adapter_health block below.
     _live_loop = _state.get("consolidation_loop")
@@ -3913,6 +3949,27 @@ async def status():
         _since_mid = int((_now - _midnight).total_seconds())
         _next_boundary = ((_since_mid // _refresh_seconds) + 1) * _refresh_seconds
         next_interim_seconds = max(0, _next_boundary - _since_mid)
+
+    # Honest next-full prediction — gate-derived, not a raw timer tick.
+    next_full_consolidation_seconds = _seconds_until_next_full_consolidation(config)
+    # Oldest un-folded interim stamp for the renderer inline math.
+    oldest_interim_stamp = _oldest_interim_stamp(config)
+
+    # Per-component VRAM ledger — device-wide totals from torch.cuda.mem_get_info
+    # plus the component deltas measured at load time.
+    # CUDA-guarded: on unavailable/fault log and leave fields None.
+    vram_used_mib: int | None = None
+    vram_total_mib: int | None = None
+    if torch.cuda.is_available():
+        try:
+            _free_bytes, _total_bytes = torch.cuda.mem_get_info()
+            vram_total_mib = _total_bytes >> 20
+            vram_used_mib = (_total_bytes - _free_bytes) >> 20
+        except Exception:  # noqa: BLE001
+            logger.warning("/status: torch.cuda.mem_get_info() failed — VRAM fields omitted")
+    _vram_comps_bytes: dict[str, int] = _state.get("vram_components") or {}
+    vram_components: dict[str, int] = {k: v >> 20 for k, v in _vram_comps_bytes.items() if v > 0}
+    vram_paramem_mib: int | None = sum(vram_components.values()) if vram_components else None
 
     # Background trainer
     bt = _state.get("background_trainer")
@@ -4129,7 +4186,6 @@ async def status():
     try:
         from paramem.backup import retention as _backup_retention
         from paramem.backup import state as _backup_state
-        from paramem.backup import timer as _backup_timer
         from paramem.backup.timer import _backup_timer_interval_seconds
 
         _backups_root = (config.paths.data / "backups").resolve()
@@ -4159,7 +4215,7 @@ async def status():
                 _disk_cap_bytes = 0
 
         # Next scheduled — read from the live backup timer state when installed.
-        _backup_timer_state = _backup_timer.cached_timer_state(max_age_seconds=5)
+        _backup_timer_state = systemd_timer.cached_timer_state("paramem-backup", max_age_seconds=5)
         _next_scheduled_at: str | None = None
         _next_us = _backup_timer_state.get("next_elapse_us") or ""
         if str(_next_us).isdigit():
@@ -4276,6 +4332,13 @@ async def status():
         pending_rehydration=bool(_state.get("pending_rehydration", False)),
         effective_mode=_state.get("effective_mode"),
         last_reclaim_error=_state.get("last_reclaim_error"),
+        vram_used_mib=vram_used_mib,
+        vram_total_mib=vram_total_mib,
+        vram_paramem_mib=vram_paramem_mib,
+        vram_components=vram_components,
+        next_full_consolidation_seconds=next_full_consolidation_seconds,
+        tier_key_counts=tier_key_counts,
+        oldest_interim_stamp=oldest_interim_stamp,
     )
 
 
@@ -5078,6 +5141,7 @@ def _build_config_derived_state(
                 )
                 if stt_gpu.load():
                     _state["stt_gpu"] = stt_gpu
+                    _state["vram_components"]["stt"] = stt_gpu.vram_delta_bytes
                     logger.info(
                         "Local STT GPU: Whisper %s on %s", config.stt.model, config.stt.device
                     )
@@ -5102,9 +5166,11 @@ def _build_config_derived_state(
 
             if not cloud_only:
                 tts_gpu = TTSManager(config.tts)
-                tts_gpu.load_all()
+                with vram_measure("tts") as _tts_vm:
+                    tts_gpu.load_all()
                 if tts_gpu.is_loaded:
                     _state["tts_gpu"] = tts_gpu
+                    _state["vram_components"]["tts"] = _tts_vm["delta"]
                     logger.info("Local TTS GPU: %s", ", ".join(tts_gpu.available_languages))
                 else:
                     logger.warning("Local TTS GPU pair failed to load")
@@ -5307,7 +5373,11 @@ def _load_model_into_state(config) -> None:
     """
     apply_process_cap(fraction=config.vram.process_cap_fraction)
     logger.info("Loading model: %s (%s)", config.model_name, config.model_config.model_id)
-    model, tokenizer = load_base_model(config.model_config)
+    with vram_measure("base") as _base_vm:
+        model, tokenizer = load_base_model(config.model_config)
+    # Store the measured delta in the per-component VRAM ledger (bytes).
+    # vram_measure stores an INT — no BASE-MODEL HOLDER created here.
+    _state["vram_components"]["base"] = _base_vm["delta"]
 
     # Manifest caches are model-specific; re-init on every load.
     _state["adapter_manifest_status"] = {}
@@ -5781,6 +5851,9 @@ def _release_base_model_in_process() -> None:
     # Holder 5: the intent-classifier handle (intent.mode=llm). Clearing it
     # is the documented "before a model unload / cloud-only switch" path.
     set_classifier_model(None, None)
+    # Clear the base-model entry from the per-component VRAM ledger so
+    # /status does not report stale VRAM after a cloud-only transition.
+    _state.get("vram_components", {}).pop("base", None)
     # Belt-and-braces: rerun the cache flush after every holder was
     # cleared. ``unload_model`` already calls gc.collect+empty_cache,
     # but at that moment the loop/trainer/worker may have been live;
@@ -11569,9 +11642,7 @@ def _is_full_cycle_due(config) -> bool:
     ``current_full_consolidation_stamp``, and ``run_housekeeping`` reads the
     stamp via ``_last_full_consolidation_window``.
     """
-    from datetime import datetime
-
-    from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
+    from paramem.memory.interim_adapter import iter_interim_dirs
 
     N = config.consolidation.max_interim_count
     # count==0 → full-fold-only consume-pending mode: every tick is a full cycle.
@@ -11590,23 +11661,14 @@ def _is_full_cycle_due(config) -> bool:
         return False
 
     # Primary: due on the (N+1)-th interim slot — first slot of the new cycle.
-    if n > 1 and (n - 1) % N == 0:
+    if _count_primary_due(n, N):
         return True
 
-    # Deadline backstop: no interim tier may age beyond one full intended interval
-    # without being folded.  Parse the oldest dir's stamp (lexical sort of
-    # "interim_YYYYMMDDTHHMM" dirs is chronological; first = oldest).
-    full_period_seconds = config.consolidation.consolidation_period_seconds
-    if full_period_seconds is None:
-        # refresh_cadence disabled (manual-only) — no auto full fold.
+    # Deadline backstop: oldest un-folded interim may not age past the full period.
+    deadline_dt = _full_cycle_deadline_dt(config)
+    if deadline_dt is None:
         return False
-
-    oldest_name, _ = dirs[0]  # iter_interim_dirs yields (adapter_name, path)
-    oldest_stamp = interim_stamp_from_name(oldest_name)
-    # Local time throughout — consistent with current_interim_stamp's datetime.now().
-    oldest_dt = datetime.strptime(oldest_stamp, "%Y%m%dT%H%M")
-    age_seconds = (datetime.now() - oldest_dt).total_seconds()
-    return age_seconds >= full_period_seconds
+    return datetime.now() >= deadline_dt
 
 
 def _oldest_interim_stamp(config) -> "str | None":
@@ -11639,6 +11701,132 @@ def _oldest_interim_stamp(config) -> "str | None":
         return None
     oldest_name, _ = dirs[0]  # sorted ascending; [0] is oldest
     return interim_stamp_from_name(oldest_name)
+
+
+def _count_primary_due(n: int, N: int) -> bool:
+    """Return True when the count-primary full-fold condition holds.
+
+    The full fold is due on the (N+1)-th interim slot — the first slot of the
+    next cycle.  Condition: at least two interims exist AND ``(n - 1) % N == 0``.
+
+    Single source of truth for both :func:`_is_full_cycle_due` (gate) and
+    :func:`_seconds_until_next_full_consolidation` (predictor).
+    """
+    return n > 1 and (n - 1) % N == 0
+
+
+def _full_cycle_deadline_dt(config) -> "datetime | None":
+    """Return the full-fold deadline as a ``datetime``, or ``None``.
+
+    The deadline is ``oldest_interim_dt + consolidation_period_seconds``.
+    Returns ``None`` when:
+
+    - No un-folded interim dirs exist.
+    - ``consolidation_period_seconds`` is ``None`` (manual-only cadence).
+
+    Timestamps are in LOCAL time throughout, consistent with
+    ``_is_full_cycle_due`` and ``_oldest_interim_stamp``.
+
+    Single source of truth for both :func:`_is_full_cycle_due` (gate) and
+    :func:`_seconds_until_next_full_consolidation` (predictor).
+    """
+    from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
+
+    full_period_seconds = config.consolidation.consolidation_period_seconds
+    if full_period_seconds is None:
+        return None
+    dirs = list(iter_interim_dirs(config.adapter_dir))
+    if not dirs:
+        return None
+    oldest_name, _ = dirs[0]
+    oldest_stamp = interim_stamp_from_name(oldest_name)
+    oldest_dt = datetime.strptime(oldest_stamp, "%Y%m%dT%H%M")
+    return oldest_dt + timedelta(seconds=full_period_seconds)
+
+
+def _seconds_until_next_full_consolidation(
+    config,
+    now: datetime | None = None,
+) -> int | None:
+    """Seconds until the next scheduled tick on which :func:`_is_full_cycle_due`
+    would evaluate to ``True``.
+
+    Based on the same gate logic as :func:`_is_full_cycle_due`:
+
+    - ``N == 0`` (full-fold-only mode): every tick is a full fold — returns
+      seconds to the next cadence boundary (same as ``next_interim_seconds``).
+    - Cadence disabled (``refresh_cadence`` maps to ``None``): returns ``None``
+      (manual-only, no scheduled ticks).
+    - No interim dirs exist yet: returns ``None`` (nothing to fold).
+    - Count-primary condition already holds (``n > 1 and (n-1) % N == 0``):
+      returns seconds to the next tick.
+    - Otherwise: ``deadline = oldest_interim_dt + full_period_seconds``; the
+      result is the deadline ceiled to the next tick boundary, since folds only
+      happen on ticks.
+
+    ``consolidation_period_seconds is None`` (cadence disabled but N > 0) also
+    returns ``None``.
+
+    Parameters
+    ----------
+    config:
+        Live server config.
+    now:
+        Override for "current time" (for testing).  Defaults to
+        ``datetime.now()``.
+    """
+    from paramem.memory.interim_adapter import compute_schedule_period_seconds, iter_interim_dirs
+
+    if now is None:
+        now = datetime.now()
+
+    N = config.consolidation.max_interim_count
+    _refresh_seconds = compute_schedule_period_seconds(config.consolidation.refresh_cadence)
+    if not _refresh_seconds or _refresh_seconds <= 0:
+        return None  # manual-only — no scheduled ticks
+
+    def _next_tick_seconds() -> int:
+        """Seconds until the next cadence boundary from midnight."""
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        since_mid = int((now - midnight).total_seconds())
+        next_boundary = ((since_mid // _refresh_seconds) + 1) * _refresh_seconds
+        return max(0, next_boundary - since_mid)
+
+    # N == 0: every tick is a full fold.
+    if N == 0:
+        return _next_tick_seconds()
+
+    dirs = list(iter_interim_dirs(config.adapter_dir))
+    n = len(dirs)
+    if n == 0:
+        return None  # no interims yet — nothing to fold
+
+    # Count-primary condition already holds → due on the next tick.
+    if _count_primary_due(n, N):
+        return _next_tick_seconds()
+
+    # Deadline backstop.
+    deadline_dt = _full_cycle_deadline_dt(config)
+    if deadline_dt is None:
+        return None  # cadence off or no interims → no deadline
+
+    if deadline_dt <= now:
+        # Deadline already passed → due at next tick.
+        return _next_tick_seconds()
+
+    # Ceil the deadline to the next tick boundary.  Ticks fire at multiples
+    # of _refresh_seconds from midnight of the deadline's day.
+    deadline_midnight = deadline_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    deadline_since_mid = int((deadline_dt - deadline_midnight).total_seconds())
+    k = deadline_since_mid // _refresh_seconds
+    if deadline_since_mid % _refresh_seconds == 0:
+        # Deadline lands exactly on a tick boundary — use that tick.
+        tick_from_mid = k * _refresh_seconds
+    else:
+        # Ceil to the next tick.
+        tick_from_mid = (k + 1) * _refresh_seconds
+    tick_dt = deadline_midnight + timedelta(seconds=tick_from_mid)
+    return max(0, int((tick_dt - now).total_seconds()))
 
 
 def _overflow_incident_for(cycle_mode: str, overflow_slot: bool) -> "tuple[str, str] | None":
@@ -12094,14 +12282,19 @@ def _set_voice_pipeline_profile(
                         loaded = stt_gpu.load()
                 except Exception:  # noqa: BLE001
                     loaded = False
-                if not loaded:
+                if loaded:
+                    _state["vram_components"]["stt"] = stt_gpu.vram_delta_bytes
+                else:
                     logger.warning(
                         "_set_voice_pipeline_profile('gpu'): STT load failed; voice path degraded"
                     )
             tts_gpu = _state.get("tts_gpu")
             if config.tts.enabled and tts_gpu is not None and not tts_gpu.is_loaded:
                 try:
-                    tts_gpu.load_all()
+                    with vram_measure("tts") as _tts_vm:
+                        tts_gpu.load_all()
+                    if tts_gpu.is_loaded:
+                        _state["vram_components"]["tts"] = _tts_vm["delta"]
                 except Exception:  # noqa: BLE001
                     logger.warning(
                         "_set_voice_pipeline_profile('gpu'): TTS load failed; voice path degraded"
@@ -12138,6 +12331,7 @@ def _set_voice_pipeline_profile(
                         "_set_voice_pipeline_profile('cpu'): stt_gpu.unload() failed; continuing"
                     )
                 _state["stt_gpu"] = None
+                _state.get("vram_components", {}).pop("stt", None)
 
             if old_tts_gpu is not None:
                 try:
@@ -12148,6 +12342,7 @@ def _set_voice_pipeline_profile(
                         "continuing"
                     )
                 _state["tts_gpu"] = None
+                _state.get("vram_components", {}).pop("tts", None)
 
             safe_empty_cache()
 

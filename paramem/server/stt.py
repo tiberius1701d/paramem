@@ -44,6 +44,11 @@ class WhisperSTT:
         self.beam_size = beam_size
         self.vad_filter = vad_filter
         self._model = None
+        # VRAM consumed by this engine in bytes (set after a successful CUDA
+        # load by _try_load_on_device via vram_measure).  Zero when loaded on
+        # CPU or before any load attempt.  Read by app.py to populate the
+        # per-component VRAM ledger in _state["vram_components"].
+        self.vram_delta_bytes: int = 0
 
     def load(self) -> bool:
         """Load the Whisper model. Returns True on success.
@@ -102,6 +107,7 @@ class WhisperSTT:
                         compute_type=self.compute_type,
                     )
                 delta_mib = m["delta"] / (1024 * 1024)
+                self.vram_delta_bytes = m["delta"]
                 logger.info(
                     "Whisper %s loaded on %s, used %.0f MiB",
                     self.model_name,

@@ -338,57 +338,27 @@ def reconcile(
     return f"consolidation timer: {state}, {detail}"
 
 
-def _boot_monotonic_seconds() -> float:
-    """Seconds since boot (matches systemd's CLOCK_MONOTONIC)."""
-    with open("/proc/uptime") as f:
-        return float(f.read().split()[0])
+def current_timer_state(timer_name: str = TIMER_NAME) -> dict:
+    """Return current timer state for /status reporting. Empty dict on failure.
 
+    Parameterised on ``timer_name`` so consolidation and backup timers share
+    one reader.  The timer-unit path is derived as
+    ``UNIT_DIR / f"{timer_name}.timer"``.
 
-_DURATION_UNITS = {
-    "us": 1e-6,
-    "ms": 1e-3,
-    "s": 1.0,
-    "min": 60.0,
-    "h": 3600.0,
-    "d": 86400.0,
-    "w": 604800.0,
-    "month": 2629800.0,
-    "y": 31557600.0,
-}
-
-
-def _parse_duration_seconds(s: str) -> float | None:
-    """Parse systemd duration strings like '2h 10.990051s' → seconds.
-
-    Systemd renders NextElapseUSecMonotonic as a human-readable duration,
-    not raw microseconds, so we parse it directly. Returns None on any
-    parse failure; caller treats that as 'no next elapse available'.
+    ``next_elapse_us`` is sourced from ``systemctl list-timers --output=json``
+    rather than ``systemctl show -p NextElapseUSecRealtime``.  On systemd 255
+    the ``show`` property renders as a human-readable date string even with
+    ``--timestamp=unix``, making integer parsing unreliable.  The JSON output
+    of ``list-timers`` always carries ``"next"`` as a plain integer in
+    microseconds (``0`` = no next elapse), which is the reliable source.
     """
-    import re as _re
-
-    s = s.strip()
-    if not s:
-        return None
-    total = 0.0
-    found = False
-    for m in _re.finditer(r"([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)", s):
-        value = float(m.group(1))
-        unit = m.group(2)
-        if unit not in _DURATION_UNITS:
-            return None
-        total += value * _DURATION_UNITS[unit]
-        found = True
-    return total if found else None
-
-
-def current_timer_state() -> dict:
-    """Return current timer state for /status reporting. Empty dict on failure."""
-    if not TIMER_PATH.exists():
+    timer_path = UNIT_DIR / f"{timer_name}.timer"
+    if not timer_path.exists():
         return {"installed": False}
     show = _run_systemctl(
         "show",
-        f"{TIMER_NAME}.timer",
-        "--property=ActiveState,NextElapseUSecRealtime,NextElapseUSecMonotonic,LastTriggerUSec",
+        f"{timer_name}.timer",
+        "--property=ActiveState,LastTriggerUSec",
     )
     if show.returncode != 0:
         return {"installed": True, "error": show.stderr.strip()}
@@ -398,20 +368,29 @@ def current_timer_state() -> dict:
             k, v = line.split("=", 1)
             props[k] = v
 
-    # Interval timers (OnBootSec/OnUnitActiveSec) populate Monotonic as a
-    # human-readable duration (e.g. "2h 10.990051s"); calendar timers
-    # populate Realtime as a timestamp string. Return next-elapse as a
-    # realtime microsecond integer regardless of source.
-    import time as _time
+    # Retrieve next elapse via list-timers --output=json.  The JSON entry
+    # for the timer carries "next" as an integer in microseconds; 0 means
+    # no next elapse scheduled.  An absent unit (timer not yet loaded by
+    # systemd) returns an empty array — treat as no-next.
+    import json as _json
 
-    next_elapse_us = props.get("NextElapseUSecRealtime", "").strip()
-    if not next_elapse_us.isdigit():
-        duration_s = _parse_duration_seconds(props.get("NextElapseUSecMonotonic", ""))
-        if duration_s is not None:
-            boot_s = _time.time() - _boot_monotonic_seconds()
-            next_elapse_us = str(int((boot_s + duration_s) * 1_000_000))
-        else:
-            next_elapse_us = ""
+    next_elapse_us = ""
+    list_out = _run_systemctl(
+        "list-timers",
+        f"{timer_name}.timer",
+        "--output=json",
+    )
+    if list_out.returncode == 0 and list_out.stdout.strip():
+        try:
+            timers = _json.loads(list_out.stdout)
+            for entry in timers:
+                if entry.get("unit") == f"{timer_name}.timer":
+                    next_val = entry.get("next", 0)
+                    if isinstance(next_val, int) and next_val > 0:
+                        next_elapse_us = str(next_val)
+                    break
+        except (ValueError, TypeError, KeyError):
+            pass  # malformed JSON or unexpected shape — leave next_elapse_us ""
 
     return {
         "installed": True,
@@ -421,22 +400,27 @@ def current_timer_state() -> dict:
     }
 
 
-_state_cache: dict = {"at": 0.0, "value": {}}
+# Per-name TTL cache: keyed by timer_name so consolidation and backup states
+# do not collide.
+_state_cache: dict[str, dict] = {}
 
 
-def cached_timer_state(max_age_seconds: float = 5.0) -> dict:
-    """Short-TTL cache wrapper for current_timer_state().
+def cached_timer_state(timer_name: str = TIMER_NAME, max_age_seconds: float = 5.0) -> dict:
+    """Short-TTL cache wrapper for :func:`current_timer_state`.
 
-    /status is polled frequently; forking `systemctl show` on every request
-    adds avoidable latency. 5s is short enough that timer state updates are
-    still visible in pstatus without being noticeably stale.
+    ``/status`` is polled frequently; forking ``systemctl show`` on every
+    request adds avoidable latency.  5 s is short enough that timer state
+    updates are still visible in ``pstatus`` without being noticeably stale.
+
+    Parameterised on ``timer_name`` so consolidation and backup states are
+    cached independently (separate entries in ``_state_cache``).
     """
     import time as _time
 
     now = _time.monotonic()
-    if now - _state_cache["at"] < max_age_seconds and _state_cache["value"]:
-        return _state_cache["value"]
-    value = current_timer_state()
-    _state_cache["at"] = now
-    _state_cache["value"] = value
+    entry = _state_cache.get(timer_name, {"at": 0.0, "value": {}})
+    if now - entry["at"] < max_age_seconds and entry["value"]:
+        return entry["value"]
+    value = current_timer_state(timer_name)
+    _state_cache[timer_name] = {"at": now, "value": value}
     return value

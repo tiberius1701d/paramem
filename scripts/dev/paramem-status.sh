@@ -331,6 +331,7 @@ fields = {
     "mode_config": d.get("mode_config", "") or "-",
     "next_run": fmt_duration(d.get("next_run_seconds")),
     "next_interim": fmt_duration(d.get("next_interim_seconds")),
+    "next_full": fmt_duration(d.get("next_full_consolidation_seconds")),
     "scheduler_started": d.get("scheduler_started", False),
     "orphaned": d.get("orphaned_pending", 0),
     "oldest_age": fmt_duration(d.get("oldest_pending_seconds")),
@@ -383,6 +384,11 @@ fields = {
     # log line. Legacy responses without this field fall back to "-" so the
     # renderer can print a dim placeholder rather than crash.
     "encryption": d.get("encryption") or "-",
+    # VRAM fields from in-process torch.cuda.mem_get_info (authoritative on WSL2).
+    "vram_used_mib": d.get("vram_used_mib"),
+    "vram_total_mib": d.get("vram_total_mib"),
+    "vram_paramem_mib": d.get("vram_paramem_mib"),
+    # next_full comes from the gate-derived helper (_seconds_until_next_full_consolidation).
     # Active-store migration in progress / interrupted (operator flipped
     # consolidation.mode in server.yaml). When True, inference falls back
     # to ``effective_mode`` (== source_mode) until tier-by-tier rebuild
@@ -418,7 +424,20 @@ print("|".join(str(fields[k]) for k in [
     "encryption",
     "pending_rehydration", "effective_mode",
     "migration_completed_tiers", "migration_failed_tiers",
+    "next_full",
+    "vram_used_mib", "vram_total_mib", "vram_paramem_mib",
 ]))
+# VRAM component lines: VRAM_COMP<TAB>component<TAB>mib
+_vram_comps = d.get("vram_components") or {}
+for _comp, _mib in sorted(_vram_comps.items()):
+    print("VRAM_COMP\t{}\t{}".format(_comp, _mib))
+# Oldest interim stamp for schedule math: OLDEST_INTERIM<TAB>stamp
+_oldest_stamp = d.get("oldest_interim_stamp") or ""
+print("OLDEST_INTERIM\t{}".format(_oldest_stamp))
+# Tier key-count lines: TIER<TAB>tier_name<TAB>count
+_tier_counts = d.get("tier_key_counts") or {}
+for _tier, _cnt in sorted(_tier_counts.items()):
+    print("TIER\t{}\t{}".format(_tier, _cnt))
 # Per-adapter spec lines: kind<TAB>rank<TAB>alpha<TAB>lr<TAB>target_kind
 for _kind, _spec in (d.get("adapter_specs") or {}).items():
     print("ADPT\t{}\t{}\t{}\t{}\t{}".format(
@@ -508,13 +527,18 @@ IFS='|' read -r mode cloud_only_reason model model_id_short model_device \
     encryption \
     pending_rehydration effective_mode \
     migration_completed_tiers migration_failed_tiers \
+    next_full \
+    vram_used_mib vram_total_mib vram_paramem_mib \
     <<< "$(echo "$parsed" | head -1)"
 speaker_lines=$(echo "$parsed" | awk '/^SPK\t/')
 health_lines=$(echo "$parsed" | awk '/^HLT\t/')
 adapter_spec_lines=$(echo "$parsed" | awk '/^ADPT\t/')
-# Parse attention items and migrate footer from the status output.
+# Parse attention items, migrate footer, and new observability lines.
 attention_lines=$(echo "$parsed" | awk '/^ATTN\t/')
 migrate_line=$(echo "$parsed" | awk '/^MIGRATE\t/' | head -1)
+vram_comp_lines=$(echo "$parsed" | awk '/^VRAM_COMP\t/')
+oldest_interim_stamp=$(echo "$parsed" | awk '/^OLDEST_INTERIM\t/' | head -1 | cut -f2)
+tier_lines=$(echo "$parsed" | awk '/^TIER\t/')
 
 # Render a duration in seconds as a short human-readable string.
 # Used for the age tag in the Attention block.
@@ -623,8 +647,6 @@ if command -v nvidia-smi &>/dev/null; then
     temp=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits 2>/dev/null | xargs)
     if [[ -n "$temp" ]]; then
         power=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | xargs)
-        mem_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | xargs)
-        mem_total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | xargs)
         # Color temperature
         if (( temp >= 80 )); then
             temp_color="${RED}"
@@ -633,12 +655,77 @@ if command -v nvidia-smi &>/dev/null; then
         else
             temp_color="${CYAN}"
         fi
-        # Server on GPU?
-        server_on_gpu=""
-        if nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q "^${server_pid}$"; then
-            server_on_gpu=" | server allocated"
+        # VRAM: prefer /status API values (authoritative on WSL2);
+        # fall back to nvidia-smi only when API is unavailable.
+        if [[ -n "$vram_used_mib" && "$vram_used_mib" != "None" && -n "$vram_total_mib" && "$vram_total_mib" != "None" ]]; then
+            mem_line="${vram_used_mib}/${vram_total_mib} MiB used"
+        else
+            mem_used_smi=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | xargs)
+            mem_total_smi=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | xargs)
+            mem_line="${mem_used_smi}/${mem_total_smi} MiB used"
         fi
-        echo -e "  GPU:      ${temp_color}${temp}°C${RESET} | ${power}W | ${mem_used}/${mem_total} MiB${server_on_gpu}"
+        echo -e "  GPU:      ${temp_color}${temp}°C${RESET} | ${power}W | ${mem_line}"
+
+        # Foreign GPU processes (PIDs != server): detect before composing the
+        # ParaMem line so the attribution logic can condition on the result.
+        # On WSL2, per-process VRAM is always N/A — PID only.
+        _foreign_pids=""
+        while IFS= read -r _pid; do
+            _pid="${_pid//[[:space:]]/}"
+            [[ -z "$_pid" || "$_pid" == "$server_pid" ]] && continue
+            if [[ -n "$_foreign_pids" ]]; then
+                _foreign_pids+=", "
+            fi
+            _foreign_pids+="PID $_pid"
+        done < <(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null || true)
+
+        # ParaMem per-component VRAM breakdown (only when components are known).
+        if [[ -n "$vram_paramem_mib" && "$vram_paramem_mib" != "None" ]]; then
+            # Build component list: "base 4480 · stt 1020 · tts 300"
+            comp_parts=""
+            if [[ -n "$vram_comp_lines" ]]; then
+                while IFS=$'\t' read -r _vcm _comp _mib; do
+                    [[ -z "$_comp" ]] && continue
+                    if [[ -n "$comp_parts" ]]; then
+                        comp_parts+=" · "
+                    fi
+                    comp_parts+="${_comp} ${_mib}"
+                done <<< "$vram_comp_lines"
+            fi
+            if [[ -z "$_foreign_pids" && -n "$vram_used_mib" && "$vram_used_mib" != "None" ]]; then
+                # No foreign process: attribute full device-used VRAM; annotate
+                # CUDA runtime overhead (context + cuBLAS + fragmentation gap).
+                _runtime_delta=$(( vram_used_mib - vram_paramem_mib ))
+                if (( _runtime_delta > 0 )); then
+                    comp_parts="${comp_parts:+${comp_parts} · }+${_runtime_delta} CUDA runtime"
+                fi
+                if [[ -n "$comp_parts" ]]; then
+                    echo -e "       ${DIM}ParaMem ${vram_used_mib} MiB (${comp_parts})${RESET}"
+                else
+                    echo -e "       ${DIM}ParaMem ${vram_used_mib} MiB${RESET}"
+                fi
+            elif [[ -n "$_foreign_pids" ]]; then
+                # Foreign process present: only the measured model VRAM is ours.
+                if [[ -n "$comp_parts" ]]; then
+                    echo -e "       ${DIM}ParaMem ≥${vram_paramem_mib} MiB models (${comp_parts})${RESET}"
+                else
+                    echo -e "       ${DIM}ParaMem ≥${vram_paramem_mib} MiB models${RESET}"
+                fi
+            else
+                # No foreign but vram_used_mib unavailable: plain component sum.
+                if [[ -n "$comp_parts" ]]; then
+                    echo -e "       ${DIM}ParaMem ${vram_paramem_mib} MiB (${comp_parts})${RESET}"
+                else
+                    echo -e "       ${DIM}ParaMem ${vram_paramem_mib} MiB${RESET}"
+                fi
+            fi
+        fi
+
+        if [[ -n "$_foreign_pids" ]]; then
+            echo -e "       ${YELLOW}foreign GPU process: ${_foreign_pids}${RESET}"
+        else
+            echo -e "       ${DIM}no foreign GPU process${RESET}"
+        fi
     fi
 fi
 
@@ -742,7 +829,47 @@ if [[ -n "$adapter_spec_lines" ]]; then
         echo -e "    ${DIM}${akind}${RESET}  r=${arank} α=${aalpha} lr=${alr} ${DIM}${atgt}${RESET}"
     done <<< "$adapter_spec_lines"
 fi
-if [[ "$active_adapter" != "-" && -n "$active_adapter" ]]; then
+if [[ -n "$tier_lines" ]]; then
+    # Per-tier breakdown from tier_key_counts.
+    # Collect counts into per-tier vars during the read loop, then emit in
+    # canonical order: episodic → semantic → procedural → interim(s).
+    _ep_cnt=""; _sem_cnt=""; _proc_cnt=""
+    interim_total=0
+    interim_slots=0
+    while IFS=$'\t' read -r _tmrk _tier _cnt; do
+        [[ -z "$_tier" ]] && continue
+        case "$_tier" in
+            episodic)   _ep_cnt="$_cnt" ;;
+            semantic)   _sem_cnt="$_cnt" ;;
+            procedural) _proc_cnt="$_cnt" ;;
+            *interim*)
+                (( interim_total += _cnt ))
+                (( interim_slots += 1 ))
+                ;;
+        esac
+    done <<< "$tier_lines"
+    # Emit in canonical training-importance order.
+    for _t in episodic semantic procedural; do
+        case "$_t" in
+            episodic)   _c="$_ep_cnt" ;;
+            semantic)   _c="$_sem_cnt" ;;
+            procedural) _c="$_proc_cnt" ;;
+        esac
+        [[ -z "$_c" ]] && continue
+        active_tag=""
+        if [[ "$active_adapter" == "$_t" ]]; then
+            active_tag=" ${GREEN}(active)${RESET}"
+        fi
+        echo -e "    ${DIM}${_t}${RESET}  ${_c} keys${active_tag}"
+    done
+    if (( interim_slots > 0 )); then
+        active_tag=""
+        if echo "$active_adapter" | grep -q "interim"; then
+            active_tag=" ${GREEN}(active)${RESET}"
+        fi
+        echo -e "    ${DIM}interim${RESET}  ${interim_total} keys (${interim_slots} slot$([ "$interim_slots" -eq 1 ] && echo "" || echo "s"))${active_tag}"
+    fi
+elif [[ "$active_adapter" != "-" && -n "$active_adapter" ]]; then
     echo -e "  Active:   ${GREEN}${active_adapter}${RESET} (${keys_count} keys)"
 else
     echo -e "  Active:   ${DIM}none${RESET}"
@@ -843,11 +970,29 @@ else
     if [[ "$next_interim" != "-" ]]; then
         echo -e "            next interim in ${CYAN}${next_interim}${RESET}"
     fi
-    # Full line: systemd timer wall-clock tick.
-    if [[ "$scheduler_started" != "True" ]]; then
+    # Full line: gate-derived next-full prediction.
+    # "next_full" is the fmt_duration string from next_full_consolidation_seconds.
+    if [[ "$next_full" != "-" && -n "$next_full" ]]; then
+        # Build inline math: (refresh × N = period; deadline = oldest +period)
+        # Strip leading "every " so "every 84h" renders as bare "84h".
+        period_bare="${consolidation_period#every }"
+        full_math=""
+        if [[ -n "$refresh_cadence" && "$refresh_cadence" != "-" && "$max_interim_count" != "0" ]]; then
+            full_math="refresh ${refresh_cadence} × ${max_interim_count} = ${period_bare}"
+            if [[ -n "$oldest_interim_stamp" && "$oldest_interim_stamp" != "" ]]; then
+                full_math+="; deadline = oldest interim ${oldest_interim_stamp} +${period_bare}"
+            fi
+        fi
+        if [[ -n "$full_math" ]]; then
+            echo -e "            next full   in ${CYAN}${next_full}${RESET} ${DIM}(${full_math})${RESET}"
+        else
+            echo -e "            next full   in ${CYAN}${next_full}${RESET}"
+        fi
+    elif [[ "$scheduler_started" != "True" ]]; then
         echo -e "            next full   ${DIM}first run pending${RESET}"
-    elif [[ "$next_run" != "-" ]]; then
-        echo -e "            next full   in ${CYAN}${next_run}${RESET}"
+    elif [[ "$next_run" != "-" && -n "$next_run" ]]; then
+        # Fallback: show legacy next_run from systemd timer tick.
+        echo -e "            next full   in ${CYAN}${next_run}${RESET} ${DIM}(systemd tick)${RESET}"
     fi
 fi
 

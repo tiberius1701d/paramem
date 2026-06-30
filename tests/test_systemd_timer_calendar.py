@@ -383,3 +383,208 @@ class TestReconcileDetailString:
         with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
             msg = systemd_timer.reconcile("03:00")
         assert "with catch-up" in msg
+
+
+class TestCurrentTimerStateJsonParser:
+    """Verify current_timer_state uses list-timers --output=json for next_elapse_us.
+
+    systemd 255 renders NextElapseUSecRealtime as a human date string rather
+    than a numeric microsecond value, even with --timestamp=unix.  The new
+    implementation uses list-timers --output=json whose "next" field is always
+    a plain integer.
+
+    current_timer_state is parameterised on timer_name (default TIMER_NAME).
+    Tests patch UNIT_DIR so the derived path resolves inside tmp_path.
+    """
+
+    _TIMER_NAME = systemd_timer.TIMER_NAME
+
+    def _timer_file(self, tmp_path, name: str = "") -> object:
+        """Create the timer file for ``name`` (default: TIMER_NAME) under tmp_path."""
+        n = name or self._TIMER_NAME
+        p = tmp_path / f"{n}.timer"
+        p.touch()
+        return p
+
+    def _make_show_run(self, active_state: str = "active", last_trigger: str = "") -> object:
+        """Return a mock _run_systemctl that handles 'show' and 'list-timers' calls."""
+        import subprocess
+
+        def _run(*args, **kwargs):
+            args_list = list(args)
+            if "show" in args_list:
+                stdout = f"ActiveState={active_state}\nLastTriggerUSec={last_trigger}\n"
+                return subprocess.CompletedProcess(args_list, 0, stdout=stdout, stderr="")
+            if "list-timers" in args_list:
+                # Default: no entry (timer not loaded by systemd).
+                return subprocess.CompletedProcess(args_list, 0, stdout="[]", stderr="")
+            return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
+
+        return _run
+
+    def _make_list_timers_run(self, next_us: int, timer_name: str = "") -> object:
+        """Return a mock _run_systemctl whose list-timers call returns next_us."""
+        import json
+        import subprocess
+
+        name = timer_name or self._TIMER_NAME
+
+        def _run(*args, **kwargs):
+            args_list = list(args)
+            if "show" in args_list:
+                return subprocess.CompletedProcess(
+                    args_list,
+                    0,
+                    stdout="ActiveState=active\nLastTriggerUSec=\n",
+                    stderr="",
+                )
+            if "list-timers" in args_list:
+                payload = json.dumps([{"next": next_us, "last": 0, "unit": f"{name}.timer"}])
+                return subprocess.CompletedProcess(args_list, 0, stdout=payload, stderr="")
+            return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
+
+        return _run
+
+    def test_valid_next_us_returned_as_digit_string(self, tmp_path, monkeypatch):
+        """A non-zero 'next' value must come back as a digit string of microseconds."""
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        self._timer_file(tmp_path)
+        _next = 1_782_856_800_000_000
+        with patch.object(systemd_timer, "_run_systemctl", self._make_list_timers_run(_next)):
+            state = systemd_timer.current_timer_state()
+        assert state["installed"] is True
+        assert state["next_elapse_us"] == str(_next)
+        assert state["next_elapse_us"].isdigit()
+
+    def test_next_zero_returns_empty_string(self, tmp_path, monkeypatch):
+        """'next':0 means no scheduled elapse — must return empty string."""
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        self._timer_file(tmp_path)
+        with patch.object(systemd_timer, "_run_systemctl", self._make_list_timers_run(0)):
+            state = systemd_timer.current_timer_state()
+        assert state["next_elapse_us"] == ""
+
+    def test_empty_json_array_returns_empty_string(self, tmp_path, monkeypatch):
+        """An empty list-timers array (unit not loaded) must return empty string."""
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        self._timer_file(tmp_path)
+        with patch.object(systemd_timer, "_run_systemctl", self._make_show_run()):
+            state = systemd_timer.current_timer_state()
+        assert state["next_elapse_us"] == ""
+
+    def test_missing_unit_in_json_returns_empty_string(self, tmp_path, monkeypatch):
+        """If the matching unit is absent from the JSON, return empty string."""
+        import json
+        import subprocess
+
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        self._timer_file(tmp_path)
+
+        def _run(*args, **kwargs):
+            args_list = list(args)
+            if "show" in args_list:
+                return subprocess.CompletedProcess(
+                    args_list, 0, stdout="ActiveState=active\nLastTriggerUSec=\n", stderr=""
+                )
+            if "list-timers" in args_list:
+                # A different unit is returned — the target unit is absent.
+                payload = json.dumps([{"next": 9_000_000, "last": 0, "unit": "other.timer"}])
+                return subprocess.CompletedProcess(args_list, 0, stdout=payload, stderr="")
+            return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
+
+        with patch.object(systemd_timer, "_run_systemctl", _run):
+            state = systemd_timer.current_timer_state()
+        assert state["next_elapse_us"] == ""
+
+    def test_active_and_last_trigger_from_show(self, tmp_path, monkeypatch):
+        """ActiveState and LastTriggerUSec must still come from systemctl show."""
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        self._timer_file(tmp_path)
+        _next = 1_782_000_000_000_000
+
+        import subprocess
+
+        def _run(*args, **kwargs):
+            args_list = list(args)
+            if "show" in args_list:
+                return subprocess.CompletedProcess(
+                    args_list,
+                    0,
+                    stdout="ActiveState=active\nLastTriggerUSec=1782000000000000\n",
+                    stderr="",
+                )
+            if "list-timers" in args_list:
+                import json
+
+                payload = json.dumps(
+                    [{"next": _next, "last": 0, "unit": f"{self._TIMER_NAME}.timer"}]
+                )
+                return subprocess.CompletedProcess(args_list, 0, stdout=payload, stderr="")
+            return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
+
+        with patch.object(systemd_timer, "_run_systemctl", _run):
+            state = systemd_timer.current_timer_state()
+        assert state["active"] is True
+        assert state["last_trigger_us"] == "1782000000000000"
+        assert state["next_elapse_us"] == str(_next)
+
+    def test_timer_path_not_exists_returns_installed_false(self, tmp_path, monkeypatch):
+        """Non-existent timer file must return {'installed': False}."""
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        # No file created — the derived path does not exist.
+        state = systemd_timer.current_timer_state()
+        assert state == {"installed": False}
+
+    def test_malformed_json_returns_empty_next(self, tmp_path, monkeypatch):
+        """Malformed list-timers JSON must not crash and must leave next_elapse_us empty."""
+        import subprocess
+
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        self._timer_file(tmp_path)
+
+        def _run(*args, **kwargs):
+            args_list = list(args)
+            if "show" in args_list:
+                return subprocess.CompletedProcess(
+                    args_list, 0, stdout="ActiveState=active\nLastTriggerUSec=\n", stderr=""
+                )
+            if "list-timers" in args_list:
+                return subprocess.CompletedProcess(
+                    args_list, 0, stdout="not valid json {{", stderr=""
+                )
+            return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
+
+        with patch.object(systemd_timer, "_run_systemctl", _run):
+            state = systemd_timer.current_timer_state()
+        assert state["next_elapse_us"] == ""
+        assert state["installed"] is True
+
+    def test_backup_timer_name_reads_backup_unit(self, tmp_path, monkeypatch):
+        """cached_timer_state('paramem-backup') reads paramem-backup.timer, not consolidate."""
+        import json
+        import subprocess
+
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        # Create the backup timer file; do NOT create the consolidation one.
+        self._timer_file(tmp_path, "paramem-backup")
+        _next = 1_783_000_000_000_000
+
+        def _run(*args, **kwargs):
+            args_list = list(args)
+            if "show" in args_list:
+                return subprocess.CompletedProcess(
+                    args_list, 0, stdout="ActiveState=active\nLastTriggerUSec=\n", stderr=""
+                )
+            if "list-timers" in args_list:
+                payload = json.dumps([{"next": _next, "last": 0, "unit": "paramem-backup.timer"}])
+                return subprocess.CompletedProcess(args_list, 0, stdout=payload, stderr="")
+            return subprocess.CompletedProcess(args_list, 0, stdout="", stderr="")
+
+        # max_age_seconds=0 bypasses the module-level cache to force a fresh read.
+        with patch.object(systemd_timer, "_run_systemctl", _run):
+            state = systemd_timer.cached_timer_state("paramem-backup", max_age_seconds=0)
+        assert state["installed"] is True
+        assert state["next_elapse_us"] == str(_next)
+        # Default consolidation timer (not created) must still return not-installed.
+        default_state = systemd_timer.current_timer_state()
+        assert default_state == {"installed": False}

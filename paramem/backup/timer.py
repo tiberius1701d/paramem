@@ -43,7 +43,6 @@ __all__ = [
     "render_service_unit",
     "render_timer_unit",
     "reconcile",
-    "cached_timer_state",
     "_backup_timer_interval_seconds",
 ]
 
@@ -199,82 +198,6 @@ def reconcile(
         detail = f"daily at {spec.on_calendar} (with catch-up)"
     state = "updated" if (svc_changed or tmr_changed) else "already current"
     return f"backup timer: {state}, {detail}"
-
-
-# ---------------------------------------------------------------------------
-# Timer state cache (mirrors systemd_timer.cached_timer_state)
-# ---------------------------------------------------------------------------
-
-_state_cache: dict = {"at": 0.0, "value": {}}
-
-
-def current_timer_state() -> dict:
-    """Return current backup timer state.  Empty dict on failure."""
-    if not TIMER_PATH.exists():
-        return {"installed": False}
-    show = _run_systemctl(
-        "show",
-        f"{TIMER_NAME}.timer",
-        "--property=ActiveState,NextElapseUSecRealtime,NextElapseUSecMonotonic,LastTriggerUSec",
-    )
-    if show.returncode != 0:
-        return {"installed": True, "error": show.stderr.strip()}
-    props = {}
-    for line in show.stdout.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            props[k] = v
-
-    import time as _time
-
-    from paramem.server.systemd_timer import (
-        _boot_monotonic_seconds,
-        _parse_duration_seconds,
-    )
-
-    next_elapse_us = props.get("NextElapseUSecRealtime", "").strip()
-    if not next_elapse_us.isdigit():
-        duration_s = _parse_duration_seconds(props.get("NextElapseUSecMonotonic", ""))
-        if duration_s is not None:
-            boot_s = _time.time() - _boot_monotonic_seconds()
-            next_elapse_us = str(int((boot_s + duration_s) * 1_000_000))
-        else:
-            next_elapse_us = ""
-
-    return {
-        "installed": True,
-        "active": props.get("ActiveState") == "active",
-        "next_elapse_us": next_elapse_us,
-        "last_trigger_us": props.get("LastTriggerUSec", ""),
-    }
-
-
-def cached_timer_state(max_age_seconds: float = 5.0) -> dict:
-    """Short-TTL cache wrapper for ``current_timer_state()``.
-
-    ``/status`` is polled frequently; forking ``systemctl show`` on every
-    request adds avoidable latency.  5 seconds is short enough that timer
-    state updates are still visible in pstatus.
-
-    Parameters
-    ----------
-    max_age_seconds:
-        Cache TTL.  Defaults to 5 seconds.
-
-    Returns
-    -------
-    dict
-        Current timer state dict.
-    """
-    import time as _time
-
-    now = _time.monotonic()
-    if now - _state_cache["at"] < max_age_seconds and _state_cache["value"]:
-        return _state_cache["value"]
-    value = current_timer_state()
-    _state_cache["at"] = now
-    _state_cache["value"] = value
-    return value
 
 
 # ---------------------------------------------------------------------------
