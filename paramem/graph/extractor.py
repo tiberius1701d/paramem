@@ -581,6 +581,7 @@ def extract_procedural_graph(
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
     model_alias: str | None = None,
+    timestamp: str | None = None,
 ) -> SessionGraph:
     """Extract preferences/habits from a session transcript.
 
@@ -588,6 +589,13 @@ def extract_procedural_graph(
     behavioral patterns rather than factual knowledge.
 
     Args:
+        timestamp: Session-start assertion time (ISO 8601), typically the
+            session's ``started_at``. Stamped onto the returned
+            ``SessionGraph.timestamp`` so ``last_seen`` on newly-merged
+            edges reflects when the facts were asserted, not when
+            extraction ran. ``None`` (default) falls back to ``now()`` —
+            preserves behaviour for callers that don't yet have a real
+            session-start time.
         speaker_name: Display name of the speaker (e.g. from voice enrollment).
             Passed to ``build_speaker_context`` as comprehension context so the
             model can map self-references in the transcript onto the stable
@@ -656,7 +664,7 @@ def extract_procedural_graph(
         json_str = _extract_json_block(raw_output)
         data = json.loads(json_str)
         data["session_id"] = session_id
-        data["timestamp"] = datetime.now(timezone.utc).isoformat()
+        data["timestamp"] = timestamp or datetime.now(timezone.utc).isoformat()
         data = _normalize_extraction(data)
         # Stamp speaker_id onto every relation dict before schema validation.
         # Relation.speaker_id is mandatory; the LLM output never includes it.
@@ -719,6 +727,7 @@ def extract_graph(
     stop_phase: str | None = None,
     model_alias: str | None = None,
     seed: int | None = None,
+    timestamp: str | None = None,
 ) -> SessionGraph:
     """Extract a knowledge graph from a session transcript.
 
@@ -784,6 +793,11 @@ def extract_graph(
             plausibility).  At the default ``temperature=0.0`` (greedy
             decoding) this is a strict no-op.  Default ``None`` preserves
             production behaviour unchanged.
+        timestamp: Session-start assertion time (ISO 8601), typically the
+            session's ``started_at``.  Stamped onto the returned
+            ``SessionGraph.timestamp`` so ``last_seen`` on newly-merged
+            edges reflects when the facts were asserted, not when
+            extraction ran.  ``None`` (default) falls back to ``now()``.
     """
     # Validate stop_phase against the canonical whitelist before any
     # work happens.  Catches typos early ("anonymise" vs "anonymize")
@@ -804,7 +818,7 @@ def extract_graph(
     with extraction_trace() as trace:
         graph = SessionGraph(
             session_id=session_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
         )
         try:
             # Phase 1 — local Mistral extract.  Raw output is the canonical
@@ -835,6 +849,7 @@ def extract_graph(
                         session_id,
                         speaker_id=speaker_id,
                         speaker_name=speaker_name,
+                        timestamp=timestamp,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1205,6 +1220,7 @@ def _parse_extraction(
     session_id: str,
     speaker_id: str,
     speaker_name: str | None = None,
+    timestamp: str | None = None,
 ) -> SessionGraph:
     """Parse raw model output into a SessionGraph.
 
@@ -1228,6 +1244,9 @@ def _parse_extraction(
         speaker_name: Display name of the speaker (e.g. ``"Tobias"``).
             Passed through for call-site compatibility; not used for entity
             matching in :func:`_stamp_speaker_entity`.
+        timestamp: Session-start assertion time (ISO 8601), forwarded from
+            the caller's ``extract_graph(timestamp=...)``.  ``None`` (default)
+            falls back to ``now()``.
     """
     json_str = _extract_json_block(raw_output)
     data = json.loads(json_str)
@@ -1240,7 +1259,7 @@ def _parse_extraction(
         raise ValueError(f"Unexpected extraction payload type: {type(data).__name__}")
 
     data["session_id"] = session_id
-    data["timestamp"] = datetime.now(timezone.utc).isoformat()
+    data["timestamp"] = timestamp or datetime.now(timezone.utc).isoformat()
 
     data = _normalize_extraction(data)
 

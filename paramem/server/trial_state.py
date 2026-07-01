@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -147,21 +147,7 @@ class TrialMarker:
 
     def to_dict(self) -> dict:
         """Serialize the marker to a JSON-ready dict."""
-        return {
-            "schema_version": self.schema_version,
-            "started_at": self.started_at,
-            "pre_trial_config_sha256": self.pre_trial_config_sha256,
-            "candidate_config_sha256": self.candidate_config_sha256,
-            "backup_paths": dict(self.backup_paths),
-            "trial_adapter_dir": self.trial_adapter_dir,
-            "trial_graph_dir": self.trial_graph_dir,
-            "config_artifact_filename": self.config_artifact_filename,
-            "migration_kind": self.migration_kind,
-            "base_swap_phase": self.base_swap_phase,
-            "old_model": self.old_model,
-            "new_model": self.new_model,
-            "bundle_slot": self.bundle_slot,
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "TrialMarker":

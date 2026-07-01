@@ -1,6 +1,7 @@
 """Tests for knowledge graph extraction."""
 
 import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -8,6 +9,8 @@ from paramem.graph.extractor import (
     _extract_json_block,
     _normalize_extraction,
     _stamp_speaker_entity,
+    extract_graph,
+    extract_procedural_graph,
 )
 from paramem.graph.schema import Entity, SessionGraph
 
@@ -368,3 +371,142 @@ class TestStampSpeakerEntity:
         assert s0.speaker_id == "speaker0"
         # speaker1 != "speaker0".lower() → else branch: ent.speaker_id = ent.name.
         assert s1.speaker_id == "speaker1"
+
+
+class TestTimestampPropagation:
+    """extract_procedural_graph stamps SessionGraph.timestamp from the passed
+    ``timestamp`` param (session-start assertion time) rather than now().
+
+    Mocks generate_answer (the sole LLM call in the procedural pipeline) so
+    the test runs on CPU with no real model — the surface under test is the
+    kwarg plumbing (timestamp → SessionGraph.timestamp), not generation
+    quality.
+    """
+
+    def _fake_raw_output(self) -> str:
+        return json.dumps(
+            {
+                "entities": [{"name": "speaker0", "entity_type": "person"}],
+                "relations": [
+                    {
+                        "subject": "speaker0",
+                        "predicate": "prefers",
+                        "object": "tea",
+                        "relation_type": "preference",
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def test_explicit_timestamp_wins_over_now(self):
+        """A caller-supplied timestamp lands verbatim on SessionGraph.timestamp."""
+        with patch(
+            "paramem.graph.extractor.generate_answer",
+            return_value=self._fake_raw_output(),
+        ):
+            graph = extract_procedural_graph(
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+                transcript="I like tea.",
+                session_id="s001",
+                speaker_id="speaker0",
+                stt_correction=False,
+                timestamp="2026-05-01T12:00:00+00:00",
+            )
+        assert graph.timestamp == "2026-05-01T12:00:00+00:00"
+
+    def test_no_timestamp_falls_back_to_now(self):
+        """Omitting timestamp preserves the now() fallback (unchanged behaviour)."""
+        from datetime import datetime, timezone
+
+        before = datetime.now(timezone.utc)
+        with patch(
+            "paramem.graph.extractor.generate_answer",
+            return_value=self._fake_raw_output(),
+        ):
+            graph = extract_procedural_graph(
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+                transcript="I like tea.",
+                session_id="s001",
+                speaker_id="speaker0",
+                stt_correction=False,
+            )
+        after = datetime.now(timezone.utc)
+        parsed = datetime.fromisoformat(graph.timestamp)
+        assert before <= parsed <= after
+
+
+class TestExtractGraphTimestampPropagation:
+    """extract_graph stamps SessionGraph.timestamp from the passed
+    ``timestamp`` param on the SUCCESS (parsed) path — i.e. through
+    ``_parse_extraction`` — not just on the parse-failure fallback branch.
+
+    Mocks ``_generate_extraction`` (the sole LLM call before parsing) with
+    valid, parseable extraction JSON containing at least one entity and one
+    relation, so ``_parse_extraction`` succeeds rather than falling back to
+    the empty-graph exception handler. ``stop_phase="local_extract"``
+    returns immediately after parsing succeeds, isolating the surface under
+    test (timestamp plumbing) from the unrelated STT/HA/SOTA phases.
+    """
+
+    def _fake_raw_output(self) -> str:
+        return json.dumps(
+            {
+                "entities": [
+                    {"name": "speaker0", "entity_type": "person"},
+                    {"name": "tea", "entity_type": "object"},
+                ],
+                "relations": [
+                    {
+                        "subject": "speaker0",
+                        "predicate": "prefers",
+                        "object": "tea",
+                        "relation_type": "preference",
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def test_explicit_timestamp_wins_over_now_on_success_path(self):
+        """A caller-supplied timestamp lands verbatim on SessionGraph.timestamp
+        when extraction parses successfully (proves the success path ran)."""
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            return_value=self._fake_raw_output(),
+        ):
+            graph = extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="I like tea.",
+                session_id="s001",
+                speaker_id="speaker0",
+                timestamp="2026-06-28T23:21:30+00:00",
+                stop_phase="local_extract",
+            )
+        assert graph.relations, "fake output must parse successfully, not fall back"
+        assert graph.timestamp == "2026-06-28T23:21:30+00:00"
+
+    def test_no_timestamp_falls_back_to_now_on_success_path(self):
+        """Omitting timestamp preserves the now() fallback on the success path."""
+        from datetime import datetime, timezone
+
+        before = datetime.now(timezone.utc)
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            return_value=self._fake_raw_output(),
+        ):
+            graph = extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="I like tea.",
+                session_id="s001",
+                speaker_id="speaker0",
+                stop_phase="local_extract",
+            )
+        after = datetime.now(timezone.utc)
+        assert graph.relations, "fake output must parse successfully, not fall back"
+        parsed = datetime.fromisoformat(graph.timestamp)
+        assert before <= parsed <= after

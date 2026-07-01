@@ -593,10 +593,13 @@ class TestPerChunkOOMSkip:
         (ha / "adapters").mkdir(parents=True, exist_ok=True)
 
         buffer = SessionBuffer(ha / "sessions", state_dir=ha / "state", debug=False)
-        # Two pending document sessions, both with speaker_id set.
+        # Two pending document sessions, both with speaker_id set. Uses
+        # append_document_chunk (not append) so the session_id is the
+        # deterministic sid itself, mirroring the real /ingest-sessions
+        # handler (app.py) — append() now mints a rotated session_id.
         for sid in ("doc-aaa", "doc-bbb"):
             buffer.set_speaker(sid, "Speaker1", "Speaker1")
-            buffer.append(
+            buffer.append_document_chunk(
                 sid,
                 "user",
                 f"Synthetic chunk for {sid}",
@@ -740,9 +743,11 @@ class TestExtractionFailedAbortsCycle:
         (ha / "adapters").mkdir(parents=True, exist_ok=True)
 
         buffer = SessionBuffer(ha / "sessions", state_dir=ha / "state", debug=False)
+        # append_document_chunk (not append): deterministic session_id,
+        # mirroring the real /ingest-sessions handler.
         for sid in ("doc-aaa", "doc-bbb", "doc-ccc"):
             buffer.set_speaker(sid, "Speaker1", "Speaker1")
-            buffer.append(
+            buffer.append_document_chunk(
                 sid,
                 "user",
                 f"Synthetic chunk for {sid}",

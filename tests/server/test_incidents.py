@@ -23,6 +23,7 @@ import time
 import pytest
 
 from paramem.server.incidents import (
+    Incident,
     IncidentStoreSchemaError,
     ack_incident,
     read_incidents,
@@ -339,3 +340,52 @@ class TestConcurrency:
         incidents = read_incidents(tmp_path)
         assert len(incidents) == 1  # all ops deduped to one incident
         assert incidents[0].count == N_THREADS * N_OPS
+
+
+# ---------------------------------------------------------------------------
+# Incident.to_dict
+# ---------------------------------------------------------------------------
+
+
+class TestIncidentToDict:
+    def test_to_dict_returns_all_fields(self):
+        """to_dict() output matches the exact key/value set for a populated instance."""
+        inc = Incident(
+            id="vram_exhausted:phase1",
+            type="vram_exhausted",
+            severity="failed",
+            first_seen="2026-06-01T00:00:00+00:00",
+            last_seen="2026-06-01T00:05:00+00:00",
+            count=3,
+            status="active",
+            summary="VRAM exhausted at phase1",
+            detail={"phase": "phase1", "free_bytes": 12345},
+        )
+        d = inc.to_dict()
+        assert d == {
+            "id": "vram_exhausted:phase1",
+            "type": "vram_exhausted",
+            "severity": "failed",
+            "first_seen": "2026-06-01T00:00:00+00:00",
+            "last_seen": "2026-06-01T00:05:00+00:00",
+            "count": 3,
+            "status": "active",
+            "summary": "VRAM exhausted at phase1",
+            "detail": {"phase": "phase1", "free_bytes": 12345},
+        }
+
+    def test_to_dict_from_dict_roundtrip(self):
+        """to_dict → from_dict → equal incident."""
+        inc = Incident(
+            id="consolidation_retry_exhausted:c001",
+            type="consolidation_retry_exhausted",
+            severity="warning",
+            first_seen="2026-06-01T00:00:00+00:00",
+            last_seen="2026-06-01T00:00:00+00:00",
+            count=1,
+            status="acknowledged",
+            summary="Retry budget exhausted",
+            detail={},
+        )
+        recovered = Incident.from_dict(inc.to_dict())
+        assert recovered == inc

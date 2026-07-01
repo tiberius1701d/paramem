@@ -523,6 +523,9 @@ voice:
     fr: {morning: "Bonjour", afternoon: "Bon après-midi", evening: "Bonsoir"}
     es: {morning: "Buenos días", afternoon: "Buenas tardes", evening: "Buenas noches"}
 
+session:
+  idle_timeout_minutes: 10  # gap since a conversation's last turn after which the next turn opens a fresh session
+
 speaker:
   enabled: false  # voice-based speaker identification via pyannote (requires pyannote install + HF auth token)
   high_confidence_threshold: 0.60  # confirmed match (cross-device centroid)

@@ -162,6 +162,7 @@ class TestDebugDumpHappyPath:
                 "last_reinforced_cycle": 5,
                 "reinforcement_count": 2,
                 "last_seen": "",
+                "first_seen": "",
             }
         }
         state = _make_state(tmp_path, store_items=items)
@@ -177,6 +178,36 @@ class TestDebugDumpHappyPath:
         assert row["relation_type"] == "factual", "relation_type must come from bookkeeping_for_key"
         assert row["last_reinforced_cycle"] == 5
         assert row["reinforcement_count"] == 2
+
+    def test_first_seen_sourced_from_bookkeeping_for_key(self, tmp_path, monkeypatch):
+        """first_seen in the dump row comes from bookkeeping_for_key, alongside
+        last_seen — observability parity for the assertion-window fields.
+        """
+        items = [
+            (
+                "episodic",
+                "graph1",
+                {"subject": "Mara", "predicate": "lives_in", "object": "Berlin"},
+            ),
+        ]
+        bk = {
+            "graph1": {
+                "speaker_id": "alice",
+                "relation_type": "factual",
+                "last_reinforced_cycle": 5,
+                "reinforcement_count": 2,
+                "last_seen": "2026-06-30T12:00:00",
+                "first_seen": "2026-06-01T09:00:00",
+            }
+        }
+        state = _make_state(tmp_path, store_items=items)
+        state["memory_store"] = _FakeStore(items, bookkeeping=bk)
+        client = _make_client(monkeypatch, state)
+        resp = client.get("/debug/dump")
+        assert resp.status_code == 200, resp.text
+        row = resp.json()["entries"][0]
+        assert row["first_seen"] == "2026-06-01T09:00:00"
+        assert row["last_seen"] == "2026-06-30T12:00:00"
 
     def test_bookkeeping_fields_absent_when_no_bookkeeping_record(self, tmp_path, monkeypatch):
         """When a key has no bookkeeping record, the row omits bookkeeping fields
@@ -198,4 +229,5 @@ class TestDebugDumpHappyPath:
         row = resp.json()["entries"][0]
         assert "speaker_id" not in row
         assert "relation_type" not in row
+        assert "first_seen" not in row
         assert "first_seen_cycle" not in row

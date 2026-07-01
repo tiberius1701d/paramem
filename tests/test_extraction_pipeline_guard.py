@@ -419,6 +419,35 @@ def test_server_extract_session_callsites_pass_identical_kwargs():
     )
 
 
+def test_server_extract_session_callsites_pass_event_time():
+    """Every `paramem/server/` extract_session(...) call site must pass
+    `event_time` explicitly.
+
+    `extract_session`'s `event_time` param defaults to ``None`` (falls back
+    to ``now()`` at the extractor layer) so the ~19 test/experiment call
+    sites outside `paramem/server/` don't need updating. Production call
+    sites MUST NOT rely on that fallback — a session's facts must carry the
+    real session-start assertion time, not consolidation-time. This guard
+    locks the production invariant without touching tests/experiments.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    server_dir = repo_root / "paramem" / "server"
+
+    missing: list[str] = []
+    for py_file in server_dir.rglob("*.py"):
+        for lineno, kwset in _collect_extract_session_callsites(py_file):
+            if "event_time" not in kwset:
+                label = f"{py_file.relative_to(repo_root).as_posix()}:{lineno}"
+                missing.append(label)
+
+    assert not missing, (
+        "extract_session call site(s) under paramem/server/ omit event_time — "
+        "the session's real started_at time would silently fall back to "
+        "now() at the extractor layer, recording consolidation-time instead "
+        "of assertion-time on newly-merged edges:\n" + "\n".join(f"  {m}" for m in missing)
+    )
+
+
 def test_server_yaml_extraction_flags_round_trip(tmp_path):
     """Gap (b): values set in server.yaml must reach `config.consolidation.*`
     unchanged.
@@ -502,6 +531,9 @@ def test_server_extract_session_kwargs_map_to_consolidation_config():
         # ConsolidationScheduleConfig because it is resolved per call,
         # not stored as a loop-level default.
         "source_type",
+        # Session-start assertion time (session["started_at"]); same
+        # per-call, not-a-loop-default reasoning as source_type.
+        "event_time",
     }
     config_fields = {f for f in vars(ConsolidationScheduleConfig()).keys()}
 

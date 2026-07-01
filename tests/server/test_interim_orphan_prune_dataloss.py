@@ -237,8 +237,12 @@ class TestSoftStaleBookkeepingRetention:
             {"subject": "Bob", "predicate": "works_at", "object": "Acme"},
             register=True,
         )
-        store.set_bookkeeping("active1", speaker_id="Speaker0", relation_type="factual")
-        store.set_bookkeeping("stale1", speaker_id="Speaker0", relation_type="preference")
+        store.set_bookkeeping(
+            "active1", speaker_id="Speaker0", relation_type="factual", first_seen=""
+        )
+        store.set_bookkeeping(
+            "stale1", speaker_id="Speaker0", relation_type="preference", first_seen=""
+        )
         # Soft-stale stale1 via the registry.
         store.discard_keys(["stale1"], mode="stale")
 

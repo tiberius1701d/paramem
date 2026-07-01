@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -150,17 +150,7 @@ class Incident:
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-ready dict."""
-        return {
-            "id": self.id,
-            "type": self.type,
-            "severity": self.severity,
-            "first_seen": self.first_seen,
-            "last_seen": self.last_seen,
-            "count": self.count,
-            "status": self.status,
-            "summary": self.summary,
-            "detail": self.detail,
-        }
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------

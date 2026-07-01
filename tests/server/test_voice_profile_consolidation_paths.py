@@ -24,6 +24,9 @@ def _make_pending(source_type: str = "transcript", n: int = 1) -> list[dict]:
             "transcript": "Hello",
             "speaker_id": "spk-1",
             "source_type": source_type,
+            "doc_title": None,
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "ended_at": "2026-01-01T00:05:00+00:00",
         }
         for i in range(n)
     ]

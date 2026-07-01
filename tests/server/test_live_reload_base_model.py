@@ -691,7 +691,6 @@ def test_preload_cache_false_clears_boot_degraded():
     fake_store.load_bookkeeping_from_disk.return_value = {
         "loaded": 0,
         "orphaned": 0,
-        "legacy_upgraded": 0,
     }
 
     state_patch = {
@@ -2150,7 +2149,7 @@ def test_hydrate_clears_boot_degraded_on_preload_cache_false():
         patch.object(
             store,
             "load_bookkeeping_from_disk",
-            return_value={"loaded": 0, "orphaned": 0, "legacy_upgraded": 0},
+            return_value={"loaded": 0, "orphaned": 0},
         ),
     ):
         app_module._hydrate_memory_store_in_place(

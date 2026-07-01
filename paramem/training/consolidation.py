@@ -23,7 +23,7 @@ from paramem.graph.extractor import (
     _graph_enrich_with_sota,
     dedup_synonym_predicates,
 )
-from paramem.graph.merger import GraphMerger
+from paramem.graph.merger import GraphMerger, min_nonempty
 from paramem.graph.name_match import (
     canonical,
     is_speaker_id,
@@ -1039,6 +1039,7 @@ class ConsolidationLoop:
         plausibility_stage: str | None = None,
         verify_anonymization: bool | None = None,
         source_type: str = "transcript",
+        event_time: str | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """Extract and generate relations from a session without training.
 
@@ -1059,6 +1060,13 @@ class ConsolidationLoop:
                 template.  Narrator binding for document sources uses the
                 same ``build_speaker_context`` mechanism as transcripts — no
                 separate ``doc_title`` or context string is needed.
+            event_time: Session-start assertion time (ISO 8601), typically
+                the session's ``started_at``. Forwarded to the extraction
+                chokepoint as ``timestamp`` so a NEW fact's edge
+                ``last_seen`` reflects when it was asserted, not when
+                extraction ran. ``None`` (default) falls back to ``now()``
+                at the extractor layer — preserves behaviour for callers
+                that don't yet have a real session-start time.
         """
         logger.info("=== Extraction (session=%s) ===", session_id)
 
@@ -1087,6 +1095,7 @@ class ConsolidationLoop:
                 plausibility_judge=plausibility_judge,
                 plausibility_stage=plausibility_stage,
                 verify_anonymization=verify_anonymization,
+                timestamp=event_time,
             )
 
             logger.info(
@@ -1134,6 +1143,7 @@ class ConsolidationLoop:
                         stt_correction=stt_correction,
                         source_type=source_type,
                         speaker_id=speaker_id,
+                        timestamp=event_time,
                     )
                     t.add("relation_count", len(proc_graph.relations))
                 procedural_rels.extend(
@@ -2335,6 +2345,14 @@ class ConsolidationLoop:
         under :data:`paramem.memory.persistence._EDGE_SOURCE_ATTR`, not the
         NetworkX-reserved ``"source"`` field, so the tag survives persist).
 
+        Each enrichment edge is a second-order fact derived from its chunk's
+        source edges, so it inherits their assertion window: ``last_seen`` is
+        the max (most recent) and ``first_seen`` the earliest non-empty
+        (:func:`~paramem.graph.merger.min_nonempty`) across the chunk
+        subgraph's edges, computed before same_as contraction mutates the
+        graph.  This mirrors :meth:`_build_registry_true_relations` stamping
+        ``last_seen``/``first_seen`` from bookkeeping.
+
         Early-return conditions (all return ``skipped=True``):
         - Graph has fewer than 10 nodes (floor — too little signal).
         - ``extraction_noise_filter`` is empty (no SOTA provider configured).
@@ -2449,6 +2467,18 @@ class ConsolidationLoop:
         for chunk_nodes in chunks:
             try:
                 chunk_subgraph = graph.subgraph(chunk_nodes)
+                # Enrichment edges are second-order facts derived from this
+                # chunk's source edges, so they inherit the chunk's assertion
+                # window rather than landing untimed.  Computed from the
+                # subgraph view BEFORE any same_as contraction below mutates
+                # ``graph`` (contraction would change what the view sees).
+                _chunk_last_seen = ""
+                _chunk_first_seen = ""
+                for _u, _v, _edata in chunk_subgraph.edges(data=True):
+                    _chunk_last_seen = max(_chunk_last_seen, _edata.get("last_seen") or "")
+                    _chunk_first_seen = min_nonempty(
+                        _chunk_first_seen, _edata.get("first_seen") or ""
+                    )
                 triples = serialize_subgraph_triples(chunk_subgraph)
                 result = _graph_enrich_with_sota(
                     triples,
@@ -2618,6 +2648,8 @@ class ConsolidationLoop:
                         speaker_id=_subj_sid,
                         symmetric=bool(rel.get("symmetric")),
                         edge_source="graph_enrichment",
+                        last_seen=_chunk_last_seen,
+                        first_seen=_chunk_first_seen,
                     )
                 )
 
@@ -2845,6 +2877,7 @@ class ConsolidationLoop:
                 _surv_recurrence: int = _survivor_edata.get("reinforcement_count", 1)
                 _surv_confidence: float = _survivor_edata.get("confidence", 0.0)
                 _surv_last_seen: str = _survivor_edata.get("last_seen", "")
+                _surv_first_seen: str = _survivor_edata.get("first_seen", "")
 
                 _retired_preds = [cp for cp in cluster_preds if cp != _survivor_pred]
                 for _ret_pred in _retired_preds:
@@ -2859,11 +2892,15 @@ class ConsolidationLoop:
                         _surv_last_seen = max(
                             _surv_last_seen, _ret_info["edata"].get("last_seen", "")
                         )
+                        _surv_first_seen = min_nonempty(
+                            _surv_first_seen, _ret_info["edata"].get("first_seen", "")
+                        )
 
                 _survivor_edata["sessions"] = _surv_sessions
                 _survivor_edata["reinforcement_count"] = _surv_recurrence
                 _survivor_edata["confidence"] = _surv_confidence
                 _survivor_edata["last_seen"] = _surv_last_seen
+                _survivor_edata["first_seen"] = _surv_first_seen
 
                 # Retire each non-survivor edge.
                 group_retired = 0
@@ -3050,6 +3087,10 @@ class ConsolidationLoop:
                   supersede a strictly-older dated registry-true rival.  Without
                   this field the captured relation would have ``last_seen=""``
                   and the any-empty COEXIST rule would suppress all supersession.
+                - ``first_seen`` from the edge ``"first_seen"`` attribute (empty
+                  string when absent) — symmetric carry so the re-merge's
+                  ``min_nonempty`` window-start logic sees the real earliest
+                  assertion instead of losing it to a synthetic fold sentinel.
         """
         import networkx as _nx
 
@@ -3077,6 +3118,7 @@ class ConsolidationLoop:
                     speaker_id=_er_spk,
                     session_ids=list(_er_data.get("sessions", [])),
                     last_seen=_er_data.get("last_seen", ""),
+                    first_seen=_er_data.get("first_seen", ""),
                 )
             )
         return _result
@@ -3605,6 +3647,7 @@ class ConsolidationLoop:
                             reinforcement_count=1,
                             last_reinforced_cycle=self.cycle_count,
                             last_seen=rec.get("last_seen", ""),
+                            first_seen=rec.get("first_seen", ""),
                             allow_empty_speaker=(rec["speaker_id"] == ""),
                         )
                     self._indexed_next_index += len(new_keyed_episodic)
@@ -3712,6 +3755,7 @@ class ConsolidationLoop:
                             reinforcement_count=1,
                             last_reinforced_cycle=self.cycle_count,
                             last_seen=rec.get("last_seen", ""),
+                            first_seen=rec.get("first_seen", ""),
                             allow_empty_speaker=(rec["speaker_id"] == ""),
                         )
                         if rec["tier"] == "procedural":
@@ -5111,6 +5155,7 @@ class ConsolidationLoop:
                     # session_graph.timestamp at ingest via merger._upsert_relation.
                     # Never fabricate now() here.
                     "last_seen": _t_data.get("last_seen", ""),
+                    "first_seen": _t_data.get("first_seen", ""),
                 }
 
                 if not defer:
@@ -5128,6 +5173,7 @@ class ConsolidationLoop:
                         reinforcement_count=1,
                         last_reinforced_cycle=self.cycle_count,
                         last_seen=_t_data.get("last_seen", ""),
+                        first_seen=_t_data.get("first_seen", ""),
                         allow_empty_speaker=(_subj_sid == ""),
                     )
                     # Advance the committed counter for the chosen tier.
@@ -5332,8 +5378,18 @@ class ConsolidationLoop:
         LIVE active key, e.g. under ``boot_degraded``), the key is logged as
         an orphan and skipped.  Bookkeeping never carries SPO.
 
-        ``relation_type`` and ``speaker_id`` always come from bookkeeping (never
-        from the entry payload which carries the merge-time value).
+        ``relation_type``, ``speaker_id``, ``last_seen``, and ``first_seen``
+        always come from bookkeeping (never from the entry payload which
+        carries the merge-time value), each via ``bk.get(...)`` with a
+        tolerant default — ``bk`` is legitimately ``{}`` for an active key
+        that has content but no bookkeeping record at all (e.g. a key
+        migrated by ``active_store_migration._migrate_tier_simulate_to_train``,
+        which writes ``store.put`` without ``set_bookkeeping``).  This is a
+        distinct case from a bookkeeping record that predates a field: the
+        mandatory-``first_seen`` guarantee is enforced at the write side
+        (``set_bookkeeping`` requires it as a keyword); this reconstruction
+        read tolerates a missing record entirely, exactly like its sibling
+        fields.
 
         Args:
             keys: Optional explicit list of active-key strings to process.
@@ -5386,6 +5442,7 @@ class ConsolidationLoop:
                     speaker_id=spk,
                     indexed_key=key,
                     last_seen=bk.get("last_seen", ""),
+                    first_seen=bk.get("first_seen", ""),
                 )
             )
         return relations
@@ -5905,16 +5962,18 @@ class ConsolidationLoop:
             # edge's key is the survivor.  The survivor's reinforcement_count
             # represents how many times this fact was independently extracted
             # (and re-keyed) across sessions before this fold collapsed the duplicates.
-            # merger.reinforcements is now dict[ik_key, last_seen] — the freshest
-            # timestamp is carried directly from the edge so bump_recurrence can
-            # advance last_seen without fabricating now().
-            _reinforcements: dict[str, str] = getattr(self.merger, "reinforcements", {})
-            for _rein_key, _rein_ts in _reinforcements.items():
+            # merger.reinforcements is now dict[ik_key, (last_seen, first_seen)] —
+            # the freshest last_seen and earliest first_seen are carried directly
+            # from the edge so bump_recurrence can advance bookkeeping without
+            # fabricating now().
+            _reinforcements: dict[str, tuple[str, str]] = getattr(self.merger, "reinforcements", {})
+            for _rein_key, (_rein_ls, _rein_fs) in _reinforcements.items():
                 if _rein_key:
                     self.store.bump_recurrence(
                         _rein_key,
                         cycle=self.cycle_count,
-                        timestamp=_rein_ts,
+                        timestamp=_rein_ls,
+                        first_seen=_rein_fs,
                     )
                     logger.debug(
                         "consolidate_interim_adapters: bumped recurrence for key=%s "

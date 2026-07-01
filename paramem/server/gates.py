@@ -20,7 +20,7 @@ import json
 import logging
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
@@ -110,13 +110,7 @@ class GateResult:
         dict[str, Any]
             All fields present; ``reason`` and ``metrics`` may be ``None``.
         """
-        return {
-            "gate": self.gate,
-            "name": self.name,
-            "status": self.status,
-            "reason": self.reason,
-            "metrics": self.metrics,
-        }
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -117,13 +117,7 @@ class BackupStateRecord:
 
     def to_dict(self) -> dict:
         """Serialise to a JSON-ready dict."""
-        return {
-            "schema_version": self.schema_version,
-            "last_run": self.last_run,
-            "last_success_at": self.last_success_at,
-            "last_failure_at": self.last_failure_at,
-            "last_failure_reason": self.last_failure_reason,
-        }
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------

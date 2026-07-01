@@ -28,7 +28,7 @@ NOT require a ``SCHEMA_VERSION`` bump and vice versa.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -204,17 +204,7 @@ class BundleManifest:
         dict
             All fields as JSON-serialisable types.
         """
-        return {
-            "bundle_schema_version": self.bundle_schema_version,
-            "created_at": self.created_at,
-            "tier": self.tier,
-            "label": self.label,
-            "live_registry_sha256": self.live_registry_sha256,
-            "base_model": self.base_model,
-            "files": list(self.files),
-            "adapters": dict(self.adapters),
-            "excluded": list(self.excluded),
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> "BundleManifest":

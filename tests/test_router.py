@@ -75,6 +75,7 @@ def _make_router_from_entries(
                 speaker_id=spk,
                 relation_type=rtype,
                 allow_empty_speaker=(spk == ""),
+                first_seen="",
             )
 
     kwargs: dict = {
@@ -860,7 +861,9 @@ class TestPreloadIndependence:
     def test_metadata_only_entries_populate_speaker_index(self):
         store = MemoryStore(replay_enabled=True)
         # Simulate load_bookkeeping_from_disk: no SPO in _entries, just bookkeeping.
-        store.set_bookkeeping("k_meta_only", speaker_id="alice", relation_type="factual")
+        store.set_bookkeeping(
+            "k_meta_only", speaker_id="alice", relation_type="factual", first_seen=""
+        )
         # Register the key so _tier_keys resolves it.
         from paramem.training.key_registry import KeyRegistry
 
@@ -875,7 +878,9 @@ class TestPreloadIndependence:
         _stub_intent(monkeypatch, Intent.PERSONAL)
         store = MemoryStore(replay_enabled=True)
         # Seed bookkeeping only — no content entry.
-        store.set_bookkeeping("k_pref", speaker_id="alice", relation_type="preference")
+        store.set_bookkeeping(
+            "k_pref", speaker_id="alice", relation_type="preference", first_seen=""
+        )
         from paramem.training.key_registry import KeyRegistry
 
         reg = KeyRegistry()
@@ -892,7 +897,7 @@ class TestPreloadIndependence:
         store = MemoryStore(replay_enabled=True)
         for i in range(3):
             key = f"graph{i}"
-            store.set_bookkeeping(key, speaker_id="charlie", relation_type="factual")
+            store.set_bookkeeping(key, speaker_id="charlie", relation_type="factual", first_seen="")
         assert len(store) == 0  # _entries empty
         router = QueryRouter(adapter_dir=Path("/nonexistent"), memory_store=store)
         assert "charlie" in router._speaker_key_index

@@ -132,13 +132,15 @@ class TestEscalation:
 
 class TestSessionBuffer:
     def test_append_and_get_pending(self, tmp_path):
+        """append() mints a session_id for the conversation_id; both turns
+        land in the same (single) pending session."""
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buffer.append("conv1", "user", "Hello")
         buffer.append("conv1", "assistant", "Hi there!")
 
         pending = buffer.get_pending()
         assert len(pending) == 1
-        assert pending[0]["session_id"] == "conv1"
+        assert pending[0]["session_id"].startswith("conv1-")
         assert "[user] Hello" in pending[0]["transcript"]
         assert "[assistant] Hi there!" in pending[0]["transcript"]
 
@@ -155,22 +157,31 @@ class TestSessionBuffer:
         buffer.append("conv1", "user", "Hello")
         buffer.append("conv2", "user", "Hi")
 
-        buffer.mark_consolidated(["conv1"])
+        pending_before = buffer.get_pending()
+        conv1_session_id = next(
+            p["session_id"] for p in pending_before if p["session_id"].startswith("conv1-")
+        )
+        conv2_session_id = next(
+            p["session_id"] for p in pending_before if p["session_id"].startswith("conv2-")
+        )
+
+        buffer.mark_consolidated([conv1_session_id])
 
         pending = buffer.get_pending()
         assert len(pending) == 1
-        assert pending[0]["session_id"] == "conv2"
+        assert pending[0]["session_id"] == conv2_session_id
 
     def test_mark_consolidated_debug_archives(self, tmp_path):
         """With debug=True + retention_dir supplied, mark_consolidated moves the JSONL."""
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=True)
         buffer.append("conv1", "user", "Hello")
+        session_id = buffer.get_pending()[0]["session_id"]
 
         retention = tmp_path / "archive"
-        buffer.mark_consolidated(["conv1"], retention_dir=retention)
+        buffer.mark_consolidated([session_id], retention_dir=retention)
 
-        assert (retention / "conv1.jsonl").exists()
-        assert not (tmp_path / "sessions" / "conv1.jsonl").exists()
+        assert (retention / f"{session_id}.jsonl").exists()
+        assert not (tmp_path / "sessions" / f"{session_id}.jsonl").exists()
 
     def test_pending_count(self, tmp_path):
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
@@ -186,8 +197,9 @@ class TestSessionBuffer:
     def test_turn_timestamps(self, tmp_path):
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=True)
         buffer.append("conv1", "user", "Hello")
+        session_id = buffer.get_pending()[0]["session_id"]
 
-        path = tmp_path / "sessions" / "conv1.jsonl"
+        path = tmp_path / "sessions" / f"{session_id}.jsonl"
         with open(path) as f:
             entry = json.loads(f.readline())
         assert "timestamp" in entry
@@ -200,8 +212,9 @@ class TestSessionBuffer:
         consumes them)."""
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
         buffer.append("conv1", "user", "Hello")
+        session_id = buffer.get_pending()[0]["session_id"]
 
-        assert (tmp_path / "sessions" / "conv1.jsonl").exists()
+        assert (tmp_path / "sessions" / f"{session_id}.jsonl").exists()
         assert buffer.pending_count == 1
         assert len(buffer.get_pending()) == 1
 
@@ -210,11 +223,12 @@ class TestSessionBuffer:
             tmp_path / "sessions", state_dir=tmp_path / "state", retain_sessions=False, debug=True
         )
         buffer.append("conv1", "user", "Hello")
-        assert (tmp_path / "sessions" / "conv1.jsonl").exists()
+        session_id = buffer.get_pending()[0]["session_id"]
+        assert (tmp_path / "sessions" / f"{session_id}.jsonl").exists()
 
-        buffer.mark_consolidated(["conv1"])
+        buffer.mark_consolidated([session_id])
 
-        assert not (tmp_path / "sessions" / "conv1.jsonl").exists()
+        assert not (tmp_path / "sessions" / f"{session_id}.jsonl").exists()
         assert not (tmp_path / "sessions" / "archive").exists()
         assert buffer.pending_count == 0
 
@@ -224,12 +238,13 @@ class TestSessionBuffer:
             tmp_path / "sessions", state_dir=tmp_path / "state", retain_sessions=True, debug=True
         )
         buffer.append("conv1", "user", "Hello")
+        session_id = buffer.get_pending()[0]["session_id"]
 
         retention = tmp_path / "archive"
-        buffer.mark_consolidated(["conv1"], retention_dir=retention)
+        buffer.mark_consolidated([session_id], retention_dir=retention)
 
-        assert not (tmp_path / "sessions" / "conv1.jsonl").exists()
-        assert (retention / "conv1.jsonl").exists()
+        assert not (tmp_path / "sessions" / f"{session_id}.jsonl").exists()
+        assert (retention / f"{session_id}.jsonl").exists()
 
     def test_speaker_tracking(self, tmp_path):
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state")
@@ -317,6 +332,30 @@ class TestSessionBuffer:
         assert not buf2.load_snapshot()
         assert not snap_path.exists(), "corrupted snapshot must be unlinked on load failure"
         assert buf2.pending_count == 0
+
+    def test_snapshot_missing_open_key_discarded(self, tmp_path, monkeypatch):
+        """A validly-encrypted payload lacking "open" is treated as corrupted:
+        strict ``payload["open"]`` raises KeyError, caught by the same
+        except that handles a bad envelope — unlink + discard (cold start),
+        not a silent ``{}`` fill."""
+        import json
+
+        from paramem.backup.encryption import _atomic_write_bytes, envelope_encrypt_bytes
+
+        self._setup_daily(tmp_path, monkeypatch)
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        snap_path = sessions_dir / "session_snapshot.enc"
+
+        # Valid envelope, but the payload predates the "open" key.
+        payload = {"turns": {"conv1": [{"role": "user", "text": "hi"}]}, "sessions": {}}
+        _atomic_write_bytes(snap_path, envelope_encrypt_bytes(json.dumps(payload).encode()))
+
+        buf = SessionBuffer(sessions_dir, state_dir=tmp_path / "state")
+        assert not buf.load_snapshot()
+        assert not snap_path.exists(), "payload missing 'open' must be discarded, not tolerated"
+        assert buf.pending_count == 0
 
     def test_snapshot_deleted_on_successful_restore(self, tmp_path, monkeypatch):
         self._setup_daily(tmp_path, monkeypatch)

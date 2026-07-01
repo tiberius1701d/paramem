@@ -203,6 +203,72 @@ class TestEnrichmentAddsEdgesWithSourceTag:
         assert found, "Expected a 'colleague of' edge with source='graph_enrichment'"
 
 
+class TestEnrichmentInheritsSourceWindow:
+    """Enrichment edges must inherit the chunk's source assertion window
+    (max last_seen, min non-empty first_seen) rather than landing untimed.
+    """
+
+    def test_enrichment_edge_gets_chunk_window(self, tmp_path, monkeypatch):
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        # Stamp the works-at edges with distinct, known timestamps so the
+        # chunk's max last_seen / min first_seen are unambiguous.
+        for i, (fs, ls) in enumerate(
+            [
+                ("2026-01-01T00:00:00", "2026-01-05T00:00:00"),
+                ("2026-01-02T00:00:00", "2026-01-06T00:00:00"),
+                ("2026-01-03T00:00:00", "2026-01-10T00:00:00"),  # max last_seen
+            ]
+        ):
+            for _, _, key, data in graph.out_edges(f"person{i}", keys=True, data=True):
+                if data.get("predicate") == "works at":
+                    graph[f"person{i}"]["acmecorp"][key]["first_seen"] = fs
+                    graph[f"person{i}"]["acmecorp"][key]["last_seen"] = ls
+
+        canned_result = (
+            [
+                {
+                    "subject": "Person0",
+                    "predicate": "colleague_of",
+                    "object": "Person1",
+                    "relation_type": "social",
+                    "confidence": 0.9,
+                }
+            ],
+            [],  # no same_as
+            "raw",
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=canned_result,
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["new_edges"] >= 1
+
+        found = None
+        for _, _, data in graph.out_edges("person0", data=True):
+            if (
+                data.get("predicate") == "colleague of"
+                and data.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
+            ):
+                found = data
+        assert found is not None, "Expected a 'colleague of' enrichment edge"
+        # The highest-reinforcement focal node (acmecorp's hub connects every
+        # person at radius<=2) puts the whole graph in the first chunk, so the
+        # window is the min/max across ALL stamped works-at edges: the three
+        # stamped person0/1/2 edges contribute first_seen 01/02/03 and
+        # last_seen 05/06/10; the rest are unstamped ("") and ignored by
+        # min_nonempty / max. This is the fix under test — previously these
+        # fields were always "".
+        assert found["first_seen"] == "2026-01-01T00:00:00"
+        assert found["last_seen"] == "2026-01-10T00:00:00"
+
+
 class TestLowConfidenceDropped:
     """Relations with confidence < 0.7 must be discarded."""
 
@@ -1221,10 +1287,12 @@ class TestRefineConsolidationGraph:
             reinforcement_count=1,
             last_reinforced_cycle=0,
             allow_empty_speaker=True,
+            first_seen="",
         )
 
-        # Simulate a Case-1 collision: merger.reinforcements contains the surviving key.
-        loop.merger.reinforcements = {"graph42": "2026-01-01T00:00:00Z"}
+        # Simulate a Case-1 collision: merger.reinforcements contains the surviving
+        # key mapped to (last_seen, first_seen).
+        loop.merger.reinforcements = {"graph42": ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")}
 
         from paramem.graph.schema import Relation
 
@@ -1262,8 +1330,9 @@ class TestRefineConsolidationGraph:
             reinforcement_count=3,
             last_reinforced_cycle=0,
             allow_empty_speaker=True,
+            first_seen="",
         )
-        loop.merger.reinforcements = {"graph7": "2026-01-01T00:00:00Z"}
+        loop.merger.reinforcements = {"graph7": ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")}
 
         from paramem.graph.schema import Relation
 
@@ -1285,7 +1354,7 @@ class TestRefineConsolidationGraph:
         """Empty recon_relations → recurrence-bump loop does not run; no crash."""
         loop = _make_loop(tmp_path)
         # graph99 would be bumped if the empty-recon guard failed.
-        loop.merger.reinforcements = {"graph99": "2026-01-01T00:00:00Z"}
+        loop.merger.reinforcements = {"graph99": ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")}
         loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
 
         bump_spy = MagicMock()
@@ -2348,6 +2417,7 @@ class TestDeferredFlushAllowEmpty:
             reinforcement_count=1,
             last_reinforced_cycle=0,
             allow_empty_speaker=(rec["speaker_id"] == ""),
+            first_seen="",
         )
         bk = loop.store.bookkeeping_for_key(key)
         assert bk is not None

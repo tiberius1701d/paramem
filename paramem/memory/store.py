@@ -130,6 +130,7 @@ import logging
 import threading
 from collections.abc import Iterator
 
+from paramem.graph.merger import min_nonempty
 from paramem.graph.name_match import is_speaker_id
 from paramem.training.key_registry import KeyRegistry
 
@@ -285,7 +286,7 @@ class MemoryStore:
 
     # ------------------------------------------------------------------
     # Per-key bookkeeping — speaker_id / relation_type / reinforcement_count
-    #                       / last_reinforced_cycle / last_seen
+    #                       / last_reinforced_cycle / last_seen / first_seen
     # SEPARATE from _entries; never in snapshot or KeyRegistry.save_bytes.
     # ------------------------------------------------------------------
     def set_bookkeeping(
@@ -294,6 +295,7 @@ class MemoryStore:
         *,
         speaker_id: str,
         relation_type: str,
+        first_seen: str,
         reinforcement_count: int = 1,
         last_reinforced_cycle: int = 0,
         last_seen: str = "",
@@ -301,12 +303,13 @@ class MemoryStore:
     ) -> None:
         """Store or update the bookkeeping record for *key*.
 
-        All five fields are mandatory in the persisted schema (one mandatory
-        tier, zero optional buckets).  The ``reinforcement_count``,
-        ``last_reinforced_cycle``, and ``last_seen`` params carry Python
-        defaults solely as a legacy-fill convenience for new-key sites and
-        boot-reload callers that do not yet know the values.  The stored dict
-        always contains all five keys.
+        All six fields are mandatory in the persisted schema (one mandatory
+        tier, zero optional buckets).  ``first_seen`` carries no Python
+        default — every call site must pass it explicitly.  The
+        ``reinforcement_count``, ``last_reinforced_cycle``, and ``last_seen``
+        params carry Python defaults solely as a legacy-fill convenience for
+        new-key sites and boot-reload callers that do not yet know the
+        values.  The stored dict always contains all six keys.
 
         ``speaker_id``: the speaker who first introduced this key.
         ``relation_type``: the model-assigned relation type from extraction
@@ -314,6 +317,10 @@ class MemoryStore:
         Legacy keys that pre-date this field are upgraded in-memory to
         ``"unknown"`` by :meth:`load_bookkeeping_from_disk`; the correct value
         is stamped at ingestion on the next consolidation cycle.
+        ``first_seen``: ISO 8601 wall-clock timestamp of the earliest session
+        that contained this fact.  Paired with ``last_seen`` to give each fact
+        its true assertion window ``[first_seen, last_seen]``.  Mandatory —
+        no runtime fallback; callers must supply the real value.
         ``reinforcement_count``: how many times the underlying fact has been
         re-seen (via intra-fold duplicate-SPO collapse) since the key was
         minted.  Default 1 (a new key has been seen once).
@@ -335,9 +342,10 @@ class MemoryStore:
                 is ``False`` — unattributed keys are not recallable by speaker.
 
         **Callers that need to update ONE field on an existing key must use
-        :meth:`bump_recurrence` (for reinforcement/last_seen updates) rather
-        than calling this method, which overwrites ALL five fields and would
-        silently reset the counters the caller did not supply.**
+        :meth:`bump_recurrence` (for reinforcement/last_seen/first_seen
+        updates) rather than calling this method, which overwrites ALL six
+        fields and would silently reset the counters the caller did not
+        supply.**
 
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit.
@@ -365,9 +373,12 @@ class MemoryStore:
                 "reinforcement_count": reinforcement_count,
                 "last_reinforced_cycle": last_reinforced_cycle,
                 "last_seen": last_seen,
+                "first_seen": first_seen,
             }
 
-    def bump_recurrence(self, key: str, *, cycle: int, timestamp: str = "") -> None:
+    def bump_recurrence(
+        self, key: str, *, cycle: int, first_seen: str, timestamp: str = ""
+    ) -> None:
         """Increment ``reinforcement_count`` and refresh cycle/timestamp for *key*.
 
         This is the ONLY correct way to update the reinforcement counter on an
@@ -385,6 +396,15 @@ class MemoryStore:
             cycle: Current consolidation cycle number.  Written to
                 ``last_reinforced_cycle`` unconditionally (the fact was
                 re-seen this cycle).
+            first_seen: ISO 8601 wall-clock timestamp of the earliest session
+                that (re-)contributed this fact.  Mandatory — no runtime
+                fallback.  When non-empty, sets ``first_seen =
+                min_nonempty(existing_first_seen, first_seen)`` so the window
+                start never regresses forward; an empty string never wins a
+                ``min_nonempty`` (it means "unknown", not "earliest possible
+                time").  Pass the real value from the boundary that has it —
+                the merger's ``reinforcements`` dict already carries the
+                collapsed min.
             timestamp: ISO 8601 wall-clock timestamp of the session that
                 triggered this reinforcement.  When non-empty, sets
                 ``last_seen = max(existing_last_seen, timestamp)`` — ISO-8601
@@ -403,19 +423,21 @@ class MemoryStore:
                     "reinforcement_count": 1,
                     "last_reinforced_cycle": cycle,
                     "last_seen": timestamp,
+                    "first_seen": first_seen,
                 }
                 return
             existing["reinforcement_count"] = existing.get("reinforcement_count", 1) + 1
             existing["last_reinforced_cycle"] = cycle
             if timestamp:
                 existing["last_seen"] = max(existing.get("last_seen", ""), timestamp)
+            existing["first_seen"] = min_nonempty(existing.get("first_seen", ""), first_seen)
 
     def bookkeeping_for_key(self, key: str) -> dict | None:
         """Return the bookkeeping record for *key*, or ``None`` when absent.
 
-        Returns a plain dict with five fields:
+        Returns a plain dict with six fields:
         ``{"speaker_id", "relation_type", "reinforcement_count",
-        "last_reinforced_cycle", "last_seen"}``
+        "last_reinforced_cycle", "last_seen", "first_seen"}``
         when present, ``None`` when the key has never been bookkept.
         Callers may use ``bk = store.bookkeeping_for_key(k) or {}`` as a
         boundary default (compliant with the is-None / empty-is-valid rule)."""
@@ -1136,6 +1158,7 @@ class MemoryStore:
                                     reinforcement_count=1,
                                     last_reinforced_cycle=0,
                                     last_seen=src.get("last_seen", ""),
+                                    first_seen=src.get("first_seen", ""),
                                     allow_empty_speaker=True,
                                 )
 
@@ -1246,28 +1269,28 @@ class MemoryStore:
         that created payload-less stub entries has been removed.  Bookkeeping
         presence MUST NOT manufacture a content cache hit.
 
-        Fields loaded: ``speaker_id``, ``relation_type``, ``reinforcement_count``,
-        ``last_reinforced_cycle``, ``last_seen``.
-        Keys absent from every tier registry (orphans — slot wiped or never
-        existed) are skipped but counted in the return dict.  Pre-refactor
-        files that lack any field are upgraded in-memory with defaults
-        (``legacy_upgraded`` counter):
-        - ``speaker_id``: ``""``
-        - ``relation_type``: ``"unknown"``
-        - ``reinforcement_count``: ``1``  (a legacy key has been seen at least once)
-        - ``last_reinforced_cycle``: ``0``
-        - ``last_seen``: ``""``
-        Keys with ``relation_type="unknown"`` will be assigned the correct type
-        on the next consolidation cycle when the triple is re-encountered.
+        Each persisted record is splatted whole into :meth:`set_bookkeeping`
+        (``self.set_bookkeeping(key, **key_meta, allow_empty_speaker=True)``).
+        The write side (``_save_key_metadata``) persists ``dict(bk)`` from
+        :meth:`bookkeeping_for_key` verbatim, so the on-disk record always
+        carries exactly the fields :meth:`set_bookkeeping` requires — there
+        is no hand-listed field projection or legacy-fill tolerance on either
+        side.  No backward compatibility: a record missing a mandatory field
+        (or carrying an unexpected one) raises ``TypeError`` from the splat,
+        not a silent default fill.  The deploy procedure for an incompatible
+        on-disk shape is to start fresh (wipe adapters and registry).
 
-        Returns ``{loaded, orphaned, legacy_upgraded}`` for ``/status`` and
-        diagnostics.  Missing file → all zeros, no-op (fresh install).
+        Keys absent from every tier registry (orphans — slot wiped or never
+        existed) are skipped but counted in the return dict.
+
+        Returns ``{loaded, orphaned}`` for ``/status`` and diagnostics.
+        Missing file → all zeros, no-op (fresh install).
         """
         from pathlib import Path
 
         path = Path(key_metadata_path)
         if not path.exists():
-            return {"loaded": 0, "orphaned": 0, "legacy_upgraded": 0}
+            return {"loaded": 0, "orphaned": 0}
 
         import json
 
@@ -1276,31 +1299,14 @@ class MemoryStore:
         metadata = json.loads(read_maybe_encrypted(path).decode("utf-8"))
         loaded = 0
         orphaned = 0
-        legacy_upgraded = 0
         for key, key_meta in metadata.get("keys", {}).items():
             tier = self.tier_for_known_key(key)
             if tier is None:
                 orphaned += 1
                 continue
-            if (
-                "speaker_id" not in key_meta
-                or "relation_type" not in key_meta
-                or "reinforcement_count" not in key_meta
-                or "last_reinforced_cycle" not in key_meta
-                or "last_seen" not in key_meta
-            ):
-                legacy_upgraded += 1
-            self.set_bookkeeping(
-                key,
-                speaker_id=key_meta.get("speaker_id", ""),
-                relation_type=key_meta.get("relation_type", "unknown"),
-                reinforcement_count=key_meta.get("reinforcement_count", 1),
-                last_reinforced_cycle=key_meta.get("last_reinforced_cycle", 0),
-                last_seen=key_meta.get("last_seen", ""),
-                allow_empty_speaker=True,
-            )
+            self.set_bookkeeping(key, **key_meta, allow_empty_speaker=True)
             loaded += 1
-        return {"loaded": loaded, "orphaned": orphaned, "legacy_upgraded": legacy_upgraded}
+        return {"loaded": loaded, "orphaned": orphaned}
 
     # ------------------------------------------------------------------
     # Diagnostic helpers

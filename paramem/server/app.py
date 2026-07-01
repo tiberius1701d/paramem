@@ -3492,12 +3492,15 @@ async def voice(http_request: Request):
     if not text:
         return VoiceResponse(transcript="", reply="")
 
-    # Per-utterance conversation_id on the shared-token path: each push-to-talk
-    # press is an independent POST /voice call, so a fresh id ensures the session
-    # buffer does not conflate turns from different speakers on the same device.
-    # The retro-claim in session_buffer.claim_sessions_for_speaker works across
-    # conversation_ids by embedding, so two-turn enrollment still works.
-    # On the per-user path, a stable id allows multi-turn context.
+    # Per-utterance transport/enrollment id on the shared-token path: each
+    # push-to-talk press is an independent POST /voice call, so a fresh id
+    # feeds _resolve_and_enroll_speaker's unknown-speaker grouping (keyed by
+    # this id) and the LLM enrollment trigger. The retro-claim in
+    # session_buffer.claim_sessions_for_speaker works across these ids by
+    # embedding, so two-turn enrollment still works. This id is NOT the
+    # session-buffer conversation_key used below — that is derived from the
+    # RESOLVED speaker after enrollment runs. On the per-user path, a stable
+    # id allows multi-turn context.
     if auth_speaker_id is None:
         conversation_id = f"voice-{uuid.uuid4().hex[:12]}"
     else:
@@ -3521,11 +3524,34 @@ async def voice(http_request: Request):
         detected_language_prob=utterance.language_probability,
     )
 
+    # Session-buffer conversation_key: derived from the RESOLVED speaker so
+    # all voice turns from the same speaker (identified, anonymous, or
+    # bearer-token) share one session-grouping + idle-rotation lineage in
+    # SessionBuffer — no per-utterance session, no "voice-default" merge of
+    # distinct speakers. A turn with no resolved speaker_id (no embedding, or
+    # register_anonymous failed) is genuinely un-attributable; fall back to
+    # the transport handle, same rule the text path uses.
+    buffer_conversation_key = (
+        f"voice-{_resolved.speaker_id}" if _resolved.speaker_id is not None else conversation_id
+    )
+
+    # Reconcile _open routing state onto the SINGLE key voice actually
+    # buffers under. _resolve_and_enroll_speaker (shared with /chat) wrote
+    # speaker state via set_speaker(conversation_id, ...) — the transport
+    # id, correct for its own enrollment/grouping purposes but distinct from
+    # buffer_conversation_key. Re-record the resolved speaker under the real
+    # buffer key and drop the now-redundant transport-id entry so it can't
+    # orphan (it never gets a session_id, so retirement-based pruning can't
+    # reach it — one leaked entry per shared-token utterance otherwise).
+    if buffer_conversation_key != conversation_id:
+        buffer.set_speaker(buffer_conversation_key, _resolved.speaker_id, _resolved.speaker or "")
+        buffer.discard_open_routing_key(conversation_id)
+
     # Route through the shared turn orchestrator.  Use the resolved effective
     # language (Whisper → stored preference → None) for routing and TTS.
     result, spoken_text = await _run_chat_turn(
         text=text,
-        conversation_id=conversation_id,
+        conversation_id=buffer_conversation_key,
         speaker_id=_resolved.speaker_id,
         speaker=_resolved.speaker,
         display_speaker=_resolved.display_speaker,
@@ -4542,8 +4568,7 @@ def _build_store_contents(
         ``new_registry``: ``dict[tier, KeyRegistry]``
         ``new_bookkeeping``: ``dict[key, bookkeeping_record]``
         ``stats``: ``{"boot_degraded": dict | None, "store_load_degraded": bool,
-                      "meta_loaded": int, "meta_orphaned": int,
-                      "meta_legacy_upgraded": int}``
+                      "meta_loaded": int, "meta_orphaned": int}``
     """
     from paramem.memory.source import (
         DiskMemorySource as _DiskMemorySource,
@@ -4558,7 +4583,6 @@ def _build_store_contents(
         "store_load_degraded": False,
         "meta_loaded": 0,
         "meta_orphaned": 0,
-        "meta_legacy_upgraded": 0,
     }
 
     # ------------------------------------------------------------------ #
@@ -4748,12 +4772,10 @@ def _build_store_contents(
         new_bookkeeping = dict(_tmp_store.iter_bookkeeping())
         stats["meta_loaded"] = _meta_stats["loaded"]
         stats["meta_orphaned"] = _meta_stats["orphaned"]
-        stats["meta_legacy_upgraded"] = _meta_stats["legacy_upgraded"]
         logger.info(
-            "load_bookkeeping_from_disk: loaded=%d orphaned=%d legacy_upgraded=%d",
+            "load_bookkeeping_from_disk: loaded=%d orphaned=%d",
             _meta_stats["loaded"],
             _meta_stats["orphaned"],
-            _meta_stats["legacy_upgraded"],
         )
     except Exception:
         logger.exception(
@@ -5033,9 +5055,9 @@ def _build_config_derived_state(
     # buffer to avoid losing in-flight state.
     if full_rebuild and rebuild_session_buffer:
         # Save snapshot on the OLD buffer FIRST (mirrors the shutdown-teardown snapshot)
-        # so mid-turn _sessions state round-trips when an encryption key is
-        # loaded (ensures mid-turn _sessions state round-trips on key-loaded deploys).
-        # No-op on a no-key deployment.
+        # so mid-turn state (_turns, _sessions, and _open routing state) round-trips
+        # when an encryption key is loaded (ensures continuity across key-loaded
+        # deploys). No-op on a no-key deployment.
         old_buffer = _state.get("session_buffer")
         if old_buffer is not None:
             old_buffer.save_snapshot()
@@ -5046,6 +5068,7 @@ def _build_config_derived_state(
             retain_sessions=config.consolidation.retain_sessions,
             debug=config.debug,
             consolidation_retry_cap=config.consolidation.consolidation_retry_cap,
+            idle_timeout_minutes=config.session.idle_timeout_minutes,
         )
         # Cold-start: rehydrate pending JSONL into memory before loading the
         # encrypted snapshot (snapshot carries mid-turn _sessions state only).
@@ -7111,11 +7134,11 @@ async def debug_dump():
     Each entry dict is the entry payload as stored, with ``tier`` and
     ``key`` fields added inline for flat consumption.  Per-key
     ``speaker_id``, ``relation_type``, ``reinforcement_count``,
-    ``last_reinforced_cycle``, and ``last_seen`` are sourced from
-    ``store.bookkeeping_for_key(key)`` (authoritative ``_bookkeeping``
-    dict) rather than the entry payload, which may be stale or absent.
-    When a key has no bookkeeping record the fields are omitted rather
-    than fabricated.
+    ``last_reinforced_cycle``, ``last_seen``, and ``first_seen`` are
+    sourced from ``store.bookkeeping_for_key(key)`` (authoritative
+    ``_bookkeeping`` dict) rather than the entry payload, which may be
+    stale or absent.  When a key has no bookkeeping record the fields
+    are omitted rather than fabricated.
     """
     config = _state["config"]
     if not getattr(config, "debug", False):
@@ -7129,18 +7152,16 @@ async def debug_dump():
     tiers: dict[str, int] = {}
     for tier, key, entry in store.iter_entries():
         row = {"tier": tier, "key": key, **entry}
-        # Overlay per-key bookkeeping fields from the authoritative _bookkeeping
-        # dict.  The entry payload (_entries) may carry stale or absent
-        # speaker_id/relation_type — _bookkeeping is the single source of truth
-        # for those fields (store.py:53-58).  Use is None (not truthiness) —
-        # an empty bookkeeping record is valid.
+        # Overlay the FULL authoritative bookkeeping record onto the row. The
+        # entry payload (_entries) may carry stale or absent bookkeeping fields
+        # (e.g. speaker_id/relation_type) — _bookkeeping is the single source of
+        # truth (store.py:53-58), so it wins. Splatting the whole record (rather
+        # than a hand-maintained field list) makes the dump integrally reflect
+        # every bookkeeping field, so a newly-added field can never be silently
+        # omitted here. Use is None (not truthiness) — an empty record is valid.
         bk = store.bookkeeping_for_key(key)
         if bk is not None:
-            row["speaker_id"] = bk["speaker_id"]
-            row["relation_type"] = bk["relation_type"]
-            row["reinforcement_count"] = bk["reinforcement_count"]
-            row["last_reinforced_cycle"] = bk["last_reinforced_cycle"]
-            row["last_seen"] = bk["last_seen"]
+            row.update(bk)
         entries.append(row)
         tiers[tier] = tiers.get(tier, 0) + 1
 
@@ -7449,7 +7470,7 @@ async def ingest_sessions(request: IngestSessionsRequest):
         # set_speaker must precede append so get_pending finds speaker_id.
         buffer.set_speaker(session_id, request.speaker_id, speaker_name or "")
         buffer.set_document_metadata(session_id, doc_id=doc_id, chunk_count=chunk_count)
-        buffer.append(
+        buffer.append_document_chunk(
             session_id,
             "user",
             chunk.chunk,
@@ -12623,6 +12644,7 @@ def _run_extraction_phase(
                 plausibility_stage=config.consolidation.extraction_plausibility_stage,
                 verify_anonymization=config.consolidation.extraction_verify_anonymization,
                 source_type=session.get("source_type", "transcript"),
+                event_time=session["started_at"],
             )
 
         for qa in episodic_rels:
@@ -12985,6 +13007,7 @@ def _extract_and_start_training():
                         plausibility_stage=config.consolidation.extraction_plausibility_stage,
                         verify_anonymization=config.consolidation.extraction_verify_anonymization,
                         source_type=session.get("source_type", "transcript"),
+                        event_time=session["started_at"],
                     )
             except VramExhausted as exc:
                 # Per-chunk isolation: log, record, skip — continue to next
@@ -13731,6 +13754,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                                 plausibility_stage=config.consolidation.extraction_plausibility_stage,
                                 verify_anonymization=config.consolidation.extraction_verify_anonymization,
                                 source_type=session.get("source_type", "transcript"),
+                                event_time=session["started_at"],
                             )
                     except VramExhausted as exc:
                         phase = exc.args[0] if exc.args else "unknown"

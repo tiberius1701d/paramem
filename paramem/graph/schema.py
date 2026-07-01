@@ -136,6 +136,17 @@ class Relation(BaseModel):
         ),
         exclude=True,
     )
+    first_seen: str = Field(
+        default="",
+        description=(
+            "Transient wall-clock timestamp carry-slot (ISO 8601). Populated by "
+            "_build_registry_true_relations from bookkeeping['first_seen'] so the "
+            "value travels through GraphMerger.merge() onto the merged graph edge. "
+            "Empty for extraction-time Relations. Never persisted to the registry, "
+            "cumulative_graph.json, or adapter weights."
+        ),
+        exclude=True,
+    )
 
 
 class SessionGraph(BaseModel):

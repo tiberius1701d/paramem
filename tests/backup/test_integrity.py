@@ -834,8 +834,18 @@ class TestDataModel:
         report = IntegrityReport(ok=False, checks=[bad], failures=[bad])
         assert report.ok is False
         d = report.to_dict()
-        assert d["ok"] is False
-        assert len(d["failures"]) == 1
+        expected_check = {
+            "path": "/bad.json",
+            "category": "registry",
+            "tier": "episodic",
+            "status": _PARSE_ERROR,
+            "detail": "bad json",
+        }
+        assert d == {
+            "ok": False,
+            "checks": [expected_check],
+            "failures": [expected_check],
+        }
 
     def test_integrity_report_ok_true_when_all_skipped(self):
         """IntegrityReport.ok True when only skipped entries."""

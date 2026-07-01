@@ -474,7 +474,9 @@ class TestMigrateTierTrainToSimulate:
         cfg = _make_config(tmp_path, mode="simulate")
         keys = ["g0"]
         loop = _make_loop_train_to_simulate(tmp_path, keys=keys)
-        loop.store.set_bookkeeping("g0", speaker_id="spk-alice", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "g0", speaker_id="spk-alice", relation_type="factual", first_seen=""
+        )
 
         reconstruction = self._make_graph_result("episodic", keys)
 

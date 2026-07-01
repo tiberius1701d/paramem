@@ -42,6 +42,7 @@ class TestRouterReadsFromLoopCache:
                     k,
                     speaker_id=spk,
                     relation_type=q.get("relation_type", "factual"),
+                    first_seen="",
                 )
         return store
 

@@ -954,6 +954,65 @@ def test_voice_shared_token_fresh_conversation_id(tmp_path, monkeypatch):
     assert all(cid.startswith("voice-") for cid in captured_conv_ids)
 
 
+def test_voice_shared_token_resolved_speaker_does_not_leak_open_entries(tmp_path, monkeypatch):
+    """Many shared-token utterances from the SAME resolved (known) speaker
+    must not accumulate one _open entry per utterance.
+
+    Regression for the orphan-leak: _resolve_and_enroll_speaker calls
+    set_speaker(transport_id, ...) internally (correct for its own
+    unknown-speaker grouping), but the buffer conversation_key
+    ("voice-{speaker_id}") is a DIFFERENT key. Without reconciliation the
+    transport-id _open entry never gets a session_id, so retirement-based
+    pruning can never evict it — one leaked entry per push-to-talk press.
+    """
+    store = _make_speaker_store(
+        known_ids={"Speaker0": "Alice"},
+        match_speaker_id="Speaker0",
+        match_tentative=False,  # non-tentative → matched identity every time
+        is_anonymous=False,
+    )
+    fresh = _make_state(tmp_path, speaker_store=store)
+    monkeypatch.setattr(app_module, "_state", fresh)
+    buffer: SessionBuffer = fresh["session_buffer"]
+    token = getattr(app_module, "_api_token", "")
+    tc = TestClient(
+        app_module.app,
+        raise_server_exceptions=True,
+        headers={"Authorization": f"Bearer {token}"} if token else {},
+    )
+
+    fake_chat_result = MagicMock()
+    fake_chat_result.text = "Reply."
+    fake_chat_result.escalated = False
+
+    async def mock_turn(**kwargs):
+        return (fake_chat_result, "Reply.")
+
+    fake_pcm = b"\x00\x00" * 800
+
+    with (
+        patch("paramem.server.app._decode_audio_to_pcm", return_value=fake_pcm),
+        patch(
+            "paramem.server.app.process_utterance",
+            new=AsyncMock(
+                return_value=UtteranceResult(
+                    text="hello", language="en", language_probability=0.95, embedding=[0.1, 0.2]
+                )
+            ),
+        ),
+        patch("paramem.server.app._run_chat_turn", new=mock_turn),
+    ):
+        for _ in range(10):
+            resp = tc.post("/voice", content=b"a", headers={"content-type": "audio/webm"})
+            assert resp.status_code == 200
+
+    # 10 utterances, each with a fresh per-utterance transport id, all
+    # resolving to the same known speaker (Speaker0) → exactly ONE _open
+    # entry ("voice-Speaker0"), not 10 (one per leaked transport id).
+    assert list(buffer._open.keys()) == ["voice-Speaker0"]
+    assert buffer.get_speaker_id("voice-Speaker0") == "Speaker0"
+
+
 # ---------------------------------------------------------------------------
 # Tests: /chat speaker vs display_speaker distinction
 # ---------------------------------------------------------------------------

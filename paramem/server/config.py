@@ -1266,6 +1266,15 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
 
 
 @dataclass
+class SessionConfig:
+    """SessionBuffer conversation-boundary settings."""
+
+    # Gap since a conversation_id's last turn after which the next append()
+    # mints a fresh session_id instead of continuing the open one.
+    idle_timeout_minutes: int = 10
+
+
+@dataclass
 class SpeakerConfig:
     """Voice-based speaker identification settings."""
 
@@ -1523,6 +1532,7 @@ class ServerConfig:
     sentence_type: SentenceTypeConfig = field(default_factory=SentenceTypeConfig)
     personal_referent: PersonalReferentConfig = field(default_factory=PersonalReferentConfig)
     voice: VoiceConfig = field(default_factory=VoiceConfig)
+    session: SessionConfig = field(default_factory=SessionConfig)
     speaker: SpeakerConfig = field(default_factory=SpeakerConfig)
     stt: STTConfig = field(default_factory=STTConfig)
     tts: TTSConfig = field(default_factory=TTSConfig)
@@ -1881,6 +1891,10 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     voice_raw = raw.get("voice", {})
     if voice_raw:
         config.voice = VoiceConfig(**voice_raw)
+
+    session_raw = raw.get("session", {})
+    if session_raw:
+        config.session = SessionConfig(**session_raw)
 
     speaker_raw = raw.get("speaker", {})
     if speaker_raw:

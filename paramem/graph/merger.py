@@ -36,6 +36,24 @@ from paramem.graph.schema import Entity, Relation, SessionGraph
 logger = logging.getLogger(__name__)
 
 
+def min_nonempty(a: str, b: str) -> str:
+    """Return the lexicographically smallest of *a* and *b*, treating "" as absent.
+
+    ISO 8601 timestamp strings sort lexicographically, so ``min`` is
+    chronological. Plain ``min("", x)`` would wrongly pick ``""`` (it sorts
+    lowest), which is correct for ``max``-based last_seen merging but wrong
+    for first_seen: an empty string means "unknown", not "earliest possible
+    time", so it must never win a first_seen ``min``. When exactly one side
+    is empty, the non-empty side wins; when both are empty, the result is
+    ``""``; when both are non-empty, the true chronological minimum wins.
+    """
+    if not a:
+        return b
+    if not b:
+        return a
+    return min(a, b)
+
+
 def check_predicate_coexistence(
     subject: str,
     predicate: str,
@@ -155,7 +173,7 @@ class GraphMerger:
         self.contradictions_resolved = []  # log of resolved contradictions
         # Per-merge/fold output lists — also initialised here so _upsert_relation
         # is safe to call without a preceding merge() call (e.g. in unit tests).
-        self.reinforcements: dict[str, str] = {}
+        self.reinforcements: dict[str, tuple[str, str]] = {}
         # collapsed: incoming ik_keys that were deduplicated away in a Case-1
         # duplicate-SPO collapse.  Parallel to reinforcements (which records the
         # surviving key); collapsed records the drifting key.  Used by the
@@ -206,17 +224,18 @@ class GraphMerger:
 
         Returns the updated cumulative graph.
 
-        ``self.reinforcements`` is a ``dict[ik_key, last_seen]`` of surviving
-        keys for each Case-1 exact-duplicate collapse that fired during this
-        merge — i.e. every fold where an incoming ``Relation.indexed_key``
-        matched an existing edge with an ``ik_key`` already stamped.  The
-        surviving key is the existing edge's key (the incoming duplicate
-        drifts); the value is the freshest (``max``) ``last_seen`` timestamp
-        after the collapse.  The bump_recurrence site reads this value to
-        advance bookkeeping without fabricating ``now()``.  Only populated
-        when ``Relation.indexed_key`` is set on the incoming relation
-        (fold-only path); always empty during normal live ingest where
-        ``Relation.indexed_key is None``.
+        ``self.reinforcements`` is a ``dict[ik_key, (last_seen, first_seen)]``
+        of surviving keys for each Case-1 exact-duplicate collapse that fired
+        during this merge — i.e. every fold where an incoming
+        ``Relation.indexed_key`` matched an existing edge with an ``ik_key``
+        already stamped.  The surviving key is the existing edge's key (the
+        incoming duplicate drifts); the value is the freshest (``max``)
+        ``last_seen`` timestamp and the earliest (``min_nonempty``)
+        ``first_seen`` timestamp after the collapse.  The bump_recurrence
+        site reads these values to advance bookkeeping without fabricating
+        ``now()``.  Only populated when ``Relation.indexed_key`` is set on
+        the incoming relation (fold-only path); always empty during normal
+        live ingest where ``Relation.indexed_key is None``.
 
         ``self.collapsed`` is the parallel list of INCOMING ``ik_key`` strings
         that were deduplicated away in each such collapse.  Where
@@ -225,7 +244,7 @@ class GraphMerger:
         ``consolidate_interim_adapters`` to distinguish intended dedup (fact
         preserved under the twin key) from genuine reconstruction loss.
         """
-        self.reinforcements: dict[str, str] = {}
+        self.reinforcements: dict[str, tuple[str, str]] = {}
         self.collapsed: list[str] = []
 
         session_id = session_graph.session_id
@@ -541,6 +560,9 @@ class GraphMerger:
             edge = self.graph[subject][obj][existing_key]
             edge["reinforcement_count"] = edge.get("reinforcement_count", 0) + 1
             edge["last_seen"] = max(edge.get("last_seen", ""), relation.last_seen or timestamp)
+            edge["first_seen"] = min_nonempty(
+                edge.get("first_seen", ""), relation.first_seen or timestamp
+            )
             edge["confidence"] = max(edge.get("confidence", 0), relation.confidence)
             sessions = edge.get("sessions", [])
             if session_id not in sessions:
@@ -566,9 +588,13 @@ class GraphMerger:
             elif relation.indexed_key and edge.get(_IK_KEY_ATTR):
                 surviving_ik = edge.get(_IK_KEY_ATTR)
                 if surviving_ik:
-                    # Record surviving key → freshest last_seen so bump_recurrence
-                    # can advance bookkeeping without fabricating now().
-                    self.reinforcements[surviving_ik] = edge.get("last_seen", "")
+                    # Record surviving key → (freshest last_seen, earliest first_seen)
+                    # so bump_recurrence can advance bookkeeping without fabricating
+                    # now().
+                    self.reinforcements[surviving_ik] = (
+                        edge.get("last_seen", ""),
+                        edge.get("first_seen", ""),
+                    )
                 # Record the incoming (drifting) key so the drift-accounting site
                 # in consolidate_interim_adapters can distinguish intended dedup
                 # (fact preserved under the surviving twin) from genuine loss.
@@ -777,6 +803,7 @@ class GraphMerger:
             sessions=_initial_sessions,
         )
         self.graph[subject][obj][new_eid]["last_seen"] = relation.last_seen or timestamp
+        self.graph[subject][obj][new_eid]["first_seen"] = relation.first_seen or timestamp
         if relation.indexed_key:
             self.graph[subject][obj][new_eid][_IK_KEY_ATTR] = relation.indexed_key
         # A-1 + B-4: stamp speaker_id unconditionally (net-new edge has no prior value)

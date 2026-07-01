@@ -1174,7 +1174,8 @@ class TestReinforcementTracking:
 
     def test_reinforcements_populated_on_duplicate_spo_collapse(self):
         """Two recon edges with same (s,p,o) but different ik_keys: Case-1 fires and
-        the surviving key appears in reinforcements with its last_seen timestamp."""
+        the surviving key appears in reinforcements with its (last_seen, first_seen)
+        timestamps."""
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation, SessionGraph
 
@@ -1225,10 +1226,14 @@ class TestReinforcementTracking:
         assert "graph1" in m.reinforcements, (
             f"Surviving key must be graph1 (existing edge); got keys={list(m.reinforcements)}"
         )
-        # The carried last_seen is the freshest (max) of both edges' timestamps.
-        assert m.reinforcements["graph1"] == "2026-01-02T00:00:00Z", (
-            "last_seen must be the freshest timestamp (s2.timestamp); "
-            f"got {m.reinforcements['graph1']!r}"
+        # The carried last_seen is the freshest (max) of both edges' timestamps;
+        # the carried first_seen is the earliest (min) of both edges' timestamps.
+        assert m.reinforcements["graph1"] == (
+            "2026-01-02T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ), (
+            "last_seen must be the freshest timestamp (s2.timestamp) and first_seen "
+            f"the earliest (s1.timestamp); got {m.reinforcements['graph1']!r}"
         )
 
     def test_reinforcements_reset_graph_clears_reinforcements(self):
@@ -1236,7 +1241,7 @@ class TestReinforcementTracking:
         from paramem.graph.merger import GraphMerger
 
         m = GraphMerger()
-        m.reinforcements = {"graph_stale": "2026-01-01T00:00:00Z"}
+        m.reinforcements = {"graph_stale": ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")}
         m.reset_graph()
         assert m.reinforcements == {}, "reset_graph must clear reinforcements"
 
@@ -1323,7 +1328,7 @@ class TestReinforcementTracking:
         m.graph.add_node("Alice")
         m._predicate_cardinality["foo"] = True
         m.contradictions_resolved.append({"method": "model"})
-        m.reinforcements["k2"] = "2026-01-01T00:00:00Z"
+        m.reinforcements["k2"] = ("2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
         m.collapsed.append("k3")
         m.removal_ledger["k3"] = {"reason": "dedup", "surviving_twin": "k2"}
 

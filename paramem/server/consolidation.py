@@ -110,7 +110,8 @@ def create_consolidation_loop(
 
     Graph is transient (RAM-only). Key metadata is seeded
     from key_metadata.json to restore cycle count, promoted keys, and
-    per-key bookkeeping (reinforcement_count, last_reinforced_cycle, last_seen) across restarts.
+    per-key bookkeeping (reinforcement_count, last_reinforced_cycle, last_seen,
+    first_seen) across restarts.
 
     Parameters
     ----------
@@ -416,16 +417,16 @@ def _save_key_metadata(loop: ConsolidationLoop, config: ServerConfig) -> None:
     keys_payload: dict = {}
     # Persist bookkeeping for BOTH active and stale keys so that stale-echo
     # probes can resolve speaker/relation_type for a soft-staled key.
+    # A key with no bookkeeping record is skipped rather than given a
+    # fabricated record — it stays recordless on reload, which every
+    # bookkeeping read site already tolerates via ``bookkeeping_for_key(k)
+    # or {}`` / ``.get(...)``.
     all_keys = loop.store.all_known_keys()
     for key in all_keys:
-        bk = loop.store.bookkeeping_for_key(key) or {}
-        keys_payload[key] = {
-            "speaker_id": bk.get("speaker_id", ""),
-            "relation_type": bk.get("relation_type", "unknown"),
-            "reinforcement_count": bk.get("reinforcement_count", 1),
-            "last_reinforced_cycle": bk.get("last_reinforced_cycle", 0),
-            "last_seen": bk.get("last_seen", ""),
-        }
+        bk = loop.store.bookkeeping_for_key(key)
+        if bk is None:
+            continue
+        keys_payload[key] = dict(bk)
     metadata = {
         "cycle_count": loop.cycle_count,
         "promoted_keys": sorted(loop.promoted_keys),

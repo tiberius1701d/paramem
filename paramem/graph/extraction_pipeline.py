@@ -254,6 +254,7 @@ class ExtractionPipeline:
             user_prompt_filename=pick("user_prompt_filename", user_prompt_filename),
             stop_phase=overrides.get("stop_phase"),
             seed=overrides.get("seed"),
+            timestamp=overrides.get("timestamp"),
         )
 
     def run(
@@ -300,6 +301,7 @@ class ExtractionPipeline:
         speaker_name: str | None = None,
         stt_correction: bool | None = None,
         source_type: str = "transcript",
+        timestamp: str | None = None,
     ) -> "SessionGraph":
         """Single entry point for procedural (preferences/habits) extraction.
 
@@ -312,6 +314,11 @@ class ExtractionPipeline:
         ``speaker_id`` is stamped onto every ``Relation`` produced by the
         procedural extractor as provenance.  Required — empty / ``None``
         raises :exc:`ValueError`.
+
+        ``timestamp``: session-start assertion time (ISO 8601), forwarded to
+        :func:`~paramem.graph.extractor.extract_procedural_graph` so
+        ``last_seen`` on newly-merged edges reflects when the facts were
+        asserted.  ``None`` (default) falls back to ``now()``.
         """
         from peft import PeftModel as _PeftModel
 
@@ -337,6 +344,7 @@ class ExtractionPipeline:
             speaker_id=speaker_id,
             system_prompt_filename=system_prompt_filename,
             user_prompt_filename=user_prompt_filename,
+            timestamp=timestamp,
         )
         if isinstance(self.model, _PeftModel):
             with self.model.disable_adapter():

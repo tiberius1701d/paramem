@@ -55,7 +55,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import pyrage
@@ -125,13 +125,7 @@ class FileCheck:
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable dict representation."""
-        return {
-            "path": self.path,
-            "category": self.category,
-            "tier": self.tier,
-            "status": self.status,
-            "detail": self.detail,
-        }
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -152,11 +146,7 @@ class IntegrityReport:
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable dict suitable for the ``GET /integrity`` endpoint."""
-        return {
-            "ok": self.ok,
-            "checks": [c.to_dict() for c in self.checks],
-            "failures": [c.to_dict() for c in self.failures],
-        }
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------

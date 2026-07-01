@@ -23,9 +23,11 @@ The original document bytes are stored as ``<doc_id>.origdoc`` in
 
 import json
 import logging
+import re
+import secrets
 import shutil
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from paramem.backup.encryption import (
@@ -55,6 +57,22 @@ def _snapshots_enabled() -> bool:
 STATE_NEW = "new"
 STATE_IDENTIFIED = "identified"
 
+# Characters outside this set are filesystem-unsafe in a JSONL filename.
+_UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _mint_session_id(conversation_id: str) -> str:
+    """Mint a fresh, filesystem-safe, race-free session id for a rotation.
+
+    Format: ``{sanitized conversation_id}-{YYYYMMDDThhmmssZ}-{rand4}``. The
+    4-char random suffix is mandatory (not "only on collision") so two
+    sessions opened for the same conversation_id in the same second never
+    collide on the JSONL filename.
+    """
+    safe = _UNSAFE_ID_CHARS.sub("_", conversation_id)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{safe}-{stamp}-{secrets.token_hex(2)}"
+
 
 class SessionBuffer:
     """Buffers conversation transcripts for later consolidation.
@@ -63,9 +81,28 @@ class SessionBuffer:
     on disk. When persist=False (production), transcripts live only in
     RAM and are discarded after consolidation.
 
-    Speaker identity is tracked per conversation_id in memory. When a
-    speaker is identified, their name is prefixed into transcript lines
-    so the graph extractor can attribute facts to the correct entity.
+    Two in-memory maps, split by concept (each field has exactly one home):
+
+    - ``_sessions`` — durable per-session metadata, keyed by ``session_id``
+      (doc_id, chunk_count, recall_retry_count). Read/written by the
+      consolidation-retirement machinery; survives cold restarts via
+      ``rehydrate_from_disk``.
+    - ``_open`` — ephemeral routing state, keyed by the caller's
+      ``conversation_id`` (the "conversation_key" role — one client/device
+      handle may span several minted sessions over time). Holds
+      ``session_id``, ``started_at``, ``last_turn_at``, ``speaker``,
+      ``speaker_id``, ``state``. Not persisted to the durable jsonl;
+      round-trips only through the encrypted graceful-restart snapshot
+      (:meth:`save_snapshot` / :meth:`load_snapshot`) — a cold restart (no
+      snapshot) starts ``_open`` empty, so the first post-restart turn
+      opens a fresh session (accepted restart-split).
+
+    :meth:`append` resolves/rotates the session_id for a ``conversation_id``
+    via ``_open`` (minting a new session after ``idle_timeout`` of
+    inactivity) and delegates the actual write to the private
+    :meth:`_append_turn`. Document ingest calls :meth:`_append_turn`
+    directly with the deterministic chunk session_id — chunk sessions never
+    rotate.
     """
 
     def __init__(
@@ -75,6 +112,7 @@ class SessionBuffer:
         retain_sessions: bool = True,
         debug: bool = False,
         consolidation_retry_cap: int = 3,
+        idle_timeout_minutes: int = 10,
     ):
         self.session_dir = Path(session_dir)
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -83,6 +121,7 @@ class SessionBuffer:
         self.retain_sessions = retain_sessions
         self.debug = debug
         self._consolidation_retry_cap = consolidation_retry_cap
+        self._idle_timeout = timedelta(minutes=idle_timeout_minutes)
         self._snapshot_path = self.session_dir / "session_snapshot.enc"
 
         if _snapshots_enabled():
@@ -96,36 +135,57 @@ class SessionBuffer:
                 "state is ephemeral across restarts"
             )
 
-        # In-memory session state: conversation_id → {speaker, speaker_id, state}
+        # Durable per-session metadata: session_id → {doc_id, chunk_count,
+        # recall_retry_count, speaker tags for doc-ingest attribution}.
         self._sessions: dict[str, dict] = {}
+        # Ephemeral routing state: conversation_id → {session_id, started_at,
+        # last_turn_at, speaker, speaker_id, state}.
+        self._open: dict[str, dict] = {}
         # In-memory turn storage (always populated, sole source when debug=False)
         self._turns: dict[str, list[dict]] = defaultdict(list)
 
     def get_session_state(self, conversation_id: str) -> str:
-        """Return the conversation state for this session."""
-        return self._sessions.get(conversation_id, {}).get("state", STATE_NEW)
+        """Return the conversation state for this session (ephemeral routing)."""
+        return self._open.get(conversation_id, {}).get("state", STATE_NEW)
 
     def get_speaker(self, conversation_id: str) -> str | None:
         """Return the identified speaker name for this session, or None."""
-        return self._sessions.get(conversation_id, {}).get("speaker")
+        return self._open.get(conversation_id, {}).get("speaker")
 
     def get_speaker_id(self, conversation_id: str) -> str | None:
         """Return the speaker ID for this session, or None."""
-        return self._sessions.get(conversation_id, {}).get("speaker_id")
+        return self._open.get(conversation_id, {}).get("speaker_id")
 
     def set_state(self, conversation_id: str, state: str) -> None:
-        """Update the conversation state."""
-        if conversation_id not in self._sessions:
-            self._sessions[conversation_id] = {"speaker": None, "state": STATE_NEW}
-        self._sessions[conversation_id]["state"] = state
+        """Update the conversation state (ephemeral routing)."""
+        if conversation_id not in self._open:
+            self._open[conversation_id] = {"speaker": None, "state": STATE_NEW}
+        self._open[conversation_id]["state"] = state
 
     def set_speaker(self, conversation_id: str, speaker_id: str, speaker_name: str) -> None:
-        """Store the identified speaker and mark as identified."""
-        if conversation_id not in self._sessions:
-            self._sessions[conversation_id] = {"speaker": None, "state": STATE_NEW}
-        self._sessions[conversation_id]["speaker"] = speaker_name
-        self._sessions[conversation_id]["speaker_id"] = speaker_id
-        self._sessions[conversation_id]["state"] = STATE_IDENTIFIED
+        """Store the identified speaker and mark as identified (ephemeral routing)."""
+        if conversation_id not in self._open:
+            self._open[conversation_id] = {"speaker": None, "state": STATE_NEW}
+        self._open[conversation_id]["speaker"] = speaker_name
+        self._open[conversation_id]["speaker_id"] = speaker_id
+        self._open[conversation_id]["state"] = STATE_IDENTIFIED
+
+    def discard_open_routing_key(self, conversation_id: str) -> None:
+        """Drop a routing-only ``_open`` entry that will never be appended to.
+
+        Voice resolution (``_resolve_and_enroll_speaker`` / ``_resolve_speaker``
+        in ``app.py``) calls :meth:`set_speaker` keyed by the per-utterance
+        transport id — a routing/enrollment handle distinct from the buffer
+        conversation_key derived from the resolved speaker
+        (``voice-{speaker_id}``). That transport-id entry never gets a
+        ``session_id`` (no turn is ever appended under it), so
+        :meth:`_prune_open_for_retired_sessions` can never evict it and it
+        would otherwise accumulate one orphan per shared-token utterance.
+        Callers discard it once the resolved buffer key is known and its
+        speaker state has been re-recorded there via :meth:`set_speaker`.
+        Silent no-op when the key is absent.
+        """
+        self._open.pop(conversation_id, None)
 
     def set_document_metadata(
         self,
@@ -155,16 +215,92 @@ class SessionBuffer:
         self._sessions[conversation_id]["doc_id"] = doc_id
         self._sessions[conversation_id]["chunk_count"] = chunk_count
 
-    def set_pending_embedding(self, conversation_id: str, embedding: list[float]) -> None:
-        """Store a voice embedding for deferred enrollment (awaiting name)."""
-        if conversation_id not in self._sessions:
-            self._sessions[conversation_id] = {"speaker": None, "state": STATE_NEW}
-        self._sessions[conversation_id]["pending_embedding"] = embedding
+    def _append_turn(
+        self,
+        session_id: str,
+        role: str,
+        text: str,
+        embedding: list[float] | None = None,
+        metadata: dict | None = None,
+        speaker_id: str | None = None,
+        speaker: str | None = None,
+    ) -> None:
+        """Sole writer: append a turn to ``_turns[session_id]`` + its JSONL.
 
-    def get_pending_embedding(self, conversation_id: str) -> list[float] | None:
-        """Retrieve and clear the pending embedding for enrollment."""
-        session = self._sessions.get(conversation_id, {})
-        return session.pop("pending_embedding", None)
+        Private. Both :meth:`append` (conversational, rotates via ``_open``)
+        and :meth:`append_document_chunk` (deterministic chunk id, never
+        rotates) resolve a concrete ``session_id`` and delegate here — the
+        actual write path (turn dict shape, disk persistence) has exactly
+        one implementation.
+
+        Args:
+            session_id: Concrete session identifier — the JSONL filename
+                and ``_turns`` key.
+            role: Turn role (``"user"`` or ``"assistant"``).
+            text: Turn text content.
+            embedding: Optional voice fingerprint for speaker matching.
+            metadata: Optional dict attached to the entry as ``"metadata"``.
+                Used by the document ingest path to carry
+                ``{"source_type": "document", "doc_title": str,
+                "chunk_index": int, "source_path": str}``.
+                Existing transcript turns without metadata stay
+                schema-compatible — the field is simply absent.
+            speaker_id: Resolved speaker ID for this turn, or ``None``.
+            speaker: Display name companion to *speaker_id*.
+        """
+        entry = {
+            "role": role,
+            "text": text,
+            "speaker": speaker,
+            "speaker_id": speaker_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if embedding and role == "user":
+            entry["embedding"] = embedding
+        if metadata is not None:
+            entry["metadata"] = metadata
+
+        self._turns[session_id].append(entry)
+
+        # Mirror the speaker tag onto the durable _sessions entry (creating
+        # it if this is the session's first turn). retirable /
+        # mark_consolidated / discard_sessions / bump_retry_and_release all
+        # key off _sessions[session_id] — a session that never appears here
+        # would fail bump_retry_and_release's R3 buffered-session guard.
+        session_meta = self._sessions.setdefault(session_id, {"speaker": None, "state": STATE_NEW})
+        if speaker_id is not None:
+            session_meta["speaker"] = speaker
+            session_meta["speaker_id"] = speaker_id
+            session_meta["state"] = STATE_IDENTIFIED
+
+        # Pending sessions ALWAYS persist on disk until consumed by a
+        # consolidation (2026-05-14 invariant — independent of debug / mode).
+        path = self.session_dir / f"{session_id}.jsonl"
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def _resolve_session_id(self, conversation_id: str) -> str:
+        """Resolve the concrete session_id for a conversation turn, rotating
+        on idle timeout.
+
+        Mints a fresh ``session_id`` (and ``started_at``) when
+        *conversation_id* has no open session yet, or when the gap since its
+        last turn exceeds ``idle_timeout``. Otherwise returns the existing
+        open session_id. Always stamps ``last_turn_at`` to now.
+        """
+        now = datetime.now(timezone.utc)
+        state = self._open.setdefault(conversation_id, {"speaker": None, "state": STATE_NEW})
+        last_turn_at = state.get("last_turn_at")
+        needs_new_session = state.get("session_id") is None or (
+            last_turn_at is not None
+            and now - datetime.fromisoformat(last_turn_at) > self._idle_timeout
+        )
+        if needs_new_session:
+            session_id = _mint_session_id(conversation_id)
+            state["session_id"] = session_id
+            state["started_at"] = now.isoformat()
+        state["last_turn_at"] = now.isoformat()
+        return state["session_id"]
 
     def append(
         self,
@@ -181,8 +317,15 @@ class SessionBuffer:
         For user turns from voice, embedding is the voice fingerprint
         from that utterance. Stored for retroactive speaker attribution.
 
+        *conversation_id* is the caller's stable routing handle (device /
+        speaker / client conversation id) — it is resolved to a concrete,
+        possibly freshly-minted ``session_id`` via ``_open`` before the turn
+        is written. A new session_id is minted on the first turn for this
+        handle, or when the gap since the last turn exceeds the configured
+        idle timeout; otherwise the turn joins the currently open session.
+
         Args:
-            conversation_id: Unique session identifier.
+            conversation_id: Caller's conversation routing handle.
             role: Turn role (``"user"`` or ``"assistant"``).
             text: Turn text content.
             embedding: Optional voice fingerprint for speaker matching.
@@ -199,31 +342,66 @@ class SessionBuffer:
                 session state (the gap that silently dropped token-authenticated
                 text sessions). When ``None`` (default), falls back to session
                 state via ``get_speaker_id`` — preserving voice / anon-promotion
-                / document-ingest callers that ``set_speaker`` before appending.
+                callers that ``set_speaker`` before appending.
             speaker: Display name companion to *speaker_id*, same precedence.
         """
         if speaker_id is None:
             speaker_id = self.get_speaker_id(conversation_id)
             speaker = self.get_speaker(conversation_id)
-        entry = {
-            "role": role,
-            "text": text,
-            "speaker": speaker,
-            "speaker_id": speaker_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        if embedding and role == "user":
-            entry["embedding"] = embedding
-        if metadata is not None:
-            entry["metadata"] = metadata
+        session_id = self._resolve_session_id(conversation_id)
+        self._append_turn(
+            session_id,
+            role,
+            text,
+            embedding=embedding,
+            metadata=metadata,
+            speaker_id=speaker_id,
+            speaker=speaker,
+        )
 
-        self._turns[conversation_id].append(entry)
+    def append_document_chunk(
+        self,
+        session_id: str,
+        role: str,
+        text: str,
+        embedding: list[float] | None = None,
+        metadata: dict | None = None,
+        speaker_id: str | None = None,
+        speaker: str | None = None,
+    ) -> None:
+        """Append a document-ingest chunk turn — deterministic id, never rotates.
 
-        # Pending sessions ALWAYS persist on disk until consumed by a
-        # consolidation (2026-05-14 invariant — independent of debug / mode).
-        path = self.session_dir / f"{conversation_id}.jsonl"
-        with open(path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        Document chunks use ``session_id == f"{doc_id}-c{chunk_index:03d}"``
+        (locked invariant) as both the routing handle and the concrete
+        session id — one chunk is exactly one session, so there is no idle
+        window to roll over. Callers must ``set_speaker(session_id, ...)``
+        and ``set_document_metadata(session_id, ...)`` before appending (the
+        speaker-id fallback below reads the same ``session_id`` key from
+        ``_open``, mirroring :meth:`append`'s precedence).
+        """
+        if speaker_id is None:
+            speaker_id = self.get_speaker_id(session_id)
+            speaker = self.get_speaker(session_id)
+        # Mirror _resolve_session_id: the routing entry must carry its
+        # session_id backlink so retirement prune (by session_id) can evict
+        # it — otherwise the _open[session_id] entry (created by the
+        # ingest set_speaker) orphans, identical to the voice transport-id
+        # leak. setdefault is robust if a caller ever appends without a
+        # prior set_speaker; per the documented contract set_speaker
+        # already precedes, so this just adds the backlink to the existing
+        # entry.
+        self._open.setdefault(session_id, {"speaker": None, "state": STATE_NEW})["session_id"] = (
+            session_id
+        )
+        self._append_turn(
+            session_id,
+            role,
+            text,
+            embedding=embedding,
+            metadata=metadata,
+            speaker_id=speaker_id,
+            speaker=speaker,
+        )
 
     def claim_sessions_for_speaker(self, speaker_id: str, speaker_name: str, speaker_store) -> int:
         """Retroactively claim pending sessions whose embeddings match.
@@ -318,6 +496,9 @@ class SessionBuffer:
           for existing turns without metadata.
         - ``"doc_title"`` — document title from the first turn's ``metadata``
           dict, or ``None`` for transcript sessions.
+        - ``"started_at"`` — first turn's timestamp (session-start assertion
+          time, fed to extraction as ``event_time``).
+        - ``"ended_at"`` — last turn's timestamp.
 
         ``_format_turns`` return shape is unchanged.  ``source_type`` and
         ``doc_title`` are read directly from the first turn's ``metadata``
@@ -340,6 +521,8 @@ class SessionBuffer:
                         "speaker_id": session_speaker_id,
                         "source_type": first_meta.get("source_type", "transcript"),
                         "doc_title": first_meta.get("doc_title"),
+                        "started_at": turns[0]["timestamp"],
+                        "ended_at": turns[-1]["timestamp"],
                     }
                 )
 
@@ -362,6 +545,8 @@ class SessionBuffer:
                         "speaker_id": session_speaker_id,
                         "source_type": first_meta.get("source_type", "transcript"),
                         "doc_title": first_meta.get("doc_title"),
+                        "started_at": turns[0]["timestamp"],
+                        "ended_at": turns[-1]["timestamp"],
                     }
                 )
 
@@ -526,6 +711,28 @@ class SessionBuffer:
 
         return result
 
+    def _prune_open_for_retired_sessions(self, session_ids: list[str]) -> None:
+        """Evict any ``_open`` entry whose ``session_id`` was just retired.
+
+        Called by :meth:`mark_consolidated` and :meth:`discard_sessions`
+        after the durable ``_sessions``/``_turns`` cleanup. Keeps the
+        ephemeral routing map coherent with retirement: without this, a
+        conversation_key whose session just retired would keep pointing
+        ``_open[conversation_key]["session_id"]`` at the now-gone id, so the
+        next turn on that key would either silently reuse a retired
+        session_id (writing into an already-archived/deleted jsonl name) or
+        (if not stale enough to rotate) never mint a fresh session at all.
+        Also bounds ``_open``'s size to live conversations.
+        """
+        retired = set(session_ids)
+        if not retired:
+            return
+        stale_keys = [
+            conv_id for conv_id, state in self._open.items() if state.get("session_id") in retired
+        ]
+        for conv_id in stale_keys:
+            del self._open[conv_id]
+
     def mark_consolidated(
         self,
         session_ids: list[str],
@@ -633,6 +840,8 @@ class SessionBuffer:
                     len(session_ids),
                 )
 
+        self._prune_open_for_retired_sessions(session_ids)
+
     def discard_sessions(self, session_ids: list[str]) -> None:
         """Drop named sessions from the in-memory queue and disk state.
 
@@ -692,6 +901,8 @@ class SessionBuffer:
                     "for %d session(s) (non-fatal)",
                     len(session_ids),
                 )
+
+        self._prune_open_for_retired_sessions(session_ids)
 
     def hydrate_retry_counts(self) -> None:
         """Seed in-memory retry counts from the durable ``consolidation_retry.json``.
@@ -1043,16 +1254,22 @@ class SessionBuffer:
         success. When the daily identity is not loaded, returns False
         without writing — snapshot persistence requires a key so a restart
         on a fresh host with the key restored can read it back.
+
+        Carries ``_open`` (ephemeral routing state) alongside the durable
+        ``_turns``/``_sessions`` — a graceful restart preserves in-progress
+        speaker/session continuity; only a cold restart (no snapshot, see
+        :meth:`rehydrate_from_disk`) starts ``_open`` empty and splits.
         """
         if not _snapshots_enabled():
             return False
-        if not self._turns and not self._sessions:
+        if not self._turns and not self._sessions and not self._open:
             logger.info("No session data to snapshot")
             return True
 
         payload = {
             "turns": dict(self._turns),
             "sessions": self._sessions,
+            "open": self._open,
         }
         try:
             plaintext = json.dumps(payload).encode()
@@ -1100,12 +1317,18 @@ class SessionBuffer:
             plaintext = envelope_decrypt_bytes(raw)
             payload = json.loads(plaintext.decode())
 
-            restored_turns = payload.get("turns", {})
-            restored_sessions = payload.get("sessions", {})
+            # Strict (no .get default) on all three keys: a payload missing
+            # any of them is a malformed/pre-this-change snapshot. Raising
+            # here routes into the except below, which unlinks and discards
+            # — the same "corrupted snapshot" disposition, not a new branch.
+            restored_turns = payload["turns"]
+            restored_sessions = payload["sessions"]
+            restored_open = payload["open"]
 
             for conv_id, turns in restored_turns.items():
                 self._turns[conv_id] = turns
             self._sessions.update(restored_sessions)
+            self._open.update(restored_open)
 
             self._snapshot_path.unlink()
             logger.info(

@@ -214,6 +214,7 @@ class TestMarkStaleKeys:
             key,
             speaker_id=speaker_id,
             relation_type="factual",
+            first_seen="",
         )
 
         # Assemble the loop mock, replacing .store with the real MemoryStore.
@@ -549,6 +550,7 @@ class TestLiveSlotManifestReStamp:
             key_to_forget,
             speaker_id=speaker_id,
             relation_type="factual",
+            first_seen="",
         )
 
         # Compute H_old — the hash of the registry BEFORE the erase.
@@ -628,6 +630,7 @@ class TestLiveSlotManifestReStamp:
             key_to_forget,
             speaker_id=speaker_id,
             relation_type="factual",
+            first_seen="",
         )
 
         # Write a slot with a DIFFERENT registry_sha256 so find_live_slot won't match H_old.

@@ -1223,9 +1223,10 @@ class TestTickGateNoNamed:
 
         self._call_tick(state)
 
-        # HOLDABLE + TTL=off → session stays pending.
+        # HOLDABLE + TTL=off → session stays pending. append() mints a
+        # session_id ("{conv_id}-{timestamp}-{rand}"), so match by prefix.
         remaining = [s["session_id"] for s in buffer.get_pending()]
-        assert conv_id in remaining
+        assert any(sid.startswith(f"{conv_id}-") for sid in remaining)
 
 
 # ---------------------------------------------------------------------------
@@ -3166,6 +3167,7 @@ class TestAbortSkipsCommit:
             "graph1",
             speaker_id="speaker0",
             relation_type="factual",
+            first_seen="",
         )
         # The edge-walk dedup and tier stage reads from merger.graph.edges(data=True).
         # Replace the MagicMock with a real MultiDiGraph carrying the graph1 edge
@@ -3476,7 +3478,9 @@ class TestConsolidateInterimAdaptersFullFlow:
                 simhash=sh,
                 register=True,
             )
-            loop.store.set_bookkeeping(key, speaker_id="speaker0", relation_type="factual")
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="factual", first_seen=""
+            )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
@@ -3572,7 +3576,9 @@ class TestConsolidateInterimAdaptersFullFlow:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("proc1", speaker_id="speaker0", relation_type="preference")
+        loop.store.set_bookkeeping(
+            "proc1", speaker_id="speaker0", relation_type="preference", first_seen=""
+        )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
@@ -3625,7 +3631,9 @@ class TestConsolidateInterimAdaptersFullFlow:
             register=True,
         )
         # Bookkeeping has relation_type="preference" — this must be injected.
-        loop.store.set_bookkeeping("proc1", speaker_id="speaker0", relation_type="preference")
+        loop.store.set_bookkeeping(
+            "proc1", speaker_id="speaker0", relation_type="preference", first_seen=""
+        )
 
         # Capture merger.merge() call args.
         merge_calls: list = []
@@ -3719,7 +3727,9 @@ class TestConsolidateInterimAdaptersFullFlow:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
@@ -3782,7 +3792,9 @@ class TestConsolidateInterimAdaptersFullFlow:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("graph_bob", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "graph_bob", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         # Register drift1 — no recon edge.  Under registry-true dedup the SPO
         # enters the merge directly, so drift1 survives into tier_keyed.
@@ -3798,7 +3810,9 @@ class TestConsolidateInterimAdaptersFullFlow:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("drift1", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "drift1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
@@ -3878,7 +3892,9 @@ class TestConsolidateInterimAdaptersFullFlow:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("graph_ok", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "graph_ok", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         # graph_hydration_miss: registered in the store but NO content entry.
         # Register it first (put with register=True), then delete the entry cache
@@ -3904,6 +3920,7 @@ class TestConsolidateInterimAdaptersFullFlow:
             relation_type="factual",
             reinforcement_count=1,
             last_reinforced_cycle=1,
+            first_seen="",
         )
         # Manually add SPO fields to bookkeeping so the drift-partition
         # classification finds them and routes to genuine_loss rather than orphan.
@@ -3976,7 +3993,9 @@ class TestConsolidateInterimAdaptersFullFlow:
                 },
                 register=True,
             )
-            loop.store.set_bookkeeping(key, speaker_id="speaker0", relation_type="factual")
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="factual", first_seen=""
+            )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
@@ -4031,7 +4050,9 @@ class TestConsolidateInterimAdaptersFullFlow:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("graph10", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "graph10", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
@@ -4179,7 +4200,11 @@ class TestConsolidateInterimAdaptersFullFlow:
             )
             # Both keys share the same last_seen → timestamps tied → coexist.
             loop.store.set_bookkeeping(
-                key, speaker_id="speaker0", relation_type="factual", last_seen=same_ts
+                key,
+                speaker_id="speaker0",
+                relation_type="factual",
+                last_seen=same_ts,
+                first_seen="",
             )
 
         # Patch check_predicate_coexistence to return REPLACE (single-valued predicate).
@@ -4251,7 +4276,7 @@ class TestConsolidateInterimAdaptersFullFlow:
                 register=True,
             )
             loop.store.set_bookkeeping(
-                key, speaker_id="speaker0", relation_type="factual", last_seen=ts
+                key, speaker_id="speaker0", relation_type="factual", last_seen=ts, first_seen=""
             )
 
         # Patch check_predicate_coexistence to return REPLACE (single-valued predicate).
@@ -4314,7 +4339,9 @@ class TestConsolidateInterimAdaptersFullFlow:
                 },
                 register=True,
             )
-            loop.store.set_bookkeeping(key, speaker_id="speaker0", relation_type="factual")
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="factual", first_seen=""
+            )
 
         # Spy that inserts BOTH edges (resolve_contradictions=False at fold).
         self._install_provenance_merge_spy(loop)
@@ -4381,6 +4408,7 @@ class TestConsolidateInterimAdaptersFullFlow:
             relation_type="factual",
             reinforcement_count=3,  # at threshold — would be promoted
             last_reinforced_cycle=1,
+            first_seen="",
         )
 
         # Recon graph: reconstruct_graph found the key in episodic (weights present there).
@@ -4489,7 +4517,9 @@ class TestDriftPartitioning:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("key_dup1", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "key_dup1", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         # key_dup2 — same SPO; recon edge collapses into key_dup1 via Case-1.
         loop.store.put(
@@ -4504,7 +4534,9 @@ class TestDriftPartitioning:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("key_dup2", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "key_dup2", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         # key_orphan — no SPO content in entry; no recon edge.
         loop.store.put(
@@ -4519,7 +4551,9 @@ class TestDriftPartitioning:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("key_orphan", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "key_orphan", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         # key_loss — has real SPO content but no recon edge (reconstruction failed).
         loop.store.put(
@@ -4534,7 +4568,9 @@ class TestDriftPartitioning:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("key_loss", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "key_loss", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         result = self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
@@ -4609,7 +4645,9 @@ class TestDriftPartitioning:
                 },
                 register=True,
             )
-            loop.store.set_bookkeeping(key, speaker_id="speaker0", relation_type="factual")
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="factual", first_seen=""
+            )
 
         # caplog.at_level alone does not capture in this project (log propagation
         # is intercepted); attach the handler directly to the named logger.
@@ -4681,7 +4719,9 @@ class TestDriftPartitioning:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("key_ok", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "key_ok", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         # key_no_pred has a non-empty subject but empty predicate.
         # _build_registry_true_relations skips it → no merged edge → drift_genuine_loss.
@@ -4697,7 +4737,9 @@ class TestDriftPartitioning:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("key_no_pred", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "key_no_pred", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         # caplog.at_level alone does not capture in this project (log propagation
         # is intercepted); attach the handler directly to the named logger.
@@ -4788,7 +4830,9 @@ class TestDriftIntendedRemoval:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("key_ok", speaker_id="speaker0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "key_ok", speaker_id="speaker0", relation_type="factual", first_seen=""
+        )
 
         # key_enrichment — active key, no recon edge; will be written to the ledger
         # by the custom enrichment side_effect (after reset_graph clears the ledger).
@@ -4808,6 +4852,7 @@ class TestDriftIntendedRemoval:
             "key_enrichment",
             speaker_id="speaker0",
             relation_type="factual",
+            first_seen="",
         )
 
         def _enrichment_side_effect():
@@ -4919,7 +4964,9 @@ class TestDriftIntendedRemoval:
                 },
                 register=True,
             )
-            loop.store.set_bookkeeping(key, speaker_id="speaker0", relation_type="factual")
+            loop.store.set_bookkeeping(
+                key, speaker_id="speaker0", relation_type="factual", first_seen=""
+            )
 
         # Pre-seed ledger for key_dup2 as well — to prove it doesn't divert to
         # intended_removal (the _collapsed_set branch must win).
@@ -5169,7 +5216,7 @@ class TestFoldGraphDebug:
 
 
 class TestBookkeepingSchema:
-    """Unit tests for the 5-field bookkeeping schema in MemoryStore."""
+    """Unit tests for the 6-field bookkeeping schema in MemoryStore."""
 
     def _make_store(self):
         from paramem.memory.store import MemoryStore
@@ -5179,9 +5226,10 @@ class TestBookkeepingSchema:
         s.load_registry("episodic", KeyRegistry())
         return s
 
-    def test_set_bookkeeping_stores_all_five_fields(self):
-        """set_bookkeeping writes all 5 fields into _bookkeeping:
-        speaker_id, relation_type, reinforcement_count, last_reinforced_cycle, last_seen.
+    def test_set_bookkeeping_stores_all_six_fields(self):
+        """set_bookkeeping writes all 6 fields into _bookkeeping: speaker_id,
+        relation_type, reinforcement_count, last_reinforced_cycle, last_seen,
+        first_seen.
         """
         store = self._make_store()
         store.set_bookkeeping(
@@ -5191,6 +5239,7 @@ class TestBookkeepingSchema:
             reinforcement_count=2,
             last_reinforced_cycle=5,
             last_seen="2026-01-01T00:00:00Z",
+            first_seen="2025-12-01T00:00:00Z",
         )
         bk = store.bookkeeping_for_key("graph1")
         assert bk is not None
@@ -5199,6 +5248,7 @@ class TestBookkeepingSchema:
         assert bk["reinforcement_count"] == 2
         assert bk["last_reinforced_cycle"] == 5
         assert bk["last_seen"] == "2026-01-01T00:00:00Z"
+        assert bk["first_seen"] == "2025-12-01T00:00:00Z"
 
     def test_set_bookkeeping_defaults_for_new_keys(self):
         """set_bookkeeping defaults reinforcement_count=1, last_reinforced_cycle=0."""
@@ -5208,6 +5258,7 @@ class TestBookkeepingSchema:
             speaker_id="",
             relation_type="factual",
             allow_empty_speaker=True,
+            first_seen="",
         )
         bk = store.bookkeeping_for_key("graph2")
         assert bk["reinforcement_count"] == 1
@@ -5222,8 +5273,9 @@ class TestBookkeepingSchema:
             relation_type="factual",
             reinforcement_count=1,
             last_reinforced_cycle=1,
+            first_seen="",
         )
-        store.bump_recurrence("graph3", cycle=7)
+        store.bump_recurrence("graph3", cycle=7, first_seen="")
         bk = store.bookkeeping_for_key("graph3")
         assert bk["reinforcement_count"] == 2
         assert bk["last_reinforced_cycle"] == 7
@@ -5233,7 +5285,7 @@ class TestBookkeepingSchema:
     def test_bump_recurrence_creates_record_when_absent(self):
         """bump_recurrence on unknown key creates a minimal record."""
         store = self._make_store()
-        store.bump_recurrence("graph_new", cycle=4)
+        store.bump_recurrence("graph_new", cycle=4, first_seen="")
         bk = store.bookkeeping_for_key("graph_new")
         assert bk is not None
         assert bk["reinforcement_count"] == 1
@@ -5248,8 +5300,9 @@ class TestBookkeepingSchema:
             relation_type="factual",
             reinforcement_count=5,
             last_reinforced_cycle=0,
+            first_seen="",
         )
-        store.bump_recurrence("k", cycle=10)
+        store.bump_recurrence("k", cycle=10, first_seen="")
         assert store.bookkeeping_for_key("k")["speaker_id"] == "speaker99"
 
     def test_bump_recurrence_does_not_regress_last_seen(self):
@@ -5261,9 +5314,10 @@ class TestBookkeepingSchema:
             speaker_id="speaker0",
             relation_type="factual",
             last_seen="2026-06-20T12:00:00Z",
+            first_seen="",
         )
         # Pass an older timestamp — must NOT overwrite the existing newer value.
-        store.bump_recurrence("k", cycle=5, timestamp="2026-05-01T08:00:00Z")
+        store.bump_recurrence("k", cycle=5, timestamp="2026-05-01T08:00:00Z", first_seen="")
         bk = store.bookkeeping_for_key("k")
         assert bk["last_seen"] == "2026-06-20T12:00:00Z", (
             f"bump_recurrence with older timestamp must not regress last_seen; "
@@ -5278,16 +5332,70 @@ class TestBookkeepingSchema:
             speaker_id="speaker0",
             relation_type="factual",
             last_seen="2026-05-01T08:00:00Z",
+            first_seen="",
         )
-        store.bump_recurrence("k2", cycle=5, timestamp="2026-06-20T12:00:00Z")
+        store.bump_recurrence("k2", cycle=5, timestamp="2026-06-20T12:00:00Z", first_seen="")
         bk = store.bookkeeping_for_key("k2")
         assert bk["last_seen"] == "2026-06-20T12:00:00Z", (
             f"bump_recurrence with newer timestamp must advance last_seen; got {bk['last_seen']!r}"
         )
 
+    def test_bump_recurrence_does_not_regress_first_seen(self):
+        """bump_recurrence with a LATER first_seen must not regress an existing
+        earlier first_seen — the invariant is min_nonempty(existing, incoming)."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "k3",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-01-01T00:00:00Z",
+        )
+        # Pass a LATER first_seen — must NOT overwrite the existing earlier value.
+        store.bump_recurrence("k3", cycle=5, first_seen="2026-06-01T00:00:00Z")
+        bk = store.bookkeeping_for_key("k3")
+        assert bk["first_seen"] == "2026-01-01T00:00:00Z", (
+            f"bump_recurrence with a later first_seen must not regress the earlier "
+            f"value; got {bk['first_seen']!r}"
+        )
+
+    def test_bump_recurrence_advances_first_seen_to_earlier(self):
+        """bump_recurrence with an EARLIER first_seen must advance (lower) first_seen."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "k4",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-06-01T00:00:00Z",
+        )
+        store.bump_recurrence("k4", cycle=5, first_seen="2026-01-01T00:00:00Z")
+        bk = store.bookkeeping_for_key("k4")
+        assert bk["first_seen"] == "2026-01-01T00:00:00Z", (
+            f"bump_recurrence with an earlier first_seen must advance the window "
+            f"start; got {bk['first_seen']!r}"
+        )
+
+    def test_bump_recurrence_empty_first_seen_never_wins_min(self):
+        """An empty incoming first_seen ('unknown') must never overwrite an
+        existing dated first_seen — min_nonempty treats '' as absent, not as
+        the earliest possible time."""
+        store = self._make_store()
+        store.set_bookkeeping(
+            "k5",
+            speaker_id="speaker0",
+            relation_type="factual",
+            first_seen="2026-03-01T00:00:00Z",
+        )
+        store.bump_recurrence("k5", cycle=5, first_seen="")
+        bk = store.bookkeeping_for_key("k5")
+        assert bk["first_seen"] == "2026-03-01T00:00:00Z", (
+            f"empty incoming first_seen must not clobber a dated existing value; "
+            f"got {bk['first_seen']!r}"
+        )
+
     def test_load_bookkeeping_from_disk_round_trip(self, tmp_path):
-        """5-field round-trip: save via _save_key_metadata, reload via
-        load_bookkeeping_from_disk."""
+        """Full-record round-trip: save via the same ``dict(bk)`` shape
+        ``_save_key_metadata`` writes, reload via load_bookkeeping_from_disk,
+        assert every field survives unchanged (write/read symmetry)."""
         import json
 
         from paramem.memory.store import MemoryStore
@@ -5302,21 +5410,29 @@ class TestBookkeepingSchema:
             relation_type="social",
             reinforcement_count=4,
             last_reinforced_cycle=9,
+            first_seen="2025-12-01T00:00:00Z",
+        )
+        store.registry("episodic").add("graph6")
+        store.set_bookkeeping(
+            "graph6",
+            speaker_id="",
+            relation_type="unknown",
+            reinforcement_count=1,
+            last_reinforced_cycle=0,
+            last_seen="",
+            first_seen="",
+            allow_empty_speaker=True,
         )
 
-        # Simulate _save_key_metadata output format.
-        bk = store.bookkeeping_for_key("graph5")
+        # Simulate _save_key_metadata output format: dump the whole record.
+        bk5 = store.bookkeeping_for_key("graph5")
+        bk6 = store.bookkeeping_for_key("graph6")
         payload = {
             "cycle_count": 10,
             "promoted_keys": [],
             "keys": {
-                "graph5": {
-                    "speaker_id": bk["speaker_id"],
-                    "relation_type": bk["relation_type"],
-                    "reinforcement_count": bk["reinforcement_count"],
-                    "last_reinforced_cycle": bk["last_reinforced_cycle"],
-                    "last_seen": bk["last_seen"],
-                }
+                "graph5": dict(bk5),
+                "graph6": dict(bk6),
             },
         }
         path = tmp_path / "key_metadata.json"
@@ -5326,31 +5442,31 @@ class TestBookkeepingSchema:
         store2 = MemoryStore(replay_enabled=True)
         store2.load_registry("episodic", KeyRegistry())
         store2.registry("episodic").add("graph5")
+        store2.registry("episodic").add("graph6")
         store2.load_bookkeeping_from_disk(path)
 
-        bk2 = store2.bookkeeping_for_key("graph5")
-        assert bk2 is not None
-        assert bk2["speaker_id"] == "SPK"
-        assert bk2["relation_type"] == "social"
-        assert bk2["reinforcement_count"] == 4
-        assert bk2["last_reinforced_cycle"] == 9
+        assert store2.bookkeeping_for_key("graph5") == bk5
+        assert store2.bookkeeping_for_key("graph6") == bk6
 
-    def test_load_bookkeeping_legacy_upgrade_missing_recurrence(self, tmp_path):
-        """Legacy key_metadata.json without recurrence fields gets defaults."""
+    def test_load_bookkeeping_incomplete_record_fails_loud(self, tmp_path):
+        """A persisted record missing a mandatory bookkeeping field raises —
+        no legacy-fill tolerance, no backward compatibility. The splat read
+        requires the on-disk record to carry every field ``set_bookkeeping``
+        needs. ``relation_type`` has no Python default on ``set_bookkeeping``,
+        so omitting it must raise ``TypeError`` from the splat."""
         import json
 
         from paramem.memory.store import MemoryStore
         from paramem.training.key_registry import KeyRegistry
 
-        # Simulate a pre-Refactor-A key_metadata.json (3-field schema).
         payload = {
             "cycle_count": 5,
             "promoted_keys": [],
             "keys": {
                 "graph_old": {
                     "speaker_id": "SPK",
-                    "relation_type": "factual",
-                    # reinforcement_count and last_reinforced_cycle absent (legacy)
+                    "first_seen": "",
+                    # relation_type absent — no Python default, must raise.
                 }
             },
         }
@@ -5360,13 +5476,41 @@ class TestBookkeepingSchema:
         store = MemoryStore(replay_enabled=True)
         store.load_registry("episodic", KeyRegistry())
         store.registry("episodic").add("graph_old")
-        result = store.load_bookkeeping_from_disk(path)
 
-        assert result["legacy_upgraded"] >= 1, "Legacy key must be counted as legacy_upgraded"
-        bk = store.bookkeeping_for_key("graph_old")
-        assert bk["reinforcement_count"] == 1
-        # Legacy default: last_reinforced_cycle=0 when absent from serialized record.
-        assert bk["last_reinforced_cycle"] == 0
+        with pytest.raises(TypeError):
+            store.load_bookkeeping_from_disk(path)
+
+    def test_load_bookkeeping_missing_first_seen_fails_loud(self, tmp_path):
+        """A record missing first_seen entirely raises — no silent '' fill,
+        per the no-shim rule."""
+        import json
+
+        from paramem.memory.store import MemoryStore
+        from paramem.training.key_registry import KeyRegistry
+
+        payload = {
+            "cycle_count": 5,
+            "promoted_keys": [],
+            "keys": {
+                "graph_stale": {
+                    "speaker_id": "SPK",
+                    "relation_type": "factual",
+                    "reinforcement_count": 1,
+                    "last_reinforced_cycle": 0,
+                    "last_seen": "2026-01-01T00:00:00Z",
+                    # first_seen absent — pre-migration on-disk shape.
+                }
+            },
+        }
+        path = tmp_path / "key_metadata.json"
+        path.write_text(json.dumps(payload))
+
+        store = MemoryStore(replay_enabled=True)
+        store.load_registry("episodic", KeyRegistry())
+        store.registry("episodic").add("graph_stale")
+
+        with pytest.raises(TypeError):
+            store.load_bookkeeping_from_disk(path)
 
 
 class TestLastSeenFlowThroughMint:
@@ -5490,9 +5634,95 @@ class TestLastSeenFlowThroughMint:
             f"got {bk['last_seen']!r}"
         )
 
+    def test_first_seen_from_edge_flows_into_bookkeeping(self, tmp_path):
+        """Edge attribute first_seen travels through _build_all_edge_entries_into
+        into set_bookkeeping, symmetric to last_seen."""
+        real_ts = "2026-06-01T10:00:00Z"
+        loop = self._make_loop(tmp_path)
+        g = loop.merger.graph
+
+        g.add_node(
+            "speaker0",
+            entity_type="person",
+            speaker_id="speaker0",
+            attributes={"name": "Alex"},
+        )
+        g.add_node("berlin", entity_type="place", attributes={"name": "Berlin"})
+        g.add_edge(
+            "speaker0",
+            "berlin",
+            predicate="lives in",
+            relation_type="factual",
+            last_seen=real_ts,
+            first_seen=real_ts,
+        )
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        minted_key = tier_keyed["episodic"][0]["key"]
+        bk = loop.store.bookkeeping_for_key(minted_key)
+        assert bk is not None, "bookkeeping must be written at mint"
+        assert bk["first_seen"] == real_ts, (
+            f"first_seen must carry the real session timestamp {real_ts!r}; "
+            f"got {bk['first_seen']!r}"
+        )
+
+    def test_merger_min_nonempty_first_seen_across_reassertion(self):
+        """CPU-only merger test: a fact re-asserted in a later session keeps its
+        original (earliest) first_seen while last_seen advances to the newest.
+
+        Exercises GraphMerger.merge() directly — no ConsolidationLoop needed —
+        proving the min-across-reassertion invariant at the merger boundary."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation, SessionGraph
+
+        m = GraphMerger()
+
+        # First session: earliest assertion.
+        s1 = SessionGraph(
+            session_id="s1",
+            timestamp="2026-01-01T00:00:00Z",
+            relations=[
+                Relation(
+                    subject="speaker0",
+                    predicate="lives_in",
+                    object="berlin",
+                    relation_type="factual",
+                    speaker_id="speaker0",
+                )
+            ],
+        )
+        m.merge(s1, resolve_contradictions=False)
+
+        # Second session (later): re-assertion of the SAME fact.
+        s2 = SessionGraph(
+            session_id="s2",
+            timestamp="2026-06-01T00:00:00Z",
+            relations=[
+                Relation(
+                    subject="speaker0",
+                    predicate="lives_in",
+                    object="berlin",
+                    relation_type="factual",
+                    speaker_id="speaker0",
+                )
+            ],
+        )
+        m.merge(s2, resolve_contradictions=False)
+
+        edge_data = next(iter(m.graph["speaker0"]["berlin"].values()))
+        assert edge_data["first_seen"] == "2026-01-01T00:00:00Z", (
+            f"first_seen must stay at the earliest assertion; got {edge_data['first_seen']!r}"
+        )
+        assert edge_data["last_seen"] == "2026-06-01T00:00:00Z", (
+            f"last_seen must advance to the newest assertion; got {edge_data['last_seen']!r}"
+        )
+
     def test_reinforcements_bump_advances_bookkeeping_last_seen(self, tmp_path):
         """INVARIANT (a): when merger.reinforcements carries a newer timestamp for a
-        survivor key, bump_recurrence advances bookkeeping last_seen to that value.
+        survivor key, bump_recurrence advances bookkeeping last_seen to that value
+        (and first_seen to the collapsed min).
 
         This tests the full consolidation path: merger.reinforcements dict →
         _refine_consolidation_graph bump loop → bump_recurrence → bookkeeping.
@@ -5511,10 +5741,13 @@ class TestLastSeenFlowThroughMint:
             reinforcement_count=1,
             last_reinforced_cycle=1,
             last_seen="2026-05-01T08:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
         )
 
-        # Simulate Case-1 collapse: reinforcements carries the survivor with a newer ts.
-        loop.merger.reinforcements = {"graph10": "2026-06-25T10:00:00Z"}
+        # Simulate Case-1 collapse: reinforcements carries the survivor with a
+        # newer last_seen and an earlier first_seen (both already merged by the
+        # merger before this dict is populated).
+        loop.merger.reinforcements = {"graph10": ("2026-06-25T10:00:00Z", "2025-12-01T00:00:00Z")}
 
         recon_rel = Relation(
             subject="speaker0",
@@ -5534,6 +5767,10 @@ class TestLastSeenFlowThroughMint:
         assert bk["last_seen"] == "2026-06-25T10:00:00Z", (
             "last_seen must advance to the new session timestamp via reinforcements→bump; "
             f"got {bk['last_seen']!r}"
+        )
+        assert bk["first_seen"] == "2025-12-01T00:00:00Z", (
+            "first_seen must advance to the earlier collapsed timestamp via "
+            f"reinforcements→bump; got {bk['first_seen']!r}"
         )
 
 
@@ -5586,6 +5823,7 @@ class TestBookkeepingBasedPromotion:
             relation_type="factual",
             reinforcement_count=3,
             last_reinforced_cycle=5,
+            first_seen="",
         )
 
         newly_promoted = loop._promote_mature_keys_inline()
@@ -5611,6 +5849,7 @@ class TestBookkeepingBasedPromotion:
             relation_type="factual",
             reinforcement_count=2,  # below threshold
             last_reinforced_cycle=5,
+            first_seen="",
         )
 
         newly_promoted = loop._promote_mature_keys_inline()
@@ -5630,6 +5869,7 @@ class TestBookkeepingBasedPromotion:
             relation_type="factual",
             reinforcement_count=5,
             last_reinforced_cycle=5,
+            first_seen="",
         )
         loop.promoted_keys.add("graph30")  # already promoted
 
@@ -5649,7 +5889,8 @@ class TestBookkeepingBasedPromotion:
             speaker_id="S0",
             relation_type="factual",
             reinforcement_count=1,
-            last_reinforced_cycle=5,  # 20 - 5 = 15 >= decay_window=10
+            last_reinforced_cycle=5,
+            first_seen="",  # 20 - 5 = 15 >= decay_window=10
         )
 
         # Must NOT raise, must NOT delete the key.
@@ -5705,6 +5946,7 @@ class TestBookkeepingBasedPromotion:
                 relation_type="factual",
                 reinforcement_count=1,
                 last_reinforced_cycle=1,
+                first_seen="",
             )
 
         TestConsolidateInterimAdaptersFullFlow._run_with_mocks(
@@ -5785,6 +6027,7 @@ class TestTierFloor:
                 relation_type=relation_type,
                 reinforcement_count=1,
                 last_reinforced_cycle=1,
+                first_seen="",
             )
 
     @staticmethod
@@ -5992,6 +6235,7 @@ class TestTierFloor:
             relation_type="factual",
             reinforcement_count=5,
             last_reinforced_cycle=3,
+            first_seen="",
         )
         # Seed episodic with enough keys to avoid whole-fold accumulate.
         ep_keys = [f"ep{i}" for i in range(35)]
@@ -7086,6 +7330,7 @@ class TestTierFloor:
                 relation_type="factual",
                 reinforcement_count=3,  # promoted threshold met
                 last_reinforced_cycle=1,
+                first_seen="",
             )
         # Episodic keys.
         ep_keys = [f"e{i}" for i in range(20)]
@@ -7244,6 +7489,7 @@ class TestTierFloor:
                 relation_type="factual",
                 reinforcement_count=3,
                 last_reinforced_cycle=1,
+                first_seen="",
             )
         # Procedural keys: store-tier "episodic" (parked, no disk slot for procedural).
         self._seed_keys(loop, "episodic", proc_keys, relation_type="preference")
@@ -7518,6 +7764,7 @@ class TestTierFloor:
                 relation_type="factual",
                 reinforcement_count=3,
                 last_reinforced_cycle=1,
+                first_seen="",
             )
         self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
         self._add_edges(
@@ -7648,6 +7895,7 @@ class TestTierFloor:
                 relation_type="factual",
                 reinforcement_count=3,
                 last_reinforced_cycle=1,
+                first_seen="",
             )
         self._seed_keys(loop, "episodic", ep_keys, relation_type="factual")
         self._add_edges(
@@ -8041,7 +8289,9 @@ class TestCollectKeyedEdgesInto:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("graph1", speaker_id="spk-0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="spk-0", relation_type="factual", first_seen=""
+        )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         loop._build_all_edge_entries_into(tier_keyed)
@@ -8100,7 +8350,9 @@ class TestCollectKeyedEdgesInto:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("proc1", speaker_id="spk-0", relation_type="preference")
+        loop.store.set_bookkeeping(
+            "proc1", speaker_id="spk-0", relation_type="preference", first_seen=""
+        )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         loop._build_all_edge_entries_into(tier_keyed)
@@ -8133,7 +8385,9 @@ class TestCollectKeyedEdgesInto:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("sem1", speaker_id="spk-0", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "sem1", speaker_id="spk-0", relation_type="factual", first_seen=""
+        )
 
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         loop._build_all_edge_entries_into(tier_keyed)
@@ -8177,7 +8431,9 @@ class TestCollectKeyedEdgesInto:
             },
             register=True,
         )
-        loop.store.set_bookkeeping("graph99", speaker_id="spk-existing", relation_type="factual")
+        loop.store.set_bookkeeping(
+            "graph99", speaker_id="spk-existing", relation_type="factual", first_seen=""
+        )
 
         # (b) Keyless edge (no ik_key) with a speaker_id-bearing subject node.
         g.add_node("bob", speaker_id="spk-new", attributes={"name": "Bob"})
@@ -8272,6 +8528,7 @@ class TestBuildRegistryTrueRelationsKeysFilter:
             key,
             speaker_id=speaker_id,
             relation_type=relation_type,
+            first_seen="",
         )
 
     def test_keys_none_returns_all_active(self, tmp_path):
@@ -8328,6 +8585,52 @@ class TestBuildRegistryTrueRelationsKeysFilter:
         assert {r.indexed_key for r in default_result} == {
             r.indexed_key for r in explicit_none_result
         }, "Default call and keys=None must produce identical key sets"
+
+    def test_first_seen_round_trips_from_bookkeeping_onto_relation(self, tmp_path):
+        """first_seen flows: bookkeeping['first_seen'] -> Relation.first_seen ->
+        merged edge['first_seen'], the full registry-true re-merge path."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import SessionGraph
+
+        loop = self._make_loop(tmp_path)
+        loop.store.put(
+            "episodic",
+            "k1",
+            {
+                "key": "k1",
+                "subject": "alice",
+                "predicate": "lives_in",
+                "object": "berlin",
+                "speaker_id": "spk-0",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "k1",
+            speaker_id="spk-0",
+            relation_type="factual",
+            last_seen="2026-06-20T00:00:00Z",
+            first_seen="2026-01-01T00:00:00Z",
+        )
+
+        relations = loop._build_registry_true_relations()
+        r1 = next(r for r in relations if r.indexed_key == "k1")
+        assert r1.first_seen == "2026-01-01T00:00:00Z", (
+            f"Relation.first_seen must carry bookkeeping's first_seen; got {r1.first_seen!r}"
+        )
+
+        # Re-merge (fold's own path): registry-true relations feed into a fresh
+        # GraphMerger at fold timestamp="" (the fold sentinel).
+        merger = GraphMerger()
+        session = SessionGraph(session_id="fold", timestamp="", relations=relations)
+        graph = merger.merge(session, resolve_contradictions=False)
+        edge_data = next(iter(graph["alice"]["berlin"].values()))
+        assert edge_data["first_seen"] == "2026-01-01T00:00:00Z", (
+            f"Merged edge must carry the registry-true first_seen; got {edge_data['first_seen']!r}"
+        )
+        assert edge_data["last_seen"] == "2026-06-20T00:00:00Z", (
+            f"Merged edge must carry the registry-true last_seen; got {edge_data['last_seen']!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -8545,6 +8848,7 @@ class TestMaterializeInterimExtraRelations:
             "graph1",
             speaker_id="spk-a",
             relation_type="factual",
+            first_seen="",
         )
 
         # Build a pending extra_relation with the same SPO (no indexed_key).
@@ -9097,6 +9401,7 @@ class TestMergeRegistryRelationsUnification:
             "graph1",
             speaker_id="speaker0",
             relation_type="factual",
+            first_seen="",
         )
 
         with patch(
@@ -10816,6 +11121,53 @@ class TestRunGraphNormalizationApply:
         assert survivor[0].get("last_seen") == "2026-06-20T14:00:00Z", (
             "Survivor last_seen must be the freshest (max) across survivor + retired; "
             f"got {survivor[0].get('last_seen')!r}"
+        )
+
+    def test_provenance_first_seen_min_on_survivor(self, tmp_path):
+        """NDA-3c: first_seen on the survivor edge equals min_nonempty(survivor,
+        retired) — the earliest assertion window start, propagated alongside the
+        existing max(last_seen).
+
+        Both edges have rec=1; last_seen tiebreaker selects graph34 (newer) as
+        survivor.  graph12 (retired) has the EARLIER first_seen; the survivor's
+        first_seen must adopt that earlier value, not its own later one.
+        """
+        from unittest.mock import patch
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        self._add_keyed_edge(graph, "morgan", "germany", "born_in", "graph12", sessions=["s1"])
+        self._add_keyed_edge(graph, "morgan", "germany", "birthplace", "graph34", sessions=["s2"])
+        for _, _, edata in graph.edges(data=True):
+            if edata.get(_IK_KEY_ATTR) == "graph12":
+                edata["last_seen"] = "2026-05-01T08:00:00Z"
+                edata["first_seen"] = "2026-01-01T00:00:00Z"  # earlier
+            elif edata.get(_IK_KEY_ATTR) == "graph34":
+                edata["last_seen"] = "2026-06-20T14:00:00Z"  # tiebreak winner
+                edata["first_seen"] = "2026-04-01T00:00:00Z"  # later than graph12's
+
+        cluster_response = self._cluster_response([["born in", "birthplace"]])
+
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
+            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+        ):
+            loop._run_graph_normalization()
+
+        survivor = [
+            edata for _, _, edata in graph.edges(data=True) if edata.get(_IK_KEY_ATTR) == "graph34"
+        ]
+        assert survivor, "graph34 (newer last_seen) must survive"
+        assert survivor[0].get("first_seen") == "2026-01-01T00:00:00Z", (
+            "Survivor first_seen must be the earliest (min) across survivor + retired, "
+            f"even though graph34 (survivor) is the last_seen tiebreak winner; "
+            f"got {survivor[0].get('first_seen')!r}"
+        )
+        assert survivor[0].get("last_seen") == "2026-06-20T14:00:00Z", (
+            "last_seen must remain the max, unaffected by the first_seen propagation"
         )
 
     def test_single_predicate_group_no_model_call(self, tmp_path):
@@ -13757,6 +14109,9 @@ class TestRunFullCycleConsumePending:
             "speaker_id": speaker_id,
             "transcript": "Hello, my name is Test User.",
             "source_type": "transcript",
+            "doc_title": None,
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": "2026-01-01T00:05:00Z",
         }
 
     def _pending_fact(self, session_id: str = "sess-1", speaker_id: str = "sp-abc") -> dict:
