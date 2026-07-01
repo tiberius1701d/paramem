@@ -548,6 +548,14 @@ fmt_duration_inline() {
         echo "0s"
         return
     fi
+    # Defensive: age fields are integers by contract, but tolerate a fractional
+    # part (strip it) and refuse non-numeric input rather than crashing bash
+    # integer arithmetic below.
+    secs=${secs%.*}
+    if [[ ! "$secs" =~ ^[0-9]+$ ]]; then
+        echo "$1"
+        return
+    fi
     local s=$((secs % 60))
     local m=$((secs / 60 % 60))
     local h=$((secs / 3600 % 24))
@@ -848,8 +856,23 @@ if [[ -n "$tier_lines" ]]; then
                 ;;
         esac
     done <<< "$tier_lines"
-    # Emit in canonical training-importance order.
-    for _t in episodic semantic procedural; do
+    # Emit in recall-probe order (matches router.py::_personal_tier_order):
+    # procedural (preferences) -> newest interim (freshest facts) -> episodic
+    # -> semantic. This is the order recall actually probes; NOT training order.
+    for _t in procedural interim episodic semantic; do
+        if [[ "$_t" == "interim" ]]; then
+            (( interim_slots > 0 )) || continue
+            active_tag=""
+            if echo "$active_adapter" | grep -q "interim"; then
+                if (( interim_total > 0 )); then
+                    active_tag=" ${GREEN}(active)${RESET}"
+                else
+                    active_tag=" ${YELLOW}(active, empty)${RESET}"
+                fi
+            fi
+            echo -e "    ${DIM}interim${RESET}  ${interim_total} keys (${interim_slots} slot$([ "$interim_slots" -eq 1 ] && echo "" || echo "s"))${active_tag}"
+            continue
+        fi
         case "$_t" in
             episodic)   _c="$_ep_cnt" ;;
             semantic)   _c="$_sem_cnt" ;;
@@ -858,17 +881,16 @@ if [[ -n "$tier_lines" ]]; then
         [[ -z "$_c" ]] && continue
         active_tag=""
         if [[ "$active_adapter" == "$_t" ]]; then
-            active_tag=" ${GREEN}(active)${RESET}"
+            if (( _c > 0 )); then
+                active_tag=" ${GREEN}(active)${RESET}"
+            else
+                # Active adapter holds no keys — flag it so it isn't mistaken
+                # for the recall-serving tier (recall probes a keyed tier).
+                active_tag=" ${YELLOW}(active, empty)${RESET}"
+            fi
         fi
         echo -e "    ${DIM}${_t}${RESET}  ${_c} keys${active_tag}"
     done
-    if (( interim_slots > 0 )); then
-        active_tag=""
-        if echo "$active_adapter" | grep -q "interim"; then
-            active_tag=" ${GREEN}(active)${RESET}"
-        fi
-        echo -e "    ${DIM}interim${RESET}  ${interim_total} keys (${interim_slots} slot$([ "$interim_slots" -eq 1 ] && echo "" || echo "s"))${active_tag}"
-    fi
 elif [[ "$active_adapter" != "-" && -n "$active_adapter" ]]; then
     echo -e "  Active:   ${GREEN}${active_adapter}${RESET} (${keys_count} keys)"
 else

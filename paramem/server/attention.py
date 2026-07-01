@@ -810,7 +810,7 @@ def _collect_vram_low_headroom_items(state: dict) -> list[AttentionItem]:
     free_gib = warn.get("free_gib", 0.0)
     headroom_gib = warn.get("headroom_gib", 0.0)
     observed_at = warn.get("observed_at")
-    age = time.time() - observed_at if isinstance(observed_at, (int, float)) else None
+    age = max(0, int(time.time() - observed_at)) if isinstance(observed_at, (int, float)) else None
     return [
         AttentionItem(
             kind="vram_low_headroom",

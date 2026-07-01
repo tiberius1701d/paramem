@@ -28,6 +28,7 @@ from paramem.server.attention import (
     _collect_pre_flight_items,
     _collect_sweeper_items,
     _collect_voice_degradation_items,
+    _collect_vram_low_headroom_items,
     collect_attention_items,
 )
 
@@ -136,6 +137,29 @@ def test_age_seconds_handles_unparseable():
 def test_age_seconds_handles_empty():
     """Empty string → None."""
     assert _age_seconds_from_iso("") is None
+
+
+def test_vram_low_headroom_age_seconds_is_int():
+    """The vram_low_headroom item's age_seconds honors the int contract.
+
+    Regression: it was computed as a raw ``time.time() - observed_at`` float,
+    which violated ``AttentionItem.age_seconds: int | None`` and crashed the
+    integer-only bash arithmetic in the pstatus duration formatter.
+    """
+    import time
+
+    state = {
+        "vram_low_headroom_warning": {
+            "label": "sess-x",
+            "free_gib": 1.35,
+            "headroom_gib": 1.5,
+            "observed_at": time.time() - 7380.5,  # fractional delta
+        }
+    }
+    items = _collect_vram_low_headroom_items(state)
+    assert len(items) == 1
+    assert type(items[0].age_seconds) is int
+    assert items[0].age_seconds >= 7380
 
 
 def test_age_seconds_handles_none():
