@@ -203,7 +203,10 @@ def render_service_unit(endpoint: str, project_root: str) -> str:
         "[Service]\n"
         "Type=oneshot\n"
         f"EnvironmentFile=-{project_root}/.env\n"
-        'ExecStart=/bin/sh -c \'printf "%s" "Authorization: Bearer $PARAMEM_API_TOKEN"'
+        # ``%%s`` escapes systemd's ``%s`` specifier (= the user's login shell,
+        # e.g. ``/bin/bash``); systemd expands ``%%s`` -> literal ``%s`` in the
+        # rendered unit so ``sh``/``printf`` receives the intended format string.
+        'ExecStart=/bin/sh -c \'printf "%%s" "Authorization: Bearer $PARAMEM_API_TOKEN"'
         f" | /usr/bin/curl -sS --fail-with-body -X POST --max-time 10 -H @- {endpoint}'\n"
     )
 

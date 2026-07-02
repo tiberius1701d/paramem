@@ -291,6 +291,33 @@ class TestRenderServiceUnitAuth:
             "Service unit must include EnvironmentFile to source PARAMEM_API_TOKEN"
         )
 
+    def test_printf_format_survives_systemd_specifier_expansion(self):
+        """The printf format must reach the shell as a literal ``%s``.
+
+        systemd expands ``%`` specifiers in ExecStart before invoking the shell:
+        ``%s`` is the user's login shell (e.g. ``/bin/bash``) and ``%%`` is a
+        literal ``%``.  A bare ``printf "%s"`` therefore becomes
+        ``printf "/bin/bash"`` at runtime, which emits ``/bin/bash`` as the
+        Authorization header value and makes every tick fail with HTTP 401.  The
+        render must escape the format as ``%%s`` so the shell receives ``%s``.
+        """
+        text = self._render()
+        execstart = next(ln for ln in text.splitlines() if ln.startswith("ExecStart="))
+
+        # Emulate systemd's ExecStart specifier expansion for the two specifiers
+        # that matter here: ``%%`` -> ``%`` and ``%s`` -> the user's shell.
+        sentinel = "\x00"
+        expanded = execstart.replace("%%", sentinel).replace("%s", "/bin/bash")
+        expanded = expanded.replace(sentinel, "%")
+
+        assert 'printf "%s"' in expanded, (
+            "After systemd specifier expansion the shell must receive "
+            f'printf "%s"; got: {expanded!r}'
+        )
+        assert 'printf "/bin/bash"' not in expanded, (
+            "Bare %s leaked as the user's shell into printf — escape it as %%s"
+        )
+
 
 class TestReconcileProjectRoot:
     """Verify project_root is threaded through reconcile() into the service unit."""
