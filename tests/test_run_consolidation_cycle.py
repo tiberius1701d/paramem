@@ -1499,3 +1499,312 @@ class TestRecallFailedSessionStaysPending:
         assert recall_incidents[0].status == "resolved", (
             "Incident must be resolved when clean cycle runs"
         )
+
+
+# ---------------------------------------------------------------------------
+# Interim-tick epoch-level crash-resume (fold_resume.json for scope="interim_slot")
+# ---------------------------------------------------------------------------
+
+
+class TestInterimFoldResume:
+    """Interim-tick crash-resume: the fold_resume.json marker persists the REAL
+    train_assignment + pending-session scope (mirrors the main_tiers resume
+    plumbing in TestFoldResumeHelpers, tests/test_consolidation.py), is read
+    back on re-entry, and restores the persisted training set (skipping
+    re-extraction) only when the pending-session scope is unchanged.
+    """
+
+    @staticmethod
+    def _persisted_entry(
+        key: str, subject: str, predicate: str, obj: str, speaker_id: str, tier: str
+    ) -> dict:
+        """Build one enriched persisted train_assignment entry (a "new" key)."""
+        return {
+            "key": key,
+            "subject": subject,
+            "predicate": predicate,
+            "object": obj,
+            "speaker_id": speaker_id,
+            "tier": tier,
+            "relation_type": "factual" if tier == "episodic" else "preference",
+            "session_ids": ["sess-1"],
+            "last_seen": "2026-07-01T00:00:00+00:00",
+            "first_seen": "2026-07-01T00:00:00+00:00",
+        }
+
+    def test_resume_restores_persisted_assignment_without_reextraction(
+        self, tmp_path: Path
+    ) -> None:
+        """Matching marker (same fold_stamp + same pending-session scope):
+
+        - training receives the persisted entries verbatim (same content, same
+          order) — the resumed dataset fingerprints identically to the
+          pre-crash one;
+        - _materialize_consolidation_graph / _build_all_edge_entries_into /
+          _capture_pending_relations are never invoked (no re-extraction);
+        - the newly-minted keys still commit to the store post-training (the
+          deferred-write metadata — relation_type/last_seen/first_seen —
+          round-trips through the marker).
+        """
+        loop = _make_mock_loop(tmp_path)
+        stamp = "20260701T0000"
+        adapter_name = f"episodic_interim_{stamp}"
+
+        fold_stamp = loop._compute_fold_stamp(tier=adapter_name)
+        persisted_entries = [
+            self._persisted_entry("graph10", "Alice", "likes", "cats", "speaker1", "episodic"),
+            self._persisted_entry("proc5", "Bob", "prefers", "coffee", "speaker2", "procedural"),
+        ]
+        loop._persist_fold_assignment(
+            "interim_slot",
+            fold_stamp,
+            {adapter_name: persisted_entries},
+            {adapter_name: "deadbeef"},
+            pending_session_ids=["sess-1"],
+        )
+
+        trained_entries_calls: list[list[dict]] = []
+
+        def _spy_train(_self, entries, *, adapter_name, **kwargs):
+            trained_entries_calls.append(list(entries))
+            return {"aborted": False}, None
+
+        def _forbid_materialize(**kw):
+            raise AssertionError("_materialize_consolidation_graph must not run on resume")
+
+        def _forbid_build_entries(*a, **kw):
+            raise AssertionError("_build_all_edge_entries_into must not run on resume")
+
+        def _forbid_capture_pending():
+            raise AssertionError("_capture_pending_relations must not run on resume")
+
+        loop._materialize_consolidation_graph = _forbid_materialize
+        loop._build_all_edge_entries_into = _forbid_build_entries
+        loop._capture_pending_relations = _forbid_capture_pending
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        with (
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=lambda m, cfg, s: m,
+            ),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.memory.persistence.commit_tier_slot"),
+            patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train),
+        ):
+            result = loop.run_consolidation_cycle(
+                [
+                    {
+                        "subject": "Alice",
+                        "predicate": "likes",
+                        "object": "cats",
+                        "session_id": "sess-1",
+                    }
+                ],
+                [
+                    {
+                        "subject": "Bob",
+                        "predicate": "prefers",
+                        "object": "coffee",
+                        "session_id": "sess-1",
+                    }
+                ],
+                speaker_id="speaker1",
+                mode="train",
+                run_label="tick-resume",
+                stamp=stamp,
+            )
+
+        assert result["mode"] == "trained"
+        assert len(trained_entries_calls) == 1, (
+            f"_train_tier_adapter must be called exactly once; got {trained_entries_calls}"
+        )
+        got = trained_entries_calls[0]
+        want = [
+            {k: e[k] for k in ("key", "subject", "predicate", "object", "speaker_id")}
+            for e in persisted_entries
+        ]
+        assert got == want, (
+            f"resumed training set must match the persisted assignment verbatim"
+            f" (same content, same order); got={got} want={want}"
+        )
+        # Newly-minted keys committed to the store post-training — proves the
+        # deferred-write metadata (relation_type/last_seen/first_seen) round-
+        # tripped correctly through the marker's enrichment.
+        assert loop.store.get("graph10") is not None
+        assert loop.store.get("proc5") is not None
+        assert sorted(result["new_keys"]) == ["graph10", "proc5"]
+        # Bookkeeping temporal fields must be the FIXTURE's real timestamp, not
+        # a silently-dropped "" default — both sides of the round trip use
+        # .get(..., "") so a dropped field would pass as "" == "" undetected;
+        # asserting the actual non-empty fixture value closes that gap.
+        for _key in ("graph10", "proc5"):
+            _bk = loop.store.bookkeeping_for_key(_key)
+            assert _bk is not None
+            assert _bk["last_seen"] == "2026-07-01T00:00:00+00:00", (
+                f"{_key}: last_seen must round-trip through the marker; got {_bk['last_seen']!r}"
+            )
+            assert _bk["first_seen"] == "2026-07-01T00:00:00+00:00", (
+                f"{_key}: first_seen must round-trip through the marker; got {_bk['first_seen']!r}"
+            )
+        # Resume path leaves the marker untouched until commit; a clean commit
+        # clears it (see TestInterimFoldResume.test_clean_commit_clears_marker
+        # for the dedicated regression coverage of that step).
+        assert not (loop._fold_state_dir / "fold_resume.json").exists()
+
+    def test_scope_change_clears_marker_and_takes_fresh_path(self, tmp_path: Path) -> None:
+        """Marker present but the pending-session set differs from the marker's:
+
+        the marker is discarded and the fresh-derivation path runs — the stale
+        (poisoned) persisted entries must NEVER reach training.
+        """
+        loop = _make_mock_loop(tmp_path)
+        stamp = "20260701T0000"
+        adapter_name = f"episodic_interim_{stamp}"
+
+        # fold_stamp matches (empty active keyset for a brand-new slot, same
+        # value the fresh cycle below will compute) — isolates the test to the
+        # pending-session-scope dimension specifically.
+        fold_stamp = loop._compute_fold_stamp(tier=adapter_name)
+        stale_entry = self._persisted_entry(
+            "STALE", "Ghost", "haunts", "attic", "speakerX", "episodic"
+        )
+        loop._persist_fold_assignment(
+            "interim_slot",
+            fold_stamp,
+            {adapter_name: [stale_entry]},
+            {adapter_name: "stalefp"},
+            pending_session_ids=["sess-OLD"],
+        )
+        marker_path = loop._fold_state_dir / "fold_resume.json"
+        assert marker_path.exists()
+
+        trained_entries_calls: list[list[dict]] = []
+
+        def _spy_train(_self, entries, *, adapter_name, **kwargs):
+            trained_entries_calls.append(list(entries))
+            return {"aborted": False}, None
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        with (
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=lambda m, cfg, s: m,
+            ),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.memory.persistence.commit_tier_slot"),
+            patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=lambda a, e: {x["key"] for x in e},
+            ),
+        ):
+            loop.run_consolidation_cycle(
+                # Different session id than the marker's ["sess-OLD"] — the
+                # pending-session scope has changed.
+                [
+                    {
+                        "subject": "Subject1",
+                        "predicate": "knows",
+                        "object": "Object1",
+                        "session_id": "sess-NEW",
+                    }
+                ],
+                [],
+                speaker_id="speaker1",
+                mode="train",
+                run_label="tick-fresh",
+                stamp=stamp,
+            )
+
+        all_trained_keys = [e["key"] for batch in trained_entries_calls for e in batch]
+        assert "STALE" not in all_trained_keys, (
+            "Stale (scope-mismatched) marker entries must NEVER reach training;"
+            f" all_trained_keys={all_trained_keys}"
+        )
+        # The fresh path derives its training set from merger.graph (populated
+        # by _make_mock_loop with two real keyless "knows" edges), not from the
+        # discarded marker.
+        assert all_trained_keys, "fresh-derivation path must still train on the real graph content"
+
+    def test_clean_commit_clears_marker(self, tmp_path: Path) -> None:
+        """A clean (fresh, non-resumed) interim commit writes a REAL marker
+        during the cycle (dataset_fingerprint populated, not the pre-fix `{}`)
+        and clears it on successful commit — regression coverage for the
+        existing clear-on-success behavior plus the fingerprint fix.
+        """
+        loop = _make_mock_loop(tmp_path)
+        stamp = "20260701T0100"
+        adapter_name = f"episodic_interim_{stamp}"
+        marker_path = loop._fold_state_dir / "fold_resume.json"
+        assert not marker_path.exists()
+
+        persist_calls: list[tuple] = []
+        _orig_persist = loop._persist_fold_assignment
+
+        def _spy_persist(scope_name, fold_stamp, train_assignment, dataset_fingerprints, **kw):
+            persist_calls.append(
+                (scope_name, fold_stamp, train_assignment, dataset_fingerprints, kw)
+            )
+            return _orig_persist(
+                scope_name, fold_stamp, train_assignment, dataset_fingerprints, **kw
+            )
+
+        loop._persist_fold_assignment = _spy_persist
+
+        from paramem.training.consolidation import ConsolidationLoop
+
+        with (
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=lambda m, cfg, s: m,
+            ),
+            patch("paramem.models.loader.switch_adapter"),
+            patch("paramem.memory.persistence.commit_tier_slot"),
+            patch(
+                "paramem.training.trainer.train_adapter",
+                return_value={"aborted": False},
+            ),
+            patch("paramem.training.consolidation.format_entry_training", return_value=[{}]),
+            patch.object(loop, "_indexed_dataset", return_value=MagicMock()),
+            patch.object(loop, "_make_training_config", return_value=MagicMock()),
+            patch.object(loop, "_disable_gradient_checkpointing"),
+            patch.object(loop, "_enable_gradient_checkpointing"),
+            patch.object(
+                ConsolidationLoop,
+                "_probe_passing_keys",
+                side_effect=lambda a, e: {x["key"] for x in e},
+            ),
+        ):
+            result = loop.run_consolidation_cycle(
+                [
+                    {
+                        "subject": "Subject1",
+                        "predicate": "knows",
+                        "object": "Object1",
+                        "session_id": "sess-clean",
+                    }
+                ],
+                [],
+                speaker_id="speaker1",
+                mode="train",
+                run_label="tick-clean",
+                stamp=stamp,
+            )
+
+        assert result["mode"] == "trained"
+        assert len(persist_calls) == 1, f"expected exactly one persist call; got {persist_calls}"
+        _scope_name, _fold_stamp, _train_assignment, _dataset_fingerprints, _kw = persist_calls[0]
+        assert _scope_name == "interim_slot"
+        assert adapter_name in _train_assignment
+        assert _train_assignment[adapter_name], "persisted assignment must not be empty"
+        # The fingerprint bug fix: dataset_fingerprints must be REAL (non-empty),
+        # not the pre-fix literal `{}`.
+        assert _dataset_fingerprints, "dataset_fingerprints must be populated, not {}"
+        assert adapter_name in _dataset_fingerprints
+        assert _kw.get("pending_session_ids") == ["sess-clean"]
+        # A clean commit clears the marker.
+        assert not marker_path.exists(), "fold_resume.json must be cleared on a clean commit"

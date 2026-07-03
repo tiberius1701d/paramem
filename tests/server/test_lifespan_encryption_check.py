@@ -160,6 +160,28 @@ class TestLifespanSecurityPosture:
         source = inspect.getsource(app_module.lifespan)
         assert '_state["encryption"]' in source
 
+    def test_lifespan_purges_partial_checkpoints_before_mode_consistency(self) -> None:
+        """Boot-time reconciliation must run before assert_mode_consistency.
+
+        A crash mid-checkpoint-save leaves plaintext files inside a partial
+        checkpoint-*/ dir that would otherwise trip _assert_mode's
+        mixed-state refusal. purge_partial_checkpoints must be invoked
+        strictly earlier in source order so the debris is cleared first.
+        """
+        from paramem.server import app as app_module
+
+        source = inspect.getsource(app_module.lifespan)
+        assert "purge_partial_checkpoints(" in source, (
+            "lifespan must call purge_partial_checkpoints to reconcile "
+            "mid-crash checkpoint debris before the mode-consistency gate"
+        )
+        purge_idx = source.index("purge_partial_checkpoints(")
+        assert_mode_idx = source.index("_assert_mode(")
+        assert purge_idx < assert_mode_idx, (
+            "purge_partial_checkpoints must run before _assert_mode — "
+            "otherwise a crash-interrupted checkpoint save bricks boot"
+        )
+
     def test_status_response_surfaces_encryption(self) -> None:
         """StatusResponse must carry an ``encryption`` field and the /status
         handler must populate it from ``_state['encryption']`` — otherwise

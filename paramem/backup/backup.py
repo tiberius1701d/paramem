@@ -479,7 +479,7 @@ _BUNDLE_EXCLUDED_DEFAULTS = [
 
 # Files inside an adapter slot that are always excluded from bundles — these are
 # transient training scaffolding that must not be captured.
-_ADAPTER_EXCLUDED_PATTERNS = frozenset({"resume_state.json", "in_training", "bg_checkpoint"})
+_ADAPTER_EXCLUDED_PATTERNS = frozenset({"staging_resume.json", "in_training", "bg_checkpoint"})
 # Subdirectory prefixes that are transient scaffolding.
 _ADAPTER_EXCLUDED_DIR_PREFIXES = ("checkpoint-", "in_training", "bg_checkpoint")
 
@@ -588,7 +588,7 @@ def write_bundle(
       rollback; **never restored** by ``restore_bundle`` (the
       ``startswith("config/")`` filter excludes it by construction).
     - Excluded: ``graph.json`` (RAM-only), ``checkpoint-*/``, ``in_training/``,
-      ``bg_checkpoint/``, ``resume_state.json`` (training scaffolding),
+      ``bg_checkpoint/``, ``staging_resume.json`` (training scaffolding),
       ``keyed_pairs.json`` (transient; regenerated from graph).
 
     Per-slot hashes: each captured adapter entry records the slot's **own**
@@ -765,7 +765,7 @@ def write_bundle(
     # --- helper: capture one adapter slot (main or interim) ---
     # _WEIGHT_FILES lists the three durable files in every slot directory.
     # Training scaffolding (checkpoint-*/, in_training/, bg_checkpoint/,
-    # resume_state.json) is never copied: we only copy the named files below,
+    # staging_resume.json) is never copied: we only copy the named files below,
     # so scaffolding is excluded structurally.  _ADAPTER_EXCLUDED_PATTERNS and
     # _ADAPTER_EXCLUDED_DIR_PREFIXES document the exclusion contract explicitly.
     _WEIGHT_FILES = ("adapter_model.safetensors", "adapter_config.json", "meta.json")

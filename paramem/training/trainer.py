@@ -509,6 +509,117 @@ def _clean_scratch(output_dir: Path, ram_dir: Optional[Path]) -> None:
         logger.debug("Cleaned RAM checkpoint dir: %s", ram_dir)
 
 
+def purge_partial_checkpoints(adapters_root: Path) -> list[Path]:
+    """Delete every ``checkpoint-*/`` dir under *adapters_root* left mid-crash.
+
+    A completed :func:`~paramem.backup.checkpoint_shard.encrypt_checkpoint_dir`
+    pass (fired from ``EncryptCheckpointCallback.on_save``,
+    ``encrypted_checkpoint_callback.py:54-69``) rewrites every file in a
+    ``checkpoint-*/`` tree as an age envelope. Therefore a ``checkpoint-*/``
+    dir containing any plaintext file proves its save was interrupted
+    mid-crash — it is unreferenced garbage (see the publish-after-encrypt
+    ordering invariant: a checkpoint is recorded in ``staging_resume.json``
+    only after ``on_save`` has fully encrypted it).
+
+    Covers both checkpoint layouts:
+
+    - Disk mode (default, ``save_steps_ram == 0``): HF Trainer writes
+      ``<slot>/checkpoint-N/`` directly under ``output_dir``, and
+      ``EncryptCheckpointCallback.on_save`` encrypts it via a **non-recursive**
+      ``output_dir.glob("checkpoint-*")`` (``encrypted_checkpoint_callback.py:61``).
+    - RAM mode (``save_steps_ram > 0``): HF Trainer's ``args.output_dir`` is
+      the ``/dev/shm`` RAM dir itself, so that same non-recursive glob
+      encrypts ``<ram_dir>/checkpoint-N/`` in place on every ``on_save``.
+      ``_RamEpochCopyCallback.on_epoch_end`` then ``copytree``s whichever
+      ``checkpoint-N`` is newest in the RAM dir to
+      ``<slot>/bg_checkpoint_epoch/checkpoint-N/`` — since ``on_save`` fires
+      within the step, strictly before the later ``on_epoch_end`` event, the
+      RAM-dir source is already fully encrypted by the time it is copied, so
+      the on-disk mirror inherits age-wrapped content even though nothing
+      ever re-globs into ``bg_checkpoint_epoch/`` directly. (Do not "fix" the
+      non-recursive glob at ``encrypted_checkpoint_callback.py:61`` to also
+      walk ``bg_checkpoint_epoch/`` — it is unnecessary and would double
+      -encrypt an already-encrypted mirror.)
+
+    Self-gated: no-op (returns ``[]``, deletes nothing) when the daily age
+    identity is not loadable (Security OFF), via
+    :func:`paramem.backup.checkpoint_shard._security_on` — under Security
+    OFF, checkpoint files are legitimately plaintext and purging them would
+    destroy a valid crash-resume checkpoint for no privacy benefit.
+
+    After purging, clears any ``staging_resume.json`` pointer
+    (``disk_checkpoint_path`` or ``ram_checkpoint_path``) that resolves
+    inside a purged dir, via the existing :func:`_read_staging_resume` /
+    :func:`_write_staging_resume` round-trip — this makes "nothing
+    references a purged dir" reconciliation-enforced rather than merely
+    inferred from callback ordering. Fully-encrypted checkpoints,
+    ``fold_resume.json``, and durable slot files are left untouched.
+
+    Args:
+        adapters_root: The ``<data>/adapters`` root to scan (same root
+            :func:`paramem.backup.encryption.infra_paths` rglobs for
+            ``adapter_model.safetensors`` and ``staging_resume.json``).
+
+    Returns:
+        The list of purged ``checkpoint-*/`` directory paths (for logging).
+    """
+    from paramem.backup.checkpoint_shard import _security_on
+
+    if not _security_on():
+        return []
+
+    from paramem.backup.age_envelope import is_age_envelope
+
+    adapters_root = Path(adapters_root)
+    purged: list[Path] = []
+    for ckpt_dir in adapters_root.rglob("checkpoint-*"):
+        if not ckpt_dir.is_dir():
+            continue
+        files = [f for f in ckpt_dir.rglob("*") if f.is_file()]
+        plaintext_files = [f for f in files if not is_age_envelope(f)]
+        if not plaintext_files:
+            continue
+        logger.warning(
+            "Purging partial checkpoint dir %s (%d plaintext file(s) of %d total) "
+            "— interrupted mid-crash save",
+            ckpt_dir,
+            len(plaintext_files),
+            len(files),
+        )
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
+        purged.append(ckpt_dir)
+
+    if not purged:
+        return purged
+
+    purged_resolved = [p.resolve() for p in purged]
+    for resume_path in adapters_root.rglob("staging_resume.json"):
+        state = _read_staging_resume(resume_path)
+        if state is None:
+            continue
+        changed = False
+        for field_name in ("disk_checkpoint_path", "ram_checkpoint_path"):
+            ckpt = state.get(field_name, "")
+            if not ckpt:
+                continue
+            ckpt_resolved = Path(ckpt).resolve()
+            if ckpt_resolved in purged_resolved or any(
+                p in ckpt_resolved.parents for p in purged_resolved
+            ):
+                logger.warning(
+                    "Clearing dangling %s pointer in %s (%s resolved into a purged checkpoint dir)",
+                    field_name,
+                    resume_path,
+                    ckpt,
+                )
+                state[field_name] = ""
+                changed = True
+        if changed:
+            _write_staging_resume(resume_path, state)
+
+    return purged
+
+
 class _StagingResumeCallback(TrainerCallback):
     """Update ``staging_resume.json`` at every HF Trainer checkpoint save.
 
@@ -935,6 +1046,11 @@ def train_adapter(
     if _use_staging and _scratch_state:
         # Install the staging resume callback AFTER _RamEpochCopyCallback so
         # the epoch-mirror copy is already written when we record its path.
+        # Also: EncryptCheckpointCallback (seeded first, above) must be
+        # registered before _StagingResumeCallback — a checkpoint pointer is
+        # recorded only after the referenced dir is fully encrypted.
+        # purge_partial_checkpoints' safety proof (referenced ⟹ encrypted ⟹
+        # never purged) rests on this order.
         callbacks.append(
             _StagingResumeCallback(
                 scratch_path=scratch_path,

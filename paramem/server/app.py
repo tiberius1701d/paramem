@@ -1905,6 +1905,23 @@ async def lifespan(app: FastAPI):
         require_encryption=config.security.require_encryption,
         daily_loadable=_daily_ok,
     )
+    # Boot-time reconciliation: a crash mid-checkpoint-save leaves plaintext
+    # files inside a partial checkpoint-*/ dir while durable stores are
+    # age-encrypted, which would otherwise trip _assert_mode's mixed-state
+    # refusal below. Purge those partial dirs (and any dangling
+    # staging_resume.json pointer into them) before the gate runs. Gated on
+    # _daily_ok (belt-and-suspenders — purge_partial_checkpoints self-gates
+    # too via _security_on()).
+    if _daily_ok:
+        from paramem.training.trainer import purge_partial_checkpoints
+
+        _purged = purge_partial_checkpoints(Path(config.paths.data) / "adapters")
+        if _purged:
+            logger.warning(
+                "Boot reconciliation purged %d partial checkpoint dir(s): %s",
+                len(_purged),
+                ", ".join(str(p) for p in _purged),
+            )
     _assert_mode(
         config.paths.data,
         daily_identity_loadable=_daily_ok,
@@ -3218,7 +3235,7 @@ async def _run_chat_turn(
     )
 
     # Training was aborted (not paused) — the next job submission will resume
-    # from the checkpoint automatically via the resume_state.json path.
+    # from the checkpoint automatically via the staging_resume.json path.
 
     spoken_text = f"{greeting_prefix}{response_text}" if greeting_prefix else response_text
     return result, spoken_text

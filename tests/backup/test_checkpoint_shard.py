@@ -386,3 +386,275 @@ class TestAgeEnvelopeCompatibility:
         for entry in ckpt.iterdir():
             if entry.is_file():
                 assert entry.read_bytes() == contents[entry.name]
+
+
+# ---------------------------------------------------------------------------
+# purge_partial_checkpoints — boot-time reconciliation of crash-interrupted
+# checkpoint saves (paramem.training.trainer).
+# ---------------------------------------------------------------------------
+
+
+class TestPurgePartialCheckpoints:
+    """Boot-time reconciliation of mid-crash checkpoint debris.
+
+    A completed ``EncryptCheckpointCallback.on_save`` (via
+    ``encrypt_checkpoint_dir``) leaves every file in a ``checkpoint-*/`` tree
+    age-encrypted, so any plaintext file inside one proves the save was
+    interrupted mid-crash. ``purge_partial_checkpoints`` deletes those dirs
+    and clears any dangling ``staging_resume.json`` pointer into them.
+    """
+
+    def _base_state(self, **overrides) -> dict:
+        state = {
+            "adapter_name": "episodic",
+            "dataset_fingerprint": "aabbccdd" * 8,
+            "training_config_fingerprint": "11223344" * 8,
+            "ram_checkpoint_path": "",
+            "disk_checkpoint_path": "",
+            "started_at": "2026-07-03T00:00:00+00:00",
+            "updated_at": "2026-07-03T00:00:00+00:00",
+        }
+        state.update(overrides)
+        return state
+
+    def test_partial_checkpoint_purged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd, caplog
+    ) -> None:
+        """A checkpoint-*/ dir with a plaintext file among age siblings is purged.
+
+        Checks both ``capfd.err`` and ``caplog.records`` so the assertion is
+        robust across pytest log-capture variants (local stderr vs CI capture),
+        mirroring ``test_shm_fallback_when_dev_shm_unavailable`` above.
+        """
+        import logging
+
+        from paramem.training.trainer import purge_partial_checkpoints
+
+        _setup_daily_identity(tmp_path, monkeypatch)
+        adapters_root = tmp_path / "adapters"
+        ckpt = adapters_root / "episodic" / "interim_20260703T1200" / "checkpoint-14"
+        contents = _seed_checkpoint(ckpt)
+        # Encrypt some but not all files — mixed state (mid-encrypt crash).
+        from paramem.backup.encryption import write_infra_bytes
+
+        write_infra_bytes(ckpt / "adapter_config.json", (ckpt / "adapter_config.json").read_bytes())
+
+        caplog.set_level(logging.WARNING)
+        purged = purge_partial_checkpoints(adapters_root)
+
+        assert purged == [ckpt]
+        assert not ckpt.exists()
+        log_text = capfd.readouterr().err + "\n".join(r.getMessage() for r in caplog.records)
+        assert "Purging partial checkpoint" in log_text
+        # Sanity: seeded contents existed before the purge (precondition proof).
+        assert len(contents) == 8
+
+    def test_partial_checkpoint_purged_nested_per_adapter_subdir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real live-debris shape: HF writes every co-resident PeftModel
+        adapter into its own subdirectory of the checkpoint dir
+        (``checkpoint-N/<adapter_name>/adapter_model.safetensors``), not a
+        flat layout. A plaintext file nested one level deeper than
+        ``_seed_checkpoint`` produces must still mark the whole
+        ``checkpoint-N`` dir partial and purge it."""
+        from paramem.training.trainer import purge_partial_checkpoints
+
+        _setup_daily_identity(tmp_path, monkeypatch)
+        adapters_root = tmp_path / "adapters"
+        ckpt = adapters_root / "episodic" / "interim_20260703T1200" / "checkpoint-14"
+        for adapter_name in ("episodic_interim_20260702T1200", "episodic_interim_20260703T0000"):
+            adapter_dir = ckpt / adapter_name
+            adapter_dir.mkdir(parents=True)
+            (adapter_dir / "adapter_model.safetensors").write_bytes(
+                b"\x00\x01safetensors-stub" + os.urandom(256)
+            )
+            (adapter_dir / "adapter_config.json").write_bytes(b'{"r": 8, "alpha": 16}')
+            (adapter_dir / "README.md").write_bytes(b"# Checkpoint\n")
+
+        purged = purge_partial_checkpoints(adapters_root)
+
+        assert purged == [ckpt]
+        assert not ckpt.exists()
+
+    def test_complete_checkpoint_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fully age-encrypted checkpoint-*/ dir survives and is not returned."""
+        from paramem.training.trainer import purge_partial_checkpoints
+
+        _setup_daily_identity(tmp_path, monkeypatch)
+        adapters_root = tmp_path / "adapters"
+        ckpt = adapters_root / "episodic" / "interim_20260703T1200" / "checkpoint-14"
+        _seed_checkpoint(ckpt)
+        encrypt_checkpoint_dir(ckpt)
+
+        purged = purge_partial_checkpoints(adapters_root)
+
+        assert purged == []
+        assert ckpt.is_dir()
+        for entry in ckpt.iterdir():
+            if entry.is_file():
+                assert is_age_envelope(entry)
+
+    def test_durable_plaintext_not_purged_but_still_trips_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A plaintext file with no checkpoint-* path component is untouched by
+        purge, and still fails assert_mode_consistency via the MIXED age/plaintext
+        branch (encryption.py:419) — the branch this whole change is motivated
+        by (a genuinely inconsistent durable store must still hard-fail, only
+        checkpoint-scratch plaintext should ever be silently reconciled)."""
+        from paramem.backup.encryption import assert_mode_consistency, write_infra_bytes
+        from paramem.backup.types import FatalConfigError
+        from paramem.training.trainer import purge_partial_checkpoints
+
+        _setup_daily_identity(tmp_path, monkeypatch)
+        data_dir = tmp_path / "data"
+        adapters_root = data_dir / "adapters"
+        durable_slot = adapters_root / "episodic" / "20260703-000000"
+        durable_slot.mkdir(parents=True)
+        durable_file = durable_slot / "adapter_model.safetensors"
+        durable_file.write_bytes(b"\x00\x01plaintext-safetensors")
+
+        # A second, age-encrypted durable file (fixed infra_paths candidate,
+        # not scratch) so the store is genuinely mixed on disk, not merely
+        # plaintext-while-daily-loaded.
+        semantic_graph = adapters_root / "semantic" / "graph.json"
+        semantic_graph.parent.mkdir(parents=True)
+        write_infra_bytes(semantic_graph, b'{"nodes": [], "edges": []}')
+        assert is_age_envelope(semantic_graph)
+
+        purged = purge_partial_checkpoints(adapters_root)
+
+        assert purged == []
+        assert durable_file.exists()
+        assert not is_age_envelope(durable_file)
+        assert is_age_envelope(semantic_graph)
+        with pytest.raises(FatalConfigError) as exc_info:
+            assert_mode_consistency(data_dir, daily_identity_loadable=True)
+        assert "Mixed encryption state" in str(exc_info.value), (
+            f"expected the mixed age/plaintext branch (encryption.py:419-438), "
+            f"got: {exc_info.value}"
+        )
+
+    def test_pointer_clear_disk_checkpoint_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """staging_resume.json's disk_checkpoint_path into a purged dir is cleared."""
+        from paramem.training.trainer import (
+            _read_staging_resume,
+            _write_staging_resume,
+            purge_partial_checkpoints,
+        )
+
+        _setup_daily_identity(tmp_path, monkeypatch)
+        adapters_root = tmp_path / "adapters"
+        slot = adapters_root / "episodic" / "interim_20260703T1200"
+        ckpt = slot / "checkpoint-14"
+        _seed_checkpoint(ckpt)
+
+        resume_path = slot / "staging_resume.json"
+        state = self._base_state(disk_checkpoint_path=str(ckpt))
+        _write_staging_resume(resume_path, state)
+        assert is_age_envelope(resume_path)
+
+        purge_partial_checkpoints(adapters_root)
+
+        assert not ckpt.exists()
+        reread = _read_staging_resume(resume_path)
+        assert reread["disk_checkpoint_path"] == ""
+        assert reread["ram_checkpoint_path"] == ""
+        assert reread["adapter_name"] == "episodic"
+        assert reread["dataset_fingerprint"] == state["dataset_fingerprint"]
+        assert is_age_envelope(resume_path)
+
+    def test_pointer_clear_ram_checkpoint_path_nested_bg_mirror(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ram_checkpoint_path nested at <slot>/bg_checkpoint_epoch/checkpoint-N
+        is cleared even though the marker lives at the enclosing <slot>/ root
+        (no enclosing-directory proximity matching — resolves by path
+        containment)."""
+        from paramem.training.trainer import (
+            _read_staging_resume,
+            _write_staging_resume,
+            purge_partial_checkpoints,
+        )
+
+        _setup_daily_identity(tmp_path, monkeypatch)
+        adapters_root = tmp_path / "adapters"
+        slot = adapters_root / "episodic" / "interim_20260703T1200"
+        ckpt = slot / "bg_checkpoint_epoch" / "checkpoint-9"
+        _seed_checkpoint(ckpt)
+
+        resume_path = slot / "staging_resume.json"
+        state = self._base_state(ram_checkpoint_path=str(ckpt))
+        _write_staging_resume(resume_path, state)
+
+        purged = purge_partial_checkpoints(adapters_root)
+
+        assert purged == [ckpt]
+        assert not ckpt.exists()
+        reread = _read_staging_resume(resume_path)
+        assert reread["ram_checkpoint_path"] == ""
+        assert reread["disk_checkpoint_path"] == ""
+
+    def test_pointer_not_cleared_for_surviving_complete_checkpoint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A pointer resolving to a complete (surviving) checkpoint elsewhere is
+        left untouched even when purging occurs for an unrelated slot."""
+        from paramem.training.trainer import (
+            _read_staging_resume,
+            _write_staging_resume,
+            purge_partial_checkpoints,
+        )
+
+        _setup_daily_identity(tmp_path, monkeypatch)
+        adapters_root = tmp_path / "adapters"
+
+        # Slot A: partial checkpoint that will be purged.
+        slot_a = adapters_root / "episodic" / "interim_20260703T1200"
+        partial_ckpt = slot_a / "checkpoint-14"
+        _seed_checkpoint(partial_ckpt)
+
+        # Slot B: complete checkpoint, pointer must survive untouched.
+        slot_b = adapters_root / "semantic" / "interim_20260703T1200"
+        complete_ckpt = slot_b / "checkpoint-10"
+        _seed_checkpoint(complete_ckpt)
+        encrypt_checkpoint_dir(complete_ckpt)
+
+        resume_path_b = slot_b / "staging_resume.json"
+        state_b = self._base_state(disk_checkpoint_path=str(complete_ckpt))
+        _write_staging_resume(resume_path_b, state_b)
+
+        purged = purge_partial_checkpoints(adapters_root)
+
+        assert purged == [partial_ckpt]
+        assert complete_ckpt.is_dir()
+        reread_b = _read_staging_resume(resume_path_b)
+        assert reread_b["disk_checkpoint_path"] == str(complete_ckpt)
+
+    def test_security_off_returns_empty_and_purges_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No loadable daily key → self-gate returns [] and leaves plaintext
+        checkpoints untouched, even though they would otherwise be flagged
+        partial."""
+        from paramem.training.trainer import purge_partial_checkpoints
+
+        monkeypatch.setattr(
+            "paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT", tmp_path / "absent.age"
+        )
+        monkeypatch.delenv(DAILY_PASSPHRASE_ENV_VAR, raising=False)
+
+        adapters_root = tmp_path / "adapters"
+        ckpt = adapters_root / "episodic" / "interim_20260703T1200" / "checkpoint-14"
+        _seed_checkpoint(ckpt)
+
+        purged = purge_partial_checkpoints(adapters_root)
+
+        assert purged == []
+        assert ckpt.is_dir()
+        assert list(ckpt.iterdir())

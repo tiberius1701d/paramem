@@ -5,6 +5,7 @@ merge into cumulative graph, score for promotion/decay, train
 episodic and semantic adapters.
 """
 
+import hashlib
 import logging
 import os
 import random
@@ -136,6 +137,113 @@ def resolve_to_node_key(
         seen.add(resolved)
         resolved = coref_map[resolved]
     return resolved
+
+
+def _fingerprint_entries(entries: "list[dict]") -> str:
+    """SHA-256 fingerprint over the sorted ``(key, subject, predicate, object)`` tuples.
+
+    Content-only identity signal for a keyed-entry list, stored in
+    ``fold_resume.json`` by :meth:`ConsolidationLoop._persist_fold_assignment`
+    (both the ``main_tiers`` and ``interim_slot`` fold branches call this same
+    helper — no duplicated fingerprint loop).  Sorting makes the result
+    independent of entry order, so it detects a genuine content change (not
+    mere reordering) between the pre-crash and post-crash ``train_assignment``.
+
+    Distinct from ``paramem.training.trainer._fingerprint_dataset``, which
+    fingerprints the *tokenized* training examples (the signal that actually
+    gates HF Trainer's ``resume_from_checkpoint`` inside ``trainer.py``) — this
+    is the coarser, pre-tokenization SPO fingerprint.
+
+    Args:
+        entries: Keyed-entry dicts, each carrying at least ``key``,
+            ``subject``, ``predicate``, ``object``.
+
+    Returns:
+        Hex-encoded SHA-256 digest string.
+    """
+    fp = hashlib.sha256()
+    for spo in sorted(
+        (e.get("key", ""), e.get("subject", ""), e.get("predicate", ""), e.get("object", ""))
+        for e in entries
+    ):
+        fp.update(repr(spo).encode("utf-8"))
+    return fp.hexdigest()
+
+
+def _persisted_from_entry_and_rec(entry: "dict", tier: str, rec: "dict | None") -> "dict":
+    """Build one ``fold_resume.json`` train_assignment entry for the interim fold.
+
+    Serialize half of the round-trip pair with :func:`_rec_from_persisted`
+    (the deserialize half) — together they are the single place the
+    interim-slot ``deferred_writes``/``new_keyed_interim`` "rec" shape (built
+    by the graph-walk in
+    :meth:`ConsolidationLoop._build_all_edge_entries_into` — see the
+    cross-link comment at that ``rec = {...}`` construction) is projected to
+    and reconstructed from the persisted marker.  *entry* is the uniform
+    ``tier_keyed`` shape (``{key, subject, predicate, object, speaker_id}``);
+    *rec* is the matching deferred-write record — present only for keys
+    newly minted THIS cycle (``None`` for anti-forgetting-replay entries,
+    which carry no rec).
+
+    Args:
+        entry: One uniform ``tier_keyed`` entry.
+        tier: ``"episodic"`` or ``"procedural"`` — which ``_tier_keyed`` list
+            *entry* came from.
+        rec: The matching ``deferred_writes`` record, or ``None`` when
+            *entry* is an existing (already-keyed) key.
+
+    Returns:
+        *entry* combined with ``"tier"`` and, when *rec* is not ``None``,
+        ``relation_type``/``session_ids``/``last_seen``/``first_seen``.
+    """
+    persisted = dict(entry)
+    persisted["tier"] = tier
+    if rec is not None:
+        persisted["relation_type"] = rec["relation_type"]
+        persisted["session_ids"] = rec["session_ids"]
+        persisted["last_seen"] = rec["last_seen"]
+        persisted["first_seen"] = rec["first_seen"]
+    return persisted
+
+
+def _rec_from_persisted(pe: "dict") -> "dict":
+    """Rebuild one ``new_keyed_interim``/``deferred_writes`` "rec" record from
+    a persisted (``fold_resume.json``) train_assignment entry.
+
+    Deserialize half of the round-trip pair with
+    :func:`_persisted_from_entry_and_rec` (the serialize half) — see that
+    function's docstring for the shared contract.  Callers must first check
+    that *pe* actually carries ``"relation_type"`` (only entries newly minted
+    pre-crash do — see :func:`_persisted_from_entry_and_rec`'s *rec* param);
+    this function does not gate on that itself and will ``KeyError`` if called
+    on a replay entry.
+
+    Args:
+        pe: One enriched entry from the persisted ``train_assignment`` list.
+
+    Returns:
+        A rec dict shaped like one element of ``deferred_writes`` — no
+        ``canon_subj``/``canon_obj``: the interim commit window never reads
+        those two graph-walk-only fields, so they are not part of the
+        round-trip contract.
+    """
+    entry = {
+        "key": pe["key"],
+        "subject": pe["subject"],
+        "predicate": pe["predicate"],
+        "object": pe["object"],
+        "speaker_id": pe["speaker_id"],
+    }
+    return {
+        "entry": entry,
+        "tier": pe.get("tier", "episodic"),
+        "predicate": pe["predicate"],
+        "relation_type": pe["relation_type"],
+        "speaker_id": pe["speaker_id"],
+        "session_ids": pe.get("session_ids", []),
+        "last_seen": pe.get("last_seen", ""),
+        "first_seen": pe.get("first_seen", ""),
+    }
 
 
 class TrialActiveError(RuntimeError):
@@ -1815,6 +1923,8 @@ class ConsolidationLoop:
         fold_stamp: str,
         train_assignment: "dict[str, list[dict]]",
         dataset_fingerprints: "dict[str, str]",
+        *,
+        pending_session_ids: "list[str] | None" = None,
     ) -> None:
         """Write the initial ``fold_resume.json`` marker once the assignment is finalized.
 
@@ -1830,7 +1940,15 @@ class ConsolidationLoop:
             fold_stamp: SHA-256 from ``_compute_fold_stamp`` (pre-mutation).
             train_assignment: Per-tier lists of entry dicts
                 (``key/subject/predicate/object/speaker_id``).
-            dataset_fingerprints: Per-tier ``_fingerprint_dataset`` hexdigest.
+            dataset_fingerprints: Per-tier ``_fingerprint_entries`` hexdigest.
+            pending_session_ids: Sorted list of session ids the current
+                pending-session batch was extracted from (``scope_name ==
+                "interim_slot"`` only — ``fold_stamp`` alone is degenerate for
+                a brand-new interim tier since ``active_keys_in_tier`` is empty
+                pre-training, so it cannot detect a changed pending-session
+                set on its own).  ``None`` (the ``main_tiers`` default) stores
+                an empty list — ``main_tiers`` has no equivalent per-cycle
+                pending-session identity to track.
         """
         non_empty_tiers = [t for t in train_assignment if train_assignment[t]]
         in_flight = non_empty_tiers[0] if non_empty_tiers else None
@@ -1843,6 +1961,9 @@ class ConsolidationLoop:
             "in_flight_tier": in_flight,
             "train_assignment": train_assignment,
             "dataset_fingerprint": dataset_fingerprints,
+            "pending_session_ids": sorted(pending_session_ids)
+            if pending_session_ids is not None
+            else [],
         }
         self._write_fold_resume(state)
         logger.debug(
@@ -3568,6 +3689,56 @@ class ConsolidationLoop:
             # scope.tier gives the logical tier; adapter_name is the PEFT slot name.
             _fold_stamp_b = self._compute_fold_stamp(tier=adapter_name or scope.tier)
 
+            # --- Crash-resume marker detection (interim fold) ---
+            # Mirrors the main_tiers fold_stamp + fold_resume.json check below
+            # (main-tiers branch): a persisted marker resumes ONLY when the
+            # scope is unchanged.  fold_stamp alone is insufficient here — for
+            # a brand-new interim tier active_keys_in_tier(adapter_name) is
+            # empty pre-training, so fold_stamp is a constant (empty-keyset)
+            # hash across ANY fresh slot's first cycle.  Pending-session
+            # identity is sourced from episodic_rels/procedural_rels'
+            # session_id field (stamped by _extract_and_start_training) since
+            # the persisted train_assignment entries carry no session_id of
+            # their own.  adapter_name doubling as the marker's single
+            # train_assignment key gives stamp/cadence-window matching for
+            # free — a marker minted for a different stamp never has this key.
+            _resume_marker_b = self._read_fold_resume()
+            _marker_ta_b: "dict[str, list[dict]]" = (
+                _resume_marker_b.get("train_assignment", {}) if _resume_marker_b is not None else {}
+            )
+            _pending_session_ids_b = sorted(
+                {
+                    _rel.get("session_id", "")
+                    for _rel in list(episodic_rels or []) + list(procedural_rels or [])
+                    if _rel.get("session_id")
+                }
+            )
+            _resume_b = (
+                _resume_marker_b is not None
+                and _resume_marker_b.get("scope") == "interim_slot"
+                and _resume_marker_b.get("fold_stamp") == _fold_stamp_b
+                and adapter_name in _marker_ta_b
+                and sorted(_resume_marker_b.get("pending_session_ids", []))
+                == _pending_session_ids_b
+            )
+            if _resume_marker_b is not None and not _resume_b:
+                # Stale marker (different scope, fold_stamp, tier, or
+                # pending-session set): clear it — the fresh-derivation path
+                # below re-extracts and re-persists.  No scratch-tree removal
+                # needed here (unlike main_tiers): each interim cycle's
+                # output_dir is per-stamp (_training_output_dir(adapter_name,
+                # interim_stamp=stamp)), so a stale marker minted for a
+                # DIFFERENT stamp never points at the current scratch dir; a
+                # same-stamp content mismatch is caught by trainer.py's own
+                # dataset-fingerprint guard (_resolve_resume_checkpoint),
+                # which purges stale checkpoints itself.
+                self._clear_fold_resume()
+                logger.info(
+                    "_run_fold[interim]: cleared stale fold_resume.json (scope/"
+                    "fold_stamp/tier/pending-session mismatch) — proceeding as"
+                    " fresh cycle"
+                )
+
             # _run_fold always controls the merger.graph lifecycle for the interim path.
             try:
                 # --- End-of-extraction debug dump (interim only) ---
@@ -3585,105 +3756,196 @@ class ConsolidationLoop:
                         self.model = create_interim_adapter(self.model, self.episodic_config, stamp)
                         logger.info("_run_fold[interim]: created interim adapter %s", adapter_name)
 
-                # --- Materialize: recall-miss diagnostic + rebuild keying surface ---
-                # Scoped to the current slot: reconstruct only the slot's registered keys
-                # (tier=adapter_name) for the recall-miss diagnostic, then reset and re-merge:
-                #   (a) registry-true relations for this slot
-                #   (b) the pending-session relations captured from merger.graph before the
-                #       reset (extra_relations), so they survive the graph reset.
-                _extra: "list[Relation] | None" = (
-                    self._capture_pending_relations()
-                    if scope.extra_relations_source == "pending"
-                    else None
-                )
-
-                recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
-                    tier=scope.tier,
-                    keys=list(self.store.active_keys_in_tier(adapter_name or scope.tier)),
-                    extra_relations=_extra,
-                    resolve_contradictions_recon=(self.config.refinement_contradiction == "on"),
-                    resolve_contradictions_extra=(self.config.refinement_contradiction == "on"),
-                )
-                if recall_miss_keys:
+                if _resume_b:
+                    # -------------------------------------------------------------
+                    # RESUME FAST-PATH: skip re-extraction, rebuild the training
+                    # set from the persisted marker so the dataset fingerprints
+                    # identically and trainer.py's own staging_resume.json
+                    # resumes the checkpoint (mirrors the main_tiers resume
+                    # fast-path below).
+                    # -------------------------------------------------------------
                     logger.info(
-                        "_run_fold[interim]: %d recall-miss key(s) in slot %s "
-                        "(kept in training set with registry-true content)",
-                        len(recall_miss_keys),
-                        adapter_name,
+                        "_run_fold[interim]: CRASH-RESUME — fold_stamp + pending-session"
+                        " scope match marker; rebuilding train set from persisted data"
+                    )
+                    if scope.source == "weights":
+                        switch_adapter(self.model, adapter_name)
+                    recall_miss_keys: "list[str]" = []
+                    _tier_keyed: dict[str, list[dict]] = {
+                        "episodic": [],
+                        "procedural": [],
+                        "semantic": [],
+                    }
+                    all_interim_keyed: "list[dict]" = []
+                    new_keyed_interim: "list[dict]" = []
+                    for _pe in _marker_ta_b.get(adapter_name, []):
+                        _pt = _pe.get("tier", "episodic")
+                        if "relation_type" in _pe:
+                            # Present only for keys newly minted pre-crash — see
+                            # _persisted_from_entry_and_rec, the enrichment
+                            # applied at persist time below.
+                            _rec = _rec_from_persisted(_pe)
+                            _entry = _rec["entry"]
+                            new_keyed_interim.append(_rec)
+                        else:
+                            _entry = {
+                                "key": _pe["key"],
+                                "subject": _pe["subject"],
+                                "predicate": _pe["predicate"],
+                                "object": _pe["object"],
+                                "speaker_id": _pe["speaker_id"],
+                            }
+                        all_interim_keyed.append(_entry)
+                        _tier_keyed[_pt].append(_entry)
+                    new_key_ids = [r["entry"]["key"] for r in new_keyed_interim]
+                    # Recall-miss diagnostics and semantic-promotion transfer are
+                    # NOT re-derived on resume — both are non-training-critical,
+                    # store-mutating steps that either already landed pre-crash
+                    # or are safely re-evaluated on the NEXT (non-resumed) cycle.
+                    # Accepted resume-path divergence — mirrors main_tiers'
+                    # drift-counter zeroing on resume below.
+                    promoted_key_set: "set[str]" = set()
+                    promoted_origin_tiers: "dict[str, str]" = {}
+                else:
+                    # -------------------------------------------------------------
+                    # FRESH-DERIVATION PATH: materialize -> refine -> build set.
+                    # -------------------------------------------------------------
+                    # --- Materialize: recall-miss diagnostic + rebuild keying surface ---
+                    # Scoped to the current slot: reconstruct only the slot's registered keys
+                    # (tier=adapter_name) for the recall-miss diagnostic, then reset and re-merge:
+                    #   (a) registry-true relations for this slot
+                    #   (b) the pending-session relations captured from merger.graph before the
+                    #       reset (extra_relations), so they survive the graph reset.
+                    _extra: "list[Relation] | None" = (
+                        self._capture_pending_relations()
+                        if scope.extra_relations_source == "pending"
+                        else None
                     )
 
-                # --- Refine ---
-                self._refine_consolidation_graph(
-                    recon_relations,
-                    normalize=scope.normalize,
-                    enrich=scope.enrich,
-                )
+                    recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
+                        tier=scope.tier,
+                        keys=list(self.store.active_keys_in_tier(adapter_name or scope.tier)),
+                        extra_relations=_extra,
+                        resolve_contradictions_recon=(self.config.refinement_contradiction == "on"),
+                        resolve_contradictions_extra=(self.config.refinement_contradiction == "on"),
+                    )
+                    if recall_miss_keys:
+                        logger.info(
+                            "_run_fold[interim]: %d recall-miss key(s) in slot %s "
+                            "(kept in training set with registry-true content)",
+                            len(recall_miss_keys),
+                            adapter_name,
+                        )
 
-                # --- Build keyed training set ---
-                if scope.source == "weights":
-                    switch_adapter(self.model, adapter_name)
-                _tier_keyed: dict[str, list[dict]] = {
-                    "episodic": [],
-                    "procedural": [],
-                    "semantic": [],
-                }
-                _, _deferred_writes = self._build_all_edge_entries_into(
-                    _tier_keyed,
-                    defer=scope.defer,
-                    tag_new=scope.tag_new,
-                )
+                    # --- Refine ---
+                    self._refine_consolidation_graph(
+                        recon_relations,
+                        normalize=scope.normalize,
+                        enrich=scope.enrich,
+                    )
 
-                all_interim_keyed = _tier_keyed["episodic"] + _tier_keyed["procedural"]
-                new_keyed_episodic = [r for r in _deferred_writes if r["tier"] == "episodic"]
-                new_keyed_proc = [r for r in _deferred_writes if r["tier"] == "procedural"]
-                new_keyed_interim = new_keyed_episodic + new_keyed_proc
-                new_key_ids = [r["entry"]["key"] for r in new_keyed_interim]
+                    # --- Build keyed training set ---
+                    if scope.source == "weights":
+                        switch_adapter(self.model, adapter_name)
+                    _tier_keyed = {
+                        "episodic": [],
+                        "procedural": [],
+                        "semantic": [],
+                    }
+                    _, _deferred_writes = self._build_all_edge_entries_into(
+                        _tier_keyed,
+                        defer=scope.defer,
+                        tag_new=scope.tag_new,
+                    )
 
-                # NOTE: the simulate path (scope.source != "weights") no longer
-                # applies its store mutations here.  There is no training step
-                # to gate on for simulate, but the writes are otherwise
-                # identical to the weights path's deferred-mutation loop below
-                # (same new_keyed_interim list) — both now go through the SAME
-                # commit-window try so a simulate-mode _persist_fold failure is
-                # compensated identically to the weights path (see the commit
-                # window below).
+                    all_interim_keyed = _tier_keyed["episodic"] + _tier_keyed["procedural"]
+                    new_keyed_episodic = [r for r in _deferred_writes if r["tier"] == "episodic"]
+                    new_keyed_proc = [r for r in _deferred_writes if r["tier"] == "procedural"]
+                    new_keyed_interim = new_keyed_episodic + new_keyed_proc
+                    new_key_ids = [r["entry"]["key"] for r in new_keyed_interim]
 
-                # --- Semantic promotion transfer (weights path, when
-                # promotions supplied).  Separate from _promote_mature_keys_inline;
-                # operates on the interim keyed set before training.
-                promoted_key_set: set[str] = set()
-                promoted_origin_tiers: dict[str, str] = {}
-                if scope.source == "weights" and new_promotions:
-                    _promo_set = {n.lower() for n in new_promotions}
-                    for _t, _k, _e in list(self.store.iter_entries()):
-                        if _k.startswith("proc"):
-                            continue
-                        _subj = _e.get("subject", "").lower()
-                        _obj = _e.get("object", "").lower()
-                        _mentions = (_subj and _subj in _promo_set) or (_obj and _obj in _promo_set)
-                        if _mentions and not self.store.has_simhash("semantic", _k):
-                            promoted_key_set.add(_k)
-                    for _pk in promoted_key_set:
-                        _origin_tier = self.store.tier_of(_pk)
-                        if _origin_tier is not None:
-                            promoted_origin_tiers[_pk] = _origin_tier
-                        self.store.move(_pk, "semantic")
-                    all_interim_keyed = [
-                        kp for kp in all_interim_keyed if kp["key"] not in promoted_key_set
-                    ]
+                    # NOTE: the simulate path (scope.source != "weights") no longer
+                    # applies its store mutations here.  There is no training step
+                    # to gate on for simulate, but the writes are otherwise
+                    # identical to the weights path's deferred-mutation loop below
+                    # (same new_keyed_interim list) — both now go through the SAME
+                    # commit-window try so a simulate-mode _persist_fold failure is
+                    # compensated identically to the weights path (see the commit
+                    # window below).
 
-                # --- interim slot: write single-entry fold_resume.json marker ---
-                # Written AFTER all_interim_keyed is fully finalized (promotion
-                # filter above may shrink it) — not at fold entry.
-                # On crash, the marker enables epoch-resume via _resolve_resume_checkpoint
-                # (the epoch checkpoint path is already wired).
-                # Interim does NOT pass retain_scratch_until_external_commit:
-                # commit_tier_slot is an inline durable write right after training,
-                # so there is no multi-tier window where a completed-but-uncommitted
-                # tier can be lost.
-                if scope.source == "weights":
-                    _b_assignment = {adapter_name: list(all_interim_keyed)}
-                    self._persist_fold_assignment("interim_slot", _fold_stamp_b, _b_assignment, {})
+                    # --- Semantic promotion transfer (weights path, when
+                    # promotions supplied).  Separate from _promote_mature_keys_inline;
+                    # operates on the interim keyed set before training.
+                    promoted_key_set = set()
+                    promoted_origin_tiers = {}
+                    if scope.source == "weights" and new_promotions:
+                        _promo_set = {n.lower() for n in new_promotions}
+                        for _t, _k, _e in list(self.store.iter_entries()):
+                            if _k.startswith("proc"):
+                                continue
+                            _subj = _e.get("subject", "").lower()
+                            _obj = _e.get("object", "").lower()
+                            _mentions = (_subj and _subj in _promo_set) or (
+                                _obj and _obj in _promo_set
+                            )
+                            if _mentions and not self.store.has_simhash("semantic", _k):
+                                promoted_key_set.add(_k)
+                        for _pk in promoted_key_set:
+                            _origin_tier = self.store.tier_of(_pk)
+                            if _origin_tier is not None:
+                                promoted_origin_tiers[_pk] = _origin_tier
+                            self.store.move(_pk, "semantic")
+                        all_interim_keyed = [
+                            kp for kp in all_interim_keyed if kp["key"] not in promoted_key_set
+                        ]
+
+                    # --- interim slot: write single-entry fold_resume.json marker ---
+                    # Written AFTER all_interim_keyed is fully finalized (promotion
+                    # filter above may shrink it) — not at fold entry.  Persists the
+                    # REAL train_assignment via _persisted_from_entry_and_rec: entry
+                    # dicts enriched with "tier" and, for newly-minted keys, the
+                    # deferred-write metadata the commit window below needs
+                    # (relation_type/session_ids/last_seen/first_seen —
+                    # new_keyed_interim's rec shape carries fields the uniform
+                    # tier_keyed entry shape does not) — so a crash-resume rebuilds
+                    # an IDENTICAL training dataset AND an identical commit-window
+                    # write set.  On crash, the marker enables epoch-resume via
+                    # _resolve_resume_checkpoint (the epoch checkpoint path is
+                    # already wired) — see the RESUME FAST-PATH branch above, which
+                    # reverses this enrichment via _rec_from_persisted.
+                    # Interim does NOT pass retain_scratch_until_external_commit:
+                    # commit_tier_slot is an inline durable write right after training,
+                    # so there is no multi-tier window where a completed-but-uncommitted
+                    # tier can be lost.
+                    if scope.source == "weights":
+                        _new_meta_by_key = {r["entry"]["key"]: r for r in new_keyed_interim}
+                        _b_persist_entries: "list[dict]" = []
+                        for _pt2, _pt2_entries in (
+                            ("episodic", _tier_keyed["episodic"]),
+                            ("procedural", _tier_keyed["procedural"]),
+                        ):
+                            for _pe2 in _pt2_entries:
+                                if _pe2["key"] in promoted_key_set:
+                                    continue
+                                _b_persist_entries.append(
+                                    _persisted_from_entry_and_rec(
+                                        _pe2, _pt2, _new_meta_by_key.get(_pe2["key"])
+                                    )
+                                )
+                        _b_assignment = {adapter_name: _b_persist_entries}
+
+                        _b_dataset_fingerprints: dict[str, str] = {}
+                        if all_interim_keyed:
+                            _b_dataset_fingerprints[adapter_name] = _fingerprint_entries(
+                                all_interim_keyed
+                            )
+                        self._persist_fold_assignment(
+                            "interim_slot",
+                            _fold_stamp_b,
+                            _b_assignment,
+                            _b_dataset_fingerprints,
+                            pending_session_ids=_pending_session_ids_b,
+                        )
 
                 # --- Train (weights source) or skip (disk source) ---
                 epi_train_loss: "float | None" = None
@@ -4151,24 +4413,11 @@ class ConsolidationLoop:
                 # Calling format_entry_training here (before the per-tier loop) would
                 # interfere with per-tier format spy patterns in existing tests and is
                 # unnecessary — SPO identity is the only change-detection signal needed.
-                import hashlib as _hashlib
-
                 _dataset_fingerprints: dict[str, str] = {}
                 for _t in ("episodic", "semantic", "procedural"):
                     _ta_entries = train_assignment[_t]
                     if _ta_entries:
-                        _fp_h = _hashlib.sha256()
-                        for _spo in sorted(
-                            (
-                                e.get("key", ""),
-                                e.get("subject", ""),
-                                e.get("predicate", ""),
-                                e.get("object", ""),
-                            )
-                            for e in _ta_entries
-                        ):
-                            _fp_h.update(repr(_spo).encode("utf-8"))
-                        _dataset_fingerprints[_t] = _fp_h.hexdigest()
+                        _dataset_fingerprints[_t] = _fingerprint_entries(_ta_entries)
                 self._persist_fold_assignment(
                     "main_tiers", _fold_stamp_c, train_assignment, _dataset_fingerprints
                 )
@@ -5193,6 +5442,11 @@ class ConsolidationLoop:
                 _rec_session_ids: list[str] = sorted(
                     set(_t_data.get("sessions", [])) - _SYNTHETIC_SESSION_IDS
                 )
+                # This "rec" shape (minus canon_subj/canon_obj, which the interim
+                # commit window never reads) is the round-trip contract with
+                # module-level _persisted_from_entry_and_rec (serialize into
+                # fold_resume.json) / _rec_from_persisted (deserialize on
+                # crash-resume) — see those functions' docstrings.
                 rec = {
                     "entry": entry,
                     "tier": tier,

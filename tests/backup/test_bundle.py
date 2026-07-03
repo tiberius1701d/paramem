@@ -9,7 +9,7 @@ Covers the recovery set:
   encrypt).
 - Real nested interim layout: interim_<stamp>/<ts>/{meta.json,...} — NOT the
   flat layout used in the prior test suite.
-- Scaffolding (checkpoint-*/, in_training/, bg_checkpoint/, resume_state.json)
+- Scaffolding (checkpoint-*/, in_training/, bg_checkpoint/, staging_resume.json)
   never appears in the bundle.
 - Multi-adapter bundle: procedural main (hash A) + episodic interim only
   (hash B) → both captured; each adapter entry records its OWN registry_sha256;
