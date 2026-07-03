@@ -2051,14 +2051,15 @@ def _sota_pipeline(
     )
 
     # Mapping-totality diagnostic.  The anonymization prompt requires
-    # every placeholder in any anonymized fact to appear as a value in
-    # ``mapping``.  When the LLM violates that contract (rare under the
-    # tightened shape-contract prompt), the orphan placeholder cannot be
-    # substituted at deanon time and the affected fact is dropped at
-    # ``_strip_residual_placeholders``.  Surface the violation here so
-    # prompt regressions are visible in ``journalctl`` and
-    # ``graph.diagnostics`` rather than silently shedding facts.
-    _check_mapping_totality(graph, anon_facts, mapping)
+    # every placeholder in any anonymized fact to appear as a key in
+    # ``reverse_mapping`` — the map deanon actually consumes
+    # (:func:`_apply_bindings`).  When the LLM violates that contract
+    # (rare under the tightened shape-contract prompt), the orphan
+    # placeholder cannot be substituted at deanon time and the affected
+    # fact is dropped at ``_strip_residual_placeholders``.  Surface the
+    # violation here so prompt regressions are visible in ``journalctl``
+    # and ``graph.diagnostics`` rather than silently shedding facts.
+    _check_mapping_totality(graph, anon_facts, reverse_mapping)
 
     # (Re-)build anonymized transcript AND facts from the ORIGINAL transcript
     # and relations using the now-complete mapping.  This covers three cases:
@@ -2686,8 +2687,8 @@ def _build_anonymization_mapping(
        in the mapping (e.g. anonymous-id session, full-name vs
        first-name mismatch), reuse the speaker entity's placeholder
        or — if no speaker entity is in scope — fall back to LLM's
-       full-name match (``"Alex Rivera"`` → reuse ``Person_1``) or
-       mint a fresh ``Person_N``.
+       exact or full-name match (``"Alex"`` or ``"Alex Rivera"`` →
+       reuse ``Person_1``) or mint a fresh ``Person_N``.
     4. **Preserve LLM hints.**  Entries the LLM emitted that the
        deterministic build does not cover (typically relation
        participants the graph doesn't know about — e.g. ``Honda``
@@ -2777,11 +2778,14 @@ def _build_anonymization_mapping(
             mapping[speaker_name] = speaker_entity_placeholder
         else:
             # No speaker entity in scope — fall back to LLM hints
-            # (full-name match) or mint a fresh Person_N.
+            # (exact or full-name match) or mint a fresh Person_N.
             speaker_lower = speaker_name.lower()
             reused: str | None = None
             for key, placeholder in llm_mapping.items():
-                if isinstance(key, str) and key.lower().startswith(speaker_lower + " "):
+                if not isinstance(key, str):
+                    continue
+                key_lower = key.lower()
+                if key_lower == speaker_lower or key_lower.startswith(speaker_lower + " "):
                     reused = placeholder
                     break
             if reused is not None:
@@ -2805,12 +2809,14 @@ def _build_anonymization_mapping(
     # entries win on conflict; LLM-only entries are added.  LLM-emitted
     # keys are entity-name-shaped (the anonymizer prompt operates on
     # relation participants, not attributes), so they are safe to enter
-    # the reverse map.
+    # the reverse map.  The reverse write is NOT gated on the forward
+    # write winning — anon_facts emitted under the LLM's (losing)
+    # placeholder still need a reverse entry to deanonymize.
     for k, v in llm_mapping.items():
         if not isinstance(k, str) or not isinstance(v, str):
             continue
-        if mapping.setdefault(k, v) == v:
-            reverse.setdefault(v, k)
+        mapping.setdefault(k, v)
+        reverse.setdefault(v, k)
 
     return mapping, reverse
 
@@ -2818,13 +2824,17 @@ def _build_anonymization_mapping(
 def _check_mapping_totality(
     graph: SessionGraph,
     anon_facts: list[dict],
-    mapping: dict,
+    reverse_mapping: dict,
 ) -> None:
     """Diagnostic check: every placeholder in any anonymized fact must
-    appear as a value in ``mapping`` (the prompt's mapping-totality
-    contract).  Surfaces violations to ``logger`` and
-    ``graph.diagnostics["totality_orphans"]`` so prompt regressions are
-    visible rather than silently shedding facts.
+    appear as a key in ``reverse_mapping`` (the prompt's mapping-totality
+    contract).  Checked against the reverse map — not the forward map —
+    because deanonymization consumes the reverse map
+    (:func:`_apply_bindings`); a placeholder present only in the forward
+    map's values still fails to translate at deanon time.  Surfaces
+    violations to ``logger`` and ``graph.diagnostics["totality_orphans"]``
+    so prompt regressions are visible rather than silently shedding
+    facts.
 
     Does not mutate inputs and does not change the data flow.  When the
     contract is violated the orphan placeholder cannot be substituted
@@ -2839,20 +2849,20 @@ def _check_mapping_totality(
     """
     if not anon_facts:
         return
-    mapping_values = set(mapping.values()) if mapping else set()
+    reverse_keys = set(reverse_mapping.keys()) if reverse_mapping else set()
     orphans: set[str] = set()
     for f in anon_facts:
         if not isinstance(f, dict):
             continue
         for field in ("subject", "object"):
             for token in _BARE_PLACEHOLDER_RE.findall(str(f.get(field, ""))):
-                if token not in mapping_values:
+                if token not in reverse_keys:
                     orphans.add(token)
     if orphans:
         ordered = sorted(orphans)
         logger.warning(
             "Anonymization mapping-totality violation: %d orphan placeholder(s) "
-            "in anon_facts not in mapping.values(): %s. Affected fact(s) will be "
+            "in anon_facts not in reverse_mapping: %s. Affected fact(s) will be "
             "dropped at the residual placeholder sweep post-deanon.",
             len(ordered),
             ordered[:5],

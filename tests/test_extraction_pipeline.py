@@ -3394,6 +3394,23 @@ class TestBuildAnonymizationMapping:
         assert mapping["Alex"] == "Person_1"
         assert mapping["Alex Rivera"] == "Person_1"
 
+    def test_speaker_name_reuses_llm_exact_match_placeholder(self):
+        """No speaker entity in scope; LLM seeded a bare single-word key
+        that matches the speaker name exactly (``"Alex"`` → ``Person_1``,
+        not ``"Alex Rivera"``); seeding must reuse that placeholder
+        rather than minting a second one for the same speaker.  Without
+        the exact-match branch, only the multi-word ``startswith`` check
+        ran, missed the bare-name hint, and minted a fresh ``Person_2``
+        — splitting the speaker across two placeholders.
+        """
+        mapping = self._build(
+            entities=[],
+            llm_mapping={"Alex": "Person_1"},
+            pii_scope={"person"},
+            speaker_name="Alex",
+        )
+        assert mapping["Alex"] == "Person_1"
+
     def test_speaker_name_mints_fresh_when_no_match(self):
         mapping = self._build(
             entities=[],
@@ -3428,6 +3445,37 @@ class TestBuildAnonymizationMapping:
             pii_scope={"person"},
         )
         assert mapping["Alex"] == "Person_1"
+
+    def test_forward_conflict_still_records_both_reverse_entries(self):
+        """Regression for the incident where the LLM's mapping hint
+        disagrees with the deterministic mint for the same real name:
+        the LLM's own extraction pass placeholdered ``Alex`` as
+        ``Person_4`` while the deterministic entity walk minted
+        ``Person_1`` for the same entity.  The forward map keeps the
+        deterministic entry (``test_deterministic_wins_on_conflict``),
+        but facts the LLM emitted still carry ``Person_4`` — the
+        reverse map must resolve BOTH placeholders back to ``Alex``, not
+        only the forward-map winner.  A fact carrying the LLM's
+        placeholder must survive deanonymization end to end.
+        """
+        from paramem.graph.extractor import _apply_bindings
+
+        forward, reverse = self._build_pair(
+            [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
+            llm_mapping={"Alex": "Person_4"},
+            pii_scope={"person"},
+        )
+        assert forward["Alex"] == "Person_1"
+        assert reverse["Person_1"] == "Alex"
+        # The LLM's disagreeing placeholder must ALSO resolve to Alex —
+        # this is the bug fix: the reverse write is no longer gated on
+        # the forward write winning.
+        assert reverse["Person_4"] == "Alex"
+
+        facts = [{"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"}]
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        assert dropped == []
+        assert kept[0]["subject"] == "Alex"
 
     def test_pii_value_already_keyed_by_llm_kept(self):
         """If an attribute value was already a key in the LLM mapping
@@ -3527,13 +3575,18 @@ class TestCheckMappingTotality:
     """Unit tests for ``_check_mapping_totality``.
 
     The diagnostic replaces the retired
-    ``_recover_missing_placeholder_mappings`` helper.  Under the open-
-    vocabulary anonymizer prompt the LLM is expected to produce a total
-    mapping by construction (see live probe at the prompt-pivot commit);
-    this helper surfaces violations to ``logger`` and
-    ``graph.diagnostics`` so prompt regressions are visible rather than
-    silently shedding facts.  Orphan-placeholder facts get dropped
-    downstream by :func:`_strip_residual_placeholders` — fail-closed.
+    ``_recover_missing_placeholder_mappings`` helper.  It is checked
+    against the REVERSE map (``{placeholder: real_name}``) rather than
+    the forward map's values, because deanonymization consumes the
+    reverse map (:func:`_apply_bindings`) — a placeholder present only
+    in the forward map's values still fails to translate at deanon
+    time.  Under the open-vocabulary anonymizer prompt the LLM is
+    expected to produce a total mapping by construction (see live probe
+    at the prompt-pivot commit); this helper surfaces violations to
+    ``logger`` and ``graph.diagnostics`` so prompt regressions are
+    visible rather than silently shedding facts.  Orphan-placeholder
+    facts get dropped downstream by :func:`_strip_residual_placeholders`
+    — fail-closed.
     """
 
     @staticmethod
@@ -3544,33 +3597,34 @@ class TestCheckMappingTotality:
         )
 
     def test_total_mapping_records_no_orphans(self):
-        """Every fact placeholder maps → no diagnostic emitted."""
+        """Every fact placeholder resolves via the reverse map → no
+        diagnostic emitted."""
         from paramem.graph.extractor import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
             {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
         ]
-        mapping = {"Alex": "Person_1", "Berlin": "City_1"}
-        _check_mapping_totality(graph, anon_facts, mapping)
+        reverse_mapping = {"Person_1": "Alex", "City_1": "Berlin"}
+        _check_mapping_totality(graph, anon_facts, reverse_mapping)
         assert "totality_orphans" not in graph.diagnostics
 
     def test_orphan_placeholder_recorded(self):
-        """A fact placeholder absent from mapping.values() is recorded as
-        an orphan in ``graph.diagnostics`` for monitoring.  No mutation
-        of inputs."""
+        """A fact placeholder absent from ``reverse_mapping`` (the keys
+        deanon actually looks up) is recorded as an orphan in
+        ``graph.diagnostics`` for monitoring.  No mutation of inputs."""
         from paramem.graph.extractor import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
             {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
         ]
-        # University_1 is missing from mapping — a totality violation.
-        mapping = {"Alex": "Person_1"}
-        _check_mapping_totality(graph, anon_facts, mapping)
+        # University_1 is missing from reverse_mapping — a totality violation.
+        reverse_mapping = {"Person_1": "Alex"}
+        _check_mapping_totality(graph, anon_facts, reverse_mapping)
         assert graph.diagnostics.get("totality_orphans") == ["University_1"]
         # Inputs must not be mutated.
-        assert mapping == {"Alex": "Person_1"}
+        assert reverse_mapping == {"Person_1": "Alex"}
 
     def test_multiple_orphans_sorted(self):
         """Multiple orphans are deduplicated and sorted for stable
@@ -3583,9 +3637,9 @@ class TestCheckMappingTotality:
             {"subject": "Person_1", "predicate": "speaks", "object": "Language_1"},
             {"subject": "Person_1", "predicate": "uses", "object": "Product_1"},
         ]
-        # Person_1 is in mapping but Org_1, Product_1, Language_1 are not.
-        mapping = {"Alex": "Person_1"}
-        _check_mapping_totality(graph, anon_facts, mapping)
+        # Person_1 is in reverse_mapping but Org_1, Product_1, Language_1 are not.
+        reverse_mapping = {"Person_1": "Alex"}
+        _check_mapping_totality(graph, anon_facts, reverse_mapping)
         assert graph.diagnostics.get("totality_orphans") == [
             "Language_1",
             "Org_1",
@@ -3594,7 +3648,7 @@ class TestCheckMappingTotality:
 
     def test_embedded_placeholder_caught(self):
         """Placeholder embedded in a compound string still surfaces as
-        an orphan when missing from mapping."""
+        an orphan when missing from ``reverse_mapping``."""
         from paramem.graph.extractor import _check_mapping_totality
 
         graph = self._graph()
@@ -3605,15 +3659,52 @@ class TestCheckMappingTotality:
                 "object": "software for Product_1's Legend",
             },
         ]
-        mapping = {"Alex": "Person_1"}
-        _check_mapping_totality(graph, anon_facts, mapping)
+        reverse_mapping = {"Person_1": "Alex"}
+        _check_mapping_totality(graph, anon_facts, reverse_mapping)
         assert graph.diagnostics.get("totality_orphans") == ["Product_1"]
 
     def test_empty_facts_short_circuits(self):
-        """No facts → no diagnostic, regardless of mapping shape."""
+        """No facts → no diagnostic, regardless of reverse_mapping shape."""
         from paramem.graph.extractor import _check_mapping_totality
 
         graph = self._graph()
         _check_mapping_totality(graph, [], {})
-        _check_mapping_totality(graph, [], {"Alex": "Person_1"})
+        _check_mapping_totality(graph, [], {"Person_1": "Alex"})
+        assert "totality_orphans" not in graph.diagnostics
+
+    def test_placeholder_in_forward_values_but_absent_from_reverse_keys_flagged(self):
+        """The check must key off the reverse map, not the forward map.
+        A placeholder that exists as a forward-map VALUE (so the old
+        ``mapping.values()`` check would have passed it) but is absent
+        from the reverse map's KEYS is still flagged — this is exactly
+        the shape the incident produced: the LLM's placeholder made it
+        into the forward map's conflict-losing value but never reached
+        the reverse map.
+        """
+        from paramem.graph.extractor import _check_mapping_totality
+
+        graph = self._graph()
+        anon_facts = [
+            {"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"},
+        ]
+        # Forward map has "Alex": "Person_4" as a value (would have
+        # passed the old, wrong check), but the reverse map only knows
+        # the deterministic winner Person_1 — Person_4 is unresolved.
+        forward_map = {"Alex": "Person_1", "SomeoneElse": "Person_4"}
+        reverse_mapping = {"Person_1": "Alex"}
+        assert "Person_4" in set(forward_map.values())
+        _check_mapping_totality(graph, anon_facts, reverse_mapping)
+        assert graph.diagnostics.get("totality_orphans") == ["Person_4"]
+
+    def test_placeholder_present_in_reverse_keys_passes(self):
+        """Once the placeholder is a key in the reverse map, the same
+        fact passes with no orphan recorded."""
+        from paramem.graph.extractor import _check_mapping_totality
+
+        graph = self._graph()
+        anon_facts = [
+            {"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"},
+        ]
+        reverse_mapping = {"Person_1": "Alex", "Person_4": "Alex"}
+        _check_mapping_totality(graph, anon_facts, reverse_mapping)
         assert "totality_orphans" not in graph.diagnostics
