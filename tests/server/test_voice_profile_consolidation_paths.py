@@ -124,7 +124,7 @@ def _patch_extract_training(pending, config, target_profile="gpu"):
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch("paramem.server.app._set_voice_pipeline_profile") as mock_profile,
-        patch("paramem.server.consolidation.create_consolidation_loop"),
+        patch("paramem.server.app.create_consolidation_loop"),
         patch("paramem.server.app.check_vram_headroom"),
         patch("paramem.server.app.vram_scope") as mock_vram_scope,
         patch("paramem.server.gpu_lock.gpu_lock_sync") as mock_lock,
@@ -159,7 +159,7 @@ def test_document_cycle_swaps_to_cpu_then_gpu_in_local_mode(tmp_path):
     ):
         # Loop returns empty QA so we hit the no-facts early exit at line 6636.
         loop = _make_loop_no_qa()
-        with patch("paramem.server.consolidation.create_consolidation_loop", return_value=loop):
+        with patch("paramem.server.app.create_consolidation_loop", return_value=loop):
             app_module._extract_and_start_training()
 
     calls = mock_profile.call_args_list
@@ -182,7 +182,7 @@ def test_voice_cycle_in_cloud_only_targets_cpu_after(tmp_path):
     ):
         # Loop returns empty QA so we hit the no-facts early exit.
         loop = _make_loop_no_qa()
-        with patch("paramem.server.consolidation.create_consolidation_loop", return_value=loop):
+        with patch("paramem.server.app.create_consolidation_loop", return_value=loop):
             app_module._extract_and_start_training()
 
     calls = mock_profile.call_args_list
@@ -206,7 +206,7 @@ def test_pure_transcript_cycle_skips_voice_swap(tmp_path):
 
     with _patch_extract_training(pending, config) as (mock_profile, mock_buffer):
         loop = _make_loop_no_qa()
-        with patch("paramem.server.consolidation.create_consolidation_loop", return_value=loop):
+        with patch("paramem.server.app.create_consolidation_loop", return_value=loop):
             app_module._extract_and_start_training()
 
     # No voice profile calls for pure-transcript cycles.
@@ -236,7 +236,7 @@ def test_mixed_cycle_with_document_evicts_then_restores_voice(tmp_path):
         mock_buffer,
     ):
         loop = _make_loop_no_qa()
-        with patch("paramem.server.consolidation.create_consolidation_loop", return_value=loop):
+        with patch("paramem.server.app.create_consolidation_loop", return_value=loop):
             app_module._extract_and_start_training()
 
     calls = mock_profile.call_args_list
@@ -299,7 +299,7 @@ def test_extraction_failed_abort_restores_voice_with_lock_held(tmp_path):
         loop.extract_session.side_effect = ExtractionFailed(
             "sota_enrich", "cloud enrichment call failed or response unparseable"
         )
-        with patch("paramem.server.consolidation.create_consolidation_loop", return_value=loop):
+        with patch("paramem.server.app.create_consolidation_loop", return_value=loop):
             app_module._extract_and_start_training()
 
     calls = mock_profile.call_args_list

@@ -402,6 +402,77 @@ class TestStaleSemantics:
         assert loaded_fold_n1._stale["graph1"]["stale_cycles"] == 1
 
 
+class TestReactivateSemantics:
+    """KeyRegistry.reactivate() — the encapsulated dual of stale().
+
+    Covers: reactivate(key) moves a stale key back to active and restores
+    its simhash; is a no-op on an already-active or entirely-unknown key
+    (mirroring stale()'s no-op when the key is not active); restores no
+    simhash when the stale record never carried one.
+    """
+
+    def test_reactivate_moves_key_from_stale_to_active(self):
+        """reactivate(key) removes from stale, adds back to active partition."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.add("graph2")
+        reg.stale("graph1")
+        reg.reactivate("graph1")
+        assert "graph1" in reg.list_active()
+        assert "graph1" not in reg.list_stale()
+        assert not reg.is_stale("graph1")
+        # graph2 unchanged
+        assert "graph2" in reg.list_active()
+
+    def test_reactivate_restores_simhash_from_stale_record(self):
+        """reactivate(key) restores the simhash carried by the stale record."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 0xBEEF)
+        reg.stale("graph1")
+        assert reg.simhash_for("graph1") == 0xBEEF  # carried into the stale record
+        reg.reactivate("graph1")
+        assert reg._simhash["graph1"] == 0xBEEF
+        assert "simhash" not in reg._stale.get("graph1", {})
+
+    def test_reactivate_key_with_no_simhash(self):
+        """reactivate(key) on a stale key that never had a simhash — no fp restored."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.stale("graph1")
+        assert "simhash" not in reg._stale["graph1"]
+        reg.reactivate("graph1")
+        assert "graph1" in reg.list_active()
+        assert "graph1" not in reg._simhash
+
+    def test_reactivate_idempotent_on_already_active(self):
+        """Calling reactivate() on an already-active key is a no-op."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.reactivate("graph1")  # never staled — must not raise
+        assert reg.list_active() == ["graph1"]
+        assert reg.list_stale() == []
+
+    def test_reactivate_idempotent_on_absent_key(self):
+        """reactivate() on a key that was never added is a no-op."""
+        reg = KeyRegistry()
+        reg.reactivate("nonexistent")  # must not raise
+        assert reg.list_active() == []
+        assert reg.list_stale() == []
+
+    def test_reactivate_then_stale_round_trips(self):
+        """stale() → reactivate() → stale() leaves the key stale again, cleanly."""
+        reg = KeyRegistry()
+        reg.add("graph1")
+        reg.set_simhash("graph1", 42)
+        reg.stale("graph1")
+        reg.reactivate("graph1")
+        reg.stale("graph1")
+        assert "graph1" in reg.list_stale()
+        assert "graph1" not in reg.list_active()
+        assert reg.simhash_for("graph1") == 42
+
+
 class TestKnownPredicate:
     """Unit tests for KeyRegistry.knows() and KeyRegistry.list_known().
 

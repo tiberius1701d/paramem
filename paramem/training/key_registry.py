@@ -124,6 +124,29 @@ class KeyRegistry:
                 # Already stale — just remove the active simhash if it leaked.
                 self._simhash.pop(key, None)
 
+    def reactivate(self, key: str) -> None:
+        """Move *key* from the stale partition back to active (idempotent).
+
+        The dual of :meth:`stale` — reverses a soft-stale transition,
+        restoring the key's simhash fingerprint (if any) from the stale
+        record back into the active partition.  Used to compensate a failed
+        interim commit: a key soft-staled during the shared
+        subtractive-removal stage must return to active exactly as before
+        the fold ran when the commit fails.
+
+        Uses :meth:`add`'s idempotent active-list insert.  Calling
+        ``reactivate`` on a key that is not in the stale partition (already
+        active, or entirely unknown to this tier) is a no-op — mirrors
+        :meth:`stale`'s no-op when *key* is not active.
+        """
+        rec = self._stale.pop(key, None)
+        if rec is None:
+            return
+        fp = rec.get("simhash")
+        if fp is not None:
+            self._simhash[key] = fp
+        self.add(key)
+
     def knows(self, key: str) -> bool:
         """True when *key* is legitimately tracked by this tier — active OR stale.
 

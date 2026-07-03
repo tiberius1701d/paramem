@@ -242,61 +242,53 @@ class TestPreloadCooldownOrder:
 
 class TestFoldWorkerCooldownOrder:
     """Structural source check: wait_for_cooldown appears before the first GPU
-    training call in _run_interim_training, _run_full_cycle, and the simulate
-    _run worker inside _await_bg_cycle.
+    training call in the shared Stage-B cycle-lifecycle primitive
+    (``_run_stage_b_cycle``, the entry point shared by the interim, full-cycle,
+    and active-store-migration closures) and in the simulate ``_run`` worker
+    inside ``_await_bg_cycle``.
 
-    These workers are nested closures; source inspection is the only viable
-    CPU-only verification without fully driving the outer endpoint functions.
-    The check mirrors the pattern in test_preload_failfast.py::
+    ``_run_stage_b_cycle`` owns the entry cooldown gate for all three Stage-B
+    paths; the per-path bodies (``_run_interim_training`` / ``_run_full_cycle``
+    / ``_run_migration_on_worker``) no longer have their own gate.  These
+    workers are nested closures; source inspection is the only viable CPU-only
+    verification without fully driving the outer endpoint functions.  The
+    check mirrors the pattern in test_preload_failfast.py::
     TestDegradeToCloudOnly::test_cuda_fault_persistent_in_permanent_cloud_only.
     """
 
-    def test_run_interim_training_has_cooldown_before_run_consolidation(self):
-        """_run_interim_training: wait_for_cooldown appears before loop.run_consolidation_cycle."""
-        source = inspect.getsource(app_module._extract_and_start_training)
+    def test_stage_b_cycle_has_cooldown_before_body_dispatch(self):
+        """_run_stage_b_cycle: wait_for_cooldown appears before body(loop, bt)."""
+        source = inspect.getsource(app_module._run_stage_b_cycle)
         cooldown_pos = source.find("wait_for_cooldown")
-        training_pos = source.find("loop.run_consolidation_cycle")
-        assert cooldown_pos != -1, (
-            "wait_for_cooldown not found in _extract_and_start_training source "
-            "(expected inside _run_interim_training closure)"
-        )
-        assert training_pos != -1, (
-            "loop.run_consolidation_cycle not found in _extract_and_start_training source"
-        )
-        assert cooldown_pos < training_pos, (
-            "wait_for_cooldown must appear before loop.run_consolidation_cycle in "
-            "_run_interim_training; check that the gate is at the top of the worker body"
+        body_pos = source.find("body(loop, bt)")
+        assert cooldown_pos != -1, "wait_for_cooldown not found in _run_stage_b_cycle source"
+        assert body_pos != -1, "body(loop, bt) dispatch not found in _run_stage_b_cycle source"
+        assert cooldown_pos < body_pos, (
+            "wait_for_cooldown must appear before the body(loop, bt) dispatch in "
+            "_run_stage_b_cycle; check that the gate is at the top of the worker body"
         )
 
-    def test_run_interim_training_uses_fold_max_wait(self):
-        """_run_interim_training source references cooldown_gate_max_wait_fold_s."""
+    def test_stage_b_cycle_uses_fold_max_wait(self):
+        """_run_stage_b_cycle source references cooldown_gate_max_wait_fold_s."""
+        source = inspect.getsource(app_module._run_stage_b_cycle)
+        assert "cooldown_gate_max_wait_fold_s" in source, (
+            "_run_stage_b_cycle must pass cooldown_gate_max_wait_fold_s to wait_for_cooldown"
+        )
+
+    def test_run_interim_training_has_no_own_cooldown_gate(self):
+        """The interim body no longer duplicates the gate — it is owned by the primitive."""
         source = inspect.getsource(app_module._extract_and_start_training)
-        assert "cooldown_gate_max_wait_fold_s" in source, (
-            "_run_interim_training must pass cooldown_gate_max_wait_fold_s to wait_for_cooldown"
+        assert "wait_for_cooldown" not in source, (
+            "_extract_and_start_training must not call wait_for_cooldown directly — "
+            "the entry cooldown gate belongs to _run_stage_b_cycle"
         )
 
-    def test_run_full_cycle_has_cooldown_at_head(self):
-        """_run_full_cycle source has wait_for_cooldown near the top, before _consume_pending."""
+    def test_run_full_cycle_has_no_own_cooldown_gate(self):
+        """The full-cycle body no longer duplicates the gate — it is owned by the primitive."""
         source = inspect.getsource(app_module._run_full_consolidation_sync)
-        cooldown_pos = source.find("wait_for_cooldown")
-        consume_pending_pos = source.find("_consume_pending")
-        assert cooldown_pos != -1, (
-            "wait_for_cooldown not found in _run_full_consolidation_sync source "
-            "(expected inside _run_full_cycle closure)"
-        )
-        assert consume_pending_pos != -1, (
-            "_consume_pending not found in _run_full_consolidation_sync source"
-        )
-        assert cooldown_pos < consume_pending_pos, (
-            "wait_for_cooldown must appear before _consume_pending in _run_full_cycle; "
-            "the gate belongs at the very top of the worker body"
-        )
-
-    def test_run_full_cycle_uses_fold_max_wait(self):
-        """_run_full_cycle source references cooldown_gate_max_wait_fold_s."""
-        source = inspect.getsource(app_module._run_full_consolidation_sync)
-        assert "cooldown_gate_max_wait_fold_s" in source, (
-            "_run_full_cycle must pass cooldown_gate_max_wait_fold_s to wait_for_cooldown"
+        assert "wait_for_cooldown" not in source, (
+            "_run_full_consolidation_sync must not call wait_for_cooldown directly — "
+            "the entry cooldown gate belongs to _run_stage_b_cycle"
         )
 
     def test_await_bg_cycle_run_has_cooldown_before_run_consolidation(self):

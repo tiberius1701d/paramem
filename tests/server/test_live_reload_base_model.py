@@ -2292,107 +2292,103 @@ def test_hydrate_weight_source_is_frame_local():
 # ---------------------------------------------------------------------------
 
 
-def test_finalize_full_calls_hydrate_when_replay_enabled():
-    """_finalize_full calls _hydrate_memory_store_in_place when replay is enabled.
+def test_finalize_full_swaps_store_when_replay_enabled_and_not_degraded():
+    """_finalize_full publishes the staged store contents on a clean success.
 
-    This is the post-consolidation staleness fix: the live store is re-hydrated
-    in-place after the fold so /debug/dump shows the active post-fold count
-    immediately, without a restart.
-
-    The test exercises _finalize_full by calling it directly (it is an inner
-    function of the full-cycle handler, extracted into a closure over loop/config).
-    We substitute loop and config with mocks, mock _hydrate_memory_store_in_place,
-    and verify it is called with the right store, config, model, and tokenizer.
+    Exercises the REAL ``app_module._finalize_full`` directly — it is a
+    module-level function taking ``(loop, result, staged_e, staged_r,
+    staged_b, staged_stats)`` as explicit parameters (no closure captures),
+    so the test calls production code rather than a hand-copied mirror.
+    ``store.swap`` is the atomic-publish primitive; it must fire exactly
+    once with the staged payload when replay is enabled and the staged
+    build did not degrade.
     """
     from paramem.server import app as app_module
 
     fake_store = MagicMock()
     fake_store.replay_enabled = True
     fake_store.all_active_keys.return_value = ["k1", "k2"]
+    swap_calls = []
+    fake_store.swap.side_effect = lambda e, r, b: swap_calls.append((e, r, b))
 
     fake_loop = MagicMock()
     fake_loop.store = fake_store
-    fake_loop.model = MagicMock(name="model")
-    fake_loop.tokenizer = MagicMock(name="tokenizer")
-
-    fake_config = _server_config()
 
     fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
-
-    hydrate_calls = []
-
-    def fake_hydrate(store, cfg, *, model, tokenizer):
-        hydrate_calls.append(
-            {
-                "store": store,
-                "config": cfg,
-                "model": model,
-                "tokenizer": tokenizer,
-            }
-        )
+    staged_e = {"episodic": {}}
+    staged_r = {"episodic": MagicMock()}
+    staged_b = {}
+    staged_stats = {"boot_degraded": False, "store_load_degraded": False}
 
     state_patch = {
         "router": MagicMock(),
         "last_consolidation": None,
-        "last_consolidation_result": None,
         "consolidating": True,
         "event_loop": None,
+        "config": _server_config(),
     }
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_revalidate_main_adapter_manifests"),
-        patch.object(app_module, "_hydrate_memory_store_in_place", side_effect=fake_hydrate),
     ):
-        # Reconstruct _finalize_full by running a minimal version of the
-        # surrounding closure logic, using loop / config / result from above.
-        # The inner function is defined in _run_full_cycle; we test the call
-        # contract by directly calling the helper via mock.
-        config = fake_config
-        loop = fake_loop
-        result = fake_result
+        app_module._finalize_full(
+            fake_loop, fake_result, staged_e, staged_r, staged_b, staged_stats
+        )
 
-        # Build and execute _finalize_full exactly as app.py does.
-        def _finalize_full() -> None:
-            loop.model.eval()
-            _state_ref = app_module._state
-            _state_ref["last_consolidation"] = "2026-01-01T00:00:00+00:00"
-            _state_ref["router"].reload()
-            app_module._revalidate_main_adapter_manifests(_state_ref)
-            if loop.store.replay_enabled:
-                app_module._hydrate_memory_store_in_place(
-                    loop.store,
-                    config,
-                    model=loop.model,
-                    tokenizer=loop.tokenizer,
-                )
-            total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
-            _state_ref["last_consolidation_result"] = {
-                "status": "rolled_back" if result.get("rolled_back") else "full_trained",
-                "tiers_rebuilt": result.get("tiers_rebuilt", []),
-                "rollback_tier": result.get("rollback_tier"),
-                "graph_drift_count": result.get("graph_drift_count", 0),
-                "total_keys": total_keys,
-            }
-            _state_ref["consolidating"] = False
-
-        _finalize_full()
-
-    assert len(hydrate_calls) == 1, (
-        f"_hydrate_memory_store_in_place must be called once; got {len(hydrate_calls)}"
-    )
-    call = hydrate_calls[0]
-    assert call["store"] is fake_store
-    assert call["config"] is fake_config
-    assert call["model"] is fake_loop.model
-    assert call["tokenizer"] is fake_loop.tokenizer
+        # Assertions on _state must run INSIDE the patch.dict block — it
+        # restores the dict to its pre-with-block contents on exit, which
+        # would discard the mutations made by _finalize_full.
+        assert swap_calls == [(staged_e, staged_r, staged_b)], (
+            f"store.swap must be called once with the staged payload; got {swap_calls}"
+        )
+        assert app_module._state["store_load_degraded"] is False
+        assert app_module._state["consolidating"] is False
 
 
-def test_finalize_full_skips_hydrate_when_replay_disabled():
-    """_hydrate_memory_store_in_place must NOT be called when replay is disabled.
+def test_finalize_full_skips_swap_when_staged_build_degraded():
+    """store.swap must NOT be called when the staged build degraded.
 
-    When replay_enabled=False there are no registries to reload from, so the
-    hydration call is guarded by the same condition as the total_keys read.
+    A degraded build (store_load_degraded=True) must preserve the live
+    in-RAM store rather than publishing a possibly-incomplete registry —
+    queries self-heal on-miss instead.
+    """
+    from paramem.server import app as app_module
+
+    fake_store = MagicMock()
+    fake_store.replay_enabled = True
+    fake_store.all_active_keys.return_value = []
+
+    fake_loop = MagicMock()
+    fake_loop.store = fake_store
+
+    fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
+    staged_stats = {"boot_degraded": None, "store_load_degraded": True}
+
+    state_patch = {
+        "router": MagicMock(),
+        "last_consolidation": None,
+        "consolidating": True,
+        "event_loop": None,
+        "config": _server_config(),
+    }
+
+    with (
+        patch.dict(app_module._state, state_patch, clear=False),
+        patch.object(app_module, "_revalidate_main_adapter_manifests"),
+    ):
+        app_module._finalize_full(fake_loop, fake_result, {}, {}, {}, staged_stats)
+
+        fake_store.swap.assert_not_called()
+        assert app_module._state["store_load_degraded"] is True
+        assert app_module._state["consolidating"] is False
+
+
+def test_finalize_full_skips_swap_when_replay_disabled():
+    """store.swap must NOT be called when replay is disabled.
+
+    There are no registries to publish when replay is off — the swap and
+    the degraded-flag propagation are both gated on ``replay_enabled``.
     """
     from paramem.server import app as app_module
 
@@ -2402,59 +2398,23 @@ def test_finalize_full_skips_hydrate_when_replay_disabled():
 
     fake_loop = MagicMock()
     fake_loop.store = fake_store
-    fake_loop.model = MagicMock(name="model")
-    fake_loop.tokenizer = MagicMock(name="tokenizer")
 
-    fake_config = _server_config()
     fake_result = {"rolled_back": False, "tiers_rebuilt": ["episodic"], "graph_drift_count": 0}
-
-    hydrate_calls = []
-
-    def fake_hydrate(store, cfg, *, model, tokenizer):
-        hydrate_calls.append(True)
+    staged_stats = {"boot_degraded": False, "store_load_degraded": False}
 
     state_patch = {
         "router": MagicMock(),
         "last_consolidation": None,
-        "last_consolidation_result": None,
         "consolidating": True,
         "event_loop": None,
+        "config": _server_config(),
     }
 
     with (
         patch.dict(app_module._state, state_patch, clear=False),
         patch.object(app_module, "_revalidate_main_adapter_manifests"),
-        patch.object(app_module, "_hydrate_memory_store_in_place", side_effect=fake_hydrate),
     ):
-        config = fake_config
-        loop = fake_loop
-        result = fake_result
+        app_module._finalize_full(fake_loop, fake_result, {}, {}, {}, staged_stats)
 
-        def _finalize_full() -> None:
-            loop.model.eval()
-            _state_ref = app_module._state
-            _state_ref["last_consolidation"] = "2026-01-01T00:00:00+00:00"
-            _state_ref["router"].reload()
-            app_module._revalidate_main_adapter_manifests(_state_ref)
-            if loop.store.replay_enabled:
-                app_module._hydrate_memory_store_in_place(
-                    loop.store,
-                    config,
-                    model=loop.model,
-                    tokenizer=loop.tokenizer,
-                )
-            total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
-            _state_ref["last_consolidation_result"] = {
-                "status": "full_trained",
-                "tiers_rebuilt": result.get("tiers_rebuilt", []),
-                "rollback_tier": result.get("rollback_tier"),
-                "graph_drift_count": result.get("graph_drift_count", 0),
-                "total_keys": total_keys,
-            }
-            _state_ref["consolidating"] = False
-
-        _finalize_full()
-
-    assert hydrate_calls == [], (
-        "_hydrate_memory_store_in_place must NOT be called when replay_enabled=False"
-    )
+        fake_store.swap.assert_not_called()
+        assert app_module._state["consolidating"] is False

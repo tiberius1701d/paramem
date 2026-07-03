@@ -11,6 +11,7 @@ GPU lifecycle (service-level):
 
 import argparse
 import asyncio
+import functools
 import hashlib as _hashlib
 import json
 import logging
@@ -12860,6 +12861,212 @@ def _scheduled_extract_done_callback(future):
         _state["consolidating"] = False
 
 
+def _get_or_create_consolidation_loop(config):
+    """Return the process-lifetime ``ConsolidationLoop``, creating it on first use.
+
+    Shared get-or-create used by :func:`_run_stage_b_cycle` (all three
+    Stage-B entry points) and by the interim path's Phase-1 extraction, which
+    needs the loop before any BG-dispatch decision is made — earlier than
+    ``_run_stage_b_cycle`` is ever called for that path.  Idempotent: a
+    second call finds the loop already in ``_state`` and returns it
+    unchanged.
+    """
+    loop = _state.get("consolidation_loop")
+    if loop is not None:
+        return loop
+    loop = create_consolidation_loop(
+        _state["model"],
+        _state["tokenizer"],
+        config,
+        _state["memory_store"],
+        state_provider=lambda: _state,
+    )
+    _state["consolidation_loop"] = loop
+    _state["model"] = loop.model
+    return loop
+
+
+def _finalize_stage_b_failure() -> None:
+    """Clear-only finalizer shared by every failed Stage-B cycle.
+
+    No ``router.reload()``: on a failed interim commit
+    ``ConsolidationLoop._run_fold``'s transactional rollback leaves the store
+    pre-cycle-identical, and the full/migration failure paths never
+    published anything either — there is nothing new for a failed cycle to
+    reload.
+    """
+    _state["consolidating"] = False
+
+
+def _run_stage_b_cycle(
+    *,
+    kind: str,
+    incident_key: str,
+    failure_summary: str,
+    failure_detail: dict,
+    body: "Callable[[object, object], tuple[str, Callable[[], None] | None]]",
+) -> None:
+    """Own the fire-and-forget BG-worker lifecycle shared by the interim-train,
+    full-cycle, and active-store-migration Stage-B closures.
+
+    Creates/reuses the process-lifetime :class:`ConsolidationLoop` (via
+    :func:`_get_or_create_consolidation_loop`), wires the singleton
+    :class:`BackgroundTrainer`, then submits *body* to the trainer under the
+    entry GPU-cooldown gate.  *body* receives ``(loop, bt)`` and must return
+    a terminal descriptor ``(outcome, finalizer)`` or raise — it must never
+    call ``_dispatch_finalize`` itself; this function is the sole dispatch
+    point, reached from exactly one call site for every terminal (success or
+    failure — there is no ``if mode`` fork here).
+
+    On a normal return, ``_state["model"]`` picks up any PEFT rebind
+    performed by *body* (``create_adapter`` / ``create_interim_adapter``) and
+    the terminal's ``finalizer`` — a zero-arg callable, or ``None`` for
+    :func:`_finalize_stage_b_failure` — is dispatched via
+    :func:`_dispatch_finalize`.
+
+    On an uncaught exception, records a *kind* incident keyed by
+    *incident_key* (severity ``"failed"``), restores the voice pipeline
+    (``lock_held=True`` — idempotent, safe on paths that never evicted
+    voice), and dispatches :func:`_finalize_stage_b_failure`.  A terminal
+    that the caller wants to treat as a *normal*, non-incident outcome
+    (``aborted``, ``accumulating``, ``extraction_failed``, ...) must be
+    returned by *body*, not raised — raising always produces a *kind*
+    incident.
+
+    Args:
+        kind: Incident type recorded on an uncaught exception
+            (``"training_crash"``, ``"consolidation_crash"``, or
+            ``"migration_error"``).
+        incident_key: Incident dedup key (``"interim"``, ``"full"``, or
+            ``"active_store"``).  Also used as the neutral cycle label on
+            the success-path completion log — unlike ``kind``, it carries
+            no incident-type implication.
+        failure_summary: Human-readable incident summary on an uncaught
+            exception.
+        failure_detail: Incident detail payload on an uncaught exception.
+        body: The path-specific Stage-B payload, closing over whatever
+            pre-stage state (extracted relations, session ids, ...) it needs.
+    """
+    config = _state["config"]
+    loop = _get_or_create_consolidation_loop(config)
+    bt = _active_bg_trainer(config)
+    loop._bg_trainer = bt
+
+    def _worker() -> None:
+        wait_for_cooldown(
+            config.vram.cooldown_gate_threshold_c,
+            config.vram.cooldown_gate_max_wait_fold_s,
+            config.vram.cooldown_gate_poll_s,
+            label="fold",
+        )
+        try:
+            outcome, finalizer = body(loop, bt)
+        except Exception:
+            logger.exception("%s crashed", kind)
+            try:
+                record_incident(
+                    config.paths.data / "state",
+                    type=kind,
+                    key=incident_key,
+                    severity="failed",
+                    summary=failure_summary,
+                    detail=failure_detail,
+                )
+            except Exception:
+                logger.exception("Failed to record %s incident (non-fatal)", kind)
+            try:
+                _set_voice_pipeline_profile(_target_profile(), lock_held=True)
+            except Exception:
+                logger.exception("Voice restore on %s failure path raised; ignoring", kind)
+            _dispatch_finalize(_finalize_stage_b_failure)
+            return
+        _state["model"] = loop.model
+        # Neutral cycle label on the success line — `kind` is an incident
+        # TYPE ("training_crash"/"consolidation_crash"/"migration_error")
+        # and is reserved for the crash path; logging it here would misread
+        # as an incident on a successful cycle.  `incident_key` ("interim"/
+        # "full"/"active_store") identifies the Stage-B path without that
+        # implication.
+        logger.info("%s: cycle complete (outcome=%s)", incident_key, outcome)
+        _dispatch_finalize(finalizer if finalizer is not None else _finalize_stage_b_failure)
+
+    bt.submit(_worker, inference_fallback_adapter="episodic")
+
+
+def _finalize_interim(loop, result: dict, *, session_ids: list, released_sids: list) -> None:
+    """Success/terminal finalizer for the interim-training Stage-B cycle.
+
+    Runs on the asyncio event loop via ``_dispatch_finalize``.  Reloads the
+    router, records the durable run-status row, auto-resolves the incidents
+    a clean interim success clears, and clears ``_state["consolidating"]``.
+    Covers every non-crash interim terminal (``trained`` / ``degenerate`` /
+    ``aborted`` / ``cap_pending``, with or without recall-failed sessions) —
+    the outcome label and clean-success gating come from *result* and
+    *released_sids*.
+
+    Args:
+        loop: The cycle's ``ConsolidationLoop`` (post-training PEFT rebind).
+        result: The ``run_consolidation_cycle`` return dict.
+        session_ids: Session ids extracted this cycle (for the run-status
+            detail count).
+        released_sids: Sessions released from the consolidation-retry cap
+            this cycle — a non-empty list blocks the clean-success
+            incident resolution below (mirrors the crash-recorded incident
+            still being live).
+    """
+    loop.model.eval()
+    _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+    _state["router"].reload()
+    # inference path sees the just-written interim slot (and any tier whose
+    # format drifted from the loop's current setting).  Count via the
+    # indexed_key_registry — it tracks every active key regardless of which
+    # adapter (main or interim) currently holds it.  The previous
+    # main-tier-simhash sum under-reported by the count of keys living in
+    # episodic_interim_<stamp> slots between full cycles.
+    total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
+    _interim_outcome = result.get("mode", "trained")
+    _interim_detail = {
+        "sessions": len(session_ids),
+        "total_keys": total_keys,
+        "adapter": result.get("adapter_name"),
+    }
+    try:
+        record_last_run(
+            _state["config"].paths.data / "state",
+            op_type="consolidation",
+            outcome=_interim_outcome,
+            summary=(
+                f"Interim {_interim_outcome}: adapter={result.get('adapter_name')}, "
+                f"{total_keys} total keys"
+            ),
+            detail=_interim_detail,
+        )
+        # Auto-resolve op-level incidents cleared by a successful interim cycle.
+        _interim_state_dir = _state["config"].paths.data / "state"
+        resolve_incidents_by_type(_interim_state_dir, "training_crash")
+        resolve_incidents_by_type(_interim_state_dir, "vram_exhausted")
+        # Resolve consolidation_retry_exhausted ONLY on a genuine clean
+        # success — no recall failures, cycle was not aborted/degenerated,
+        # and no sessions were cap-released this cycle.  An abort/degenerate
+        # cycle carries no recall_failed_session_ids but is NOT a success;
+        # resolving here would wipe an incident recorded by the same cycle.
+        _is_clean_success = (
+            not result.get("recall_failed_session_ids", [])
+            and _interim_outcome not in {"aborted", "cap_pending"}
+            and not released_sids
+        )
+        if _is_clean_success:
+            resolve_incidents_by_type(_interim_state_dir, "consolidation_retry_exhausted")
+    except Exception:
+        logger.exception("Post-interim run-status/incident bookkeeping failed (non-fatal)")
+    _state["consolidating"] = False
+    logger.info(
+        "Scheduled-tick complete — adapter=%s, %d total keys",
+        result.get("adapter_name"),
+        total_keys,
+    )
+
+
 def _extract_and_start_training():
     """Extract pending sessions and submit a single interim-training job.
 
@@ -12875,25 +13082,15 @@ def _extract_and_start_training():
         SessionClass,
         _save_key_metadata,
         classify_session,
-        create_consolidation_loop,
         session_retention_dir,
     )
 
     config = _state["config"]
     session_buffer = _state["session_buffer"]
 
-    # Create or reuse consolidation loop
-    loop = _state.get("consolidation_loop")
-    if loop is None:
-        loop = create_consolidation_loop(
-            _state["model"],
-            _state["tokenizer"],
-            config,
-            _state["memory_store"],
-            state_provider=lambda: _state,
-        )
-        _state["consolidation_loop"] = loop
-        _state["model"] = loop.model
+    # Create or reuse consolidation loop — needed here for Phase 1 extraction,
+    # earlier than _run_stage_b_cycle's own get-or-create (Phase 2, below).
+    loop = _get_or_create_consolidation_loop(config)
 
     # Read HA home context for location validation
     ha_context = None
@@ -13261,72 +13458,33 @@ def _extract_and_start_training():
     max_interim_count = config.consolidation.max_interim_count
     interim_overflow_slack = config.consolidation.interim_overflow_slack
 
-    # Fetch (or create) the process-lifetime singleton BG trainer so the worker
-    # thread holds the GPU lock for the duration of the callable and concurrent
-    # STT/TTS inference abort requests reach it.
-    bt = _active_bg_trainer(config)
-    if _state.get("consolidation_loop") is not None:
-        _state["consolidation_loop"]._bg_trainer = bt
-
-    def _run_interim_training() -> None:
+    def _run_interim_training(loop, bt) -> "tuple[str, Callable[[], None] | None]":
         """Execute the interim training pass + post-train bookkeeping.
 
-        Runs on the BG trainer worker thread under the GPU lock.  The helper
-        does its own atomic I5 save of the interim slot + registry; we then
-        run the cross-cycle bookkeeping (promotion check, key-metadata save,
-        session marking, router reload, state updates) after each cycle.
+        Runs on the BG trainer worker thread under the GPU lock (the entry
+        cooldown gate, the try/except crash envelope, and the model-handle
+        refresh are owned by ``_run_stage_b_cycle``).  The helper does its
+        own atomic I5 save of the interim slot + registry; we then run the
+        cross-cycle bookkeeping (promotion check, key-metadata save, session
+        marking, router reload, state updates) after each cycle.
         """
-        # T2b: pre-task GPU cooldown gate — wait until GPU is cool before the
-        # training burst.  One call per interim-fold kickoff; NOT called
-        # per-session (that would invoke it inside the extraction loop).
-        # Bounded by cooldown_gate_max_wait_fold_s (default 300 s); the fold
-        # runs async off the event loop so a wait here does not block requests.
-        wait_for_cooldown(
-            config.vram.cooldown_gate_threshold_c,
-            config.vram.cooldown_gate_max_wait_fold_s,
-            config.vram.cooldown_gate_poll_s,
-            label="fold",
+        # Callsite 4: BG-worker interim train.  Runs inside the BG worker
+        # thread under ``gpu_lock_sync()`` (acquired by
+        # ``_run_callable_queue``).  The surrounding BG-trainer construction
+        # and closure pattern are unchanged; only the deleted
+        # ``_train_extracted_into_interim`` is replaced with the unified
+        # ``run_consolidation_cycle``.  Fire-and-forget semantics are
+        # preserved — this is NOT converted to ``_await_bg_cycle``.
+        result = loop.run_consolidation_cycle(
+            all_episodic_rels,
+            all_procedural_rels,
+            speaker_id=primary_speaker,
+            mode="train",
+            run_label=f"tick-{primary_speaker or 'anon'}",
+            schedule=schedule,
+            max_interim_count=max_interim_count,
+            interim_overflow_slack=interim_overflow_slack,
         )
-        try:
-            # Callsite 4: BG-worker interim train.  Runs inside the BG worker
-            # thread under ``gpu_lock_sync()`` (acquired by
-            # ``_run_callable_queue``).  The surrounding BG-trainer construction
-            # and closure pattern are unchanged; only the deleted
-            # ``_train_extracted_into_interim`` is replaced with the unified
-            # ``run_consolidation_cycle``.  Fire-and-forget semantics are
-            # preserved — this is NOT converted to ``_await_bg_cycle``.
-            result = loop.run_consolidation_cycle(
-                all_episodic_rels,
-                all_procedural_rels,
-                speaker_id=primary_speaker,
-                mode="train",
-                run_label=f"tick-{primary_speaker or 'anon'}",
-                schedule=schedule,
-                max_interim_count=max_interim_count,
-                interim_overflow_slack=interim_overflow_slack,
-            )
-        except Exception:
-            logger.exception(
-                "Scheduled-tick interim training failed — leaving %d sessions pending",
-                len(session_ids),
-            )
-            record_incident(
-                _state["config"].paths.data / "state",
-                type="training_crash",
-                key="interim",
-                severity="failed",
-                summary=f"Interim training crashed — {len(session_ids)} session(s) still pending",
-                detail={"sessions": len(session_ids)},
-            )
-            # Restore voice pipeline even on training failure — we evicted
-            # at cycle start, the device should return to its post-startup
-            # baseline regardless of whether training succeeded.
-            if evict_voice_for_cycle:
-                _set_voice_pipeline_profile(_target_profile(), lock_held=True)
-            return
-
-        # Pick up any PeftModel handle rebinding from create_interim_adapter.
-        _state["model"] = loop.model
 
         logger.info(
             "Scheduled-tick interim training: mode=%s, adapter=%s, new_keys=%d",
@@ -13496,76 +13654,166 @@ def _extract_and_start_training():
         except Exception:
             logger.exception("Post-interim bookkeeping failed (non-fatal)")
 
-        # Restore voice pipeline on the BG worker thread, before posting
-        # _finalize_interim to the event loop. Voice load is multi-second
-        # GPU work; running it on the event loop would block asyncio.
-        # Symmetric with the eviction at cycle start: paired with the
-        # _state["consolidating"] = False signal inside _finalize_interim.
+        # Restore voice pipeline on the BG worker thread, before returning the
+        # terminal — voice load is multi-second GPU work; running it on the
+        # event loop would block asyncio.  Symmetric with the eviction at
+        # cycle start: paired with the _state["consolidating"] = False signal
+        # inside _finalize_interim.
         if evict_voice_for_cycle:
             _set_voice_pipeline_profile(_target_profile(), lock_held=True)
 
-        # State mutations + router reload — post to the event loop so the
-        # router cache and inference path see the new slot atomically.
-        def _finalize_interim() -> None:
-            loop.model.eval()
-            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-            _state["router"].reload()
-            # inference path sees the just-written interim slot (and any
-            # tier whose format drifted from the loop's current setting).
-            # Count via the indexed_key_registry — it tracks every active key
-            # regardless of which adapter (main or interim) currently holds it.
-            # The previous main-tier-simhash sum under-reported by the count of
-            # keys living in episodic_interim_<stamp> slots between full cycles.
-            total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
-            _interim_outcome = result.get("mode", "trained")
-            _interim_detail = {
-                "sessions": len(session_ids),
-                "total_keys": total_keys,
-                "adapter": result.get("adapter_name"),
-            }
-            try:
-                record_last_run(
-                    _state["config"].paths.data / "state",
-                    op_type="consolidation",
-                    outcome=_interim_outcome,
-                    summary=(
-                        f"Interim {_interim_outcome}: adapter={result.get('adapter_name')}, "
-                        f"{total_keys} total keys"
-                    ),
-                    detail=_interim_detail,
-                )
-                # Auto-resolve op-level incidents cleared by a successful interim cycle.
-                _interim_state_dir = _state["config"].paths.data / "state"
-                resolve_incidents_by_type(_interim_state_dir, "training_crash")
-                resolve_incidents_by_type(_interim_state_dir, "vram_exhausted")
-                # Resolve consolidation_retry_exhausted ONLY on a genuine clean
-                # success — no recall failures, cycle was not aborted/degenerated,
-                # and no sessions were cap-released this cycle.  An abort/degenerate
-                # cycle carries no recall_failed_session_ids but is NOT a success;
-                # resolving here would wipe an incident recorded by the same cycle.
-                _is_clean_success = (
-                    not result.get("recall_failed_session_ids", [])
-                    and _cycle_mode not in {"aborted", "cap_pending"}
-                    and not _released_sids
-                )
-                if _is_clean_success:
-                    resolve_incidents_by_type(_interim_state_dir, "consolidation_retry_exhausted")
-            except Exception:
-                logger.exception("Post-interim run-status/incident bookkeeping failed (non-fatal)")
-            _state["consolidating"] = False
-            logger.info(
-                "Scheduled-tick complete — adapter=%s, %d total keys",
-                result.get("adapter_name"),
-                total_keys,
-            )
+        finalizer = functools.partial(
+            _finalize_interim,
+            loop,
+            result,
+            session_ids=session_ids,
+            released_sids=_released_sids,
+        )
+        return _cycle_mode, finalizer
 
-        _dispatch_finalize(_finalize_interim)
-
-    bt.submit(_run_interim_training, inference_fallback_adapter="episodic")
+    _run_stage_b_cycle(
+        kind="training_crash",
+        incident_key="interim",
+        failure_summary=f"Interim training crashed — {len(session_ids)} session(s) still pending",
+        failure_detail={"sessions": len(session_ids)},
+        body=_run_interim_training,
+    )
     logger.info(
         "Extraction done — interim-training job submitted to BG trainer (%d sessions)",
         len(session_ids),
     )
+
+
+def _finalize_full_status_only(
+    *, outcome: str, summary: str, detail: dict, touch_last_consolidation: bool = False
+) -> None:
+    """Record-only finalizer for full-cycle terminals that touch no store/router
+    state: ``aborted``, ``accumulating``, and ``noop``.
+
+    Each of these three terminals already ran its own outcome-specific
+    logging inside the full-cycle body before returning; this finalizer's
+    sole job is the durable run-status record and the flag clear, both of
+    which must happen atomically with everything else ``_dispatch_finalize``
+    guards.
+
+    Args:
+        outcome: Run-status outcome label (also used in the exception log
+            on a record-write failure).
+        summary: Human-readable run-status summary.
+        detail: Run-status detail payload.
+        touch_last_consolidation: When ``True`` (the ``noop`` terminal only —
+            matches pre-refactor behavior; ``aborted``/``accumulating`` never
+            stamped this field), updates ``_state["last_consolidation"]``
+            before recording.  Distinct from the on-disk per-tier window
+            stamp, which ``accumulating`` deliberately leaves unadvanced.
+    """
+    if touch_last_consolidation:
+        _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+    try:
+        record_last_run(
+            _state["config"].paths.data / "state",
+            op_type="consolidation",
+            outcome=outcome,
+            summary=summary,
+            detail=detail,
+        )
+    except Exception:
+        logger.exception("Failed to record %s run status (non-fatal)", outcome)
+    _state["consolidating"] = False
+
+
+def _finalize_full(
+    loop, result: dict, staged_e: dict, staged_r: dict, staged_b: dict, staged_stats: dict
+) -> None:
+    """CPU-only event-loop closure for the full-cycle ``full_trained`` terminal.
+
+    Publishes the staged store contents built on the worker thread, updates
+    ``_state`` flags, revalidates manifests, reloads the router, and records
+    the consolidation result.
+
+    Step order is load-bearing:
+
+    a. ``store.swap`` — atomically publish new entries/registry/bookkeeping,
+       ONLY when ``staged_stats["store_load_degraded"]`` is ``False``.  A
+       degraded build preserves the live store; a legitimately empty
+       registry (``store_load_degraded=False``, no active keys) still swaps.
+    b. ``_state`` ``boot_degraded`` / ``store_load_degraded`` — from
+       *staged_stats*, always propagated regardless of whether swap ran.
+    c. ``_revalidate_main_adapter_manifests`` — reads fresh on-disk slots.
+    d. ``_state["router"].reload()`` — AFTER the swap so the speaker index
+       is built from the freshly-published bookkeeping.
+    e. ``_state`` flags / result bookkeeping — ``last_consolidation`` etc.
+
+    Args:
+        loop: The cycle's ``ConsolidationLoop`` (post-fold PEFT rebind).
+        result: The ``consolidate_interim_adapters`` / ``run_housekeeping``
+            return dict.
+        staged_e: Staged ``tier -> key -> entry`` map built off-store on the
+            worker thread by ``_build_store_contents``.
+        staged_r: Staged ``tier -> KeyRegistry`` map.
+        staged_b: Staged ``key -> bookkeeping-record`` map.
+        staged_stats: ``{"boot_degraded", "store_load_degraded"}`` from the
+            staged build.
+    """
+    if loop.store.replay_enabled:
+        # a. Atomically publish only when the registry build SUCCEEDED.
+        # A degraded build (store_load_degraded=True, raised internally
+        # or caught by the caller) must not wipe the live registry/
+        # bookkeeping — preserve the authoritative in-RAM state and let
+        # queries self-heal on-miss.  A legitimately empty registry
+        # (store_load_degraded=False, read succeeded with no active keys)
+        # DOES swap.
+        if not staged_stats["store_load_degraded"]:
+            loop.store.swap(staged_e, staged_r, staged_b)
+        # b. Propagate degraded flags regardless of whether we swapped.
+        _state["store_load_degraded"] = staged_stats["store_load_degraded"]
+        _state["boot_degraded"] = staged_stats["boot_degraded"]
+    # c. Re-validate manifests now that main slots have been re-saved
+    #    with a fresh registry hash + window_stamp.  Without this,
+    #    /status keeps showing "FINGERPRINT MISMATCH" until restart.
+    _revalidate_main_adapter_manifests(_state)
+    # d. Reload router AFTER swap so the speaker index is built from
+    #    the freshly-published bookkeeping (phase-2 ordering fix).
+    _state["router"].reload()
+    # e. Result bookkeeping.
+    total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
+    _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+    _full_outcome = "rolled_back" if result.get("rolled_back") else "full_trained"
+    _full_detail = {
+        "tiers_rebuilt": result.get("tiers_rebuilt", []),
+        "rollback_tier": result.get("rollback_tier"),
+        "graph_drift_count": result.get("graph_drift_count", 0),
+        "total_keys": total_keys,
+    }
+    try:
+        record_last_run(
+            _state["config"].paths.data / "state",
+            op_type="consolidation",
+            outcome=_full_outcome,
+            summary=f"Full cycle {_full_outcome}: {total_keys} total keys",
+            detail=_full_detail,
+        )
+        # Auto-resolve op-level incidents cleared by a successful full cycle.
+        _full_state_dir = _state["config"].paths.data / "state"
+        resolve_incidents_by_type(_full_state_dir, "consolidation_crash")
+        resolve_incidents_by_type(_full_state_dir, "vram_exhausted")
+        resolve_incidents_by_type(_full_state_dir, "extraction_failed")
+        # Full-cycle path mirrors the interim path — resolve
+        # consolidation_retry_exhausted only when the cycle returned zero
+        # recall-failed session ids and was not itself aborted.
+        if not result.get("recall_failed_session_ids", []) and result.get(
+            "mode", "full_trained"
+        ) not in {"aborted"}:
+            resolve_incidents_by_type(_full_state_dir, "consolidation_retry_exhausted")
+        # A completed fold drains the interim ring — overdue and ring-cap
+        # incidents are all resolved regardless of recall outcome.
+        resolve_incidents_by_type(_full_state_dir, "full_consolidation_overdue")
+        resolve_incidents_by_type(_full_state_dir, "interim_cap_reached")
+        resolve_incidents_by_type(_full_state_dir, "interim_overflow_pending")
+    except Exception:
+        logger.exception("Post-full-cycle run-status/incident bookkeeping failed (non-fatal)")
+    _state["consolidating"] = False
+    logger.info("Full cycle bookkeeping complete — %d total keys", total_keys)
 
 
 def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
@@ -13594,40 +13842,17 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         SessionClass,
         _save_key_metadata,
         classify_session,
-        create_consolidation_loop,
         session_retention_dir,
     )
 
     config = _state["config"]
 
-    loop = _state.get("consolidation_loop")
-    if loop is None:
-        loop = create_consolidation_loop(
-            _state["model"],
-            _state["tokenizer"],
-            config,
-            _state["memory_store"],
-            state_provider=lambda: _state,
-        )
-        _state["consolidation_loop"] = loop
-        _state["model"] = loop.model
+    def _run_full_cycle(loop, bt) -> "tuple[str, Callable[[], None] | None]":
+        """Run on the BG trainer worker thread under the GPU lock.
 
-    bt = _active_bg_trainer(config)
-    _state["consolidation_loop"]._bg_trainer = bt
-
-    def _run_full_cycle() -> None:
-        """Run on the BG trainer worker thread under the GPU lock."""
-        # T2b: pre-task GPU cooldown gate — wait until GPU is cool before the
-        # full-cycle fold (extraction + training) burst.  One call per
-        # full-fold kickoff; NOT called inside the per-session extraction loop.
-        # Bounded by cooldown_gate_max_wait_fold_s (default 300 s); the fold
-        # runs async off the event loop so a wait here does not block requests.
-        wait_for_cooldown(
-            config.vram.cooldown_gate_threshold_c,
-            config.vram.cooldown_gate_max_wait_fold_s,
-            config.vram.cooldown_gate_poll_s,
-            label="fold",
-        )
+        The entry cooldown gate, the try/except crash envelope, and the
+        model-handle refresh are owned by ``_run_stage_b_cycle``.
+        """
         # Voice eviction: the standard full cycle (count > 0) collapses existing
         # interim slots (already-trained keys) into main — it does not run the
         # extraction chain, so the KV-cache spikes that motivate eviction do not
@@ -13806,8 +14031,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                                 "at": datetime.now(timezone.utc).isoformat(),
                             },
                         )
-                        _state["consolidating"] = False
-                        return
+                        return "extraction_failed", None
 
                     for qa in episodic_rels:
                         qa["speaker_id"] = session_speaker_id
@@ -13853,39 +14077,17 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                     consume_pending=_consume_pending,
                 )
         except AbortedDuringConsolidation as exc:
-            # aborted = normal yield-to-chat outcome; NOT an incident.
+            # aborted = normal yield-to-chat outcome; NOT an incident — a
+            # normal terminal return, never raised past this point (raising
+            # to _run_stage_b_cycle would record a consolidation_crash
+            # incident, which this is not).
             logger.info("Full consolidation aborted for inference: %s", exc)
-            try:
-                record_last_run(
-                    _state["config"].paths.data / "state",
-                    op_type="consolidation",
-                    outcome="aborted",
-                    summary="Full consolidation aborted to yield GPU for inference",
-                    detail={},
-                )
-            except Exception:
-                logger.exception("Failed to record aborted run status (non-fatal)")
-            _state["consolidating"] = False
-            return
-        except Exception:
-            logger.exception("Full consolidation failed")
-            try:
-                record_incident(
-                    _state["config"].paths.data / "state",
-                    type="consolidation_crash",
-                    key="full",
-                    severity="failed",
-                    summary="Full consolidation crashed unexpectedly",
-                    detail={},
-                )
-            except Exception:
-                logger.exception("Failed to record consolidation_crash incident (non-fatal)")
-            _state["consolidating"] = False
-            return
-
-        # Pick up any PeftModel wrapper rebinding done by the per-tier
-        # delete_adapter / create_adapter cycles inside consolidate_interim_adapters.
-        _state["model"] = loop.model
+            return "aborted", functools.partial(
+                _finalize_full_status_only,
+                outcome="aborted",
+                summary="Full consolidation aborted to yield GPU for inference",
+                detail={},
+            )
 
         logger.info(
             "Full cycle complete — tiers_rebuilt=%s, drift=%d, rolled_back=%s",
@@ -13919,22 +14121,6 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # True and the fold re-fires next window.  Do not call mark_consolidated.
         if result.get("status") == "accumulating":
             _acc_reason = result.get("accumulating_reason", {})
-            try:
-                record_last_run(
-                    _state["config"].paths.data / "state",
-                    op_type="consolidation",
-                    outcome="accumulating",
-                    summary=(
-                        f"Accumulating — total keys below floor {_acc_reason.get('floor', '?')}"
-                    ),
-                    detail={
-                        "accumulating_reason": _acc_reason,
-                        "tiers_rebuilt": [],
-                    },
-                )
-            except Exception:
-                logger.exception("Failed to record accumulating run status (non-fatal)")
-            _state["consolidating"] = False
             logger.info(
                 "Full cycle accumulating — total keys below floor %d; "
                 "sessions left pending, window stamp NOT updated so next tick re-fires. "
@@ -13942,27 +14128,18 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 _acc_reason.get("floor", "?"),
                 _acc_reason,
             )
-            return
+            return "accumulating", functools.partial(
+                _finalize_full_status_only,
+                outcome="accumulating",
+                summary=f"Accumulating — total keys below floor {_acc_reason.get('floor', '?')}",
+                detail={"accumulating_reason": _acc_reason, "tiers_rebuilt": []},
+            )
 
         # Under housekeeping=True, DO NOT treat tiers_rebuilt==[]
         # as a noop.  The housekeeping fold ran the full merger topology even with
         # no interim slots; its result is the groomed graph, not an absence of work.
         # Only the SCHEDULED path returns early on the empty-tiers-rebuilt signal.
         if not housekeeping and not result.get("tiers_rebuilt"):
-            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-            try:
-                record_last_run(
-                    _state["config"].paths.data / "state",
-                    op_type="consolidation",
-                    outcome="noop",
-                    summary="Full cycle no-op — nothing to rebuild",
-                    detail={
-                        "tiers_rebuilt": [],
-                        "graph_drift_count": result.get("graph_drift_count", 0),
-                    },
-                )
-            except Exception:
-                logger.exception("Failed to record noop run status (non-fatal)")
             # MF-A Site A: at count==0 the consume-pending pre-stage extracted
             # sessions into merger.graph, but the fold found nothing new to train
             # (all facts already present after dedup).  Mark extraction-succeeded
@@ -13976,20 +14153,28 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                     )
                 except Exception:
                     logger.exception("consume-pending noop: mark_consolidated failed (non-fatal)")
-            _state["consolidating"] = False
             logger.info(
                 "Full cycle no-op — nothing to rebuild, inner finalize already "
                 "ran inside consolidate_interim_adapters; consolidating flag cleared"
             )
-            return
+            return "noop", functools.partial(
+                _finalize_full_status_only,
+                outcome="noop",
+                summary="Full cycle no-op — nothing to rebuild",
+                detail={
+                    "tiers_rebuilt": [],
+                    "graph_drift_count": result.get("graph_drift_count", 0),
+                },
+                touch_last_consolidation=True,
+            )
 
         # The rebuilt main slots were already persisted+verified to disk inside
         # consolidate_interim_adapters' finalize (between the registry rewrite
         # and the interim purge), so the on-disk main meta.json carries a fresh
         # window_stamp + registry_sha256 and the slots remount on restart. If
-        # that persist/verify had failed, the method would have raised and we
-        # would have landed in the ``except Exception`` handler above with
-        # sessions left pending — so reaching here means main is durable.
+        # that persist/verify had failed, the method would have raised and
+        # propagated to ``_run_stage_b_cycle``'s crash envelope (consolidation_crash
+        # incident, sessions left pending) — so reaching here means main is durable.
 
         # Persist key metadata.
         #
@@ -14064,92 +14249,17 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 )
                 staged_stats = {"boot_degraded": None, "store_load_degraded": True}
 
-        def _finalize_full() -> None:
-            """CPU-only event-loop closure — no GPU work.
+        return "full_trained", functools.partial(
+            _finalize_full, loop, result, staged_e, staged_r, staged_b, staged_stats
+        )
 
-            Publishes the staged store contents built on the worker thread,
-            updates _state flags, revalidates manifests, reloads the router,
-            and records the consolidation result.
-
-            Step order is load-bearing:
-            a. store.swap — atomically publish new entries/registry/bookkeeping,
-               ONLY when staged_stats["store_load_degraded"] is False.  A
-               degraded build preserves the live store; a legitimately empty
-               registry (store_load_degraded=False, no active keys) still swaps.
-            b. _state boot_degraded / store_load_degraded — from staged_stats,
-               always propagated regardless of whether swap ran.
-            c. _revalidate_main_adapter_manifests — reads fresh on-disk slots.
-            d. _state["router"].reload() — AFTER the swap so the speaker index
-               is built from the freshly-published bookkeeping.  (Previously
-               router.reload ran BEFORE hydrate, which meant the index was built
-               from the pre-fold bookkeeping.  Correct ordering is here.)
-            e. _state flags / result bookkeeping — last_consolidation etc.
-            """
-            if loop.store.replay_enabled:
-                # a. Atomically publish only when the registry build SUCCEEDED.
-                # A degraded build (store_load_degraded=True, raised internally
-                # or caught in the except above) must not wipe the live
-                # registry/bookkeeping — preserve the authoritative in-RAM
-                # state and let queries self-heal on-miss.  A legitimately
-                # empty registry (store_load_degraded=False, read succeeded
-                # with no active keys) DOES swap.
-                if not staged_stats["store_load_degraded"]:
-                    loop.store.swap(staged_e, staged_r, staged_b)
-                # b. Propagate degraded flags regardless of whether we swapped.
-                _state["store_load_degraded"] = staged_stats["store_load_degraded"]
-                _state["boot_degraded"] = staged_stats["boot_degraded"]
-            # c. Re-validate manifests now that main slots have been re-saved
-            #    with a fresh registry hash + window_stamp.  Without this,
-            #    /status keeps showing "FINGERPRINT MISMATCH" until restart.
-            _revalidate_main_adapter_manifests(_state)
-            # d. Reload router AFTER swap so the speaker index is built from
-            #    the freshly-published bookkeeping (phase-2 ordering fix).
-            _state["router"].reload()
-            # e. Result bookkeeping.
-            total_keys = len(loop.store.all_active_keys()) if loop.store.replay_enabled else 0
-            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-            _full_outcome = "rolled_back" if result.get("rolled_back") else "full_trained"
-            _full_detail = {
-                "tiers_rebuilt": result.get("tiers_rebuilt", []),
-                "rollback_tier": result.get("rollback_tier"),
-                "graph_drift_count": result.get("graph_drift_count", 0),
-                "total_keys": total_keys,
-            }
-            try:
-                record_last_run(
-                    _state["config"].paths.data / "state",
-                    op_type="consolidation",
-                    outcome=_full_outcome,
-                    summary=f"Full cycle {_full_outcome}: {total_keys} total keys",
-                    detail=_full_detail,
-                )
-                # Auto-resolve op-level incidents cleared by a successful full cycle.
-                _full_state_dir = _state["config"].paths.data / "state"
-                resolve_incidents_by_type(_full_state_dir, "consolidation_crash")
-                resolve_incidents_by_type(_full_state_dir, "vram_exhausted")
-                resolve_incidents_by_type(_full_state_dir, "extraction_failed")
-                # Full-cycle path mirrors the interim path — resolve
-                # consolidation_retry_exhausted only when the cycle returned zero
-                # recall-failed session ids and was not itself aborted.
-                if not result.get("recall_failed_session_ids", []) and result.get(
-                    "mode", "full_trained"
-                ) not in {"aborted"}:
-                    resolve_incidents_by_type(_full_state_dir, "consolidation_retry_exhausted")
-                # A completed fold drains the interim ring — overdue and ring-cap
-                # incidents are all resolved regardless of recall outcome.
-                resolve_incidents_by_type(_full_state_dir, "full_consolidation_overdue")
-                resolve_incidents_by_type(_full_state_dir, "interim_cap_reached")
-                resolve_incidents_by_type(_full_state_dir, "interim_overflow_pending")
-            except Exception:
-                logger.exception(
-                    "Post-full-cycle run-status/incident bookkeeping failed (non-fatal)"
-                )
-            _state["consolidating"] = False
-            logger.info("Full cycle bookkeeping complete — %d total keys", total_keys)
-
-        _dispatch_finalize(_finalize_full)
-
-    bt.submit(_run_full_cycle, inference_fallback_adapter="episodic")
+    _run_stage_b_cycle(
+        kind="consolidation_crash",
+        incident_key="full",
+        failure_summary="Full consolidation crashed unexpectedly",
+        failure_detail={},
+        body=_run_full_cycle,
+    )
     logger.info("Full consolidation submitted to BG trainer")
 
 
@@ -14215,6 +14325,60 @@ def _arm_active_store_migration(config) -> bool:
     return False
 
 
+def _finalize_migration(loop, updated) -> None:
+    """Success/terminal finalizer for the active-store-migration Stage-B cycle.
+
+    Runs on the asyncio event loop via ``_dispatch_finalize``.  Records the
+    durable run-status row and, on ``all_tiers_done``, clears
+    ``pending_rehydration`` (restoring ``effective_mode`` to the operator's
+    configured mode) and auto-resolves migration incidents.  Partial
+    completion leaves ``pending_rehydration`` set so a re-trigger picks up
+    the remaining tiers.
+
+    Args:
+        loop: The cycle's ``ConsolidationLoop`` (post-migration PEFT rebind).
+        updated: The ``MigrationState`` returned by ``migrate``.
+    """
+    loop.model.eval()
+    _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
+    _all_done = updated.all_tiers_done(loop.store.tiers_with_registry())
+    _mig_outcome = "migration_complete" if _all_done else "migration_partial"
+    _mig_detail = {
+        "direction": updated.direction,
+        "completed_tiers": list(updated.completed_tiers),
+        "failed_tiers": dict(updated.failed_tiers),
+    }
+    try:
+        record_last_run(
+            _state["config"].paths.data / "state",
+            op_type="consolidation",
+            outcome=_mig_outcome,
+            summary=f"Migration {_mig_outcome}: direction={updated.direction}",
+            detail=_mig_detail,
+        )
+        if _all_done:
+            # Auto-resolve migration incidents on successful completion.
+            _mig_state_dir = _state["config"].paths.data / "state"
+            resolve_incidents_by_type(_mig_state_dir, "migration_error")
+            resolve_incidents_by_type(_mig_state_dir, "migration_phase_failed")
+    except Exception:
+        logger.exception("Post-migration run-status/incident bookkeeping failed (non-fatal)")
+    if _all_done:
+        _state["pending_rehydration"] = False
+        _state["effective_mode"] = _state["config"].consolidation.mode
+        logger.info(
+            "Active-store migration complete; effective_mode=%s",
+            _state["config"].consolidation.mode,
+        )
+    # Partial completion: pending_rehydration stays True so a re-trigger
+    # picks up remaining tiers. effective_mode stays at source_mode.
+    # peft_config alone is not a safe key set: a ``train → simulate``
+    # migration unloads main adapters, so iterating it misses them and
+    # the inference path sees a stale snapshot from boot.  Reading
+    # from disk also drops entries for slots the migration deleted.
+    _state["consolidating"] = False
+
+
 def _run_active_store_migration_sync() -> None:
     """Execute the pending active-store migration on a worker thread.
 
@@ -14235,7 +14399,6 @@ def _run_active_store_migration_sync() -> None:
         load_state,
         migrate,
     )
-    from paramem.server.consolidation import create_consolidation_loop
 
     config = _state["config"]
     state = load_state(config.adapter_dir)
@@ -14248,43 +14411,13 @@ def _run_active_store_migration_sync() -> None:
         logger.info("Active-store migration: state file absent — clearing pending flag")
         return
 
-    loop = _state.get("consolidation_loop")
-    if loop is None:
-        loop = create_consolidation_loop(
-            _state["model"],
-            _state["tokenizer"],
-            config,
-            _state["memory_store"],
-            state_provider=lambda: _state,
-        )
-        _state["consolidation_loop"] = loop
-        _state["model"] = loop.model
+    def _run_migration_on_worker(loop, bt) -> "tuple[str, Callable[[], None] | None]":
+        """Run on the BG-trainer worker thread under the GPU lock.
 
-    bt = _active_bg_trainer(config)
-    _state["consolidation_loop"]._bg_trainer = bt
-
-    def _run_migration_on_worker() -> None:
-        """Run on the BG-trainer worker thread under the GPU lock."""
-        try:
-            updated = migrate(loop, config, state)
-        except Exception:
-            logger.exception("Active-store migration raised — leaving state file on disk")
-            try:
-                record_incident(
-                    _state["config"].paths.data / "state",
-                    type="migration_error",
-                    key="active_store",
-                    severity="failed",
-                    summary="Active-store migration raised unexpectedly",
-                    detail={},
-                )
-            except Exception:
-                logger.exception("Failed to record migration_error incident (non-fatal)")
-            _state["consolidating"] = False
-            return
-
-        # Pick up any PEFT rebinding inside migrate's create_adapter calls.
-        _state["model"] = loop.model
+        The entry cooldown gate, the try/except crash envelope, and the
+        model-handle refresh are owned by ``_run_stage_b_cycle``.
+        """
+        updated = migrate(loop, config, state)
 
         logger.info(
             "Active-store migration done: direction=%s completed=%s failed=%s",
@@ -14293,51 +14426,15 @@ def _run_active_store_migration_sync() -> None:
             list(updated.failed_tiers.keys()),
         )
 
-        def _finalize_migration() -> None:
-            loop.model.eval()
-            _state["last_consolidation"] = datetime.now(timezone.utc).isoformat()
-            _all_done = updated.all_tiers_done(loop.store.tiers_with_registry())
-            _mig_outcome = "migration_complete" if _all_done else "migration_partial"
-            _mig_detail = {
-                "direction": updated.direction,
-                "completed_tiers": list(updated.completed_tiers),
-                "failed_tiers": dict(updated.failed_tiers),
-            }
-            try:
-                record_last_run(
-                    _state["config"].paths.data / "state",
-                    op_type="consolidation",
-                    outcome=_mig_outcome,
-                    summary=f"Migration {_mig_outcome}: direction={updated.direction}",
-                    detail=_mig_detail,
-                )
-                if _all_done:
-                    # Auto-resolve migration incidents on successful completion.
-                    _mig_state_dir = _state["config"].paths.data / "state"
-                    resolve_incidents_by_type(_mig_state_dir, "migration_error")
-                    resolve_incidents_by_type(_mig_state_dir, "migration_phase_failed")
-            except Exception:
-                logger.exception(
-                    "Post-migration run-status/incident bookkeeping failed (non-fatal)"
-                )
-            if _all_done:
-                _state["pending_rehydration"] = False
-                _state["effective_mode"] = config.consolidation.mode
-                logger.info(
-                    "Active-store migration complete; effective_mode=%s",
-                    config.consolidation.mode,
-                )
-            # Partial completion: pending_rehydration stays True so a re-trigger
-            # picks up remaining tiers. effective_mode stays at source_mode.
-            # peft_config alone is not a safe key set: a ``train → simulate``
-            # migration unloads main adapters, so iterating it misses them and
-            # the inference path sees a stale snapshot from boot.  Reading
-            # from disk also drops entries for slots the migration deleted.
-            _state["consolidating"] = False
+        return "migration_done", functools.partial(_finalize_migration, loop, updated)
 
-        _dispatch_finalize(_finalize_migration)
-
-    bt.submit(_run_migration_on_worker, inference_fallback_adapter="episodic")
+    _run_stage_b_cycle(
+        kind="migration_error",
+        incident_key="active_store",
+        failure_summary="Active-store migration raised unexpectedly",
+        failure_detail={},
+        body=_run_migration_on_worker,
+    )
     logger.info("Active-store migration submitted to BG trainer")
 
 

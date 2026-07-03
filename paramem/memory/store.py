@@ -551,6 +551,27 @@ class MemoryStore:
                         reg.remove(key)
             self._registry.setdefault(new_tier, KeyRegistry()).add(key)
 
+    def drop_tier(self, tier: str) -> None:
+        """Remove *tier* wholesale: its entries, registry (incl. simhash), and
+        the bookkeeping records for every key it held active.
+
+        Compensates a failed interim commit whose tier registration must be
+        rolled back atomically — the tier-granularity peer of :meth:`delete`
+        (single-key, all tiers) and :meth:`move` (single-key, cross-tier).
+        Bookkeeping has no tier index of its own (it is a flat ``key ->
+        record`` dict), so :meth:`active_keys_in_tier` is used to enumerate
+        which records to drop before the registry itself is removed.
+
+        No-op when *tier* is unknown to either ``_entries`` or ``_registry``.
+
+        The entire compound mutation (bookkeeping + entries + registry/simhash)
+        is performed under a single lock acquisition."""
+        with self._lock:
+            for key in self.active_keys_in_tier(tier):
+                self._bookkeeping.pop(key, None)
+            self._entries.pop(tier, None)
+            self._registry.pop(tier, None)
+
     # ------------------------------------------------------------------
     # SimHash fingerprints — public accessors
     # ------------------------------------------------------------------
@@ -841,6 +862,36 @@ class MemoryStore:
                 raise ValueError(
                     f"MemoryStore.discard_keys: unknown mode {mode!r}; expected 'erase' or 'stale'"
                 )
+
+    def reactivate(self, tier: str, key: str) -> None:
+        """Reverse a soft-stale transition for *key* in *tier* (rollback primitive).
+
+        The dual of ``discard_keys(mode="stale")`` — delegates to
+        :meth:`KeyRegistry.reactivate` on *tier*'s registry (mirroring how
+        ``discard_keys(mode="stale")`` delegates to ``reg.stale()``), moving
+        *key* back from the stale partition to active and restoring its
+        simhash fingerprint from the stale record.  Used to compensate a
+        failed interim commit: the shared soft-stale stage
+        (:meth:`~paramem.training.consolidation.ConsolidationLoop._apply_subtractive_removals_to_store`)
+        soft-stales pre-existing keys before the commit is durable; on
+        failure those keys must return to active exactly as before the fold
+        ran.
+
+        Guards ``replay_enabled`` (matching :meth:`discard_keys`): when
+        replay is disabled, this is a no-op.  Also a no-op when the tier has
+        no registry, or *key* is not in that tier's stale partition —
+        idempotent, safe to call from a compensation loop that does not
+        track whether it already ran.
+
+        The entire compound mutation (registry active-set + simhash) is
+        performed under a single lock acquisition."""
+        if not self._replay_enabled:
+            return
+        with self._lock:
+            reg = self._registry.get(tier)
+            if reg is None:
+                return
+            reg.reactivate(key)
 
     # ------------------------------------------------------------------
     # Snapshot / restore — cycle-resume rollback rope

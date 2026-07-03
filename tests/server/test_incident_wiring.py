@@ -577,6 +577,116 @@ class TestAutoResolve:
 
 
 # ---------------------------------------------------------------------------
+# Part A regression: an exception in the interim post-cycle bookkeeping
+# region (not just the run_consolidation_cycle call itself) must still
+# clear _state["consolidating"] and record a training_crash incident.  Before
+# the Stage-B cycle-lifecycle primitive, only the run_consolidation_cycle
+# call was try/except-wrapped; a crash anywhere in the unwrapped bookkeeping
+# region below it (session-buffer retry bump, incident recording, etc.)
+# left the flag stuck forever.  _run_stage_b_cycle's envelope now wraps the
+# ENTIRE interim body, closing that leak structurally.
+# ---------------------------------------------------------------------------
+
+
+class TestInterimBookkeepingRegionCrash:
+    def _drive_extract_and_start_training(self, state, tmp_path, *, bump_retry_error):
+        """Run _extract_and_start_training end to end with a mocked BG trainer.
+
+        Phase 1 extraction and run_consolidation_cycle are mocked (no GPU);
+        the crash is injected into session_buffer.bump_retry_and_release,
+        which lives in the interim body's post-cycle bookkeeping region —
+        outside the narrow try/except that only wraps run_consolidation_cycle
+        pre-refactor.
+        """
+        cfg = state["config"]
+        cfg.vram.cooldown_gate_threshold_c = 0
+        cfg.vram.vram_cache_headroom_gib = 0.5
+        cfg.consolidation.mode = "train"
+        cfg.consolidation.refresh_cadence = ""
+        cfg.consolidation.interim_overflow_slack = 0
+
+        loop = MagicMock()
+        loop.model = MagicMock(name="model")
+        loop.config.indexed_key_replay = True
+        loop.shutdown_requested = False
+        loop.extract_session.return_value = (
+            [
+                {
+                    "subject": "Alex",
+                    "predicate": "lives_in",
+                    "object": "Millfield",
+                    "relation_type": "factual",
+                }
+            ],
+            [],
+        )
+        # Recall-failed session forces the _count_sids branch, which calls
+        # session_buffer.bump_retry_and_release — the crash injection site.
+        loop.run_consolidation_cycle.return_value = {
+            "mode": "trained",
+            "adapter_name": "episodic_interim_t001",
+            "new_keys": [],
+            "recall_failed_session_ids": ["sess-1"],
+            "overflow_slot": False,
+        }
+        state["consolidation_loop"] = loop
+
+        sb = state["session_buffer"]
+        sb.pending_facts.return_value = [
+            {"session_id": "sess-1", "speaker_id": "speaker0", "has_voice_embedding": False}
+        ]
+        sb.get_pending.return_value = [
+            {
+                "session_id": "sess-1",
+                "speaker_id": "speaker0",
+                "transcript": "hi",
+                "source_type": "transcript",
+                "started_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        sb._consolidation_retry_cap = 3
+        sb._sessions = {}
+        sb.bump_retry_and_release.side_effect = bump_retry_error
+
+        mock_bt = MagicMock()
+        mock_bt.submit.side_effect = lambda fn, **kw: fn()
+
+        with (
+            patch("paramem.server.app.BackgroundTrainer", return_value=mock_bt),
+            patch("paramem.server.app.check_vram_headroom"),
+            patch("paramem.server.app.vram_scope"),
+            patch("paramem.server.app._set_voice_pipeline_profile"),
+            patch("paramem.server.consolidation.session_retention_dir", return_value=None),
+        ):
+            app_module._extract_and_start_training()
+
+    def test_bookkeeping_crash_clears_consolidating_flag(self, state, tmp_path):
+        """An uncaught exception in the bookkeeping region still clears the flag."""
+        state["consolidating"] = True
+        self._drive_extract_and_start_training(
+            state, tmp_path, bump_retry_error=RuntimeError("disk io error")
+        )
+        assert state["consolidating"] is False, (
+            "_state['consolidating'] must be cleared even when the interim body "
+            "raises outside the run_consolidation_cycle call itself"
+        )
+
+    def test_bookkeeping_crash_records_training_crash_incident(self, state, tmp_path):
+        """The crash records a training_crash/interim incident via the shared envelope."""
+        state["consolidating"] = True
+        self._drive_extract_and_start_training(
+            state, tmp_path, bump_retry_error=RuntimeError("disk io error")
+        )
+        incidents = read_incidents(_state_dir(state))
+        training_crashes = [i for i in incidents if i.type == "training_crash"]
+        assert len(training_crashes) == 1, (
+            f"expected exactly one training_crash incident; got {incidents}"
+        )
+        assert training_crashes[0].id == "training_crash:interim"
+        assert training_crashes[0].status == "active"
+
+
+# ---------------------------------------------------------------------------
 # T17b — consolidation_retry_exhausted NOT resolved by Pass B
 # ---------------------------------------------------------------------------
 

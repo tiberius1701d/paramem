@@ -566,6 +566,84 @@ class TestMoveDelete:
 
 
 # ---------------------------------------------------------------------------
+# drop_tier — tier-granularity rollback primitive (Part B)
+# ---------------------------------------------------------------------------
+
+
+class TestDropTier:
+    def test_drop_tier_removes_entries_registry_and_bookkeeping(self):
+        s = MemoryStore()
+        s.put("episodic_interim_t001", "graph1", _entry("graph1"), simhash=0xCAFE)
+        s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="t0")
+        s.drop_tier("episodic_interim_t001")
+        assert s.entries_in_tier("episodic_interim_t001") == {}
+        assert s.has_registry("episodic_interim_t001") is False
+        assert s.bookkeeping_for_key("graph1") is None
+
+    def test_drop_tier_does_not_touch_other_tiers(self):
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"), simhash=1)
+        s.set_bookkeeping("graph1", speaker_id="speaker0", relation_type="factual", first_seen="t0")
+        s.put("episodic_interim_t001", "graph2", _entry("graph2"), simhash=2)
+        s.drop_tier("episodic_interim_t001")
+        assert s.get("graph1") == _entry("graph1")
+        assert s.bookkeeping_for_key("graph1") is not None
+        assert s.entries_in_tier("episodic_interim_t001") == {}
+
+    def test_drop_tier_unknown_tier_is_noop(self):
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"))
+        s.drop_tier("does_not_exist")  # must not raise
+        assert s.get("graph1") == _entry("graph1")
+
+
+# ---------------------------------------------------------------------------
+# reactivate — dual of discard_keys(mode="stale") (Part B rollback primitive)
+# ---------------------------------------------------------------------------
+
+
+class TestReactivate:
+    def test_reactivate_restores_active_and_simhash(self):
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"), simhash=0xBEEF)
+        s.discard_keys(["graph1"], mode="stale")
+        assert s.is_stale("graph1")
+        assert "graph1" not in s.registry("episodic")
+
+        s.reactivate("episodic", "graph1")
+        assert "graph1" in s.registry("episodic")
+        assert not s.is_stale("graph1")
+        assert s.simhash("episodic", "graph1") == 0xBEEF
+
+    def test_reactivate_noop_when_key_not_stale(self):
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"), simhash=1)
+        s.reactivate("episodic", "graph1")  # already active — must not raise
+        assert "graph1" in s.registry("episodic")
+
+    def test_reactivate_noop_when_tier_unknown(self):
+        s = MemoryStore()
+        s.reactivate("does_not_exist", "graph1")  # must not raise
+
+    def test_reactivate_key_with_no_simhash(self):
+        """A staled key that never had a fingerprint reactivates cleanly (fp=None branch)."""
+        s = MemoryStore()
+        s.put("episodic", "graph1", _entry("graph1"))  # no simhash= kwarg
+        s.discard_keys(["graph1"], mode="stale")
+        assert s.is_stale("graph1")
+        s.reactivate("episodic", "graph1")
+        assert "graph1" in s.registry("episodic")
+        assert not s.is_stale("graph1")
+        assert s.simhash("episodic", "graph1") is None
+
+    def test_reactivate_noop_when_replay_disabled(self):
+        """reactivate() is a no-op guard, matching discard_keys' replay_enabled gate."""
+        s = MemoryStore(replay_enabled=False)
+        s.put("episodic", "graph1", _entry("graph1"), simhash=1, register=False)
+        s.reactivate("episodic", "graph1")  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # Snapshot / restore — cycle-resume rollback rope
 # ---------------------------------------------------------------------------
 

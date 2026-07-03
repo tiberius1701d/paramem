@@ -2279,9 +2279,11 @@ class ConsolidationLoop:
             to ``{"stale_cycles": int, "simhash": int|None}`` records.  Passed
             by the fold caller to
             :meth:`_reset_main_tier_registries_and_simhashes` so the rebuilt
-            registry seeds the stale partition.  Interim callers can ignore the
-            return value (``store.discard_keys`` already mutated the in-memory
-            registry; ``commit_tier_slot`` persists it).
+            registry seeds the stale partition.  The interim caller (in
+            :meth:`_run_fold`) also captures it: on a failed commit those
+            keys are re-activated via :meth:`MemoryStore.reactivate` before
+            re-raising (``store.discard_keys`` already mutated the in-memory
+            registry; ``commit_tier_slot`` persists it on success).
         """
         _ledger: dict[str, dict] = getattr(self.merger, "removal_ledger", {})
         # Reasons that become soft-stale at ALL scopes (ingest, interim, fold).
@@ -3546,10 +3548,20 @@ class ConsolidationLoop:
         # ------------------------------------------------------------------
         # interim mini-fold (scope.persist == "interim_slot")
         # ------------------------------------------------------------------
-        # Source: weights (reconstruct from adapter weights, scoped to tier).
-        # Persist: commit_tier_slot (writes adapter weights + sidecar JSON).
-        # Single-tier training; promote=False, tier_floor=False.
+        # Source: weights (train) or disk (simulate) — reconstruct scoped to
+        # tier for both.  Persist: commit_tier_slot (writes adapter weights
+        # for train, graph.json sidecar for simulate).  Single-tier training
+        # (weights only); promote=False, tier_floor=False.
         # Extracted from the training body of run_consolidation_cycle.
+        # Transactional commit window: a raise from _persist_fold onward (or
+        # from the simhash/store-write steps just before it) is compensated —
+        # soft-stales re-activated, promotions reversed, the fresh interim
+        # tier dropped wholesale — before the exception is re-raised, so a
+        # failed commit leaves the store byte-identical to its pre-cycle state.
+        # Unconditional across BOTH venues: the simulate path's store writes
+        # live inside this same commit window (no separate pre-window put
+        # loop), so a simulate-mode _persist_fold failure is compensated
+        # identically to the weights path.
         # ------------------------------------------------------------------
         if scope.persist == "interim_slot":
             # --- interim-slot fold-stamp (minted before any store mutation) ---
@@ -3627,36 +3639,20 @@ class ConsolidationLoop:
                 new_keyed_interim = new_keyed_episodic + new_keyed_proc
                 new_key_ids = [r["entry"]["key"] for r in new_keyed_interim]
 
-                # Simulate path: apply store mutations immediately (no training step).
-                if scope.source != "weights":
-                    for rec in new_keyed_interim:
-                        _entry = rec["entry"]
-                        _key = _entry["key"]
-                        self.store.put(
-                            adapter_name,
-                            _key,
-                            _entry,
-                            simhash=compute_simhash(
-                                _key, _entry["subject"], rec["predicate"], _entry["object"]
-                            ),
-                        )
-                        self.store.set_bookkeeping(
-                            _key,
-                            speaker_id=rec["speaker_id"],
-                            relation_type=rec["relation_type"],
-                            reinforcement_count=1,
-                            last_reinforced_cycle=self.cycle_count,
-                            last_seen=rec.get("last_seen", ""),
-                            first_seen=rec.get("first_seen", ""),
-                            allow_empty_speaker=(rec["speaker_id"] == ""),
-                        )
-                    self._indexed_next_index += len(new_keyed_episodic)
-                    self._procedural_next_index += len(new_keyed_proc)
+                # NOTE: the simulate path (scope.source != "weights") no longer
+                # applies its store mutations here.  There is no training step
+                # to gate on for simulate, but the writes are otherwise
+                # identical to the weights path's deferred-mutation loop below
+                # (same new_keyed_interim list) — both now go through the SAME
+                # commit-window try so a simulate-mode _persist_fold failure is
+                # compensated identically to the weights path (see the commit
+                # window below).
 
                 # --- Semantic promotion transfer (weights path, when
                 # promotions supplied).  Separate from _promote_mature_keys_inline;
                 # operates on the interim keyed set before training.
                 promoted_key_set: set[str] = set()
+                promoted_origin_tiers: dict[str, str] = {}
                 if scope.source == "weights" and new_promotions:
                     _promo_set = {n.lower() for n in new_promotions}
                     for _t, _k, _e in list(self.store.iter_entries()):
@@ -3668,6 +3664,9 @@ class ConsolidationLoop:
                         if _mentions and not self.store.has_simhash("semantic", _k):
                             promoted_key_set.add(_k)
                     for _pk in promoted_key_set:
+                        _origin_tier = self.store.tier_of(_pk)
+                        if _origin_tier is not None:
+                            promoted_origin_tiers[_pk] = _origin_tier
                         self.store.move(_pk, "semantic")
                     all_interim_keyed = [
                         kp for kp in all_interim_keyed if kp["key"] not in promoted_key_set
@@ -3713,19 +3712,45 @@ class ConsolidationLoop:
                 else:
                     _epi_passing = None
 
-                # Update interim simhash registry.
+                # --- Commit window: simhash registration, deferred store writes,
+                # subtractive soft-stales, and the durable persist — all-or-nothing.
+                # A raise anywhere in this window (including inside _persist_fold)
+                # means the interim commit failed; the in-memory mutations already
+                # applied this cycle — the promotion moves captured above, plus
+                # whatever ran below before the raise — are compensated: soft-staled
+                # pre-existing keys are re-activated FIRST (a key promoted this
+                # cycle and independently soft-staled afterward is stale in its
+                # post-promotion tier — reactivating before the promotion reversal
+                # guarantees store.move only ever sees a clean active key), then
+                # promotions move back to their origin tier, then the fresh
+                # interim tier is dropped wholesale — so the store is left
+                # byte-identical to its pre-cycle state before the exception is
+                # re-raised unchanged (caller retry/pinning semantics untouched).
+                # Counters are deliberately NOT part of the compensated state —
+                # they are only incremented after this block succeeds, so a
+                # failure leaves them unadvanced with no capture/restore needed.
                 _passing_interim = (
                     [kp for kp in all_interim_keyed if kp["key"] in _epi_passing]
                     if _epi_passing is not None
                     else all_interim_keyed
                 )
-                self.store.replace_simhashes_in_tier(adapter_name, build_registry(_passing_interim))
-
-                # --- Apply deferred interim store mutations (weights source) ---
                 _recall_failed_session_ids: set[str] = set()
-                if scope.source == "weights":
-                    _ep_flushed = 0
-                    _proc_flushed = 0
+                _ep_flushed = 0
+                _proc_flushed = 0
+                _soft_stale_by_tier: dict[str, dict] = {}
+                try:
+                    # Update interim simhash registry.
+                    self.store.replace_simhashes_in_tier(
+                        adapter_name, build_registry(_passing_interim)
+                    )
+
+                    # --- Apply deferred interim store mutations (both venues) ---
+                    # Weights source gates on the post-training recall verdict
+                    # (_epi_passing); simulate has no training step, so
+                    # _epi_passing is None (set in the else branch above) and
+                    # every key passes through unconditionally — the same
+                    # "no verdict admits all" rule already used for a
+                    # weights-source cycle with early-stop disabled.
                     for rec in new_keyed_interim:
                         _entry = rec["entry"]
                         _key = _entry["key"]
@@ -3762,19 +3787,45 @@ class ConsolidationLoop:
                             _proc_flushed += 1
                         else:
                             _ep_flushed += 1
-                    self._indexed_next_index += _ep_flushed
-                    self._procedural_next_index += _proc_flushed
 
-                # --- Shared soft-stale stage (M5) ---
-                self._apply_subtractive_removals_to_store(scope=scope.subtractive_scope)
+                    # --- Shared soft-stale stage (M5) ---
+                    _soft_stale_by_tier = self._apply_subtractive_removals_to_store(
+                        scope=scope.subtractive_scope
+                    )
 
-                # --- Persist interim slot ---
-                self._persist_fold(
-                    scope,
-                    adapter_name=adapter_name,
-                    stamp=stamp,
-                    all_keyed=all_interim_keyed,
-                )
+                    # --- Persist interim slot ---
+                    self._persist_fold(
+                        scope,
+                        adapter_name=adapter_name,
+                        stamp=stamp,
+                        all_keyed=all_interim_keyed,
+                    )
+                except Exception:
+                    # Re-activate soft-stales BEFORE reversing promotions: a key
+                    # that was promoted THIS cycle and independently soft-staled
+                    # afterward (same-cycle overlap) is stale in its NEW
+                    # (post-promotion) tier at this point.  store.move's
+                    # registry-transfer step only recognizes a key as owned by
+                    # its old tier via the active-only membership check, so
+                    # moving it back while still stale would leave an orphaned
+                    # stale record behind and register it active in BOTH tiers.
+                    # Re-activating first guarantees move() always operates on
+                    # a clean active key.
+                    for _stale_tier, _stale_keys in _soft_stale_by_tier.items():
+                        for _stale_key in _stale_keys:
+                            self.store.reactivate(_stale_tier, _stale_key)
+                    for _pk, _origin_tier in promoted_origin_tiers.items():
+                        self.store.move(_pk, _origin_tier)
+                    self.store.drop_tier(adapter_name)
+                    raise
+
+                # Counters advance only after the commit above succeeded —
+                # for both venues; simulate's counters are no longer bumped
+                # eagerly outside the commit window (see the NOTE above the
+                # promotion-transfer block).
+                self._indexed_next_index += _ep_flushed
+                self._procedural_next_index += _proc_flushed
+
                 # Clear the interim-slot fold_resume.json marker on clean commit.
                 self._clear_fold_resume()
 
