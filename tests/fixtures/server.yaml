@@ -54,7 +54,7 @@
 # QUALITY CONSIDERATIONS (self-bias risk)
 # - If your extraction pipeline uses the SAME cloud model/provider that will
 #   answer inference queries, the LLM-judge stages (noise_filter,
-#   plausibility, ner_check, anonymization verify, STT correction) become
+#   plausibility, ner_check, anonymization verify) become
 #   "model-as-judge-for-itself": the judge rates its own outputs, confirming
 #   its own biases and systematically over- or under-filtering certain
 #   fact classes. Expected quality degradation.
@@ -254,7 +254,6 @@ consolidation:
   extraction_max_tokens: 8192  # output-token budget — must match server.yaml.example to avoid silent truncation in simulate-mode probes (gated by tests/server/test_config_parity.py)
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap — must match server.yaml.example (parity-gated)
   calibrate_endpoint_enabled: false  # opt-in dev tool; off in tests by default
-  extraction_stt_correction: true  # correct STT errors from assistant responses
   extraction_ha_validation: true  # validate locations against HA home context
   extraction_noise_filter: anthropic  # dev-test posture: exercise SOTA enrichment code paths. Cloud calls fall through gracefully when ANTHROPIC_API_KEY is unset.
   extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering

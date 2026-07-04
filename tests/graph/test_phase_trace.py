@@ -195,8 +195,8 @@ class TestBackwardCompat:
 class TestGraphRebindingDecoupling:
     def test_trace_survives_graph_rebinding(self):
         """The architectural reason for contextvar-backed trace: helpers
-        rebind ``graph = ...`` (parse, STT correction, HA validation,
-        etc.) — the trace must NOT live on a particular SessionGraph."""
+        rebind ``graph = ...`` (parse, HA validation, etc.) — the trace
+        must NOT live on a particular SessionGraph."""
         with extraction_trace() as trace:
             graph_a = _empty_graph()
             with phase_trace("local_extract") as t:
@@ -251,7 +251,6 @@ class TestExtractGraphStopPhase:
             speaker_id="Speaker0",
             speaker_name="Alex",
             validate=False,  # don't try the SOTA pipeline
-            stt_correction=False,
             ha_validation=False,
             stop_phase="local_extract",
         )

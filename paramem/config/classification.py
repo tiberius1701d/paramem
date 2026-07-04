@@ -101,7 +101,6 @@ CLASSIFICATION: Final[dict[str, Tier]] = {
     "consolidation.decay_window": Tier.PIPELINE_ALTERING,
     "consolidation.max_interim_count": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_max_tokens": Tier.PIPELINE_ALTERING,
-    "consolidation.extraction_stt_correction": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_ha_validation": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_noise_filter": Tier.PIPELINE_ALTERING,
     "consolidation.extraction_noise_filter_model": Tier.PIPELINE_ALTERING,

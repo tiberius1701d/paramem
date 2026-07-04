@@ -226,7 +226,6 @@ def test_procedural_kwargs_match_extract_procedural_graph_signature():
         "max_tokens",
         "prompts_dir",
         "model_alias",
-        "stt_correction",
         "speaker_name",
         "speaker_id",
         "system_prompt_filename",
@@ -463,7 +462,6 @@ def test_server_yaml_extraction_flags_round_trip(tmp_path):
 
     flipped = {
         "extraction_max_tokens": 4096,
-        "extraction_stt_correction": False,
         "extraction_ha_validation": False,
         "extraction_noise_filter": "",
         "extraction_noise_filter_model": "claude-other",
@@ -605,7 +603,6 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
     flipped = {
         "extraction_temperature": 0.7,
         "extraction_max_tokens": 4096,
-        "extraction_stt_correction": False,
         "extraction_ha_validation": False,
         "extraction_noise_filter": "claude",
         "extraction_noise_filter_model": "claude-other",
@@ -716,14 +713,12 @@ def test_run_threads_positional_args_procedural(monkeypatch):
         "s042",
         speaker_id="Speaker0",
         speaker_name="Alex",
-        stt_correction=False,
     )
 
     assert captured["model"] is model_sentinel
     assert captured["transcript"] == "alex prefers coffee"
     assert captured["session_id"] == "s042"
     assert captured["kwargs"]["speaker_name"] == "Alex"
-    assert captured["kwargs"]["stt_correction"] is False
     assert captured["kwargs"]["prompts_dir"] == "/custom/prompts"
 
 
@@ -768,8 +763,7 @@ def test_run_uses_default_prompts_for_document(monkeypatch):
 
 def test_run_document_flips_gate_defaults(monkeypatch):
     """``source_type='document'`` survives as a runtime distinction for
-    gate defaults — ``stt_correction`` and ``ha_validation`` default to
-    ``False`` because written text has no STT artefact surface and HA
+    gate defaults — ``ha_validation`` defaults to ``False`` because HA
     grounding is dialogue-only.  Prompt selection no longer differs.
     """
     captured = {}
@@ -782,7 +776,6 @@ def test_run_document_flips_gate_defaults(monkeypatch):
 
     pipeline = _make_pipeline()
     pipeline.run("doc text", "doc-001", source_type="document", speaker_id="Speaker0")
-    assert captured["kwargs"]["stt_correction"] is False
     assert captured["kwargs"]["ha_validation"] is False
 
 

@@ -654,7 +654,7 @@ def main(argv: list[str] | None = None) -> int:
             "Forwarded to /calibrate/extract — pipeline returns immediately "
             "after the named phase completes (saves compute when only early "
             "phases need inspection). Valid names: local_extract, "
-            "stt_correction, ha_validation, anonymize, anonymize_verify, "
+            "ha_validation, anonymize, anonymize_verify, "
             "anonymize_repair, sota_enrich, anon_plausibility, deanon, "
             "deanon_plausibility. Default: run full pipeline."
         ),

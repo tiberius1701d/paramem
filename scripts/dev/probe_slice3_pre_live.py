@@ -241,7 +241,6 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
         output_dir=out_dir,
         save_cycle_snapshots=False,
         persist_graph=False,
-        extraction_stt_correction=False,
         extraction_ha_validation=False,
         extraction_noise_filter="off",
         extraction_plausibility_judge="off",

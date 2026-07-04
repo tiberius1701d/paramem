@@ -14,9 +14,8 @@ Architecture
 
 The trace is **decoupled from any particular** :class:`SessionGraph`
 **instance**.  Pipeline helpers freely rebind ``graph = ...`` (e.g.
-:func:`_parse_extraction`, :func:`_correct_entity_names`,
-:func:`_validate_with_ha_context` all return new ``SessionGraph``
-objects) — the trace survives because it lives in a
+:func:`_parse_extraction`, :func:`_validate_with_ha_context` both
+return new ``SessionGraph`` objects) — the trace survives because it lives in a
 :class:`contextvars.ContextVar` set up by an outer
 :func:`extraction_trace` scope, not on the graph.
 
@@ -54,8 +53,6 @@ step runs (in firing order for the default configuration):
 Phase                       Notes
 ==========================  ===============================================
 ``local_extract``           Mistral runs the extraction prompt.
-``stt_correction``          Pure-Python entity-name typo correction.
-                            ``raw_output=None``.
 ``ha_validation``           Pure-Python location validation against HA
                             home context. ``raw_output=None``.
 ``anonymize``               Mistral runs the anonymizer; emits mapping
@@ -115,7 +112,6 @@ if TYPE_CHECKING:
 # simply do not fire — order in the trace reflects what actually ran.
 PHASE_NAMES: tuple[str, ...] = (
     "local_extract",
-    "stt_correction",
     "ha_validation",
     "anonymize",
     "anonymize_verify",
@@ -153,8 +149,8 @@ class PhaseRecord:
         nested work.  Captured automatically by the context manager.
     raw_output:
         Raw LLM/transformer text the phase generated, when applicable.
-        ``None`` for pure-Python phases (STT correction, HA validation,
-        deanon, grounding gate, etc.).
+        ``None`` for pure-Python phases (HA validation, deanon,
+        grounding gate, etc.).
     parsed:
         Phase-specific structured result.  Shape is per-phase but each
         phase's writer documents its keys (entity counts, mapping

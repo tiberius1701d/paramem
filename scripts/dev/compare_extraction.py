@@ -5,7 +5,6 @@ All models go through the same code path:
 1. Same extraction prompt
 2. Same JSON parsing
 3. Same normalization
-4. Same STT correction
 
 Each model pass saves results immediately. Re-running skips completed passes.
 Saved passes are not validated against the current session set — when running
@@ -43,7 +42,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from paramem.graph.extractor import (
-    _correct_entity_names,
     _extract_json_block,
     _normalize_extraction,
     load_extraction_prompts,
@@ -120,8 +118,8 @@ def load_transcripts(path: Path | None = None) -> list[dict]:
     return transcripts
 
 
-def run_extraction(raw_output: str, transcript: str, session_id: str) -> SessionGraph:
-    """Shared extraction pipeline: parse -> normalize -> STT correct."""
+def run_extraction(raw_output: str, session_id: str) -> SessionGraph:
+    """Shared extraction pipeline: parse -> normalize."""
     try:
         json_str = _extract_json_block(raw_output)
         data = json.loads(json_str)
@@ -136,10 +134,6 @@ def run_extraction(raw_output: str, transcript: str, session_id: str) -> Session
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
-    if not graph.relations:
-        return graph
-
-    graph = _correct_entity_names(graph, transcript)
     return graph
 
 
@@ -1233,7 +1227,7 @@ def run_pass(
                 tokenizer,
                 speaker_name=None,
             )
-            extracted = run_extraction(raw, t["transcript"], sid)
+            extracted = run_extraction(raw, sid)
             print(f"    -> {len(extracted.relations)} relations (extracted)")
             print_relations(extracted)
             # Serialize BEFORE enrichment — some enrichment paths mutate in place.

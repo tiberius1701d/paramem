@@ -168,7 +168,6 @@ class TestExtractProceduralGraph:
             "test_proc",
             speaker_id="Speaker0",
             max_tokens=1024,
-            stt_correction=False,
         )
         # Should extract at least something (preferences)
         # Quality depends on Mistral — may extract 0 or more
@@ -186,7 +185,6 @@ class TestExtractProceduralGraph:
             "test_empty",
             speaker_id="Speaker0",
             max_tokens=512,
-            stt_correction=False,
         )
         assert graph.session_id == "test_empty"
 
@@ -638,7 +636,6 @@ class TestRunExtractGraphHelper:
             save_cycle_snapshots=False,
             prompts_dir=server_config.prompts_dir,
             extraction_max_tokens=cc.extraction_max_tokens,
-            extraction_stt_correction=cc.extraction_stt_correction,
             extraction_ha_validation=cc.extraction_ha_validation,
             extraction_noise_filter=cc.extraction_noise_filter,
             extraction_noise_filter_model=cc.extraction_noise_filter_model,

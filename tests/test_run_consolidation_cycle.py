@@ -82,7 +82,6 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
         config=ExtractionConfig(
             temperature=0.0,
             max_tokens=256,
-            stt_correction=False,
             ha_validation=False,
             noise_filter="",
             noise_filter_model="",

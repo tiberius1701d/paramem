@@ -576,7 +576,6 @@ def extract_procedural_graph(
     temperature: float = 0.0,
     max_tokens: int = 1024,
     prompts_dir: str | Path | None = None,
-    stt_correction: bool = True,
     speaker_name: str | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
@@ -605,12 +604,6 @@ def extract_procedural_graph(
         speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
             ``Relation`` extracted in this pass as provenance. Required —
             callers must always supply a real speaker ID.
-        stt_correction: Correct entity names from the assistant response turn.
-            Document chunks have no assistant response, so the
-            ``ExtractionPipeline.run_procedural`` chokepoint defaults
-            this to ``False`` for ``source_type="document"``; passing
-            ``stt_correction=True`` with a document source is harmless
-            but produces no correction.
         system_prompt_filename: Filename of the system prompt within the prompts
             directory.  Defaults to :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`.
             One prompt-pair is the single ground truth for procedural
@@ -685,9 +678,6 @@ def extract_procedural_graph(
     if speaker_id:
         graph = _stamp_speaker_entity(graph, speaker_id=speaker_id)
 
-    if graph.relations and stt_correction:
-        graph = _correct_entity_names(graph, transcript)
-
     logger.info(
         "Procedural extraction: %d entities, %d relations (session=%s)",
         len(graph.entities),
@@ -709,7 +699,6 @@ def extract_graph(
     prompts_dir: str | Path | None = None,
     validate: bool = True,
     ha_context: dict | None = None,
-    stt_correction: bool = True,
     ha_validation: bool = True,
     noise_filter: str = "",
     noise_filter_model: str = "claude-sonnet-4-6",
@@ -733,9 +722,8 @@ def extract_graph(
 
     Multi-pass pipeline:
     1. Extract candidate triples from transcript
-    2. Correct STT entity names from assistant responses (configurable)
-    3. Validate with HA context — location ground truth (configurable)
-    4. SOTA pipeline (anonymize → enrich → plausibility → de-anonymize, configurable)
+    2. Validate with HA context — location ground truth (configurable)
+    3. SOTA pipeline (anonymize → enrich → plausibility → de-anonymize, configurable)
 
     All filters fail gracefully — extraction result is preserved on any failure.
 
@@ -753,15 +741,9 @@ def extract_graph(
         temperature: Sampling temperature for extraction (default 0.0 for determinism).
         max_tokens: Max output tokens for extraction (default 2048).
         prompts_dir: Optional override for prompt config directory.
-        validate: Run SOTA pipeline pass 4 (default True). Passes 2-3 have
-            their own flags (stt_correction, ha_validation).
+        validate: Run SOTA pipeline pass 3 (default True). Pass 2 has
+            its own flag (ha_validation).
         ha_context: HA home config for location validation (from get_home_context).
-        stt_correction: Correct entity names from assistant responses.
-            Document chunks have no assistant response, so the
-            ``ExtractionPipeline.run`` chokepoint defaults this to
-            ``False`` for ``source_type="document"``; passing
-            ``stt_correction=True`` with a document source is harmless
-            but produces no correction.
         ha_validation: Validate locations against HA home context.
         noise_filter: SOTA provider for noise filtering ("" = disabled).
         ner_check: Enable spaCy NER cross-check for PII detection (default False).
@@ -866,25 +848,7 @@ def extract_graph(
             if not graph.relations:
                 return graph
 
-            # Phase 2 — STT correction (pure-Python; no LLM call).
-            if stt_correction:
-                with phase_trace("stt_correction") as t:
-                    before = _summarise_graph(graph)
-                    graph = _correct_entity_names(graph, transcript)
-                    after = _summarise_graph(graph)
-                    t.set_parsed(
-                        {
-                            "before": before,
-                            "after": after,
-                            "renamed_entities": [
-                                e for e in after["entity_names"] if e not in before["entity_names"]
-                            ],
-                        }
-                    )
-                if stop_phase == "stt_correction":
-                    return graph
-
-            # Phase 3 — HA validation (pure-Python; no LLM call).
+            # HA validation (pure-Python; no LLM call).
             if ha_validation and ha_context:
                 with phase_trace("ha_validation") as t:
                     before = _summarise_graph(graph)
@@ -894,7 +858,7 @@ def extract_graph(
                 if stop_phase == "ha_validation":
                     return graph
 
-            # Phase 4 — SOTA pipeline.  Each sub-phase (anonymize,
+            # SOTA pipeline.  Each sub-phase (anonymize,
             # anonymize_verify, anonymize_repair, sota_enrich,
             # anon_plausibility, deanon, deanon_plausibility) records its
             # own block via phase_trace from inside _sota_pipeline.
@@ -1028,7 +992,6 @@ def extract_and_anonymize_for_cloud(
             # regardless of the configured model.
             prompts_dir=prompts_dir,
             validate=False,
-            stt_correction=False,
             ha_validation=False,
             noise_filter="",
         )
@@ -1627,94 +1590,6 @@ def _normalize_extraction(data: dict) -> dict:
     data.setdefault("relations", [])
 
     return data
-
-
-def _correct_entity_names(graph: SessionGraph, transcript: str) -> SessionGraph:
-    """Correct STT-garbled entity names using assistant responses.
-
-    When the user says "Frankford" but the assistant responds with "Frankfurt",
-    the assistant's spelling is more likely correct. Fuzzy-match extracted
-    entity names against tokens in assistant responses (Levenshtein distance ≤ 2).
-    """
-    # Collect tokens from assistant responses
-    assistant_tokens: set[str] = set()
-    for line in transcript.split("\n"):
-        line_lower = line.strip().lower()
-        if line_lower.startswith("[assistant]") or line_lower.startswith("assistant:"):
-            # Extract words ≥ 4 chars (skip common words)
-            prefix_len = line.index("]") + 1 if "]" in line else line.index(":") + 1
-            words = line[prefix_len:].split()
-            for w in words:
-                clean = w.strip(".,!?;:'\"()")
-                if len(clean) >= 4:
-                    assistant_tokens.add(clean)
-
-    if not assistant_tokens:
-        return graph
-
-    # Check each entity and relation object against assistant tokens
-    corrections: dict[str, str] = {}
-    for entity in graph.entities:
-        correction = _find_correction(entity.name, assistant_tokens)
-        if correction:
-            corrections[entity.name] = correction
-
-    for relation in graph.relations:
-        correction = _find_correction(relation.object, assistant_tokens)
-        if correction:
-            corrections[relation.object] = correction
-
-    if not corrections:
-        return graph
-
-    # Apply corrections
-    for entity in graph.entities:
-        if entity.name in corrections:
-            logger.info("STT correction: %s → %s", entity.name, corrections[entity.name])
-            entity.name = corrections[entity.name]
-
-    for relation in graph.relations:
-        if relation.object in corrections:
-            relation.object = corrections[relation.object]
-        if relation.subject in corrections:
-            relation.subject = corrections[relation.subject]
-
-    return graph
-
-
-def _find_correction(name: str, candidates: set[str]) -> str | None:
-    """Find a candidate with Levenshtein distance ≤ 2 from name.
-
-    Returns the candidate if found, None otherwise.
-    Only corrects if the name is NOT already in the candidates (no self-match).
-    """
-    if name in candidates:
-        return None
-
-    for candidate in candidates:
-        if abs(len(name) - len(candidate)) > 2:
-            continue
-        dist = _levenshtein(name.lower(), candidate.lower())
-        if 0 < dist <= 2:
-            return candidate
-    return None
-
-
-def _levenshtein(s: str, t: str) -> int:
-    """Compute Levenshtein distance between two strings."""
-    if len(s) < len(t):
-        return _levenshtein(t, s)
-    if len(t) == 0:
-        return len(s)
-
-    prev_row = list(range(len(t) + 1))
-    for i, sc in enumerate(s):
-        curr_row = [i + 1]
-        for j, tc in enumerate(t):
-            cost = 0 if sc == tc else 1
-            curr_row.append(min(curr_row[j] + 1, prev_row[j + 1] + 1, prev_row[j] + cost))
-        prev_row = curr_row
-    return prev_row[-1]
 
 
 def _validate_with_ha_context(graph: SessionGraph, ha_context: dict) -> SessionGraph:

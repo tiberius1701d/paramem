@@ -61,7 +61,6 @@ SCENARIOS = [
             "consolidation.max_epochs": 10,
             "consolidation.indexed_key_replay": True,
             "consolidation.promotion_threshold": 3,
-            "consolidation.extraction_stt_correction": False,
             "consolidation.extraction_ha_validation": False,
             "consolidation.extraction_noise_filter": "",
             "consolidation.extraction_plausibility_judge": "off",
@@ -91,7 +90,6 @@ SCENARIOS = [
             "consolidation.max_epochs": 10,
             "consolidation.indexed_key_replay": True,
             "consolidation.promotion_threshold": 3,
-            "consolidation.extraction_stt_correction": False,
             "consolidation.extraction_ha_validation": False,
             "consolidation.extraction_noise_filter": "anthropic",
             "consolidation.extraction_noise_filter_model": "claude-sonnet-4-6",
@@ -200,7 +198,6 @@ def test_factory_threads_every_config_knob(
         == cfg.consolidation.graph_enrichment_max_entities_per_pass
     )
     # --- Extraction knobs ---
-    assert captured["extraction_stt_correction"] == cfg.consolidation.extraction_stt_correction
     assert captured["extraction_ha_validation"] == cfg.consolidation.extraction_ha_validation
     assert captured["extraction_noise_filter"] == cfg.consolidation.extraction_noise_filter
     assert (

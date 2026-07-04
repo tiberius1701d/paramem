@@ -1,4 +1,4 @@
-"""Tests for the extraction pipeline — STT correction, HA validation, noise filter, JSON parsing."""
+"""Tests for the extraction pipeline — HA validation, noise filter, JSON parsing."""
 
 import json
 from pathlib import Path
@@ -7,10 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from paramem.graph.extractor import (
-    _correct_entity_names,
     _extract_json_block,
-    _find_correction,
-    _levenshtein,
     _validate_with_ha_context,
 )
 from paramem.graph.schema import Entity, Relation, SessionGraph
@@ -41,84 +38,6 @@ def _make_graph(relations, entities=None):
         entities=entities,
         relations=rels,
     )
-
-
-# --- Levenshtein ---
-
-
-class TestLevenshtein:
-    def test_identical(self):
-        assert _levenshtein("hello", "hello") == 0
-
-    def test_one_char_diff(self):
-        assert _levenshtein("hello", "hallo") == 1
-
-    def test_insertion(self):
-        assert _levenshtein("hello", "helloo") == 1
-
-    def test_deletion(self):
-        assert _levenshtein("hello", "helo") == 1
-
-    def test_one_substitution(self):
-        assert _levenshtein("dinslaker", "dinslaken") == 1
-
-    def test_two_changes(self):
-        assert _levenshtein("dinslager", "dinslaken") == 2
-
-    def test_empty(self):
-        assert _levenshtein("", "abc") == 3
-        assert _levenshtein("abc", "") == 3
-
-    def test_completely_different(self):
-        assert _levenshtein("abc", "xyz") == 3
-
-
-# --- STT Correction ---
-
-
-class TestFindCorrection:
-    def test_close_match(self):
-        assert _find_correction("Frankford", {"Frankfurt", "Frankfurt"}) == "Frankfurt"
-
-    def test_exact_match_no_correction(self):
-        assert _find_correction("Frankfurt", {"Frankfurt", "Berlin"}) is None
-
-    def test_no_match(self):
-        assert _find_correction("Tokyo", {"Frankfurt", "Berlin"}) is None
-
-    def test_too_far(self):
-        assert _find_correction("Paris", {"Frankfurt"}) is None
-
-    def test_case_insensitive(self):
-        assert _find_correction("millfeld", {"Millfield"}) == "Millfield"
-
-
-class TestCorrectEntityNames:
-    def test_corrects_from_assistant_response(self):
-        graph = _make_graph([("Alex", "parents_live_in", "Frankford")])
-        transcript = "[user] My parents live in Frankford.\n[assistant] Frankfurt is about 300km."
-        result = _correct_entity_names(graph, transcript)
-        assert result.relations[0].object == "Frankfurt"
-
-    def test_no_correction_when_exact(self):
-        graph = _make_graph([("Alex", "lives_in", "Frankfurt")])
-        transcript = "[user] I live in Frankfurt.\n[assistant] Frankfurt is nice."
-        result = _correct_entity_names(graph, transcript)
-        assert result.relations[0].object == "Frankfurt"
-
-    def test_no_assistant_response(self):
-        graph = _make_graph([("Alex", "lives_in", "Kelkham")])
-        transcript = "[user] I live in Kelkham."
-        result = _correct_entity_names(graph, transcript)
-        # No assistant tokens to correct from
-        assert result.relations[0].object == "Kelkham"
-
-    def test_short_words_skipped(self):
-        graph = _make_graph([("Alex", "likes", "Tea")])
-        transcript = "[user] I like tea.\n[assistant] Tea is great."
-        result = _correct_entity_names(graph, transcript)
-        # "Tea" is < 4 chars, skipped in assistant token extraction
-        assert result.relations[0].object == "Tea"
 
 
 # --- HA Context Validation ---

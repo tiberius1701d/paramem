@@ -206,7 +206,6 @@ class TestExtractionPathParity:
             (
                 True,
                 {
-                    "extraction_stt_correction": False,
                     "extraction_ha_validation": False,
                     "extraction_verify_anonymization": False,
                 },

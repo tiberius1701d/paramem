@@ -273,7 +273,6 @@ def _build_test_config() -> Path:
       consolidation.mode       -> simulate (extract only; no LoRA training)
       consolidation.orphan_retirement -> "every 1m"  (60 s TTL for HOLDABLE sessions)
       consolidation.training_idle_debounce_s -> 0 (tick fires immediately after chat)
-      consolidation.extraction_stt_correction -> false
       consolidation.extraction_ha_validation  -> false
       speaker.enabled          -> true   (store loads the pre-seeded profile)
       stt.enabled              -> false
@@ -317,7 +316,6 @@ def _build_test_config() -> Path:
     # chats — otherwise _maybe_trigger_scheduled_consolidation returns
     # "deferred_idle" (chat too recent) and never reaches classification.
     cfg["consolidation"]["training_idle_debounce_s"] = 0
-    cfg["consolidation"]["extraction_stt_correction"] = False
     cfg["consolidation"]["extraction_ha_validation"] = False
 
     # Speaker: enabled so SpeakerStore loads the pre-seeded profile.

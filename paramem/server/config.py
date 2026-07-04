@@ -997,7 +997,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     # production. Server short-circuits with 503 when a real consolidation
     # cycle is running so calibration calls cannot race against the model.
     calibrate_endpoint_enabled: bool = False
-    extraction_stt_correction: bool = True  # correct STT errors from assistant responses
     extraction_ha_validation: bool = True  # validate locations against HA home context
     extraction_noise_filter: str = "anthropic"  # SOTA provider for noise filtering ("" = disabled)
     extraction_noise_filter_model: str = "claude-sonnet-4-6"  # model for noise filtering

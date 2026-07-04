@@ -21,7 +21,7 @@
 # QUALITY CONSIDERATIONS (self-bias risk)
 # - If your extraction pipeline uses the SAME cloud model/provider that will
 #   answer inference queries, the LLM-judge stages (noise_filter,
-#   plausibility, ner_check, anonymization verify, STT correction) become
+#   plausibility, ner_check, anonymization verify) become
 #   "model-as-judge-for-itself": the judge rates its own outputs, confirming
 #   its own biases and systematically over- or under-filtering certain
 #   fact classes. Expected quality degradation.
@@ -253,7 +253,6 @@ consolidation:
   extraction_max_tokens: 8192  # output-token budget for local extract, anonymize, SOTA enrich, deanon; 8192 sized for ~1500-word document chunks
   extraction_plausibility_max_tokens: 8192  # plausibility-stage cap; tuned independently from extraction_max_tokens. Default tracks the unified budget; tighten only when the GPU host headroom forces a trade-off (smaller cap = lower KV-cache peak; observed PII attribute capture is more reliable at the larger cap so 8192 is the safe default)
   calibrate_endpoint_enabled: false  # opt-in dev tool: POST /calibrate/{extract,anonymize,plausibility} for prompt iteration against the live Mistral instance. Off in production; 503 returned while a real consolidation cycle is running.
-  extraction_stt_correction: true  # correct STT errors from assistant responses
   extraction_ha_validation: true  # validate locations against HA home context
   extraction_noise_filter: ""  # SOTA provider for noise filtering ("" = disabled, ship default)
   extraction_noise_filter_model: claude-sonnet-4-6  # model for noise filtering

@@ -411,7 +411,6 @@ class TestTimestampPropagation:
                 transcript="I like tea.",
                 session_id="s001",
                 speaker_id="speaker0",
-                stt_correction=False,
                 timestamp="2026-05-01T12:00:00+00:00",
             )
         assert graph.timestamp == "2026-05-01T12:00:00+00:00"
@@ -431,7 +430,6 @@ class TestTimestampPropagation:
                 transcript="I like tea.",
                 session_id="s001",
                 speaker_id="speaker0",
-                stt_correction=False,
             )
         after = datetime.now(timezone.utc)
         parsed = datetime.fromisoformat(graph.timestamp)

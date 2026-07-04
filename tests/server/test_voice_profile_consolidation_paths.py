@@ -57,7 +57,6 @@ def _make_config(mode="train", tmp_path=None):
     cfg = MagicMock()
     cfg.adapters.episodic.enabled = True
     cfg.consolidation.mode = mode
-    cfg.consolidation.extraction_stt_correction = False
     cfg.consolidation.extraction_ha_validation = False
     cfg.consolidation.extraction_noise_filter = False
     cfg.consolidation.extraction_noise_filter_model = ""

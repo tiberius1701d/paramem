@@ -82,7 +82,6 @@ class ExtractionConfig:
     temperature: float = 0.0
     max_tokens: int = 8192
     plausibility_max_tokens: int = 8192
-    stt_correction: bool = True
     ha_validation: bool = True
     noise_filter: str = "anthropic"
     noise_filter_model: str = "claude-sonnet-4-6"
@@ -193,15 +192,13 @@ class ExtractionPipeline:
 
         Gate defaults still differ by ``source_type``:
 
-        * ``"transcript"`` (default) — ``stt_correction`` and
-          ``ha_validation`` default to the config values (typically
-          ``True``).
+        * ``"transcript"`` (default) — ``ha_validation`` defaults to
+          the config value (typically ``True``).
 
-        * ``"document"`` — ``stt_correction`` defaults to ``False``
-          (written text has no STT artefact surface) and
-          ``ha_validation`` defaults to ``False`` (Home Assistant
-          entity grounding is a dialogue-context concern).  Operators
-          may still override either explicitly via *overrides*.
+        * ``"document"`` — ``ha_validation`` defaults to ``False``
+          (Home Assistant entity grounding is a dialogue-context
+          concern). Operators may still override it explicitly via
+          *overrides*.
 
         ``speaker_id`` is **required** in *overrides* and must be a
         non-empty string.  An absent or empty value raises
@@ -220,10 +217,8 @@ class ExtractionPipeline:
         system_prompt_filename = DEFAULT_SYSTEM_PROMPT_FILENAME
         user_prompt_filename = DEFAULT_USER_PROMPT_FILENAME
         if source_type == "document":
-            stt_correction_default = False
             ha_validation_default = False
         else:
-            stt_correction_default = cfg.stt_correction
             ha_validation_default = cfg.ha_validation
 
         return dict(
@@ -236,7 +231,6 @@ class ExtractionPipeline:
             # by design and ignore this value.
             model_alias=self.model_name,
             ha_context=overrides.get("ha_context"),
-            stt_correction=pick("stt_correction", stt_correction_default),
             ha_validation=pick("ha_validation", ha_validation_default),
             noise_filter=pick("noise_filter", cfg.noise_filter),
             noise_filter_model=pick("noise_filter_model", cfg.noise_filter_model),
@@ -299,17 +293,14 @@ class ExtractionPipeline:
         *,
         speaker_id: str,
         speaker_name: str | None = None,
-        stt_correction: bool | None = None,
         source_type: str = "transcript",
         timestamp: str | None = None,
     ) -> "SessionGraph":
         """Single entry point for procedural (preferences/habits) extraction.
 
-        ``source_type`` mirrors :meth:`run` — only governs the
-        ``stt_correction`` default (``False`` for documents).  The
-        prompt-pair is the same regardless of source type; document
-        chunks land in the ``{transcript}`` slot like transcripts do.
-        Explicit *stt_correction* overrides still win.
+        ``source_type`` mirrors :meth:`run`.  The prompt-pair is the
+        same regardless of source type; document chunks land in the
+        ``{transcript}`` slot like transcripts do.
 
         ``speaker_id`` is stamped onto every ``Relation`` produced by the
         procedural extractor as provenance.  Required — empty / ``None``
@@ -329,8 +320,6 @@ class ExtractionPipeline:
 
         self.model.gradient_checkpointing_disable()
         cfg = self.config
-        stt_default = False if source_type == "document" else cfg.stt_correction
-        stt = stt_default if stt_correction is None else stt_correction
         # Single prompt-pair for both source types — see :meth:`kwargs`.
         system_prompt_filename = DEFAULT_SYSTEM_PROMPT_FILENAME
         user_prompt_filename = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME
@@ -339,7 +328,6 @@ class ExtractionPipeline:
             prompts_dir=self.prompts_dir,
             # model_alias drives per-file prompt resolution — see kwargs() comment.
             model_alias=self.model_name,
-            stt_correction=stt,
             speaker_name=speaker_name,
             speaker_id=speaker_id,
             system_prompt_filename=system_prompt_filename,
