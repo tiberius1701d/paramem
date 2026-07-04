@@ -1058,7 +1058,14 @@ class TestSOTANoiseFilter:
         )
         # No ANTHROPIC_API_KEY → skips gracefully
         with patch.dict("os.environ", {}, clear=True):
-            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
+            result = _sota_pipeline(
+                graph,
+                "transcript",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
             # Should return original graph unchanged
             assert len(result.relations) == 1
 
@@ -1122,6 +1129,7 @@ class TestSOTANoiseFilter:
                 None,
                 speaker_id="speaker0",
                 plausibility_judge="off",
+                correction_entity_types=set(),
             )
         # With plausibility_judge="off", fallback runs the residual-placeholder sweep only.
         # Both entities ARE in the transcript → relation survives.
@@ -1165,7 +1173,14 @@ class TestSOTANoiseFilter:
             ),
         ):
             with pytest.raises(ExtractionFailed) as excinfo:
-                _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
+                _sota_pipeline(
+                    graph,
+                    "transcript",
+                    None,
+                    None,
+                    speaker_id="speaker0",
+                    correction_entity_types=set(),
+                )
         assert excinfo.value.phase == "sota_enrich"
 
     def test_pipeline_enriched_facts_get_deanonymized(self):
@@ -1196,7 +1211,14 @@ class TestSOTANoiseFilter:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
+            result = _sota_pipeline(
+                graph,
+                "transcript",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
 
         # Both enriched relations survive and get de-anonymized
         assert len(result.relations) == 2
@@ -1237,7 +1259,14 @@ class TestSOTANoiseFilter:
                 return_value=(enriched_anon, None, {}, None, {}),
             ),
         ):
-            result = _sota_pipeline(graph, transcript, None, None, speaker_id="speaker0")
+            result = _sota_pipeline(
+                graph,
+                transcript,
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
 
         # Composite strings must be de-anonymized, not dropped
         subjects = {r.subject for r in result.relations}
@@ -1631,7 +1660,12 @@ class TestSOTANoiseFilter:
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
         ):
             result = _sota_pipeline(
-                graph, "Alex lives in Millfield.", None, None, speaker_id="speaker0"
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
             )
 
         assert len(filter_calls) == 1, "SOTA was not called after repair"
@@ -1685,7 +1719,14 @@ class TestSOTANoiseFilter:
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
         ):
-            _sota_pipeline(graph, "Alex mentioned something.", None, None, speaker_id="speaker0")
+            _sota_pipeline(
+                graph,
+                "Alex mentioned something.",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
 
         # SOTA WAS called — the deterministic builder substituted
         # ``Ghost`` to its placeholder before verify ran, so no leak
@@ -1722,6 +1763,73 @@ class TestSOTANoiseFilter:
         # Both pairs end up canonical: keys are real, values are placeholders.
         assert out == {"Alex": "Person_1", "Millfield": "Person_2"}
         assert stats == {"inverted": 1, "dropped": 0}
+
+    def test_entity_correction_call_site_wired_into_pipeline(self):
+        """Integration coverage for the entity_correction phase call site.
+
+        Stubs ``paramem.graph.extractor.correct_entity_surfaces`` (the name
+        bound in extractor's own namespace via its top-of-file import) so
+        this proves the WIRING added to ``_sota_pipeline`` — the stub is
+        called exactly once and its return value lands verbatim on
+        ``graph.diagnostics["entity_corrections"]`` — without needing a
+        live model. Reuses the same ``anonymize_with_local_model`` /
+        ``_filter_with_sota`` happy-path mocking pattern as the sibling
+        tests in this class.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        canned_applied = [
+            {
+                "locus": "placeholder",
+                "placeholder": "City_1",
+                "type": "place",
+                "kind": "place",
+                "before": "Frankfrut",
+                "after": "Frankfurt",
+            }
+        ]
+        correction_calls = []
+
+        def fake_correct_entity_surfaces(reverse_mapping, entities, model, tokenizer, **kwargs):
+            correction_calls.append((dict(reverse_mapping), list(entities), kwargs))
+            return canned_applied
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(anon_facts, mapping, "", ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, {}, None, {}),
+            ),
+            patch(
+                "paramem.graph.extractor.correct_entity_surfaces",
+                side_effect=fake_correct_entity_surfaces,
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "transcript",
+                None,
+                None,
+                speaker_id="speaker0",
+                plausibility_judge="off",
+                correction_entity_types={"place"},
+            )
+
+        assert len(correction_calls) == 1, "correct_entity_surfaces must be called exactly once"
+        assert result.diagnostics["entity_corrections"] == canned_applied
 
 
 class TestApplyBindings:
@@ -2246,6 +2354,7 @@ class TestPlausibilityAnon:
                 speaker_id="speaker0",
                 plausibility_judge="claude",
                 plausibility_stage="anon",
+                correction_entity_types=set(),
             )
 
         # Only the valid fact survives
@@ -2312,6 +2421,7 @@ class TestPlausibilityDeanon:
                 speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
+                correction_entity_types=set(),
             )
 
         # Plausibility ran and dropped the tautology
@@ -2418,6 +2528,7 @@ class TestResidualLeakDropsReferencingTriples:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 ner_check=True,
+                correction_entity_types=set(),
             )
 
         # SOTA must NOT be called (_skip_sota=True after residual leak)
@@ -2469,7 +2580,14 @@ class TestAnonFailureFallback:
                 side_effect=fake_fallback,
             ),
         ):
-            result = _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
+            result = _sota_pipeline(
+                graph,
+                "transcript",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
 
         assert fallback_calls == ["anon_failed"], (
             "fallback must be triggered with reason=anon_failed"
@@ -2519,7 +2637,14 @@ class TestSotaEnrichmentFailureRaises:
             ),
         ):
             try:
-                _sota_pipeline(graph, "transcript", None, None, speaker_id="speaker0")
+                _sota_pipeline(
+                    graph,
+                    "transcript",
+                    None,
+                    None,
+                    speaker_id="speaker0",
+                    correction_entity_types=set(),
+                )
             except ExtractionFailed as exc:
                 assert exc.phase == "sota_enrich"
                 assert exc.reason
@@ -2595,6 +2720,7 @@ class TestAllDroppedSafetyNet:
                 speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
+                correction_entity_types=set(),
             )
 
         assert "all_dropped" in fallback_calls, f"Expected all_dropped, got: {fallback_calls}"
@@ -2647,6 +2773,7 @@ class TestEntityTypePreservation:
                 None,
                 speaker_id="speaker0",
                 plausibility_judge="off",
+                correction_entity_types=set(),
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -2689,6 +2816,7 @@ class TestEntityTypePreservation:
                 None,
                 speaker_id="speaker0",
                 plausibility_judge="off",
+                correction_entity_types=set(),
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -2745,6 +2873,7 @@ class TestEntityTypePreservation:
                 None,
                 speaker_id="speaker0",
                 plausibility_judge="off",
+                correction_entity_types=set(),
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -2979,6 +3108,7 @@ class TestExtractGraphNewKwargs:
                 speaker_id="speaker0",
                 verify_anonymization=False,
                 plausibility_judge="off",
+                correction_entity_types=set(),
             )
 
         # With verify_anonymization=False the guard function must not be called
@@ -3031,6 +3161,7 @@ class TestDiagnosticsKeys:
                 speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
+                correction_entity_types=set(),
             )
 
         assert "plausibility" in result.diagnostics, "diagnostics must contain 'plausibility'"
@@ -3070,6 +3201,7 @@ class TestDiagnosticsKeys:
                 None,
                 speaker_id="speaker0",
                 plausibility_judge="off",
+                correction_entity_types=set(),
             )
 
         assert result.diagnostics.get("anonymize") == "ok"

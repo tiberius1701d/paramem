@@ -93,6 +93,7 @@ class ExtractionConfig:
     plausibility_stage: str = "deanon"
     verify_anonymization: bool = True
     pii_scope: set[str] | frozenset[str] | None = None
+    correction_entity_types: set[str] | frozenset[str] | None = None
 
 
 def _require_speaker_id(overrides: dict) -> str:
@@ -243,6 +244,7 @@ class ExtractionPipeline:
             plausibility_stage=pick("plausibility_stage", cfg.plausibility_stage),
             verify_anonymization=pick("verify_anonymization", cfg.verify_anonymization),
             pii_scope=pick("pii_scope", cfg.pii_scope),
+            correction_entity_types=pick("correction_entity_types", cfg.correction_entity_types),
             speaker_id=_require_speaker_id(overrides),
             system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),
             user_prompt_filename=pick("user_prompt_filename", user_prompt_filename),

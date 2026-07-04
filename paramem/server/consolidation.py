@@ -171,6 +171,9 @@ def create_consolidation_loop(
         # Empty list disables NER-scope filtering entirely (consolidation
         # then uses the primitive default {person, place}).
         extraction_pii_scope=set(config.sanitization.cloud_scope),
+        extraction_correction_entity_types=set(
+            config.consolidation.extraction_correction_entity_types
+        ),
         extraction_ha_validation=config.consolidation.extraction_ha_validation,
         extraction_noise_filter=config.consolidation.extraction_noise_filter,
         extraction_noise_filter_model=config.consolidation.extraction_noise_filter_model,

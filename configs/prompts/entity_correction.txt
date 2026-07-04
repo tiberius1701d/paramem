@@ -1,0 +1,37 @@
+Classify the KIND of the given value and, if it is a clear misspelling or mis-transcription of a WELL-KNOWN real place, organization, or concept you recognize with confidence, correct it.
+
+## Kind (strict enum)
+
+`kind` is exactly one of:
+- `place` — a city, country, region, or other geographic location.
+- `organization` — a company, institution, or other named organization.
+- `concept` — an app, product, brand, or other named thing.
+- `person` — a person's name, famous or not.
+- `other` — anything else: email, phone number, date, age, role/title, free-text, or any value that is not itself a named entity.
+
+## Rules
+
+- Always classify `kind` first, from the value and the `context` on its left (context is the anonymizer type or the attribute key the value came from — a hint, not the answer).
+- If `kind` is `place`, `organization`, or `concept` AND the value is a clear misspelling/mis-transcription of a WELL-KNOWN real entity you recognize with confidence: give the standard spelling in `corrected` and set `is_known_entity` to `true`.
+- If `kind` is `person`: NEVER correct it, even if you recognize the correct spelling of a public figure's name. Return the value EXACTLY unchanged in `corrected` and set `is_known_entity` to `false`. World knowledge is not the authority for a person's spelling.
+- Otherwise (unfamiliar, fictional, or anything you are not confident about): return the value EXACTLY unchanged in `corrected` and set `is_known_entity` to `false`.
+- Do NOT guess. Do NOT invent a value you are not sure of. Do NOT expand the value with extra words or suffixes that were not present (e.g. do not add "AG", "Inc.", "GmbH"). Do NOT change casing unless the standard spelling itself differs in casing.
+- Never replace the value with a DIFFERENT entity, even a similar-sounding one. When in doubt, leave it unchanged and set `is_known_entity` to `false`.
+
+## Examples
+
+POSITIVE — clear misspelling of a well-known city:
+Input: place = Frankfrut
+Output: {{"input": "Frankfrut", "kind": "place", "corrected": "Frankfurt", "is_known_entity": true}}
+
+NEGATIVE — person's name, never corrected even if recognized:
+Input: manager = Angela Merkl
+Output: {{"input": "Angela Merkl", "kind": "person", "corrected": "Angela Merkl", "is_known_entity": false}}
+
+NEGATIVE — unfamiliar/fictional name, not a recognized entity:
+Input: origin = Vellmarn
+Output: {{"input": "Vellmarn", "kind": "place", "corrected": "Vellmarn", "is_known_entity": false}}
+
+Input: {context} = {value}
+
+Return JSON only with exactly the keys `input`, `kind`, `corrected`, `is_known_entity`. No prose, no markdown, no extra keys.

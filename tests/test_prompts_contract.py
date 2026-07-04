@@ -500,6 +500,61 @@ class TestAnonymizationPrompt:
         assert not stray, f"Stray unrendered placeholder(s) found in rendered prompt: {stray!r}"
 
 
+class TestEntityCorrectionPrompt:
+    """Contract tests for ``entity_correction.txt`` (paramem.graph.entity_correction).
+
+    The module calls ``template.format(context=..., value=...)`` — the slot
+    names must match exactly. The output contract now carries FOUR fields
+    (``input``, ``kind``, ``corrected``, ``is_known_entity``); ``kind`` is a
+    strict enum (``place``/``organization``/``concept``/``person``/``other``)
+    that structurally excludes person-name correction — the enum values and
+    all three few-shot examples (real correction, person left unchanged,
+    fiction left unchanged) must be present so the gate the module reads has
+    evidence backing it.
+    """
+
+    def _render(self, tmpl: str) -> str:
+        return tmpl.format(context="place", value="Frankfrut")
+
+    def test_renders_without_format_errors(self):
+        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        assert "{context}" not in rendered
+        assert "{value}" not in rendered
+
+    def test_no_stray_unescaped_placeholders(self):
+        """No stray {word} tokens remain after render (only JSON literal braces)."""
+        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        stray = re.findall(r"(?<!\{)\{[a-z_]+\}", rendered)
+        assert not stray, f"Stray unrendered placeholder(s) found in rendered prompt: {stray!r}"
+
+    def test_contains_output_contract_tokens(self):
+        """The output-contract keys `kind` and `is_known_entity` must appear."""
+        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        assert "kind" in rendered
+        assert "is_known_entity" in rendered
+
+    def test_contains_strict_kind_enum_values(self):
+        """All five `kind` enum values must be named in the prompt."""
+        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        for value in ("place", "organization", "concept", "person", "other"):
+            assert value in rendered, f"kind enum value {value!r} missing from prompt"
+
+    def test_contains_all_three_example_markers(self):
+        """All three few-shot examples (real correction, person unchanged,
+        fiction unchanged) must be present and render cleanly."""
+        rendered = self._render(_load_prompt("entity_correction.txt", required=True))
+        assert "POSITIVE" in rendered
+        assert rendered.count("NEGATIVE") >= 2
+        # The positive example must actually change the surface.
+        assert "Frankfurt" in rendered
+        # The person example must be present and left unchanged.
+        assert "Angela Merkl" in rendered
+        assert '"kind": "person"' in rendered
+        # The fiction example must be present and rejected.
+        assert "Vellmarn" in rendered
+        assert '"is_known_entity": false' in rendered
+
+
 class TestMergerCoexistencePrompt:
     """Contract tests for the merger coexistence prompt.
 

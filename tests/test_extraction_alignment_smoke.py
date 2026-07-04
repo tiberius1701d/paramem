@@ -136,6 +136,7 @@ class TestAlignmentSmoke:
                 speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
+                correction_entity_types=set(),
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -185,6 +186,7 @@ class TestAlignmentSmoke:
                 speaker_id="speaker0",
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
+                correction_entity_types=set(),
             )
 
         dropped = result.diagnostics.get("plausibility_dropped", 0)
@@ -212,6 +214,7 @@ class TestAlignmentSmoke:
                 None,
                 speaker_id="speaker0",
                 plausibility_judge="off",
+                correction_entity_types=set(),
             )
 
         assert result.diagnostics.get("fallback_path") is None, (

@@ -1029,6 +1029,17 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     extraction_verify_anonymization: bool = True  # forward-path privacy guard
     extraction_ner_check: bool = False  # optional spaCy PII cross-check
     extraction_ner_model: str = "en_core_web_sm"  # spaCy model when ner_check=True
+    # Anonymizer entity types eligible for local misspelling correction on
+    # the reverse map (see paramem.graph.entity_correction). "person" is
+    # excluded by default — private-name spelling is owned by the
+    # enrollment/voice-profile flow, not world knowledge. The "attributes"
+    # member also corrects in-scope misspellings stored in entity attributes
+    # (e.g. current_location), not just relation surfaces; person-name and
+    # non-entity attribute values are excluded by the model's own kind
+    # classification.
+    extraction_correction_entity_types: list[str] = field(
+        default_factory=lambda: ["place", "organization", "concept", "attributes"]
+    )
     # Maximum number of concurrent interim adapters. Caps the rolling
     # episodic_interim_YYYYMMDDTHHMM adapters resident in VRAM at any one time.
     # Must be proven to fit by the startup VRAM validator before the server starts.

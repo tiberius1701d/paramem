@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.evaluation.recall import generate_answer
+from paramem.graph.entity_correction import correct_entity_surfaces
 from paramem.graph.name_match import is_speaker_id
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.prompts import _load_prompt
@@ -711,6 +712,7 @@ def extract_graph(
     plausibility_stage: str = "deanon",
     verify_anonymization: bool = True,
     pii_scope: set[str] | frozenset[str] | None = None,
+    correction_entity_types: set[str] | frozenset[str] | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
     stop_phase: str | None = None,
@@ -753,6 +755,15 @@ def extract_graph(
         plausibility_stage: When to run plausibility ("deanon"=after de-anon,
             "anon"=on anonymized data with SOTA judge).
         verify_anonymization: Run forward-path privacy guard before SOTA (default True).
+        correction_entity_types: Scope-and-enable knob for the local
+            entity-surface correction stage (see
+            :func:`paramem.graph.entity_correction.correct_entity_surfaces`).
+            Entity-type members (``place``/``organization``/``concept``)
+            gate which surfaces are corrected; ``"attributes"`` additionally
+            enables correcting ``graph.entities[*].attributes`` values.
+            ``None`` or empty disables the stage entirely — there is no
+            implicit default scope; production always threads the
+            configured value.
         speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
             ``Relation`` produced by this extraction pass as provenance.
             Required — callers must always supply the session's speaker ID.
@@ -883,6 +894,9 @@ def extract_graph(
                     speaker_name=speaker_name,
                     speaker_id=speaker_id,
                     pii_scope=pii_scope,
+                    correction_entity_types=correction_entity_types,
+                    prompts_dir=prompts_dir,
+                    model_alias=model_alias,
                     max_tokens=max_tokens,
                     plausibility_max_tokens=plausibility_max_tokens,
                     stop_phase=stop_phase,
@@ -1796,6 +1810,9 @@ def _sota_pipeline(
     verify_anonymization: bool = True,
     speaker_name: str | None = None,
     pii_scope: set[str] | frozenset[str] | None = None,
+    correction_entity_types: set[str] | frozenset[str] | None = None,
+    prompts_dir: str | Path | None = None,
+    model_alias: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     stop_phase: str | None = None,
@@ -1805,6 +1822,9 @@ def _sota_pipeline(
 
     Stages:
     1. Local anonymize    → facts + transcript with placeholders (one total mapping)
+    1c. Local entity-surface correction (:func:`paramem.graph.entity_correction.
+        correct_entity_surfaces`) — corrects misspelled real place/org/concept
+        surfaces in the reverse map only; forward map + transcript are untouched.
     1d. Forward-path privacy guard (verify_anonymization=True): detect and repair leaks.
         Residual leak after repair: fact-level filter + skip SOTA, OR fallback to raw
         plausibility if mapping is non-canonical.
@@ -1924,6 +1944,38 @@ def _sota_pipeline(
         pii_scope=pii_scope,
         speaker_name=speaker_name,
     )
+
+    # Phase — entity_correction.  Local model corrects misspelled real
+    # place/organization/concept surfaces at two loci: the reverse map
+    # VALUES ONLY (not keys — the forward map used to anonymize the
+    # transcript below, and every downstream identity check keyed on
+    # placeholders, are unaffected) and, when the "attributes" knob member
+    # is set, graph.entities[*].attributes values in place (e.g.
+    # current_location) — the same graph object this function returns, so
+    # the mutation reaches QA generation downstream. Runs regardless of
+    # ``_skip_sota`` (correction is independent of cloud enrichment) and
+    # safely precedes the totality check below (placeholder keys are
+    # untouched). See paramem.graph.entity_correction for the full contract.
+    with phase_trace("entity_correction") as t:
+        applied = correct_entity_surfaces(
+            reverse_mapping,
+            graph.entities,
+            model,
+            tokenizer,
+            correction_entity_types=correction_entity_types,
+            prompts_dir=prompts_dir,
+            model_alias=model_alias,
+            seed=seed,
+        )
+        if applied:
+            graph.diagnostics["entity_corrections"] = applied
+        t.set_parsed({"applied_count": len(applied)})
+    if stop_phase == "entity_correction":
+        # Calibration short-circuit: entity_correction completed; downstream
+        # phases (verify, repair, sota_enrich, …) are skipped.  graph.relations
+        # remains the local-extract output; the correction result lives in
+        # graph.diagnostics["entity_corrections"] / phases[entity_correction].
+        return graph
 
     # Mapping-totality diagnostic.  The anonymization prompt requires
     # every placeholder in any anonymized fact to appear as a key in

@@ -281,6 +281,19 @@ consolidation:
   extraction_verify_anonymization: true         # forward-path privacy guard (do not disable)
   extraction_ner_check: false                   # optional spaCy PII cross-check
   extraction_ner_model: en_core_web_sm          # spaCy model when ner_check=true
+  # Local, privacy-preserving STT spelling repair (paramem/graph/entity_correction.py).
+  # Runs entirely on-device on the anonymization *reverse map*: misheard real names
+  # (e.g. "Frankfrut" -> "Frankfurt") are fixed in place before de-anonymization, so
+  # nothing extra ever leaves the machine — the cloud enrichment stage still sees only
+  # anonymized placeholders (City_1, Org_1, ...), never these real surfaces. Lists the
+  # anonymizer entity types eligible for correction; empty list ([]) turns it off.
+  # "person" is excluded by default: a private individual's name is not world-knowledge-
+  # correctable, and rewriting it risks corrupting a real identity — person spelling is
+  # owned by the local enrollment/voice-profile flow. The "attributes" member also
+  # corrects in-scope misspellings stored in entity attributes (e.g. current_location),
+  # not just relation surfaces; person-name and non-entity attribute values are excluded
+  # by the model's own kind classification.
+  extraction_correction_entity_types: [place, organization, concept, attributes]
   # Max concurrent interim adapters in VRAM. Together with refresh_cadence
   # this determines the derived full-consolidation period:
   #     full_cycle = refresh_cadence × max_interim_count

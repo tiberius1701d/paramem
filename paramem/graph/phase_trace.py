@@ -57,6 +57,9 @@ Phase                       Notes
                             home context. ``raw_output=None``.
 ``anonymize``               Mistral runs the anonymizer; emits mapping
                             + anonymized facts + anonymized transcript.
+``entity_correction``       Mistral corrects misspelled real place /
+                            organization / concept surfaces in the
+                            reverse anonymization map (values only).
 ``anonymize_verify``        Pure-Python residual-leak verifier.
                             ``raw_output=None``.
 ``anonymize_repair``        Pure-Python leak repair (extend mapping or
@@ -114,6 +117,7 @@ PHASE_NAMES: tuple[str, ...] = (
     "local_extract",
     "ha_validation",
     "anonymize",
+    "entity_correction",
     "anonymize_verify",
     "anonymize_repair",
     "sota_enrich",
