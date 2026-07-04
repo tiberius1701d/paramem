@@ -820,6 +820,42 @@ def test_run_honors_prompt_filename_overrides(monkeypatch):
     assert captured["kwargs"]["system_prompt_filename"] == "calib_extraction_system.txt"
 
 
+def test_kwargs_honors_prompts_dir_override():
+    """A per-call ``prompts_dir`` override passed via :meth:`kwargs` MUST win
+    over ``self.prompts_dir`` (the construction-time default).
+
+    Regression guard: ``prompts_dir`` was hardcoded as
+    ``prompts_dir=self.prompts_dir`` inside :meth:`ExtractionPipeline.kwargs`,
+    unlike every other tunable (``noise_filter``, ``system_prompt_filename``,
+    etc.) which routes through the local ``pick`` helper. A caller passing
+    ``prompts_dir=...`` into ``ExtractionPipeline.run(...)`` — e.g.
+    ``POST /calibrate/extract`` swapping in a candidate prompt directory —
+    had the override silently dropped; the model always ran against the
+    construction-time ``self.prompts_dir`` while the response still echoed
+    the candidate file contents, making every prompts_dir A/B invalid.
+    """
+    from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
+
+    pipeline = ExtractionPipeline(
+        model=MagicMock(),
+        tokenizer=MagicMock(),
+        config=ExtractionConfig(),
+        prompts_dir="configs/prompts",
+    )
+
+    # Override wins.
+    kw = pipeline.kwargs(
+        source_type="transcript",
+        speaker_id="Speaker0",
+        prompts_dir="/tmp/override_dir",
+    )
+    assert kw["prompts_dir"] == "/tmp/override_dir"
+
+    # No override → falls back to self.prompts_dir.
+    kw_default = pipeline.kwargs(source_type="transcript", speaker_id="Speaker0")
+    assert kw_default["prompts_dir"] == "configs/prompts"
+
+
 def test_run_procedural_uses_default_prompts_for_document(monkeypatch):
     """:meth:`run_procedural` with ``source_type='document'`` must still use
     ``DEFAULT_SYSTEM_PROMPT_FILENAME`` and

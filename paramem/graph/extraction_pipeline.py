@@ -225,7 +225,7 @@ class ExtractionPipeline:
             temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,
             plausibility_max_tokens=cfg.plausibility_max_tokens,
-            prompts_dir=self.prompts_dir,
+            prompts_dir=pick("prompts_dir", self.prompts_dir),
             # model_alias drives per-file prompt resolution in extract_graph /
             # extract_procedural_graph.  sota_* prompts are model-independent
             # by design and ignore this value.
