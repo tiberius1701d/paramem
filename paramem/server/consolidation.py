@@ -207,9 +207,9 @@ def create_consolidation_loop(
 
     # Wire the full-consolidation period string so _save_adapters can stamp
     # main slots with the current full-cycle window. Empty string in
-    # experiment paths (state_provider=None) → window_stamp="" → Phase 4
-    # gate treats those slots as unknown-window and forces a first full
-    # cycle on adoption.
+    # experiment paths (state_provider=None) → window_stamp="" → the
+    # full-cycle window gate treats those slots as unknown-window and forces
+    # a first full cycle on adoption.
     loop.full_consolidation_period_string = config.consolidation.consolidation_period_string
 
     if seed_state_from_disk:

@@ -324,7 +324,7 @@ def _cudnn_deterministic():
 
 
 # ---------------------------------------------------------------------------
-# Shared measurement primitives (Seam A and Seam B)
+# Shared measurement primitives
 # ---------------------------------------------------------------------------
 
 
@@ -576,7 +576,7 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
     from paramem.graph.phase_trace import get_phases
 
     phase_records = [r.to_dict() for r in get_phases(graph)]
-    # Phase 1 raw output, surfaced at the top level for easy diffing of
+    # Local-extract raw output, surfaced at the top level for easy diffing of
     # the local-extract prompt without traversing the phases list.
     local_extract = next(
         (p for p in phase_records if p.get("name") == "local_extract"),

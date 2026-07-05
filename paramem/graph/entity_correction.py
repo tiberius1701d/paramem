@@ -1,9 +1,9 @@
-"""Local-LLM classify+correct of misspelled entity surfaces (s38 extension).
+"""Local-LLM classify+correct of misspelled entity surfaces.
 
 This is a distinct pipeline stage — deliberately its own module rather than
-folded into ``paramem/graph/extractor.py`` (see
-``.agent/design-place-correction-20260704.md``, "EXTENSION (s38)" +
-"DECOMPOSITION", for the full rationale and live-probe evidence trail).
+folded into ``paramem/graph/extractor.py`` — so the misspelled-entity-surface
+correction judgement is isolated from extraction and applied uniformly across
+every locus where a correctable value can appear.
 
 The judgement "is this value a misspelled well-known place/organization/
 concept, and if so what is the correct spelling" is independent of WHERE

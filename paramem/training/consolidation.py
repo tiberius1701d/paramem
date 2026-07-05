@@ -95,7 +95,7 @@ def resolve_to_node_key(
     in_graph: "Callable[[str], bool]",
     coref_map: "dict[str, str] | None" = None,
 ) -> str:
-    """Resolve a surface name to the actual node key used in the graph (P5).
+    """Resolve a surface name to the actual node key used in the graph.
 
     Collapses the two formerly-duplicated nested resolvers
     (``_resolve_node_key`` / ``_resolve_name``) into one module-level
@@ -107,7 +107,7 @@ def resolve_to_node_key(
        IS already a valid node key; return it unchanged.  This handles ordinary
        non-speaker node keys (node-key model A: the key IS the canonical form)
        without an extra ``canonical()`` call.  Note: with casefolded speaker
-       keys (§0 invariant), verbatim speaker ids (``"Speaker0"``) are NOT in
+       keys, verbatim speaker ids (``"Speaker0"``) are NOT in
        the graph (the key is ``"speaker0"``), so they fall through to step 2.
     2. **Canonical fallback** — ``canonical(name)`` (casefolds, diacritic-folds,
        separator-normalizes).  This resolves speaker ids to their casefolded node
@@ -118,9 +118,8 @@ def resolve_to_node_key(
        set so a malformed coref loop does not block.
 
     The stale rationale "verbatim-first because speaker nodes are keyed
-    VERBATIM" no longer applies: after Step 2 of the speaker-identity
-    unification, speaker node keys ARE casefolded, so the membership shortcut
-    is only useful for ordinary node keys.
+    VERBATIM" no longer applies: speaker node keys are now casefolded, so the
+    membership shortcut is only useful for ordinary node keys.
 
     Args:
         name: Surface name or node key to resolve.
@@ -336,8 +335,8 @@ class FoldScope:
             simulate path skips it because there are no weight-resident keys to
             promote.
         tier_floor: When ``True``, run the per-tier floor park/graduate pass
-            (Pass-2) after the build-entries stage.  ``True`` for the full-fold
-            train path only.
+            as a second pass after the build-entries stage.  ``True`` for the
+            full-fold train path only.
         subtractive_scope: Forwarded to
             :meth:`~ConsolidationLoop._apply_subtractive_removals_to_store`
             (``"interim"`` | ``"fold"``).
@@ -2217,7 +2216,8 @@ class ConsolidationLoop:
             interim_overflow_slack: Number of extra overflow slots allowed
                 beyond ``max_interim_count`` before keep-pending kicks in.
                 At 0 (default), cap_pending fires immediately when ``c >= N``
-                (identical to S4 behavior).  At slack > 0, the gate is:
+                (identical to the original no-slack behavior).  At slack > 0,
+                the gate is:
                     c < N           → normal mint (unchanged)
                     N <= c < N+slack → overflow mint; result["overflow_slot"]=True
                     c >= N+slack    → cap_pending (keep sessions pending)
@@ -2388,7 +2388,7 @@ class ConsolidationLoop:
     ) -> "dict[str, dict[str, dict]]":
         """Consume ``merger.removal_ledger`` entries and soft-stale their keys.
 
-        This is the shared soft-stale stage (M5) called by BOTH
+        This is the shared soft-stale stage called by BOTH
         ``run_consolidation_cycle`` (interim) and ``consolidate_interim_adapters``
         (fold) after every merge that can produce subtractive removals.  The
         shared body is identical for both scopes; the persist/registry-seed step
@@ -2650,7 +2650,7 @@ class ConsolidationLoop:
             #   3. Surface-form safety gate (token-subset + Jaro-Winkler).
             coref_map: dict[str, str] = {}
 
-            # _in_graph closure passed to resolve_to_node_key (P5).
+            # _in_graph closure passed to resolve_to_node_key.
             _in_graph = graph.__contains__
 
             for pair in same_as_pairs:
@@ -2677,9 +2677,10 @@ class ConsolidationLoop:
                         drop,
                     )
                     continue
-                # Resolve to actual node keys via P5 (membership shortcut then
-                # canonical).  BL-1: keep _safe_to_merge_surface on the ORIGINAL
-                # SURFACE strings (fuzzy layer-2 check; done before resolution).
+                # Resolve to actual node keys via resolve_to_node_key
+                # (membership shortcut then canonical).  Keep _safe_to_merge_surface
+                # on the ORIGINAL SURFACE strings (fuzzy layer-2 check; done
+                # before resolution).
                 keep_canon = resolve_to_node_key(keep, _in_graph)
                 drop_canon = resolve_to_node_key(drop, _in_graph)
                 if keep_canon == drop_canon:
@@ -2742,7 +2743,7 @@ class ConsolidationLoop:
                     continue
                 # Remap endpoints through this chunk's coref map so edges
                 # referencing a to-be-dropped node still land on the canonical.
-                # P5: resolve_to_node_key(membership shortcut → canonical → coref chain).
+                # resolve_to_node_key(membership shortcut → canonical → coref chain).
                 subj_canon = resolve_to_node_key(rel.get("subject", ""), _in_graph, coref_map)
                 raw_pred = rel.get("predicate", "")
                 obj_canon = resolve_to_node_key(rel.get("object", ""), _in_graph, coref_map)
@@ -3305,7 +3306,7 @@ class ConsolidationLoop:
         Entry shape passed to the probe contains ONLY the four canonical
         SPO fields (``key``, ``subject``, ``predicate``, ``object``).
         Sentinel fields such as ``_new`` carried by ``all_interim_keyed``
-        are intentionally stripped (M2) so the probe entry shape matches what
+        are intentionally stripped so the probe entry shape matches what
         ``_entries_for_tier`` produces and what ``_run_recall_sanity_probe``
         expects.
 
@@ -3855,7 +3856,7 @@ class ConsolidationLoop:
                     # _session_entities, so its main-tier twin is always in scope
                     # (Case-1 can never miss a legitimate target).  A recital's
                     # reinforcement is credited to the surviving main key via the
-                    # merger's adopt_reinforcements accumulator (R2), consumed by
+                    # merger's adopt_reinforcements accumulator, consumed by
                     # _refine_consolidation_graph's bump loop.
                     _session_entities = {r.subject for r in (_extra or [])} | {
                         r.object for r in (_extra or [])
@@ -4108,7 +4109,7 @@ class ConsolidationLoop:
                         else:
                             _ep_flushed += 1
 
-                    # --- Shared soft-stale stage (M5) ---
+                    # --- Shared soft-stale stage ---
                     _soft_stale_by_tier = self._apply_subtractive_removals_to_store(
                         scope=scope.subtractive_scope
                     )
@@ -4562,7 +4563,7 @@ class ConsolidationLoop:
                 _stale_in_active = _soft_stale_keys & _all_keyed
                 if _stale_in_active:
                     logger.warning(
-                        "_run_fold[main_tiers]: R4 invariant violation — %d key(s) appear"
+                        "_run_fold[main_tiers]: invariant violation — %d key(s) appear"
                         " in both soft_stale_by_tier and _all_keyed (trained as active AND"
                         " stale); this indicates tier_keyed was mutated after _all_keyed"
                         " was built: %s",
@@ -6350,13 +6351,13 @@ class ConsolidationLoop:
            when both stages are skipped).
         4. Two INDEPENDENTLY-guarded recurrence-bump blocks (never unioned under
            one relaxed guard — each dict is consumed by its own loop with its own
-           guard, so R2 adds a credit without changing the pre-existing
-           ``reinforcements`` bump contract):
+           guard, so the recital-dedup credit adds a bump without changing the
+           pre-existing ``reinforcements`` bump contract):
 
            - If ``recon_relations`` is non-empty, scan ``merger.reinforcements``
              for Case-1 duplicate-SPO collapses and call
              :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
-             surviving key.  This guard is byte-identical to the pre-R2
+             surviving key.  This guard is byte-identical to the original
              contract: a re-merge must actually have run for this bump to fire.
            - If ``merger.adopt_reinforcements`` is non-empty, call
              :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
@@ -6434,8 +6435,8 @@ class ConsolidationLoop:
             # the freshest last_seen and earliest first_seen are carried directly
             # from the edge so bump_recurrence can advance bookkeeping without
             # fabricating now().  This guard (recon_relations non-empty) is the
-            # original, unchanged contract — R2 does not relax it; it only adds
-            # the independent adopt-credit block below.
+            # original, unchanged contract — the recital-dedup credit does not
+            # relax it; it only adds the independent adopt-credit block below.
             _reinforcements: dict[str, tuple[str, str]] = getattr(self.merger, "reinforcements", {})
             for _rein_key, (_rein_ls, _rein_fs) in _reinforcements.items():
                 if _rein_key:
@@ -6451,7 +6452,7 @@ class ConsolidationLoop:
                         _rein_key,
                     )
 
-        # --- Reinforcement bump (R2): interim recital-dedup Case-1-adopt credits ---
+        # --- Reinforcement bump: interim recital-dedup Case-1-adopt credits ---
         # merger.adopt_reinforcements contains the main-tier ik_key credited by the
         # interim recital-dedup merge's Case-1-adopt (a recited pending fact adopts
         # a main key onto its keyless edge).  Independently guarded from the block

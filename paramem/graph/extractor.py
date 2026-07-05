@@ -835,7 +835,7 @@ def extract_graph(
             timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
         )
         try:
-            # Phase 1 — local Mistral extract.  Raw output is the canonical
+            # Local-model extraction step.  Raw output is the canonical
             # isolation point for the extraction prompt (calibration /
             # debugging diffs prompt variants by comparing this raw_output,
             # before any downstream phase has had a chance to mutate the
@@ -2001,7 +2001,7 @@ def _sota_pipeline(
 
     original_count = len(graph.relations)
 
-    # Phase 4 — anonymize.  Mistral runs the anonymizer prompt; emits
+    # Anonymization step.  Mistral runs the anonymizer prompt; emits
     # mapping + anonymized facts + anonymized transcript.  Phase trace
     # captures the raw model JSON so calibration can diff prompt
     # variants on the anonymizer in isolation.
