@@ -691,7 +691,7 @@ class TestSessionRotation:
     def test_session_id_collision_free_under_same_second_opens(self):
         """Two rotations for the SAME conversation_id, minted within the same
         wall-clock second, produce distinct session_ids — the mandatory
-        4-char random suffix (not "only on collision") makes the jsonl
+        8-char random suffix (not "only on collision") makes the jsonl
         filename race-free."""
         from paramem.server.session_buffer import _mint_session_id
 

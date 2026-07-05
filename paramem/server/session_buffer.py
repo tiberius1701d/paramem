@@ -64,14 +64,14 @@ _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
 def _mint_session_id(conversation_id: str) -> str:
     """Mint a fresh, filesystem-safe, race-free session id for a rotation.
 
-    Format: ``{sanitized conversation_id}-{YYYYMMDDThhmmssZ}-{rand4}``. The
-    4-char random suffix is mandatory (not "only on collision") so two
+    Format: ``{sanitized conversation_id}-{YYYYMMDDThhmmssZ}-{rand8}``. The
+    8-char random suffix is mandatory (not "only on collision") so two
     sessions opened for the same conversation_id in the same second never
     collide on the JSONL filename.
     """
     safe = _UNSAFE_ID_CHARS.sub("_", conversation_id)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{safe}-{stamp}-{secrets.token_hex(2)}"
+    return f"{safe}-{stamp}-{secrets.token_hex(4)}"
 
 
 class SessionBuffer:
