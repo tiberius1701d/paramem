@@ -68,6 +68,27 @@ def _state_enabled() -> dict:
     }
 
 
+def _peft_model_mock() -> MagicMock:
+    """MagicMock that passes ``isinstance(model, PeftModel)``.
+
+    ``disable_adapter`` returns a working context manager so the
+    ``base_model_inference`` guard can enter and exit it, and the
+    gradient-checkpointing toggles are mocked no-ops.  Used by the
+    base-weights guard tests to prove the calibrate handlers disable the
+    active adapter around the model call.
+    """
+    from peft import PeftModel
+
+    model = MagicMock(spec=PeftModel)
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=None)
+    cm.__exit__ = MagicMock(return_value=False)
+    model.disable_adapter = MagicMock(return_value=cm)
+    model.gradient_checkpointing_disable = MagicMock()
+    model.gradient_checkpointing_enable = MagicMock()
+    return model
+
+
 class TestPreflight:
     def test_404_when_flag_disabled(self):
         with pytest.raises(HTTPException) as exc:
@@ -208,6 +229,81 @@ class TestCalibrateAnonymize:
             calibrate_anonymize(_state_disabled(), req)
         assert exc.value.status_code == 404
 
+    def test_prompt_override_reaches_model(self, tmp_path):
+        """A prompts_dir + filename override actually drives the model call.
+
+        Regression guard: anonymize_with_local_model previously ignored
+        prompts_dir and always loaded configs/prompts/anonymization.txt, so
+        the override was cosmetic (displayed but not executed).  This asserts
+        the SENTINEL override template is what apply_chat_template receives.
+        """
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        sentinel = "SENTINEL-ANON-OVERRIDE"
+        (prompts_dir / "my_anon.txt").write_text(
+            f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
+        )
+
+        req = CalibrateAnonymizeRequest(
+            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
+            transcript="hello there",
+            prompts_dir=str(prompts_dir),
+            anonymization_prompt_filename="my_anon.txt",
+        )
+
+        captured: list[list[dict]] = []
+
+        def _capture_template(messages, **kw):
+            captured.append(messages)
+            return "formatted-prompt"
+
+        state["tokenizer"].apply_chat_template.side_effect = _capture_template
+
+        valid_json = '{"mapping": {}, "anonymized_facts": [], "anonymized_transcript": ""}'
+        with (
+            _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
+            _mock.patch("paramem.graph.extractor.generate_answer", return_value=valid_json),
+        ):
+            result = calibrate_anonymize(state, req)
+
+        assert result["stage"] == "anonymize"
+        assert captured, "apply_chat_template was never called"
+        user_content = next(m["content"] for m in captured[0] if m["role"] == "user")
+        assert sentinel in user_content, (
+            f"Model received default prompt instead of override: {user_content!r}"
+        )
+
+    def test_runs_on_base_weights(self):
+        """calibrate_anonymize disables the active adapter around the model call.
+
+        Mirrors production, where anonymization runs inside extract_graph's
+        disable_adapter scope.  The direct calibrate call must do the same via
+        base_model_inference so it does not read the training-active adapter.
+        """
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        state["model"] = _peft_model_mock()
+        req = CalibrateAnonymizeRequest(
+            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
+            transcript="hello",
+        )
+
+        with _mock.patch(
+            "paramem.graph.extractor.anonymize_with_local_model",
+            return_value=([], {}, "", "raw"),
+        ) as helper:
+            result = calibrate_anonymize(state, req)
+
+        assert result["stage"] == "anonymize"
+        assert helper.called
+        assert state["model"].disable_adapter.called, (
+            "calibrate_anonymize must run the helper under base_model_inference"
+        )
+
 
 class TestCalibratePlausibility:
     def test_disabled_404(self):
@@ -215,6 +311,76 @@ class TestCalibratePlausibility:
         with pytest.raises(HTTPException) as exc:
             calibrate_plausibility(_state_disabled(), req)
         assert exc.value.status_code == 404
+
+    def test_prompt_override_reaches_model(self, tmp_path):
+        """A prompts_dir + filename override actually drives the model call.
+
+        Regression guard: local_plausibility_filter previously ignored
+        prompts_dir and always loaded configs/prompts/sota_plausibility.txt,
+        so the override was cosmetic.  This asserts the SENTINEL override
+        template is what apply_chat_template receives.
+        """
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        sentinel = "SENTINEL-PLAUS-OVERRIDE"
+        (prompts_dir / "my_plaus.txt").write_text(
+            f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
+        )
+
+        req = CalibratePlausibilityRequest(
+            facts=[],
+            transcript="hello there",
+            prompts_dir=str(prompts_dir),
+            plausibility_prompt_filename="my_plaus.txt",
+        )
+
+        captured: list[list[dict]] = []
+
+        def _capture_template(messages, **kw):
+            captured.append(messages)
+            return "formatted-prompt"
+
+        state["tokenizer"].apply_chat_template.side_effect = _capture_template
+
+        with (
+            _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
+            _mock.patch("paramem.graph.extractor.generate_answer", return_value="{}"),
+        ):
+            result = calibrate_plausibility(state, req)
+
+        assert result["stage"] == "plausibility"
+        assert captured, "apply_chat_template was never called"
+        user_content = next(m["content"] for m in captured[0] if m["role"] == "user")
+        assert sentinel in user_content, (
+            f"Model received default prompt instead of override: {user_content!r}"
+        )
+
+    def test_runs_on_base_weights(self):
+        """calibrate_plausibility disables the active adapter around the model call.
+
+        Mirrors production, where the plausibility filter runs inside
+        extract_graph's disable_adapter scope.
+        """
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        state["model"] = _peft_model_mock()
+        req = CalibratePlausibilityRequest(facts=[], transcript="hello")
+
+        with _mock.patch(
+            "paramem.graph.extractor.local_plausibility_filter",
+            return_value=([], "raw"),
+        ) as helper:
+            result = calibrate_plausibility(state, req)
+
+        assert result["stage"] == "plausibility"
+        assert helper.called
+        assert state["model"].disable_adapter.called, (
+            "calibrate_plausibility must run the helper under base_model_inference"
+        )
 
 
 class TestCalibrateNormalize:

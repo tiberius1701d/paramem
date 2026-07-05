@@ -1045,7 +1045,7 @@ def extract_and_anonymize_for_cloud(
 
         try:
             anon_facts, mapping, anon_transcript, _raw = anonymize_with_local_model(
-                graph, model, tokenizer, transcript=transcript
+                graph, model, tokenizer, transcript=transcript, prompts_dir=prompts_dir
             )
         except Exception:
             logger.exception("Cloud egress: anonymization raised; treating as block")
@@ -3729,18 +3729,26 @@ _DEFAULT_ANONYMIZER_MAX_TOKENS = 2048
 _DEFAULT_ANONYMIZER_TEMPERATURE = 0.0
 
 
-def load_anonymization_prompt() -> str:
+def load_anonymization_prompt(
+    prompts_dir: str | Path | None = None,
+    filename: str = "anonymization.txt",
+) -> str:
     """Single source of truth for the anonymization prompt.
 
     Both the local-model and cloud-extractor anonymization paths read through
     this helper so a `configs/prompts/anonymization.txt` override applies to
     both — no silent divergence.
 
+    ``prompts_dir`` overrides the search directory (forwarded to
+    :func:`_load_prompt`); ``filename`` overrides the template name so a
+    calibration operator can point at an alternate prompt file.  Both default
+    to the production values, so production callers are unaffected.
+
     The prompt this function loads is external config — edit
     ``configs/prompts/anonymization.txt`` to tune; no code changes are
     needed.
     """
-    return _load_prompt("anonymization.txt", required=True)
+    return _load_prompt(filename, prompts_dir=prompts_dir, required=True)
 
 
 def anonymize_with_local_model(
@@ -3751,6 +3759,8 @@ def anonymize_with_local_model(
     max_tokens: int = _DEFAULT_ANONYMIZER_MAX_TOKENS,
     temperature: float = _DEFAULT_ANONYMIZER_TEMPERATURE,
     seed: int | None = None,
+    prompts_dir: str | Path | None = None,
+    prompt_filename: str = "anonymization.txt",
 ) -> tuple[list[dict] | None, dict, str, str]:
     """Anonymize extracted facts AND transcript using the local model.
 
@@ -3766,6 +3776,10 @@ def anonymize_with_local_model(
 
     ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the
     default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
+
+    ``prompts_dir`` and ``prompt_filename`` are forwarded to
+    :func:`load_anonymization_prompt` so a calibration override actually
+    reaches the model; both default to the production template.
     """
     facts = [
         {
@@ -3778,7 +3792,7 @@ def anonymize_with_local_model(
         for r in graph.relations
     ]
 
-    anon_prompt = load_anonymization_prompt()
+    anon_prompt = load_anonymization_prompt(prompts_dir=prompts_dir, filename=prompt_filename)
     prompt = anon_prompt.format(
         facts_json=json.dumps(facts, indent=2),
         transcript=transcript or "(no transcript provided)",
@@ -4682,6 +4696,8 @@ def local_plausibility_filter(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     seed: int | None = None,
+    prompts_dir: str | Path | None = None,
+    prompt_filename: str = "sota_plausibility.txt",
 ) -> tuple[list[dict] | None, str]:
     """Local-model plausibility filter — drops invalid relations only.
 
@@ -4700,9 +4716,14 @@ def local_plausibility_filter(
 
     ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the
     default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
+
+    ``prompts_dir`` overrides the search directory and ``prompt_filename``
+    the template name (both forwarded to :func:`_load_prompt`) so a
+    calibration override actually reaches the model; both default to the
+    production template.
     """
     _vram_snapshot(f"plaus_filter_entry n_facts={len(facts)}")
-    plaus_prompt = _load_prompt("sota_plausibility.txt", required=True)
+    plaus_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
     prompt = plaus_prompt.format(
         facts_json=_render_indexed_facts(facts),
         transcript=transcript or "(not available)",

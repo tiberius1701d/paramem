@@ -717,16 +717,21 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
             detail=f"Invalid SessionGraph payload: {exc}",
         ) from exc
 
+    from paramem.models.loader import base_model_inference
+
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     with _measured_local_call() as m:
-        anon_facts, mapping, anon_transcript, raw_output = anonymize_with_local_model(
-            graph,
-            model,
-            tokenizer,
-            transcript=req.transcript,
-            max_tokens=max_tokens,
-            seed=req.params.seed,
-        )
+        with base_model_inference(model):
+            anon_facts, mapping, anon_transcript, raw_output = anonymize_with_local_model(
+                graph,
+                model,
+                tokenizer,
+                transcript=req.transcript,
+                max_tokens=max_tokens,
+                seed=req.params.seed,
+                prompts_dir=req.prompts_dir,
+                prompt_filename=filename,
+            )
 
     parsed: dict[str, Any] = {
         "anonymized_facts": anon_facts,
@@ -760,19 +765,24 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
     filename = req.plausibility_prompt_filename or "sota_plausibility.txt"
     prompt_path, prompt_sha, prompt_content = _read_prompt(req.prompts_dir, filename)
 
+    from paramem.models.loader import base_model_inference
+
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     temperature = req.params.temperature if req.params.temperature is not None else 0.0
 
     with _measured_local_call() as m:
-        kept, raw_output = local_plausibility_filter(
-            req.facts,
-            req.transcript,
-            model,
-            tokenizer,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            seed=req.params.seed,
-        )
+        with base_model_inference(model):
+            kept, raw_output = local_plausibility_filter(
+                req.facts,
+                req.transcript,
+                model,
+                tokenizer,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                seed=req.params.seed,
+                prompts_dir=req.prompts_dir,
+                prompt_filename=filename,
+            )
 
     dropped = [f for f in req.facts if f not in (kept or [])]
     parsed: dict[str, Any] = {
