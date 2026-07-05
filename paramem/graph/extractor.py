@@ -1,5 +1,6 @@
 """LLM-based knowledge graph extraction — generate once, parse once."""
 
+import contextlib
 import json
 import logging
 import re
@@ -4890,10 +4891,12 @@ def dedup_synonym_predicates(
         return clusters_by_so, diagnostics
 
     local_mode = sota is None
-    if local_mode:
-        model.gradient_checkpointing_disable()
-
-    try:
+    # Predicate-dedup is structured extraction: the local path must run on the
+    # base weights (adapter disabled) with the KV cache live (checkpointing off,
+    # restored to entry state on exit).  The SOTA path uses the cloud model and
+    # leaves the local model untouched.
+    cm = base_model_inference(model) if local_mode else contextlib.nullcontext()
+    with cm:
         for key in candidate_keys:
             rels_for_group = groups[key]
             # Build canonical → first-seen surface predicate map.
@@ -4992,9 +4995,5 @@ def dedup_synonym_predicates(
             if grounded_clusters:
                 clusters_by_so[key] = grounded_clusters
                 diagnostics["groups_with_clusters"] += 1
-
-    finally:
-        if local_mode:
-            model.gradient_checkpointing_enable()
 
     return clusters_by_so, diagnostics

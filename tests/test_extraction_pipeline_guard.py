@@ -1419,3 +1419,71 @@ def test_extract_name_via_llm_enters_base_model_inference():
         "extraction and must run on the base weights, not the training-active "
         "adapter."
     )
+
+
+def _function_calls_base_model_inference(fn) -> bool:
+    """Return True if ``fn`` contains a call to ``base_model_inference``.
+
+    Unlike :func:`_enters_base_model_inference` (which only inspects ``with``
+    context-managers), this scans for the call node anywhere in the function
+    body so it also matches the conditional-context-manager form
+    ``cm = base_model_inference(model) if local_mode else nullcontext()``.
+    """
+    import ast as _ast
+
+    for node in _ast.walk(fn):
+        if (
+            isinstance(node, _ast.Call)
+            and isinstance(node.func, _ast.Name)
+            and node.func.id == "base_model_inference"
+        ):
+            return True
+    return False
+
+
+def _find_function(module_rel: str, fn_name: str):
+    """Parse ``module_rel`` and return the top-level ``FunctionDef`` ``fn_name``."""
+    import ast as _ast
+
+    repo_root = Path(__file__).resolve().parent.parent
+    tree = _ast.parse((repo_root / module_rel).read_text())
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.FunctionDef) and node.name == fn_name:
+            return node
+    raise AssertionError(f"{fn_name} not found in {module_rel}")
+
+
+def test_dedup_synonym_predicates_local_path_enters_base_model_inference():
+    """``dedup_synonym_predicates`` must run its local-model path on the base
+    weights via ``base_model_inference``.
+
+    Predicate-dedup is structured extraction: the local path must run with the
+    PA adapter disabled (it would otherwise bias synonym clustering) and with
+    gradient checkpointing restored to its entry state.  The SOTA path uses the
+    cloud model and is wrapped in ``nullcontext`` instead — the guard only
+    asserts the primitive is present in the function, mirroring the app.py
+    enrollment guard.
+    """
+    target = _find_function("paramem/graph/extractor.py", "dedup_synonym_predicates")
+    assert _function_calls_base_model_inference(target), (
+        "dedup_synonym_predicates must gate its local-model calls behind "
+        "`base_model_inference(model)` (conditional on local_mode) so predicate "
+        "dedup runs on the base weights with the KV cache live."
+    )
+
+
+def test_classify_via_llm_enters_base_model_inference():
+    """LLM intent classification in ``paramem/server/intent.py`` must run on the
+    base weights.
+
+    ``_classify_via_llm`` calls ``model.generate`` for label extraction; the PA
+    adapter would bias content-free imperatives toward PERSONAL, so the generate
+    must be wrapped in ``base_model_inference(model)`` (adapter disabled,
+    checkpointing restored to entry state).
+    """
+    target = _find_function("paramem/server/intent.py", "_classify_via_llm")
+    assert _function_calls_base_model_inference(target), (
+        "_classify_via_llm must wrap its model.generate call in "
+        "`with base_model_inference(model):` — intent classification runs on the "
+        "base weights, not the training-active adapter."
+    )

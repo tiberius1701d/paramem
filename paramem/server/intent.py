@@ -476,48 +476,26 @@ def _classify_via_llm(
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-        # Gradient checkpointing must be off during generate() (HF silently
-        # disables KV cache when checkpointing is active).  Pair every
-        # disable with a matching restore in `finally`.
-        was_checkpointing = bool(getattr(model, "is_gradient_checkpointing", False))
-        if was_checkpointing:
-            model.gradient_checkpointing_disable()
+        # Intent classification runs on the bare base model with the KV cache
+        # live.  The PA adapter is trained on personal-key recall and would bias
+        # the classifier toward PERSONAL on content-free imperatives; gradient
+        # checkpointing must be off during generate() (HF silently disables the
+        # KV cache when checkpointing is active).  ``base_model_inference``
+        # disables the adapter and restores checkpointing to its entry state.
+        from paramem.models.loader import base_model_inference
 
-        # Intent classification runs on the bare base model.  The PA
-        # adapter is trained on personal-key recall and would bias the
-        # classifier toward PERSONAL on content-free imperatives.
-        # ``disable_adapter`` is a no-op for unwrapped base models.
-        from peft import PeftModel as _PeftModel
+        with base_model_inference(model):
+            import torch as _torch
 
-        try:
-            if isinstance(model, _PeftModel):
-                with model.disable_adapter():
-                    import torch as _torch
-
-                    with _torch.no_grad():
-                        output_ids = model.generate(
-                            **inputs,
-                            max_new_tokens=config.llm_max_new_tokens,
-                            do_sample=False,
-                            temperature=config.llm_temperature,
-                            pad_token_id=getattr(tokenizer, "pad_token_id", None)
-                            or getattr(tokenizer, "eos_token_id", None),
-                        )
-            else:
-                import torch as _torch
-
-                with _torch.no_grad():
-                    output_ids = model.generate(
-                        **inputs,
-                        max_new_tokens=config.llm_max_new_tokens,
-                        do_sample=False,
-                        temperature=config.llm_temperature,
-                        pad_token_id=getattr(tokenizer, "pad_token_id", None)
-                        or getattr(tokenizer, "eos_token_id", None),
-                    )
-        finally:
-            if was_checkpointing:
-                model.gradient_checkpointing_enable()
+            with _torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=config.llm_max_new_tokens,
+                    do_sample=False,
+                    temperature=config.llm_temperature,
+                    pad_token_id=getattr(tokenizer, "pad_token_id", None)
+                    or getattr(tokenizer, "eos_token_id", None),
+                )
 
         generated = output_ids[0][inputs["input_ids"].shape[-1] :]
         response = tokenizer.decode(generated, skip_special_tokens=True)
