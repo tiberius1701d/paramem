@@ -148,15 +148,6 @@ class ConsolidationConfig:
     # recency fires only when REPLACE is returned.  Applied uniformly at ingest,
     # interim, and fold; no positional fork.  off|on.
     refinement_contradiction: str = "off"
-    # Interim-time dedup of a RECITED exact triple (a session restating a fact
-    # already stored in a main tier) against the recalled main-tier facts, via
-    # the merger's existing Case-1 identity — so the recited fact is never
-    # minted as a new interim key (instead of being minted at interim and only
-    # collapsed later at the full fold).  Dark-shipped OFF by default: R2
-    # (recital reinforcement is not credited to the surviving main key) is an
-    # accepted regression while off; resolving it is a gate for any future
-    # default-ON flip.  See .agent/plan-interim-recital-dedup.md.
-    interim_recital_dedup: bool = False
     # Minimum recall fraction (0, 1] that every recall gate must reach before the
     # adapter fold is accepted.  Applied to: post-save disk-integrity probes
     # (_verify_saved_adapter_from_disk), interim-cycle training

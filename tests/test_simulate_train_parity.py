@@ -607,7 +607,7 @@ class TestInterimRecitalDedupSimulateTrainParity:
 
     def _make_loop(self, tmp_path: Path) -> ConsolidationLoop:
         """Minimal ConsolidationLoop with a REAL GraphMerger and one seeded
-        main-tier key, ``interim_recital_dedup=True``.
+        main-tier key.  Interim recital dedup is unconditional.
         """
         from paramem.graph.merger import GraphMerger
 
@@ -624,7 +624,7 @@ class TestInterimRecitalDedupSimulateTrainParity:
         model.add_adapter.side_effect = lambda name, cfg: model.peft_config.update({name: cfg})
         loop.model = model
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(indexed_key_replay=True, interim_recital_dedup=True)
+        loop.config = ConsolidationConfig(indexed_key_replay=True)
         loop.training_config = TrainingConfig(
             num_epochs=1,
             gradient_checkpointing=False,

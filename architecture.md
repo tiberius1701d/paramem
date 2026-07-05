@@ -180,6 +180,8 @@ During the compression phase, each session's knowledge graph is stored in the ad
 
 **Dedup is registry-true.** Two keys collapse iff their registry-true SPO is identical. The collapsed key is **soft-staled** (registry entry retained, simhash retained, excluded from training) so the fact is still accessible to the stale-echo research seam and key ids can be recycled later. The fold is **additive and lossless** with respect to registered facts: no registered fact is silently erased by a recall miss.
 
+Dedup also fires at the interim mini-fold, not only at the full fold: a session that recites a fact already stored in a main tier is deduped against the recalled, session-scoped main-tier facts, so the recital never mints a transient interim key. The recital instead credits the surviving main key's reinforcement count, exactly as a full-fold collapse would.
+
 Key insight: reconstruction does not need to be perfect. Facts that matter get reinforced through natural conversational repetition. Decay is passive: keys not re-seen for `decay_window` cycles are logged as decay candidates; there is no active deletion.
 
 This replaces an earlier design (periodic full-retrain sweeps on stored QA pairs) which contradicted the core architectural invariant: knowledge lives in weights, not in files.

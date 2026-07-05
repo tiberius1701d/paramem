@@ -3846,43 +3846,37 @@ class ConsolidationLoop:
                         self.store.active_keys_in_tier(adapter_name or scope.tier)
                     )
 
-                    # --- Interim recital dedup (dark-shipped, OFF by default) ---
-                    # config.interim_recital_dedup.  When enabled, scope the dedup
-                    # targets to main-tier keys whose SPO touches an entity present
-                    # in THIS cycle's pending-session relations (_extra) — no
-                    # entity-to-key index exists, so this reads registry SPO
-                    # directly rather than rebuilding a graph.  A recited fact IS
-                    # in _extra, so its entities are in _session_entities, so its
-                    # main-tier twin is always in scope (Case-1 can never miss a
-                    # legitimate target).  _dedup_keys stays None when the flag
-                    # is off — the byte-identical no-op path for both the
-                    # materialize call (dedup_target_keys=None) and the edge-walk
-                    # call (exclude_keys=None) below.
-                    # R2 (accepted regression while OFF-by-default): a recited
-                    # fact's reinforcement is not credited to the main key — see
-                    # .agent/plan-interim-recital-dedup.md v2 amendment #4.
-                    _dedup_keys: "list[str] | None" = None
-                    if self.config.interim_recital_dedup:
-                        _session_entities = {r.subject for r in (_extra or [])} | {
-                            r.object for r in (_extra or [])
-                        }
-                        _slot_keys_set = set(_slot_keys)
+                    # --- Interim recital dedup (unconditional) ---
+                    # Scope the dedup targets to main-tier keys whose SPO touches
+                    # an entity present in THIS cycle's pending-session relations
+                    # (_extra) — no entity-to-key index exists, so this reads
+                    # registry SPO directly rather than rebuilding a graph.  A
+                    # recited fact IS in _extra, so its entities are in
+                    # _session_entities, so its main-tier twin is always in scope
+                    # (Case-1 can never miss a legitimate target).  A recital's
+                    # reinforcement is credited to the surviving main key via the
+                    # merger's adopt_reinforcements accumulator (R2), consumed by
+                    # _refine_consolidation_graph's bump loop.
+                    _session_entities = {r.subject for r in (_extra or [])} | {
+                        r.object for r in (_extra or [])
+                    }
+                    _slot_keys_set = set(_slot_keys)
 
-                        def _dedup_touches_session(_dk: str) -> bool:
-                            _dk_entry = self.store.get(_dk)
-                            if _dk_entry is None:
-                                return False
-                            return (
-                                canonical(_dk_entry.get("subject", "")) in _session_entities
-                                or canonical(_dk_entry.get("object", "")) in _session_entities
-                            )
+                    def _dedup_touches_session(_dk: str) -> bool:
+                        _dk_entry = self.store.get(_dk)
+                        if _dk_entry is None:
+                            return False
+                        return (
+                            canonical(_dk_entry.get("subject", "")) in _session_entities
+                            or canonical(_dk_entry.get("object", "")) in _session_entities
+                        )
 
-                        _dedup_keys = [
-                            _dk
-                            for _dk_tier in ("episodic", "semantic", "procedural")
-                            for _dk in self.store.active_keys_in_tier(_dk_tier)
-                            if _dk not in _slot_keys_set and _dedup_touches_session(_dk)
-                        ]
+                    _dedup_keys: "list[str]" = [
+                        _dk
+                        for _dk_tier in ("episodic", "semantic", "procedural")
+                        for _dk in self.store.active_keys_in_tier(_dk_tier)
+                        if _dk not in _slot_keys_set and _dedup_touches_session(_dk)
+                    ]
 
                     recall_miss_keys, recon_relations = self._materialize_consolidation_graph(
                         tier=scope.tier,
@@ -3919,7 +3913,7 @@ class ConsolidationLoop:
                         _tier_keyed,
                         defer=scope.defer,
                         tag_new=scope.tag_new,
-                        exclude_keys=(set(_dedup_keys) if _dedup_keys is not None else None),
+                        exclude_keys=set(_dedup_keys),
                     )
 
                     all_interim_keyed = _tier_keyed["episodic"] + _tier_keyed["procedural"]
@@ -5366,9 +5360,9 @@ class ConsolidationLoop:
             exclude_keys: Optional set of ``ik_key`` strings to skip entirely
                 during the edge walk — neither minted (N/A; these edges always
                 already carry a key) nor keyed-replayed into ``tier_keyed``.
-                Used by the interim recital-dedup feature
-                (``config.interim_recital_dedup``) to exclude main-tier facts
-                that :meth:`_materialize_consolidation_graph` merged in as
+                Used by the (unconditional) interim recital-dedup feature to
+                exclude main-tier facts that :meth:`_materialize_consolidation_graph`
+                merged in as
                 ``dedup_target_keys``: those facts participate in the merge's
                 Case-1 identity (so a recited pending fact collapses onto
                 them) but must never acquire interim-adapter weight residence
@@ -6020,8 +6014,8 @@ class ConsolidationLoop:
            relations alongside the slot's recalled registry-true keys.  At interim,
            merge order (slot first, pending second) encodes recency: the NEW pending
            supersedes the OLD slot when ``resolve_contradictions_extra=True``.
-        6. If ``dedup_target_keys`` is not ``None`` (interim recital dedup,
-           ``config.interim_recital_dedup``), build registry-true relations for
+        6. If ``dedup_target_keys`` is not ``None`` (interim recital dedup, always
+           computed by the interim caller), build registry-true relations for
            that key subset and re-merge them LAST — AFTER the ``extra_relations``
            merge in step 5 — with ``resolve_contradictions=False`` unconditionally.
            See the INVARIANT below.
@@ -6118,9 +6112,8 @@ class ConsolidationLoop:
                 runs.  The full-fold and simulate (``source="disk"``) callers
                 never pass this param, so their behavior is byte-identical to
                 before this parameter existed.  The interim fresh-derivation
-                caller passes the caller-scoped subset (session-touched
-                main-tier keys) when ``config.interim_recital_dedup`` is
-                enabled, else ``None``.  Ignored when ``source="disk"``.
+                caller always passes the caller-scoped subset (session-touched
+                main-tier keys; possibly empty).  Ignored when ``source="disk"``.
             resolve_contradictions_recon: Forwarded to
                 :meth:`_merge_registry_relations` for the registry-true recon
                 merge.  Driven by ``config.refinement_contradiction == "on"``.
@@ -6304,7 +6297,8 @@ class ConsolidationLoop:
         )
 
         # --- Re-merge dedup_target_keys (interim recital dedup) LAST ---
-        # Dark-shipped behind config.interim_recital_dedup (default OFF).
+        # Unconditional feature: the interim fresh-derivation caller always
+        # computes and passes dedup_target_keys (possibly an empty list).
         # GUARD: only merge when dedup_target_keys is not None — None is the
         # byte-identical no-op for every caller that doesn't pass this param
         # (full-fold, simulate).  Never pass None straight through to

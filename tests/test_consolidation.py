@@ -9792,8 +9792,7 @@ class TestMaterializeInterimExtraRelations:
 
 
 # ---------------------------------------------------------------------------
-# Interim recital dedup (config.interim_recital_dedup, dark-shipped OFF)
-# .agent/plan-interim-recital-dedup.md v2 amendments
+# Interim recital dedup (unconditional — every interim fresh-derivation cycle)
 # ---------------------------------------------------------------------------
 
 
@@ -9834,7 +9833,7 @@ class TestInterimRecitalDedup:
     """
 
     @staticmethod
-    def _make_loop(tmp_path, *, interim_recital_dedup: bool = False):
+    def _make_loop(tmp_path):
         """Minimal ConsolidationLoop with a real GraphMerger for dedup tests.
 
         Copied from TestMaterializeInterimExtraRelations._make_loop (same
@@ -9859,10 +9858,7 @@ class TestInterimRecitalDedup:
             {name: cfg}
         )
         loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(
-            indexed_key_replay=True,
-            interim_recital_dedup=interim_recital_dedup,
-        )
+        loop.config = ConsolidationConfig(indexed_key_replay=True)
         loop.training_config = TrainingConfig(
             num_epochs=1,
             gradient_checkpointing=False,
@@ -10624,9 +10620,9 @@ class TestInterimRecitalDedup:
 
         Setup mirrors test_r1_benign_slot_key_survives_no_cross_tier_bump:
         an interim slot key ("graph_slot") and a main-tier key
-        ("graph_main") share identical canonical SPO, interim_recital_dedup
-        is ON, and the interim cycle's dedup-LAST merge collapses
-        "graph_main" onto "graph_slot" -- recorded in merger.collapsed /
+        ("graph_main") share identical canonical SPO, and the (unconditional)
+        interim cycle's dedup-LAST merge collapses "graph_main" onto
+        "graph_slot" -- recorded in merger.collapsed /
         removal_ledger[reason="dedup", surviving_twin="graph_slot"].
 
         A SUBSEQUENT full fold is then driven through the production entry
@@ -10664,7 +10660,6 @@ class TestInterimRecitalDedup:
         loop = TestConsolidateInterimAdaptersFullFlow._make_loop(
             tmp_path, merger_graph=nx.MultiDiGraph()
         )
-        loop.config.interim_recital_dedup = True
         _adapter = "episodic_interim_20260101T0000"
 
         # Main-tier dedup target.  "episodic" registry is created here FIRST
@@ -10787,7 +10782,7 @@ class TestInterimRecitalDedup:
     def test_session_scoping_includes_in_session_excludes_out_of_session(self, tmp_path):
         from paramem.graph.schema import Relation, SessionGraph
 
-        loop = self._make_loop(tmp_path, interim_recital_dedup=True)
+        loop = self._make_loop(tmp_path)
 
         # In-session main-tier key: subject "Alice" (display surface) --
         # touched because the session mentions "alice" (canonical node key).
@@ -10861,7 +10856,7 @@ class TestInterimRecitalDedup:
         assert len(materialize_calls) == 1
         dedup_keys = materialize_calls[0].get("dedup_target_keys")
         assert dedup_keys is not None, (
-            "dedup_target_keys must be computed when interim_recital_dedup=True"
+            "dedup_target_keys must always be computed by the interim caller"
         )
         assert "graph_a" in dedup_keys, f"in-session main key must be in scope; got {dedup_keys}"
         assert "graph_b" not in dedup_keys, (
@@ -10877,7 +10872,7 @@ class TestInterimRecitalDedup:
 
         from paramem.graph.schema import Relation, SessionGraph
 
-        loop = self._make_loop(tmp_path, interim_recital_dedup=True)
+        loop = self._make_loop(tmp_path)
         stamp = "20260201T0000"
         adapter_name = f"episodic_interim_{stamp}"
 
