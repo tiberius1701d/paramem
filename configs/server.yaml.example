@@ -198,6 +198,7 @@ consolidation:
   refinement_enrichment: "off"  # graph-stage SOTA enrichment pass. off|on. Requires sota_enabled:true to fire.
   refinement_normalization: "off"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
+  interim_recital_dedup: false  # dedup a recited exact triple against recalled main-tier facts at interim (dark-shipped; default OFF)
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
   consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
   # Floor below which a tier's keys park in episodic (the always-trained large

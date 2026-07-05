@@ -1656,8 +1656,9 @@ class ServerConfig:
         """Build ConsolidationConfig for ConsolidationLoop.
 
         New flat knobs (sota_enabled, refinement_enrichment, refinement_normalization,
-        refinement_contradiction) are threaded through here so ConsolidationLoop
-        reads them from config rather than from direct attribute access.
+        refinement_contradiction, interim_recital_dedup) are threaded through here
+        so ConsolidationLoop reads them from config rather than from direct
+        attribute access.
         """
         return ConsolidationConfig(
             promotion_threshold=self.consolidation.promotion_threshold,
@@ -1667,6 +1668,7 @@ class ServerConfig:
             refinement_enrichment=self.consolidation.refinement_enrichment,
             refinement_normalization=self.consolidation.refinement_normalization,
             refinement_contradiction=self.consolidation.refinement_contradiction,
+            interim_recital_dedup=self.consolidation.interim_recital_dedup,
             recall_sanity_threshold=self.consolidation.recall_sanity_threshold,
             min_tier_key_floor=self.consolidation.min_tier_key_floor,
             tier_fast_start=self.consolidation.tier_fast_start,

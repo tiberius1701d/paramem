@@ -573,6 +573,207 @@ class TestSimulateTrainParity:
 
 
 # ---------------------------------------------------------------------------
+# Interim recital dedup: simulate==train parity
+# (.agent/plan-interim-recital-dedup.md v2 amendment #6)
+# ---------------------------------------------------------------------------
+
+
+class TestInterimRecitalDedupSimulateTrainParity:
+    """Simulate==train parity for the interim recital-dedup feature.
+
+    Uses a REAL GraphMerger (unlike this module's MagicMock-merger
+    ``_build_loop``) so the actual Case-1 dedup collapse fires;
+    ``reconstruct_graph`` is stubbed (no GPU), mirroring
+    ``TestMaterializeInterimExtraRelations`` in test_consolidation.py.
+
+    The interim fresh-derivation materialize call never passes ``source=``
+    (always defaults to the "weights" body regardless of venue — see
+    ``_materialize_consolidation_graph``'s docstring and
+    ``.agent/plan-interim-recital-dedup.md`` section 7), so the dedup merge
+    added at the end of that body runs identically for both the "simulate"
+    and "train" venues of ``run_consolidation_cycle``.
+    """
+
+    _STAMP = "20260301T0000"
+
+    @staticmethod
+    def _fake_reconstruct(loop, *, tier=None, strict=False):
+        """Reconstruct stub: returns empty graph + no failures (no GPU)."""
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
+
+    def _make_loop(self, tmp_path: Path) -> ConsolidationLoop:
+        """Minimal ConsolidationLoop with a REAL GraphMerger and one seeded
+        main-tier key, ``interim_recital_dedup=True``.
+        """
+        from paramem.graph.merger import GraphMerger
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+
+        # NOTE: deliberately do NOT set model.__class__ = PeftModel (unlike
+        # some test_consolidation.py fixtures) -- mirrors this file's own
+        # _build_loop so isinstance(self.model, PeftModel) is False and
+        # _verify_saved_adapter_from_disk's disk-integrity probe (which would
+        # need REAL adapter files that the mocked save_adapter never writes)
+        # gracefully skips via its "not a PeftModel" branch.
+        model = MagicMock()
+        model.peft_config = {}
+        model.add_adapter.side_effect = lambda name, cfg: model.peft_config.update({name: cfg})
+        loop.model = model
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(indexed_key_replay=True, interim_recital_dedup=True)
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+        )
+        loop.episodic_config = AdapterConfig(
+            rank=4, alpha=8, learning_rate=1e-4, target_modules=["q_proj"]
+        )
+        loop.semantic_config = AdapterConfig(
+            rank=4, alpha=8, learning_rate=1e-4, target_modules=["q_proj"]
+        )
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop.output_dir = tmp_path
+        loop.snapshot_dir = None
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop._thermal_policy = None
+        loop.shutdown_requested = False
+
+        loop.merger = GraphMerger(model=None)
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        store.put(
+            "episodic",
+            "graph_main",
+            {
+                "key": "graph_main",
+                "subject": "alice",
+                "predicate": "lives_in",
+                "object": "berlin",
+            },
+            simhash=1,
+        )
+        store.set_bookkeeping(
+            "graph_main", speaker_id="sp_test", relation_type="factual", first_seen=""
+        )
+        loop.store = store
+
+        loop.cycle_count = 0
+        loop._indexed_next_index = 100
+        loop._procedural_next_index = 1
+        loop.promoted_keys: set = set()
+        loop.fingerprint_cache = None
+        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        loop.full_consolidation_period_string = ""
+        return loop
+
+    def _seed_pending(self, loop: ConsolidationLoop) -> None:
+        """Merge this cycle's pending-session content directly into
+        ``merger.graph``: one RECITED fact (matches ``graph_main``) + one
+        NOVEL fact — mirrors what ``extract_session`` would have already
+        merged in before the interim cycle runs.
+        """
+        from paramem.graph.schema import Relation, SessionGraph
+
+        session = SessionGraph(
+            session_id="s1",
+            timestamp="",
+            entities=[],
+            relations=[
+                Relation(
+                    subject="alice",
+                    predicate="lives_in",
+                    object="berlin",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="sp_test",
+                ),
+                Relation(
+                    subject="alice",
+                    predicate="likes",
+                    object="tea",
+                    relation_type="factual",
+                    confidence=1.0,
+                    speaker_id="sp_test",
+                ),
+            ],
+        )
+        loop.merger.merge(session, resolve_contradictions=False)
+
+    def test_dedup_minted_keys_identical_simulate_vs_train(self, tmp_path):
+        """A recited-plus-novel session with dedup ON mints the SAME interim
+        keys regardless of venue -- the recited fact dedups against
+        ``graph_main`` and only the novel fact mints, in BOTH venues.
+        """
+        loop_sim = self._make_loop(tmp_path / "sim")
+        loop_train = self._make_loop(tmp_path / "train")
+        self._seed_pending(loop_sim)
+        self._seed_pending(loop_train)
+
+        episodic_rels = [
+            {
+                "subject": "alice",
+                "predicate": "lives_in",
+                "object": "berlin",
+                "relation_type": "factual",
+                "speaker_id": "sp_test",
+            },
+            {
+                "subject": "alice",
+                "predicate": "likes",
+                "object": "tea",
+                "relation_type": "factual",
+                "speaker_id": "sp_test",
+            },
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop_sim.run_consolidation_cycle(
+                list(episodic_rels),
+                [],
+                speaker_id="sp_test",
+                mode="simulate",
+                run_label="dedup-parity",
+                stamp=self._STAMP,
+            )
+
+            patches = _patches_for_train_mode()
+            with patches[0], patches[1], patches[2], patches[3]:
+                loop_train.run_consolidation_cycle(
+                    list(episodic_rels),
+                    [],
+                    speaker_id="sp_test",
+                    mode="train",
+                    run_label="dedup-parity",
+                    stamp=self._STAMP,
+                )
+
+        adapter_name = f"episodic_interim_{self._STAMP}"
+        sim_keys = set(loop_sim.store.active_keys_in_tier(adapter_name))
+        train_keys = set(loop_train.store.active_keys_in_tier(adapter_name))
+
+        assert sim_keys == train_keys, (
+            f"minted interim keys diverged between venues: sim={sim_keys} train={train_keys}"
+        )
+        assert "graph_main" not in sim_keys and "graph_main" not in train_keys, (
+            "the recited fact must dedup against the main-tier key in BOTH venues"
+        )
+        assert len(sim_keys) == 1, f"exactly one novel key expected; got {sim_keys}"
+
+
+# ---------------------------------------------------------------------------
 # TestProbeKeysFromGraph — DiskMemorySource.probe (mode-agnostic)
 # ---------------------------------------------------------------------------
 

@@ -9780,6 +9780,1020 @@ class TestMaterializeInterimExtraRelations:
 
 
 # ---------------------------------------------------------------------------
+# Interim recital dedup (config.interim_recital_dedup, dark-shipped OFF)
+# .agent/plan-interim-recital-dedup.md v2 amendments
+# ---------------------------------------------------------------------------
+
+
+class TestInterimRecitalDedup:
+    """Unit tests for the interim recital-dedup feature (dedup_target_keys on
+    _materialize_consolidation_graph, exclude_keys on
+    _build_all_edge_entries_into, and the session-scoped selection formula
+    inside _run_fold's interim fresh-derivation branch).
+
+    Covered invariants (v2 amendments #1-#6):
+
+    1. A recited exact triple (matches a merged-in main-tier dedup target)
+       collapses onto the main key via the merger's Case-1 identity and
+       mints NO new interim key.
+    2. A novel session fact still mints a new interim key even when a
+       dedup target is present.
+    3. exclude_keys skips the keyed-replay branch entirely (neither minted
+       nor replayed); without exclude_keys the baseline replay is preserved.
+    4. Dataset-fingerprint stability: a recited-only cycle with dedup ON
+       fingerprints identically to an empty-delta cycle.
+    5. dedup_target_keys omitted (or None) is a byte-identical no-op —
+       the full-fold and simulate (source="disk") callers never pass it.
+    6. Dedup-LAST ordering: a session fact contradicting a main-tier dedup
+       target does NOT soft-stale/retire the main key even with
+       refinement_contradiction="on".
+    7. R1 edge case (pre-existing interim-slot key sharing identical SPO
+       with a main-tier dedup target) is benign under dedup-LAST: the slot
+       key survives/trains; no cross-tier bump_recurrence lands on the
+       main key.
+    8. Session-scoping: the real _run_fold call site passes dedup_target_keys
+       containing only main-tier keys that touch an entity mentioned in
+       THIS cycle's pending-session relations; an out-of-session main key
+       is excluded.
+    9. REAL crash-resume fast-path: a marker persisted from a feature-ON
+       fresh derivation reconstructs an IDENTICAL all_interim_keyed on
+       resume (dedup exclusion is baked into the marker; resume never
+       re-derives it).
+    """
+
+    @staticmethod
+    def _make_loop(tmp_path, *, interim_recital_dedup: bool = False):
+        """Minimal ConsolidationLoop with a real GraphMerger for dedup tests.
+
+        Copied from TestMaterializeInterimExtraRelations._make_loop (same
+        shape: object.__new__ so no GPU model or extraction pipeline is
+        needed; real GraphMerger(model=None) so merge/reset_graph execute
+        correctly; real MemoryStore with replay_enabled=True).
+        reconstruct_graph must be mocked by each test via _fake_reconstruct.
+        """
+        from peft import PeftModel
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.model.peft_config = {}
+        loop.model.add_adapter.side_effect = lambda name, cfg: loop.model.peft_config.update(
+            {name: cfg}
+        )
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(
+            indexed_key_replay=True,
+            interim_recital_dedup=interim_recital_dedup,
+        )
+        loop.training_config = TrainingConfig(
+            num_epochs=1,
+            gradient_checkpointing=False,
+            batch_size=1,
+            recall_early_stopping=False,
+            recall_probe_batch_size=1,
+        )
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.snapshot_dir = None
+        loop.shutdown_requested = False
+        loop._bg_trainer = None
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop.cycle_count = 0
+        loop._indexed_next_index = 1
+        loop._procedural_next_index = 1
+        loop._procedural_tentative_next_index = 1
+        loop._indexed_ep_interim = {}
+        loop.promoted_keys = set()
+        loop.full_consolidation_period_string = ""
+
+        loop.merger = GraphMerger(model=None)
+
+        store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            store.load_registry(tier, KeyRegistry())
+        loop.store = store
+
+        loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
+        return loop
+
+    @staticmethod
+    def _fake_reconstruct(loop, *, tier=None, strict=False):
+        """Reconstruct stub: returns empty graph + no failures (no GPU)."""
+        import networkx as nx
+
+        from paramem.graph.reconstruct import ReconstructionResult
+
+        return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
+
+    # ------------------------------------------------------------------
+    # 1. Recited exact triple -> no new interim key
+    # ------------------------------------------------------------------
+
+    def test_recited_exact_triple_dedups_no_new_key(self, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = self._make_loop(tmp_path)
+        _adapter = "episodic_interim_20260101T0000"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        extra = [
+            Relation(
+                subject="alice",
+                predicate="lives in",
+                object="berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+            )
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=[],
+                extra_relations=extra,
+                dedup_target_keys=["graph1"],
+            )
+
+        assert loop.merger.graph.number_of_edges() == 1, (
+            "recited exact triple must collapse onto the single main-tier edge"
+        )
+        all_ik = {d.get(_IK_KEY_ATTR) for _, _, d in loop.merger.graph.edges(data=True)}
+        assert all_ik == {"graph1"}
+        assert loop.merger.collapsed == [], (
+            f"primary recital path must not record a collapse; got {loop.merger.collapsed}"
+        )
+        assert loop.merger.removal_ledger == {}, (
+            f"primary recital path must not soft-stale anything; got {loop.merger.removal_ledger}"
+        )
+
+        tier_keyed = {"episodic": [], "procedural": [], "semantic": []}
+        minted, _ = loop._build_all_edge_entries_into(
+            tier_keyed, defer=True, tag_new=True, exclude_keys={"graph1"}
+        )
+        assert minted == {"episodic": 0, "procedural": 0}, (
+            f"recited fact must not mint a new interim key; got {minted}"
+        )
+        assert tier_keyed == {"episodic": [], "procedural": [], "semantic": []}, (
+            "main key must be excluded — no interim key emitted for the recited fact"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Novel session fact still mints an interim key
+    # ------------------------------------------------------------------
+
+    def test_novel_session_fact_still_mints_key(self, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+        # Bump the running key counter so the newly-minted key cannot
+        # coincidentally collide with the literal string "graph1" used below
+        # for the pre-existing main-tier key (they live in different tiers'
+        # registries -- no real collision -- but a shared string would make
+        # the key-based assertions below ambiguous).
+        loop._indexed_next_index = 100
+        _adapter = "episodic_interim_20260101T0000"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        extra = [
+            Relation(
+                subject="alice",
+                predicate="works at",
+                object="acme corp",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+            )
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=[],
+                extra_relations=extra,
+                dedup_target_keys=["graph1"],
+            )
+
+        tier_keyed = {"episodic": [], "procedural": [], "semantic": []}
+        minted, _ = loop._build_all_edge_entries_into(
+            tier_keyed, defer=True, tag_new=True, exclude_keys={"graph1"}
+        )
+        assert minted["episodic"] == 1, f"novel fact must mint exactly one new key; got {minted}"
+        assert len(tier_keyed["episodic"]) == 1
+        assert not any(e.get("key") == "graph1" for e in tier_keyed["episodic"]), (
+            "main key must remain excluded even when a novel fact mints alongside it"
+        )
+        assert tier_keyed["episodic"][0]["object"] == "acme corp", (
+            "the minted entry must be the NOVEL fact, not the excluded main key"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. exclude_keys skips the keyed-replay branch
+    # ------------------------------------------------------------------
+
+    def test_exclude_keys_skips_keyed_replay_branch(self, tmp_path):
+        loop = self._make_loop(tmp_path)
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph1", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        registry_relations = loop._build_registry_true_relations(keys=["graph1"])
+        loop._merge_registry_relations(
+            registry_relations, session_id="__test_seed__", log_label="seed"
+        )
+        assert loop.merger.graph.number_of_edges() == 1
+
+        tier_keyed_excluded = {"episodic": [], "procedural": [], "semantic": []}
+        minted_excluded, _ = loop._build_all_edge_entries_into(
+            tier_keyed_excluded, defer=True, tag_new=True, exclude_keys={"graph1"}
+        )
+        assert tier_keyed_excluded["episodic"] == [], (
+            "excluded keyed edge must NOT be replayed into tier_keyed"
+        )
+        assert minted_excluded == {"episodic": 0, "procedural": 0}
+
+        tier_keyed_baseline = {"episodic": [], "procedural": [], "semantic": []}
+        minted_baseline, _ = loop._build_all_edge_entries_into(
+            tier_keyed_baseline, defer=True, tag_new=True, exclude_keys=None
+        )
+        assert any(e["key"] == "graph1" for e in tier_keyed_baseline["episodic"]), (
+            "baseline (exclude_keys=None) must replay the keyed edge"
+        )
+        assert minted_baseline == {"episodic": 0, "procedural": 0}, (
+            "a keyed replay edge is never counted as minted"
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Dataset-fingerprint stability (dedup-ON recited-only == empty-delta)
+    # ------------------------------------------------------------------
+
+    def test_dataset_fingerprint_stable_recited_only_vs_empty_delta(self, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+        from paramem.training.consolidation import _fingerprint_entries
+
+        extra = [
+            Relation(
+                subject="alice",
+                predicate="lives in",
+                object="berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+            )
+        ]
+
+        loop_on = self._make_loop(tmp_path / "on")
+        loop_on.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop_on.store.set_bookkeeping(
+            "graph1", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop_on._materialize_consolidation_graph(
+                tier="episodic_interim_x",
+                keys=[],
+                extra_relations=extra,
+                dedup_target_keys=["graph1"],
+            )
+        tier_keyed_on = {"episodic": [], "procedural": [], "semantic": []}
+        loop_on._build_all_edge_entries_into(
+            tier_keyed_on, defer=True, tag_new=True, exclude_keys={"graph1"}
+        )
+        all_interim_keyed_on = tier_keyed_on["episodic"] + tier_keyed_on["procedural"]
+        assert all_interim_keyed_on == [], (
+            "feature-ON recited-only cycle must suppress the transient mint entirely"
+        )
+
+        loop_empty = self._make_loop(tmp_path / "empty")
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop_empty._materialize_consolidation_graph(
+                tier="episodic_interim_x", keys=[], extra_relations=None
+            )
+        tier_keyed_empty = {"episodic": [], "procedural": [], "semantic": []}
+        loop_empty._build_all_edge_entries_into(tier_keyed_empty, defer=True, tag_new=True)
+        all_interim_keyed_empty = tier_keyed_empty["episodic"] + tier_keyed_empty["procedural"]
+
+        assert _fingerprint_entries(all_interim_keyed_on) == _fingerprint_entries(
+            all_interim_keyed_empty
+        ), "dedup-ON recited-only fingerprint must equal the empty-delta cycle fingerprint"
+
+        # Contrast: WITHOUT dedup, the same recited-only cycle mints a
+        # transient key (non-empty) -- the churn dedup suppresses.
+        loop_off = self._make_loop(tmp_path / "off")
+        loop_off.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop_off.store.set_bookkeeping(
+            "graph1", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop_off._materialize_consolidation_graph(
+                tier="episodic_interim_x", keys=[], extra_relations=extra
+            )
+        tier_keyed_off = {"episodic": [], "procedural": [], "semantic": []}
+        loop_off._build_all_edge_entries_into(tier_keyed_off, defer=True, tag_new=True)
+        all_interim_keyed_off = tier_keyed_off["episodic"] + tier_keyed_off["procedural"]
+        assert len(all_interim_keyed_off) == 1, (
+            "without dedup, the recited fact mints a transient interim key "
+            "(the churn the feature removes)"
+        )
+
+    # ------------------------------------------------------------------
+    # 5. dedup_target_keys omitted/None is a byte-identical no-op
+    #    (full-fold and simulate/disk callers never pass it)
+    # ------------------------------------------------------------------
+
+    def test_dedup_param_absent_is_full_fold_noop_regression(self, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+
+        extra = [
+            Relation(
+                subject="alice",
+                predicate="likes",
+                object="tea",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+            )
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            miss_a, recon_a = loop._materialize_consolidation_graph(extra_relations=extra)
+            edges_a = loop.merger.graph.number_of_edges()
+            collapsed_a = list(loop.merger.collapsed)
+            ledger_a = dict(loop.merger.removal_ledger)
+
+            loop.merger.reset_graph()
+            miss_b, recon_b = loop._materialize_consolidation_graph(
+                extra_relations=extra, dedup_target_keys=None
+            )
+            edges_b = loop.merger.graph.number_of_edges()
+            collapsed_b = list(loop.merger.collapsed)
+            ledger_b = dict(loop.merger.removal_ledger)
+
+        assert edges_a == edges_b == 1
+        assert miss_a == miss_b
+        assert {r.indexed_key for r in recon_a} == {r.indexed_key for r in recon_b}
+        assert collapsed_a == collapsed_b == []
+        assert ledger_a == ledger_b == {}
+
+    # ------------------------------------------------------------------
+    # 6. Dedup-LAST ordering protects the main key under
+    #    refinement_contradiction="on"
+    # ------------------------------------------------------------------
+
+    def test_contradiction_interaction_dedup_last_protects_main_key(self, tmp_path):
+        from unittest.mock import MagicMock as _MM
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+        _adapter = "episodic_interim_20260101T0000"
+        # Enable Case-2 cardinality resolution (requires a non-None model).
+        loop.merger.model = _MM()
+        loop.merger.tokenizer = _MM()
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="spk-a",
+            relation_type="factual",
+            first_seen="2020-01-01T00:00:00",
+            last_seen="2020-01-01T00:00:00",
+        )
+
+        # Contradicting session fact: same subject+predicate, DIFFERENT
+        # object, NEWER last_seen.  If the main-tier edge existed before this
+        # merge (dedup FIRST), Case-2 REPLACE could retire it.
+        contradicting = [
+            Relation(
+                subject="alice",
+                predicate="lives in",
+                object="hamburg",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+                last_seen="2026-01-01T00:00:00",
+            )
+        ]
+
+        with (
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                side_effect=self._fake_reconstruct,
+            ),
+            patch(
+                "paramem.graph.merger.check_predicate_coexistence",
+                return_value="REPLACE",
+            ),
+        ):
+            loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=[],
+                extra_relations=contradicting,
+                dedup_target_keys=["graph1"],
+                resolve_contradictions_recon=True,
+                resolve_contradictions_extra=True,
+            )
+
+        assert "graph1" not in loop.merger.removal_ledger, (
+            "the main-tier dedup target must NOT be soft-staled/retired by the "
+            f"session contradiction; removal_ledger={loop.merger.removal_ledger}"
+        )
+        # Both facts coexist: the contradicting pending edge (merged first,
+        # no rival present yet) and the main-tier edge (merged in LAST,
+        # unconditionally, resolve_contradictions=False).
+        assert loop.merger.graph.number_of_edges() == 2
+
+    # ------------------------------------------------------------------
+    # 7. R1 edge case: slot-key/main-key SPO collision is benign under
+    #    dedup-LAST — the slot key survives; no cross-tier bump on main.
+    # ------------------------------------------------------------------
+
+    def test_r1_benign_slot_key_survives_no_cross_tier_bump(self, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = self._make_loop(tmp_path)
+        _adapter = "episodic_interim_20260101T0000"
+
+        # Main-tier dedup target.
+        loop.store.put(
+            "episodic",
+            "graph_main",
+            {
+                "key": "graph_main",
+                "subject": "alice",
+                "predicate": "lives in",
+                "object": "berlin",
+            },
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph_main", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        # Pre-existing interim slot key with the SAME (s,p,o) -- the anomaly.
+        loop.store.load_registry(_adapter, KeyRegistry())
+        loop.store.put(
+            _adapter,
+            "graph_slot",
+            {
+                "key": "graph_slot",
+                "subject": "alice",
+                "predicate": "lives in",
+                "object": "berlin",
+            },
+            simhash=2,
+        )
+        loop.store.set_bookkeeping(
+            "graph_slot", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=["graph_slot"],
+                extra_relations=None,
+                dedup_target_keys=["graph_main"],
+            )
+
+        assert loop.merger.graph.number_of_edges() == 1
+        surviving_keys = {d.get(_IK_KEY_ATTR) for _, _, d in loop.merger.graph.edges(data=True)}
+        assert surviving_keys == {"graph_slot"}, (
+            f"slot key must survive as the edge's ik_key under dedup-LAST; got {surviving_keys}"
+        )
+        assert "graph_main" in loop.merger.collapsed
+        assert loop.merger.removal_ledger.get("graph_main", {}).get("surviving_twin") == (
+            "graph_slot"
+        )
+        assert "graph_main" not in loop.merger.reinforcements, (
+            "no cross-tier bump_recurrence on the main-tier key"
+        )
+        assert "graph_slot" in loop.merger.reinforcements, (
+            "the surviving slot key is recorded for the fold's bump_recurrence pass"
+        )
+
+        tier_keyed = {"episodic": [], "procedural": [], "semantic": []}
+        loop._build_all_edge_entries_into(
+            tier_keyed, defer=True, tag_new=True, exclude_keys={"graph_main"}
+        )
+        assert any(e["key"] == "graph_slot" for e in tier_keyed["episodic"]), (
+            "the slot key must survive/train despite the R1 collision"
+        )
+        assert not any(e["key"] == "graph_main" for e in tier_keyed["episodic"])
+
+    # ------------------------------------------------------------------
+    # 7b. R1 cross-fold no-leak: the interim-time "dedup" collapse of the
+    #     main key must not survive (via merger.collapsed/removal_ledger)
+    #     into a SUBSEQUENT full fold's drift-partition step.  Exercises
+    #     barrier 1 specifically: reset_graph() (called unconditionally at
+    #     the top of every _materialize_consolidation_graph invocation,
+    #     including the full fold's own) must clear the interim cycle's
+    #     leftover collapsed/removal_ledger state before the full fold's
+    #     own registry-true recon and drift-partition run.
+    # ------------------------------------------------------------------
+
+    def test_r1_interim_collapse_does_not_leak_into_subsequent_full_fold(self, tmp_path):
+        """R1 collision + a SUBSEQUENT full fold: graph_main survives.
+
+        Setup mirrors test_r1_benign_slot_key_survives_no_cross_tier_bump:
+        an interim slot key ("graph_slot") and a main-tier key
+        ("graph_main") share identical canonical SPO, interim_recital_dedup
+        is ON, and the interim cycle's dedup-LAST merge collapses
+        "graph_main" onto "graph_slot" -- recorded in merger.collapsed /
+        removal_ledger[reason="dedup", surviving_twin="graph_slot"].
+
+        A SUBSEQUENT full fold is then driven through the production entry
+        (consolidate_interim_adapters, via
+        TestConsolidateInterimAdaptersFullFlow's real-GraphMerger harness --
+        the same pattern TestDriftPartitioning uses).  Both keys are still
+        active with identical SPO, so the full fold's OWN registry-true
+        recon naturally re-collides them: "graph_main" (in the "episodic"
+        registry, created before the interim tier's registry below) merges
+        first and survives as THIS fold's Case-3 edge; "graph_slot" merges
+        second and legitimately collapses as THIS fold's own
+        drift_deduplicated key -- an independent, correct verdict, the
+        opposite of the interim cycle's verdict.
+
+        Barrier-1 assertion: removal_ledger["graph_main"] (the STALE
+        interim-time entry, surviving_twin="graph_slot") must be GONE by
+        the time the full fold's drift-partition reads
+        self.merger.removal_ledger -- reset_graph() wipes it before the
+        full fold's own recon runs.  If reset_graph() were skipped, that
+        stale entry would still be present after the full fold.
+
+        Outcome assertions (the coordinator's requested regression pin):
+        graph_main is still ACTIVE after the full fold -- not soft-staled,
+        not in soft_stale_by_tier (checked via store.is_stale), still in
+        episodic's active keys.
+        """
+        from unittest.mock import patch
+
+        import networkx as nx
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.reconstruct import ReconstructionResult
+        from paramem.training.key_registry import KeyRegistry
+
+        loop = TestConsolidateInterimAdaptersFullFlow._make_loop(
+            tmp_path, merger_graph=nx.MultiDiGraph()
+        )
+        loop.config.interim_recital_dedup = True
+        _adapter = "episodic_interim_20260101T0000"
+
+        # Main-tier dedup target.  "episodic" registry is created here FIRST
+        # (matches production reality: main tiers exist from server boot,
+        # long before any given interim tier).
+        loop.store.put(
+            "episodic",
+            "graph_main",
+            {
+                "key": "graph_main",
+                "subject": "alice",
+                "predicate": "lives in",
+                "object": "berlin",
+                "speaker_id": "spk-a",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_main", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        # Pre-existing interim slot key with the SAME (s,p,o) -- the R1
+        # anomaly.  Registered SECOND (its own, later-created registry).
+        loop.store.load_registry(_adapter, KeyRegistry())
+        loop.store.put(
+            _adapter,
+            "graph_slot",
+            {
+                "key": "graph_slot",
+                "subject": "alice",
+                "predicate": "lives in",
+                "object": "berlin",
+                "speaker_id": "spk-a",
+            },
+            register=True,
+        )
+        loop.store.set_bookkeeping(
+            "graph_slot", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        # --- Interim cycle: reuse the R1 fixture's direct-call mechanism to
+        # cheaply reproduce the "interim cycle already ran" state on
+        # self.merger, exactly as test_r1_benign_slot_key_survives_no_cross_tier_bump
+        # does (real GraphMerger so Case-1 collapse actually fires). ---
+        loop.merger = GraphMerger(model=None)
+
+        def _fake_reconstruct(self_inner, *, tier=None, strict=False):
+            return ReconstructionResult(graph=nx.MultiDiGraph(), failures=[])
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=_fake_reconstruct,
+        ):
+            loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=["graph_slot"],
+                extra_relations=None,
+                dedup_target_keys=["graph_main"],
+            )
+
+        # Setup preconditions (mirrors the R1 unit test above).
+        assert "graph_main" in loop.merger.collapsed, (
+            "setup precondition: the interim dedup-LAST merge must collapse graph_main"
+        )
+        assert (
+            loop.merger.removal_ledger.get("graph_main", {}).get("surviving_twin") == "graph_slot"
+        ), "setup precondition: graph_main's interim-time surviving twin must be graph_slot"
+        assert not loop.store.is_stale("graph_main"), (
+            "setup precondition: the interim collapse must not itself soft-stale graph_main"
+        )
+
+        # --- Subsequent FULL FOLD, driven through the production entry ---
+        result = TestConsolidateInterimAdaptersFullFlow._run_with_mocks(
+            loop, tmp_path, ReconstructionResult(graph=nx.MultiDiGraph())
+        )
+
+        # Barrier 1: the interim cycle's stale removal_ledger/collapsed
+        # attribution for graph_main must be gone by the time the full
+        # fold's drift-partition reads self.merger.removal_ledger /
+        # self.merger.collapsed -- reset_graph() (unconditional, at the top
+        # of every _materialize_consolidation_graph call) clears it before
+        # the full fold's own registry-true recon runs.
+        assert loop.merger.removal_ledger.get("graph_main") is None, (
+            "the interim cycle's stale removal_ledger entry for graph_main must not "
+            f"survive into the full fold; got {loop.merger.removal_ledger.get('graph_main')}"
+        )
+
+        # graph_main must still be ACTIVE: not soft-staled, still present in
+        # episodic's (and the store's overall) active keys.
+        assert not loop.store.is_stale("graph_main"), (
+            "graph_main must not be soft-staled by the subsequent full fold"
+        )
+        assert "graph_main" in loop.store.active_keys_in_tier("episodic"), (
+            "graph_main must remain in episodic's active keys after the full fold"
+        )
+        assert "graph_main" in loop.store.all_active_keys()
+
+        # graph_slot, by contrast, legitimately loses THIS fold's own fresh
+        # Case-1 collision (its registry was created after episodic's) --
+        # an independent, correct outcome, not evidence of a leak.  It is
+        # soft-staled by the drift-partition step and then the interim
+        # slot's own (now-absorbed) registry is retired by the full fold's
+        # registry rebuild, so it no longer appears as an active key either
+        # way -- not asserting on its stale-vs-removed final state here, only
+        # that it is the one (and only) key the full fold legitimately
+        # collapses this cycle.
+        assert result["drift_deduplicated"] == 1, (
+            f"expected graph_slot to be THIS fold's own (legitimate) dedup collapse; got {result}"
+        )
+        assert "graph_slot" not in loop.store.all_active_keys(), (
+            "graph_slot must no longer be an active key after losing THIS fold's own "
+            "Case-1 collision"
+        )
+
+    # ------------------------------------------------------------------
+    # 8. Session-scoping: the real _run_fold call site scopes
+    #    dedup_target_keys to main keys touching a session entity.
+    # ------------------------------------------------------------------
+
+    def test_session_scoping_includes_in_session_excludes_out_of_session(self, tmp_path):
+        from paramem.graph.schema import Relation, SessionGraph
+
+        loop = self._make_loop(tmp_path, interim_recital_dedup=True)
+
+        # In-session main-tier key: subject "Alice" (display surface) --
+        # touched because the session mentions "alice" (canonical node key).
+        loop.store.put(
+            "episodic",
+            "graph_a",
+            {"key": "graph_a", "subject": "Alice", "predicate": "lives in", "object": "Berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph_a", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+        # Out-of-session main-tier key: subject "Carol" -- never mentioned.
+        loop.store.put(
+            "episodic",
+            "graph_b",
+            {"key": "graph_b", "subject": "Carol", "predicate": "works at", "object": "acme"},
+            simhash=2,
+        )
+        loop.store.set_bookkeeping(
+            "graph_b", speaker_id="spk-c", relation_type="factual", first_seen=""
+        )
+
+        # Pre-populate merger.graph with this cycle's pending-session content
+        # (mentions "alice") so _capture_pending_relations sees it.
+        loop.merger.merge(
+            SessionGraph(
+                session_id="s1",
+                timestamp="",
+                entities=[],
+                relations=[
+                    Relation(
+                        subject="alice",
+                        predicate="likes",
+                        object="tea",
+                        relation_type="factual",
+                        confidence=1.0,
+                        speaker_id="spk-a",
+                    )
+                ],
+            ),
+            resolve_contradictions=False,
+        )
+
+        materialize_calls: list[dict] = []
+
+        def _spy_materialize(**kw):
+            materialize_calls.append(kw)
+            return (set(), [])
+
+        loop._materialize_consolidation_graph = _spy_materialize  # type: ignore[method-assign]
+
+        stamp = "20260120T0000"
+        loop.run_consolidation_cycle(
+            [
+                {
+                    "subject": "alice",
+                    "predicate": "likes",
+                    "object": "tea",
+                    "relation_type": "factual",
+                    "speaker_id": "spk-a",
+                }
+            ],
+            [],
+            speaker_id="spk-a",
+            mode="simulate",
+            run_label="session-scoping-test",
+            stamp=stamp,
+        )
+
+        assert len(materialize_calls) == 1
+        dedup_keys = materialize_calls[0].get("dedup_target_keys")
+        assert dedup_keys is not None, (
+            "dedup_target_keys must be computed when interim_recital_dedup=True"
+        )
+        assert "graph_a" in dedup_keys, f"in-session main key must be in scope; got {dedup_keys}"
+        assert "graph_b" not in dedup_keys, (
+            f"out-of-session main key must NOT be in scope; got {dedup_keys}"
+        )
+
+    # ------------------------------------------------------------------
+    # 9. REAL crash-resume fast-path: identical all_interim_keyed
+    # ------------------------------------------------------------------
+
+    def test_real_resume_fast_path_identical_all_interim_keyed(self, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation, SessionGraph
+
+        loop = self._make_loop(tmp_path, interim_recital_dedup=True)
+        stamp = "20260201T0000"
+        adapter_name = f"episodic_interim_{stamp}"
+
+        # Main-tier dedup target: the session below recites this fact verbatim.
+        loop.store.put(
+            "episodic",
+            "graph_main",
+            {
+                "key": "graph_main",
+                "subject": "alice",
+                "predicate": "lives in",
+                "object": "berlin",
+            },
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph_main", speaker_id="spk-a", relation_type="factual", first_seen=""
+        )
+
+        # Pre-populate merger.graph with this cycle's pending-session content:
+        # a RECITED fact (matches graph_main) + a NOVEL fact.
+        loop.merger.merge(
+            SessionGraph(
+                session_id="s1",
+                timestamp="",
+                entities=[],
+                relations=[
+                    Relation(
+                        subject="alice",
+                        predicate="lives in",
+                        object="berlin",
+                        relation_type="factual",
+                        confidence=1.0,
+                        speaker_id="spk-a",
+                    ),
+                    Relation(
+                        subject="alice",
+                        predicate="likes",
+                        object="tea",
+                        relation_type="factual",
+                        confidence=1.0,
+                        speaker_id="spk-a",
+                    ),
+                ],
+            ),
+            resolve_contradictions=False,
+        )
+
+        episodic_rels = [
+            {
+                "subject": "alice",
+                "predicate": "lives in",
+                "object": "berlin",
+                "relation_type": "factual",
+                "speaker_id": "spk-a",
+            },
+            {
+                "subject": "alice",
+                "predicate": "likes",
+                "object": "tea",
+                "relation_type": "factual",
+                "speaker_id": "spk-a",
+            },
+        ]
+
+        captured_entries: list[list[dict]] = []
+
+        def _spy_train_crash(_self, entries, *, adapter_name, **kwargs):
+            captured_entries.append(list(entries))
+            raise RuntimeError("simulated crash")
+
+        def _spy_train_success(_self, entries, *, adapter_name, **kwargs):
+            captured_entries.append(list(entries))
+            return {"aborted": False, "train_loss": 0.1}, None
+
+        with (
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                side_effect=self._fake_reconstruct,
+            ),
+            patch("paramem.training.consolidation.switch_adapter"),
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=lambda m, cfg, stamp: m,
+            ),
+            patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train_crash),
+            patch.object(ConsolidationLoop, "_persist_fold"),
+        ):
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                loop.run_consolidation_cycle(
+                    list(episodic_rels),
+                    [],
+                    speaker_id="spk-a",
+                    mode="train",
+                    run_label="resume-fast-path-test",
+                    stamp=stamp,
+                )
+
+        assert len(captured_entries) == 1, (
+            "training must have been attempted exactly once pre-crash"
+        )
+        pre_crash_entries = captured_entries[0]
+        assert not any(e["key"] == "graph_main" for e in pre_crash_entries), (
+            "the recited fact must NOT have minted a transient key pre-crash"
+        )
+        assert len(pre_crash_entries) == 1, (
+            f"exactly one novel key expected pre-crash; got {pre_crash_entries}"
+        )
+
+        # Marker must be on disk.
+        marker = loop._read_fold_resume()
+        assert marker is not None, "fold_resume.json must be persisted before the crash"
+        assert marker.get("scope") == "interim_slot"
+        assert adapter_name in marker.get("train_assignment", {})
+
+        # Second call: SAME stamp -> _resume_b must match -> RESUME FAST-PATH.
+        with (
+            patch(
+                "paramem.training.consolidation.reconstruct_graph",
+                side_effect=self._fake_reconstruct,
+            ),
+            patch("paramem.training.consolidation.switch_adapter"),
+            patch(
+                "paramem.memory.interim_adapter.create_interim_adapter",
+                side_effect=lambda m, cfg, stamp: m,
+            ),
+            patch.object(ConsolidationLoop, "_train_tier_adapter", _spy_train_success),
+            patch.object(ConsolidationLoop, "_persist_fold"),
+        ):
+            result = loop.run_consolidation_cycle(
+                list(episodic_rels),
+                [],
+                speaker_id="spk-a",
+                mode="train",
+                run_label="resume-fast-path-test",
+                stamp=stamp,
+            )
+
+        assert result.get("mode") == "trained", f"resumed cycle must complete; got {result!r}"
+        assert len(captured_entries) == 2
+        post_resume_entries = captured_entries[1]
+
+        def _key_set(entries):
+            return {(e["key"], e["subject"], e["predicate"], e["object"]) for e in entries}
+
+        assert _key_set(pre_crash_entries) == _key_set(post_resume_entries), (
+            "resume must reconstruct an IDENTICAL all_interim_keyed to the "
+            f"pre-crash derivation; pre={pre_crash_entries} post={post_resume_entries}"
+        )
+        assert not any(e["key"] == "graph_main" for e in post_resume_entries), (
+            "the main-tier dedup target must remain excluded on resume too"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Multi-speaker dcf4189 invariant + keyed-walk vs flat parity
 # ---------------------------------------------------------------------------
 
