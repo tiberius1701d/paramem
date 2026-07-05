@@ -9,7 +9,7 @@ from pathlib import Path
 
 from paramem.evaluation.recall import generate_answer
 from paramem.graph.entity_correction import correct_entity_surfaces
-from paramem.graph.name_match import is_speaker_id
+from paramem.graph.name_match import canonical, is_speaker_id
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Entity, SessionGraph
@@ -582,6 +582,7 @@ def extract_procedural_graph(
     user_prompt_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
     model_alias: str | None = None,
     timestamp: str | None = None,
+    source_type: str = "transcript",
 ) -> SessionGraph:
     """Extract preferences/habits from a session transcript.
 
@@ -618,6 +619,10 @@ def extract_procedural_graph(
             prompt resolution: ``prompts_dir/<model_alias>/<filename>``
             is checked first, falling back to ``prompts_dir`` and then
             ``configs/prompts/``.  SOTA cloud prompts are not affected.
+        source_type: ``"transcript"`` (default) or ``"document"``. Forwarded
+            to :func:`_stamp_speaker_entity` as the Guard B gate for the
+            document-only exact-full-name rewrite of third-person speaker
+            mentions onto ``speaker_id``.
     """
     system, prompt = load_procedural_prompt(
         prompts_dir,
@@ -677,7 +682,9 @@ def extract_procedural_graph(
     # _stamp_speaker_entity runs on an already-validated graph; it cannot fail
     # on malformed model output and must not be swallowed by the parse guard.
     if speaker_id:
-        graph = _stamp_speaker_entity(graph, speaker_id=speaker_id)
+        graph = _stamp_speaker_entity(
+            graph, speaker_id=speaker_id, speaker_name=speaker_name, source_type=source_type
+        )
 
     logger.info(
         "Procedural extraction: %d entities, %d relations (session=%s)",
@@ -719,6 +726,7 @@ def extract_graph(
     model_alias: str | None = None,
     seed: int | None = None,
     timestamp: str | None = None,
+    source_type: str = "transcript",
 ) -> SessionGraph:
     """Extract a knowledge graph from a session transcript.
 
@@ -791,6 +799,10 @@ def extract_graph(
             ``SessionGraph.timestamp`` so ``last_seen`` on newly-merged
             edges reflects when the facts were asserted, not when
             extraction ran.  ``None`` (default) falls back to ``now()``.
+        source_type: ``"transcript"`` (default) or ``"document"``. Forwarded
+            to :func:`_parse_extraction` / :func:`_stamp_speaker_entity` as
+            the Guard B gate for the document-only exact-full-name rewrite
+            of third-person speaker mentions onto ``speaker_id``.
     """
     # Validate stop_phase against the canonical whitelist before any
     # work happens.  Catches typos early ("anonymise" vs "anonymize")
@@ -843,6 +855,7 @@ def extract_graph(
                         speaker_id=speaker_id,
                         speaker_name=speaker_name,
                         timestamp=timestamp,
+                        source_type=source_type,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -1198,6 +1211,7 @@ def _parse_extraction(
     speaker_id: str,
     speaker_name: str | None = None,
     timestamp: str | None = None,
+    source_type: str = "transcript",
 ) -> SessionGraph:
     """Parse raw model output into a SessionGraph.
 
@@ -1218,12 +1232,17 @@ def _parse_extraction(
         speaker_id: Speaker store ID (e.g. ``"Speaker0"``).  Stamped onto
             every relation as provenance and used to identify the session
             speaker entity.  Required — callers must always supply a real id.
-        speaker_name: Display name of the speaker (e.g. ``"Tobias"``).
-            Passed through for call-site compatibility; not used for entity
-            matching in :func:`_stamp_speaker_entity`.
+        speaker_name: Display name of the speaker (e.g. ``"Tobias"``).  Used
+            for document-source exact-full-name binding in
+            :func:`_stamp_speaker_entity` (fires only when ``source_type ==
+            "document"`` and the name is multi-token — see that function's
+            guards); has no effect on transcript-source extraction.
         timestamp: Session-start assertion time (ISO 8601), forwarded from
             the caller's ``extract_graph(timestamp=...)``.  ``None`` (default)
             falls back to ``now()``.
+        source_type: ``"transcript"`` (default) or ``"document"``. Forwarded
+            to :func:`_stamp_speaker_entity` as the Guard B gate for the
+            exact-full-name rewrite.
     """
     json_str = _extract_json_block(raw_output)
     data = json.loads(json_str)
@@ -1249,7 +1268,9 @@ def _parse_extraction(
 
     # Post-process: stamp speaker_id on speaker-id entities.
     if speaker_id:
-        graph = _stamp_speaker_entity(graph, speaker_id=speaker_id)
+        graph = _stamp_speaker_entity(
+            graph, speaker_id=speaker_id, speaker_name=speaker_name, source_type=source_type
+        )
 
     logger.info(
         "Extracted graph: %d entities, %d relations (session=%s)",
@@ -1264,6 +1285,8 @@ def _stamp_speaker_entity(
     graph: SessionGraph,
     *,
     speaker_id: str,
+    speaker_name: str | None = None,
+    source_type: str = "transcript",
 ) -> SessionGraph:
     """Stamp ``speaker_id`` on speaker-id entities in the extracted graph.
 
@@ -1271,34 +1294,132 @@ def _stamp_speaker_entity(
     model to emit ``speaker{N}`` (lowercase) as the entity name and relation
     subject.  The ingest safety-net in :func:`_normalize_extraction` ensures
     the entity name is already lowercase before this function is called.
-    This post-processor walks the entity list and sets ``entity.speaker_id``
-    on every entity whose name passes :func:`~paramem.graph.name_match.is_speaker_id`:
 
-    * **Session speaker** — when ``ent.name == speaker_id.lower()`` the entity
-      IS the session speaker.  Its ``speaker_id`` field is set to
-      ``speaker_id.lower()`` (the authoritative lowercase id from the caller),
-      preserving the authoritative-id pin.  This guards against the model
-      emitting the wrong digit (e.g. ``speaker1`` in a ``speaker0`` session).
+    Two responsibilities compose here, in order:
 
-    * **Other speaker reference** — when a different ``speaker{N}`` id appears
-      (e.g. a third-party speaker), ``entity.speaker_id`` is set to
-      ``ent.name`` (already lowercase via the ingest safety-net).
+    1. **Exact-full-name rewrite (document sources only).** Third-person
+       documents (e.g. a CV: "Tobias Preusser led the team") describe the
+       speaker by literal name rather than self-reference, so the model has
+       no ``speaker{N}`` token to emit for the subject.  When both guards
+       below hold, every entity/relation field that matches the speaker's
+       full name via :func:`~paramem.graph.name_match.canonical` (exact
+       match only — no substrings, no first-name subsets, no honorifics) is
+       rewritten to ``speaker_id.lower()`` *before* the stamping loop below
+       runs, so the rewritten entities are also stamped.
+
+       * **Guard A (full-name only)** — fires only when
+         ``len(canonical(speaker_name).split()) >= 2``. A single-token
+         display name (``resolve_speaker_name`` routinely returns a bare
+         first name) fails closed: no rewrite. This is what prevents a
+         first-person transcript mention like "My friend Tobias came over"
+         from ever being eligible (paired with Guard B below, which excludes
+         transcripts outright).
+       * **Guard B (document sources only)** — fires only when
+         ``source_type == "document"``. Transcript/voice sessions keep
+         today's first-person comprehension binding untouched.
+
+       Rewriting a relation's ``object`` to the speaker id can synthesize a
+       ``(speaker0, pred, speaker0)`` self-loop when the same full name was
+       both subject and object (e.g. "X reported to X" narration collapsing
+       onto one person). The self-loop filter in :func:`_normalize_extraction`
+       already ran earlier in the pipeline and cannot see a self-loop this
+       rewrite creates, and the graph merger has no ``subject == object``
+       guard, so such relations are dropped here — the whole relation, not
+       just the object field, since leaving the literal name on ``object``
+       would both re-expose it to downstream anonymization and produce a
+       bogus fact.
+
+       The rewrite can also produce two entities named ``speaker_id.lower()``
+       in one graph (a pre-existing speaker entity plus one renamed by the
+       rewrite); those are collapsed into one, unioning ``attributes``.
+
+    2. **Existing ``is_speaker_id`` stamping loop** (unchanged in shape) sets
+       ``entity.speaker_id`` on every entity whose (possibly just-rewritten)
+       name passes :func:`~paramem.graph.name_match.is_speaker_id`:
+
+       * **Session speaker** — when ``ent.name == speaker_id.lower()`` the
+         entity IS the session speaker.  Its ``speaker_id`` field is set to
+         ``speaker_id.lower()`` (the authoritative lowercase id from the
+         caller), preserving the authoritative-id pin.  This guards against
+         the model emitting the wrong digit (e.g. ``speaker1`` in a
+         ``speaker0`` session).
+
+       * **Other speaker reference** — when a different ``speaker{N}`` id
+         appears (e.g. a third-party speaker), ``entity.speaker_id`` is set
+         to ``ent.name`` (already lowercase via the ingest safety-net).
 
     Non-speaker entities (display names like ``"Tobias Becker"``, places, orgs)
-    are left untouched: ``is_speaker_id`` returns ``False`` for them.
+    are left untouched: ``is_speaker_id`` returns ``False`` for them, and the
+    rewrite in (1) only fires under both guards.
 
     Args:
         graph: Parsed :class:`~paramem.graph.schema.SessionGraph` after
             schema validation.
         speaker_id: Authoritative speaker id (e.g. ``"speaker0"``).  Used as
-            the authoritative-pin guard to detect wrong-digit model emissions.
+            the authoritative-pin guard to detect wrong-digit model emissions,
+            and as the rewrite target in (1).
+        speaker_name: Display name of the speaker (e.g. ``"Tobias Preusser"``),
+            used ONLY as the exact-full-name rewrite target in (1). ``None``
+            (default; e.g. an anonymous speaker) skips the rewrite — there is
+            nothing to bind a third-person mention to.
+        source_type: ``"transcript"`` (default) or ``"document"``. The
+            rewrite in (1) fires only for ``"document"`` (Guard B).
 
     Returns:
         Updated ``SessionGraph`` with ``speaker_id`` set on all speaker-id
-        entities.  Entities that are not speaker ids are unmodified.
+        entities, and (for document sources with a full display name) the
+        speaker's literal full name rewritten to ``speaker_id.lower()``
+        wherever it appears verbatim as an entity name or relation
+        subject/object. Entities/relations that don't match are unmodified.
     """
     if not graph.entities:
         return graph
+
+    do_rewrite = (
+        source_type == "document"
+        and speaker_name
+        and not is_speaker_id(speaker_name)
+        and len(canonical(speaker_name).split()) >= 2
+    )
+
+    if do_rewrite:
+        target = canonical(speaker_name)
+        sid = speaker_id.lower()
+
+        for ent in graph.entities:
+            if canonical(ent.name) == target:
+                ent.name = sid
+        for rel in graph.relations:
+            if canonical(rel.subject) == target:
+                rel.subject = sid
+            if canonical(rel.object) == target:
+                rel.object = sid
+
+        # Self-loop drop: dropping the whole relation (not just skipping the
+        # object rewrite) is the only choice that keeps the literal name out
+        # of anonymization — see docstring point (1).
+        kept_relations = []
+        for rel in graph.relations:
+            if rel.subject == sid and rel.object == sid:
+                logger.debug("Filtered rewrite-synthesized self-loop: %s -> %s", sid, sid)
+                continue
+            kept_relations.append(rel)
+        graph.relations = kept_relations
+
+        # Duplicate-speaker collapse: keep the first speaker_id-named entity,
+        # union attributes from any later duplicate the rewrite produced.
+        kept_entities = []
+        speaker_entity = None
+        for ent in graph.entities:
+            if ent.name == sid:
+                if speaker_entity is None:
+                    speaker_entity = ent
+                    kept_entities.append(ent)
+                else:
+                    speaker_entity.attributes = {**ent.attributes, **speaker_entity.attributes}
+                continue
+            kept_entities.append(ent)
+        graph.entities = kept_entities
 
     for ent in graph.entities:
         if not is_speaker_id(ent.name):

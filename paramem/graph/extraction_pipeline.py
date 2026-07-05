@@ -180,7 +180,10 @@ class ExtractionPipeline:
     def kwargs(self, *, source_type: str = "transcript", **overrides) -> dict:
         """Build the kwarg dict passed into :func:`extract_graph`.
 
-        ``source_type`` only governs runtime gate defaults; **prompt
+        ``source_type`` governs runtime gate defaults and is forwarded
+        into the returned dict as ``source_type`` so :func:`extract_graph`
+        (and, inside it, :func:`_stamp_speaker_entity`) can gate the
+        document-only exact-full-name speaker rewrite on it. **Prompt
         files are the same for every source type**.  One prompt-pair
         (``extraction.txt`` + ``extraction_system.txt``) is the single
         ground truth for extraction; document chunks land in the same
@@ -251,6 +254,7 @@ class ExtractionPipeline:
             stop_phase=overrides.get("stop_phase"),
             seed=overrides.get("seed"),
             timestamp=overrides.get("timestamp"),
+            source_type=source_type,
         )
 
     def run(
@@ -335,6 +339,7 @@ class ExtractionPipeline:
             system_prompt_filename=system_prompt_filename,
             user_prompt_filename=user_prompt_filename,
             timestamp=timestamp,
+            source_type=source_type,
         )
         if isinstance(self.model, _PeftModel):
             with self.model.disable_adapter():

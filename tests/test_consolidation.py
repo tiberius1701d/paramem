@@ -305,6 +305,154 @@ class TestExtractionPathParity:
         assert any(qa["predicate"] == "prefers" for qa in episodic)
         assert procedural == []
 
+    def _capture_transcript_spy(self, bucket, fixture):
+        """Spy matching the extract_graph_spy/extract_procedural_spy call shape
+        (model, tokenizer, transcript, session_id, **kwargs); captures the
+        transcript positional arg instead of kwargs."""
+
+        def _f(model, tokenizer, transcript, session_id, **kwargs):
+            bucket.append(transcript)
+            return fixture
+
+        return _f
+
+    def test_document_ownership_cue_prepended(self, monkeypatch, tmp_path):
+        """source_type='document' + speaker_name → the local extraction slot
+        (both extract_graph and extract_procedural_graph) is prefixed with the
+        ownership cue; session_transcript itself is untouched."""
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+        from paramem.training.consolidation import OWNERSHIP_CUE
+
+        session_graph = SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[Entity(name="speaker0", entity_type="person")],
+            relations=[
+                Relation(
+                    subject="speaker0",
+                    predicate="leads",
+                    object="the team",
+                    relation_type="factual",
+                    speaker_id="speaker0",
+                )
+            ],
+        )
+        procedural_graph = SessionGraph(session_id="s001", timestamp="2026-01-01T00:00:00Z")
+
+        captured_graph: list[str] = []
+        captured_procedural: list[str] = []
+        loop = self._build_loop(
+            monkeypatch,
+            tmp_path,
+            procedural_enabled=True,
+            extract_graph_spy=self._capture_transcript_spy(captured_graph, session_graph),
+            extract_procedural_spy=self._capture_transcript_spy(
+                captured_procedural, procedural_graph
+            ),
+        )
+        body = "Tobias Preusser led the platform team."
+        loop.extract_session(
+            session_transcript=body,
+            session_id="s001",
+            speaker_id="speaker0",
+            speaker_name="Tobias Preusser",
+            source_type="document",
+        )
+
+        expected_cue = OWNERSHIP_CUE.format(name="Tobias Preusser", sid="speaker0")
+        assert captured_graph == [expected_cue + body]
+        assert captured_procedural == [expected_cue + body]
+
+    def test_transcript_source_no_cue(self, monkeypatch, tmp_path):
+        """source_type='transcript' → the extraction slot is the unmodified body."""
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+
+        session_graph = SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[Entity(name="speaker0", entity_type="person")],
+            relations=[
+                Relation(
+                    subject="speaker0",
+                    predicate="leads",
+                    object="the team",
+                    relation_type="factual",
+                    speaker_id="speaker0",
+                )
+            ],
+        )
+        procedural_graph = SessionGraph(session_id="s001", timestamp="2026-01-01T00:00:00Z")
+
+        captured_graph: list[str] = []
+        loop = self._build_loop(
+            monkeypatch,
+            tmp_path,
+            procedural_enabled=True,
+            extract_graph_spy=self._capture_transcript_spy(captured_graph, session_graph),
+            extract_procedural_spy=self._capture_transcript_spy([], procedural_graph),
+        )
+        body = "I lead the platform team."
+        loop.extract_session(
+            session_transcript=body,
+            session_id="s001",
+            speaker_id="speaker0",
+            speaker_name="Tobias Preusser",
+            source_type="transcript",
+        )
+
+        assert captured_graph == [body]
+
+    def test_anonymous_document_no_cue(self, monkeypatch, tmp_path):
+        """source_type='document' but speaker_name is None (anonymous speaker)
+        → no cue is prepended; nothing to bind the name to."""
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+
+        session_graph = SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00Z",
+            entities=[Entity(name="Tobias Preusser", entity_type="person")],
+            relations=[
+                Relation(
+                    subject="Tobias Preusser",
+                    predicate="leads",
+                    object="the team",
+                    relation_type="factual",
+                    speaker_id="speaker0",
+                )
+            ],
+        )
+        procedural_graph = SessionGraph(session_id="s001", timestamp="2026-01-01T00:00:00Z")
+
+        captured_graph: list[str] = []
+        loop = self._build_loop(
+            monkeypatch,
+            tmp_path,
+            procedural_enabled=True,
+            extract_graph_spy=self._capture_transcript_spy(captured_graph, session_graph),
+            extract_procedural_spy=self._capture_transcript_spy([], procedural_graph),
+        )
+        body = "Tobias Preusser led the platform team."
+        loop.extract_session(
+            session_transcript=body,
+            session_id="s001",
+            speaker_id="speaker0",
+            speaker_name=None,
+            source_type="document",
+        )
+
+        assert captured_graph == [body]
+
+    def test_extraction_pipeline_forwards_source_type(self):
+        """ExtractionPipeline.kwargs forwards source_type into the returned
+        dict so extract_graph receives Guard B (guards the Edit 5 wiring)."""
+        from unittest.mock import MagicMock
+
+        from paramem.graph.extraction_pipeline import ExtractionPipeline
+
+        pipeline = ExtractionPipeline(model=MagicMock(), tokenizer=MagicMock())
+        result = pipeline.kwargs(source_type="document", speaker_id="speaker0")
+        assert result["source_type"] == "document"
+
 
 class TestInterimRefinementGate:
     """extract_session merger.merge is always called; resolve_contradictions tracks config.

@@ -78,6 +78,17 @@ _SYNTHETIC_SESSION_IDS: frozenset[str] = frozenset(
     }
 )
 
+# Ownership cue prepended to the local extraction slot for document sources
+# with a known speaker name — a soft, in-prompt signal raising first-pass
+# model compliance with the exact-full-name speaker rewrite that
+# _stamp_speaker_entity applies deterministically regardless (extractor.py).
+# Not a prompt file: this is a caller-layer prepend onto the slot content,
+# per the single-topology one-prompt-pair design (extraction_pipeline.py
+# kwargs() docstring).
+OWNERSHIP_CUE = (
+    "[Document provided by {name} ({sid}). Statements describing {name} are facts about {sid}.]\n\n"
+)
+
 
 def resolve_to_node_key(
     name: str,
@@ -1177,6 +1188,18 @@ class ConsolidationLoop:
         """
         logger.info("=== Extraction (session=%s) ===", session_id)
 
+        # Ownership cue: a soft, in-prompt compliance aid for document
+        # sources with a known speaker name — see OWNERSHIP_CUE. Built as a
+        # LOCAL extraction-only variable; session_transcript itself is left
+        # unmodified because it is reused below for STT anchoring / traces.
+        # The deterministic exact-full-name rewrite in _stamp_speaker_entity
+        # does not depend on this cue; it only raises first-pass compliance.
+        extraction_input = session_transcript
+        if source_type == "document" and speaker_name:
+            extraction_input = (
+                OWNERSHIP_CUE.format(name=speaker_name, sid=speaker_id) + session_transcript
+            )
+
         # Outer extraction_trace scope wraps the whole session body so the
         # orchestrator phases (merge_into_cumulative, procedural_extract,
         # dedup_*) record into the same trace as the inner extract_graph /
@@ -1186,7 +1209,7 @@ class ConsolidationLoop:
         with extraction_trace() as trace:
             # --- EXTRACT ---
             session_graph = self.extraction.run(
-                session_transcript,
+                extraction_input,
                 session_id,
                 source_type=source_type,
                 ha_context=ha_context,
@@ -1243,7 +1266,7 @@ class ConsolidationLoop:
             if self.procedural_config is not None:
                 with phase_trace("procedural_extract") as t:
                     proc_graph = self.extraction.run_procedural(
-                        session_transcript,
+                        extraction_input,
                         session_id,
                         speaker_name=speaker_name,
                         source_type=source_type,
