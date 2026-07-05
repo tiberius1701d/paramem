@@ -257,6 +257,42 @@ class ExtractionPipeline:
             source_type=source_type,
         )
 
+    def _run_extractor(
+        self,
+        extract_fn,
+        session_transcript: str,
+        session_id: str,
+        call_kwargs: dict,
+    ) -> "SessionGraph":
+        """Shared execution primitive for :meth:`run` and :meth:`run_procedural`.
+
+        Disables gradient checkpointing (HF silently disables the KV cache
+        when checkpointing is active; KV cache is required for
+        ``model.generate()``), then wraps the call in ``disable_adapter()``
+        when ``self.model`` is a ``PeftModel`` (extraction must run on the
+        base model, never the adapter being trained).  ``extract_fn`` is
+        ``extract_graph`` or ``extract_procedural_graph``.
+        """
+        from peft import PeftModel as _PeftModel
+
+        self.model.gradient_checkpointing_disable()
+        if isinstance(self.model, _PeftModel):
+            with self.model.disable_adapter():
+                return extract_fn(
+                    self.model,
+                    self.tokenizer,
+                    session_transcript,
+                    session_id,
+                    **call_kwargs,
+                )
+        return extract_fn(
+            self.model,
+            self.tokenizer,
+            session_transcript,
+            session_id,
+            **call_kwargs,
+        )
+
     def run(
         self,
         session_transcript: str,
@@ -271,26 +307,8 @@ class ExtractionPipeline:
         kwarg :meth:`kwargs` returns plus the chokepoint-only fields
         ``speaker_id``, ``speaker_name``, ``ha_context``, ``stop_phase``.
         """
-        from peft import PeftModel as _PeftModel
-
-        self.model.gradient_checkpointing_disable()
         kwargs = self.kwargs(source_type=source_type, **overrides)
-        if isinstance(self.model, _PeftModel):
-            with self.model.disable_adapter():
-                return extract_graph(
-                    self.model,
-                    self.tokenizer,
-                    session_transcript,
-                    session_id,
-                    **kwargs,
-                )
-        return extract_graph(
-            self.model,
-            self.tokenizer,
-            session_transcript,
-            session_id,
-            **kwargs,
-        )
+        return self._run_extractor(extract_graph, session_transcript, session_id, kwargs)
 
     def run_procedural(
         self,
@@ -301,6 +319,10 @@ class ExtractionPipeline:
         speaker_name: str | None = None,
         source_type: str = "transcript",
         timestamp: str | None = None,
+        prompts_dir: str | Path | None = None,
+        seed: int | None = None,
+        system_prompt_filename: str | None = None,
+        user_prompt_filename: str | None = None,
     ) -> "SessionGraph":
         """Single entry point for procedural (preferences/habits) extraction.
 
@@ -316,44 +338,40 @@ class ExtractionPipeline:
         :func:`~paramem.graph.extractor.extract_procedural_graph` so
         ``last_seen`` on newly-merged edges reflects when the facts were
         asserted.  ``None`` (default) falls back to ``now()``.
-        """
-        from peft import PeftModel as _PeftModel
 
+        ``prompts_dir``/``seed``/``system_prompt_filename``/
+        ``user_prompt_filename`` mirror the same-named overrides on
+        :meth:`run` (via :meth:`kwargs`): each defaults to ``None``, which
+        preserves the pre-existing production behaviour (``self.prompts_dir``,
+        no seed, the two ``DEFAULT_*`` prompt filenames) unchanged for every
+        existing caller. ``stop_phase`` is intentionally NOT exposed here —
+        procedural extraction is a single-phase call, so a stop point is
+        inapplicable.
+        """
         if not speaker_id:
             raise ValueError(
                 "speaker_id is required for procedural extraction (no empty-string default)."
             )
 
-        self.model.gradient_checkpointing_disable()
         cfg = self.config
         # Single prompt-pair for both source types — see :meth:`kwargs`.
-        system_prompt_filename = DEFAULT_SYSTEM_PROMPT_FILENAME
-        user_prompt_filename = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME
+        resolved_system_prompt_filename = system_prompt_filename or DEFAULT_SYSTEM_PROMPT_FILENAME
+        resolved_user_prompt_filename = (
+            user_prompt_filename or DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME
+        )
         call_kwargs = dict(
             max_tokens=cfg.max_tokens,
-            prompts_dir=self.prompts_dir,
+            prompts_dir=prompts_dir if prompts_dir is not None else self.prompts_dir,
             # model_alias drives per-file prompt resolution — see kwargs() comment.
             model_alias=self.model_name,
             speaker_name=speaker_name,
             speaker_id=speaker_id,
-            system_prompt_filename=system_prompt_filename,
-            user_prompt_filename=user_prompt_filename,
+            system_prompt_filename=resolved_system_prompt_filename,
+            user_prompt_filename=resolved_user_prompt_filename,
+            seed=seed,
             timestamp=timestamp,
             source_type=source_type,
         )
-        if isinstance(self.model, _PeftModel):
-            with self.model.disable_adapter():
-                return extract_procedural_graph(
-                    self.model,
-                    self.tokenizer,
-                    session_transcript,
-                    session_id,
-                    **call_kwargs,
-                )
-        return extract_procedural_graph(
-            self.model,
-            self.tokenizer,
-            session_transcript,
-            session_id,
-            **call_kwargs,
+        return self._run_extractor(
+            extract_procedural_graph, session_transcript, session_id, call_kwargs
         )

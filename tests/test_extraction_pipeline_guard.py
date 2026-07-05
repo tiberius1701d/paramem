@@ -722,6 +722,40 @@ def test_run_threads_positional_args_procedural(monkeypatch):
     assert captured["kwargs"]["prompts_dir"] == "/custom/prompts"
 
 
+def test_run_procedural_threads_seed_and_prompt_overrides(monkeypatch):
+    """:meth:`run_procedural` must forward ``seed``/``prompts_dir``/
+    ``system_prompt_filename``/``user_prompt_filename`` unchanged into the
+    extractor's kwargs.
+
+    Regression guard for the shared prompt-source + seed configuration
+    vocabulary added alongside :meth:`run`'s equivalent overrides (routed
+    through the common :meth:`_run_extractor` primitive).
+    """
+    captured = {}
+
+    def spy(model, tokenizer, transcript, session_id, **kwargs):
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_procedural_graph", spy)
+
+    pipeline = _make_pipeline()
+    pipeline.run_procedural(
+        "transcript text",
+        "s001",
+        speaker_id="Speaker0",
+        seed=123,
+        prompts_dir="/x",
+        system_prompt_filename="s.txt",
+        user_prompt_filename="u.txt",
+    )
+
+    assert captured["kwargs"]["seed"] == 123
+    assert captured["kwargs"]["prompts_dir"] == "/x"
+    assert captured["kwargs"]["system_prompt_filename"] == "s.txt"
+    assert captured["kwargs"]["user_prompt_filename"] == "u.txt"
+
+
 def test_run_uses_default_prompts_for_document(monkeypatch):
     """When called with source_type='document', :meth:`ExtractionPipeline.run`
     must still use ``DEFAULT_SYSTEM_PROMPT_FILENAME`` and

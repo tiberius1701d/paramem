@@ -101,6 +101,28 @@ class CalibrateExtractRequest(BaseModel):
     params: CalibrateParams = Field(default_factory=CalibrateParams)
 
 
+class CalibrateProceduralRequest(BaseModel):
+    """Run the procedural (preferences/habits) extractor on a transcript.
+
+    Mirrors :class:`CalibrateExtractRequest`'s prompt-source + seed
+    configuration vocabulary — ``prompts_dir`` / ``procedural_prompt_filename``
+    / ``procedural_system_prompt_filename`` override the prompt pair,
+    ``params.seed`` threads through :meth:`ExtractionPipeline.run_procedural`.
+    ``stop_phase`` is intentionally NOT mirrored: procedural extraction is a
+    single-phase call, so a stop point is inapplicable.
+    """
+
+    transcript: str
+    speaker_id: str
+    speaker_name: str | None = None
+    source_type: str = Field(default="transcript", pattern="^(transcript|document)$")
+    session_id: str = "calib"
+    prompts_dir: str | None = None
+    procedural_prompt_filename: str | None = None
+    procedural_system_prompt_filename: str | None = None
+    params: CalibrateParams = Field(default_factory=CalibrateParams)
+
+
 class CalibrateAnonymizeRequest(BaseModel):
     """Run the anonymizer on an explicit graph + transcript pair.
 
@@ -466,21 +488,16 @@ def _preflight(state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, Any]:
-    """Run the local extractor for a single transcript.
+def _ensure_calibration_loop(state: dict):
+    """Lazy-init the loop the same way the production /consolidate handler does.
 
-    Routes through :meth:`ExtractionPipeline.run` (the single-topology
-    chokepoint).  The pipeline lives on the process-wide
-    ``ConsolidationLoop`` so calibration calls share the exact instance
-    the production /consolidate cycle uses — same model, same config,
-    same flags.  Never calls ``extract_graph`` directly.
+    This is not a parallel route — it's the same factory and the same single
+    ``ConsolidationLoop`` instance.  The FIRST call (calibrate or consolidate)
+    creates it; subsequent calls reuse.  Calibration touches only
+    ``loop.extraction`` (read-only): no merger, no trainer, no disk writes.
+    Shared by every calibration handler that needs the pipeline — do not
+    inline a second init path.
     """
-    _preflight(state)
-    # Lazy-init the loop the same way the production /consolidate handler does.
-    # This is not a parallel route — it's the same factory and the same single
-    # ConsolidationLoop instance.  The FIRST call (calibrate or consolidate)
-    # creates it; subsequent calls reuse.  Calibration touches only
-    # ``loop.extraction`` (read-only): no merger, no trainer, no disk writes.
     loop = state.get("consolidation_loop")
     if loop is None:
         from paramem.server.consolidation import create_consolidation_loop
@@ -494,6 +511,20 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
         )
         state["consolidation_loop"] = loop
         state["model"] = loop.model
+    return loop
+
+
+def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, Any]:
+    """Run the local extractor for a single transcript.
+
+    Routes through :meth:`ExtractionPipeline.run` (the single-topology
+    chokepoint).  The pipeline lives on the process-wide
+    ``ConsolidationLoop`` so calibration calls share the exact instance
+    the production /consolidate cycle uses — same model, same config,
+    same flags.  Never calls ``extract_graph`` directly.
+    """
+    _preflight(state)
+    loop = _ensure_calibration_loop(state)
 
     # Resolve prompt files for transparency: even though the actual read
     # happens inside extract_graph via ``_load_prompt``, we surface the
@@ -555,6 +586,92 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
 
     return _build_calibrate_response(
         stage="extract",
+        prompts=[
+            {
+                "role": "system",
+                "path": sys_prompt_path,
+                "sha": sys_prompt_sha,
+                "content": sys_prompt_content,
+            },
+            {
+                "role": "user",
+                "path": user_prompt_path,
+                "sha": user_prompt_sha,
+                "content": user_prompt_content,
+            },
+        ],
+        raw_output=raw_output,
+        parsed=parsed,
+        input_prompt_text=user_prompt_content,
+        measurement=m,
+        params=req.params,
+        state=state,
+        supports_seed=True,
+        phases=phase_records,
+    )
+
+
+def calibrate_procedural(state: dict, req: CalibrateProceduralRequest) -> dict[str, Any]:
+    """Run the procedural extractor for a single transcript.
+
+    Routes through :meth:`ExtractionPipeline.run_procedural` (the
+    single-topology chokepoint for procedural extraction).  The pipeline
+    lives on the same process-wide ``ConsolidationLoop`` that
+    :func:`calibrate_extract` shares — same model, same config, same
+    flags.  Never calls ``extract_procedural_graph`` directly.
+
+    Mirrors :func:`calibrate_extract`'s prompt-provenance + override
+    handling.  Never opens its own phase trace: production only records a
+    ``procedural_extract`` phase because ``ConsolidationLoop.extract_session``
+    wraps the call in ``phase_trace`` on the way in. Called directly here
+    (outside that wrapper), the returned graph carries no phase records, so
+    ``raw_output`` is always empty — ``parsed`` (the extracted graph
+    itself) is the calibration signal for this stage.
+    """
+    _preflight(state)
+    if not req.speaker_id:
+        raise HTTPException(
+            status_code=400,
+            detail="speaker_id is required for procedural extraction (no empty-string default).",
+        )
+    loop = _ensure_calibration_loop(state)
+
+    # Resolve prompt files for transparency, mirroring calibrate_extract.
+    user_filename = req.procedural_prompt_filename or "extraction_procedural.txt"
+    sys_filename = req.procedural_system_prompt_filename or "extraction_system.txt"
+    sys_prompt_path, sys_prompt_sha, sys_prompt_content = _read_prompt(
+        req.prompts_dir, sys_filename
+    )
+    user_prompt_path, user_prompt_sha, user_prompt_content = _read_prompt(
+        req.prompts_dir, user_filename
+    )
+
+    with _measured_local_call() as m:
+        graph = loop.extraction.run_procedural(
+            req.transcript,
+            req.session_id,
+            speaker_id=req.speaker_id,
+            speaker_name=req.speaker_name,
+            source_type=req.source_type,
+            prompts_dir=req.prompts_dir,
+            system_prompt_filename=sys_filename,
+            user_prompt_filename=user_filename,
+            seed=req.params.seed,
+        )
+
+    parsed = graph.model_dump(mode="json") if hasattr(graph, "model_dump") else {}
+
+    from paramem.graph.phase_trace import get_phases
+
+    phase_records = [r.to_dict() for r in get_phases(graph)]
+    procedural_extract = next(
+        (p for p in phase_records if p.get("name") == "procedural_extract"),
+        None,
+    )
+    raw_output = (procedural_extract or {}).get("raw_output") or ""
+
+    return _build_calibrate_response(
+        stage="procedural",
         prompts=[
             {
                 "role": "system",

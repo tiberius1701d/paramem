@@ -7207,6 +7207,11 @@ async def calibrate_extract_route(req: calibrate_module.CalibrateExtractRequest)
     return calibrate_module.calibrate_extract(_state, req)
 
 
+@app.post("/calibrate/procedural", dependencies=[Depends(require_admin)])
+async def calibrate_procedural_route(req: calibrate_module.CalibrateProceduralRequest):
+    return calibrate_module.calibrate_procedural(_state, req)
+
+
 @app.post("/calibrate/anonymize", dependencies=[Depends(require_admin)])
 async def calibrate_anonymize_route(req: calibrate_module.CalibrateAnonymizeRequest):
     return calibrate_module.calibrate_anonymize(_state, req)

@@ -576,6 +576,7 @@ def extract_procedural_graph(
     speaker_id: str,
     temperature: float = 0.0,
     max_tokens: int = 1024,
+    seed: int | None = None,
     prompts_dir: str | Path | None = None,
     speaker_name: str | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
@@ -606,6 +607,9 @@ def extract_procedural_graph(
         speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
             ``Relation`` extracted in this pass as provenance. Required —
             callers must always supply a real speaker ID.
+        seed: Optional RNG seed forwarded to :func:`generate_answer`.  At the
+            default ``temperature=0.0`` (greedy decoding) this is a strict
+            no-op.  Default ``None`` preserves production behaviour unchanged.
         system_prompt_filename: Filename of the system prompt within the prompts
             directory.  Defaults to :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`.
             One prompt-pair is the single ground truth for procedural
@@ -655,7 +659,12 @@ def extract_procedural_graph(
     # KV cache from the prior phases. Symmetric with the other wraps.
     with vram_scope("procedural"):
         raw_output = generate_answer(
-            model, tokenizer, formatted, max_new_tokens=max_tokens, temperature=temperature
+            model,
+            tokenizer,
+            formatted,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
         )
     logger.debug("Procedural extraction raw: %s", raw_output[:500])
 

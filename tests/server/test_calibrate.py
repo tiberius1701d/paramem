@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from paramem.graph.extraction_pipeline import ExtractionPipeline
 from paramem.server.calibrate import (
@@ -27,6 +28,7 @@ from paramem.server.calibrate import (
     CalibrateNormalizeRequest,
     CalibrateParams,
     CalibratePlausibilityRequest,
+    CalibrateProceduralRequest,
     _build_calibrate_response,
     _effective_params,
     _Measurement,
@@ -37,6 +39,7 @@ from paramem.server.calibrate import (
     calibrate_name,
     calibrate_normalize,
     calibrate_plausibility,
+    calibrate_procedural,
 )
 
 
@@ -138,6 +141,47 @@ class TestCalibrateExtract:
         with pytest.raises(HTTPException) as exc:
             calibrate_extract(state, req)
         assert exc.value.status_code == 503
+
+
+class TestCalibrateProceduralRequest:
+    """Schema-level tests for CalibrateProceduralRequest (no GPU)."""
+
+    def test_defaults(self):
+        req = CalibrateProceduralRequest(transcript="x", speaker_id="speaker0")
+        assert req.source_type == "transcript"
+        assert req.session_id == "calib"
+        assert req.speaker_name is None
+        assert req.prompts_dir is None
+        assert req.procedural_prompt_filename is None
+        assert req.procedural_system_prompt_filename is None
+
+    def test_source_type_pattern_rejects_bad_value(self):
+        with pytest.raises(ValidationError):
+            CalibrateProceduralRequest(transcript="x", speaker_id="speaker0", source_type="voice")
+
+
+class TestCalibrateProcedural:
+    def test_disabled_404(self):
+        req = CalibrateProceduralRequest(transcript="x", speaker_id="speaker0")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_procedural(_state_disabled(), req)
+        assert exc.value.status_code == 404
+
+    def test_consolidating_503(self):
+        state = _state_enabled()
+        state["consolidating"] = True
+        req = CalibrateProceduralRequest(transcript="x", speaker_id="speaker0")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_procedural(state, req)
+        assert exc.value.status_code == 503
+
+    def test_empty_speaker_id_400(self):
+        state = _state_enabled()
+        req = CalibrateProceduralRequest(transcript="x", speaker_id="")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_procedural(state, req)
+        assert exc.value.status_code == 400
+        assert "speaker_id" in exc.value.detail.lower()
 
 
 class TestCalibrateAnonymize:
