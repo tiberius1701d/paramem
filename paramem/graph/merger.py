@@ -190,6 +190,16 @@ class GraphMerger:
         # reason ∈ {"dedup", "contradiction_same_pred",
         #            "enrichment_same_as", "predicate_synonym_collapse", "semantic_dedup"}
         self.removal_ledger: dict[str, dict] = {}
+        # adopt_reinforcements: main-tier ik_key -> (last_seen, first_seen) recorded
+        # when the interim recital-dedup merge's Case-1-adopt branch (relation
+        # carries an indexed_key, existing edge is keyless) stamps that key onto a
+        # recited pending fact's edge.  Populated ONLY in the dedup merge's
+        # Case-1-adopt; reset ONLY in reset_graph() (NOT in merge(), same lifetime
+        # as removal_ledger — it must survive an intervening interim enrichment
+        # merge()); consumed EXACTLY ONCE per fold at the reinforcement bump site
+        # in _refine_consolidation_graph — a second _refine invocation would
+        # double-bump (do not add one).
+        self.adopt_reinforcements: dict[str, tuple[str, str]] = {}
         # Cache: predicate → True (multi-valued/coexist) or False (single-valued/replace)
         self._predicate_cardinality: dict[str, bool] = {}
         # Resolve prompts once at construction so a file edit takes effect next cycle.
@@ -203,6 +213,7 @@ class GraphMerger:
         session_graph: SessionGraph,
         *,
         resolve_contradictions: bool = True,
+        credit_adopt_reinforcement: bool = False,
     ) -> nx.MultiDiGraph:
         """Merge a session graph into the cumulative graph.
 
@@ -221,6 +232,12 @@ class GraphMerger:
                 ) coexist rather than fabricating a NOW recency value.
                 When ``False``, Case-2 is short-circuited: no model call, no
                 edge removal.
+            credit_adopt_reinforcement: When ``True``, the Case-1-adopt branch
+                (an incoming keyed relation adopts its ``indexed_key`` onto a
+                pre-existing keyless edge) also records the adopted key in
+                ``self.adopt_reinforcements`` for the fold's reinforcement bump
+                pass.  Default ``False`` for every caller except the interim
+                recital-dedup merge.
 
         Returns the updated cumulative graph.
 
@@ -318,6 +335,7 @@ class GraphMerger:
                 session_id,
                 timestamp,
                 resolve_contradictions=resolve_contradictions,
+                credit_adopt_reinforcement=credit_adopt_reinforcement,
             )
 
         logger.info(
@@ -496,6 +514,7 @@ class GraphMerger:
         timestamp: str,
         *,
         resolve_contradictions: bool = True,
+        credit_adopt_reinforcement: bool = False,
     ) -> None:
         """Insert or update a relation edge.
 
@@ -504,7 +523,10 @@ class GraphMerger:
         1. Identical triple already exists — exact-duplicate reinforcement: bump
            recurrence.  Case-1-adopt: if the existing edge has no ``ik_key`` and
            the incoming ``relation.indexed_key`` is set, adopt the key onto the
-           existing edge (fold-only provenance carry-through).
+           existing edge (fold-only provenance carry-through).  When
+           ``credit_adopt_reinforcement`` is ``True``, the adopted key is also
+           recorded in ``self.adopt_reinforcements`` for the fold's
+           reinforcement bump pass (interim recital-dedup only).
         2. Same (subject, predicate) but different object — cardinality resolution
            when a model is present and ``resolve_contradictions=True``:
 
@@ -578,6 +600,15 @@ class GraphMerger:
             # Case-1-adopt: adopt incoming ik_key onto a keyless existing edge.
             if relation.indexed_key and not edge.get(_IK_KEY_ATTR):
                 edge[_IK_KEY_ATTR] = relation.indexed_key
+                if credit_adopt_reinforcement:
+                    # The edge's last_seen/first_seen are already merged
+                    # (max/min_nonempty, above) over the recited pending fact
+                    # and the main-tier dedup target — the exact values
+                    # bump_recurrence wants; no now() fabrication.
+                    self.adopt_reinforcements[relation.indexed_key] = (
+                        edge.get("last_seen", ""),
+                        edge.get("first_seen", ""),
+                    )
             # Case-1 reinforcement: when BOTH the existing edge AND the incoming
             # relation carry an ik_key, this is a fold-time duplicate-SPO collapse.
             # The SURVIVING key is the existing edge's ik_key (the incoming
@@ -829,6 +860,7 @@ class GraphMerger:
         - ``reinforcements`` — prior fold's Case-1 surviving keys
         - ``collapsed`` — prior fold's Case-1 deduplicated (incoming) keys
         - ``removal_ledger`` — prior fold's reason-coded edge removal records
+        - ``adopt_reinforcements`` — prior fold's dedup-adopt credited main keys
 
         Does NOT touch ``model``, ``tokenizer``, or the prompt strings — those
         are construction-time state and must survive across folds.
@@ -841,6 +873,7 @@ class GraphMerger:
         self.reinforcements = {}
         self.collapsed = []
         self.removal_ledger = {}
+        self.adopt_reinforcements = {}
 
     def release(self) -> None:
         """Drop the base-model reference this merger holds (BASE-MODEL HOLDER).

@@ -5900,6 +5900,7 @@ class ConsolidationLoop:
         log_label: str,
         timestamp: str = "",
         resolve_contradictions: bool = False,
+        credit_adopt_reinforcement: bool = False,
     ) -> None:
         """Build a synthetic :class:`SessionGraph` from *relations* and merge it.
 
@@ -5950,6 +5951,12 @@ class ConsolidationLoop:
                 :meth:`~paramem.graph.merger.GraphMerger.merge`.  Default
                 ``False`` (no cardinality resolution).  Set ``True`` when the config
                 ``refinement_contradiction == "on"``.
+            credit_adopt_reinforcement: Forwarded to
+                :meth:`~paramem.graph.merger.GraphMerger.merge`.  Default
+                ``False`` for every caller (recon, extra-relations, simulate,
+                enrichment).  Set ``True`` ONLY by the interim recital-dedup
+                merge call, so a recited fact's Case-1-adopt onto a main-tier
+                key is credited to that key's reinforcement.
         """
         if not relations:
             return
@@ -5970,6 +5977,7 @@ class ConsolidationLoop:
             self.merger.merge(
                 _session,
                 resolve_contradictions=resolve_contradictions,
+                credit_adopt_reinforcement=credit_adopt_reinforcement,
             )
         finally:
             if _needs_guard:
@@ -6316,6 +6324,7 @@ class ConsolidationLoop:
                 session_id="__interim_maintier_dedup__",
                 log_label="main-tier recital dedup",
                 resolve_contradictions=False,
+                credit_adopt_reinforcement=True,
             )
 
         # Debug: snapshot the merged graph (after re-merge, before enrichment).
@@ -6345,19 +6354,32 @@ class ConsolidationLoop:
            Cloud dependency.
         3. Emit a debug snapshot ("enriched") after the refine step (or immediately
            when both stages are skipped).
-        4. If ``recon_relations`` is non-empty, scan ``merger.reinforcements`` for
-           Case-1 duplicate-SPO collapses and call
-           :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
-           surviving key.  The recurrence-bump runs regardless of *normalize* or
-           *enrich* — it reflects duplicate-SPO collapses from the merge, which
-           happen at every level that merges.
+        4. Two INDEPENDENTLY-guarded recurrence-bump blocks (never unioned under
+           one relaxed guard — each dict is consumed by its own loop with its own
+           guard, so R2 adds a credit without changing the pre-existing
+           ``reinforcements`` bump contract):
+
+           - If ``recon_relations`` is non-empty, scan ``merger.reinforcements``
+             for Case-1 duplicate-SPO collapses and call
+             :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
+             surviving key.  This guard is byte-identical to the pre-R2
+             contract: a re-merge must actually have run for this bump to fire.
+           - If ``merger.adopt_reinforcements`` is non-empty, call
+             :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
+             main-tier key credited by the interim recital-dedup merge's
+             Case-1-adopt.  This guard is independent of ``recon_relations`` —
+             a recital-only interim cycle has empty ``recon_relations`` (no slot
+             keys reconstructed) but a non-empty ``adopt_reinforcements``, and
+             must still bump.  The two dicts are disjoint by construction (see
+             the block below), so no key is ever double-bumped across the two.
 
         Args:
             recon_relations: The list of registry-true :class:`Relation` objects
-                produced by :meth:`_materialize_consolidation_graph`.  Used only
-                as a boolean guard — when empty, the recurrence-bump loop is
-                skipped (no re-merge was performed so ``merger.reinforcements``
-                will be empty too).
+                produced by :meth:`_materialize_consolidation_graph`.  Used as
+                the guard for the ``merger.reinforcements`` bump block only (see
+                point 4) — when empty, that block is skipped (no re-merge was
+                performed so ``merger.reinforcements`` will be empty too).  Does
+                NOT gate the independent ``adopt_reinforcements`` bump block.
             normalize: When ``True``, run :meth:`_run_graph_normalization`
                 (local-model predicate alignment + entity merge + dedup).
                 Callers pass ``normalize=scope.normalize``.
@@ -6417,7 +6439,9 @@ class ConsolidationLoop:
             # merger.reinforcements is now dict[ik_key, (last_seen, first_seen)] —
             # the freshest last_seen and earliest first_seen are carried directly
             # from the edge so bump_recurrence can advance bookkeeping without
-            # fabricating now().
+            # fabricating now().  This guard (recon_relations non-empty) is the
+            # original, unchanged contract — R2 does not relax it; it only adds
+            # the independent adopt-credit block below.
             _reinforcements: dict[str, tuple[str, str]] = getattr(self.merger, "reinforcements", {})
             for _rein_key, (_rein_ls, _rein_fs) in _reinforcements.items():
                 if _rein_key:
@@ -6430,6 +6454,37 @@ class ConsolidationLoop:
                     logger.debug(
                         "consolidate_interim_adapters: bumped recurrence for key=%s "
                         "(intra-fold duplicate-SPO collapse)",
+                        _rein_key,
+                    )
+
+        # --- Reinforcement bump (R2): interim recital-dedup Case-1-adopt credits ---
+        # merger.adopt_reinforcements contains the main-tier ik_key credited by the
+        # interim recital-dedup merge's Case-1-adopt (a recited pending fact adopts
+        # a main key onto its keyless edge).  Independently guarded from the block
+        # above — NOT unioned under one relaxed guard — so this credit is additive
+        # and never changes when the ``reinforcements`` block fires.  A recital-only
+        # interim cycle has empty ``recon_relations`` (no slot keys reconstructed)
+        # but a non-empty ``adopt_reinforcements``, and must still bump here.  The
+        # two dicts are disjoint by construction (reinforcements records the
+        # SLOT/surviving key from the both-keyed collision elif — both edges
+        # keyed; adopt_reinforcements records the MAIN key from the Case-1-adopt
+        # branch — existing edge keyless), so no key is ever double-bumped across
+        # the two blocks.
+        _adopt_reinforcements: dict[str, tuple[str, str]] = getattr(
+            self.merger, "adopt_reinforcements", {}
+        )
+        if _adopt_reinforcements:
+            for _rein_key, (_rein_ls, _rein_fs) in _adopt_reinforcements.items():
+                if _rein_key:
+                    self.store.bump_recurrence(
+                        _rein_key,
+                        cycle=self.cycle_count,
+                        timestamp=_rein_ls,
+                        first_seen=_rein_fs,
+                    )
+                    logger.debug(
+                        "consolidate_interim_adapters: bumped recurrence for key=%s "
+                        "(recital-dedup adopt)",
                         _rein_key,
                     )
 

@@ -4054,7 +4054,13 @@ class TestConsolidateInterimAdaptersFullFlow:
         from paramem.graph.name_match import canonical as _canonical
         from paramem.memory.persistence import _IK_KEY_ATTR
 
-        def _spy_merge(session_graph, *, resolve_contradictions=True, align_predicates=False):
+        def _spy_merge(
+            session_graph,
+            *,
+            resolve_contradictions=True,
+            align_predicates=False,
+            credit_adopt_reinforcement=False,
+        ):
             for rel in session_graph.relations:
                 if rel.indexed_key:
                     _subj = rel.subject
@@ -4342,7 +4348,13 @@ class TestConsolidateInterimAdaptersFullFlow:
         # Capture merger.merge() call args.
         merge_calls: list = []
 
-        def _spy_merge(session_graph, *, resolve_contradictions=True, align_predicates=False):
+        def _spy_merge(
+            session_graph,
+            *,
+            resolve_contradictions=True,
+            align_predicates=False,
+            credit_adopt_reinforcement=False,
+        ):
             merge_calls.append(session_graph)
             # Stamp the ik_key from the Relation onto the merged graph edge so
             # the edge-walk stage can read it back (mirrors real _upsert_relation behaviour).
@@ -9955,6 +9967,16 @@ class TestInterimRecitalDedup:
         assert loop.merger.removal_ledger == {}, (
             f"primary recital path must not soft-stale anything; got {loop.merger.removal_ledger}"
         )
+        # R2: the recital-dedup Case-1-adopt branch records the main key in
+        # adopt_reinforcements -- exactly once -- NOT in reinforcements (that
+        # dict is reserved for the both-keyed-collision elif).
+        assert loop.merger.adopt_reinforcements == {"graph1": ("", "")}, (
+            f"dedup adopt must credit graph1 exactly once; got {loop.merger.adopt_reinforcements}"
+        )
+        assert loop.merger.reinforcements == {}, (
+            f"the Case-1-adopt path must never populate reinforcements; got "
+            f"{loop.merger.reinforcements}"
+        )
 
         tier_keyed = {"episodic": [], "procedural": [], "semantic": []}
         minted, _ = loop._build_all_edge_entries_into(
@@ -9966,6 +9988,181 @@ class TestInterimRecitalDedup:
         assert tier_keyed == {"episodic": [], "procedural": [], "semantic": []}, (
             "main key must be excluded — no interim key emitted for the recited fact"
         )
+
+    # ------------------------------------------------------------------
+    # 1b. Recital-only end-to-end bump: main key reinforced exactly once
+    #     (pins the relaxed bump-loop guard -- recon_relations is empty here)
+    # ------------------------------------------------------------------
+
+    def test_recital_adopt_credits_main_key_reinforcement_end_to_end(self, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+        loop.cycle_count = 7
+        _adapter = "episodic_interim_20260101T0000"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="spk-a",
+            relation_type="factual",
+            first_seen="2020-01-01T00:00:00",
+            last_seen="2020-01-01T00:00:00",
+        )
+        before = loop.store.bookkeeping_for_key("graph1")
+        before_count = before["reinforcement_count"]
+
+        extra = [
+            Relation(
+                subject="alice",
+                predicate="lives in",
+                object="berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+                last_seen="2026-02-01T00:00:00",
+            )
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            _miss, recon_relations = loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=[],  # recital-only: no slot keys reconstructed
+                extra_relations=extra,
+                dedup_target_keys=["graph1"],
+            )
+
+        assert recon_relations == [], (
+            "recital-only cycle must reconstruct no slot keys — this pins the "
+            "relaxed bump-loop guard (previously gated `if recon_relations:`, "
+            "which would have skipped the bump entirely for this cycle shape)"
+        )
+        assert "graph1" in loop.merger.adopt_reinforcements, (
+            "the dedup merge's Case-1-adopt must record the main key"
+        )
+
+        loop._refine_consolidation_graph(recon_relations, normalize=False, enrich=False)
+
+        after = loop.store.bookkeeping_for_key("graph1")
+        assert after["reinforcement_count"] == before_count + 1, (
+            f"main key reinforcement must bump by exactly 1; before={before_count} after={after}"
+        )
+        assert after["last_reinforced_cycle"] == 7
+        assert after["last_seen"] == "2026-02-01T00:00:00", (
+            "last_seen must advance to the recited session's timestamp"
+        )
+
+    # ------------------------------------------------------------------
+    # 1c. adopt_reinforcements survives an intervening non-empty merge()
+    #     (the entire reason for the dedicated accumulator: merge() resets
+    #     merger.reinforcements/collapsed unconditionally at entry, but must
+    #     NOT reset adopt_reinforcements -- an interim enrichment merge runs
+    #     between the dedup merge and the refine bump loop in production).
+    # ------------------------------------------------------------------
+
+    def test_recital_adopt_survives_intervening_enrichment_merge(self, tmp_path):
+        from unittest.mock import patch
+
+        from paramem.graph.schema import Relation
+
+        loop = self._make_loop(tmp_path)
+        loop.cycle_count = 9
+        _adapter = "episodic_interim_20260101T0000"
+
+        loop.store.put(
+            "episodic",
+            "graph1",
+            {"key": "graph1", "subject": "alice", "predicate": "lives in", "object": "berlin"},
+            simhash=1,
+        )
+        loop.store.set_bookkeeping(
+            "graph1",
+            speaker_id="spk-a",
+            relation_type="factual",
+            first_seen="2020-01-01T00:00:00",
+            last_seen="2020-01-01T00:00:00",
+        )
+        before_count = loop.store.bookkeeping_for_key("graph1")["reinforcement_count"]
+
+        extra = [
+            Relation(
+                subject="alice",
+                predicate="lives in",
+                object="berlin",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-a",
+                last_seen="2026-03-01T00:00:00",
+            )
+        ]
+
+        with patch(
+            "paramem.training.consolidation.reconstruct_graph",
+            side_effect=self._fake_reconstruct,
+        ):
+            _miss, recon_relations = loop._materialize_consolidation_graph(
+                tier=_adapter,
+                keys=[],
+                extra_relations=extra,
+                dedup_target_keys=["graph1"],
+            )
+
+        assert "graph1" in loop.merger.adopt_reinforcements, (
+            "setup precondition: the dedup merge's Case-1-adopt must record graph1"
+        )
+
+        # Interpose a NON-EMPTY registry-relations merge -- the same shape as a
+        # real interim graph-enrichment pass, which runs between the dedup
+        # merge and the refine bump loop in production
+        # (_refine_consolidation_graph calls _run_graph_enrichment before the
+        # bump loop when enrich=True).  GraphMerger.merge() unconditionally
+        # resets self.reinforcements/self.collapsed at entry whenever it is
+        # invoked with a non-empty relation set -- this call reproduces that
+        # reset without depending on the SOTA enrichment path.
+        enrichment_relation = [
+            Relation(
+                subject="bob",
+                predicate="works at",
+                object="acme corp",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id="spk-b",
+            )
+        ]
+        loop._merge_registry_relations(
+            enrichment_relation,
+            session_id="__test_enrichment__",
+            log_label="test enrichment relations",
+            resolve_contradictions=False,
+        )
+
+        assert loop.merger.reinforcements == {}, (
+            "setup precondition: the intervening merge must have reset reinforcements"
+        )
+        assert "graph1" in loop.merger.adopt_reinforcements, (
+            "adopt_reinforcements MUST survive the intervening merge() call -- this is "
+            "the entire reason for the dedicated accumulator (it is reset ONLY in "
+            f"reset_graph(), never in merge()); got {loop.merger.adopt_reinforcements}"
+        )
+
+        loop._refine_consolidation_graph(recon_relations, normalize=False, enrich=False)
+
+        after = loop.store.bookkeeping_for_key("graph1")
+        assert after["reinforcement_count"] == before_count + 1, (
+            "the recital-dedup credit must still be applied after an intervening "
+            f"merge() reset reinforcements; before={before_count} after={after}"
+        )
+        assert after["last_reinforced_cycle"] == 9
 
     # ------------------------------------------------------------------
     # 2. Novel session fact still mints an interim key
@@ -10028,6 +10225,10 @@ class TestInterimRecitalDedup:
         )
         assert tier_keyed["episodic"][0]["object"] == "acme corp", (
             "the minted entry must be the NOVEL fact, not the excluded main key"
+        )
+        assert loop.merger.adopt_reinforcements == {}, (
+            "a novel (non-recital) fact must not populate adopt_reinforcements — "
+            f"no dedup target shares its (s,p,o); got {loop.merger.adopt_reinforcements}"
         )
 
     # ------------------------------------------------------------------
@@ -10197,6 +10398,7 @@ class TestInterimRecitalDedup:
             edges_a = loop.merger.graph.number_of_edges()
             collapsed_a = list(loop.merger.collapsed)
             ledger_a = dict(loop.merger.removal_ledger)
+            adopt_a = dict(loop.merger.adopt_reinforcements)
 
             loop.merger.reset_graph()
             miss_b, recon_b = loop._materialize_consolidation_graph(
@@ -10205,12 +10407,17 @@ class TestInterimRecitalDedup:
             edges_b = loop.merger.graph.number_of_edges()
             collapsed_b = list(loop.merger.collapsed)
             ledger_b = dict(loop.merger.removal_ledger)
+            adopt_b = dict(loop.merger.adopt_reinforcements)
 
         assert edges_a == edges_b == 1
         assert miss_a == miss_b
         assert {r.indexed_key for r in recon_a} == {r.indexed_key for r in recon_b}
         assert collapsed_a == collapsed_b == []
         assert ledger_a == ledger_b == {}
+        assert adopt_a == adopt_b == {}, (
+            "dedup_target_keys omitted/None (full-fold, simulate) must never "
+            f"populate adopt_reinforcements; got a={adopt_a} b={adopt_b}"
+        )
 
     # ------------------------------------------------------------------
     # 6. Dedup-LAST ordering protects the main key under
@@ -10285,6 +10492,11 @@ class TestInterimRecitalDedup:
         # no rival present yet) and the main-tier edge (merged in LAST,
         # unconditionally, resolve_contradictions=False).
         assert loop.merger.graph.number_of_edges() == 2
+        assert loop.merger.adopt_reinforcements == {}, (
+            "a contradiction REPLACE must not credit adopt_reinforcements — the "
+            "dedup merge inserts graph1 as a net-new (different-object) edge, "
+            f"never a Case-1-adopt; got {loop.merger.adopt_reinforcements}"
+        )
 
     # ------------------------------------------------------------------
     # 7. R1 edge case: slot-key/main-key SPO collision is benign under
@@ -10337,7 +10549,7 @@ class TestInterimRecitalDedup:
             "paramem.training.consolidation.reconstruct_graph",
             side_effect=self._fake_reconstruct,
         ):
-            loop._materialize_consolidation_graph(
+            _miss, recon_relations = loop._materialize_consolidation_graph(
                 tier=_adapter,
                 keys=["graph_slot"],
                 extra_relations=None,
@@ -10358,6 +10570,33 @@ class TestInterimRecitalDedup:
         )
         assert "graph_slot" in loop.merger.reinforcements, (
             "the surviving slot key is recorded for the fold's bump_recurrence pass"
+        )
+        # R2: the R1 collision rides the both-keyed-collision elif, never the
+        # Case-1-adopt branch -- graph_main must never enter adopt_reinforcements.
+        assert "graph_main" not in loop.merger.adopt_reinforcements, (
+            "R1 collision must not credit the main key via adopt_reinforcements; "
+            f"got {loop.merger.adopt_reinforcements}"
+        )
+
+        # End-to-end: the main key's reinforcement must NOT be bumped by this
+        # interim cycle; the surviving SLOT key MAY bump (same-tier, benign).
+        main_before = loop.store.bookkeeping_for_key("graph_main")["reinforcement_count"]
+        slot_before = loop.store.bookkeeping_for_key("graph_slot")["reinforcement_count"]
+        loop.cycle_count = 3
+        # recon_relations must be the REAL (non-empty) list from the materialize
+        # call above (keys=["graph_slot"]) -- the reinforcements bump block is
+        # guarded by `if recon_relations:` (the original, unrelaxed contract), so
+        # passing [] here would wrongly skip the slot key's expected bump.
+        loop._refine_consolidation_graph(recon_relations, normalize=False, enrich=False)
+        main_after = loop.store.bookkeeping_for_key("graph_main")["reinforcement_count"]
+        slot_after = loop.store.bookkeeping_for_key("graph_slot")["reinforcement_count"]
+        assert main_after == main_before, (
+            "the R1 collision must not bump the main key's reinforcement via the "
+            f"interim cycle; before={main_before} after={main_after}"
+        )
+        assert slot_after == slot_before + 1, (
+            "the surviving slot key IS expected to bump (same-tier, benign, "
+            f"pre-existing both-keyed-collision behavior); before={slot_before} after={slot_after}"
         )
 
         tier_keyed = {"episodic": [], "procedural": [], "semantic": []}
@@ -10657,6 +10896,7 @@ class TestInterimRecitalDedup:
         loop.store.set_bookkeeping(
             "graph_main", speaker_id="spk-a", relation_type="factual", first_seen=""
         )
+        main_before = loop.store.bookkeeping_for_key("graph_main")["reinforcement_count"]
 
         # Pre-populate merger.graph with this cycle's pending-session content:
         # a RECITED fact (matches graph_main) + a NOVEL fact.
@@ -10790,6 +11030,17 @@ class TestInterimRecitalDedup:
         )
         assert not any(e["key"] == "graph_main" for e in post_resume_entries), (
             "the main-tier dedup target must remain excluded on resume too"
+        )
+
+        # R2 resume no-double-credit: the recital-dedup adopt bump is applied
+        # ONLY on the pre-crash fresh-derivation pass (inside _refine_consolidation_graph,
+        # itself only reachable from the fresh-derivation branch).  The resume
+        # fast-path never re-enters materialize/refine, so the credit must land
+        # exactly once across the crash->resume pair: N+1, not N+2.
+        main_after = loop.store.bookkeeping_for_key("graph_main")["reinforcement_count"]
+        assert main_after == main_before + 1, (
+            "the recital-dedup credit must be applied exactly once across the "
+            f"crash->resume pair (N+1, not N+2); before={main_before} after={main_after}"
         )
 
 
