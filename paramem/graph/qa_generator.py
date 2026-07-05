@@ -13,6 +13,7 @@ from paramem.graph.relation_prep import (  # noqa: F401
     filter_procedural_relations,
     partition_relations,
 )
+from paramem.models.loader import base_model_inference
 
 logger = logging.getLogger(__name__)
 
@@ -216,26 +217,8 @@ def generate_qa_from_relations(
     if model is None or tokenizer is None:
         return _run_qa_generation(relations, model, tokenizer)
 
-    try:
-        from peft import PeftModel
-    except ImportError:
-        PeftModel = None
-
-    is_peft = PeftModel is not None and isinstance(model, PeftModel)
-    was_checkpointing = bool(getattr(model, "is_gradient_checkpointing", False))
-    if was_checkpointing:
-        model.gradient_checkpointing_disable()
-
-    try:
-        if is_peft:
-            with model.disable_adapter():
-                return _run_qa_generation(relations, model, tokenizer)
+    with base_model_inference(model):
         return _run_qa_generation(relations, model, tokenizer)
-    finally:
-        if was_checkpointing:
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
 
 
 def generate_qa_from_graph(

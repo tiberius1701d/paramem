@@ -7,6 +7,7 @@ Swapping the base model requires only changing the model_id in config.
 import contextlib
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +29,49 @@ from transformers import (
 from paramem.utils.config import AdapterConfig, ModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def base_model_inference(model):
+    """Run generation on the base weights in a clean inference state.
+
+    Yields with any active LoRA adapter disabled so the base model drives
+    output, and with gradient checkpointing turned off for the duration of the
+    scope.  HF silently disables the KV cache whenever gradient checkpointing is
+    active, which makes ``model.generate()`` produce garbage; disabling it here
+    keeps the cache live.  The entry state of both is restored on exit —
+    checkpointing is re-enabled only when it was already on at scope entry (a
+    model that enters with checkpointing OFF exits OFF).  Without this,
+    structured-generation calls (QA distillation, extraction, dedup) drift
+    across cycles: the train path leaves checkpointing enabled after episodic
+    training, so the next ``generate`` runs without the KV cache and falls
+    through to a degraded fallback path.
+
+    Args:
+        model: The (optionally PEFT-wrapped) model to run inference on.
+    """
+    try:
+        from peft import PeftModel
+    except ImportError:
+        PeftModel = None
+
+    is_peft = PeftModel is not None and isinstance(model, PeftModel)
+    was_checkpointing = bool(getattr(model, "is_gradient_checkpointing", False))
+    if was_checkpointing:
+        model.gradient_checkpointing_disable()
+
+    try:
+        if is_peft:
+            with model.disable_adapter():
+                yield
+        else:
+            yield
+    finally:
+        if was_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
 
 # Cache for system role support per tokenizer class to avoid repeated try/except
 _system_role_cache: dict[str, bool] = {}

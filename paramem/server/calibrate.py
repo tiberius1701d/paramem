@@ -874,21 +874,10 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     temperature = req.params.temperature if req.params.temperature is not None else 0.0
 
-    from peft import PeftModel as _PeftModel
+    from paramem.models.loader import base_model_inference
 
     with _measured_local_call() as m:
-        if isinstance(model, _PeftModel):
-            with model.disable_adapter():
-                clusters_by_so, diag = dedup_synonym_predicates(
-                    relations,
-                    model=model,
-                    tokenizer=tokenizer,
-                    filter_prompt=filter_content,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    seed=req.params.seed,
-                )
-        else:
+        with base_model_inference(model):
             clusters_by_so, diag = dedup_synonym_predicates(
                 relations,
                 model=model,
@@ -990,17 +979,20 @@ def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
         "max_tokens": req.params.max_tokens,
     }
 
+    from paramem.models.loader import base_model_inference
+
     with _measured_local_call() as m:
-        extracted, raw_output = extract_name_via_llm(
-            req.turns,
-            model,
-            tokenizer,
-            prompts_dir=req.prompts_dir,
-            prompt_filename=user_filename,
-            system_filename=sys_filename,
-            user_turns_only=req.user_turns_only,
-            params=inference_params,
-        )
+        with base_model_inference(model):
+            extracted, raw_output = extract_name_via_llm(
+                req.turns,
+                model,
+                tokenizer,
+                prompts_dir=req.prompts_dir,
+                prompt_filename=user_filename,
+                system_filename=sys_filename,
+                user_turns_only=req.user_turns_only,
+                params=inference_params,
+            )
 
     parsed: dict[str, Any] = {"name": extracted}
 

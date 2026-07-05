@@ -1294,3 +1294,128 @@ def test_background_trainer_single_constructor_literal_in_app():
         "Move the construction into _build_bg_trainer and have the caller "
         "use _active_bg_trainer or _build_bg_trainer."
     )
+
+
+# ---------------------------------------------------------------------------
+# base_model_inference primitive — entry-state restoration + adapter guard
+# ---------------------------------------------------------------------------
+
+
+def _inference_model_mock(*, peft: bool, checkpointing: bool):
+    """Build a mock model for :func:`base_model_inference` tests.
+
+    ``peft=True`` returns a ``MagicMock(spec=PeftModel)`` so the primitive's
+    ``isinstance(model, PeftModel)`` branch fires; ``peft=False`` returns a
+    plain mock that fails that check.  ``checkpointing`` seeds the
+    ``is_gradient_checkpointing`` flag the primitive reads at scope entry.
+    ``gradient_checkpointing_{disable,enable}`` are attached explicitly because
+    they are not on ``PeftModel``'s spec surface.
+    """
+    from peft import PeftModel
+
+    m = MagicMock(spec=PeftModel) if peft else MagicMock()
+    m.is_gradient_checkpointing = checkpointing
+    m.disable_adapter = MagicMock()
+    m.gradient_checkpointing_disable = MagicMock()
+    m.gradient_checkpointing_enable = MagicMock()
+    return m
+
+
+def test_base_model_inference_restores_checkpointing_when_entered_on():
+    """A model entering with gradient checkpointing ON must exit ON.
+
+    Inside the scope checkpointing is disabled (KV cache required for
+    ``generate``); the finally clause re-enables it with the non-reentrant
+    kwargs so the caller's training state is unchanged after the scope.
+    """
+    from paramem.models.loader import base_model_inference
+
+    m = _inference_model_mock(peft=False, checkpointing=True)
+    with base_model_inference(m):
+        m.gradient_checkpointing_disable.assert_called_once()
+        m.gradient_checkpointing_enable.assert_not_called()
+
+    m.gradient_checkpointing_enable.assert_called_once()
+    _, kwargs = m.gradient_checkpointing_enable.call_args
+    assert kwargs["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
+
+
+def test_base_model_inference_leaves_checkpointing_off_when_entered_off():
+    """A model entering with checkpointing OFF must exit OFF — the restore is
+    conditional on the pre-scope state, never an unconditional re-enable."""
+    from paramem.models.loader import base_model_inference
+
+    m = _inference_model_mock(peft=False, checkpointing=False)
+    with base_model_inference(m):
+        pass
+
+    m.gradient_checkpointing_disable.assert_not_called()
+    m.gradient_checkpointing_enable.assert_not_called()
+
+
+def test_base_model_inference_enters_disable_adapter_for_peft():
+    """When the model is a PeftModel, the scope must enter ``disable_adapter()``
+    so generation runs on the base weights."""
+    from paramem.models.loader import base_model_inference
+
+    m = _inference_model_mock(peft=True, checkpointing=False)
+    with base_model_inference(m):
+        pass
+
+    m.disable_adapter.assert_called_once()
+    m.disable_adapter.return_value.__enter__.assert_called_once()
+
+
+def test_base_model_inference_skips_disable_adapter_for_plain_model():
+    """A plain (non-PeftModel) model must NOT be wrapped in ``disable_adapter()``."""
+    from paramem.models.loader import base_model_inference
+
+    m = _inference_model_mock(peft=False, checkpointing=False)
+    with base_model_inference(m):
+        pass
+
+    m.disable_adapter.assert_not_called()
+
+
+def test_extract_name_via_llm_enters_base_model_inference():
+    """Name enrollment in ``paramem/server/app.py`` must run on the base weights.
+
+    ``_extract_name_via_llm`` runs structured name extraction; production
+    invokes it with the training-active adapter live, so it must open
+    ``base_model_inference(model)`` before the ``extract_name_via_llm``
+    generate call.  Source-level guard: the graph/ and calibrate copies of the
+    base-inference guard are covered by their own module tests, but this
+    enrollment site lives in app.py and otherwise has no offline regression net.
+    """
+    import ast
+
+    repo_root = Path(__file__).resolve().parent.parent
+    app_file = repo_root / "paramem" / "server" / "app.py"
+    tree = ast.parse(app_file.read_text())
+
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_extract_name_via_llm":
+            target = node
+            break
+    assert target is not None, "_extract_name_via_llm not found in paramem/server/app.py"
+
+    def _enters_base_model_inference(fn: ast.FunctionDef) -> bool:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.With):
+                for item in node.items:
+                    call = item.context_expr
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Name)
+                        and call.func.id == "base_model_inference"
+                    ):
+                        return True
+        return False
+
+    assert _enters_base_model_inference(target), (
+        "_extract_name_via_llm must wrap its extract_name_via_llm call in "
+        "`with base_model_inference(model):` — name enrollment is structured "
+        "extraction and must run on the base weights, not the training-active "
+        "adapter."
+    )

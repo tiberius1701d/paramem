@@ -14483,8 +14483,14 @@ def _extract_name_via_llm(
     the transcript to user turns only (assistant salutation leak fix).
     """
     from paramem.graph.name_extraction import extract_name_via_llm
+    from paramem.models.loader import base_model_inference
 
-    name, _raw = extract_name_via_llm(turns, model, tokenizer)
+    # Name enrollment is structured extraction — it must run on the base
+    # weights, never the training-active adapter.  base_model_inference also
+    # keeps the KV cache live for the generate call and restores the model's
+    # entry state on exit.
+    with base_model_inference(model):
+        name, _raw = extract_name_via_llm(turns, model, tokenizer)
     return name
 
 

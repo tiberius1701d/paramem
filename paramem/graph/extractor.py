@@ -24,7 +24,7 @@ from paramem.graph.schema_config import (
     format_relation_types,
     relation_types,
 )
-from paramem.models.loader import adapt_messages
+from paramem.models.loader import adapt_messages, base_model_inference
 from paramem.server.vram_guard import vram_scope
 
 logger = logging.getLogger(__name__)
@@ -1006,45 +1006,50 @@ def extract_and_anonymize_for_cloud(
     if not scope:
         return transcript, {}, {}
 
-    try:
-        graph = extract_graph(
-            model,
-            tokenizer,
-            transcript,
-            session_id="cloud_egress",
-            # Ephemeral graph: extracted only to anchor anonymization, then
-            # discarded — the stamped provenance is never persisted.  Use the
-            # resolved speaker_id when the caller has one (text-only /chat
-            # requests may not), falling back to the "cloud_egress" sentinel
-            # that already names the session.
-            speaker_id=speaker_id or "cloud_egress",
-            speaker_name=speaker_name,
-            # No model_alias: cloud-egress extraction is deliberately
-            # model-independent.  This graph exists only to anchor PII
-            # anonymization (entity spans), not to build the knowledge graph,
-            # and entity/attribute extraction is reliable across models — the
-            # per-model prompt overrides target relation decomposition, which
-            # is not load-bearing here.  So the shared base prompt is used
-            # regardless of the configured model.
-            prompts_dir=prompts_dir,
-            validate=False,
-            ha_validation=False,
-            noise_filter="",
-        )
-    except Exception:
-        logger.exception("Cloud egress: local extraction failed; treating as block")
-        return "", {}, {}
+    # Both LLM calls below (extraction + anonymization) are structured
+    # extraction and must run on the base weights, never the training-active
+    # adapter.  One shared scope disables the adapter and keeps the KV cache
+    # live for both generates, restoring the model's entry state on exit.
+    with base_model_inference(model):
+        try:
+            graph = extract_graph(
+                model,
+                tokenizer,
+                transcript,
+                session_id="cloud_egress",
+                # Ephemeral graph: extracted only to anchor anonymization, then
+                # discarded — the stamped provenance is never persisted.  Use the
+                # resolved speaker_id when the caller has one (text-only /chat
+                # requests may not), falling back to the "cloud_egress" sentinel
+                # that already names the session.
+                speaker_id=speaker_id or "cloud_egress",
+                speaker_name=speaker_name,
+                # No model_alias: cloud-egress extraction is deliberately
+                # model-independent.  This graph exists only to anchor PII
+                # anonymization (entity spans), not to build the knowledge graph,
+                # and entity/attribute extraction is reliable across models — the
+                # per-model prompt overrides target relation decomposition, which
+                # is not load-bearing here.  So the shared base prompt is used
+                # regardless of the configured model.
+                prompts_dir=prompts_dir,
+                validate=False,
+                ha_validation=False,
+                noise_filter="",
+            )
+        except Exception:
+            logger.exception("Cloud egress: local extraction failed; treating as block")
+            return "", {}, {}
 
-    if not graph.relations:
-        return "", {}, {}
+        if not graph.relations:
+            return "", {}, {}
 
-    try:
-        anon_facts, mapping, anon_transcript, _raw = anonymize_with_local_model(
-            graph, model, tokenizer, transcript=transcript
-        )
-    except Exception:
-        logger.exception("Cloud egress: anonymization raised; treating as block")
-        return "", {}, {}
+        try:
+            anon_facts, mapping, anon_transcript, _raw = anonymize_with_local_model(
+                graph, model, tokenizer, transcript=transcript
+            )
+        except Exception:
+            logger.exception("Cloud egress: anonymization raised; treating as block")
+            return "", {}, {}
 
     if anon_facts is None or not mapping:
         return "", {}, {}

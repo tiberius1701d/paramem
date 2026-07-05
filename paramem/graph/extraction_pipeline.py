@@ -58,6 +58,7 @@ from paramem.graph.extractor import (
     extract_graph,
     extract_procedural_graph,
 )
+from paramem.models.loader import base_model_inference
 
 if TYPE_CHECKING:
     from paramem.graph.schema import SessionGraph
@@ -135,13 +136,13 @@ class ExtractionPipeline:
       (calibration relies on this to swap a ``calib_*.txt`` variant).
 
     - :meth:`run(transcript, session_id, source_type, **overrides) ->
-      SessionGraph` — factual extraction.  Wraps ``extract_graph`` with
-      the ``disable_adapter()`` context manager when the model is a
-      ``PeftModel`` (extraction must run on the base model, never the
-      adapter being trained), and disables gradient checkpointing on
-      the model first (HF Trainer silently disables KV cache when
-      checkpointing is active; KV cache is required for
-      ``model.generate()``).
+      SessionGraph` — factual extraction.  Runs ``extract_graph`` inside
+      :func:`~paramem.models.loader.base_model_inference`, which disables
+      any active LoRA adapter (extraction must run on the base model,
+      never the adapter being trained) and gradient checkpointing (HF
+      silently disables the KV cache when checkpointing is active; the
+      cache is required for ``model.generate()``) for the call, then
+      restores both to their pre-scope state on exit.
 
     - :meth:`run_procedural(transcript, session_id, *, speaker_id, ...)
       -> SessionGraph` — procedural-extraction sibling.  Same
@@ -266,32 +267,23 @@ class ExtractionPipeline:
     ) -> "SessionGraph":
         """Shared execution primitive for :meth:`run` and :meth:`run_procedural`.
 
-        Disables gradient checkpointing (HF silently disables the KV cache
-        when checkpointing is active; KV cache is required for
-        ``model.generate()``), then wraps the call in ``disable_adapter()``
-        when ``self.model`` is a ``PeftModel`` (extraction must run on the
-        base model, never the adapter being trained).  ``extract_fn`` is
-        ``extract_graph`` or ``extract_procedural_graph``.
+        Runs the extractor inside :func:`base_model_inference`, which disables
+        gradient checkpointing for the call (HF silently disables the KV cache
+        when checkpointing is active; the cache is required for
+        ``model.generate()``), disables any active LoRA adapter when
+        ``self.model`` is a ``PeftModel`` (extraction must run on the base
+        model, never the adapter being trained), and restores both to their
+        entry state on exit.  ``extract_fn`` is ``extract_graph`` or
+        ``extract_procedural_graph``.
         """
-        from peft import PeftModel as _PeftModel
-
-        self.model.gradient_checkpointing_disable()
-        if isinstance(self.model, _PeftModel):
-            with self.model.disable_adapter():
-                return extract_fn(
-                    self.model,
-                    self.tokenizer,
-                    session_transcript,
-                    session_id,
-                    **call_kwargs,
-                )
-        return extract_fn(
-            self.model,
-            self.tokenizer,
-            session_transcript,
-            session_id,
-            **call_kwargs,
-        )
+        with base_model_inference(self.model):
+            return extract_fn(
+                self.model,
+                self.tokenizer,
+                session_transcript,
+                session_id,
+                **call_kwargs,
+            )
 
     def run(
         self,
