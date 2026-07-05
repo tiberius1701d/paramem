@@ -29,6 +29,8 @@ NEGATIVE — same transcript:
 
 Existing bare anonymizer placeholders (`Person_1`, `City_1`, `Org_1`, etc.) stay bare. Do NOT re-brace them. Leave them exactly as the extractor emitted them.
 
+Before returning: every `{{Prefix_N}}` you wrote in `add`/`modify` MUST have a matching `bindings` entry (key without braces). If you cannot bind it to an exact transcript span, do NOT introduce the placeholder — write the entity surface inline instead.
+
 
 ## Coreference resolution
 

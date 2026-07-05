@@ -2315,6 +2315,15 @@ def _sota_pipeline(
     # calibration inspection.
     with phase_trace("deanon") as t:
         deanon_input_count = len(enriched_anon)
+        if enriched_anon:
+            _check_mapping_totality(
+                graph,
+                enriched_anon,
+                reverse_mapping,
+                sota_bindings=sota_bindings,
+                diagnostic_key="sota_pending_orphans",
+                stage="sota_enrichment",
+            )
         deanon_facts, dropped_facts = _apply_bindings(enriched_anon, reverse_mapping, sota_bindings)
         if dropped_facts:
             graph.diagnostics["residual_dropped_facts"] = dropped_facts
@@ -2752,16 +2761,36 @@ def _check_mapping_totality(
     graph: SessionGraph,
     anon_facts: list[dict],
     reverse_mapping: dict,
+    *,
+    sota_bindings: dict | None = None,
+    diagnostic_key: str = "totality_orphans",
+    stage: str = "anonymizer",
 ) -> None:
     """Diagnostic check: every placeholder in any anonymized fact must
-    appear as a key in ``reverse_mapping`` (the prompt's mapping-totality
-    contract).  Checked against the reverse map — not the forward map —
-    because deanonymization consumes the reverse map
-    (:func:`_apply_bindings`); a placeholder present only in the forward
-    map's values still fails to translate at deanon time.  Surfaces
-    violations to ``logger`` and ``graph.diagnostics["totality_orphans"]``
-    so prompt regressions are visible rather than silently shedding
-    facts.
+    resolve against ``reverse_mapping`` (plus ``sota_bindings`` when
+    given) — the union that :func:`_apply_bindings` actually consumes at
+    deanon time.  Checked against the reverse map — not the forward map —
+    because a placeholder present only in the forward map's values still
+    fails to translate at deanon time.  Surfaces violations to ``logger``
+    and ``graph.diagnostics[diagnostic_key]`` so prompt regressions are
+    visible rather than silently shedding facts.
+
+    Generalised to cover two call sites: the pre-SOTA anonymizer check
+    (``sota_bindings=None``, default ``diagnostic_key``/``stage``) and a
+    post-SOTA check (``sota_bindings=sota_bindings,
+    diagnostic_key="sota_pending_orphans", stage="sota_enrichment"``) that
+    predicts SOTA's minted-placeholder drops before :func:`_apply_bindings`
+    sheds them.  Matches both braced (``{Event_1}``) and bare (``Event_1``)
+    placeholder forms via ``_PLACEHOLDER_TOKEN_RE`` — harmless for the
+    pre-SOTA call, whose facts only ever carry bare tokens.
+
+    When ``sota_bindings`` is given, also flags any KEY present in both
+    ``sota_bindings`` and ``reverse_mapping`` with a DIFFERING value —
+    the union's reverse-wins tie-break (:func:`_apply_bindings`) would
+    otherwise silently resolve a minted placeholder to the wrong real
+    name.  Recorded (sorted) to ``graph.diagnostics["sota_binding_collisions"]``.
+    Reverse-wins semantics are unchanged; this only makes the silent
+    wrong-resolution observable.
 
     Does not mutate inputs and does not change the data flow.  When the
     contract is violated the orphan placeholder cannot be substituted
@@ -2774,30 +2803,52 @@ def _check_mapping_totality(
     :class:`paramem.graph.merger.GraphMerger`, not on placeholder
     vocabulary.
     """
+    if sota_bindings:
+        collisions = sorted(
+            k for k, v in sota_bindings.items() if k in reverse_mapping and reverse_mapping[k] != v
+        )
+        if collisions:
+            logger.warning(
+                "SOTA binding collision: %d placeholder(s) present in both "
+                "sota_bindings and reverse_mapping with differing values "
+                "(reverse_mapping wins): %s.",
+                len(collisions),
+                collisions[:5],
+            )
+            graph.diagnostics["sota_binding_collisions"] = collisions
     if not anon_facts:
         return
-    reverse_keys = set(reverse_mapping.keys()) if reverse_mapping else set()
+    resolvable = set(reverse_mapping or {}) | set(sota_bindings or {})
     orphans: set[str] = set()
     for f in anon_facts:
         if not isinstance(f, dict):
             continue
         for field in ("subject", "object"):
-            for token in _BARE_PLACEHOLDER_RE.findall(str(f.get(field, ""))):
-                if token not in reverse_keys:
-                    orphans.add(token)
+            for t in _PLACEHOLDER_TOKEN_RE.findall(str(f.get(field, ""))):
+                name = t[0] or t[1]
+                if name not in resolvable:
+                    orphans.add(name)
+    # Q3 completeness: a binding value may itself contain a bare placeholder
+    # (e.g. "Senior Engineer at Org_9") that never resolves — the braced
+    # pass exposes it but nothing substitutes it, so it drops silently.
+    for value in (sota_bindings or {}).values():
+        if not isinstance(value, str):
+            continue
+        for t in _PLACEHOLDER_TOKEN_RE.findall(value):
+            name = t[0] or t[1]
+            if name not in resolvable:
+                orphans.add(name)
     if orphans:
         ordered = sorted(orphans)
         logger.warning(
-            "Anonymization mapping-totality violation: %d orphan placeholder(s) "
-            "in anon_facts not in reverse_mapping: %s. Affected fact(s) will be "
+            "%s mapping-totality violation: %d orphan placeholder(s) "
+            "in anon_facts not resolvable: %s. Affected fact(s) will be "
             "dropped at the residual placeholder sweep post-deanon.",
+            "SOTA enrichment binding-totality" if stage == "sota_enrichment" else "Anonymization",
             len(ordered),
             ordered[:5],
         )
-        graph.diagnostics["totality_orphans"] = ordered
-
-
-_BARE_PLACEHOLDER_RE = re.compile(r"\b([A-Z][A-Za-z]*_\d+)\b")
+        graph.diagnostics[diagnostic_key] = ordered
 
 
 _TYPE_PREFIX_OVERRIDES = {
@@ -3098,21 +3149,31 @@ def _apply_bindings(
 ) -> tuple[list[dict], list[dict]]:
     """De-anonymize facts via state-machine substitution.
 
-    Combines two substitution sources into one pass:
+    Merges the anonymizer reverse map and SOTA's bindings into ONE union
+    resolve map, rendered in both braced and bare form:
 
     * **Anonymizer reverse map** (``reverse`` arg) —
       ``placeholder -> entity_name`` produced by
-      :func:`_build_anonymization_mapping`.  Substituted via
-      word-boundary token walk so apostrophes / punctuation around
-      bare tokens don't break (``Person_2's cousin`` ->
-      ``Alex's cousin``).  Earlier revisions inverted the forward
-      mapping here, which was lossy when PII attributes folded onto
-      the entity placeholder; the explicit reverse is now produced
-      alongside the forward map.
+      :func:`_build_anonymization_mapping`.  Earlier revisions inverted
+      the forward mapping here, which was lossy when PII attributes
+      folded onto the entity placeholder; the explicit reverse is now
+      produced alongside the forward map.
     * **SOTA bindings** (``sota_bindings`` arg) — ``placeholder_name -> real_text``
-      that SOTA emitted alongside its enriched facts. The braced literal
-      ``{Event_1}`` is matched and replaced directly (string substitution);
-      no diff against the updated transcript, no LLM call.
+      that SOTA emitted alongside its enriched facts (new entities SOTA
+      minted, e.g. ``Event_1``).
+
+    ``reverse`` wins on key collision (deterministic, consistent with the
+    "deterministic wins" tie-break used elsewhere for the anonymizer
+    mapping).  The union round-trips a placeholder regardless of which
+    form (braced or bare) it was actually emitted in: SOTA's contract
+    asks for braced minted placeholders and bare anonymizer placeholders,
+    but models don't always comply, so both maps are tried against both
+    forms.  Braced literal substitution runs first (unambiguous, no
+    word-boundary needed), then word-boundary substitution over the same
+    map catches bare occurrences (``Person_2's cousin`` -> ``Alex's
+    cousin``) and resolves any bare placeholder nested inside a bound
+    value (``"Senior Engineer at Org_1"`` -> ``"Senior Engineer at
+    Acme"``).
 
     Facts whose subject or object still contains a placeholder pattern after
     substitution are dropped via the existing residual sweep. Causes:
@@ -3130,18 +3191,14 @@ def _apply_bindings(
     (``_extract_sota_bindings``) which produced bogus mappings under
     multi-token replace blocks (bug 5).
     """
-    # Map braced literal -> real_text. SOTA's contract: binding key omits braces.
-    braced_map: dict[str, str] = {
-        f"{{{k}}}": v
-        for k, v in sota_bindings.items()
+    # Union resolve map: reverse wins on collision (deterministic entity
+    # names over freshly-minted SOTA prefixes).
+    resolve: dict[str, str] = {
+        k: v
+        for k, v in {**sota_bindings, **reverse}.items()
         if isinstance(k, str) and isinstance(v, str) and k and v
     }
-    # Bare placeholder -> entity_name comes from the producer; no inversion here.
-    bare_map: dict[str, str] = {
-        ph: real
-        for ph, real in reverse.items()
-        if isinstance(ph, str) and isinstance(real, str) and ph and real
-    }
+    braced_map: dict[str, str] = {f"{{{k}}}": v for k, v in resolve.items()}
 
     substituted: list[dict] = []
     for f in facts:
@@ -3149,17 +3206,18 @@ def _apply_bindings(
             continue
         subj = str(f.get("subject", ""))
         obj = str(f.get("object", ""))
-        # Substitute braced SOTA placeholders (literal string match —
-        # the braces make these unambiguous, no word-boundary needed).
+        # Pass 1: braced literal substring replace (unambiguous, no
+        # word-boundary needed).
         for braced, real in braced_map.items():
             if braced in subj:
                 subj = subj.replace(braced, real)
             if braced in obj:
                 obj = obj.replace(braced, real)
-        # Substitute bare anonymizer placeholders (word-boundary so
-        # apostrophes and surrounding punctuation work).
-        subj = _substitute_whole_words(subj, bare_map)
-        obj = _substitute_whole_words(obj, bare_map)
+        # Pass 2: bare word-boundary substitution over the SAME union map
+        # (apostrophes / surrounding punctuation handled; also resolves
+        # any bare token exposed by pass 1, e.g. nested-value binding).
+        subj = _substitute_whole_words(subj, resolve)
+        obj = _substitute_whole_words(obj, resolve)
         substituted.append({**f, "subject": subj, "object": obj})
 
     # Residual sweep catches unresolved placeholders (missing binding, anon

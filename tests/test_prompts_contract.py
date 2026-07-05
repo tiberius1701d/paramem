@@ -272,6 +272,23 @@ class TestEnrichmentPromptContract:
             "anti-pattern in a NEGATIVE block."
         )
 
+    def test_teaches_pre_return_binding_self_audit(self):
+        """The brace-binding section must end with a self-audit clause
+        instructing the model to verify, before returning, that every
+        minted placeholder has a matching ``bindings`` entry — and to
+        write the entity surface inline rather than mint an unbound
+        placeholder.  Structural, phrasing-tolerant: the exact wording is
+        free to evolve; the pre-return check binding minted tokens to
+        ``bindings`` is not."""
+        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        assert "Before returning" in tmpl, (
+            "Enrichment prompt must contain a 'Before returning' self-audit clause."
+        )
+        assert "bindings" in tmpl
+        # Must still render cleanly (format-escape correctness for the new line).
+        rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
+        assert "Before returning" in rendered
+
 
 class TestPlausibilityPromptContract:
     def test_renders_without_format_errors(self):

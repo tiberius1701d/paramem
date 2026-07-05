@@ -2039,6 +2039,113 @@ class TestApplyBindings:
         kept, _ = _apply_bindings(facts, reverse, sota_bindings={})
         assert kept[0]["subject"] == "Alex"
 
+    def test_minted_placeholder_round_trips_bare(self):
+        """A SOTA-minted placeholder emitted BARE (not braced, contra the
+        prompt's contract) still round-trips via the union resolve map —
+        today's two-channel design drops this because ``bare_map`` only
+        ever contained ``reverse``."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "attended",
+                "object": "Event_1",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
+        ]
+        reverse = {"Person_1": "Alice"}
+        sota_bindings = {"Event_1": "the quarterly retro"}
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings)
+        assert dropped == []
+        assert kept[0]["object"] == "the quarterly retro"
+
+    def test_minted_placeholder_round_trips_braced_regression(self):
+        """Braced-form minted placeholder still resolves (regression
+        guard for the union unification)."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "attended",
+                "object": "{Event_1}",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
+        ]
+        reverse = {"Person_1": "Alice"}
+        sota_bindings = {"Event_1": "the quarterly retro"}
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings)
+        assert dropped == []
+        assert kept[0]["object"] == "the quarterly retro"
+
+    def test_anonymizer_placeholder_wrongly_braced_still_resolves(self):
+        """An anonymizer placeholder the cloud wrongly re-braced
+        (contra the prompt's 'leave bare' contract) still resolves via
+        the union — it is in ``reverse``, which is now tried in both
+        the braced and bare pass."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "attended",
+                "object": "{Person_1}",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
+        ]
+        reverse = {"Person_1": "Alex"}
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        assert dropped == []
+        assert kept[0]["object"] == "Alex"
+
+    def test_nested_binding_value_resolves_in_order(self):
+        """A binding value containing a bare anonymizer placeholder
+        (``"Senior Engineer at Org_1"``) resolves fully: braced pass
+        expands ``{Role_1}`` to the value, bare pass then resolves the
+        exposed ``Org_1`` from the SAME union map."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "held_role",
+                "object": "{Role_1}",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
+        ]
+        sota_bindings = {"Role_1": "Senior Engineer at Org_1"}
+        reverse = {"Person_1": "Alex", "Org_1": "Acme"}
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings)
+        assert dropped == []
+        assert kept[0]["object"] == "Senior Engineer at Acme"
+
+    def test_collision_reverse_wins_in_resolved_output(self):
+        """When a key collides between ``sota_bindings`` and ``reverse``
+        with differing values, ``reverse`` wins (deterministic entity
+        name over a freshly-minted SOTA value) — the collision itself is
+        surfaced by :func:`_check_mapping_totality`, not here."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {
+                "subject": "Org_1",
+                "predicate": "based_in",
+                "object": "Germany",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
+        ]
+        reverse = {"Org_1": "Acme"}
+        sota_bindings = {"Org_1": "Wrong Corp"}
+        kept, dropped = _apply_bindings(facts, reverse, sota_bindings)
+        assert dropped == []
+        assert kept[0]["subject"] == "Acme"
+
 
 class TestResidualSweepCatchesEmbeddedPlaceholders:
     def test_strip_residual_placeholders_catches_bare_and_composite(self):
@@ -3759,3 +3866,122 @@ class TestCheckMappingTotality:
         reverse_mapping = {"Person_1": "Alex", "Person_4": "Alex"}
         _check_mapping_totality(graph, anon_facts, reverse_mapping)
         assert "totality_orphans" not in graph.diagnostics
+
+    def test_post_sota_missing_binding_predicted_before_drop(self, caplog):
+        """A fact referencing a braced placeholder absent from BOTH
+        ``sota_bindings`` and ``reverse_mapping`` is recorded under the
+        SOTA-stage diagnostic key and logged BEFORE :func:`_apply_bindings`
+        drops the fact."""
+        import logging
+
+        from paramem.graph.extractor import _apply_bindings, _check_mapping_totality
+
+        graph = self._graph()
+        anon_facts = [
+            {"subject": "Person_1", "predicate": "works_at", "object": "{Org_9}"},
+        ]
+        reverse_mapping = {"Person_1": "Alex"}
+        sota_bindings: dict = {}
+        # caplog.at_level() silently fails here because the logger is not
+        # propagating to the root; attach the handler to the specific
+        # logger directly (see test_skips_unrecognised_class_filenames pattern
+        # in test_intent.py).
+        extractor_logger = logging.getLogger("paramem.graph.extractor")
+        prior_level = extractor_logger.level
+        extractor_logger.setLevel(logging.WARNING)
+        extractor_logger.addHandler(caplog.handler)
+        try:
+            _check_mapping_totality(
+                graph,
+                anon_facts,
+                reverse_mapping,
+                sota_bindings=sota_bindings,
+                diagnostic_key="sota_pending_orphans",
+                stage="sota_enrichment",
+            )
+        finally:
+            extractor_logger.removeHandler(caplog.handler)
+            extractor_logger.setLevel(prior_level)
+        assert graph.diagnostics.get("sota_pending_orphans") == ["Org_9"]
+        assert any("sota enrichment" in r.getMessage().lower() for r in caplog.records)
+        kept, dropped = _apply_bindings(anon_facts, reverse_mapping, sota_bindings)
+        assert kept == []
+        assert len(dropped) == 1
+
+    def test_post_sota_nested_binding_value_unbound_predicted(self):
+        """A binding value that itself contains an unresolved bare
+        placeholder (``"... at Org_9"``) is predicted as an orphan even
+        though no fact directly references ``Org_9``."""
+        from paramem.graph.extractor import _check_mapping_totality
+
+        graph = self._graph()
+        anon_facts = [
+            {"subject": "Person_1", "predicate": "held_role", "object": "{Role_1}"},
+        ]
+        reverse_mapping: dict = {}
+        sota_bindings = {"Role_1": "Senior Engineer at Org_9"}
+        _check_mapping_totality(
+            graph,
+            anon_facts,
+            reverse_mapping,
+            sota_bindings=sota_bindings,
+            diagnostic_key="sota_pending_orphans",
+            stage="sota_enrichment",
+        )
+        assert "Org_9" in graph.diagnostics.get("sota_pending_orphans", [])
+
+    def test_collision_between_sota_bindings_and_reverse_recorded(self, caplog):
+        """A key present in BOTH ``sota_bindings`` and ``reverse_mapping``
+        with differing values is recorded to
+        ``graph.diagnostics["sota_binding_collisions"]`` and warned about —
+        the reverse-wins tie-break in :func:`_apply_bindings` would
+        otherwise silently resolve to the wrong real name."""
+        import logging
+
+        from paramem.graph.extractor import _check_mapping_totality
+
+        graph = self._graph()
+        anon_facts = [
+            {"subject": "Org_1", "predicate": "based_in", "object": "Germany"},
+        ]
+        reverse_mapping = {"Org_1": "Acme"}
+        sota_bindings = {"Org_1": "Wrong Corp"}
+        # caplog.at_level() silently fails here because the logger is not
+        # propagating to the root; attach the handler to the specific
+        # logger directly (see test_skips_unrecognised_class_filenames pattern
+        # in test_intent.py).
+        extractor_logger = logging.getLogger("paramem.graph.extractor")
+        prior_level = extractor_logger.level
+        extractor_logger.setLevel(logging.WARNING)
+        extractor_logger.addHandler(caplog.handler)
+        try:
+            _check_mapping_totality(
+                graph,
+                anon_facts,
+                reverse_mapping,
+                sota_bindings=sota_bindings,
+                diagnostic_key="sota_pending_orphans",
+                stage="sota_enrichment",
+            )
+        finally:
+            extractor_logger.removeHandler(caplog.handler)
+            extractor_logger.setLevel(prior_level)
+        assert graph.diagnostics.get("sota_binding_collisions") == ["Org_1"]
+        assert any("collision" in r.getMessage().lower() for r in caplog.records)
+
+    def test_pre_sota_positional_calls_unaffected_by_generalization(self):
+        """The existing positional pre-SOTA call sites (this class's
+        earlier tests) keep passing unchanged — defaults preserve
+        behaviour: ``sota_bindings=None`` skips the collision scan and
+        the diagnostic key stays ``"totality_orphans"``."""
+        from paramem.graph.extractor import _check_mapping_totality
+
+        graph = self._graph()
+        anon_facts = [
+            {"subject": "Person_1", "predicate": "studied_at", "object": "University_1"},
+        ]
+        reverse_mapping = {"Person_1": "Alex"}
+        _check_mapping_totality(graph, anon_facts, reverse_mapping)
+        assert graph.diagnostics.get("totality_orphans") == ["University_1"]
+        assert "sota_binding_collisions" not in graph.diagnostics
+        assert "sota_pending_orphans" not in graph.diagnostics
