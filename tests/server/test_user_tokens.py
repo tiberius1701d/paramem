@@ -213,6 +213,19 @@ class TestRevoke:
 
         assert count == 0
 
+    def test_revoke_speaker_cased_input_matches_lowercase_stored_entry(
+        self, tmp_path, monkeypatch, store_path
+    ):
+        """revoke_speaker('Speaker0') revokes a token minted via mint('speaker0', ...)."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+        token = store.mint("speaker0", "My Device")
+
+        count = store.revoke_speaker("Speaker0")
+
+        assert count == 1
+        assert store.lookup(token) is None
+
 
 # ---------------------------------------------------------------------------
 # list() — never exposes hashes or plaintext tokens
@@ -776,6 +789,17 @@ class TestMintSpeakerIdValidation:
 
         token = store.mint("speaker0", "My Device")
         assert token is not None
+        assert store.lookup(token) == "speaker0"
+
+    def test_mint_cased_speaker_id_is_coerced_to_lowercase(self, tmp_path, monkeypatch, store_path):
+        """mint('Speaker0', ...) stores and resolves the canonical lowercase form."""
+        _setup_daily(tmp_path, monkeypatch)
+        store = UserTokenStore(store_path)
+
+        token = store.mint("Speaker0", "My Device")
+
+        entries = store.list()
+        assert entries[0]["speaker_id"] == "speaker0"
         assert store.lookup(token) == "speaker0"
 
 

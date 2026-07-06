@@ -72,7 +72,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     mode.add_argument(
         "--speaker",
         metavar="SPEAKER_ID",
-        help="Revoke all non-revoked tokens for this speaker (e.g. Speaker0).",
+        help="Revoke all non-revoked tokens for this speaker (e.g. speaker0).",
     )
     mode.add_argument(
         "--label",
@@ -148,6 +148,7 @@ def run(args: argparse.Namespace) -> int:
         0 on success or ``--list``; 1 on error (config not found, no match,
         I/O error, store write failure).
     """
+    from paramem.graph.name_match import is_speaker_id
     from paramem.server.user_tokens import UserTokenStore
 
     data_dir = _resolve_data_dir(args)
@@ -171,17 +172,23 @@ def run(args: argparse.Namespace) -> int:
 
     # --speaker: revoke all tokens for the named speaker.
     if args.speaker is not None:
+        # Ingest safety-net: coerce any residual cased form (e.g. "Speaker0")
+        # to the canonical lowercase form so the preview match below (and the
+        # revoke_speaker() call) agree with the canonical form store.list()
+        # returns for entries minted via the same coercion.
+        speaker = args.speaker.lower() if is_speaker_id(args.speaker) else args.speaker
+
         # Preview what will be revoked.
         entries = store.list()
-        targets = [e for e in entries if e["speaker_id"] == args.speaker and not e["revoked"]]
+        targets = [e for e in entries if e["speaker_id"] == speaker and not e["revoked"]]
         if not targets:
             print(
-                f"No active tokens found for speaker '{args.speaker}'.",
+                f"No active tokens found for speaker '{speaker}'.",
                 file=sys.stderr,
             )
             return 1
 
-        print(f"Will revoke {len(targets)} token(s) for speaker '{args.speaker}':")
+        print(f"Will revoke {len(targets)} token(s) for speaker '{speaker}':")
         for e in targets:
             print(f"  label={e['label']!r}  created={e['created']}")
 
@@ -194,8 +201,8 @@ def run(args: argparse.Namespace) -> int:
                 print("Aborted.")
                 return 1
 
-        count = store.revoke_speaker(args.speaker)
-        print(f"Revoked {count} token(s) for speaker '{args.speaker}'.")
+        count = store.revoke_speaker(speaker)
+        print(f"Revoked {count} token(s) for speaker '{speaker}'.")
         print("NOTE: revocation takes effect immediately (live reload on next request).")
         return 0
 

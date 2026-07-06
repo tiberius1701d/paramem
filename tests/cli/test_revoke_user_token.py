@@ -125,7 +125,9 @@ class TestListTokens:
 
         assert rc == 0
         out = capsys.readouterr().out
-        assert "Speaker0" in out
+        # mint() coerces a cased speaker_id (e.g. "Speaker0") to the
+        # canonical lowercase form — see UserTokenStore.mint.
+        assert "speaker0" in out
         assert "phone" in out
 
     def test_list_empty_store_exits_zero(
@@ -179,7 +181,9 @@ class TestRevokeBySpeaker:
         store = UserTokenStore(data_dir / "user_tokens.json")
         assert store.lookup(t1) is None, "t1 must be revoked"
         assert store.lookup(t2) is None, "t2 must be revoked"
-        assert store.lookup(t_other) == "Speaker1", "other speaker's token must be untouched"
+        # mint() coerces a cased speaker_id (e.g. "Speaker1") to the
+        # canonical lowercase form — see UserTokenStore.mint.
+        assert store.lookup(t_other) == "speaker1", "other speaker's token must be untouched"
 
     def test_on_disk_store_reflects_revoked_true(self, tmp_path: Path) -> None:
         """After --speaker revocation, the on-disk JSON has revoked=True entries."""
@@ -192,8 +196,13 @@ class TestRevokeBySpeaker:
 
         raw = json.loads((data_dir / "user_tokens.json").read_text(encoding="utf-8"))
         entries = list(raw["tokens"].values())
-        assert all(e["revoked"] is True for e in entries if e["speaker_id"] == "Speaker0"), (
-            "on-disk entries for Speaker0 must have revoked=True"
+        # mint() + revoke coerce the cased input to canonical lowercase, so the
+        # on-disk entry is stored under "speaker0"; filter on that to avoid a
+        # vacuously-true assertion.
+        speaker0_entries = [e for e in entries if e["speaker_id"] == "speaker0"]
+        assert speaker0_entries, "expected a speaker0 entry on disk"
+        assert all(e["revoked"] is True for e in speaker0_entries), (
+            "on-disk entries for speaker0 must have revoked=True"
         )
 
     def test_no_match_returns_exit_1(self, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -257,7 +266,9 @@ class TestRevokeByLabel:
         store = UserTokenStore(data_dir / "user_tokens.json")
         assert store.lookup(t_phone) is None, "Speaker0 phone must be revoked"
         assert store.lookup(t_other) is None, "Speaker1 phone must also be revoked"
-        assert store.lookup(t_tablet) == "Speaker0", "tablet must be untouched"
+        # mint() coerces a cased speaker_id (e.g. "Speaker0") to the
+        # canonical lowercase form — see UserTokenStore.mint.
+        assert store.lookup(t_tablet) == "speaker0", "tablet must be untouched"
 
     def test_on_disk_store_reflects_revoked_true(self, tmp_path: Path) -> None:
         """After --label revocation, the on-disk JSON has revoked=True for matching entries."""
@@ -382,9 +393,10 @@ class TestErrorPaths:
         rc = revoke_user_token.run(args)
 
         assert rc == 1
-        # Token must still be active.
+        # Token must still be active.  mint() coerces a cased speaker_id
+        # (e.g. "Speaker0") to the canonical lowercase form.
         store = UserTokenStore(data_dir / "user_tokens.json")
-        assert store.lookup(t) == "Speaker0", "token must not be revoked after abort"
+        assert store.lookup(t) == "speaker0", "token must not be revoked after abort"
 
     def test_confirm_yes_proceeds_without_prompt(self, tmp_path: Path) -> None:
         """--yes bypasses the confirmation prompt and revokes successfully."""

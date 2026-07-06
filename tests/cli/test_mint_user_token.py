@@ -131,10 +131,12 @@ class TestHappyPath:
 
         store = UserTokenStore(data_dir / "user_tokens.json")
         resolved = store.lookup(token)
-        assert resolved == "Speaker0", f"lookup() must return 'Speaker0', got {resolved!r}"
+        # mint() coerces a cased speaker_id (e.g. "Speaker0") to the
+        # canonical lowercase form — see UserTokenStore.mint.
+        assert resolved == "speaker0", f"lookup() must return 'speaker0', got {resolved!r}"
 
     def test_store_entry_has_expected_speaker_and_label(self, tmp_path: Path) -> None:
-        """The store entry has the correct speaker_id and label."""
+        """The store entry has the correct (canonicalized) speaker_id and label."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
@@ -143,7 +145,9 @@ class TestHappyPath:
 
         store = UserTokenStore(data_dir / "user_tokens.json")
         entries = store.list()
-        assert entries[0]["speaker_id"] == "Speaker1"
+        # mint() coerces a cased speaker_id (e.g. "Speaker1") to the
+        # canonical lowercase form — see UserTokenStore.mint.
+        assert entries[0]["speaker_id"] == "speaker1"
         assert entries[0]["label"] == "My Phone"
         assert entries[0]["revoked"] is False
 

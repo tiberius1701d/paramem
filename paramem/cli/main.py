@@ -369,3 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     # Unreachable after subparsers.required = True, but keeps mypy happy.
     parser.print_help(sys.stderr)
     return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

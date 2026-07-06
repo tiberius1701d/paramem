@@ -274,6 +274,11 @@ class UserTokenStore:
                 "Tokens must reference a canonical speaker{N} id (e.g. 'speaker0') or "
                 "pass speaker_id=None for an unattributed shared-device token."
             )
+        # Ingest safety-net: coerce any residual cased form (e.g. "Speaker0") a
+        # caller passes to the canonical lowercase form, mirroring
+        # ``_normalize_extraction``'s is_speaker_id-gated coercion.
+        if is_speaker_id(speaker_id):
+            speaker_id = speaker_id.lower()
         token = secrets.token_urlsafe(32)
         key = _sha256hex(token)
         entry: dict = {
@@ -432,6 +437,10 @@ class UserTokenStore:
                 "unattributed tokens.  Use revoke_label() to revoke an "
                 "unattributed token by its label instead."
             )
+        # Ingest safety-net: coerce any residual cased form (e.g. "Speaker0")
+        # so it matches the canonical lowercase form stored by mint().
+        if is_speaker_id(speaker_id):
+            speaker_id = speaker_id.lower()
         count = 0
         with self._lock:
             for entry in self._tokens.values():
@@ -439,9 +448,12 @@ class UserTokenStore:
                 # never accidentally matched by this method.
                 if entry.get("speaker_id") is None:
                     continue
-                # Comparison is intentionally EXACT (case-sensitive): normalising
-                # would risk merging distinct speakers.  Use
-                # ``revoke-user-token --list`` to see canonical IDs.
+                # Comparison is EXACT on the canonical form: the coercion above
+                # only lowercases a residual cased *input* (e.g. "Speaker0") to
+                # match the canonical lowercase form entries are stored under
+                # (mint() applies the same coercion) — it never folds distinct
+                # speaker ids together.  Use ``revoke-user-token --list`` to see
+                # canonical IDs.
                 if entry["speaker_id"] == speaker_id and not entry["revoked"]:
                     entry["revoked"] = True
                     count += 1

@@ -186,3 +186,17 @@ class TestParamemMAlias:
             f"stdout: {result.stdout.decode()}\n"
             f"stderr: {result.stderr.decode()}"
         )
+
+    def test_paramem_cli_main_module_alias_equivalent(self):
+        """``python -m paramem.cli.main --help`` exits 0, confirming the
+        module's own ``if __name__ == "__main__":`` guard is wired (not just
+        the package-level ``__main__.py`` alias)."""
+        result = subprocess.run(
+            [sys.executable, "-m", "paramem.cli.main", "--help"],
+            capture_output=True,
+        )
+        assert result.returncode == 0, (
+            f"python -m paramem.cli.main --help exited {result.returncode}.\n"
+            f"stdout: {result.stdout.decode()}\n"
+            f"stderr: {result.stderr.decode()}"
+        )

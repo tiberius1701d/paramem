@@ -122,7 +122,7 @@ class TestPerUserTokenHeader:
 
         resp = client.get("/ping", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 200
-        assert resp.json()["speaker_id"] == "Speaker0"
+        assert resp.json()["speaker_id"] == "speaker0"
 
     def test_invalid_token_returns_401(self, tmp_path, monkeypatch):
         """An invalid bearer token is rejected with 401."""
@@ -213,7 +213,7 @@ class TestCookieToken:
 
         resp = client.get("/ping")
         assert resp.status_code == 200
-        assert resp.json()["speaker_id"] == "Speaker0"
+        assert resp.json()["speaker_id"] == "speaker0"
 
     def test_header_takes_precedence_over_cookie(self, tmp_path, monkeypatch):
         """When both header and cookie are present, the header token is used."""
@@ -228,7 +228,7 @@ class TestCookieToken:
         # Header carries the good token; cookie carries an invalid value.
         resp = client.get("/ping", headers={"Authorization": f"Bearer {good_token}"})
         assert resp.status_code == 200
-        assert resp.json()["speaker_id"] == "Speaker0"
+        assert resp.json()["speaker_id"] == "speaker0"
 
     def test_invalid_cookie_returns_401(self, tmp_path, monkeypatch):
         """An invalid cookie token is rejected."""
@@ -457,7 +457,7 @@ class TestOnBothMode:
 
         resp = client.get("/ping", headers={"Authorization": f"Bearer {user_token}"})
         assert resp.status_code == 200
-        assert resp.json()["speaker_id"] == "Speaker0"
+        assert resp.json()["speaker_id"] == "speaker0"
 
     def test_shared_token_authorized_in_on_both_mode(self, tmp_path, monkeypatch):
         """Shared token + per-user store: the shared token also authorizes (no
@@ -712,7 +712,7 @@ class TestCookieNameGetter:
         client = TestClient(app, cookies={"custom_cookie": token})
         resp = client.get("/ping")
         assert resp.status_code == 200
-        assert resp.json()["speaker_id"] == "Speaker0"
+        assert resp.json()["speaker_id"] == "speaker0"
 
     def test_default_cookie_name_ignored_when_getter_returns_custom(self, tmp_path, monkeypatch):
         """When getter returns 'custom_cookie', the default 'paramem_token' cookie
@@ -735,7 +735,7 @@ class TestCookieNameGetter:
         client = TestClient(app, cookies={"paramem_token": token})
         resp = client.get("/ping")
         assert resp.status_code == 200
-        assert resp.json()["speaker_id"] == "Speaker0"
+        assert resp.json()["speaker_id"] == "speaker0"
 
 
 # ---------------------------------------------------------------------------
@@ -777,7 +777,7 @@ class TestScopeOnRequestState:
         resp = client.get("/ping", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 200
         assert resp.json()["scope"] == "admin"
-        assert resp.json()["speaker_id"] == "Speaker0"
+        assert resp.json()["speaker_id"] == "speaker0"
 
     def test_per_user_chat_token_sets_chat_scope(self, tmp_path, monkeypatch):
         """A per-user chat token sets request.state.scope = 'chat'."""
