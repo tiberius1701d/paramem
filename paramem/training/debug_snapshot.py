@@ -49,6 +49,7 @@ Layout::
             fold_assignments.json                # on_fold_assignments
         training/tiers/<tier>/adapter_weights/  # on_main_adapters_saved
         cycle_summary_snapshot.json              # on_cycle_end
+        calibrate_extract_<session_id>_<ts>.json # on_calibrate_extract
 
 The procedural relations file is omitted when the procedural list is
 empty (mirrors the pre-refactor behaviour of ``_save_debug_artifacts``).
@@ -61,6 +62,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +75,17 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_path_component(value: Any) -> str:
+    """Map any character that isn't alnum/``-``/``_`` to ``_`` (regex-free).
+
+    Neutralises path separators and ``.`` so a request-controlled value
+    (e.g. ``session_id``) cannot traverse out of the debug base directory
+    when used as a filename or directory component.
+    """
+    sanitized = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(value))
+    return sanitized or "_"
 
 
 class DebugSnapshotWriter:
@@ -132,7 +145,7 @@ class DebugSnapshotWriter:
         base = self._active_base(interim_stamp=interim_stamp)
         if base is None:
             return
-        out_path = base / "sessions" / session_id / f"{kind}_snapshot.json"
+        out_path = base / "sessions" / _safe_path_component(session_id) / f"{kind}_snapshot.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(graph.model_dump_json(indent=2))
 
@@ -412,6 +425,35 @@ class DebugSnapshotWriter:
             len(raw_outputs),
             applied,
         )
+
+    def on_calibrate_extract(
+        self,
+        payload: dict[str, Any],
+        *,
+        session_id: str,
+        interim_stamp: str | None = None,
+    ) -> None:
+        """Persist a full ``/calibrate/extract`` result as a debug artifact.
+
+        Writes ``<base>/calibrate_extract_<session_id>_<timestamp>.json`` —
+        the timestamp keeps repeated calibration calls against the same
+        ``session_id`` from clobbering each other's artifact.  *payload* is
+        dumped verbatim (parsed graph including ``diagnostics``, phase
+        records, raw model output) so entity-correction proposals rejected
+        by the apply gate stay inspectable even though they never reach
+        ``graph.diagnostics["entity_corrections"]``.
+
+        Self-gated on ``save_cycle_snapshots`` / ``_debug_base``; no-op
+        when debug is disabled.
+        """
+        base = self._active_base(interim_stamp=interim_stamp)
+        if base is None:
+            return
+        timestamp = int(time.time())
+        safe_session_id = _safe_path_component(session_id)
+        out_path = base / f"calibrate_extract_{safe_session_id}_{timestamp}.json"
+        _write_json(out_path, payload)
+        logger.info("Debug calibrate_extract snapshot written: %s", out_path)
 
     def on_cycle_end(
         self,

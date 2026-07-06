@@ -1770,7 +1770,7 @@ class TestSOTANoiseFilter:
         Stubs ``paramem.graph.extractor.correct_entity_surfaces`` (the name
         bound in extractor's own namespace via its top-of-file import) so
         this proves the WIRING added to ``_sota_pipeline`` — the stub is
-        called exactly once and its return value lands verbatim on
+        called exactly once and its ``"applied"`` list lands verbatim on
         ``graph.diagnostics["entity_corrections"]`` — without needing a
         live model. Reuses the same ``anonymize_with_local_model`` /
         ``_filter_with_sota`` happy-path mocking pattern as the sibling
@@ -1797,11 +1797,23 @@ class TestSOTANoiseFilter:
                 "after": "Frankfurt",
             }
         ]
+        canned_verdicts = [
+            {
+                "locus": "placeholder",
+                "placeholder": "City_1",
+                "type": "place",
+                "kind": "place",
+                "is_known_entity": True,
+                "proposed": "Frankfurt",
+                "applied": True,
+                "reject_reason": None,
+            }
+        ]
         correction_calls = []
 
         def fake_correct_entity_surfaces(reverse_mapping, entities, model, tokenizer, **kwargs):
             correction_calls.append((dict(reverse_mapping), list(entities), kwargs))
-            return canned_applied
+            return {"applied": canned_applied, "verdicts": canned_verdicts}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
@@ -1830,6 +1842,7 @@ class TestSOTANoiseFilter:
 
         assert len(correction_calls) == 1, "correct_entity_surfaces must be called exactly once"
         assert result.diagnostics["entity_corrections"] == canned_applied
+        assert result.diagnostics["entity_correction_verdicts"] == canned_verdicts
 
 
 class TestApplyBindings:

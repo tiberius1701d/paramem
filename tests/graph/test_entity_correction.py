@@ -48,7 +48,7 @@ class TestScopeGating:
             correction_entity_types=set(),
         )
 
-        assert result == []
+        assert result == {"applied": [], "verdicts": []}
         assert reverse_mapping == {"City_1": "Frankfrut"}
         called.assert_not_called()
 
@@ -67,7 +67,7 @@ class TestScopeGating:
             correction_entity_types=None,
         )
 
-        assert result == []
+        assert result == {"applied": [], "verdicts": []}
         called.assert_not_called()
 
     def test_correctable_kinds_empty_after_intersection_returns_empty(self, monkeypatch):
@@ -88,7 +88,7 @@ class TestScopeGating:
             correction_entity_types={"person", "attributes"},
         )
 
-        assert result == []
+        assert result == {"applied": [], "verdicts": []}
         called.assert_not_called()
         assert reverse_mapping == {"City_1": "Frankfrut"}
         assert entity.attributes == {"origin": "Frankfrut"}
@@ -106,7 +106,7 @@ class TestScopeGating:
             correction_entity_types=_DEFAULT_SCOPE,
         )
 
-        assert result == []
+        assert result == {"applied": [], "verdicts": []}
         called.assert_not_called()
 
 
@@ -133,7 +133,7 @@ class TestPlaceholderLocus:
         )
 
         assert reverse_mapping["City_1"] == "Frankfurt"
-        assert result == [
+        assert result["applied"] == [
             {
                 "locus": "placeholder",
                 "placeholder": "City_1",
@@ -141,6 +141,18 @@ class TestPlaceholderLocus:
                 "kind": "place",
                 "before": "Frankfrut",
                 "after": "Frankfurt",
+            }
+        ]
+        assert result["verdicts"] == [
+            {
+                "locus": "placeholder",
+                "placeholder": "City_1",
+                "type": "place",
+                "kind": "place",
+                "is_known_entity": True,
+                "proposed": "Frankfurt",
+                "applied": True,
+                "reject_reason": None,
             }
         ]
 
@@ -169,7 +181,19 @@ class TestPlaceholderLocus:
         )
 
         assert reverse_mapping["City_1"] == "Angela Merkl"
-        assert result == []
+        assert result["applied"] == []
+        assert result["verdicts"] == [
+            {
+                "locus": "placeholder",
+                "placeholder": "City_1",
+                "type": "place",
+                "kind": "person",
+                "is_known_entity": True,
+                "proposed": "Angela Merkel",
+                "applied": False,
+                "reject_reason": "kind_not_correctable",
+            }
+        ]
 
     def test_person_placeholder_never_gathered(self, monkeypatch):
         """Person_N is excluded at gather time (its anonymizer type "person"
@@ -226,7 +250,19 @@ class TestPlaceholderLocus:
         )
 
         assert reverse_mapping["City_1"] == "Grenholm"
-        assert result == []
+        assert result["applied"] == []
+        assert result["verdicts"] == [
+            {
+                "locus": "placeholder",
+                "placeholder": "City_1",
+                "type": "place",
+                "kind": "place",
+                "is_known_entity": False,
+                "proposed": "Grenholm",
+                "applied": False,
+                "reject_reason": "not_known_entity",
+            }
+        ]
 
     def test_corrected_equal_to_value_is_a_noop(self, monkeypatch):
         """corrected == value never counts as an applied change, even when
@@ -251,7 +287,19 @@ class TestPlaceholderLocus:
         )
 
         assert reverse_mapping["Thing_1"] == "Pytorch"
-        assert result == []
+        assert result["applied"] == []
+        assert result["verdicts"] == [
+            {
+                "locus": "placeholder",
+                "placeholder": "Thing_1",
+                "type": "concept",
+                "kind": "concept",
+                "is_known_entity": True,
+                "proposed": "Pytorch",
+                "applied": False,
+                "reject_reason": "no_change",
+            }
+        ]
 
     def test_product_kind_normalizes_to_concept_and_applies(self, monkeypatch):
         """(i) A model-returned kind of "product" normalizes to "concept" so
@@ -276,7 +324,7 @@ class TestPlaceholderLocus:
         )
 
         assert reverse_mapping["Thing_1"] == "Pytorch"
-        assert result == [
+        assert result["applied"] == [
             {
                 "locus": "placeholder",
                 "placeholder": "Thing_1",
@@ -307,7 +355,16 @@ class TestPlaceholderLocus:
         )
 
         assert reverse_mapping["City_1"] == "not json at all, no braces"
-        assert result == []
+        assert result["applied"] == []
+        assert result["verdicts"] == [
+            {
+                "locus": "placeholder",
+                "placeholder": "City_1",
+                "type": "place",
+                "applied": False,
+                "reject_reason": "parse_error",
+            }
+        ]
 
     def test_multiple_placeholder_targets_return_list_of_applied_changes(self, monkeypatch):
         """The returned list matches every applied change, in placeholder-
@@ -344,7 +401,7 @@ class TestPlaceholderLocus:
         )
 
         assert reverse_mapping == {"City_1": "Frankfurt", "Org_1": "Wobbleco"}
-        assert result == [
+        assert result["applied"] == [
             {
                 "locus": "placeholder",
                 "placeholder": "City_1",
@@ -413,7 +470,7 @@ class TestAttributeLocus:
         )
 
         assert entity.attributes == {"current_location": "Frankfurt"}
-        assert result == [
+        assert result["applied"] == [
             {
                 "locus": "attribute",
                 "entity": "Speaker0",
@@ -451,7 +508,7 @@ class TestAttributeLocus:
         )
 
         assert entity.attributes == {"last_name": "Merkl"}
-        assert result == []
+        assert result["applied"] == []
 
     def test_attribute_kind_other_not_applied(self, monkeypatch):
         """(e) An attribute value the model classifies as kind=other (e.g. an
@@ -480,7 +537,7 @@ class TestAttributeLocus:
         )
 
         assert entity.attributes == {"email": "alex.morgan@example.com"}
-        assert result == []
+        assert result["applied"] == []
 
     def test_attributes_not_in_knob_leaves_attribute_values_untouched(self, monkeypatch):
         """(g) When "attributes" is absent from the knob, the attribute locus
@@ -513,7 +570,7 @@ class TestAttributeLocus:
             correction_entity_types={"place", "organization", "concept"},
         )
 
-        assert result == []
+        assert result == {"applied": [], "verdicts": []}
         assert entity.attributes == {"current_location": "Frankfrut"}
         calls_assert_msg = "attribute locus must not be gathered without 'attributes' in scope"
         assert calls == [], calls_assert_msg
@@ -537,7 +594,7 @@ class TestAttributeLocus:
             correction_entity_types=_DEFAULT_SCOPE,
         )
 
-        assert result == []
+        assert result == {"applied": [], "verdicts": []}
         called.assert_not_called()
 
     def test_both_loci_return_list_carries_locus_field(self, monkeypatch):
@@ -576,7 +633,7 @@ class TestAttributeLocus:
             correction_entity_types=_DEFAULT_SCOPE,
         )
 
-        loci = {r["locus"] for r in result}
+        loci = {r["locus"] for r in result["applied"]}
         assert loci == {"placeholder", "attribute"}
         assert reverse_mapping["City_1"] == "Frankfurt"
         assert entity.attributes["current_location"] == "Novatek Systems"

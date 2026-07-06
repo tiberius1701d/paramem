@@ -584,7 +584,7 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
     )
     raw_output = (local_extract or {}).get("raw_output") or ""
 
-    return _build_calibrate_response(
+    response = _build_calibrate_response(
         stage="extract",
         prompts=[
             {
@@ -609,6 +609,13 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
         supports_seed=True,
         phases=phase_records,
     )
+    # Debug artifact: the full result (parsed graph incl. diagnostics — e.g.
+    # entity_correction_verdicts, which carries apply-gate-REJECTED entity
+    # correction proposals that never reach graph.diagnostics["entity_corrections"]
+    # — plus phase records and raw output) so rejected proposals stay
+    # inspectable. Self-gated; no-op unless config.debug is on.
+    loop._debug_writer.on_calibrate_extract(response, session_id=req.session_id)
+    return response
 
 
 def calibrate_procedural(state: dict, req: CalibrateProceduralRequest) -> dict[str, Any]:

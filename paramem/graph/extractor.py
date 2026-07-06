@@ -2093,7 +2093,7 @@ def _sota_pipeline(
     # safely precedes the totality check below (placeholder keys are
     # untouched). See paramem.graph.entity_correction for the full contract.
     with phase_trace("entity_correction") as t:
-        applied = correct_entity_surfaces(
+        correction_result = correct_entity_surfaces(
             reverse_mapping,
             graph.entities,
             model,
@@ -2103,14 +2103,21 @@ def _sota_pipeline(
             model_alias=model_alias,
             seed=seed,
         )
+        applied = correction_result["applied"]
+        verdicts = correction_result["verdicts"]
         if applied:
             graph.diagnostics["entity_corrections"] = applied
-        t.set_parsed({"applied_count": len(applied)})
+        graph.diagnostics["entity_correction_verdicts"] = verdicts
+        t.set_parsed(
+            {"applied_count": len(applied), "rejected_count": len(verdicts) - len(applied)}
+        )
     if stop_phase == "entity_correction":
         # Calibration short-circuit: entity_correction completed; downstream
         # phases (verify, repair, sota_enrich, …) are skipped.  graph.relations
         # remains the local-extract output; the correction result lives in
-        # graph.diagnostics["entity_corrections"] / phases[entity_correction].
+        # graph.diagnostics["entity_corrections"] (applied only) /
+        # graph.diagnostics["entity_correction_verdicts"] (every evaluated
+        # target) / phases[entity_correction].
         return graph
 
     # Mapping-totality diagnostic.  The anonymization prompt requires

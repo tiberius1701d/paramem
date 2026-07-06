@@ -191,7 +191,7 @@ def correct_entity_surfaces(
     prompts_dir: str | None = None,
     model_alias: str | None = None,
     seed: int | None = None,
-) -> list[dict]:
+) -> dict[str, list[dict]]:
     """Correct misspelled real-world entity surfaces across two loci.
 
     Gathers correctable values from (a) ``reverse_mapping`` placeholder
@@ -240,17 +240,32 @@ def correct_entity_surfaces(
             is a strict no-op.
 
     Returns:
-        A list of applied-correction dicts, each carrying ``"locus"``
-        (``"placeholder"`` or ``"attribute"``), the locus-specific
-        provenance (``"placeholder"``/``"type"`` or ``"entity"``/``"key"``),
-        plus ``"kind"``, ``"before"``, ``"after"``. Empty when the stage is
-        disabled, no target is in scope, or every gathered target was
-        rejected by the gate or failed to parse.
+        ``{"applied": [...], "verdicts": [...]}``.
+
+        ``"applied"`` carries only the accepted corrections: each dict has
+        ``"locus"`` (``"placeholder"`` or ``"attribute"``), the
+        locus-specific provenance (``"placeholder"``/``"type"`` or
+        ``"entity"``/``"key"``), plus ``"kind"``, ``"before"``, ``"after"``.
+        Empty when the stage is disabled, no target is in scope, or every
+        gathered target was rejected by the gate or failed to parse.
+
+        ``"verdicts"`` carries one entry per evaluated target regardless of
+        gate outcome: the target's ``meta`` (``"locus"`` + locus-specific
+        provenance) merged with ``"kind"``, ``"is_known_entity"``,
+        ``"proposed"`` (the verdict's ``corrected`` value), ``"applied"``
+        (bool), and ``"reject_reason"`` — ``None`` when applied, else one
+        of ``"kind_not_correctable"``, ``"not_known_entity"``,
+        ``"empty_correction"``, ``"no_change"`` (the same four gate clauses
+        that drive the apply decision), or ``"parse_error"`` when
+        :func:`_verdict` raised. A target that fails to parse has no
+        ``"kind"``/``"is_known_entity"``/``"proposed"`` keys since no
+        verdict was produced. Empty (both lists) when the stage is
+        disabled or no target is in scope.
     """
     knob = frozenset(correction_entity_types or ())
     correctable_kinds = knob & _CORRECTABLE
     if not correctable_kinds:
-        return []
+        return {"applied": [], "verdicts": []}
     attr_on = "attributes" in knob
 
     targets: list[_Target] = []
@@ -292,9 +307,10 @@ def correct_entity_surfaces(
                 )
 
     if not targets:
-        return []
+        return {"applied": [], "verdicts": []}
 
     applied: list[dict] = []
+    verdicts: list[dict] = []
     with vram_scope("entity_correction"):
         for target in targets:
             try:
@@ -314,13 +330,20 @@ def correct_entity_surfaces(
                     target.value,
                     exc,
                 )
+                verdicts.append({**target.meta, "applied": False, "reject_reason": "parse_error"})
                 continue
-            if (
-                verdict["kind"] in correctable_kinds
-                and verdict["is_known_entity"]
-                and verdict["corrected"]
-                and verdict["corrected"] != target.value
-            ):
+            if verdict["kind"] not in correctable_kinds:
+                reject_reason = "kind_not_correctable"
+            elif not verdict["is_known_entity"]:
+                reject_reason = "not_known_entity"
+            elif not verdict["corrected"]:
+                reject_reason = "empty_correction"
+            elif verdict["corrected"] == target.value:
+                reject_reason = "no_change"
+            else:
+                reject_reason = None
+            is_applied = reject_reason is None
+            if is_applied:
                 target.write_back(verdict["corrected"])
                 applied.append(
                     {
@@ -330,4 +353,14 @@ def correct_entity_surfaces(
                         "after": verdict["corrected"],
                     }
                 )
-    return applied
+            verdicts.append(
+                {
+                    **target.meta,
+                    "kind": verdict["kind"],
+                    "is_known_entity": verdict["is_known_entity"],
+                    "proposed": verdict["corrected"],
+                    "applied": is_applied,
+                    "reject_reason": reject_reason,
+                }
+            )
+    return {"applied": applied, "verdicts": verdicts}

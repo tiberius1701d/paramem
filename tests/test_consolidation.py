@@ -13462,6 +13462,108 @@ class TestNormalizationDebugSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# Debug snapshot — on_calibrate_extract writes calibrate_extract_<sid>_<ts>.json
+# ---------------------------------------------------------------------------
+
+
+class TestCalibrateExtractDebugSnapshot:
+    """on_calibrate_extract routes the full ``/calibrate/extract`` result
+    payload through DebugSnapshotWriter, gated identically to on_normalization.
+
+    Tests:
+    - CE-1: save_cycle_snapshots=True -> calibrate_extract_<sid>_<ts>.json written
+            with the payload verbatim.
+    - CE-2: save_cycle_snapshots=False -> no file written (self-gated no-op).
+    """
+
+    @staticmethod
+    def _make_debug_loop(tmp_path, *, save_cycle_snapshots: bool):
+        """Build a ConsolidationLoop with debug snapshot writing enabled/disabled."""
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.debug_snapshot import DebugSnapshotWriter
+        from paramem.utils.config import ConsolidationConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.config = ConsolidationConfig(indexed_key_replay=True)
+        loop.save_cycle_snapshots = save_cycle_snapshots
+        loop._current_interim_stamp = None  # type: ignore[assignment]
+        loop.cycle_count = 0
+        loop.run_id = "test_run"
+
+        if save_cycle_snapshots:
+            debug_base = tmp_path / "debug"
+            debug_base.mkdir()
+            loop._debug_base = debug_base
+            loop.snapshot_dir = tmp_path / "snapshot"
+            loop.snapshot_dir.mkdir()
+        else:
+            loop._debug_base = None
+            loop.snapshot_dir = None
+
+        loop._debug_writer = DebugSnapshotWriter(loop)
+        return loop
+
+    def test_calibrate_extract_snapshot_written_when_debug_enabled(self, tmp_path):
+        """CE-1: save_cycle_snapshots=True -> file written with the payload verbatim."""
+        import json
+
+        loop = self._make_debug_loop(tmp_path, save_cycle_snapshots=True)
+
+        payload = {
+            "stage": "extract",
+            "raw_output": "raw model output",
+            "parsed": {"diagnostics": {"entity_correction_verdicts": [{"applied": False}]}},
+            "phases": [{"name": "local_extract"}],
+        }
+
+        loop._debug_writer.on_calibrate_extract(payload, session_id="calib")
+
+        matches = list(tmp_path.rglob("calibrate_extract_calib_*.json"))
+        assert matches, "calibrate_extract_<sid>_<ts>.json must be written when debug is enabled"
+        assert json.loads(matches[0].read_text()) == payload
+
+    def test_calibrate_extract_snapshot_not_written_when_debug_disabled(self, tmp_path):
+        """CE-2: save_cycle_snapshots=False -> no file written (self-gated no-op)."""
+        loop = self._make_debug_loop(tmp_path, save_cycle_snapshots=False)
+
+        loop._debug_writer.on_calibrate_extract({"stage": "extract"}, session_id="calib")
+
+        matches = list(tmp_path.rglob("calibrate_extract_*.json"))
+        assert not matches, "calibrate_extract snapshot must NOT be written when debug is disabled"
+
+
+# ---------------------------------------------------------------------------
+# _safe_path_component — sanitizes session_id used as a path component
+# ---------------------------------------------------------------------------
+
+
+class TestSafePathComponent:
+    """``_safe_path_component`` maps non alnum/-/_ characters to ``_``.
+
+    Guards the ``on_calibrate_extract`` filename and ``on_session_extracted``
+    directory-component write sites against a request-controlled
+    ``session_id`` containing path separators or ``..``.
+    """
+
+    def test_traversal_attempt_sanitized(self):
+        from paramem.training.debug_snapshot import _safe_path_component
+
+        assert "/" not in _safe_path_component("../etc")
+        assert ".." not in _safe_path_component("../etc")
+
+    def test_path_separator_sanitized(self):
+        from paramem.training.debug_snapshot import _safe_path_component
+
+        assert _safe_path_component("a/b") == "a_b"
+
+    def test_normal_uuid_passes_through_unchanged(self):
+        from paramem.training.debug_snapshot import _safe_path_component
+
+        uuid = "f3c2c91e-c000"
+        assert _safe_path_component(uuid) == uuid
+
+
+# ---------------------------------------------------------------------------
 # Level gating — normalize/enrich booleans for refinement_normalization / sota_enabled
 # ---------------------------------------------------------------------------
 

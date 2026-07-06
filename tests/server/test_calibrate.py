@@ -163,6 +163,35 @@ class TestCalibrateExtract:
             calibrate_extract(state, req)
         assert exc.value.status_code == 503
 
+    def test_debug_writer_invoked_with_response_and_session_id(self):
+        """calibrate_extract routes its assembled response through the debug hook.
+
+        Regression guard for the call site at calibrate.py's
+        ``loop._debug_writer.on_calibrate_extract(response, session_id=...)``
+        line: DebugSnapshotWriter.on_calibrate_extract's own file-write
+        behaviour is covered by
+        tests/test_consolidation.py::TestCalibrateExtractDebugSnapshot, but
+        nothing previously asserted that calibrate_extract actually calls it.
+        """
+        from paramem.graph.schema import SessionGraph
+
+        state = _state_enabled()
+        graph = SessionGraph(session_id="calib", timestamp="2026-01-01T00:00:00Z")
+        state["consolidation_loop"].extraction.run.return_value = graph
+        req = CalibrateExtractRequest(
+            transcript="hello there",
+            speaker_id="speaker0",
+            source_type="transcript",
+        )
+
+        result = calibrate_extract(state, req)
+
+        writer = state["consolidation_loop"]._debug_writer
+        assert writer.on_calibrate_extract.call_count == 1
+        call = writer.on_calibrate_extract.call_args
+        assert call.args[0] == result
+        assert call.kwargs["session_id"] == req.session_id
+
 
 class TestCalibrateProceduralRequest:
     """Schema-level tests for CalibrateProceduralRequest (no GPU)."""
