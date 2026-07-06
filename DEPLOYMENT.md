@@ -539,7 +539,7 @@ paramem mint-user-token [SPEAKER_ID] \
     [--force-admin]
 ```
 
-- `SPEAKER_ID` — the speaker this token authenticates (e.g. `Speaker0`). Required unless `--unattributed` is given.
+- `SPEAKER_ID` — the speaker this token authenticates (e.g. `speaker0`). Required unless `--unattributed` is given.
 - `--scope` — token capability: `chat` (conversational endpoints `/chat`, `/voice`, `/push/*`, `/status` only — the secure default) or `admin` (all endpoints, including operational ones like `/gpu/*`, `/consolidate`, `/backup/*`). Default: `chat`.
 - `--unattributed` — mint a token with no bound speaker (for shared devices that identify speakers by voice embedding). Cannot be combined with a positional `SPEAKER_ID`.
 - `--force-admin` — required when combining `--scope admin` with `--unattributed`. Prints a warning: an unattributed admin token cannot be revoked by speaker; use `revoke-user-token --label` to revoke it.
@@ -551,7 +551,7 @@ paramem mint-user-token [SPEAKER_ID] \
 The command prints a terminal QR encoding a deep-link URL (`https://<host>/app#token=<t>&url=<encoded-onboard-url>`) plus a text fallback, then exits. The QR is scannable with the phone's native camera — no app is needed. The plaintext token is never written to any log file. Example:
 
 ```bash
-paramem mint-user-token Speaker0 \
+paramem mint-user-token speaker0 \
     --label phone \
     --onboard-url "https://<your-host>.<your-tailnet>.ts.net"
 ```
@@ -609,7 +609,7 @@ This is the flow for adding a household member (e.g. "Alice's iPhone") to an exi
 **Admin side (run once per device)**
 
 ```bash
-paramem mint-user-token Speaker1 \
+paramem mint-user-token speaker1 \
     --label "Alice iPhone" \
     --onboard-url "https://<your-host>.<your-tailnet>.ts.net" \
     --png /tmp/alice-iphone-qr.png
@@ -634,13 +634,13 @@ Use `paramem revoke-user-token` to revoke tokens without manually editing the en
 paramem revoke-user-token --list --config configs/server.yaml
 
 # Revoke all tokens for a speaker (e.g. lost device, access change):
-paramem revoke-user-token --speaker Speaker0 --config configs/server.yaml
+paramem revoke-user-token --speaker speaker0 --config configs/server.yaml
 
 # Revoke by device label (e.g. revoke a specific device only):
 paramem revoke-user-token --label "phone" --config configs/server.yaml
 
 # Skip the confirmation prompt in scripts:
-paramem revoke-user-token --speaker Speaker0 --yes --config configs/server.yaml
+paramem revoke-user-token --speaker speaker0 --yes --config configs/server.yaml
 ```
 
 The command reads and writes `user_tokens.json` via the same encrypted-store path as `mint-user-token` — no manual decrypt/re-encrypt step is needed. If `PARAMEM_DAILY_PASSPHRASE` is set and the daily key is loaded (Security ON), the store is read and written as an age envelope automatically.
@@ -657,7 +657,7 @@ Revoking a token removes a member's **access**; `POST /speaker/forget` removes t
 curl -sS -X POST http://localhost:8420/speaker/forget \
   -H "Authorization: Bearer $PARAMEM_API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"speaker_id": "Speaker0"}'
+  -d '{"speaker_id": "speaker0"}'
 # → {"removed_speaker": true, "stale_keys": ["graph12", ...], "discarded_sessions": ["conv-abc"]}
 ```
 
@@ -842,7 +842,7 @@ A custom conversation agent for Home Assistant is included in `custom_components
 ParaMem includes a local voice pipeline for privacy-first operation:
 
 - **Local STT:** Whisper distil-large-v3 on GPU via Wyoming protocol (port 10300). CPU fallback: distil-small.en.
-- **Speaker identification:** WeSpeaker (`pyannote/wespeaker-voxceleb-resnet34-LM`, 256-dim) voice embeddings via pyannote-audio. Multi-embedding profiles (up to 50 per speaker) with L2-normalized centroid matching for cross-device robustness. Auto-enrichment on confirmed matches. Deferred identity binding keeps anonymous utterances bound to a BPE-stable `Speaker{N}` placeholder until the speaker discloses a name, after which the graph is retro-claimed without a rewrite at training time (name resolves at render).
+- **Speaker identification:** WeSpeaker (`pyannote/wespeaker-voxceleb-resnet34-LM`, 256-dim) voice embeddings via pyannote-audio. Multi-embedding profiles (up to 50 per speaker) with L2-normalized centroid matching for cross-device robustness. Auto-enrichment on confirmed matches. Deferred identity binding keeps anonymous utterances bound to a BPE-stable `speaker{N}` placeholder until the speaker discloses a name, after which the graph is retro-claimed without a rewrite at training time (name resolves at render).
 - **Multilingual TTS:** Piper voices per language with MMS-TTS fallback; language detection on the response text, speaker binding so each speaker's preferred voice persists, routed to media players via HA.
 - **Anti-confabulation voice prompt:** a separate system prompt at the voice turn tells the model not to invent facts about the speaker when the parametric memory has nothing to say, and to fall through to the SOTA path cleanly.
 - **Mobile PWA voice path:** The PWA (served at `/app` when `mobile_pwa.enabled: true`) supports push-to-talk voice in addition to text. The browser records audio and POSTs it to `POST /voice` (raw audio blob; `audio/mp4`, `audio/webm`, or `audio/L16`; 25 MB hard cap). The server decodes to 16 kHz int16 mono, transcribes via Whisper, and returns `{transcript, reply, audio, audio_format, follow_up?}` — where `audio` is a base64-encoded WAV of the synthesised reply voiced through the same per-language TTS voices as the HA satellites (e.g. Kokoro `af_heart` for English), or `""` when TTS is unavailable (the PWA falls back to text display). Routing goes through the same `_run_chat_turn` path as `POST /chat`. **Token-type selector:** a per-user token resolves identity from the token (no embedding computed, cheap); a shared token triggers voice-embedding identification and the same enrollment/greeting/name-disclosure path as `POST /chat`, with a fresh per-utterance conversation_id on each push-to-talk press. Deployment: personal device → issue a per-user token; shared device → issue the shared token with voice enrollment. Error statuses: `404` when `mobile_pwa.enabled` is false, `503` when STT is not loaded (cloud-only mode), `413` for an oversized payload, `400` for an undecodable audio body.

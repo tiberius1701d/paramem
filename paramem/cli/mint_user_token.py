@@ -64,7 +64,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         nargs="?",
         default=None,
         help=(
-            "Speaker this token authenticates (e.g. Speaker0).  "
+            "Speaker this token authenticates (e.g. speaker0).  "
             "Required unless --unattributed is given."
         ),
     )

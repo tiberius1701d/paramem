@@ -20,14 +20,14 @@ Usage::
     # Full pipeline on the resume's chunk 0, baseline + candidate compared:
     python scripts/dev/calibrate_prompts.py \\
         --input ingest/resume.pdf --chunk 0 \\
-        --speaker Alex --speaker-id Speaker0 \\
+        --speaker Alex --speaker-id speaker0 \\
         --stages extract,anonymize,enrich,plausibility \\
         --baseline auto --prompt-prefix calib_
 
     # Variance probe — 5 seeds, just the extract stage:
     python scripts/dev/calibrate_prompts.py \\
         --input ingest/resume.pdf --chunk 0 \\
-        --speaker-id Speaker0 --stages extract \\
+        --speaker-id speaker0 --stages extract \\
         --seeds 42,7,1337,2024,99
 
     # Re-iterate on the enrichment prompt only, seeded from a prior dump:
@@ -579,7 +579,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--source-type", choices=["transcript", "document"], default=None)
     parser.add_argument("--speaker", default="Alex")
-    parser.add_argument("--speaker-id", default="Speaker0")
+    parser.add_argument("--speaker-id", default="speaker0")
     parser.add_argument(
         "--stages",
         default="extract,anonymize,enrich,plausibility",

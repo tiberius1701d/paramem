@@ -13,9 +13,9 @@ class Entity(BaseModel):
     """A typed entity extracted from a session transcript.
 
     When the entity represents a speaker, ``speaker_id`` is populated with
-    the speaker store's stable system ID (e.g. ``Speaker0``) and that ID is
+    the speaker store's stable system ID (e.g. ``speaker0``) and that ID is
     the canonical graph identity — ``name`` is a mutable display attribute
-    that can change (anonymous "Speaker0" → disclosed "Alex") without
+    that can change (anonymous "speaker0" → disclosed "Alex") without
     re-keying the graph. For non-speaker entities (places, organisations,
     concepts), ``speaker_id`` stays ``None`` and identity is ``name``.
     """
@@ -37,7 +37,7 @@ class Entity(BaseModel):
     speaker_id: str | None = Field(
         default=None,
         description=(
-            "Speaker store ID (e.g. 'Speaker0'). Populated iff this entity "
+            "Speaker store ID (e.g. 'speaker0'). Populated iff this entity "
             "represents a speaker. When set, ``speaker_id`` is the canonical "
             "graph identity; ``name`` is a mutable display attribute."
         ),
@@ -49,7 +49,7 @@ class Relation(BaseModel):
 
     Every relation carries a ``speaker_id`` recording which speaker
     contributed the fact (provenance). For unknown speakers, the speaker
-    store's anonymous group ID (``Speaker0``, ``Speaker1``, …) is used —
+    store's anonymous group ID (``speaker0``, ``speaker1``, …) is used —
     there is never an absent ``speaker_id``. The router and recall layers
     read this field to scope retrieval per speaker.
 
@@ -71,7 +71,7 @@ class Relation(BaseModel):
         description=(
             "Speaker store ID of the speaker who contributed this fact. "
             "Mandatory; for unknown speakers this is the anonymous-group ID "
-            "from SpeakerStore.register_anonymous (e.g. 'Speaker7')."
+            "from SpeakerStore.register_anonymous (e.g. 'speaker7')."
         ),
     )
     indexed_key: str | None = Field(

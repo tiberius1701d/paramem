@@ -53,7 +53,7 @@ The core mechanism is **indexed key retrieval**: each fact gets a unique key (`g
 
 - **Scale:** 550/550 keys at 100% on Mistral 7B — see [Results](#results) and Findings.
 - **Live deployment:** Running as a Home Assistant conversation agent on WSL2 + RTX 5070, with local Whisper STT, WeSpeaker speaker identification (via pyannote-audio), Piper / MMS-TTS, and tri-path routing (parametric memory → HA tools → SOTA cloud).
-- **Pipeline:** privacy-aware extraction (local extract → anonymize → SOTA enrichment with explicit binding → de-anonymize via state-machine substitution → plausibility), graph-level SOTA enrichment at full consolidation, anti-confabulation voice prompt, deferred identity binding with BPE-stable `Speaker{N}` placeholders.
+- **Pipeline:** privacy-aware extraction (local extract → anonymize → SOTA enrichment with explicit binding → de-anonymize via state-machine substitution → plausibility), graph-level SOTA enrichment at full consolidation, anti-confabulation voice prompt, deferred identity binding with BPE-stable `speaker{N}` placeholders.
 - **Crash safety:** epoch-level resume with SHA-256 fingerprint validation, age-encrypted session snapshots under Security-ON, systemd timer with `Persistent=true`.
 
 ## Architecture

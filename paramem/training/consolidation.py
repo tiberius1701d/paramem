@@ -2652,7 +2652,7 @@ class ConsolidationLoop:
                 # unified by canonical node-keying, so no merge needed) or
                 # DIFFERENT speakers (must never merge — Jaro-Winkler treats the
                 # distinguishing digit as a typo and would incorrectly merge
-                # Speaker0/Speaker1).  Skip unconditionally: the pair is always
+                # speaker0/speaker1).  Skip unconditionally: the pair is always
                 # either redundant or catastrophically wrong.
                 # Note: the ``keep_canon == drop_canon`` post-resolution check
                 # handles the casing-only case (Speaker0/speaker0), but does NOT

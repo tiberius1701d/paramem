@@ -396,7 +396,7 @@ class SpeakerStore:
                     return existing.speaker_id
                 # Named profile matched:
                 #   high-confidence → reject (duplicate voice under a different name)
-                #   tentative       → fall through to mint a new Speaker{N} (protect
+                #   tentative       → fall through to mint a new speaker{N} (protect
                 #                     the named centroid from ambiguous-voice contamination)
                 if not existing.tentative:
                     logger.warning(
@@ -406,7 +406,7 @@ class SpeakerStore:
                         existing.confidence,
                     )
                     return None
-                # tentative + named → fall through to mint a fresh Speaker{N}.
+                # tentative + named → fall through to mint a fresh speaker{N}.
 
             speaker_id = self._mint_anon_speaker_id()
             self._profiles[speaker_id] = {
@@ -436,7 +436,7 @@ class SpeakerStore:
         Algorithm:
         1. Call ``match(embedding)``: if a high-confidence (non-tentative) hit exists,
            return that existing speaker_id — handles cross-session centroid recognition.
-        2. Otherwise allocate ``Speaker{N}`` (globally monotonic counter), create the
+        2. Otherwise allocate ``speaker{N}`` (globally monotonic counter), create the
            profile with ``enroll_method="anonymous_voice"``, increment the counter,
            and persist.
 
@@ -459,7 +459,7 @@ class SpeakerStore:
         # Step 1: check if the voice already has a profile.
         # Tentative matches against anonymous profiles are reused to avoid
         # split-identity across sessions with slightly varying voice embeddings.
-        # Tentative matches against named profiles allocate a new Speaker{N} to
+        # Tentative matches against named profiles allocate a new speaker{N} to
         # protect named-profile centroids from ambiguous-voice contamination.
         existing = self.match(embedding)
         if existing.speaker_id is not None:
@@ -537,7 +537,7 @@ class SpeakerStore:
           ``name`` field equals the ``speaker_id`` — an internal token, not a
           salutation).  Callers constructing user-facing text (greeting prefix,
           system-prompt "You are speaking with X" strings, extraction context)
-          must never pin the opaque ``Speaker{N}`` token as a display name;
+          must never pin the opaque ``speaker{N}`` token as a display name;
           returning ``None`` lets them suppress the token cleanly.
 
         Unlike ``get_name``, this method never raises — it is safe to use as a

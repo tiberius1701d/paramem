@@ -31,9 +31,11 @@ import unicodedata
 # in the ``str.split()`` call so no special entry for multiple spaces is needed.
 _SEP = str.maketrans({"_": " ", "-": " "})
 
-# Compiled once: matches the system speaker-id format "Speaker{N}" where N is
-# one or more decimal digits.  Case-insensitive so "speaker0" (casefolded node
-# key) also passes the structural test.
+# Compiled once: matches the system speaker-id format "speaker{N}" (the
+# canonical lowercase form) where N is one or more decimal digits.
+# Case-insensitive so a residual cased form like "Speaker0" also passes the
+# structural test — the regex tolerates the cased form as input; it is never
+# the canonical form.
 _SPEAKER_ID_RE = re.compile(r"^[Ss]peaker\d+$")
 
 

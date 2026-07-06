@@ -458,7 +458,7 @@ def build_speaker_context(
 
     Loads the ``EXTRACTION-DIRECTIVE`` section from
     ``configs/prompts/speaker_directive.txt`` and slots in
-    ``{speaker_id}`` (the stable system id, e.g. ``"Speaker0"``) and
+    ``{speaker_id}`` (the stable system id, e.g. ``"speaker0"``) and
     ``{speaker_name}`` (the display name, e.g. ``"Alice"``).
 
     Returns an empty string when ``speaker_id`` is absent or empty —
@@ -602,10 +602,10 @@ def extract_procedural_graph(
         speaker_name: Display name of the speaker (e.g. from voice enrollment).
             Passed to ``build_speaker_context`` as comprehension context so the
             model can map self-references in the transcript onto the stable
-            ``speaker_id``.  The model uses the ``Speaker{N}`` id — not the
+            ``speaker_id``.  The model uses the ``speaker{N}`` id — not the
             display name — as the subject of every extracted preference.
             Mirrors the same parameter on ``extract_graph``.
-        speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
+        speaker_id: Speaker store ID (e.g. ``"speaker0"``). Stamped onto every
             ``Relation`` extracted in this pass as provenance. Required —
             callers must always supply a real speaker ID.
         seed: Optional RNG seed forwarded to :func:`generate_answer`.  At the
@@ -782,7 +782,7 @@ def extract_graph(
             ``None`` or empty disables the stage entirely — there is no
             implicit default scope; production always threads the
             configured value.
-        speaker_id: Speaker store ID (e.g. ``"Speaker0"``). Stamped onto every
+        speaker_id: Speaker store ID (e.g. ``"speaker0"``). Stamped onto every
             ``Relation`` produced by this extraction pass as provenance.
             Required — callers must always supply the session's speaker ID.
         system_prompt_filename: Filename of the system prompt within the prompts
@@ -1163,7 +1163,7 @@ def _generate_extraction(
     Narrator binding is achieved via the ``{speaker_context}`` placeholder
     in the **user** template (``extraction.txt``), populated by
     :func:`build_speaker_context`.  The directive pins the stable
-    ``speaker_id`` (e.g. ``"Speaker0"``) as the subject of every extracted
+    ``speaker_id`` (e.g. ``"speaker0"``) as the subject of every extracted
     speaker-fact, with the display ``speaker_name`` supplied as comprehension
     context so the model maps self-references onto the id.
 
@@ -1237,14 +1237,15 @@ def _parse_extraction(
     rewrapped here so downstream normalization can proceed.
 
     After schema validation, :func:`_stamp_speaker_entity` is called to stamp
-    ``speaker_id`` on every entity whose name is a speaker id (``Speaker{N}``
-    format).  The session speaker receives the authoritative cased ``speaker_id``
-    value; other speaker-id entities receive their own name as ``speaker_id``.
+    ``speaker_id`` on every entity whose name is a speaker id (``speaker{N}``
+    format).  The session speaker receives the authoritative lowercase
+    ``speaker_id`` value; other speaker-id entities receive their own name as
+    ``speaker_id``.
 
     Args:
         raw_output: Raw model output string.
         session_id: Session identifier for the graph.
-        speaker_id: Speaker store ID (e.g. ``"Speaker0"``).  Stamped onto
+        speaker_id: Speaker store ID (e.g. ``"speaker0"``).  Stamped onto
             every relation as provenance and used to identify the session
             speaker entity.  Required — callers must always supply a real id.
         speaker_name: Display name of the speaker (e.g. ``"Tobias"``).  Used
@@ -2848,7 +2849,7 @@ def _build_anonymization_mapping(
     if speaker_name and speaker_name not in mapping:
         if speaker_entity_placeholder is not None:
             # Speaker is in graph.entities but under a different
-            # surface form (e.g. anonymous "Speaker0" → display
+            # surface form (e.g. anonymous "speaker0" → display
             # "Alex").  Reuse that placeholder so every form maps
             # consistently.  ``reverse`` already points the placeholder
             # at the canonical entity name from the entity-mint pass; do

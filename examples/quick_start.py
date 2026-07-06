@@ -229,7 +229,7 @@ _ABSTENTION_MARKERS: frozenset[str] = frozenset(
 
 # 256-dim L2-normalised unit vector (first component = 1.0, rest = 0.0).
 # Sent with every /chat call so the server registers a stable anonymous
-# Speaker{N} profile and attributes all turns to the same speaker_id.
+# speaker{N} profile and attributes all turns to the same speaker_id.
 _SPEAKER_EMBEDDING: list[float] = [1.0] + [0.0] * 255
 
 # Conversation ID used for all injected turns — keeps them in one session

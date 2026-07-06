@@ -3289,7 +3289,7 @@ wall-clock interruptions. Listed as future work.
 ## Inference Latency: preload_cache On vs Off (2026-06-03)
 
 **Server:** Qwen3-4B QLoRA 4-bit, `mode=local`, 239 active keys
-(episodic 137 / procedural 83 / episodic_interim 19), single speaker (`Speaker0`).
+(episodic 137 / procedural 83 / episodic_interim 19), single speaker (`speaker0`).
 **Endpoint:** `POST /debug/probe` — same `handle_chat → _probe_and_reason → memory_store.probe`
 path as `/chat`.
 **Latency:** wall-clock, request sent to full response received (`time.perf_counter`).
