@@ -200,6 +200,10 @@ class TestDevicePlacement:
         _verify_device_placement(model, config)
 
     @pytest.mark.gpu
+    @pytest.mark.skipif(
+        "not config.getoption('--gpu', default=False)",
+        reason="GPU tests require --gpu flag",
+    )
     def test_all_gpu_params_pass(self):
         from paramem.models.loader import _verify_device_placement
 

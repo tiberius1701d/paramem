@@ -43,6 +43,11 @@ if not _gpu_explicitly_requested(sys.argv):
     # libcuda (the shared-lib mapping is unavoidable; the allocation/handle
     # acquisition is what actually contends).
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    # ``CUDA_VISIBLE_DEVICES=""`` hides the CUDA device but not the GPU
+    # thermal sensor — wait_for_cooldown reads temperature via nvidia-smi,
+    # which ignores CUDA visibility. Disable the cooldown gate outright so a
+    # non-gpu run never blocks on (or even queries) the real GPU sensor.
+    os.environ.setdefault("PARAMEM_COOLDOWN_DISABLED", "1")
 
 # ``_api_token`` in app.py is captured at import time (module-level
 # ``load_token_from_env()``).  Some test modules (e.g.

@@ -20,6 +20,8 @@ from __future__ import annotations
 import inspect
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import paramem.server.app as app_module
 from paramem.server.app import _build_store_contents
 
@@ -64,6 +66,15 @@ def _inject_config(config, *, model=None, tokenizer=None):
 
 class TestWaitForCooldown:
     """Unit tests for wait_for_cooldown — all CPU-only via _gpu_temp patching."""
+
+    @pytest.fixture(autouse=True)
+    def _real_gate(self, monkeypatch):
+        """These tests call the real ``wait_for_cooldown`` and assert its
+        polling/return behaviour, so the conftest-wide
+        ``PARAMEM_COOLDOWN_DISABLED=1`` (set for non-gpu test runs) must not
+        short-circuit it here.
+        """
+        monkeypatch.delenv("PARAMEM_COOLDOWN_DISABLED", raising=False)
 
     def test_hot_to_cool_sequence(self):
         """Hot→cool sequence: polls until temp drops to or below threshold.

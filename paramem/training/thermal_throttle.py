@@ -20,6 +20,7 @@ overnight runs are unaffected by construction. Live-server-only.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -136,6 +137,9 @@ def wait_for_cooldown(
 
     No-op (returns immediately) when:
 
+    * ``PARAMEM_COOLDOWN_DISABLED=1`` is set in the environment (explicit
+      gate-disable knob — also usable at runtime on a host with a broken GPU
+      sensor, and set by ``tests/conftest.py`` for non-gpu test runs).
     * ``threshold_c <= 0`` (gate disabled).
     * ``_gpu_temp()`` returns ``None`` (sensor unavailable — never block GPU
       work on a missing sensor; silently degrades to today's no-gate
@@ -153,6 +157,8 @@ def wait_for_cooldown(
         label: Optional site label for log messages (e.g. ``"preload"``,
             ``"fold"``, ``"inference"``).
     """
+    if os.environ.get("PARAMEM_COOLDOWN_DISABLED") == "1":
+        return None
     if threshold_c <= 0:
         return None
     temp = _gpu_temp()
