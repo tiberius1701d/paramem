@@ -371,7 +371,7 @@ class TestErrorPaths:
         """Exit 1 with a clear error when config file is not found."""
         missing_cfg = tmp_path / "nonexistent.yaml"
 
-        rc = revoke_user_token.run(_make_args(missing_cfg, speaker="Speaker0"))
+        rc = revoke_user_token.run(_make_args(missing_cfg, speaker="speaker0"))
 
         assert rc == 1
         err = capsys.readouterr().err
@@ -424,9 +424,9 @@ class TestCliRegistration:
         from paramem.cli.main import _build_parser
 
         parser = _build_parser()
-        args = parser.parse_args(["revoke-user-token", "--speaker", "Speaker0"])
+        args = parser.parse_args(["revoke-user-token", "--speaker", "speaker0"])
         assert args.command == "revoke-user-token"
-        assert args.speaker == "Speaker0"
+        assert args.speaker == "speaker0"
 
     def test_label_flag_accepted(self) -> None:
         """--label flag is accepted by the parser."""
@@ -449,7 +449,7 @@ class TestCliRegistration:
         from paramem.cli.main import _build_parser
 
         parser = _build_parser()
-        args = parser.parse_args(["revoke-user-token", "--speaker", "Speaker0", "--yes"])
+        args = parser.parse_args(["revoke-user-token", "--speaker", "speaker0", "--yes"])
         assert args.yes is True
 
     def test_config_flag_accepted(self) -> None:
@@ -475,4 +475,4 @@ class TestCliRegistration:
 
         parser = _build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["revoke-user-token", "--speaker", "Speaker0", "--label", "phone"])
+            parser.parse_args(["revoke-user-token", "--speaker", "speaker0", "--label", "phone"])

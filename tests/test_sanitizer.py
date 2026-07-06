@@ -55,7 +55,7 @@ class TestPersonalEntityDetection:
         findings = check_personal_content(
             "What time does my dentist's office open?",
             known_entities={"dr_smith"},  # the dentist isn't a known entity
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         assert "personal_entity" not in findings
         # First-person + speaker_id — first_person_personal fires
@@ -178,14 +178,14 @@ class TestFirstPersonResolution:
     def test_question_with_speaker_flags_first_person_personal(self):
         findings = check_personal_content(
             "Where do I live?",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         assert "first_person_personal" in findings
 
     def test_statement_with_speaker_flags_first_person_personal(self):
         findings = check_personal_content(
             "I live in Kelkham.",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         assert "first_person_personal" in findings
 
@@ -197,7 +197,7 @@ class TestFirstPersonResolution:
     def test_no_first_person_no_finding(self):
         findings = check_personal_content(
             "What's the capital of France?",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         assert findings == []
 
@@ -222,7 +222,7 @@ class TestFirstPersonResolution:
         ):
             findings = check_personal_content(
                 "Wo wohne ich?",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 personal_referent_config=cfg,
             )
         assert "first_person_personal" in findings
@@ -244,7 +244,7 @@ class TestFirstPersonResolution:
         ):
             findings = check_personal_content(
                 "I read that the Eiffel Tower was built in 1889.",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 personal_referent_config=cfg,
             )
         assert "first_person_personal" not in findings
@@ -265,7 +265,7 @@ class TestFirstPersonResolution:
         ):
             findings = check_personal_content(
                 "Where do I live?",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 personal_referent_config=cfg,
             )
         assert "first_person_personal" in findings
@@ -274,7 +274,7 @@ class TestFirstPersonResolution:
         # "my" appears mid-sentence, not first word.
         findings = check_personal_content(
             "Tell me what's on my schedule today.",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         assert "first_person_personal" in findings
 
@@ -289,7 +289,7 @@ class TestSanitizeForCloud:
         query, findings = sanitize_for_cloud(
             "Where do I live?",
             mode="off",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         assert query == "Where do I live?"
         assert findings == []
@@ -298,7 +298,7 @@ class TestSanitizeForCloud:
         query, findings = sanitize_for_cloud(
             "Where do I live?",
             mode="warn",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         assert query == "Where do I live?"
         assert "first_person_personal" in findings
@@ -307,7 +307,7 @@ class TestSanitizeForCloud:
         query, findings = sanitize_for_cloud(
             "Where do I live?",
             mode="block",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
         assert query is None
         assert "first_person_personal" in findings
@@ -325,7 +325,7 @@ class TestSanitizeForCloud:
         query, findings = sanitize_for_cloud(
             "What's the weather today?",
             mode="block",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             known_entities={"pat"},
         )
         assert query == "What's the weather today?"
@@ -336,7 +336,7 @@ class TestSanitizeForCloud:
             query, findings = sanitize_for_cloud(
                 "Turn on the kitchen light",
                 mode=mode,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 known_entities={"pat"},
             )
             assert query == "Turn on the kitchen light"
@@ -435,7 +435,7 @@ class TestM3SpeakerDisplayNameCoverage:
     """M3 coverage: the speaker's display name must be flagged as a personal
     referent even when it is not a registry subject.
 
-    Under the id-as-subject refactor (step 8+) the registry holds ``Speaker0``
+    Under the id-as-subject refactor (step 8+) the registry holds ``speaker0``
     as the subject rather than ``"Tobias"``.  inference.py::handle_chat now
     explicitly adds the resolved ``speaker`` display name to ``known_entities``
     so the sanitizer still catches queries that mention the real name.
@@ -516,7 +516,7 @@ class TestM3SpeakerDisplayNameCoverage:
                 text="What does Tobias do for work?",
                 conversation_id="conv1",
                 speaker="Tobias",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 history=None,
                 model=mock_model,
                 tokenizer=mock_tokenizer,
@@ -576,7 +576,7 @@ class TestM3SpeakerDisplayNameCoverage:
                 text="Hello there.",
                 conversation_id="conv2",
                 speaker=None,  # anonymous / not resolved
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 history=None,
                 model=mock_model,
                 tokenizer=mock_tokenizer,

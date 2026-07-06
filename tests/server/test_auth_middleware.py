@@ -103,7 +103,7 @@ class TestPerUserTokenHeader:
         """A valid per-user token in Authorization header → 200."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        token = store.mint("Speaker0", "Test")
+        token = store.mint("speaker0", "Test")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
@@ -128,7 +128,7 @@ class TestPerUserTokenHeader:
         """An invalid bearer token is rejected with 401."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Test")  # populate store so auth is enabled
+        store.mint("speaker0", "Test")  # populate store so auth is enabled
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
@@ -147,9 +147,9 @@ class TestPerUserTokenHeader:
         """
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        token = store.mint("Speaker0", "Test")
+        token = store.mint("speaker0", "Test")
         # Keep a second active token (verifies per-token revocation, not full drain).
-        store.mint("Speaker0", "Device B")
+        store.mint("speaker0", "Device B")
         store.revoke_token(token)
 
         app = _make_app(user_token_getter=lambda: store)
@@ -167,7 +167,7 @@ class TestPerUserTokenHeader:
         """
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        token = store.mint("Speaker0", "Device")
+        token = store.mint("speaker0", "Device")
         store.revoke_token(token)  # last (and only) token revoked
 
         assert not store.has_active_tokens()  # store is empty
@@ -187,7 +187,7 @@ class TestPerUserTokenHeader:
         """No token presented when store has active tokens → 401."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Test")
+        store.mint("speaker0", "Test")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
@@ -234,7 +234,7 @@ class TestCookieToken:
         """An invalid cookie token is rejected."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app, cookies={"paramem_token": "bad-cookie-token"})
@@ -251,7 +251,7 @@ class TestCookieToken:
         """
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app, cookies={"paramem_token": "   "})
@@ -304,7 +304,7 @@ class TestExemptPaths:
         """/ is exempt — reachable even when auth is ON."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Device")  # enable auth
+        store.mint("speaker0", "Device")  # enable auth
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
@@ -316,7 +316,7 @@ class TestExemptPaths:
         """/manifest.json is exempt — reachable even when auth is ON."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
@@ -328,7 +328,7 @@ class TestExemptPaths:
         """/ping is not exempt — requires a valid token when auth is ON."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
@@ -381,7 +381,7 @@ class TestExemptPrefixes:
         """A path under an exempt prefix passes through without a token."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Device")  # enable auth
+        store.mint("speaker0", "Device")  # enable auth
 
         # Add /app/ route and exempt it via prefix.
         app = FastAPI()
@@ -418,7 +418,7 @@ class TestExemptPrefixes:
         """
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
 
         app = FastAPI()
         app.add_middleware(
@@ -465,7 +465,7 @@ class TestOnBothMode:
         """
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Device")  # populate store
+        store.mint("speaker0", "Device")  # populate store
 
         app = _make_app(shared_token="shared-secret", user_token_getter=lambda: store)
         client = TestClient(app)
@@ -489,7 +489,7 @@ class TestFailClean:
         """
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        store.mint("Speaker0", "Device")
+        store.mint("speaker0", "Device")
 
         handler_called = []
 
@@ -783,7 +783,7 @@ class TestScopeOnRequestState:
         """A per-user chat token sets request.state.scope = 'chat'."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        token = store.mint("Speaker0", "Phone", scope="chat")
+        token = store.mint("speaker0", "Phone", scope="chat")
 
         app = _make_scope_app(user_token_getter=lambda: store)
         client = TestClient(app)

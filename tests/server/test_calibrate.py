@@ -144,7 +144,7 @@ class TestCalibrateExtract:
     def test_disabled_404(self):
         req = CalibrateExtractRequest(
             transcript="x",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             source_type="document",
         )
         with pytest.raises(HTTPException) as exc:
@@ -156,7 +156,7 @@ class TestCalibrateExtract:
         state["consolidating"] = True
         req = CalibrateExtractRequest(
             transcript="x",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             source_type="document",
         )
         with pytest.raises(HTTPException) as exc:
@@ -730,14 +730,14 @@ class TestExtractionPipelineKwargsSeed:
         from unittest.mock import MagicMock
 
         pipeline = ExtractionPipeline(MagicMock(), MagicMock())
-        kwargs = pipeline.kwargs(seed=7, speaker_id="Speaker0")
+        kwargs = pipeline.kwargs(seed=7, speaker_id="speaker0")
         assert kwargs["seed"] == 7
 
     def test_seed_none_by_default(self):
         from unittest.mock import MagicMock
 
         pipeline = ExtractionPipeline(MagicMock(), MagicMock())
-        kwargs = pipeline.kwargs(speaker_id="Speaker0")
+        kwargs = pipeline.kwargs(speaker_id="speaker0")
         assert kwargs["seed"] is None
 
 

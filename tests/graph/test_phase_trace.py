@@ -248,7 +248,7 @@ class TestExtractGraphStopPhase:
             tokenizer=MagicMock(),
             transcript="Alex lives in Berlin.",
             session_id="test-stop-phase",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             speaker_name="Alex",
             validate=False,  # don't try the SOTA pipeline
             ha_validation=False,
@@ -271,7 +271,7 @@ class TestExtractGraphStopPhase:
                 tokenizer=MagicMock(),
                 transcript="x",
                 session_id="t",
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 stop_phase="anonymise",  # British spelling — should fail
             )
 

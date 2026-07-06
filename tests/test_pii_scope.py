@@ -158,7 +158,7 @@ def _make_mixed_graph():
                 object="Acme Corp",
                 relation_type="factual",
                 confidence=1.0,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
             ),
             Relation(
                 subject="Alice",
@@ -166,7 +166,7 @@ def _make_mixed_graph():
                 object="Berlin",
                 relation_type="factual",
                 confidence=1.0,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
             ),
         ],
     )
@@ -346,17 +346,17 @@ def test_extraction_pipeline_kwargs_threads_pii_scope():
     )
 
     # Config-level default propagates when no override is given.
-    kwargs = pipeline.kwargs(speaker_id="Speaker0")
+    kwargs = pipeline.kwargs(speaker_id="speaker0")
     assert kwargs["pii_scope"] == {"person", "place", "organization"}
 
     # Per-call override wins over the config-level default.
-    overridden = pipeline.kwargs(pii_scope={"person"}, speaker_id="Speaker0")
+    overridden = pipeline.kwargs(pii_scope={"person"}, speaker_id="speaker0")
     assert overridden["pii_scope"] == {"person"}
 
     # None at the config level is honoured (callers downstream interpret
     # this as "use the primitive default").  Distinct from set().
     pipeline.config.pii_scope = None
-    kwargs = pipeline.kwargs(speaker_id="Speaker0")
+    kwargs = pipeline.kwargs(speaker_id="speaker0")
     assert kwargs["pii_scope"] is None
 
 

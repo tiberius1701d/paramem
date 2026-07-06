@@ -152,7 +152,7 @@ def test_extraction_pipeline_kwargs_match_extract_graph_signature(source_type):
     from paramem.graph.extractor import extract_graph
 
     pipeline = _make_pipeline()
-    pipeline_keys = set(pipeline.kwargs(source_type=source_type, speaker_id="Speaker0").keys())
+    pipeline_keys = set(pipeline.kwargs(source_type=source_type, speaker_id="speaker0").keys())
     extractor_params = set(inspect.signature(extract_graph).parameters) - _EXTRACTOR_POSITIONAL
 
     unknown = pipeline_keys - extractor_params
@@ -180,7 +180,7 @@ def test_kwargs_emits_model_alias():
         config=ExtractionConfig(),
         model_name="qwen3-4b",
     )
-    kw = pipeline.kwargs(source_type="transcript", speaker_id="Speaker0")
+    kw = pipeline.kwargs(source_type="transcript", speaker_id="speaker0")
     assert "model_alias" in kw, "kwargs() must emit 'model_alias'"
     assert kw["model_alias"] == "qwen3-4b"
 
@@ -190,7 +190,7 @@ def test_kwargs_emits_model_alias():
         tokenizer=MagicMock(),
         config=ExtractionConfig(),
     )
-    kw_base = pipeline_base.kwargs(source_type="transcript", speaker_id="Speaker0")
+    kw_base = pipeline_base.kwargs(source_type="transcript", speaker_id="speaker0")
     assert kw_base["model_alias"] is None
 
 
@@ -277,7 +277,7 @@ def test_run_wraps_peft_model_in_disable_adapter(monkeypatch):
         "paramem.graph.extraction_pipeline.extract_graph",
         lambda *a, **kw: MagicMock(),
     )
-    pipeline.run("transcript", "s001", speaker_id="Speaker0")
+    pipeline.run("transcript", "s001", speaker_id="speaker0")
 
     fake_peft.disable_adapter.assert_called_once()
 
@@ -291,7 +291,7 @@ def test_run_skips_disable_adapter_for_plain_model(monkeypatch):
         "paramem.graph.extraction_pipeline.extract_graph",
         lambda *a, **kw: MagicMock(),
     )
-    pipeline.run("transcript", "s001", speaker_id="Speaker0")
+    pipeline.run("transcript", "s001", speaker_id="speaker0")
 
     plain_model.disable_adapter.assert_not_called()
 
@@ -323,7 +323,7 @@ def test_run_threads_positional_args(monkeypatch):
     )
     pipeline.prompts_dir = "/custom/prompts"
 
-    pipeline.run("alex lives here", "s042", speaker_id="Speaker0")
+    pipeline.run("alex lives here", "s042", speaker_id="speaker0")
 
     assert captured["model"] is model_sentinel
     assert captured["tokenizer"] is tokenizer_sentinel
@@ -565,7 +565,7 @@ def test_run_procedural_wraps_peft_model_in_disable_adapter(monkeypatch):
         "paramem.graph.extraction_pipeline.extract_procedural_graph",
         lambda *a, **kw: MagicMock(),
     )
-    pipeline.run_procedural("transcript", "s001", speaker_id="Speaker0")
+    pipeline.run_procedural("transcript", "s001", speaker_id="speaker0")
 
     fake_peft.disable_adapter.assert_called_once()
 
@@ -579,7 +579,7 @@ def test_run_procedural_skips_disable_adapter_for_plain_model(monkeypatch):
         "paramem.graph.extraction_pipeline.extract_procedural_graph",
         lambda *a, **kw: MagicMock(),
     )
-    pipeline.run_procedural("transcript", "s001", speaker_id="Speaker0")
+    pipeline.run_procedural("transcript", "s001", speaker_id="speaker0")
 
     plain_model.disable_adapter.assert_not_called()
 
@@ -685,7 +685,7 @@ def test_consolidation_loop_threads_model_name_to_extraction_pipeline(tmp_path):
     )
 
     # Verify model_alias flows through into kwargs() as well.
-    kw = loop.extraction.kwargs(source_type="transcript", speaker_id="Speaker0")
+    kw = loop.extraction.kwargs(source_type="transcript", speaker_id="speaker0")
     assert kw["model_alias"] == "qwen3-4b"
 
 
@@ -711,7 +711,7 @@ def test_run_threads_positional_args_procedural(monkeypatch):
     pipeline.run_procedural(
         "alex prefers coffee",
         "s042",
-        speaker_id="Speaker0",
+        speaker_id="speaker0",
         speaker_name="Alex",
     )
 
@@ -743,7 +743,7 @@ def test_run_procedural_threads_seed_and_prompt_overrides(monkeypatch):
     pipeline.run_procedural(
         "transcript text",
         "s001",
-        speaker_id="Speaker0",
+        speaker_id="speaker0",
         seed=123,
         prompts_dir="/x",
         system_prompt_filename="s.txt",
@@ -783,7 +783,7 @@ def test_run_uses_default_prompts_for_document(monkeypatch):
     monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_graph", spy)
 
     pipeline = _make_pipeline()
-    pipeline.run("some document text", "doc-001", source_type="document", speaker_id="Speaker0")
+    pipeline.run("some document text", "doc-001", source_type="document", speaker_id="speaker0")
 
     got_system = captured["kwargs"].get("system_prompt_filename")
     assert got_system == DEFAULT_SYSTEM_PROMPT_FILENAME, (
@@ -809,7 +809,7 @@ def test_run_document_flips_gate_defaults(monkeypatch):
     monkeypatch.setattr("paramem.graph.extraction_pipeline.extract_graph", spy)
 
     pipeline = _make_pipeline()
-    pipeline.run("doc text", "doc-001", source_type="document", speaker_id="Speaker0")
+    pipeline.run("doc text", "doc-001", source_type="document", speaker_id="speaker0")
     assert captured["kwargs"]["ha_validation"] is False
 
 
@@ -840,7 +840,7 @@ def test_run_honors_prompt_filename_overrides(monkeypatch):
         "transcript text",
         "calib-001",
         source_type="transcript",
-        speaker_id="Speaker0",
+        speaker_id="speaker0",
         # Operator-supplied calibration overrides.
         user_prompt_filename="calib_extraction.txt",
         system_prompt_filename="calib_extraction_system.txt",
@@ -880,13 +880,13 @@ def test_kwargs_honors_prompts_dir_override():
     # Override wins.
     kw = pipeline.kwargs(
         source_type="transcript",
-        speaker_id="Speaker0",
+        speaker_id="speaker0",
         prompts_dir="/tmp/override_dir",
     )
     assert kw["prompts_dir"] == "/tmp/override_dir"
 
     # No override → falls back to self.prompts_dir.
-    kw_default = pipeline.kwargs(source_type="transcript", speaker_id="Speaker0")
+    kw_default = pipeline.kwargs(source_type="transcript", speaker_id="speaker0")
     assert kw_default["prompts_dir"] == "configs/prompts"
 
 
@@ -914,7 +914,7 @@ def test_run_procedural_uses_default_prompts_for_document(monkeypatch):
 
     pipeline = _make_pipeline()
     pipeline.run_procedural(
-        "some document text", "doc-001", speaker_id="Speaker0", source_type="document"
+        "some document text", "doc-001", speaker_id="speaker0", source_type="document"
     )
 
     got_system = captured["kwargs"].get("system_prompt_filename")
@@ -951,7 +951,7 @@ def test_run_procedural_threads_source_type_transcript(monkeypatch):
 
     pipeline = _make_pipeline()
     pipeline.run_procedural(
-        "some transcript text", "s001", speaker_id="Speaker0", source_type="transcript"
+        "some transcript text", "s001", speaker_id="speaker0", source_type="transcript"
     )
 
     got_system = captured["kwargs"].get("system_prompt_filename")
@@ -1039,7 +1039,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
                 object="Acme",
                 relation_type="factual",
                 confidence=1.0,
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
             )
         ],
         summary="Alice works at Acme.",
@@ -1057,7 +1057,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
     assert snapshot_root is not None
 
     # --- Episodic chokepoint ---
-    graph = loop.extraction.run("transcript text", "sess-A", speaker_id="Speaker0")
+    graph = loop.extraction.run("transcript text", "sess-A", speaker_id="speaker0")
     loop._debug_writer.on_session_extracted(graph, "sess-A", "graph")
 
     main_path = snapshot_root / "sessions" / "sess-A" / "graph_snapshot.json"
@@ -1068,7 +1068,7 @@ def test_consolidation_dumps_per_session_graph_with_diagnostics(monkeypatch, tmp
     assert main_dump["relations"][0]["predicate"] == "works_at"
 
     # --- Procedural chokepoint ---
-    proc_graph = loop.extraction.run_procedural("transcript text", "sess-A", speaker_id="Speaker0")
+    proc_graph = loop.extraction.run_procedural("transcript text", "sess-A", speaker_id="speaker0")
     loop._debug_writer.on_session_extracted(proc_graph, "sess-A", "procedural_graph")
 
     proc_path = snapshot_root / "sessions" / "sess-A" / "procedural_graph_snapshot.json"

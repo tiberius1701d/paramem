@@ -2871,7 +2871,7 @@ class TestSpeakerPredecessorInheritance:
         """Two speakers both hold the same role concept → attribute key mints with ''
         (ambiguous — must not be attributed to either speaker).
 
-        Graph: speaker0 →held_role→ 'Engineer', Speaker1 →held_role→ 'Engineer',
+        Graph: speaker0 →held_role→ 'Engineer', speaker1 →held_role→ 'Engineer',
         'Engineer' →attr→ 'Y'.  Fallback sees 2 distinct predecessors → ''.
         """
         from paramem.server.router import QueryRouter

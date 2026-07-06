@@ -303,7 +303,7 @@ class TestConsolidationIntegration:
         )
 
         config = self._make_config(tmp_path)
-        buffer = self._make_session_buffer(tmp_path, "conv-vram-1", "Speaker7")
+        buffer = self._make_session_buffer(tmp_path, "conv-vram-1", "speaker7")
 
         with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
             with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
@@ -320,8 +320,8 @@ class TestConsolidationIntegration:
         loop.extract_session = MagicMock(side_effect=[torch.cuda.OutOfMemoryError("simulated")])
 
         config = self._make_config(tmp_path)
-        buffer = self._make_session_buffer(tmp_path, "conv-vram-2a", "Speaker7")
-        buffer.set_speaker("conv-vram-2b", "Speaker7", "Speaker7")
+        buffer = self._make_session_buffer(tmp_path, "conv-vram-2a", "speaker7")
+        buffer.set_speaker("conv-vram-2b", "speaker7", "speaker7")
         buffer.append("conv-vram-2b", "user", "Second session")
         buffer.append("conv-vram-2b", "assistant", "Reply")
 
@@ -353,7 +353,7 @@ class TestConsolidationIntegration:
                         "predicate": "lives_in",
                         "object": "Berlin",
                         "relation_type": "factual",
-                        "speaker_id": "Speaker7",
+                        "speaker_id": "speaker7",
                     }
                 ],
                 [],
@@ -369,7 +369,7 @@ class TestConsolidationIntegration:
         # Add adapters.episodic.enabled to satisfy the guard in _run_extraction_phase.
         config.adapters.episodic.enabled = True
         config.consolidation.mode = "train"
-        buffer = self._make_session_buffer(tmp_path, "conv-vram-train-1", "Speaker7")
+        buffer = self._make_session_buffer(tmp_path, "conv-vram-train-1", "speaker7")
 
         with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
             with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
@@ -390,14 +390,14 @@ class TestConsolidationIntegration:
         """
         loop = self._make_mock_loop()
         # Extract returns one QA pair so the cycle reaches the training step.
-        loop.extract_session = lambda *_a, **_kw: ([{"key": "k1", "speaker_id": "Speaker7"}], [])
+        loop.extract_session = lambda *_a, **_kw: ([{"key": "k1", "speaker_id": "speaker7"}], [])
         loop.run_consolidation_cycle = lambda *_a, **_kw: (_ for _ in ()).throw(
             torch.cuda.OutOfMemoryError("training simulated")
         )
 
         config = self._make_config(tmp_path)
         config.consolidation.mode = "train"
-        buffer = self._make_session_buffer(tmp_path, "conv-vram-train", "Speaker7")
+        buffer = self._make_session_buffer(tmp_path, "conv-vram-train", "speaker7")
 
         with patch("paramem.server.vram_guard.torch.cuda.is_available", return_value=True):
             with patch("paramem.server.vram_guard.torch.cuda.empty_cache"):
@@ -598,7 +598,7 @@ class TestPerChunkOOMSkip:
         # deterministic sid itself, mirroring the real /ingest-sessions
         # handler (app.py) — append() now mints a rotated session_id.
         for sid in ("doc-aaa", "doc-bbb"):
-            buffer.set_speaker(sid, "Speaker1", "Speaker1")
+            buffer.set_speaker(sid, "speaker1", "speaker1")
             buffer.append_document_chunk(
                 sid,
                 "user",
@@ -746,7 +746,7 @@ class TestExtractionFailedAbortsCycle:
         # append_document_chunk (not append): deterministic session_id,
         # mirroring the real /ingest-sessions handler.
         for sid in ("doc-aaa", "doc-bbb", "doc-ccc"):
-            buffer.set_speaker(sid, "Speaker1", "Speaker1")
+            buffer.set_speaker(sid, "speaker1", "speaker1")
             buffer.append_document_chunk(
                 sid,
                 "user",

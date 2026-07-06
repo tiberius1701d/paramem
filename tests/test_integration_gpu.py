@@ -166,7 +166,7 @@ class TestExtractProceduralGraph:
             tokenizer,
             transcript,
             "test_proc",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             max_tokens=1024,
         )
         # Should extract at least something (preferences)
@@ -183,7 +183,7 @@ class TestExtractProceduralGraph:
             tokenizer,
             "[user] Stop.",
             "test_empty",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             max_tokens=512,
         )
         assert graph.session_id == "test_empty"
@@ -213,7 +213,7 @@ class TestSOTAFullFlow:
                     object="Millfield",
                     relation_type="factual",
                     confidence=1.0,
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
         )
@@ -650,7 +650,7 @@ class TestRunExtractGraphHelper:
         graph = loop.extraction.run(
             "[user] My name is Alex. I live in Millfield.\n[assistant] Nice to meet you, Alex.",
             "gap_a_session",
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
         )
 
         assert isinstance(graph, SessionGraph)
@@ -1037,7 +1037,7 @@ class TestSimulateModePromptIteration:
         buffer = SessionBuffer(
             session_dir=cfg.paths.sessions, state_dir=cfg.paths.data / "state", debug=False
         )
-        buffer.set_speaker("sim-test-001", "Speaker0", "Alex")
+        buffer.set_speaker("sim-test-001", "speaker0", "Alex")
         chunk_text = (
             "Alex is an Engineering Leader Software at Acme Corp in Germany. "
             "He led platform architecture for the Polaris XR-7 system."

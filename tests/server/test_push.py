@@ -92,10 +92,10 @@ class TestPushSubscriptionStoreBasic:
         store = PushSubscriptionStore(store_path)
         sub = _make_subscription()
 
-        added = store.add("Speaker0", sub)
+        added = store.add("speaker0", sub)
 
         assert added is True
-        subs = store.list("Speaker0")
+        subs = store.list("speaker0")
         assert len(subs) == 1
         assert subs[0]["endpoint"] == sub["endpoint"]
 
@@ -113,24 +113,24 @@ class TestPushSubscriptionStoreBasic:
 
         sub0 = _make_subscription("https://push.example.com/s0")
         sub1 = _make_subscription("https://push.example.com/s1")
-        store.add("Speaker0", sub0)
-        store.add("Speaker1", sub1)
+        store.add("speaker0", sub0)
+        store.add("speaker1", sub1)
 
-        assert len(store.list("Speaker0")) == 1
-        assert len(store.list("Speaker1")) == 1
-        assert store.list("Speaker0")[0]["endpoint"] == sub0["endpoint"]
-        assert store.list("Speaker1")[0]["endpoint"] == sub1["endpoint"]
+        assert len(store.list("speaker0")) == 1
+        assert len(store.list("speaker1")) == 1
+        assert store.list("speaker0")[0]["endpoint"] == sub0["endpoint"]
+        assert store.list("speaker1")[0]["endpoint"] == sub1["endpoint"]
 
     def test_all_returns_all_speakers(self, tmp_path, monkeypatch, store_path):
         """all() returns all subscriptions keyed by speaker_id."""
         _setup_daily(tmp_path, monkeypatch)
         store = PushSubscriptionStore(store_path)
-        store.add("Speaker0", _make_subscription("https://push.example.com/0"))
-        store.add("Speaker1", _make_subscription("https://push.example.com/1"))
+        store.add("speaker0", _make_subscription("https://push.example.com/0"))
+        store.add("speaker1", _make_subscription("https://push.example.com/1"))
 
         result = store.all()
 
-        assert set(result.keys()) == {"Speaker0", "Speaker1"}
+        assert set(result.keys()) == {"speaker0", "speaker1"}
 
 
 # ---------------------------------------------------------------------------
@@ -145,12 +145,12 @@ class TestEndpointDedupe:
         store = PushSubscriptionStore(store_path)
         sub = _make_subscription("https://push.example.com/dup")
 
-        first = store.add("Speaker0", sub)
-        second = store.add("Speaker0", sub)
+        first = store.add("speaker0", sub)
+        second = store.add("speaker0", sub)
 
         assert first is True
         assert second is False
-        assert len(store.list("Speaker0")) == 1
+        assert len(store.list("speaker0")) == 1
 
     def test_add_different_endpoints_for_same_speaker(self, tmp_path, monkeypatch, store_path):
         """Two different endpoints for the same speaker both persist."""
@@ -159,10 +159,10 @@ class TestEndpointDedupe:
 
         sub_a = _make_subscription("https://push.example.com/a")
         sub_b = _make_subscription("https://push.example.com/b")
-        store.add("Speaker0", sub_a)
-        store.add("Speaker0", sub_b)
+        store.add("speaker0", sub_a)
+        store.add("speaker0", sub_b)
 
-        subs = store.list("Speaker0")
+        subs = store.list("speaker0")
         endpoints = {s["endpoint"] for s in subs}
         assert endpoints == {sub_a["endpoint"], sub_b["endpoint"]}
 
@@ -178,37 +178,37 @@ class TestRemove:
         _setup_daily(tmp_path, monkeypatch)
         store = PushSubscriptionStore(store_path)
         sub = _make_subscription("https://push.example.com/gone")
-        store.add("Speaker0", sub)
+        store.add("speaker0", sub)
 
         count = store.remove("https://push.example.com/gone")
 
         assert count == 1
-        assert store.list("Speaker0") == []
+        assert store.list("speaker0") == []
 
     def test_remove_unknown_endpoint_returns_zero(self, tmp_path, monkeypatch, store_path):
         """remove() on an unknown endpoint returns 0."""
         _setup_daily(tmp_path, monkeypatch)
         store = PushSubscriptionStore(store_path)
-        store.add("Speaker0", _make_subscription("https://push.example.com/stay"))
+        store.add("speaker0", _make_subscription("https://push.example.com/stay"))
 
         count = store.remove("https://push.example.com/no-such")
 
         assert count == 0
-        assert len(store.list("Speaker0")) == 1
+        assert len(store.list("speaker0")) == 1
 
     def test_remove_across_speakers(self, tmp_path, monkeypatch, store_path):
         """remove() removes the endpoint for all speakers that hold it."""
         _setup_daily(tmp_path, monkeypatch)
         store = PushSubscriptionStore(store_path)
         shared_endpoint = "https://push.example.com/shared"
-        store.add("Speaker0", _make_subscription(shared_endpoint))
-        store.add("Speaker1", _make_subscription(shared_endpoint))
+        store.add("speaker0", _make_subscription(shared_endpoint))
+        store.add("speaker1", _make_subscription(shared_endpoint))
 
         count = store.remove(shared_endpoint)
 
         assert count == 2
-        assert store.list("Speaker0") == []
-        assert store.list("Speaker1") == []
+        assert store.list("speaker0") == []
+        assert store.list("speaker1") == []
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +223,7 @@ class TestOnDiskSecurity:
 
         _setup_daily(tmp_path, monkeypatch)
         store = PushSubscriptionStore(store_path)
-        store.add("Speaker0", _make_subscription())
+        store.add("speaker0", _make_subscription())
 
         disk_bytes = store_path.read_bytes()
 
@@ -236,7 +236,7 @@ class TestOnDiskSecurity:
     ):
         """Security OFF: store is written as plaintext JSON."""
         store = PushSubscriptionStore(store_path)
-        store.add("Speaker0", _make_subscription())
+        store.add("speaker0", _make_subscription())
 
         disk_bytes = store_path.read_bytes()
 
@@ -251,11 +251,11 @@ class TestOnDiskSecurity:
         _setup_daily(tmp_path, monkeypatch)
         store = PushSubscriptionStore(store_path)
         sub = _make_subscription("https://push.example.com/reload")
-        store.add("Speaker0", sub)
+        store.add("speaker0", sub)
 
         store2 = PushSubscriptionStore(store_path)
 
-        subs = store2.list("Speaker0")
+        subs = store2.list("speaker0")
         assert len(subs) == 1
         assert subs[0]["endpoint"] == sub["endpoint"]
 
@@ -278,7 +278,7 @@ class TestOnDiskSecurity:
 
         with patch("paramem.backup.encryption.write_infra_bytes", side_effect=_plaintext_write):
             with pytest.raises(RuntimeError, match="written in plaintext"):
-                store.add("Speaker0", _make_subscription())
+                store.add("speaker0", _make_subscription())
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +541,7 @@ class TestPushSubscribeEndpoint:
     def test_subscribe_returns_subscribed(self, tmp_path, monkeypatch):
         """push_subscribe returns {'status': 'subscribed'} for a valid request."""
         result, _store = _call_push_subscribe(
-            tmp_path, monkeypatch, push_enabled=True, speaker_id="Speaker0"
+            tmp_path, monkeypatch, push_enabled=True, speaker_id="speaker0"
         )
         assert result == {"status": "subscribed"}
 
@@ -552,12 +552,12 @@ class TestPushSubscribeEndpoint:
             tmp_path,
             monkeypatch,
             push_enabled=True,
-            speaker_id="Speaker7",
+            speaker_id="speaker7",
             endpoint=endpoint,
         )
 
         assert store is not None
-        subs = store.list("Speaker7")
+        subs = store.list("speaker7")
         assert len(subs) == 1
         assert subs[0]["endpoint"] == endpoint
 
@@ -573,7 +573,7 @@ class TestPushSubscribeEndpoint:
     def test_subscribe_503_when_push_disabled(self, tmp_path, monkeypatch):
         """push_subscribe returns 503 JSONResponse when push_enabled=false."""
         result, _store = _call_push_subscribe(
-            tmp_path, monkeypatch, push_enabled=False, speaker_id="Speaker0"
+            tmp_path, monkeypatch, push_enabled=False, speaker_id="speaker0"
         )
 
         assert result.status_code == 503
@@ -592,7 +592,7 @@ class TestPushSubscribeEndpoint:
             {
                 "endpoint": "https://web.push.example.com/hijack",
                 "keys": {"p256dh": "X", "auth": "Y"},
-                "speaker_id": "Speaker99",  # extra field — must be silently ignored
+                "speaker_id": "speaker99",  # extra field — must be silently ignored
             }
         )
         # After construction, the model must not carry speaker_id.
@@ -606,15 +606,15 @@ class TestPushSubscribeEndpoint:
             tmp_path,
             monkeypatch,
             push_enabled=True,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             endpoint=endpoint,
         )
         assert store is not None
         # Subscription is under the token identity.
-        assert len(store.list("Speaker0")) == 1
+        assert len(store.list("speaker0")) == 1
         # No subscription for any other speaker.
         all_subs = store.all()
-        assert set(all_subs.keys()) == {"Speaker0"}
+        assert set(all_subs.keys()) == {"speaker0"}
 
 
 # ---------------------------------------------------------------------------
@@ -646,56 +646,56 @@ class TestSubscriptionValidation:
         store = self._store(store_path, tmp_path, monkeypatch)
         sub = {"endpoint": "http://push.example.com/test", "keys": {"p256dh": "A", "auth": "B"}}
         with pytest.raises(ValueError, match="https://"):
-            store.add("Speaker0", sub)
+            store.add("speaker0", sub)
 
     def test_rejects_localhost_endpoint(self, tmp_path, monkeypatch, store_path):
         """https://localhost/... must be rejected as a loopback host."""
         store = self._store(store_path, tmp_path, monkeypatch)
         sub = {"endpoint": "https://localhost/push/token", "keys": {"p256dh": "A", "auth": "B"}}
         with pytest.raises(ValueError, match="push relay"):
-            store.add("Speaker0", sub)
+            store.add("speaker0", sub)
 
     def test_rejects_loopback_ip(self, tmp_path, monkeypatch, store_path):
         """https://127.0.0.1/... must be rejected as a loopback address."""
         store = self._store(store_path, tmp_path, monkeypatch)
         sub = {"endpoint": "https://127.0.0.1/push/token", "keys": {"p256dh": "A", "auth": "B"}}
         with pytest.raises(ValueError, match="non-public IP"):
-            store.add("Speaker0", sub)
+            store.add("speaker0", sub)
 
     def test_rejects_rfc1918_host(self, tmp_path, monkeypatch, store_path):
         """https://10.0.0.5/... must be rejected (RFC-1918 private address)."""
         store = self._store(store_path, tmp_path, monkeypatch)
         sub = {"endpoint": "https://10.0.0.5/push/token", "keys": {"p256dh": "A", "auth": "B"}}
         with pytest.raises(ValueError, match="non-public IP"):
-            store.add("Speaker0", sub)
+            store.add("speaker0", sub)
 
     def test_rejects_bare_hostname(self, tmp_path, monkeypatch, store_path):
         """https://internalhost/... (no dot) must be rejected."""
         store = self._store(store_path, tmp_path, monkeypatch)
         sub = {"endpoint": "https://internalhost/push", "keys": {"p256dh": "A", "auth": "B"}}
         with pytest.raises(ValueError, match="push relay"):
-            store.add("Speaker0", sub)
+            store.add("speaker0", sub)
 
     def test_rejects_dot_local_hostname(self, tmp_path, monkeypatch, store_path):
         """https://device.local/... (mDNS) must be rejected."""
         store = self._store(store_path, tmp_path, monkeypatch)
         sub = {"endpoint": "https://device.local/push", "keys": {"p256dh": "A", "auth": "B"}}
         with pytest.raises(ValueError, match="push relay"):
-            store.add("Speaker0", sub)
+            store.add("speaker0", sub)
 
     def test_rejects_missing_p256dh(self, tmp_path, monkeypatch, store_path):
         """Subscription missing 'p256dh' key must be rejected."""
         store = self._store(store_path, tmp_path, monkeypatch)
         sub = {"endpoint": "https://web.push.apple.com/token", "keys": {"auth": "B"}}
         with pytest.raises(ValueError, match="p256dh"):
-            store.add("Speaker0", sub)
+            store.add("speaker0", sub)
 
     def test_rejects_missing_auth(self, tmp_path, monkeypatch, store_path):
         """Subscription missing 'auth' key must be rejected."""
         store = self._store(store_path, tmp_path, monkeypatch)
         sub = {"endpoint": "https://web.push.apple.com/token", "keys": {"p256dh": "A"}}
         with pytest.raises(ValueError, match="auth"):
-            store.add("Speaker0", sub)
+            store.add("speaker0", sub)
 
     def test_accepts_apple_push_endpoint(self, tmp_path, monkeypatch, store_path):
         """Realistic Apple push endpoint with valid keys must be accepted (no false positive)."""
@@ -708,9 +708,9 @@ class TestSubscriptionValidation:
             },
         }
         # Must not raise — this is a valid real-world subscription shape.
-        added = store.add("Speaker0", sub)
+        added = store.add("speaker0", sub)
         assert added is True
-        assert len(store.list("Speaker0")) == 1
+        assert len(store.list("speaker0")) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +725,7 @@ class TestPushSubscribeEndpointValidation:
             tmp_path,
             monkeypatch,
             push_enabled=True,
-            speaker_id="Speaker0",
+            speaker_id="speaker0",
             endpoint="http://push.example.com/bad",
         )
 
@@ -756,10 +756,10 @@ class TestToctouClearsMemory:
 
         with patch("paramem.backup.encryption.write_infra_bytes", side_effect=_plaintext_write):
             with pytest.raises(RuntimeError, match="written in plaintext"):
-                store.add("Speaker0", _make_subscription())
+                store.add("speaker0", _make_subscription())
 
         # After the guard fires, in-memory state must be cleared.
-        assert store.list("Speaker0") == [], (
+        assert store.list("speaker0") == [], (
             "list() must return [] after TOCTOU guard clears in-memory state"
         )
         assert store.all() == {}, "all() must return {} after TOCTOU guard clears in-memory state"

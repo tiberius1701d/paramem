@@ -78,7 +78,7 @@ def _make_speaker_store(
     known_ids: dict[str, str | None] | None = None,
     match_speaker_id: str | None = None,
     match_tentative: bool = True,
-    anon_id: str = "Speaker3",
+    anon_id: str = "speaker3",
     is_anonymous: bool = True,
 ) -> MagicMock:
     """Return a minimal SpeakerStore mock for voice-enrollment tests.
@@ -656,8 +656,8 @@ def test_voice_personal_token_skips_embedding(tmp_path, monkeypatch):
     When auth_speaker_id is set (per-user token), compute_embedding is False.
 
     The speaker_id is injected via real BearerTokenMiddleware + UserTokenStore:
-    a per-user token minted for Speaker0 is sent in the Authorization header so
-    auth.py:180 sets scope["state"]["speaker_id"] = "Speaker0" — the same real
+    a per-user token minted for speaker0 is sent in the Authorization header so
+    auth.py:180 sets scope["state"]["speaker_id"] = "speaker0" — the same real
     code path used in production.
     """
     # Set up the daily identity so UserTokenStore.mint() can sign the token.
@@ -669,7 +669,7 @@ def test_voice_personal_token_skips_embedding(tmp_path, monkeypatch):
     _clear_daily_identity_cache()
 
     user_store = UserTokenStore(tmp_path / "user_tokens.json")
-    per_user_token = user_store.mint("Speaker0", "TestDevice")
+    per_user_token = user_store.mint("speaker0", "TestDevice")
 
     # Wire the store into _state so the middleware's lambda resolves it.
     fresh = _make_state(tmp_path)
@@ -678,7 +678,7 @@ def test_voice_personal_token_skips_embedding(tmp_path, monkeypatch):
 
     # app_module.app wires BearerTokenMiddleware with user_token_getter pointing at
     # _state["user_token_store"].  Presenting the per-user token causes auth.py:180
-    # to set scope["state"]["speaker_id"] = "Speaker0" on the real request scope.
+    # to set scope["state"]["speaker_id"] = "speaker0" on the real request scope.
     tc = TestClient(app_module.app, raise_server_exceptions=True)
 
     fake_pcm = b"\x00\x00" * 800
@@ -696,7 +696,7 @@ def test_voice_personal_token_skips_embedding(tmp_path, monkeypatch):
     from paramem.server.app import ResolvedSpeaker
 
     resolved = ResolvedSpeaker(
-        speaker_id="Speaker0",
+        speaker_id="speaker0",
         speaker="Alice",
         display_speaker="Alice",
         follow_up=None,
@@ -741,8 +741,8 @@ def test_voice_shared_token_computes_embedding(tmp_path, monkeypatch):
     auth_speaker_id is None (no per-user token in test environment).
     """
     store = _make_speaker_store(
-        known_ids={"Speaker0": "Alice"},
-        match_speaker_id="Speaker0",
+        known_ids={"speaker0": "Alice"},
+        match_speaker_id="speaker0",
         match_tentative=False,  # non-tentative → matched identity
         is_anonymous=False,
     )
@@ -795,7 +795,7 @@ def test_voice_shared_token_computes_embedding(tmp_path, monkeypatch):
 def test_voice_shared_token_unknown_voice_enrolls(tmp_path, monkeypatch):
     """Shared token + unknown voice → register_anonymous called, follow_up returned."""
     store = _make_speaker_store(
-        anon_id="Speaker3",
+        anon_id="speaker3",
         is_anonymous=True,
     )
     # Default: no match (match_speaker_id=None, match_tentative=True)
@@ -854,7 +854,7 @@ def test_voice_shared_token_unknown_voice_enrolls(tmp_path, monkeypatch):
 def test_voice_name_disclosure_binds(tmp_path, monkeypatch):
     """_run_enrollment_for_speaker returns a name → follow_up cleared to None."""
     store = _make_speaker_store(
-        anon_id="Speaker3",
+        anon_id="speaker3",
         is_anonymous=True,
     )
     fresh = _make_state(tmp_path, speaker_store=store)
@@ -966,8 +966,8 @@ def test_voice_shared_token_resolved_speaker_does_not_leak_open_entries(tmp_path
     pruning can never evict it — one leaked entry per push-to-talk press.
     """
     store = _make_speaker_store(
-        known_ids={"Speaker0": "Alice"},
-        match_speaker_id="Speaker0",
+        known_ids={"speaker0": "Alice"},
+        match_speaker_id="speaker0",
         match_tentative=False,  # non-tentative → matched identity every time
         is_anonymous=False,
     )
@@ -1007,10 +1007,10 @@ def test_voice_shared_token_resolved_speaker_does_not_leak_open_entries(tmp_path
             assert resp.status_code == 200
 
     # 10 utterances, each with a fresh per-utterance transport id, all
-    # resolving to the same known speaker (Speaker0) → exactly ONE _open
-    # entry ("voice-Speaker0"), not 10 (one per leaked transport id).
-    assert list(buffer._open.keys()) == ["voice-Speaker0"]
-    assert buffer.get_speaker_id("voice-Speaker0") == "Speaker0"
+    # resolving to the same known speaker (speaker0) → exactly ONE _open
+    # entry ("voice-speaker0"), not 10 (one per leaked transport id).
+    assert list(buffer._open.keys()) == ["voice-speaker0"]
+    assert buffer.get_speaker_id("voice-speaker0") == "speaker0"
 
 
 # ---------------------------------------------------------------------------
@@ -1028,10 +1028,10 @@ def test_chat_anonymous_speaker_raw_vs_display(tmp_path, monkeypatch):
     from paramem.server.app import ResolvedSpeaker
 
     # An anonymous speaker: store.is_anonymous returns True, speaker is the
-    # canonical "Speaker3" ID, display_speaker is suppressed (None).
+    # canonical "speaker3" ID, display_speaker is suppressed (None).
     anon_resolved = ResolvedSpeaker(
-        speaker_id="Speaker3",
-        speaker="Speaker3",
+        speaker_id="speaker3",
+        speaker="speaker3",
         display_speaker=None,  # suppressed until disclosure
         follow_up="What's your name?",
         greeting_prefix=None,
@@ -1072,7 +1072,7 @@ def test_chat_anonymous_speaker_raw_vs_display(tmp_path, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     # Raw canonical ID propagates to ChatResponse.speaker (attribution)
-    assert body["speaker"] == "Speaker3"
+    assert body["speaker"] == "speaker3"
     # _run_chat_turn must receive display_speaker=None (suppression intact)
     call_kwargs = mock_run_turn.call_args.kwargs
     assert call_kwargs["display_speaker"] is None
@@ -1119,7 +1119,7 @@ class TestResolvedSpeakerSeam:
 
     def test_token_path_returns_token_identity(self, tmp_path, monkeypatch):
         """auth_speaker_id set → identity from token, register_anonymous not called."""
-        store = _make_speaker_store(known_ids={"Speaker0": "Alice"}, is_anonymous=False)
+        store = _make_speaker_store(known_ids={"speaker0": "Alice"}, is_anonymous=False)
         self._patch_state(monkeypatch, store=store)
 
         req = self._make_chat_request()
@@ -1130,7 +1130,7 @@ class TestResolvedSpeakerSeam:
         result = asyncio.run(
             app_module._resolve_and_enroll_speaker(
                 request=req,
-                auth_speaker_id="Speaker0",
+                auth_speaker_id="speaker0",
                 buffer=buf,
                 store=store,
                 detected_language=None,
@@ -1138,14 +1138,14 @@ class TestResolvedSpeakerSeam:
             )
         )
 
-        assert result.speaker_id == "Speaker0"
+        assert result.speaker_id == "speaker0"
         assert result.speaker == "Alice"
         assert result.follow_up is None
         store.register_anonymous.assert_not_called()
 
     def test_anonymous_embedding_triggers_registration(self, tmp_path, monkeypatch):
         """Unknown voice with embedding → register_anonymous called, follow_up set."""
-        store = _make_speaker_store(anon_id="Speaker3", is_anonymous=True)
+        store = _make_speaker_store(anon_id="speaker3", is_anonymous=True)
         self._patch_state(monkeypatch, store=store)
 
         req = self._make_chat_request(embedding=[0.1, 0.2, 0.3])
@@ -1168,13 +1168,13 @@ class TestResolvedSpeakerSeam:
                 )
             )
 
-        assert result.speaker_id == "Speaker3"
+        assert result.speaker_id == "speaker3"
         assert result.follow_up == "What's your name?"
         store.register_anonymous.assert_called_once_with([0.1, 0.2, 0.3])
 
     def test_disclosure_clears_follow_up(self, tmp_path, monkeypatch):
         """_run_enrollment_for_speaker returns a name → speaker set, follow_up None."""
-        store = _make_speaker_store(anon_id="Speaker3", is_anonymous=True)
+        store = _make_speaker_store(anon_id="speaker3", is_anonymous=True)
         self._patch_state(monkeypatch, store=store)
 
         req = self._make_chat_request(embedding=[0.1, 0.2], text="My name is Alex")

@@ -40,7 +40,7 @@ KEYED_ENTRY_FIELDS = ("key", "subject", "predicate", "object", "speaker_id")
 _EDGE_DATA = {
     "key": "graph1",
     "predicate": "lives_in",
-    "speaker_id": "Speaker0",
+    "speaker_id": "speaker0",
 }
 
 _SUBJECT = "Alice"
@@ -137,7 +137,7 @@ class TestRoundTrip:
         assert q["subject"] == _SUBJECT
         assert q["object"] == _OBJECT
         assert q["predicate"] == "lives_in"
-        assert q["speaker_id"] == "Speaker0"
+        assert q["speaker_id"] == "speaker0"
 
         # Also verify the internal attribute is present in raw edge data.
         edges = list(g2.edges(keys=True, data=True))
@@ -352,7 +352,7 @@ class TestEntryByKey:
         assert result["subject"] == _SUBJECT
         assert result["object"] == _OBJECT
         assert result["predicate"] == "lives_in"
-        assert result["speaker_id"] == "Speaker0"
+        assert result["speaker_id"] == "speaker0"
 
     def test_miss_returns_none(self):
         """entry_by_key returns None when the key is absent."""
@@ -481,7 +481,7 @@ class TestBuildTierGraphFromStore:
                     "subject": "Alice",
                     "predicate": "lives_in",
                     "object": "Berlin",
-                    "speaker_id": "Speaker0",
+                    "speaker_id": "speaker0",
                 }
             },
         )
@@ -494,7 +494,7 @@ class TestBuildTierGraphFromStore:
         assert q["subject"] == "Alice"
         assert q["object"] == "Berlin"
         assert q["predicate"] == "lives_in"
-        assert q["speaker_id"] == "Speaker0"
+        assert q["speaker_id"] == "speaker0"
 
     def test_happy_path_multiple_keys(self):
         """All keys in the simhash registry are added to the graph."""

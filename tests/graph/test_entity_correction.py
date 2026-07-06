@@ -78,7 +78,7 @@ class TestScopeGating:
         monkeypatch.setattr("paramem.graph.entity_correction.generate_answer", called)
         model, tokenizer = _model_tokenizer()
         reverse_mapping = {"City_1": "Frankfrut"}
-        entity = Entity(name="Speaker0", entity_type="person", attributes={"origin": "Frankfrut"})
+        entity = Entity(name="speaker0", entity_type="person", attributes={"origin": "Frankfrut"})
 
         result = correct_entity_surfaces(
             reverse_mapping,
@@ -448,7 +448,7 @@ class TestAttributeLocus:
         corrected when "attributes" is in the knob."""
         model, tokenizer = _model_tokenizer()
         entity = Entity(
-            name="Speaker0",
+            name="speaker0",
             entity_type="person",
             attributes={"current_location": "Frankfrut"},
         )
@@ -473,7 +473,7 @@ class TestAttributeLocus:
         assert result["applied"] == [
             {
                 "locus": "attribute",
-                "entity": "Speaker0",
+                "entity": "speaker0",
                 "key": "current_location",
                 "kind": "place",
                 "before": "Frankfrut",
@@ -486,7 +486,7 @@ class TestAttributeLocus:
         last_name) is never applied — person is never in correctable_kinds."""
         model, tokenizer = _model_tokenizer()
         entity = Entity(
-            name="Speaker0",
+            name="speaker0",
             entity_type="person",
             attributes={"last_name": "Merkl"},
         )
@@ -515,7 +515,7 @@ class TestAttributeLocus:
         email address) is never applied."""
         model, tokenizer = _model_tokenizer()
         entity = Entity(
-            name="Speaker0",
+            name="speaker0",
             entity_type="person",
             attributes={"email": "alex.morgan@example.com"},
         )
@@ -545,7 +545,7 @@ class TestAttributeLocus:
         though the knob still carries in-scope entity-type members."""
         model, tokenizer = _model_tokenizer()
         entity = Entity(
-            name="Speaker0",
+            name="speaker0",
             entity_type="person",
             attributes={"current_location": "Frankfrut"},
         )
@@ -579,7 +579,7 @@ class TestAttributeLocus:
         """Empty/whitespace attribute values are never gathered as targets."""
         model, tokenizer = _model_tokenizer()
         entity = Entity(
-            name="Speaker0",
+            name="speaker0",
             entity_type="person",
             attributes={"nickname": "", "origin": "   "},
         )
@@ -603,7 +603,7 @@ class TestAttributeLocus:
         model, tokenizer = _model_tokenizer()
         reverse_mapping = {"City_1": "Frankfrut"}
         entity = Entity(
-            name="Speaker0",
+            name="speaker0",
             entity_type="person",
             attributes={"current_location": "Novatek Systams"},
         )

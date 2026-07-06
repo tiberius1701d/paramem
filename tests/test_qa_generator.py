@@ -462,7 +462,7 @@ class TestGenerateQaFromGraph:
                     predicate="lives_in",
                     object="Heilbronn",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
         )
@@ -498,7 +498,7 @@ class TestGenerateQaFromGraph:
                     predicate="lives_in",
                     object="Heilbronn",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             entities=[
@@ -523,7 +523,7 @@ class TestGenerateQaFromGraph:
                     predicate="has_email",
                     object="alex@example.com",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 )
             ],
             entities=[
@@ -546,14 +546,14 @@ class TestGenerateQaFromGraph:
                     predicate="prefers",
                     object="dark_mode",
                     relation_type="preference",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
                 Relation(
                     subject="Alex",
                     predicate="lives_in",
                     object="Heilbronn",
                     relation_type="factual",
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                 ),
             ],
         )

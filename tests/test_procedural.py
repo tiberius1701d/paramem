@@ -177,7 +177,7 @@ class TestProcGraphMergeGap:
         # Simulate the result of merger.merge(proc_graph, ...):
         # one procedural-typed edge in merger.graph.
         g = nx.MultiDiGraph()
-        g.add_node("alice", speaker_id="Speaker0", attributes={"name": "Alice"})
+        g.add_node("alice", speaker_id="speaker0", attributes={"name": "Alice"})
         g.add_node("tea", attributes={"name": "Tea"})
         g.add_edge("alice", "tea", predicate="prefers", relation_type="preference")
         loop.merger.graph = g
@@ -223,7 +223,7 @@ class TestProceduralRoutedToInterim:
         loop = _make_minimal_loop(tmp_path)
 
         g = nx.MultiDiGraph()
-        g.add_node("bob", speaker_id="Speaker0", attributes={"name": "Bob"})
+        g.add_node("bob", speaker_id="speaker0", attributes={"name": "Bob"})
         g.add_node("jazz", attributes={"name": "Jazz"})
         g.add_edge("bob", "jazz", predicate="likes", relation_type="preference")
         loop.merger.graph = g
@@ -248,11 +248,11 @@ class TestProceduralRoutedToInterim:
                         "predicate": "likes",
                         "object": "Jazz",
                         "relation_type": "preference",
-                        "speaker_id": "Speaker0",
+                        "speaker_id": "speaker0",
                     }
                 ],
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="test_interim_route",
                 stamp="t001",
@@ -284,7 +284,7 @@ class TestSimulateModeRegistersProceduralKeys:
         loop.config.mode = "simulate"
 
         g = nx.MultiDiGraph()
-        g.add_node("carol", speaker_id="Speaker0", attributes={"name": "Carol"})
+        g.add_node("carol", speaker_id="speaker0", attributes={"name": "Carol"})
         g.add_node("cycling", attributes={"name": "Cycling"})
         g.add_edge("carol", "cycling", predicate="enjoys", relation_type="preference")
         loop.merger.graph = g
@@ -324,11 +324,11 @@ class TestSimulateModeRegistersProceduralKeys:
                         "predicate": "enjoys",
                         "object": "Cycling",
                         "relation_type": "preference",
-                        "speaker_id": "Speaker0",
+                        "speaker_id": "speaker0",
                     }
                 ],
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="simulate",
                 run_label="test_simulate",
                 stamp="t001",
@@ -378,7 +378,7 @@ class TestProceduralSessionPending:
 
         session_id = "session-proc-b7"
         g = nx.MultiDiGraph()
-        g.add_node("dave", speaker_id="Speaker0", attributes={"name": "Dave"})
+        g.add_node("dave", speaker_id="speaker0", attributes={"name": "Dave"})
         g.add_node("hiking", attributes={"name": "Hiking"})
         g.add_edge(
             "dave",
@@ -411,11 +411,11 @@ class TestProceduralSessionPending:
                         "predicate": "loves",
                         "object": "Hiking",
                         "relation_type": "preference",
-                        "speaker_id": "Speaker0",
+                        "speaker_id": "speaker0",
                     }
                 ],
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="test_b7",
                 stamp="t001",
@@ -455,7 +455,7 @@ class TestProceduralKeyRegisteredInInterimTier:
         loop = _make_minimal_loop(tmp_path)
 
         g = nx.MultiDiGraph()
-        g.add_node("eve", speaker_id="Speaker0", attributes={"name": "Eve"})
+        g.add_node("eve", speaker_id="speaker0", attributes={"name": "Eve"})
         g.add_node("running", attributes={"name": "Running"})
         g.add_edge("eve", "running", predicate="enjoys", relation_type="preference")
         loop.merger.graph = g
@@ -486,11 +486,11 @@ class TestProceduralKeyRegisteredInInterimTier:
                         "predicate": "enjoys",
                         "object": "Running",
                         "relation_type": "preference",
-                        "speaker_id": "Speaker0",
+                        "speaker_id": "speaker0",
                     }
                 ],
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="test_tier_regression",
                 stamp="t001",
@@ -518,7 +518,7 @@ class TestProceduralKeyRegisteredInInterimTier:
         loop = _make_minimal_loop(tmp_path)
 
         g = nx.MultiDiGraph()
-        g.add_node("frank", speaker_id="Speaker0", attributes={"name": "Frank"})
+        g.add_node("frank", speaker_id="speaker0", attributes={"name": "Frank"})
         g.add_node("chess", attributes={"name": "Chess"})
         g.add_edge("frank", "chess", predicate="plays", relation_type="preference")
         loop.merger.graph = g
@@ -548,11 +548,11 @@ class TestProceduralKeyRegisteredInInterimTier:
                         "predicate": "plays",
                         "object": "Chess",
                         "relation_type": "preference",
-                        "speaker_id": "Speaker0",
+                        "speaker_id": "speaker0",
                     }
                 ],
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="test_bk_preference",
                 stamp="t001",
@@ -577,7 +577,7 @@ class TestProceduralKeyRegisteredInInterimTier:
         loop = _make_minimal_loop(tmp_path)
 
         g = nx.MultiDiGraph()
-        g.add_node("gwen", speaker_id="Speaker0", attributes={"name": "Gwen"})
+        g.add_node("gwen", speaker_id="speaker0", attributes={"name": "Gwen"})
         g.add_node("yoga", attributes={"name": "Yoga"})
         g.add_edge("gwen", "yoga", predicate="practices", relation_type="preference")
         loop.merger.graph = g
@@ -600,11 +600,11 @@ class TestProceduralKeyRegisteredInInterimTier:
                         "predicate": "practices",
                         "object": "Yoga",
                         "relation_type": "preference",
-                        "speaker_id": "Speaker0",
+                        "speaker_id": "speaker0",
                     }
                 ],
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="test_active_keys",
                 stamp="t001",

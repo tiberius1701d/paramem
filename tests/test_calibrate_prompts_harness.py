@@ -55,7 +55,7 @@ class TestNormalizeStageNoNameError:
                         {
                             "id": "alice",
                             "attributes": {"name": "Alice"},
-                            "speaker_id": "Speaker0",
+                            "speaker_id": "speaker0",
                         }
                     ],
                     "links": [],

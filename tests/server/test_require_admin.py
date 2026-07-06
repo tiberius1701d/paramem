@@ -108,7 +108,7 @@ class TestChatScopeOnAdminRoute:
         """A chat-scope per-user token → 403 on admin GET endpoint."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        token = store.mint("Speaker0", "Device", scope="chat")
+        token = store.mint("speaker0", "Device", scope="chat")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
@@ -123,7 +123,7 @@ class TestChatScopeOnAdminRoute:
         """A chat-scope per-user token → 403 on admin POST endpoint."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        token = store.mint("Speaker0", "Device", scope="chat")
+        token = store.mint("speaker0", "Device", scope="chat")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
@@ -158,7 +158,7 @@ class TestAdminScopeOnAdminRoute:
         """An admin-scope per-user token → 200 on admin GET endpoint."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        token = store.mint("Speaker0", "Admin Device", scope="admin")
+        token = store.mint("speaker0", "Admin Device", scope="admin")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)
@@ -186,7 +186,7 @@ class TestChatScopeReachesChat:
         """A chat-scope per-user token can reach /chat without 403."""
         _setup_daily(tmp_path, monkeypatch)
         store = _make_store(tmp_path)
-        token = store.mint("Speaker0", "Phone", scope="chat")
+        token = store.mint("speaker0", "Phone", scope="chat")
 
         app = _make_app(user_token_getter=lambda: store)
         client = TestClient(app)

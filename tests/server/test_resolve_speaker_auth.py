@@ -81,13 +81,13 @@ def _make_request(embedding=None, conversation_id="default"):
 class TestAuthSpeakerIdAuthoritative:
     def test_returns_auth_id_and_name_when_store_knows_id(self):
         """auth_speaker_id set + store has profile → returns (id, name)."""
-        store = _make_store({"Speaker0": "Mara"})
+        store = _make_store({"speaker0": "Mara"})
         buf = _make_buffer()
         req = _make_request()
 
-        sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="Speaker0")
+        sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="speaker0")
 
-        assert sid == "Speaker0"
+        assert sid == "speaker0"
         assert name == "Mara"
 
     def test_returns_auth_id_with_none_name_when_store_has_no_profile(self):
@@ -96,9 +96,9 @@ class TestAuthSpeakerIdAuthoritative:
         buf = _make_buffer()
         req = _make_request()
 
-        sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="Speaker0")
+        sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="speaker0")
 
-        assert sid == "Speaker0"
+        assert sid == "speaker0"
         assert name is None
 
     def test_returns_auth_id_with_none_name_when_store_is_absent(self):
@@ -106,9 +106,9 @@ class TestAuthSpeakerIdAuthoritative:
         buf = _make_buffer()
         req = _make_request()
 
-        sid, name = _resolve_speaker(req, buf, speaker_store=None, auth_speaker_id="Speaker0")
+        sid, name = _resolve_speaker(req, buf, speaker_store=None, auth_speaker_id="speaker0")
 
-        assert sid == "Speaker0"
+        assert sid == "speaker0"
         assert name is None
 
     def test_auth_id_overrides_voice_embedding(self):
@@ -117,38 +117,38 @@ class TestAuthSpeakerIdAuthoritative:
         Even when the request carries a speaker embedding that would match a
         different speaker via voice, the authenticated token identity wins.
         """
-        # Store: auth ID "Speaker0" (name "Mara"); voice match would return
-        # "Speaker1" if the embedding branch ran — but it must not run.
+        # Store: auth ID "speaker0" (name "Mara"); voice match would return
+        # "speaker1" if the embedding branch ran — but it must not run.
         store = MagicMock()
         store.get_name.return_value = "Mara"
         # _resolve_speaker now calls resolve_speaker_name (P3) for the auth path.
         store.resolve_speaker_name.return_value = "Mara"
 
         voice_match = MagicMock()
-        voice_match.speaker_id = "Speaker1"
+        voice_match.speaker_id = "speaker1"
         voice_match.tentative = False
         store.match.return_value = voice_match
 
         buf = _make_buffer()
         req = _make_request(embedding=[0.1, 0.2, 0.3])
 
-        sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="Speaker0")
+        sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="speaker0")
 
-        assert sid == "Speaker0"
+        assert sid == "speaker0"
         assert name == "Mara"
         # store.match must never have been called (voice path skipped)
         store.match.assert_not_called()
 
     def test_auth_id_overrides_session_history(self):
         """auth_speaker_id overrides a previously identified session speaker."""
-        store = _make_store({"Speaker0": "Mara"})
+        store = _make_store({"speaker0": "Mara"})
         # Buffer has a different speaker from an earlier turn.
-        buf = _make_buffer(speaker_id="Speaker1", speaker_name="Alice")
+        buf = _make_buffer(speaker_id="speaker1", speaker_name="Alice")
         req = _make_request()
 
-        sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="Speaker0")
+        sid, name = _resolve_speaker(req, buf, store, auth_speaker_id="speaker0")
 
-        assert sid == "Speaker0"
+        assert sid == "speaker0"
         assert name == "Mara"
 
 
@@ -162,7 +162,7 @@ class TestNoAuthSpeakerIdFallthrough:
         """auth_speaker_id=None → voice embedding branch runs normally."""
         store = MagicMock()
         voice_match = MagicMock()
-        voice_match.speaker_id = "Speaker1"
+        voice_match.speaker_id = "speaker1"
         voice_match.name = "Alice"
         voice_match.tentative = False
         store.match.return_value = voice_match
@@ -172,18 +172,18 @@ class TestNoAuthSpeakerIdFallthrough:
 
         sid, name = _resolve_speaker(req, buf, store, auth_speaker_id=None)
 
-        assert sid == "Speaker1"
+        assert sid == "speaker1"
         assert name == "Alice"
 
     def test_none_auth_uses_session_history(self):
         """auth_speaker_id=None, no embedding → session history used."""
         store = _make_store()
-        buf = _make_buffer(speaker_id="Speaker2", speaker_name="Bob")
+        buf = _make_buffer(speaker_id="speaker2", speaker_name="Bob")
         req = _make_request(embedding=None)
 
         sid, name = _resolve_speaker(req, buf, store, auth_speaker_id=None)
 
-        assert sid == "Speaker2"
+        assert sid == "speaker2"
         assert name == "Bob"
 
     def test_none_auth_returns_anonymous_when_no_signals(self):

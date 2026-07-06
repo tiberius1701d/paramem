@@ -62,7 +62,7 @@ def _make_config_yaml(tmp_path: Path, data_dir: Path) -> Path:
 
 def _make_args(
     config: Path,
-    speaker_id: str | None = "Speaker0",
+    speaker_id: str | None = "speaker0",
     *,
     label: str = "",
     onboard_url: str = "",
@@ -96,7 +96,7 @@ class TestHappyPath:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        rc = mint_user_token.run(_make_args(cfg, "Speaker0"))
+        rc = mint_user_token.run(_make_args(cfg, "speaker0"))
 
         assert rc == 0
         store_path = data_dir / "user_tokens.json"
@@ -108,7 +108,7 @@ class TestHappyPath:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        mint_user_token.run(_make_args(cfg, "Speaker0"))
+        mint_user_token.run(_make_args(cfg, "speaker0"))
 
         store = UserTokenStore(data_dir / "user_tokens.json")
         entries = store.list()
@@ -157,7 +157,7 @@ class TestHappyPath:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        mint_user_token.run(_make_args(cfg, "Speaker0"))
+        mint_user_token.run(_make_args(cfg, "speaker0"))
         out = capsys.readouterr().out
 
         token_line = next(ln for ln in out.splitlines() if ln.startswith("token"))
@@ -181,7 +181,7 @@ class TestQrAndTextOutput:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        mint_user_token.run(_make_args(cfg, "Speaker0"))
+        mint_user_token.run(_make_args(cfg, "speaker0"))
         out = capsys.readouterr().out
 
         # Either ANSI escape codes (QR terminal output) or the text fallback are
@@ -198,11 +198,11 @@ class TestQrAndTextOutput:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        mint_user_token.run(_make_args(cfg, "Speaker2", onboard_url="https://example.ts.net"))
+        mint_user_token.run(_make_args(cfg, "speaker2", onboard_url="https://example.ts.net"))
         out = capsys.readouterr().out
         lines = out.splitlines()
 
-        assert any("Speaker2" in ln for ln in lines), "speaker_id must appear in stdout"
+        assert any("speaker2" in ln for ln in lines), "speaker_id must appear in stdout"
         assert any("https://example.ts.net" in ln for ln in lines), (
             "onboard_url must appear in stdout"
         )
@@ -216,7 +216,7 @@ class TestQrAndTextOutput:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        mint_user_token.run(_make_args(cfg, "Speaker0", onboard_url="https://example.ts.net"))
+        mint_user_token.run(_make_args(cfg, "speaker0", onboard_url="https://example.ts.net"))
         out = capsys.readouterr().out
 
         # Token from text fallback line.
@@ -250,7 +250,7 @@ class TestPngOutput:
         png_path = tmp_path / "qr.png"
 
         rc = mint_user_token.run(
-            _make_args(cfg, "Speaker0", onboard_url="https://example.ts.net", png=str(png_path))
+            _make_args(cfg, "speaker0", onboard_url="https://example.ts.net", png=str(png_path))
         )
 
         assert rc == 0
@@ -270,7 +270,7 @@ class TestErrorPaths:
         """Exit 1 with a clear error when config file is not found."""
         missing_cfg = tmp_path / "nonexistent.yaml"
 
-        rc = mint_user_token.run(_make_args(missing_cfg, "Speaker0"))
+        rc = mint_user_token.run(_make_args(missing_cfg, "speaker0"))
 
         assert rc == 1
         err = capsys.readouterr().err
@@ -288,7 +288,7 @@ class TestErrorPaths:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        rc = mint_user_token.run(_make_args(cfg, "Speaker0", onboard_url=""))
+        rc = mint_user_token.run(_make_args(cfg, "speaker0", onboard_url=""))
         assert rc == 0
 
         captured = capsys.readouterr()
@@ -316,7 +316,7 @@ class TestErrorPaths:
         cfg = _make_config_yaml(tmp_path, data_dir)
         png_path = tmp_path / "qr.png"
 
-        rc = mint_user_token.run(_make_args(cfg, "Speaker0", onboard_url="", png=str(png_path)))
+        rc = mint_user_token.run(_make_args(cfg, "speaker0", onboard_url="", png=str(png_path)))
         assert rc == 0
         assert not png_path.exists(), "PNG must NOT be written when --onboard-url is omitted"
 
@@ -338,9 +338,9 @@ class TestCliRegistration:
         from paramem.cli.main import _build_parser
 
         parser = _build_parser()
-        args = parser.parse_args(["mint-user-token", "Speaker0"])
+        args = parser.parse_args(["mint-user-token", "speaker0"])
         assert args.command == "mint-user-token"
-        assert args.speaker_id == "Speaker0"
+        assert args.speaker_id == "speaker0"
 
     def test_all_flags_accepted(self) -> None:
         """All declared flags are accepted by the parser without error."""
@@ -350,7 +350,7 @@ class TestCliRegistration:
         args = parser.parse_args(
             [
                 "mint-user-token",
-                "Speaker0",
+                "speaker0",
                 "--label",
                 "My Tablet",
                 "--onboard-url",
@@ -361,7 +361,7 @@ class TestCliRegistration:
                 "/tmp/qr.png",
             ]
         )
-        assert args.speaker_id == "Speaker0"
+        assert args.speaker_id == "speaker0"
         assert args.label == "My Tablet"
         assert args.onboard_url == "https://example.ts.net"
         assert args.config == "/tmp/cfg.yaml"
@@ -389,7 +389,7 @@ class TestScopeAndUnattributed:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        rc = mint_user_token.run(_make_args(cfg, "Speaker0", scope="admin"))
+        rc = mint_user_token.run(_make_args(cfg, "speaker0", scope="admin"))
         assert rc == 0
 
         store = UserTokenStore(data_dir / "user_tokens.json")
@@ -402,7 +402,7 @@ class TestScopeAndUnattributed:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        rc = mint_user_token.run(_make_args(cfg, "Speaker0"))
+        rc = mint_user_token.run(_make_args(cfg, "speaker0"))
         assert rc == 0
 
         store = UserTokenStore(data_dir / "user_tokens.json")
@@ -437,7 +437,7 @@ class TestScopeAndUnattributed:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        rc = mint_user_token.run(_make_args(cfg, speaker_id="Speaker0", unattributed=True))
+        rc = mint_user_token.run(_make_args(cfg, speaker_id="speaker0", unattributed=True))
         assert rc == 1
         err = capsys.readouterr().err
         assert "cannot be combined" in err or "SPEAKER_ID" in err
@@ -499,7 +499,7 @@ class TestScopeAndUnattributed:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        mint_user_token.run(_make_args(cfg, "Speaker0", scope="admin"))
+        mint_user_token.run(_make_args(cfg, "speaker0", scope="admin"))
         out = capsys.readouterr().out
         assert any("scope" in ln for ln in out.splitlines()), (
             "Text fallback must include a 'scope' line"
@@ -527,7 +527,7 @@ class TestNonTtyWarning:
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        rc = mint_user_token.run(_make_args(cfg, "Speaker0"))
+        rc = mint_user_token.run(_make_args(cfg, "speaker0"))
         assert rc == 0
 
         err = capsys.readouterr().err
@@ -543,7 +543,7 @@ class TestNewParserFlags:
         from paramem.cli.main import _build_parser
 
         parser = _build_parser()
-        args = parser.parse_args(["mint-user-token", "Speaker0", "--scope", "admin"])
+        args = parser.parse_args(["mint-user-token", "speaker0", "--scope", "admin"])
         assert args.scope == "admin"
 
     def test_unattributed_flag_accepted(self) -> None:

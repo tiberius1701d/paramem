@@ -236,7 +236,7 @@ class TestRegistryLastWriteOrder:
             loop.run_consolidation_cycle(
                 _fake_qa(2),
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="conv-i5-001",
                 schedule="every 2h",
@@ -289,7 +289,7 @@ class TestRegistryLastWriteOrder:
                 loop.run_consolidation_cycle(
                     _fake_qa(1),
                     [],
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     mode="train",
                     run_label="conv-i5-002",
                     schedule="every 2h",
@@ -650,7 +650,7 @@ class TestManifestWritten:
             result = loop.run_consolidation_cycle(
                 _fake_qa(2),
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="conv-manifest-001",
                 schedule="every 2h",
@@ -735,7 +735,7 @@ class TestInterTierCommitRecoverable:
                 loop.run_consolidation_cycle(
                     _fake_qa(2),
                     _fake_proc_rels(1),
-                    speaker_id="Speaker0",
+                    speaker_id="speaker0",
                     mode="train",
                     run_label="conv-recover-001",
                     schedule="every 2h",
@@ -788,7 +788,7 @@ class TestSessionIdsProvenanceCarry:
 
         loop = _make_mock_loop(tmp_path)
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("speaker0", speaker_id="Speaker0", attributes={"name": "Alex"})
+        real_graph.add_node("speaker0", speaker_id="speaker0", attributes={"name": "Alex"})
         real_graph.add_node("berlin", attributes={"name": "Berlin"})
         real_graph.add_edge(
             "speaker0",
@@ -852,7 +852,7 @@ class TestSessionIdsProvenanceCarry:
 
         Multi-session edge scenario: the edge carries real session ids from two
         sessions.  The minted entry's speaker_id must come from the subject node's
-        speaker_id attribute ('Speaker0'), not from any session_id value.
+        speaker_id attribute ('speaker0'), not from any session_id value.
         """
         loop = self._make_loop_with_sessions_in_graph(
             tmp_path, session_ids=["session-A", "session-B"]
@@ -863,10 +863,10 @@ class TestSessionIdsProvenanceCarry:
 
         assert deferred_writes, "Expected at least one deferred write"
         rec = deferred_writes[0]
-        # speaker_id on the rec comes from the subject node attribute ("Speaker0"),
+        # speaker_id on the rec comes from the subject node attribute ("speaker0"),
         # not from any session_ids element.
-        assert rec["speaker_id"] == "Speaker0", (
-            f"speaker_id must be 'Speaker0' (from subject node attribute); "
+        assert rec["speaker_id"] == "speaker0", (
+            f"speaker_id must be 'speaker0' (from subject node attribute); "
             f"got {rec['speaker_id']!r}"
         )
         # The rec carries BOTH real session ids.
@@ -881,7 +881,7 @@ class TestSessionIdsProvenanceCarry:
 
         loop = _make_mock_loop(tmp_path)
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("speaker0", speaker_id="Speaker0", attributes={"name": "Alex"})
+        real_graph.add_node("speaker0", speaker_id="speaker0", attributes={"name": "Alex"})
         real_graph.add_node("berlin", attributes={"name": "Berlin"})
         # No 'sessions' key on the edge (legacy graph or edge without stamps).
         real_graph.add_edge("speaker0", "berlin", predicate="lives_in", relation_type="factual")
@@ -973,7 +973,7 @@ class TestRecallFailedSessionStaysPending:
             refinement_normalization=refinement_normalization,
         )
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("alice", speaker_id="Speaker0", attributes={"name": "Alice"})
+        real_graph.add_node("alice", speaker_id="speaker0", attributes={"name": "Alice"})
         real_graph.add_node("paris", attributes={"name": "Paris"})
         real_graph.add_edge(
             "alice",
@@ -1001,7 +1001,7 @@ class TestRecallFailedSessionStaysPending:
                 "predicate": "placeholder",
                 "object": "placeholder",
                 "relation_type": "factual",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
             }
         ]
         with (
@@ -1022,7 +1022,7 @@ class TestRecallFailedSessionStaysPending:
             return loop.run_consolidation_cycle(
                 _dummy_rel,  # bypass guard step 3; real keys come from merger.graph
                 [],  # procedural_rels: empty for episodic-only tests
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode=mode,
                 run_label="test",
                 schedule="",
@@ -1277,7 +1277,7 @@ class TestRecallFailedSessionStaysPending:
             refinement_normalization="on",
         )
         real_graph = nx.MultiDiGraph()
-        real_graph.add_node("alice", speaker_id="Speaker0", attributes={"name": "Alice"})
+        real_graph.add_node("alice", speaker_id="speaker0", attributes={"name": "Alice"})
         real_graph.add_node("paris", attributes={"name": "Paris"})
         real_graph.add_node("london", attributes={"name": "London"})
         # Edge 1: contributing session "session-pass"
@@ -1334,11 +1334,11 @@ class TestRecallFailedSessionStaysPending:
                         "predicate": "p",
                         "object": "p",
                         "relation_type": "factual",
-                        "speaker_id": "Speaker0",
+                        "speaker_id": "speaker0",
                     }
                 ],
                 [],
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="test",
                 schedule="",
@@ -1407,7 +1407,7 @@ class TestRecallFailedSessionStaysPending:
             result = loop.run_consolidation_cycle(
                 [],
                 [{"relation_type": "preference"}],  # non-empty so no-relations guard passes
-                speaker_id="Speaker0",
+                speaker_id="speaker0",
                 mode="train",
                 run_label="test",
                 schedule="",

@@ -71,7 +71,7 @@ def _write_simulate_graph(simulate_dir: Path, tier: str, entries: list[dict]) ->
             **{
                 _IK_KEY_ATTR: entry["key"],
                 "predicate": entry.get("predicate", "related_to"),
-                "speaker_id": entry.get("speaker_id", "Speaker0"),
+                "speaker_id": entry.get("speaker_id", "speaker0"),
             },
         )
     save_memory_to_disk(graph, graph_path, encrypted=False)
@@ -108,7 +108,7 @@ def _full_quad(key: str, predicate: str = "related_to") -> dict:
         "subject": "Subject",
         "predicate": predicate,
         "object": "Object",
-        "speaker_id": "Speaker0",
+        "speaker_id": "speaker0",
     }
 
 
@@ -322,7 +322,7 @@ def _make_loop_train_to_simulate(
                 "subject": "Subject",
                 "predicate": "related_to",
                 "object": "Object",
-                "speaker_id": "Speaker0",
+                "speaker_id": "speaker0",
             },
         )
     loop.store = store
@@ -1582,7 +1582,7 @@ def _write_simulate_graph_at(slot_root: Path, entries: list[dict]) -> Path:
             **{
                 _IK_KEY_ATTR: entry["key"],
                 "predicate": entry.get("predicate", "related_to"),
-                "speaker_id": entry.get("speaker_id", "Speaker0"),
+                "speaker_id": entry.get("speaker_id", "speaker0"),
             },
         )
     save_memory_to_disk(graph, graph_path, encrypted=False)
