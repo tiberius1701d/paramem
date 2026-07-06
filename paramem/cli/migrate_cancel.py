@@ -68,7 +68,9 @@ def run(args: argparse.Namespace) -> int:
         print(
             f"paramem migrate-cancel: the server at {args.server_url} returned 404 for\n"
             "/migration/cancel.\n"
-            "Available migration endpoints: /migration/preview, /cancel, /status, /diff.\n"
+            "Available migration endpoints: /migration/preview, /migration/cancel, "
+            "/migration/confirm, /migration/status, /migration/diff, /migration/accept, "
+            "/migration/rollback.\n"
             "Check `paramem --version` and server version are aligned.",
             file=sys.stderr,
         )

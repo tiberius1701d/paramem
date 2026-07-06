@@ -12,20 +12,21 @@ import sys
 
 from paramem.cli import http_client
 
-_DEFAULT_KINDS = ["config", "graph", "registry"]
-
 
 def run(args: argparse.Namespace) -> int:
     """Execute the ``backup-create`` subcommand.
 
     Parses ``--kinds`` (comma-separated) and ``--label``, POSTs to
-    ``/backup/create``, and renders the result.
+    ``/backup/create``, and renders the result.  Value flags whose ``args``
+    attribute is ``None`` are omitted from the POST body so the server's
+    ``BackupCreateRequest`` default (``["snapshot_bundle"]`` for ``kinds``)
+    is the single source of truth.
 
     Parameters
     ----------
     args:
         Parsed namespace from the ``backup-create`` subparser.  Expected
-        attributes: ``server_url`` (str), ``kinds`` (str), ``label``
+        attributes: ``server_url`` (str), ``kinds`` (str | None), ``label``
         (str | None), ``json`` (bool).
 
     Returns
@@ -35,17 +36,16 @@ def run(args: argparse.Namespace) -> int:
         1 on 400 kind_invalid, HTTP error, or ``success=False`` from the server.
         2 on server unreachable.
     """
-    # Parse --kinds (comma-separated; empty list → default).
-    kinds_raw = getattr(args, "kinds", "")
-    if kinds_raw:
-        kinds = [k.strip() for k in kinds_raw.split(",") if k.strip()]
-    else:
-        kinds = []
-    if not kinds:
-        kinds = _DEFAULT_KINDS
+    # Parse --kinds (comma-separated). None → omit from body; the server
+    # default (["snapshot_bundle"]) then applies.
+    kinds_raw = getattr(args, "kinds", None)
+    body: dict = {}
+    if kinds_raw is not None:
+        body["kinds"] = [k.strip() for k in kinds_raw.split(",") if k.strip()]
 
     label = getattr(args, "label", None)
-    body = {"kinds": kinds, "label": label}
+    if label is not None:
+        body["label"] = label
 
     url = f"{args.server_url}/backup/create"
     try:

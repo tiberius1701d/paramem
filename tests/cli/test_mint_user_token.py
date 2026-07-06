@@ -4,12 +4,12 @@ Covers:
 - Happy path: exit 0, token store created with exactly one entry, token
   round-trips via UserTokenStore.lookup().
 - QR output: something QR-like (or the text fallback) reaches stdout.
-- Deep-link: QR/printed output encodes /app#token=<t>&url=<encoded-server-url>.
-- Text fallback is printed (speaker_id, server_url, token, deeplink).
+- Deep-link: QR/printed output encodes /app#token=<t>&url=<encoded-onboard-url>.
+- Text fallback is printed (speaker_id, onboard_url, token, deeplink).
 - CLI registration: subcommand appears in the top-level parser.
 - Config not found: exit 1 with clear error.
 - PNG write: QR saved to specified path when --png is given.
-- No --server-url: WARNING emitted, no crash, token still printed.
+- No --onboard-url: WARNING emitted, no crash, token still printed.
 - No daily key needed: store written in plaintext (Security OFF) — no
   PARAMEM_DAILY_PASSPHRASE required.
 """
@@ -65,7 +65,7 @@ def _make_args(
     speaker_id: str | None = "Speaker0",
     *,
     label: str = "",
-    server_url: str = "",
+    onboard_url: str = "",
     png: str | None = None,
     scope: str = "chat",
     unattributed: bool = False,
@@ -75,7 +75,7 @@ def _make_args(
     return argparse.Namespace(
         speaker_id=speaker_id,
         label=label,
-        server_url=server_url,
+        onboard_url=onboard_url,
         config=str(config),
         png=png,
         scope=scope,
@@ -189,30 +189,30 @@ class TestQrAndTextOutput:
     def test_text_fallback_lines_present(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
     ) -> None:
-        """speaker_id, server_url, and token lines all appear in stdout."""
+        """speaker_id, onboard_url, and token lines all appear in stdout."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        mint_user_token.run(_make_args(cfg, "Speaker2", server_url="https://example.ts.net"))
+        mint_user_token.run(_make_args(cfg, "Speaker2", onboard_url="https://example.ts.net"))
         out = capsys.readouterr().out
         lines = out.splitlines()
 
         assert any("Speaker2" in ln for ln in lines), "speaker_id must appear in stdout"
         assert any("https://example.ts.net" in ln for ln in lines), (
-            "server_url must appear in stdout"
+            "onboard_url must appear in stdout"
         )
         assert any(ln.startswith("token") for ln in lines), "token line must appear in stdout"
 
     def test_deeplink_has_token_and_url_params(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
     ) -> None:
-        """The printed deep-link contains /app#token=<t>&url=<encoded-server-url>."""
+        """The printed deep-link contains /app#token=<t>&url=<encoded-onboard-url>."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        mint_user_token.run(_make_args(cfg, "Speaker0", server_url="https://example.ts.net"))
+        mint_user_token.run(_make_args(cfg, "Speaker0", onboard_url="https://example.ts.net"))
         out = capsys.readouterr().out
 
         # Token from text fallback line.
@@ -228,7 +228,7 @@ class TestQrAndTextOutput:
         assert token in deeplink, "Deep-link must contain the minted token"
         assert "url=" in deeplink, "Deep-link must contain url= parameter"
         assert "https%3A%2F%2Fexample.ts.net" in deeplink, (
-            "server_url must be percent-encoded in the deep-link"
+            "onboard_url must be percent-encoded in the deep-link"
         )
 
 
@@ -239,14 +239,14 @@ class TestQrAndTextOutput:
 
 class TestPngOutput:
     def test_png_created_when_path_given(self, tmp_path: Path) -> None:
-        """--png writes a PNG file at the specified path when --server-url is also given."""
+        """--png writes a PNG file at the specified path when --onboard-url is also given."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
         png_path = tmp_path / "qr.png"
 
         rc = mint_user_token.run(
-            _make_args(cfg, "Speaker0", server_url="https://example.ts.net", png=str(png_path))
+            _make_args(cfg, "Speaker0", onboard_url="https://example.ts.net", png=str(png_path))
         )
 
         assert rc == 0
@@ -272,51 +272,49 @@ class TestErrorPaths:
         err = capsys.readouterr().err
         assert "config file not found" in err or "not found" in err
 
-    def test_no_server_url_emits_warning_no_crash(
+    def test_no_onboard_url_emits_warning_no_crash(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
     ) -> None:
-        """Omitting --server-url emits a WARNING to stderr, exits 0, and still prints the token.
+        """Omitting --onboard-url emits a WARNING to stderr, exits 0, and still prints the token.
 
         No QR is emitted and no deep-link line appears in stdout — the warning
-        explains that --server-url is required for a scannable QR.
+        explains that --onboard-url is required for a scannable QR.
         """
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
 
-        rc = mint_user_token.run(_make_args(cfg, "Speaker0", server_url=""))
+        rc = mint_user_token.run(_make_args(cfg, "Speaker0", onboard_url=""))
         assert rc == 0
 
         captured = capsys.readouterr()
         assert "WARNING" in captured.err, (
-            "A WARNING must appear in stderr when --server-url is omitted"
+            "A WARNING must appear in stderr when --onboard-url is omitted"
         )
-        assert "--server-url" in captured.err or "server-url" in captured.err, (
-            "The warning must mention --server-url"
-        )
+        assert "--onboard-url" in captured.err, "The warning must mention --onboard-url"
 
         # Token is still printed as a text fallback.
         lines = captured.out.splitlines()
         assert any(ln.startswith("token") for ln in lines), (
-            "Plaintext token must still be printed even without --server-url"
+            "Plaintext token must still be printed even without --onboard-url"
         )
-        # No deep-link line when server_url is empty.
+        # No deep-link line when onboard_url is empty.
         assert not any(ln.startswith("deeplink") for ln in lines), (
-            "No deeplink line must appear when --server-url is omitted"
+            "No deeplink line must appear when --onboard-url is omitted"
         )
 
-    def test_no_server_url_with_png_emits_warning(
+    def test_no_onboard_url_with_png_emits_warning(
         self, tmp_path: Path, capsys: pytest.CaptureFixture
     ) -> None:
-        """--png combined with no --server-url emits a warning that --png is ignored."""
+        """--png combined with no --onboard-url emits a warning that --png is ignored."""
         data_dir = tmp_path / "data"
         data_dir.mkdir()
         cfg = _make_config_yaml(tmp_path, data_dir)
         png_path = tmp_path / "qr.png"
 
-        rc = mint_user_token.run(_make_args(cfg, "Speaker0", server_url="", png=str(png_path)))
+        rc = mint_user_token.run(_make_args(cfg, "Speaker0", onboard_url="", png=str(png_path)))
         assert rc == 0
-        assert not png_path.exists(), "PNG must NOT be written when --server-url is omitted"
+        assert not png_path.exists(), "PNG must NOT be written when --onboard-url is omitted"
 
         err = capsys.readouterr().err
         assert "WARNING" in err
@@ -351,7 +349,7 @@ class TestCliRegistration:
                 "Speaker0",
                 "--label",
                 "My Tablet",
-                "--server-url",
+                "--onboard-url",
                 "https://example.ts.net",
                 "--config",
                 "/tmp/cfg.yaml",
@@ -361,7 +359,7 @@ class TestCliRegistration:
         )
         assert args.speaker_id == "Speaker0"
         assert args.label == "My Tablet"
-        assert args.server_url == "https://example.ts.net"
+        assert args.onboard_url == "https://example.ts.net"
         assert args.config == "/tmp/cfg.yaml"
         assert args.png == "/tmp/qr.png"
 

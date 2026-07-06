@@ -3,7 +3,7 @@
 Mints an opaque bearer token into the :class:`paramem.server.user_tokens.UserTokenStore`
 for the specified speaker and renders a scannable QR code containing the onboarding
 deep-link URL to stdout.  The QR encodes a URL of the form
-``https://<host>/app#token=<t>&url=<encoded-server-url>`` — exactly the form the
+``https://<host>/app#token=<t>&url=<encoded-onboard-url>`` — exactly the form the
 phone's **native camera** can open, which causes the PWA to store the credentials
 automatically without any manual copy-paste.
 
@@ -48,8 +48,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         description=(
             "Mints an opaque bearer token for SPEAKER_ID, writes it to the "
             "UserTokenStore, and prints a scannable QR code to stdout. "
-            "When --server-url is given the QR encodes a deep-link onboarding URL "
-            "of the form https://<host>/app#token=<t>&url=<server-url>, which the "
+            "When --onboard-url is given the QR encodes a deep-link onboarding URL "
+            "of the form https://<host>/app#token=<t>&url=<onboard-url>, which the "
             "phone's native camera can open to onboard the device automatically. "
             "The plaintext token and the deep-link URL are also printed as a text "
             "fallback. "
@@ -75,7 +75,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help='Human-readable device or purpose label stored with the token (default: "").',
     )
     p.add_argument(
-        "--server-url",
+        "--onboard-url",
         default="",
         metavar="URL",
         help=(
@@ -159,12 +159,12 @@ def run(args: argparse.Namespace) -> int:
 
     Resolves the data directory from the server config, mints a bearer token
     via :class:`paramem.server.user_tokens.UserTokenStore`, and (when
-    ``--server-url`` is provided) renders a terminal QR code of the deep-link
-    onboarding URL ``https://<host>/app#token=<t>&url=<encoded-server-url>``.
+    ``--onboard-url`` is provided) renders a terminal QR code of the deep-link
+    onboarding URL ``https://<host>/app#token=<t>&url=<encoded-onboard-url>``.
     The deep-link is scannable by the phone's native camera, which opens the PWA
     and stores credentials automatically.
 
-    When ``--server-url`` is omitted a QR is not produced; a WARNING is printed
+    When ``--onboard-url`` is omitted a QR is not produced; a WARNING is printed
     to stderr and only the plaintext token is emitted.
 
     The plaintext token and (when applicable) the deep-link URL are printed to
@@ -237,13 +237,13 @@ def run(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # Build and emit the QR only when --server-url is given.  Without it we
+    # Build and emit the QR only when --onboard-url is given.  Without it we
     # cannot produce an absolute deep-link that the native camera can open.
-    if args.server_url:
-        base = args.server_url.rstrip("/")
+    if args.onboard_url:
+        base = args.onboard_url.rstrip("/")
         # token is secrets.token_urlsafe(32) — already URL-safe, no encoding needed.
         # Percent-encode the url= value because it contains "://" and "/" characters.
-        deeplink = f"{base}/app#token={token}&url={quote(args.server_url, safe='')}"
+        deeplink = f"{base}/app#token={token}&url={quote(args.onboard_url, safe='')}"
 
         qr = segno.make(deeplink)
 
@@ -263,13 +263,13 @@ def run(args: argparse.Namespace) -> int:
                 return 1
     else:
         print(
-            "WARNING: --server-url not provided; no QR code emitted.  "
-            "Pass --server-url <https://your-host> to produce a native-camera-scannable QR.",
+            "WARNING: --onboard-url not provided; no QR code emitted.  "
+            "Pass --onboard-url <https://your-host> to produce a native-camera-scannable QR.",
             file=sys.stderr,
         )
         if args.png:
             print(
-                "WARNING: --png ignored because --server-url is required to build the QR.",
+                "WARNING: --png ignored because --onboard-url is required to build the QR.",
                 file=sys.stderr,
             )
         deeplink = ""
@@ -283,7 +283,7 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     print(f"speaker_id : {speaker_display}")
-    print(f"server_url : {args.server_url}")
+    print(f"onboard_url : {args.onboard_url}")
     print(f"scope      : {scope}")
     print(f"token      : {token}")
     if deeplink:

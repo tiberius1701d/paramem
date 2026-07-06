@@ -20,27 +20,62 @@ from pathlib import Path
 from paramem.cli import http_client
 
 
-def _trial_json_path(server_url: str) -> Path:
-    """Return the conventional path to ``state/trial.json`` on the local host.
+def _resolve_data_dir(config: str) -> Path | None:
+    """Resolve the data directory from the server config.
 
-    The marker lives at ``data/ha/state/trial.json`` (inside the ``data/ha/``
-    tree, NOT at a bare ``state/`` path).  The CLI and server always share
-    the same host, so this relative path resolves correctly when the CLI is
-    invoked from the project root.
+    Mirrors the pattern in :func:`paramem.cli.mint_user_token._resolve_data_dir`.
+
+    Parameters
+    ----------
+    config:
+        Path to the server config file (typically ``args.config``).
+
+    Returns
+    -------
+    Path | None
+        The resolved data directory, or ``None`` if the config file was not
+        found (an error message is printed to stderr before returning).
+    """
+    from paramem.server.config import load_server_config
+
+    config_path = Path(config).expanduser().resolve()
+    if not config_path.exists():
+        print(f"ERROR: config file not found: {config_path}", file=sys.stderr)
+        return None
+    cfg = load_server_config(str(config_path))
+    return cfg.paths.data
+
+
+def _trial_json_path(server_url: str, config: str = "configs/server.yaml") -> Path:
+    """Return the path to ``state/trial.json`` under the configured data dir.
+
+    The marker lives at ``<paths.data>/state/trial.json``.  The data
+    directory is resolved from the server config (mirroring
+    :func:`paramem.cli.mint_user_token._resolve_data_dir`) rather than a
+    hardcoded ``data/ha`` path, so the CLI honors a non-default
+    ``paths.data`` the same way the server does.
 
     Parameters
     ----------
     server_url:
         Not used to derive the path (the path is always local), but kept as
-        a parameter for future multi-host extensions.
+        a parameter for backward compatibility / future multi-host
+        extensions.
+    config:
+        Path to the server config file used to resolve ``paths.data``.
+        Defaults to ``configs/server.yaml``.
 
     Returns
     -------
     Path
-        Relative path ``data/ha/state/trial.json`` resolved from the current
-        working directory.
+        ``<paths.data>/state/trial.json``.  Falls back to
+        ``data/ha/state/trial.json`` when the config file cannot be
+        resolved (e.g. offline fallback invoked from an unexpected cwd).
     """
-    return Path("data") / "ha" / "state" / "trial.json"
+    data_dir = _resolve_data_dir(config)
+    if data_dir is None:
+        return Path("data") / "ha" / "state" / "trial.json"
+    return Path(data_dir) / "state" / "trial.json"
 
 
 def run(args: argparse.Namespace) -> int:
@@ -67,7 +102,9 @@ def run(args: argparse.Namespace) -> int:
         print(
             f"paramem migrate-status: the server at {args.server_url} returned 404 for\n"
             "/migration/status.\n"
-            "Available migration endpoints: /migration/preview, /cancel, /status, /diff.\n"
+            "Available migration endpoints: /migration/preview, /migration/cancel, "
+            "/migration/confirm, /migration/status, /migration/diff, /migration/accept, "
+            "/migration/rollback.\n"
             "Check `paramem --version` and server version are aligned.",
             file=sys.stderr,
         )
@@ -76,7 +113,9 @@ def run(args: argparse.Namespace) -> int:
         # Server is offline — fall back to reading state/trial.json directly.
         # The file does not exist during initial deploy; print a clear message
         # and exit 0 (absence of a trial marker is not an error).
-        trial_path = _trial_json_path(args.server_url)
+        trial_path = _trial_json_path(
+            args.server_url, getattr(args, "config", "configs/server.yaml")
+        )
         if trial_path.exists():
             try:
                 trial_data = json.loads(trial_path.read_text(encoding="utf-8"))

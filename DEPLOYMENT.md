@@ -531,7 +531,7 @@ When `mobile_pwa.enabled: true`, each device that should access the server must 
 ```bash
 paramem mint-user-token [SPEAKER_ID] \
     [--label LABEL] \
-    [--server-url URL] \
+    [--onboard-url URL] \
     [--config PATH] \
     [--png FILE] \
     [--scope {chat,admin}] \
@@ -544,16 +544,16 @@ paramem mint-user-token [SPEAKER_ID] \
 - `--unattributed` — mint a token with no bound speaker (for shared devices that identify speakers by voice embedding). Cannot be combined with a positional `SPEAKER_ID`.
 - `--force-admin` — required when combining `--scope admin` with `--unattributed`. Prints a warning: an unattributed admin token cannot be revoked by speaker; use `revoke-user-token --label` to revoke it.
 - `--label` — human-readable device or purpose label stored with the token (e.g. `phone`).
-- `--server-url` — base URL of the ParaMem server (e.g. `https://<your-host>.<your-tailnet>.ts.net`). Required to produce a native-camera-scannable QR deep-link; omitting it skips the QR and emits a warning.
+- `--onboard-url` — base URL of the ParaMem server (e.g. `https://<your-host>.<your-tailnet>.ts.net`). Required to produce a native-camera-scannable QR deep-link; omitting it skips the QR and emits a warning.
 - `--config` — server config path (default: `configs/server.yaml`), used to resolve the data directory.
 - `--png` — also save the QR as a PNG file.
 
-The command prints a terminal QR encoding a deep-link URL (`https://<host>/app#token=<t>&url=<encoded-server-url>`) plus a text fallback, then exits. The QR is scannable with the phone's native camera — no app is needed. The plaintext token is never written to any log file. Example:
+The command prints a terminal QR encoding a deep-link URL (`https://<host>/app#token=<t>&url=<encoded-onboard-url>`) plus a text fallback, then exits. The QR is scannable with the phone's native camera — no app is needed. The plaintext token is never written to any log file. Example:
 
 ```bash
 paramem mint-user-token Speaker0 \
     --label phone \
-    --server-url "https://<your-host>.<your-tailnet>.ts.net"
+    --onboard-url "https://<your-host>.<your-tailnet>.ts.net"
 ```
 
 **Encryption note.** If `PARAMEM_DAILY_PASSPHRASE` is set and the daily key is loaded (Security ON), `user_tokens.json` is age-encrypted; the passphrase must be available when running this command. Without a daily key the store is written in plaintext (Security OFF). See [`SECURITY.md §5`](SECURITY.md) for the full token-store encryption contract.
@@ -611,7 +611,7 @@ This is the flow for adding a household member (e.g. "Alice's iPhone") to an exi
 ```bash
 paramem mint-user-token Speaker1 \
     --label "Alice iPhone" \
-    --server-url "https://<your-host>.<your-tailnet>.ts.net" \
+    --onboard-url "https://<your-host>.<your-tailnet>.ts.net" \
     --png /tmp/alice-iphone-qr.png
 ```
 

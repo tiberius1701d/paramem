@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from paramem.backup.types import ArtifactKind
 from paramem.cli import (
     backup_create,
     backup_list,
@@ -75,8 +76,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- migrate ---
     p_migrate = subparsers.add_parser(
         "migrate",
-        help="Preview a candidate server.yaml migration.",
-        description=("POST /migration/preview with a candidate config path."),
+        help="Run an interactive trial migration to a candidate server.yaml.",
+        description=(
+            "Runs the interactive migration trial: preview the candidate config, "
+            "confirm to start the trial, poll trial-gate status, then accept or "
+            "roll back. --json switches to preview-only mode: emits the raw "
+            "PreviewResponse and does not run the trial."
+        ),
     )
     p_migrate.add_argument(
         "path",
@@ -94,6 +100,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "migrate-status",
         help="Show the current migration trial status.",
         description=("GET /migration/status."),
+    )
+    p_ms.add_argument(
+        "--config",
+        default="configs/server.yaml",
+        metavar="PATH",
+        help=(
+            "Server config used to resolve paths.data for the offline "
+            "trial.json fallback (default: configs/server.yaml)."
+        ),
     )
     p_ms.add_argument(
         "--json",
@@ -153,7 +168,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_bl.add_argument(
         "--kind",
-        choices=["config", "graph", "registry", "snapshot", "resume"],
+        choices=[k.value for k in ArtifactKind],
         default=None,
         help="Filter by artifact kind.",
     )
@@ -171,10 +186,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_bc.add_argument(
         "--kinds",
-        default="config,graph,registry",
+        default=None,
         metavar="KINDS",
         help=(
-            "Comma-separated list of artifact kinds to back up (default: config,graph,registry)."
+            "Comma-separated list of artifact kinds to back up. When omitted, the "
+            "server default (snapshot_bundle, the self-contained recovery bundle) "
+            "is used. Explicit config,graph,registry is still accepted "
+            "(deprecated per-artifact)."
         ),
     )
     p_bc.add_argument(
@@ -192,13 +210,25 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- backup-restore ---
     p_br = subparsers.add_parser(
         "backup-restore",
-        help="Restore a config backup (only kind=config supported).",
+        help=(
+            "Restore a backup slot onto the live store (config or snapshot_bundle; "
+            "kind auto-detected from the slot)."
+        ),
         description="POST /backup/restore.",
     )
     p_br.add_argument(
         "backup_id",
         metavar="BACKUP_ID",
         help="Slot directory name to restore (e.g. 20260421-04000012).",
+    )
+    p_br.add_argument(
+        "--restore-config",
+        action="store_true",
+        dest="restore_config",
+        help=(
+            "For a snapshot_bundle, also restore the bundle's server.yaml to the "
+            "live config (default: leave live config untouched)."
+        ),
     )
     p_br.add_argument(
         "--json",

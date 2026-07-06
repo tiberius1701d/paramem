@@ -186,26 +186,28 @@ class TestMigrateStatusOfflineFallback:
 
 
 class TestTrialJsonPathCorrection:
-    """_trial_json_path returns data/ha/state/trial.json.
+    """_trial_json_path resolves <paths.data>/state/trial.json from the config.
 
-    The marker lives at data/ha/state/trial.json inside the data/ha/ tree,
-    NOT at a bare state/trial.json path relative to the project root.
-    This test asserts the path constant directly so a future regression
-    is caught at the unit level.
+    The marker lives at ``<paths.data>/state/trial.json``.  ``paths.data`` is
+    resolved via ``load_server_config()`` (anchored to the project root, same
+    as ``mint_user_token._resolve_data_dir``) rather than a hardcoded
+    ``data/ha`` path, so the CLI honors a non-default ``paths.data`` the same
+    way the server does.
     """
 
     def test_migrate_status_offline_reads_data_ha_state_trial_json(self):
-        """_trial_json_path() returns Path('data/ha/state/trial.json').
+        """_trial_json_path() resolves to <project-root>/data/ha/state/trial.json.
 
-        The path must match data/ha/state/trial.json exactly — a cwd-relative
-        state/trial.json would fail to locate the marker when the server writes
-        to data/ha/state/.
+        With the default configs/server.yaml (paths.data: data/ha), the
+        resolved path must end in data/ha/state/trial.json — not a
+        cwd-relative bare state/trial.json.
         """
         path = _trial_json_path("http://localhost:8420")
-        expected = Path("data") / "ha" / "state" / "trial.json"
-        assert path == expected, (
-            f"_trial_json_path returned {path!r}; expected {expected!r}. "
-            "Correction 4: marker lives at data/ha/state/trial.json, not state/trial.json."
+        assert path.is_absolute(), f"_trial_json_path must resolve to an absolute path: {path!r}"
+        expected_suffix = Path("data") / "ha" / "state" / "trial.json"
+        assert path.parts[-4:] == expected_suffix.parts, (
+            f"_trial_json_path returned {path!r}; expected it to end in {expected_suffix!r}. "
+            "Correction 4: marker lives under paths.data/state/trial.json."
         )
 
     def test_migrate_status_offline_marker_present_renders_trial_state(

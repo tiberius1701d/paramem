@@ -196,7 +196,11 @@ class TestBackupListKindFilterPassthrough:
 
 class TestBackupCreateDefaultKinds:
     def test_backup_create_default_kinds_posts_correct_body(self, monkeypatch, capsys) -> None:
-        """main(['backup-create']) → POST body kinds=["config","graph","registry"]."""
+        """main(['backup-create']) with no --kinds → body omits kinds/label entirely.
+
+        The server's BackupCreateRequest default (["snapshot_bundle"]) is the
+        single source of truth; the CLI must not hardcode a stale default.
+        """
         seen_bodies = []
 
         def _fake_post(url, body, **kw):
@@ -207,8 +211,12 @@ class TestBackupCreateDefaultKinds:
         rc = main(["backup-create"])
         assert rc == 0
         assert seen_bodies
-        assert seen_bodies[0]["kinds"] == ["config", "graph", "registry"]
-        assert seen_bodies[0]["label"] is None
+        assert "kinds" not in seen_bodies[0], (
+            f"kinds must be omitted so the server default applies: {seen_bodies[0]!r}"
+        )
+        assert "label" not in seen_bodies[0], (
+            f"label must be omitted when not given: {seen_bodies[0]!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -262,15 +270,71 @@ class TestBackupCreateRendersSlotsAndSkips:
 
 class TestBackupRestoreHappyPath:
     def test_backup_restore_happy_path(self, monkeypatch, capsys) -> None:
-        """Mocked 200 → stdout contains 'Restored config' + restart hint; rc=0."""
+        """Mocked 200 → stdout contains 'Restored backup' + restart hint; rc=0."""
         fake_resp = _fake_restore_response("20260421-040000")
         monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: fake_resp)
-        args = _args(backup_id="20260421-040000", json=False)
+        args = _args(backup_id="20260421-040000", restore_config=False, json=False)
         rc = backup_restore.run(args)
         assert rc == 0
         captured = capsys.readouterr()
-        assert "Restored config" in captured.out
+        assert "Restored backup" in captured.out
         assert "restart" in captured.out.lower() or "systemctl" in captured.out
+
+    def test_backup_restore_default_sends_restore_config_false(self, monkeypatch) -> None:
+        """No --restore-config → POST body has restore_config=False (always present)."""
+        seen_bodies = []
+
+        def _fake_post(url, body, **kw):
+            seen_bodies.append(body)
+            return _fake_restore_response("20260421-040000")
+
+        monkeypatch.setattr(http_client, "post_json", _fake_post)
+        args = _args(backup_id="20260421-040000", restore_config=False, json=False)
+        backup_restore.run(args)
+        assert seen_bodies
+        assert seen_bodies[0]["restore_config"] is False
+
+    def test_backup_restore_restore_config_flag_sends_true(self, monkeypatch) -> None:
+        """--restore-config → POST body has restore_config=True."""
+        seen_bodies = []
+
+        def _fake_post(url, body, **kw):
+            seen_bodies.append(body)
+            return _fake_restore_response("20260421-040000")
+
+        monkeypatch.setattr(http_client, "post_json", _fake_post)
+        args = _args(backup_id="20260421-040000", restore_config=True, json=False)
+        backup_restore.run(args)
+        assert seen_bodies
+        assert seen_bodies[0]["restore_config"] is True
+
+    def test_backup_restore_snapshot_bundle_renders_adapters_and_orphans(
+        self, monkeypatch, capsys
+    ) -> None:
+        """A snapshot_bundle restore response renders restored_adapters/pruned_orphans
+
+        and does NOT print the old config-only 'Restored config' header.
+        """
+        fake_resp = {
+            "restored": {"registry": "/data/backups/registry/latest"},
+            "backed_up_pre_restore": {"bundle": "/data/backups/snapshot/safety"},
+            "restart_required": True,
+            "restart_hint": "systemctl --user restart paramem-server",
+            "restored_adapters": ["episodic", "semantic"],
+            "pruned_orphans": [
+                {"name": "procedural_interim_3", "kind": "interim", "active_keys": 12}
+            ],
+        }
+        monkeypatch.setattr(http_client, "post_json", lambda *a, **kw: fake_resp)
+        args = _args(backup_id="20260421-040000", restore_config=True, json=False)
+        rc = backup_restore.run(args)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "Restored config" not in captured.out
+        assert "episodic" in captured.out
+        assert "semantic" in captured.out
+        assert "procedural_interim_3" in captured.out
+        assert "interim" in captured.out
 
 
 # ---------------------------------------------------------------------------
