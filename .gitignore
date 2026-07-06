@@ -148,3 +148,6 @@ experiments/fixtures/
 # spec=Path mocks is a separate pass.
 <MagicMock*
 MagicMock/
+
+# StrictDoc requirements baseline — gitignored until it splits into its own repo
+baseline/
