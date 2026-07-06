@@ -98,7 +98,8 @@ Grouped index of all tests. See Part headers below for context.
 [Test 11 — Extraction Pipeline Configuration](#test-11-extraction-pipeline-configuration) ·
 [6-Model Extraction Comparison](#6-model-extraction-comparison-2026-04-14) ·
 [Extraction Probe Sweep](#extraction-probe-sweep-2026-04-17) ·
-[Extraction Pipeline Evolution](#extraction-pipeline-evolution)
+[Extraction Pipeline Evolution](#extraction-pipeline-evolution) ·
+[Predicate-Synonym Normalization: Default On](#predicate-synonym-normalization-default-on-2026-07-06)
 
 **Part 7 — Deployment & operations:**
 [HA Pipeline Latency](#ha-pipeline-latency-2026-03-27) ·
@@ -2998,6 +2999,38 @@ Outlines never worked in production — 0% success across all Tests 1-8 due to a
 ### Current privacy-aware pipeline
 
 Extract → anonymize → leak-guard + repair → SOTA enrich (with `new_entity_bindings`) → state-machine deanonymize (residual-placeholder fact-drop) → plausibility filter. Each stage has one job and a clear failure mode. Prompts externalized to `configs/prompts/`. The May 2026 redesign replaced the prior LLM-based deanonymization step with deterministic state-machine substitution driven by SOTA-declared bindings — eliminated the session-2 VRAM-crash class and the false-binding class that arose from token-diffing transcripts. The transcript-grounding gate was removed shortly after (post-hoc token-attestation against the original transcript was structurally incompatible with SOTA's licensed enrichment surface; CV probe data showed it dropped reasonable enrichments at high recall cost without catching genuine fabrications). See "Extraction Probe Sweep (2026-04-17)" below for validated results at scale (recorded under the prior architecture; the current pipeline is structurally simpler but emits the same fact shape).
+
+---
+
+## Predicate-Synonym Normalization: Default On (2026-07-06)
+
+The full-fold predicate-synonym collapse pass (consolidation.refinement_normalization)
+now defaults on. During consolidation it makes one model call per candidate
+(subject, object) group and collapses synonymous predicates on that same pair — e.g.
+"Alex likes jazz" and "Alex enjoys jazz" become one edge. It is predicate-only:
+objects are never merged.
+
+Measured on a single full fold (local Mistral 7B, 2026-07-06): 23 candidate
+(subject, object) groups examined, 19 predicate clusters collapsed across 21 edges.
+Two were clear over-merges — "owns" folded into "has pet" (on a fictional pet) and
+"plays on schedule" folded into "spends time on" (on a generic time-of-day object) —
+plus one borderline case ("best friend" folded into "is friends with", losing
+intensity). Every real-fact merge was clean: skills ("has skill" = "domain expertise"),
+languages ("knows language" = "speaks language"), team-scaling, country of residence,
+and dates all collapsed correctly. Precision on this fold was approximately 0.89
+(17 of 19).
+
+Framing: this is one small-n fold on one model, not a benchmark — the diagnostics
+come from the live fold, not a persisted outputs/ results file. Both over-merges
+landed on fictional or generic objects, so real-entity behavior at scale is not
+established here. The observed error mode is collapsing predicates that are
+directionally related but not synonymous.
+
+Why enabled despite the errors: the prior bar for enabling this pass was zero
+over-merges. That bar was relaxed by an explicit decision — the pass is predicate-only
+(no object or fact loss), every real-fact merge on this fold was clean, and the setting
+is reversible. The over-merge mode remains a known limitation to watch as production
+entities and fold sizes grow.
 
 ---
 

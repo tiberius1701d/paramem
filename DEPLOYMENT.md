@@ -803,8 +803,11 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | POST | `/debug/recall` | admin + `config.debug=true` | Operator-only direct adapter recall probe.  Bypasses the router and reasoning step: activates `adapter` (or disables all when `adapter="none"`), runs `text` through the model, returns raw output + a `parse_recalled_entry` attempt + the active adapter + latency.  Use to measure direct natural-language recall from adapter weights as distinct from the cache-driven enumerate-then-reason path on `/chat`.  Body: `{text, adapter, system_prompt?, max_new_tokens?, temperature?}`. |
 | GET | `/debug/dump` | admin + `config.debug=true` | Operator-only zero-GPU read of the in-memory `MemoryStore`.  Walks `iter_entries()` and returns every `(tier, key, entry)` as a flat list.  ~5 ms for typical operator-scale stores vs ~min for the equivalent per-key `/debug/recall` sweep.  Use for content inventory, cross-model A/B setup, or scoring against a probe-suite output. |
 | POST | `/calibrate/extract` | admin + `calibrate_endpoint_enabled` | Live extraction prompt probe — run the extraction pipeline on a sample transcript; no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
+| POST | `/calibrate/procedural` | admin + `calibrate_endpoint_enabled` | Live procedural-extraction prompt probe; no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
 | POST | `/calibrate/anonymize` | admin + `calibrate_endpoint_enabled` | Live anonymization prompt probe — no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
+| POST | `/calibrate/normalize` | admin + `calibrate_endpoint_enabled` | Live predicate-synonym normalization probe (retest harness for `refinement_normalization`); no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
 | POST | `/calibrate/plausibility` | admin + `calibrate_endpoint_enabled` | Live plausibility-filter prompt probe — no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
+| POST | `/calibrate/name` | admin + `calibrate_endpoint_enabled` | Live name-extraction prompt probe; no weights written. Gated by `consolidation.calibrate_endpoint_enabled=true` (default off). |
 
 **Chat request:**
 

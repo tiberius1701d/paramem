@@ -58,11 +58,30 @@ Experiments require a GPU with 8GB+ VRAM:
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Smoke test (~4 min)
-python experiments/phase4_indexed_keys_smoke.py --num-epochs 30
+# Smoke test — trains a tiny procedural adapter (attention + MLP target modules)
+# and asserts loss drops without CUDA OOM on 8 GB VRAM
+python experiments/smoke_procedural_mlp.py
 
 # Post-install REST smoke (needs a running server, debug: true, PARAMEM_API_TOKEN)
 python examples/quick_start.py
+```
+
+Prompts are editable without a code change — every LLM-touching pipeline stage reads its prompt from `configs/prompts/*.txt` (see [Tuning prompts](#tuning-prompts) below).
+
+### Tuning prompts
+
+`scripts/dev/calibrate_prompts.py` drives the `/calibrate/*` endpoints against the running server's local model, so a prompt edit can be validated live (extract, anonymize, enrich, plausibility, and the other calibration stages) without touching training code. The endpoints it calls are gated behind `consolidation.calibrate_endpoint_enabled` (default off) — see [DEPLOYMENT.md](DEPLOYMENT.md) for the full `/calibrate/*` reference.
+
+### Running GPU tests
+
+The default `pytest tests/` run auto-deselects `@pytest.mark.gpu` tests (see `tests/conftest.py`) so the CPU-only suite never touches CUDA. To opt in:
+
+```bash
+# Run everything, including GPU-marked tests
+pytest --gpu
+
+# Recall tests (train ~30 epochs + probe) require --gpu as well
+pytest --gpu --recall
 ```
 
 ## Pull Request Process

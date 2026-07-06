@@ -66,7 +66,7 @@ Base Model (frozen, 4-bit quantized)
 
 During inference, adapters can be switched at near-zero cost. During training, each adapter is optimized independently with its own objective.
 
-### AD-11: Procedural Adapter Targets MLP Layers (Phase 4, live in server deployment)
+### AD-11: Procedural Adapter Targets MLP Layers (live in server deployment)
 
 The procedural adapter targets both attention layers (`q/k/v/o_proj`) and MLP layers (`gate/up/down_proj`). Episodic and semantic adapters target attention only.
 
@@ -78,7 +78,7 @@ The procedural adapter targets both attention layers (`q/k/v/o_proj`) and MLP la
 
 Extraction uses a dedicated `extraction_procedural.txt` prompt for preference/behavioral content, separate from the factual extraction prompt.
 
-### AD-13: Indexed Key Memory (Phase 4)
+### AD-13: Indexed Key Memory
 
 Per-fact addressable recall using sequential keys in a chat-template JSON format. Each fact is assigned a key (graph1, graph2, …) and the model is trained to reconstruct that fact when prompted with the key. Training stays in the proven chat-template shape that avoids the format collision produced by mixing QA pairs and hashes in a single adapter pass.
 
@@ -90,7 +90,7 @@ Per-fact addressable recall using sequential keys in a chat-template JSON format
 
 A QA-trained adapter probed with the quad template fails (and vice versa), so the inference path reads each adapter's format and uses the matching template + parser.
 
-### AD-14: SimHash Registry for Hallucination Detection (Phase 4)
+### AD-14: SimHash Registry for Hallucination Detection
 
 An external SimHash registry (key → 64-bit fingerprint) is saved alongside each adapter. SimHash is a locality-sensitive hash (Charikar, 2002): similar content produces similar fingerprints, enabling continuous confidence scoring (0.0–1.0) rather than binary pass/fail.
 
@@ -134,32 +134,33 @@ The knowledge graph is a JSON document per session, merged into a cumulative gra
 
 Rationale: Personal-scale data (hundreds to low thousands of entities) doesn't need a database. JSON + NetworkX is sufficient, zero-dependency, and trivially portable. A graph DB can be added later if scale demands it.
 
-### AD-16: Multi-Stage Privacy-Aware Extraction Pipeline (Phase 5)
+### AD-16: Multi-Stage Privacy-Aware Extraction Pipeline
 
 Graph extraction is a staged chain built around a cloud-boundary privacy envelope.
 The local model owns everything that touches real user data; the SOTA cloud model
 sees only anonymized placeholders. Every stage falls forward — a failure at stage
 N keeps the predecessor's output and continues.
 
-1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. The session speaker's stable `Speaker{N}` system id is injected as the canonical subject of their facts; the display name is passed as comprehension context and resolved to a name only at inference/render time.
+1. **Extract** (`configs/prompts/extraction.txt`): local model emits triples + entities. The session speaker's stable `speaker{N}` system id is injected as the canonical subject of their facts; the display name is passed as comprehension context and resolved to a name only at inference/render time.
 2. **Anonymize** (`configs/prompts/anonymization.txt`): local model produces `{real → placeholder}` mapping + anonymized transcript.
-3. **Leak guard + repair**: PII-scoped check with optional spaCy NER cross-check. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`). Missed names extend the mapping, hallucinated names drop referencing triples, orphan placeholders are dropped at the residual sweep.
-4. **SOTA enrichment with delta protocol** (`configs/prompts/sota_enrichment.txt`): SOTA returns a delta envelope `{add, modify, drop, bindings}` — only the changes against the input fact list, plus `bindings: {placeholder: real_name}` for net-new entities. The pipeline applies the delta, merges bindings before de-anonymization, and reconstructs the updated transcript locally. No transcript token-diff and no fact-echo (order-of-magnitude token reduction vs. the prior "echo every fact" envelope).
-5. **De-anonymize** (`_apply_bindings`): deterministic substring replacement of placeholder tokens with their real values from the merged reverse mapping. Any fact whose subject or object still contains a placeholder-shaped token after substitution is dropped.
-6. **Plausibility** (`configs/prompts/sota_plausibility.txt` or `local_plausibility_filter`): grounding-based residual safety net. Six rules cover (R1) self-loops, (R2) name-swap and role-leak shapes, (R3) transcript contradiction, (R4) conversation-role leaks, (R5) content-free objects, (R6) namespaced system identifiers.
+3. **Entity-surface correction** (`configs/prompts/entity_correction.txt`): the local model reviews real entity surfaces on the anonymization reverse map and node attributes and corrects misspelled place/org/concept names; an apply-gate rejects any proposal targeting an entity not already known, and all verdicts — accepted and rejected — are recorded on `graph.diagnostics["entity_correction_verdicts"]` (persisted as a debug artifact when debug is on). Speaker/person nodes are left untouched.
+4. **Leak guard + repair**: PII-scoped check with optional spaCy NER cross-check. Placeholders follow an **open-vocabulary shape contract** (`^[A-Z][A-Za-z]*_\d+$`). Missed names extend the mapping, hallucinated names drop referencing triples, orphan placeholders are dropped at the residual sweep.
+5. **SOTA enrichment with delta protocol** (`configs/prompts/sota_enrichment.txt`): SOTA returns a delta envelope `{add, modify, drop, bindings}` — only the changes against the input fact list, plus `bindings: {placeholder: real_name}` for net-new entities. The pipeline applies the delta, merges bindings before de-anonymization, and reconstructs the updated transcript locally. No transcript token-diff and no fact-echo (order-of-magnitude token reduction vs. the prior "echo every fact" envelope).
+6. **De-anonymize** (`_apply_bindings`): deterministic substring replacement of placeholder tokens with their real values from the merged reverse mapping. Any fact whose subject or object still contains a placeholder-shaped token after substitution is dropped.
+7. **Plausibility** (`configs/prompts/sota_plausibility.txt` or `local_plausibility_filter`): grounding-based residual safety net. Six rules cover (R1) self-loops, (R2) name-swap and role-leak shapes, (R3) transcript contradiction, (R4) conversation-role leaks, (R5) content-free objects, (R6) namespaced system identifiers.
 
 A **fallback path** runs local plausibility on the raw extraction when the primary chain empties out. Per-stage diagnostics record raw outputs, transcript round-trip, and dropped facts for audit.
 
 **Single chokepoint.** Every orchestrator reaches the extraction chain through `ExtractionPipeline` (`paramem/graph/extraction_pipeline.py`). Direct calls to `extract_graph(...)` or `extract_procedural_graph(...)` are forbidden by `tests/test_extraction_pipeline_guard.py`. The class exposes `run(transcript, session_id, *, source_type, **overrides)` for transcript-shaped inputs and `run_procedural(...)` for the preference/habits stream.
 
-### AD-15: Indexed Key Consolidation Loop (Phase 4)
+### AD-15: Indexed Key Consolidation Loop
 
 The consolidation loop integrates indexed key memory (AD-13) with the existing graph extraction and promotion pipeline. Each cycle: extract relations from session → assign sequential keys to new facts → train episodic adapter on all active keys → during the full consolidation fold (`consolidate_interim_adapters`), keys whose per-key `reinforcement_count` meets the promotion threshold are promoted episodic→semantic; `store.move(key, "semantic")` moves the registry entry and SimHash — so promotion happens before tier assignment.
 
 **Transcript-stage boundary (§4.S architectural symmetry).** The consolidation fold has two modes sharing an identical grooming pipeline — they diverge ONLY in their persistence tail:
 - **`train` mode**: source = reconstruct-from-adapter-weights; sink = retrain PEFT adapters.
 - **`simulate` mode**: source = `load_memory_from_disk(graph.json)`; sink = `save_memory_to_disk(graph.json)`.
-Both modes run `canonical()` node identity + Case-1/Case-2 dedup via `GraphMerger.merge(additive=True)` + `_run_graph_enrichment` before the divergence point. Grooming logic is shared: both `run_consolidation_cycle` (interim) and `consolidate_interim_adapters` (full fold) route through the single spine `_run_fold`; `consolidate_simulate_fold` likewise delegates to `_run_fold`. There is no dual-method parity requirement — a grooming change goes in `_run_fold` once and both modes inherit it. The `POST /consolidate/housekeeping` endpoint triggers an on-demand grooming pass through `run_housekeeping()`, which dispatches to the correct mode-specific method with gate (d) bypassed.
+Both modes run `canonical()` node identity + Case-1/Case-2 dedup via `GraphMerger.merge(additive=True)` + `_run_graph_normalization` (predicate-synonym collapse via `dedup_synonym_predicates`; runs when `refinement_normalization` is on, which is the default) + `_run_graph_enrichment` before the divergence point. Grooming logic is shared: both `run_consolidation_cycle` (interim) and `consolidate_interim_adapters` (full fold) route through the single spine `_run_fold`; `consolidate_simulate_fold` likewise delegates to `_run_fold`. There is no dual-method parity requirement — a grooming change goes in `_run_fold` once and both modes inherit it. The `POST /consolidate/housekeeping` endpoint triggers an on-demand grooming pass through `run_housekeeping()`, which dispatches to the correct mode-specific method with gate (d) bypassed.
 
 **Fold merge input is registry-true.** The fold sources its Stage-2 merge input from `store.get(key)` / `store.bookkeeping_for_key(key)` (registry-true SPO) for every active key, not from the reconstruction result. Reconstruction is a **health/retry signal** only: a key whose reconstructed SPO disagrees with its registry-true SPO is flagged in `result["recall_miss_keys"]` and retrained with its registry-true content — it is never silently dropped. A recall miss does not delete a key.
 
@@ -172,7 +173,7 @@ Key design decisions:
 
 Validated: 10-cycle smoke test, episodic 6/6 (100%), semantic 6/6 (100%), 49.9 min total.
 
-### AD-10: Key-Addressable Replay (Phase 4)
+### AD-10: Key-Addressable Replay
 
 Adapter weights are the single source of truth for all personal knowledge. No external corpus of training samples is maintained.
 
@@ -188,7 +189,7 @@ This replaces an earlier design (periodic full-retrain sweeps on stored QA pairs
 
 ## Training Contract
 
-**AD-7: Phased Code Structure** — exploration in notebooks; production code in the `paramem/` package from Phase 2 onward. Project structure is documented in `README.md`.
+**AD-7: Phased Code Structure** — exploration in notebooks; production code lives in the `paramem/` package (notebooks are exploration-only). Project structure is documented in `README.md`.
 
 ### AD-6: QLoRA Training with Gradient Checkpointing
 
@@ -201,7 +202,7 @@ This replaces an earlier design (periodic full-retrain sweeps on stored QA pairs
 
 These constraints are encoded as defaults in the training config, overridable per-experiment.
 
-### AD-20: Staging+Promote Adapter Contract (Phase 5)
+### AD-20: Staging+Promote Adapter Contract
 
 Every adapter training event — consolidation cycle, interim mint, base-swap Phase B — runs through a two-slot **staging+promote** contract, not directly on the production tier. The contract has one entry point (`paramem/training/trainer.py::train_adapter`) and one staging slot per process (`in_training`).
 
@@ -217,7 +218,7 @@ Every adapter training event — consolidation cycle, interim mint, base-swap Ph
 
 **Live-reload after base-swap final tier.** After the final `migrate()` returns, the orchestrator calls `_live_reload_base_model` before marking `status=pass`. The reload tears down the PeftModel and rebuilds it from disk, picking up every tier's promoted adapter so the running server serves the new base without a systemctl restart. For the reload to fit on 8 GiB, all base-model holders (`BackgroundTrainer.model`, `ConsolidationLoop.model/.extraction.model`) are released via their encapsulated `release()` methods before the reload.
 
-### AD-17: Background Training with Inference Pause (Phase 5)
+### AD-17: Background Training with Inference Pause
 
 Consolidation supports two code paths:
 
@@ -278,7 +279,7 @@ PERSONAL" short-circuit caused imperatives from enrolled speakers
 to misroute into the PA path). The router scopes keys by speaker
 but lets the classifier decide intent.
 
-### AD-18: Multi-Engine Multilingual TTS (Phase 5)
+### AD-18: Multi-Engine Multilingual TTS
 
 Local text-to-speech via pluggable engines (`ENGINE_REGISTRY`) behind a common `TTSEngine` ABC:
 
@@ -304,7 +305,7 @@ Both paths feed the transcript into `_run_chat_turn` — the same turn-orchestra
 
 ## Evaluation Infrastructure
 
-### AD-8: RAG Baseline with FAISS (Phase 4)
+### AD-8: RAG Baseline with FAISS
 
 RAG pipeline uses the same embedding model already installed (all-MiniLM-L6-v2) for chunk retrieval. FAISS-CPU for vector search — lightweight, no GPU needed at our scale (hundreds of chunks). Falls back to numpy cosine search if FAISS install fails on WSL2.
 
