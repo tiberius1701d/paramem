@@ -3403,20 +3403,17 @@ class TestInterimCommitFailureRollback:
     Reuses ``TestAbortSkipsCommit``'s minimal-loop harness (real
     ``MemoryStore`` + a real ``merger.graph`` walk, GPU/training internals
     mocked) and forces ``_persist_fold`` to raise so the compensation path
-    inside ``_run_fold``'s interim branch fires: the promotion move is
-    reversed, the soft-staled pre-existing key is re-activated, and the
-    fresh interim tier is dropped wholesale — before the exception is
-    re-raised unchanged.
+    inside ``_run_fold``'s interim branch fires: the soft-staled
+    pre-existing key is re-activated, and the fresh interim tier is dropped
+    wholesale — before the exception is re-raised unchanged.
     """
 
     def _make_loop(self, monkeypatch, tmp_path):
-        """Minimal ConsolidationLoop with two pre-existing episodic keys.
+        """Minimal ConsolidationLoop with one pre-existing episodic key.
 
-        ``graph_promo`` mentions the promoted entity ("alex") so the
-        promotion-transfer stage moves it to semantic before training.
         ``graph_stale`` is soft-staled via a pre-set ``merger.removal_ledger``
-        entry during the shared soft-stale stage. Both must be reverted to
-        their pre-cycle state when the commit fails.
+        entry during the shared soft-stale stage, and must be reverted to
+        its pre-cycle state when the commit fails.
         """
         from peft import PeftModel
 
@@ -3462,20 +3459,6 @@ class TestInterimCommitFailureRollback:
         loop._indexed_next_index = 0
         loop._indexed_ep_interim = {}
 
-        loop.store.put(
-            "episodic",
-            "graph_promo",
-            {
-                "key": "graph_promo",
-                "subject": "alex",
-                "predicate": "works_at",
-                "object": "acme",
-            },
-            simhash=111,
-        )
-        loop.store.set_bookkeeping(
-            "graph_promo", speaker_id="speaker0", relation_type="factual", first_seen="t0"
-        )
         loop.store.put(
             "episodic",
             "graph_stale",
@@ -3570,7 +3553,6 @@ class TestInterimCommitFailureRollback:
                     mode="train",
                     run_label="test_rollback",
                     stamp="t001",
-                    new_promotions=["Alex"],
                 )
 
     def test_failed_commit_drops_the_fresh_interim_tier(self, monkeypatch, tmp_path):
@@ -3588,13 +3570,6 @@ class TestInterimCommitFailureRollback:
         assert not loop.store.is_stale("graph_stale")
         assert loop.store.simhash("episodic", "graph_stale") == 222
 
-    def test_failed_commit_reverts_promotion(self, monkeypatch, tmp_path):
-        """graph_promo is moved to semantic mid-cycle, then moved back on failure."""
-        loop = self._make_loop(monkeypatch, tmp_path)
-        self._run_cycle_expecting_failure(loop)
-        assert loop.store.tier_of("graph_promo") == "episodic"
-        assert "graph_promo" not in loop.store.registry("semantic")
-
     def test_failed_commit_leaves_key_count_unchanged(self, monkeypatch, tmp_path):
         """Total active-key count is byte-identical to the pre-cycle count."""
         loop = self._make_loop(monkeypatch, tmp_path)
@@ -3609,194 +3584,13 @@ class TestInterimCommitFailureRollback:
         self._run_cycle_expecting_failure(loop)
         assert loop._indexed_next_index == pre_index
 
-    # -----------------------------------------------------------------
-    # LOW-3: the SAME key is both promoted and soft-staled in one cycle.
-    # This is the case that motivated re-activating soft-stales BEFORE
-    # reversing promotions in the except handler (see the comment at the
-    # compensation site in consolidation.py) — reversing the promotion
-    # first would move a still-stale key while it is stale in its NEW
-    # (post-promotion) tier, and store.move's registry-transfer step only
-    # recognizes active membership, leaving an orphaned stale record
-    # behind and the key active in BOTH tiers.
-    # -----------------------------------------------------------------
-
-    def _make_loop_with_dual_key(self, monkeypatch, tmp_path):
-        """Minimal ConsolidationLoop with ONE pre-existing key that is both
-        promotable (mentions "alex") and targeted by the removal ledger.
-        """
-        from peft import PeftModel
-
-        from paramem.memory.store import MemoryStore
-        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
-
-        loop = object.__new__(ConsolidationLoop)
-        loop.model = MagicMock()
-        loop.model.__class__ = PeftModel
-        loop.model.peft_config = {
-            "episodic": MagicMock(),
-            "semantic": MagicMock(),
-            "procedural": MagicMock(),
-            "in_training": MagicMock(),
-        }
-        loop.tokenizer = MagicMock()
-        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
-        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
-        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.procedural_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
-        loop.wandb_config = None
-        loop._thermal_policy = None
-        loop.output_dir = tmp_path
-        loop.store = MemoryStore(replay_enabled=True)
-        loop.promoted_keys = set()
-        loop.cycle_count = 0
-        loop.episodic_simhash = {}
-        loop.semantic_simhash = {}
-        loop.procedural_simhash = {}
-        loop._procedural_next_index = 0
-        loop._procedural_tentative_next_index = 0
-        loop.merger = MagicMock()
-        loop.merger.graph.nodes = {}
-        loop._bg_trainer = None
-        loop.shutdown_requested = False
-        loop._early_stop_callback = None
-        loop.fingerprint_cache = None
-        loop._keep_prior_slots = 2
-        loop._debug_base = None
-        loop.save_cycle_snapshots = False
-        loop.snapshot_dir = None
-        loop._indexed_next_index = 0
-        loop._indexed_ep_interim = {}
-
-        loop.store.put(
-            "episodic",
-            "graph_dual",
-            {
-                "key": "graph_dual",
-                "subject": "alex",
-                "predicate": "works_at",
-                "object": "acme",
-            },
-            simhash=333,
-        )
-        loop.store.set_bookkeeping(
-            "graph_dual", speaker_id="speaker0", relation_type="factual", first_seen="t0"
-        )
-        return loop
-
-    def _run_dual_key_cycle_expecting_failure(self, loop):
-        """Drive run_consolidation_cycle with _persist_fold raising.
-
-        graph_dual is promoted (moves episodic -> semantic) BEFORE the
-        merger's removal ledger is consulted, so the soft-stale stage sees
-        it already in semantic and stales it THERE — reproducing the
-        same-cycle promoted-and-staled overlap.
-        """
-        from unittest.mock import MagicMock, patch
-
-        import networkx as nx
-
-        real_graph = nx.MultiDiGraph()
-        real_graph.add_node("speaker0", speaker_id="speaker0", attributes={"name": "Alex"})
-        real_graph.add_node("millfield", attributes={"name": "Millfield"})
-        real_graph.add_edge(
-            "speaker0",
-            "millfield",
-            predicate="lives_in",
-            relation_type="factual",
-        )
-        loop.merger.graph = real_graph
-        loop.merger.removal_ledger = {"graph_dual": {"reason": "entity_merge"}}
-
-        trained_metrics = {"train_loss": 0.2, "aborted": False}
-
-        with (
-            patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
-            patch(
-                "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
-                MagicMock,
-            ),
-            patch("paramem.training.trainer.train_adapter", return_value=trained_metrics),
-            patch.object(
-                ConsolidationLoop,
-                "_resolve_target_slot",
-                return_value="episodic_interim_t001",
-            ),
-            patch.object(ConsolidationLoop, "_refine_consolidation_graph", return_value=None),
-            patch.object(ConsolidationLoop, "_enable_gradient_checkpointing", return_value=None),
-            patch.object(ConsolidationLoop, "_disable_gradient_checkpointing", return_value=None),
-            patch.object(
-                ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
-            ),
-            patch.object(
-                ConsolidationLoop,
-                "_probe_passing_keys",
-                side_effect=lambda adapter_name, entries: {e["key"] for e in entries},
-            ),
-            patch("paramem.training.consolidation.switch_adapter"),
-            patch(
-                "paramem.training.consolidation.format_entry_training",
-                return_value=[{"input_ids": [1], "labels": [1]}],
-            ),
-            patch(
-                "paramem.memory.interim_adapter.create_interim_adapter",
-                side_effect=lambda m, cfg, stamp: m,
-            ),
-            patch.object(ConsolidationLoop, "_persist_fold", side_effect=RuntimeError("disk full")),
-        ):
-            with pytest.raises(RuntimeError, match="disk full"):
-                loop.run_consolidation_cycle(
-                    [
-                        {
-                            "subject": "Alex",
-                            "predicate": "lives_in",
-                            "object": "Millfield",
-                            "relation_type": "factual",
-                            "speaker_id": "speaker0",
-                        }
-                    ],
-                    [],
-                    speaker_id="speaker0",
-                    mode="train",
-                    run_label="test_dual_rollback",
-                    stamp="t001",
-                    new_promotions=["Alex"],
-                )
-
-    def test_failed_commit_dual_promoted_and_staled_key_ends_active_once_in_origin(
-        self, monkeypatch, tmp_path
-    ):
-        """A key both promoted and soft-staled in one cycle ends active,
-        exactly once, back in its origin tier — no orphaned stale record.
-        """
-        loop = self._make_loop_with_dual_key(monkeypatch, tmp_path)
-        self._run_dual_key_cycle_expecting_failure(loop)
-
-        # Active exactly once, in the origin tier (episodic).
-        assert loop.store.tier_of("graph_dual") == "episodic"
-        assert "graph_dual" in loop.store.registry("episodic")
-        assert "graph_dual" not in loop.store.registry("semantic")
-        assert not loop.store.is_stale("graph_dual")
-        assert loop.store.simhash("episodic", "graph_dual") == 333
-
-        # No duplicate/orphan: exactly one active copy across every tier.
-        active_copies = [
-            t for t in ("episodic", "semantic") if "graph_dual" in loop.store.registry(t)
-        ]
-        assert active_copies == ["episodic"]
-        assert loop.store.all_active_keys().count("graph_dual") == 1
-
-        # No orphaned stale record left behind in the (former) promoted tier.
-        semantic_reg = loop.store.registry("semantic")
-        assert "graph_dual" not in semantic_reg.list_stale()
-
 
 class TestInterimCommitFailureRollbackSimulate:
     """MEDIUM-1: the simulate-venue mirror of TestInterimCommitFailureRollback.
 
     Simulate (``mode="simulate"`` -> ``scope.source="disk"``) skips training
-    and the weights-only promotion-transfer block entirely, but its deferred
-    store writes (put/set_bookkeeping) and counter increments now live
+    and PEFT slot minting entirely, but its deferred store writes
+    (put/set_bookkeeping) and counter increments now live
     INSIDE the same commit-window try as the weights path (no separate
     pre-window put loop) — so a simulate-mode ``_persist_fold`` failure must
     compensate identically: the fresh interim tier dropped, a soft-staled
@@ -3868,8 +3662,8 @@ class TestInterimCommitFailureRollbackSimulate:
 
     def _run_cycle_expecting_failure(self, loop):
         """Drive run_consolidation_cycle(mode="simulate") with _persist_fold
-        raising — no training, no PEFT slot minting, no promotion transfer
-        (all weights-only), but the SAME commit-window try/except."""
+        raising — no training, no PEFT slot minting (both weights-only),
+        but the SAME commit-window try/except."""
         from unittest.mock import patch
 
         import networkx as nx

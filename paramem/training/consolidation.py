@@ -1382,7 +1382,6 @@ class ConsolidationLoop:
             speaker_id=speaker_id,
             mode="train",
             run_label=f"train-adapters-cycle{self.cycle_count + 1}",
-            new_promotions=None,
         )
 
         # --- Roll interim slot into main ---
@@ -2144,7 +2143,6 @@ class ConsolidationLoop:
         interim_overflow_slack: int = 0,
         stamp: str | None = None,
         recall_sanity_threshold: "float | None" = None,
-        new_promotions: "list[str] | None" = None,
     ) -> dict:
         """Unified interim-cycle entry: key prep + optional training + atomic persistence.
 
@@ -2184,8 +2182,6 @@ class ConsolidationLoop:
            (procedural) keys, trained with the attention-only episodic adapter
            config by design; procedural keys fold to the ``procedural`` main
            adapter only at the full fold.
-           When *new_promotions* is non-empty, move matching episodic keys to
-           semantic before training.
         10. Train (train mode) or skip training (simulate mode).
         11. Apply deferred store mutations; advance counters for both episodic
             and procedural minted keys.
@@ -2229,11 +2225,6 @@ class ConsolidationLoop:
                 when this is ``None`` (the default).  Not currently consumed inside
                 this method — interim-cycle saves go through ``commit_tier_slot``,
                 which reads the threshold from the loop config.
-            new_promotions: Optional list of entity names promoted to semantic
-                this cycle.  When non-empty, matching episodic keys are moved to
-                the semantic tier via ``store.move`` before training, so they are
-                excluded from the episodic training set.  Only meaningful in
-                train mode; ignored in simulate mode.
 
         Returns:
             Result dict with keys ``{"triples_extracted", "new_keys",
@@ -2348,8 +2339,6 @@ class ConsolidationLoop:
         # source is derived from mode: "weights" for train, "disk" for simulate.
         # All pipeline stages (materialize, refine, build-keyed, train/skip, commit)
         # execute inside _run_fold; this wrapper only owns pre-resolution + early-exits.
-        # new_promotions forwarded as a parameter — _run_fold handles
-        # the semantic-transfer block scope-gated on source=="weights" && new_promotions.
         # Map the caller's mode Literal to the FoldScope source axis without a mode== fork.
         _interim_source = {"train": "weights", "simulate": "disk"}[mode]
         result = self._run_fold(
@@ -2369,7 +2358,6 @@ class ConsolidationLoop:
             ),
             adapter_name=adapter_name,
             stamp=stamp,
-            new_promotions=new_promotions,
             run_label=run_label,
             triples_extracted=triples_extracted,
             episodic_rels=episodic_rels,
@@ -3442,7 +3430,6 @@ class ConsolidationLoop:
         # interim-scope extras (only consumed when scope.persist == "interim_slot")
         adapter_name: "str | None" = None,
         stamp: "str | None" = None,
-        new_promotions: "list[str] | None" = None,
         run_label: str = "",
         triples_extracted: int = 0,
         episodic_rels: "list[dict] | None" = None,
@@ -3506,10 +3493,6 @@ class ConsolidationLoop:
                 ``scope.tier``.
             stamp: Sub-interval stamp for :func:`~paramem.memory.persistence.commit_tier_slot`
                 (``interim_slot`` path only).
-            new_promotions: Optional list of entity names to transfer to semantic
-                before training (``interim_slot`` / ``source="weights"`` path only).
-                Retained explicitly so the semantic-transfer block is
-                not lost when ``run_consolidation_cycle`` becomes a thin wrapper.
             run_label: Tag woven into the wandb ``run_name`` for traceability
                 (``interim_slot`` path only).
             triples_extracted: Number of episodic relations extracted this cycle
@@ -3819,14 +3802,11 @@ class ConsolidationLoop:
                         all_interim_keyed.append(_entry)
                         _tier_keyed[_pt].append(_entry)
                     new_key_ids = [r["entry"]["key"] for r in new_keyed_interim]
-                    # Recall-miss diagnostics and semantic-promotion transfer are
-                    # NOT re-derived on resume — both are non-training-critical,
-                    # store-mutating steps that either already landed pre-crash
-                    # or are safely re-evaluated on the NEXT (non-resumed) cycle.
-                    # Accepted resume-path divergence — mirrors main_tiers'
-                    # drift-counter zeroing on resume below.
-                    promoted_key_set: "set[str]" = set()
-                    promoted_origin_tiers: "dict[str, str]" = {}
+                    # Recall-miss diagnostics are NOT re-derived on resume —
+                    # non-training-critical, and safely re-evaluated on the
+                    # NEXT (non-resumed) cycle.  Accepted resume-path
+                    # divergence — mirrors main_tiers' drift-counter zeroing
+                    # on resume below.
                 else:
                     # -------------------------------------------------------------
                     # FRESH-DERIVATION PATH: materialize -> refine -> build set.
@@ -3932,36 +3912,10 @@ class ConsolidationLoop:
                     # compensated identically to the weights path (see the commit
                     # window below).
 
-                    # --- Semantic promotion transfer (weights path, when
-                    # promotions supplied).  Separate from _promote_mature_keys_inline;
-                    # operates on the interim keyed set before training.
-                    promoted_key_set = set()
-                    promoted_origin_tiers = {}
-                    if scope.source == "weights" and new_promotions:
-                        _promo_set = {n.lower() for n in new_promotions}
-                        for _t, _k, _e in list(self.store.iter_entries()):
-                            if _k.startswith("proc"):
-                                continue
-                            _subj = _e.get("subject", "").lower()
-                            _obj = _e.get("object", "").lower()
-                            _mentions = (_subj and _subj in _promo_set) or (
-                                _obj and _obj in _promo_set
-                            )
-                            if _mentions and not self.store.has_simhash("semantic", _k):
-                                promoted_key_set.add(_k)
-                        for _pk in promoted_key_set:
-                            _origin_tier = self.store.tier_of(_pk)
-                            if _origin_tier is not None:
-                                promoted_origin_tiers[_pk] = _origin_tier
-                            self.store.move(_pk, "semantic")
-                        all_interim_keyed = [
-                            kp for kp in all_interim_keyed if kp["key"] not in promoted_key_set
-                        ]
-
                     # --- interim slot: write single-entry fold_resume.json marker ---
-                    # Written AFTER all_interim_keyed is fully finalized (promotion
-                    # filter above may shrink it) — not at fold entry.  Persists the
-                    # REAL train_assignment via _persisted_from_entry_and_rec: entry
+                    # Written AFTER all_interim_keyed is fully finalized — not
+                    # at fold entry.  Persists the REAL train_assignment via
+                    # _persisted_from_entry_and_rec: entry
                     # dicts enriched with "tier" and, for newly-minted keys, the
                     # deferred-write metadata the commit window below needs
                     # (relation_type/session_ids/last_seen/first_seen —
@@ -3984,8 +3938,6 @@ class ConsolidationLoop:
                             ("procedural", _tier_keyed["procedural"]),
                         ):
                             for _pe2 in _pt2_entries:
-                                if _pe2["key"] in promoted_key_set:
-                                    continue
                                 _b_persist_entries.append(
                                     _persisted_from_entry_and_rec(
                                         _pe2, _pt2, _new_meta_by_key.get(_pe2["key"])
@@ -4037,16 +3989,11 @@ class ConsolidationLoop:
                 # subtractive soft-stales, and the durable persist — all-or-nothing.
                 # A raise anywhere in this window (including inside _persist_fold)
                 # means the interim commit failed; the in-memory mutations already
-                # applied this cycle — the promotion moves captured above, plus
-                # whatever ran below before the raise — are compensated: soft-staled
-                # pre-existing keys are re-activated FIRST (a key promoted this
-                # cycle and independently soft-staled afterward is stale in its
-                # post-promotion tier — reactivating before the promotion reversal
-                # guarantees store.move only ever sees a clean active key), then
-                # promotions move back to their origin tier, then the fresh
-                # interim tier is dropped wholesale — so the store is left
-                # byte-identical to its pre-cycle state before the exception is
-                # re-raised unchanged (caller retry/pinning semantics untouched).
+                # applied this cycle are compensated: soft-staled pre-existing
+                # keys are re-activated, then the fresh interim tier is dropped
+                # wholesale — so the store is left byte-identical to its
+                # pre-cycle state before the exception is re-raised unchanged
+                # (caller retry/pinning semantics untouched).
                 # Counters are deliberately NOT part of the compensated state —
                 # they are only incremented after this block succeeds, so a
                 # failure leaves them unadvanced with no capture/restore needed.
@@ -4122,28 +4069,21 @@ class ConsolidationLoop:
                         all_keyed=all_interim_keyed,
                     )
                 except Exception:
-                    # Re-activate soft-stales BEFORE reversing promotions: a key
-                    # that was promoted THIS cycle and independently soft-staled
-                    # afterward (same-cycle overlap) is stale in its NEW
-                    # (post-promotion) tier at this point.  store.move's
-                    # registry-transfer step only recognizes a key as owned by
-                    # its old tier via the active-only membership check, so
-                    # moving it back while still stale would leave an orphaned
-                    # stale record behind and register it active in BOTH tiers.
-                    # Re-activating first guarantees move() always operates on
-                    # a clean active key.
+                    # Undo this cycle's mutations before re-raising: reactivate
+                    # any key the shared soft-stale stage staled this cycle
+                    # (reversing _apply_subtractive_removals_to_store), then
+                    # drop the freshly-minted interim tier wholesale — restoring
+                    # the store to its pre-cycle state.
                     for _stale_tier, _stale_keys in _soft_stale_by_tier.items():
                         for _stale_key in _stale_keys:
                             self.store.reactivate(_stale_tier, _stale_key)
-                    for _pk, _origin_tier in promoted_origin_tiers.items():
-                        self.store.move(_pk, _origin_tier)
                     self.store.drop_tier(adapter_name)
                     raise
 
                 # Counters advance only after the commit above succeeded —
                 # for both venues; simulate's counters are no longer bumped
-                # eagerly outside the commit window (see the NOTE above the
-                # promotion-transfer block).
+                # eagerly outside the commit window (see the NOTE in the
+                # fresh-derivation path above).
                 self._indexed_next_index += _ep_flushed
                 self._procedural_next_index += _proc_flushed
 
