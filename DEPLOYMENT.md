@@ -766,7 +766,7 @@ state until the migration finishes.
 
 ### API
 
-Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token required; **chat** — any valid token (shared or per-user `--scope chat`); **admin** — admin-scope token required (`require_admin` dependency, app.py:2418).
+Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token required; **chat** — any valid token (shared or per-user `--scope chat`); **admin** — admin-scope token required (`require_admin` dependency, app.py:2615).
 
 | Method | Path | Scope | Description |
 |--------|------|-------|-------------|
@@ -779,12 +779,14 @@ Complete REST endpoint reference. Auth scopes: **unauthenticated** — no token 
 | GET | `/push/vapid-public-key` | chat | Return the VAPID EC P-256 application server public key for `PushManager.subscribe()`. 503 when push is disabled. See [Enabling Web Push](#enabling-web-push). |
 | POST | `/push/subscribe` | chat | Register a browser push subscription for the authenticated speaker. Requires a per-user token (shared tokens have no bound speaker_id). See [Enabling Web Push](#enabling-web-push). |
 | POST | `/consolidate` | admin | Trigger consolidation manually (blocking). Shares the gate logic with `/scheduled-tick` — decides full-cycle vs interim based on the live slot's `window_stamp`. |
+| POST | `/consolidate/housekeeping` | admin | Run a full GraphMerger re-grooming pass over the stored graph without consuming pending sessions or advancing consolidation watermarks. |
 | POST | `/scheduled-tick` | admin | Systemd user-timer entrypoint (`paramem-consolidate.timer`). Runs the cooperative extract + background-train path; returns `deferred` when the GPU is unavailable. 409 `trial_active` while a migration TRIAL is in progress. |
 | POST | `/refresh-ha` | admin | Rebuild the HA entity graph from `/api/states` + `/api/services`. |
 | POST | `/ingest-sessions` | admin | Enqueue pre-chunked document segments for the next consolidation cycle (operator CLI: `scripts/ingest_docs.py`). Idempotent — chunks already in the ingest registry are skipped. |
 | POST | `/ingest-sessions/cancel` | admin | Discard queued ingest sessions by session ID without running consolidation. |
 | POST | `/gpu/acquire` | admin | Clear any `PARAMEM_EXTRA_ARGS=--defer-model` hold and, if this process is in defer mode, reload the base model in-process.  Called by `pstatus --acquire`.  Idempotent. |
 | POST | `/gpu/release` | admin | Release the base model in-process and switch to cloud-only mode, freeing VRAM. |
+| POST | `/incidents/{incident_id}/ack` | admin | Acknowledge an active incident, silencing its attention row in `/status`. |
 | GET | `/integrity` | admin | Run the infrastructure integrity check (registries, simhash, meta, graph files) and return a `{ok, checks, failures}` report. Cloud-only-safe — no GPU dependency. |
 | POST | `/admin/assign-orphans` | admin | Operator-only corrective action: permanently attribute orphan sessions to a single speaker.  Rewrites session jsonls on disk when present; the bound speaker_id flows through the next consolidation cycle into permanent storage regardless of debug mode. |
 | POST | `/speaker/forget` | admin | Remove a speaker's profile, mark their indexed-memory keys stale, and discard pending sessions. Uses `mark_stale` strategy — weights decay through future training cycles; does not trigger immediate retraining. See [Forgetting a speaker](#forgetting-a-speaker-data-erasure). |
