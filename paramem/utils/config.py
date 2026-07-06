@@ -20,6 +20,8 @@ from typing import Optional
 
 import yaml
 
+from paramem.utils.paths import find_project_root
+
 # Valid values for refinement_enrichment and refinement_normalization.
 # Shared between utils.config and server.config (server.config imports this).
 _REFINEMENT_TOGGLES: frozenset[str] = frozenset({"off", "on"})
@@ -233,7 +235,12 @@ def load_config(
     function -- enforced by ``tests/test_test_config_loader_usage.py``.
     """
     if config_path is None:
-        config_path = Path(__file__).parent.parent.parent / "archive" / "configs" / "default.yaml"
+        config_path = (
+            (find_project_root(Path(__file__)) or Path(__file__).resolve().parents[2])
+            / "archive"
+            / "configs"
+            / "default.yaml"
+        )
     else:
         config_path = Path(config_path)
 

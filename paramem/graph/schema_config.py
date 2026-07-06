@@ -20,9 +20,15 @@ from pathlib import Path
 
 import yaml
 
+from paramem.utils.paths import find_project_root
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent.parent.parent / "configs" / "schema.yaml"
+_DEFAULT_SCHEMA_PATH = (
+    (find_project_root(Path(__file__)) or Path(__file__).resolve().parents[2])
+    / "configs"
+    / "schema.yaml"
+)
 
 # Hardcoded mirror of configs/schema.yaml.  Updated here whenever the YAML
 # gains a new entry; never removed without a schema migration.

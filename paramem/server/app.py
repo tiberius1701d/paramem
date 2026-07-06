@@ -94,6 +94,7 @@ from paramem.server.vram_validator import (
 from paramem.training.consolidation import AbortedDuringConsolidation
 from paramem.training.thermal_throttle import ThermalPolicy, wait_for_cooldown
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
+from paramem.utils.paths import find_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -2335,10 +2336,7 @@ async def lifespan(app: FastAPI):
         full_period or "<manual only>",
     )
     try:
-        msg = systemd_timer.reconcile(
-            interim_cadence,
-            project_root=str(Path(__file__).resolve().parent.parent.parent),
-        )
+        msg = systemd_timer.reconcile(interim_cadence)
         logger.info("%s", msg)
     except Exception:
         logger.exception("Failed to reconcile consolidation timer — continuing without schedule")
@@ -2351,7 +2349,6 @@ async def lifespan(app: FastAPI):
         backup_msg = backup_timer.reconcile(
             backup_schedule,
             python_path=sys.executable,
-            project_root=str(Path(__file__).resolve().parent.parent.parent),
         )
         logger.info("%s", backup_msg)
     except Exception:
@@ -14929,7 +14926,7 @@ def main():
     args = parser.parse_args()
 
     # Setup
-    project_root = Path(__file__).parent.parent.parent
+    project_root = find_project_root(Path(__file__)) or Path(__file__).resolve().parents[2]
     load_dotenv(project_root / ".env")
 
     # Per-secret file layout under ~/.config/paramem/secrets/ with strict

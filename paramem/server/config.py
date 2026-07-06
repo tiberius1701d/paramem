@@ -16,6 +16,7 @@ from paramem.utils.config import (
     ModelConfig,
     TrainingConfig,
 )
+from paramem.utils.paths import find_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -1737,15 +1738,7 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     # ``pyproject.toml`` is found above the file — preserves legacy
     # behaviour for yamls supplied from outside the repo tree.
     yaml_dir = Path(path).resolve().parent
-    config_dir = yaml_dir
-    walker = yaml_dir
-    while walker != walker.parent:
-        if (walker / "pyproject.toml").exists():
-            config_dir = walker
-            break
-        walker = walker.parent
-    else:
-        config_dir = yaml_dir.parent  # legacy fallback
+    config_dir = find_project_root(yaml_dir) or yaml_dir.parent  # legacy fallback
     paths_raw = raw.get("paths", {})
     if paths_raw:
         config.paths = PathsConfig(

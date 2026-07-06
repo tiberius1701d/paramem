@@ -46,7 +46,7 @@ def _resolve_data_dir(config: str) -> Path | None:
     return cfg.paths.data
 
 
-def _trial_json_path(server_url: str, config: str = "configs/server.yaml") -> Path:
+def _trial_json_path(server_url: str, config: str = "configs/server.yaml") -> Path | None:
     """Return the path to ``state/trial.json`` under the configured data dir.
 
     The marker lives at ``<paths.data>/state/trial.json``.  The data
@@ -67,14 +67,15 @@ def _trial_json_path(server_url: str, config: str = "configs/server.yaml") -> Pa
 
     Returns
     -------
-    Path
-        ``<paths.data>/state/trial.json``.  Falls back to
-        ``data/ha/state/trial.json`` when the config file cannot be
-        resolved (e.g. offline fallback invoked from an unexpected cwd).
+    Path | None
+        ``<paths.data>/state/trial.json``, or ``None`` when the config file
+        cannot be resolved (``_resolve_data_dir`` already printed the error
+        to stderr in that case) — there is no safe cwd-relative guess to fall
+        back to.
     """
     data_dir = _resolve_data_dir(config)
     if data_dir is None:
-        return Path("data") / "ha" / "state" / "trial.json"
+        return None
     return Path(data_dir) / "state" / "trial.json"
 
 
@@ -116,6 +117,13 @@ def run(args: argparse.Namespace) -> int:
         trial_path = _trial_json_path(
             args.server_url, getattr(args, "config", "configs/server.yaml")
         )
+        if trial_path is None:
+            print(
+                "server offline and trial-state path could not be resolved "
+                "(no config); nothing to show.",
+                file=sys.stderr,
+            )
+            return 0
         if trial_path.exists():
             try:
                 trial_data = json.loads(trial_path.read_text(encoding="utf-8"))

@@ -17,6 +17,8 @@ from pathlib import Path
 
 import httpx
 
+from paramem.utils.paths import find_project_root
+
 
 def _repo_env_path(start: Path) -> Path | None:
     """Walk from *start* toward the filesystem root looking for a ``pyproject.toml``.
@@ -29,10 +31,8 @@ def _repo_env_path(start: Path) -> Path | None:
     against a temp tree by passing an arbitrary *start* path without
     monkeypatching module-level ``__file__``.
     """
-    for parent in start.resolve().parents:
-        if (parent / "pyproject.toml").is_file():
-            return parent / ".env"
-    return None
+    root = find_project_root(start)
+    return root / ".env" if root is not None else None
 
 
 def resolve_token(*, allow_files: bool | None = None) -> str | None:

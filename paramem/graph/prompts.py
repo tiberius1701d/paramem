@@ -1,14 +1,21 @@
 """Shared prompt-loading utilities for the graph package.
 
-Dependency-light module: only imports from the standard library so that
-``paramem.graph.merger`` can import the loader without pulling in the
-heavyweight ``paramem.graph.extractor`` transitive dependency chain
-(models.loader / vram_guard / evaluation.recall).
+Dependency-light module: only imports from the standard library plus
+``paramem.utils.paths`` (itself stdlib-only) so that ``paramem.graph.merger``
+can import the loader without pulling in the heavyweight
+``paramem.graph.extractor`` transitive dependency chain (models.loader /
+vram_guard / evaluation.recall).
 """
 
 from pathlib import Path
 
-_DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "configs" / "prompts"
+from paramem.utils.paths import find_project_root
+
+_DEFAULT_PROMPT_DIR = (
+    (find_project_root(Path(__file__)) or Path(__file__).resolve().parents[2])
+    / "configs"
+    / "prompts"
+)
 
 _SPEAKER_DIRECTIVE_FILE = "speaker_directive.txt"
 _SPEAKER_DIRECTIVE_SENTINEL = "==="

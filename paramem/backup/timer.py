@@ -26,6 +26,7 @@ from paramem.server.systemd_timer import (
     _write_if_changed,  # noqa: PLC2701 – intentional private reuse
     parse_schedule,
 )
+from paramem.utils.paths import find_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +108,7 @@ def reconcile(
     schedule: str,
     *,
     python_path: str,
-    project_root: str,
+    project_root: str | None = None,
     tier: str = "daily",
 ) -> str:
     """Reconcile the ``paramem-backup`` systemd user timer.
@@ -127,7 +128,11 @@ def reconcile(
     python_path:
         Absolute path to the Python interpreter.
     project_root:
-        Absolute path to the project root.
+        Absolute path to the project root. Defaults to ``None``, in which
+        case it is resolved via ``find_project_root(Path(__file__))``
+        (nearest ancestor containing ``pyproject.toml``), falling back to
+        ``Path(__file__).resolve().parents[2]`` when no such ancestor exists
+        (e.g. an installed package under site-packages).
     tier:
         Backup tier written into the service unit's ``ExecStart``.  Always
         ``"daily"`` in production.
@@ -137,6 +142,9 @@ def reconcile(
     str
         Short human-readable description of the action taken.
     """
+    if project_root is None:
+        _r = find_project_root(Path(__file__))
+        project_root = str(_r if _r is not None else Path(__file__).resolve().parents[2])
     # "daily HH:MM" is a natural operator idiom. Normalise to "HH:MM" so
     # parse_schedule (which expects either "daily" or "HH:MM", not both) can
     # parse it.  Keep the original string for error messages.

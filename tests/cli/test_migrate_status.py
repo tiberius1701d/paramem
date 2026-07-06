@@ -13,7 +13,6 @@ Covers:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from unittest.mock import patch
 
 from paramem.cli import http_client
@@ -195,19 +194,27 @@ class TestTrialJsonPathCorrection:
     way the server does.
     """
 
-    def test_migrate_status_offline_reads_data_ha_state_trial_json(self):
-        """_trial_json_path() resolves to <project-root>/data/ha/state/trial.json.
+    def test_migrate_status_offline_resolves_absolute_paths_data_trial_json(self):
+        """_trial_json_path() resolves to an absolute <paths.data>/state/trial.json.
 
-        With the default configs/server.yaml (paths.data: data/ha), the
-        resolved path must end in data/ha/state/trial.json — not a
-        cwd-relative bare state/trial.json.
+        Uses the tracked contract fixture (tests/fixtures/server.yaml) so the
+        assertion is deterministic in CI — it does NOT depend on the gitignored
+        configs/server.yaml existing. load_server_config anchors a relative
+        paths.data to the project root, so the marker path must be absolute and
+        equal to <paths.data>/state/trial.json — never a cwd-relative bare
+        state/trial.json (Correction 4).
         """
-        path = _trial_json_path("http://localhost:8420")
+        from paramem.server.config import load_server_config
+
+        config = "tests/fixtures/server.yaml"
+        expected = load_server_config(config).paths.data / "state" / "trial.json"
+
+        path = _trial_json_path("http://localhost:8420", config=config)
+
         assert path.is_absolute(), f"_trial_json_path must resolve to an absolute path: {path!r}"
-        expected_suffix = Path("data") / "ha" / "state" / "trial.json"
-        assert path.parts[-4:] == expected_suffix.parts, (
-            f"_trial_json_path returned {path!r}; expected it to end in {expected_suffix!r}. "
-            "Correction 4: marker lives under paths.data/state/trial.json."
+        assert path == expected, (
+            f"_trial_json_path returned {path!r}; expected <paths.data>/state/trial.json "
+            f"= {expected!r}. Correction 4: marker lives under paths.data/state/trial.json."
         )
 
     def test_migrate_status_offline_marker_present_renders_trial_state(
@@ -257,3 +264,13 @@ class TestTrialJsonPathCorrection:
         assert "2026-04-22T01:00:00" in captured.out, (
             f"started_at not found in output: {captured.out!r}"
         )
+
+    def test_trial_json_path_returns_none_when_config_unresolvable(self):
+        """_trial_json_path returns None (not a cwd-relative guess) when config can't be resolved.
+
+        ``_resolve_data_dir`` already prints the config-not-found error to
+        stderr; there is no safe path to fall back to, so the caller must be
+        told explicitly rather than silently getting a bogus relative path.
+        """
+        path = _trial_json_path("http://x", config="/does/not/exist.yaml")
+        assert path is None

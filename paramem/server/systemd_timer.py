@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from paramem.server.schedule_grammar import parse_schedule_atom
+from paramem.utils.paths import find_project_root
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +263,7 @@ def _write_if_changed(path: Path, content: str) -> bool:
 def reconcile(
     schedule: str,
     endpoint: str = DEFAULT_ENDPOINT,
-    project_root: str = str(Path(__file__).resolve().parent.parent.parent),
+    project_root: str | None = None,
 ) -> str:
     """Reconcile the systemd user timer with the configured schedule.
 
@@ -284,11 +285,15 @@ def reconcile(
     project_root:
         Absolute path to the project root used to derive the
         ``EnvironmentFile`` path in the rendered service unit.  Defaults to
-        the project root inferred from this module's location so the server
-        lifespan can rely on the default; the ``app.py`` call site passes it
-        explicitly via ``str(Path(__file__).resolve().parent.parent.parent)``
-        for clarity and testability.
+        ``None``, in which case it is resolved via
+        ``find_project_root(Path(__file__))`` (nearest ancestor containing
+        ``pyproject.toml``), falling back to
+        ``Path(__file__).resolve().parents[2]`` when no such ancestor exists
+        (e.g. an installed package under site-packages).
     """
+    if project_root is None:
+        _r = find_project_root(Path(__file__))
+        project_root = str(_r if _r is not None else Path(__file__).resolve().parents[2])
     spec = parse_schedule(schedule)
     if spec is None:
         logger.error(
