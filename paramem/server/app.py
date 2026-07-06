@@ -13088,11 +13088,22 @@ def _extract_and_start_training():
 
     Runs in executor thread.  Phase 1 (extraction) holds the GPU lock and
     produces the per-batch (episodic_rels, procedural_rels) tuple.  Phase 2
-    submits one callable to ``BackgroundTrainer`` that mints a fresh
-    ``episodic_interim_<stamp>`` slot (or absorbs into the newest existing
-    when the cap is hit) and trains the batch into it.  Main adapters are
-    only updated by the full-cycle path that calls
-    ``consolidate_interim_adapters``.
+    submits one callable to ``BackgroundTrainer`` that trains into the
+    ``episodic_interim_<stamp>`` slot for the CURRENT consolidation window
+    (``stamp`` is the refresh-cadence window floor from
+    ``current_interim_stamp`` — e.g. the 12:00 window stamps
+    ``episodic_interim_20260706T1200``).  When a slot for the current
+    window already exists, that slot is retrained in place; a new
+    stamp/slot is minted only when a new window opens.  Training is
+    new-plus-replay: with replay enabled (``indexed_key_replay``, the live
+    default), the slot is retrained on its existing keys reconstructed from
+    adapter weights UNION the new batch, not the new batch alone.
+    ``max_interim_count`` is the overflow ceiling governing what happens
+    when a NEW window's mint would exceed it — an overflow slot beyond the
+    cap (when ``interim_overflow_slack > 0``) or ``cap_pending`` (sessions
+    stay pending for the next tick), never absorption into an existing
+    slot.  Main adapters are only updated by the full-cycle path that
+    calls ``consolidate_interim_adapters``.
     """
     from paramem.server.consolidation import (
         SessionClass,
@@ -13448,10 +13459,15 @@ def _extract_and_start_training():
         _dispatch_finalize(_finalize_simulate)
         return
 
-    # --- Phase 2 + 3: Train into a fresh interim slot via the BG trainer ---
-    # The scheduled tick mints a new ``episodic_interim_<stamp>`` adapter and
-    # trains the batch into it (or absorbs into the newest existing slot when
-    # the cap is reached).  Main adapters are NOT touched here — they only
+    # --- Phase 2 + 3: Train into the current-window interim slot via the BG trainer ---
+    # The scheduled tick trains into ``episodic_interim_<stamp>``, where
+    # ``stamp`` is the current consolidation window's floor
+    # (current_interim_stamp).  An existing current-window slot is
+    # retrained in place — new-plus-replay: reconstructed existing keys
+    # UNION the new batch; a new stamp/slot is minted only when a new
+    # window opens.  ``max_interim_count`` is the overflow ceiling for that
+    # mint (overflow slot or cap_pending), never absorption into an
+    # existing slot.  Main adapters are NOT touched here — they only
     # change at the full-cycle boundary, where consolidate_interim_adapters()
     # collapses the accumulated interim slots into episodic / semantic /
     # procedural.  Freshness-wins router order: probing the newest interim
