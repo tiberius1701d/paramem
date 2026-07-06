@@ -650,7 +650,12 @@ class TestCheckPredicateCoexistenceParser:
                 return_value=[{"role": "user", "content": "test"}],
             ):
                 return check_predicate_coexistence(
-                    "Alex", "speaks", model, tokenizer, "Classify {predicate}: COEXIST or REPLACE"
+                    "Alex",
+                    "speaks",
+                    model,
+                    tokenizer,
+                    "Classify {predicate}: COEXIST or REPLACE",
+                    "You classify relationship cardinality.",
                 )
 
     def test_coexist_verdict_parsed(self):

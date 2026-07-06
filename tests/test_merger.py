@@ -790,7 +790,7 @@ class TestModelContradictionAndRelease:
 
         verdict = "REPLACE" if is_single_valued else "COEXIST"
 
-        def _patched_coexistence(subject, predicate, mdl, tok, prompt=None):
+        def _patched_coexistence(subject, predicate, mdl, tok, prompt=None, system_prompt=None):
             return verdict
 
         return model, tokenizer, _patched_coexistence
@@ -1712,7 +1712,7 @@ class TestRemovalLedger:
         from paramem.graph.schema import Relation, SessionGraph
         from paramem.memory.persistence import _IK_KEY_ATTR
 
-        def _always_replace(subject, predicate, mdl, tok, prompt=None):
+        def _always_replace(subject, predicate, mdl, tok, prompt=None, system_prompt=None):
             return "REPLACE"
 
         m = GraphMerger(model=object(), tokenizer=object())  # non-None to trigger Case-2

@@ -124,6 +124,109 @@ class TestPromptFilesPresent:
         )
 
 
+class TestSystemPromptFilesPresent:
+    """Presence + brace guard for the seven externalized SYSTEM-prompt files.
+
+    Each file is the companion ``<base>_system.txt`` for an already-external
+    USER template, following the ``extraction.txt`` / ``extraction_system.txt``
+    pattern.  See :func:`test_extraction_system_txt_no_braces` for the
+    rationale on the brace guard — system prompts receive no slot
+    substitution, so a stray ``{`` would leak raw template syntax into the
+    model context.
+    """
+
+    _SYSTEM_PROMPT_FILES = (
+        "entity_correction_system.txt",
+        "merger_coexistence_system.txt",
+        "anonymization_system.txt",
+        "sota_plausibility_system.txt",
+        "sota_enrichment_system.txt",
+        "graph_dedup_filter_system.txt",
+        "sota_graph_enrichment_system.txt",
+    )
+
+    def test_entity_correction_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "entity_correction_system.txt").exists()
+
+    def test_merger_coexistence_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "merger_coexistence_system.txt").exists()
+
+    def test_anonymization_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "anonymization_system.txt").exists()
+
+    def test_sota_plausibility_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "sota_plausibility_system.txt").exists()
+
+    def test_sota_enrichment_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "sota_enrichment_system.txt").exists()
+
+    def test_graph_dedup_filter_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "graph_dedup_filter_system.txt").exists()
+
+    def test_sota_graph_enrichment_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "sota_graph_enrichment_system.txt").exists()
+
+    def test_all_system_prompt_files_no_braces(self):
+        for filename in self._SYSTEM_PROMPT_FILES:
+            content = (_PROMPTS_DIR / filename).read_text()
+            assert "{" not in content, (
+                f"{filename} contains '{{' braces — system prompts are "
+                "plain-English only; slot substitution runs only on user templates."
+            )
+
+
+class TestSystemPromptGoldens:
+    """Byte-for-byte preservation goldens for the seven externalized files.
+
+    Each golden string was captured programmatically from the pre-change
+    inline literal/constant (single-line literals copied verbatim from
+    source; the three former module constants captured via
+    ``repr(extractor._SOTA_*_SYSTEM_PROMPT)`` before the constants were
+    replaced with ``_load_prompt(...)`` calls) — never hand-retyped against
+    the new ``.txt`` file, so a shared typo cannot silently pass both sides.
+    """
+
+    def test_entity_correction_system_golden(self):
+        content = (_PROMPTS_DIR / "entity_correction_system.txt").read_text().strip()
+        assert content == "Output valid JSON only."
+
+    def test_merger_coexistence_system_golden(self):
+        content = (_PROMPTS_DIR / "merger_coexistence_system.txt").read_text().strip()
+        assert content == "You classify relationship cardinality."
+
+    def test_anonymization_system_golden(self):
+        content = (_PROMPTS_DIR / "anonymization_system.txt").read_text().strip()
+        assert content == "You anonymize data. Output valid JSON only."
+
+    def test_sota_plausibility_system_golden(self):
+        content = (_PROMPTS_DIR / "sota_plausibility_system.txt").read_text().strip()
+        assert content == (
+            "You are a knowledge graph plausibility filter. Drop invalid facts "
+            "only. Do NOT add or modify facts. Output valid JSON only."
+        )
+
+    def test_sota_enrichment_system_golden(self):
+        content = (_PROMPTS_DIR / "sota_enrichment_system.txt").read_text().strip()
+        assert content == (
+            "You are a knowledge graph enrichment assistant. Resolve coreference "
+            "and split compound facts. Do NOT remove facts — a separate "
+            "plausibility filter handles removal. Output valid JSON only."
+        )
+
+    def test_graph_dedup_filter_system_golden(self):
+        content = (_PROMPTS_DIR / "graph_dedup_filter_system.txt").read_text().strip()
+        assert content == "You identify synonym predicate clusters. Output valid JSON only."
+
+    def test_sota_graph_enrichment_system_golden(self):
+        content = (_PROMPTS_DIR / "sota_graph_enrichment_system.txt").read_text().strip()
+        assert content == (
+            "You are a knowledge graph enrichment assistant operating over a "
+            "pre-merged cross-transcript graph. Emit cross-session second-order "
+            "relations and same_as pairs for duplicate entities. Output valid "
+            "JSON only."
+        )
+
+
 class TestRetiredDocumentPromptsAbsent:
     """The document-variant prompt files are retired — their absence is the
     architectural guard against silent drift on schema-shape rules.

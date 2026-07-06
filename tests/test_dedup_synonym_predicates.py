@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from paramem.graph.extractor import dedup_synonym_predicates
+from paramem.graph.prompts import _load_prompt
 
 
 def _make_model_tokenizer(raw_outputs: list[str]):
@@ -254,7 +255,7 @@ class TestSotaBranch:
         "provider": "anthropic",
         "filter_model": "claude-sonnet-4-6",
         "endpoint": None,
-        "system_prompt": "You identify synonym predicate clusters. Output valid JSON only.",
+        "system_prompt": _load_prompt("graph_dedup_filter_system.txt", required=True),
     }
 
     def test_sota_call_receives_raw_prompt(self):

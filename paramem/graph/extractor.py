@@ -3794,12 +3794,13 @@ def anonymize_with_local_model(
     ]
 
     anon_prompt = load_anonymization_prompt(prompts_dir=prompts_dir, filename=prompt_filename)
+    anon_system = _load_prompt("anonymization_system.txt", prompts_dir=prompts_dir, required=True)
     prompt = anon_prompt.format(
         facts_json=json.dumps(facts, indent=2),
         transcript=transcript or "(no transcript provided)",
     )
     messages = [
-        {"role": "system", "content": "You anonymize data. Output valid JSON only."},
+        {"role": "system", "content": anon_system},
         {"role": "user", "content": prompt},
     ]
     formatted = tokenizer.apply_chat_template(
@@ -3869,15 +3870,8 @@ PROVIDER_KEY_ENV = {
 }
 
 
-_SOTA_ENRICHMENT_SYSTEM_PROMPT = (
-    "You are a knowledge graph enrichment assistant. "
-    "Resolve coreference and split compound facts. Do NOT remove facts — a "
-    "separate plausibility filter handles removal. Output valid JSON only."
-)
-_SOTA_PLAUSIBILITY_SYSTEM_PROMPT = (
-    "You are a knowledge graph plausibility filter. "
-    "Drop invalid facts only. Do NOT add or modify facts. Output valid JSON only."
-)
+_SOTA_ENRICHMENT_SYSTEM_PROMPT = _load_prompt("sota_enrichment_system.txt", required=True)
+_SOTA_PLAUSIBILITY_SYSTEM_PROMPT = _load_prompt("sota_plausibility_system.txt", required=True)
 
 
 # _DEFAULT_FILTER_MAX_TOKENS / _DEFAULT_FILTER_TEMPERATURE /
@@ -4202,10 +4196,8 @@ def _filter_with_sota(
 # Graph-level SOTA enrichment (Task #10)
 # ---------------------------------------------------------------------------
 
-_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT = (
-    "You are a knowledge graph enrichment assistant operating over a pre-merged "
-    "cross-transcript graph. Emit cross-session second-order relations and same_as "
-    "pairs for duplicate entities. Output valid JSON only."
+_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT = _load_prompt(
+    "sota_graph_enrichment_system.txt", required=True
 )
 
 
@@ -4891,6 +4883,7 @@ def dedup_synonym_predicates(
         return clusters_by_so, diagnostics
 
     local_mode = sota is None
+    dedup_system = _load_prompt("graph_dedup_filter_system.txt", required=True)
     # Predicate-dedup is structured extraction: the local path must run on the
     # base weights (adapter disabled) with the KV cache live (checkpointing off,
     # restored to entry state on exit).  The SOTA path uses the cloud model and
@@ -4911,12 +4904,7 @@ def dedup_synonym_predicates(
 
             if local_mode:
                 messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You identify synonym predicate clusters. Output valid JSON only."
-                        ),
-                    },
+                    {"role": "system", "content": dedup_system},
                     {"role": "user", "content": rendered},
                 ]
                 formatted = tokenizer.apply_chat_template(

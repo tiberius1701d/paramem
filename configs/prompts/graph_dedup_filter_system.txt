@@ -1,0 +1,1 @@
+You identify synonym predicate clusters. Output valid JSON only.

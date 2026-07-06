@@ -60,6 +60,7 @@ def check_predicate_coexistence(
     model,
     tokenizer,
     prompt: str,
+    system_prompt: str,
 ) -> str:
     """Ask the model whether the predicate is single-valued (REPLACE) or multi-valued (COEXIST).
 
@@ -86,6 +87,9 @@ def check_predicate_coexistence(
         prompt: Prompt template with a ``{predicate}`` slot.  Load from
             ``merger_coexistence.txt`` via ``_load_prompt(..., required=True)``
             and pass here — no inline fallback constant exists.
+        system_prompt: System-role content for the classification call.  Load
+            from ``merger_coexistence_system.txt`` via
+            ``_load_prompt(..., required=True)`` and pass here.
     """
     from paramem.evaluation.recall import generate_answer
     from paramem.models.loader import adapt_messages
@@ -94,7 +98,7 @@ def check_predicate_coexistence(
 
     messages = adapt_messages(
         [
-            {"role": "system", "content": "You classify relationship cardinality."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         tokenizer,
@@ -161,9 +165,10 @@ class GraphMerger:
                 :meth:`release` to drop the reference.
             tokenizer: Tokenizer paired with *model*.
             prompts_dir: Optional directory to load ``merger_coexistence.txt``
-                from.  Falls back to ``configs/prompts/`` in the project root.
-                The file is required; its absence raises :exc:`FileNotFoundError`.
-                Resolved once at construction so a config edit takes effect at the
+                and ``merger_coexistence_system.txt`` from.  Falls back to
+                ``configs/prompts/`` in the project root.  Both files are
+                required; absence raises :exc:`FileNotFoundError`.  Resolved
+                once at construction so a config edit takes effect at the
                 next consolidation cycle (when a new merger instance is created).
         """
         self.similarity_threshold = similarity_threshold
@@ -206,6 +211,9 @@ class GraphMerger:
         _pd = Path(prompts_dir) if prompts_dir else None
         self._coexistence_prompt = _load_prompt(
             "merger_coexistence.txt", prompts_dir=_pd, required=True
+        )
+        self._coexistence_system = _load_prompt(
+            "merger_coexistence_system.txt", prompts_dir=_pd, required=True
         )
 
     def merge(
@@ -704,6 +712,7 @@ class GraphMerger:
                         self.model,
                         self.tokenizer,
                         self._coexistence_prompt,
+                        self._coexistence_system,
                     )
                     # Cache: True = multi-valued (COEXIST), False = single-valued (REPLACE).
                     if verdict == "REPLACE":

@@ -146,9 +146,15 @@ def _verdict(
         model=model_alias,
         required=True,
     )
+    system_prompt = _load_prompt(
+        "entity_correction_system.txt",
+        prompts_dir=prompts_dir,
+        model=model_alias,
+        required=True,
+    )
     prompt = template.format(context=context, value=value)
     messages = [
-        {"role": "system", "content": "Output valid JSON only."},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
     formatted = tokenizer.apply_chat_template(

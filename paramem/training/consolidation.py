@@ -2950,8 +2950,8 @@ class ConsolidationLoop:
                         "provider": provider,
                         "filter_model": ext_cfg.noise_filter_model,
                         "endpoint": ext_cfg.noise_filter_endpoint or None,
-                        "system_prompt": (
-                            "You identify synonym predicate clusters. Output valid JSON only."
+                        "system_prompt": _load_prompt(
+                            "graph_dedup_filter_system.txt", required=True
                         ),
                     }
                 }
