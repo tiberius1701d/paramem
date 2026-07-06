@@ -14856,6 +14856,11 @@ class TestFoldResumeHelpers:
                     "_run_graph_enrichment",
                     return_value={"skipped": True},
                 ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_normalization",
+                    return_value={"skipped": True},
+                ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
                 patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
                 patch.object(
@@ -15082,6 +15087,11 @@ class TestFoldResumeHelpers:
                 patch.object(
                     ConsolidationLoop,
                     "_run_graph_enrichment",
+                    return_value={"skipped": True},
+                ),
+                patch.object(
+                    ConsolidationLoop,
+                    "_run_graph_normalization",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),

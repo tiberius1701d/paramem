@@ -196,7 +196,7 @@ consolidation:
   decay_window: 10             # cycles before unreinforced keys decay
   sota_enabled: false           # master gate for ALL SOTA (transcript pipeline + graph enrichment). false = ship default (off)
   refinement_enrichment: "off"  # graph-stage SOTA enrichment pass. off|on. Requires sota_enabled:true to fire.
-  refinement_normalization: "off"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
+  refinement_normalization: "on"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)
   consolidation_retry_cap: 3    # cycles a session stays pending on recall-gate failure or DEGENERATE outcome before being released; ABORT does not count
