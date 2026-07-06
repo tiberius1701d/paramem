@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "configs" / "prompts"
 
 
@@ -256,3 +258,33 @@ class TestRetiredDocumentPromptsAbsent:
             "extraction_procedural_document.txt has been re-introduced — "
             "procedural extraction uses a single prompt for every source type."
         )
+
+
+class TestEnsurePromptAssets:
+    """Runtime startup guard mirroring the ship-gate presence tests above.
+
+    ``ensure_prompt_assets`` runs first in the server lifespan so a broken
+    checkout / non-editable pip install (prompts are not packaged) fails
+    loudly instead of the extraction pipeline silently loading empty prompts.
+    """
+
+    def test_passes_with_real_prompt_dir(self):
+        # A repo checkout always has configs/prompts/ with the required files.
+        from paramem.graph.prompts import ensure_prompt_assets
+
+        ensure_prompt_assets()
+
+    def test_raises_when_dir_missing(self, monkeypatch, tmp_path):
+        import paramem.graph.prompts as prompts_mod
+
+        monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path / "absent")
+        with pytest.raises(RuntimeError, match="Prompt asset directory not found"):
+            prompts_mod.ensure_prompt_assets()
+
+    def test_raises_when_required_file_missing(self, monkeypatch, tmp_path):
+        # Directory exists but lacks the load-bearing extraction files.
+        import paramem.graph.prompts as prompts_mod
+
+        monkeypatch.setattr(prompts_mod, "_DEFAULT_PROMPT_DIR", tmp_path)
+        with pytest.raises(RuntimeError, match="Required prompt file"):
+            prompts_mod.ensure_prompt_assets()

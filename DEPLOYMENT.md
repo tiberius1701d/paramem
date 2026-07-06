@@ -74,6 +74,16 @@ cd paramem
 pip install -e ".[voice,dev]"
 ```
 
+> **Run from the repo checkout.** ParaMem loads runtime assets — the prompt
+> templates (`configs/prompts/`), the graph schema (`configs/schema.yaml`), and
+> the config template (`configs/server.yaml.example`) — from the project
+> directory, resolved relative to the repository root rather than the process's
+> working directory. These are **not** shipped as Python package data, so the
+> editable install (`pip install -e`) above is required: it keeps the package
+> inside the checkout where the assets live. A non-editable install into
+> `site-packages` will not find them, and the server fails fast at startup with
+> a clear error if the prompt assets are absent.
+
 ### Extras
 
 | Extra | Installs | When to use |

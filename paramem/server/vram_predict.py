@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from paramem.server.config import DEFAULT_DATA_DIR
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -238,7 +240,7 @@ def predict_tts_bytes(
 
     # Resolve Piper model_dir from config (mirrors PiperTTSEngine.__init__)
     model_dir_str = getattr(tts_config, "model_dir", "") or ""
-    piper_dir = Path(model_dir_str) if model_dir_str else Path("data/ha/tts/piper")
+    piper_dir = Path(model_dir_str) if model_dir_str else DEFAULT_DATA_DIR / "tts" / "piper"
 
     total_bytes = 0
     piper_voices_on_gpu = 0

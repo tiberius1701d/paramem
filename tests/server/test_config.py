@@ -18,7 +18,12 @@ from pathlib import Path
 
 import pytest
 
-from paramem.server.config import PathsConfig, load_server_config
+from paramem.server.config import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_SERVER_CONFIG_PATH,
+    PathsConfig,
+    load_server_config,
+)
 
 
 def _write_yaml(tmp_path: Path, content: str) -> Path:
@@ -667,3 +672,55 @@ class TestTierFloorConfigPlumbing:
         config = load_server_config(yaml_file)
         assert config.consolidation.min_tier_key_floor == 30
         assert config.consolidation.tier_fast_start is True
+
+
+class TestDefaultServerConfigPathIsCwdIndependent:
+    """``DEFAULT_SERVER_CONFIG_PATH`` is absolute and anchored to the repo root,
+    so config resolution does not depend on the process's working directory.
+
+    ParaMem deploys from a repo checkout (editable install under systemd) with
+    ``WorkingDirectory`` = repo root today; these tests lock in that the loader
+    no longer *relies* on that cwd, closing the same landmine class as the
+    ``_trial_json_path`` fallback bug.
+    """
+
+    def test_default_path_is_absolute_and_repo_anchored(self):
+        # The old ``Path("configs/server.yaml")`` literal was relative; the fix
+        # anchors it to the nearest ``pyproject.toml`` ancestor (the repo root).
+        assert DEFAULT_SERVER_CONFIG_PATH.is_absolute()
+        assert DEFAULT_SERVER_CONFIG_PATH.name == "server.yaml"
+        assert DEFAULT_SERVER_CONFIG_PATH.parent.name == "configs"
+        assert (DEFAULT_SERVER_CONFIG_PATH.parent.parent / "pyproject.toml").is_file()
+
+    def test_default_load_is_cwd_independent(self, monkeypatch, tmp_path):
+        # Resolve from the repo-root cwd (pytest's cwd) first.
+        from_root = load_server_config()
+        # A loaded config absolutizes ``paths.data`` against the repo root; a
+        # bare ``ServerConfig()`` (the "path vanished" branch) leaves it the
+        # relative ``data/ha`` default. Under the old relative default, calling
+        # from a foreign cwd hit that branch — this asserts it no longer does.
+        monkeypatch.chdir(tmp_path)
+        from_foreign = load_server_config()
+        assert from_foreign.paths.data.is_absolute()
+        assert from_foreign.paths.data == from_root.paths.data
+        assert from_foreign.model_name == from_root.model_name
+
+    def test_relative_string_default_still_resolves(self, monkeypatch):
+        # The fresh-clone comparison resolves ``path`` so a caller may still
+        # spell the default as the cwd-relative ``configs/server.yaml`` (as
+        # several existing call sites and tests do) from the repo root.
+        repo_root = DEFAULT_SERVER_CONFIG_PATH.parent.parent
+        monkeypatch.chdir(repo_root)
+        cfg = load_server_config("configs/server.yaml")
+        assert cfg.paths.data.is_absolute()
+
+    def test_default_data_dir_is_absolute_and_repo_anchored(self):
+        # The data-root fallback used where a loaded ``config.paths.data`` is
+        # unavailable (config is None / a test mock). It replaced cwd-relative
+        # ``Path("data/ha/...")`` literals scattered across the server, so it
+        # must be absolute and share the repo root with the config path.
+        assert DEFAULT_DATA_DIR.is_absolute()
+        assert DEFAULT_DATA_DIR.name == "ha"
+        assert DEFAULT_DATA_DIR.parent.name == "data"
+        assert DEFAULT_DATA_DIR.parent.parent == DEFAULT_SERVER_CONFIG_PATH.parent.parent
+        assert (DEFAULT_DATA_DIR.parent.parent / "pyproject.toml").is_file()

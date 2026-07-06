@@ -30,6 +30,7 @@ from pathlib import Path
 from paramem.backup.age_envelope import is_age_envelope
 from paramem.backup.encryption import _atomic_write_bytes, envelope_encrypt_bytes, infra_paths
 from paramem.backup.key_store import DAILY_PASSPHRASE_ENV_VAR
+from paramem.server.config import DEFAULT_DATA_DIR, DEFAULT_SERVER_CONFIG_PATH
 
 # DAILY_KEY_PATH_DEFAULT is intentionally NOT imported as a local binding
 # here: tests monkeypatch ``paramem.backup.key_store.DAILY_KEY_PATH_DEFAULT``
@@ -58,7 +59,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/server.yaml"),
+        default=DEFAULT_SERVER_CONFIG_PATH,
         metavar="PATH",
         help="Server config file (default: configs/server.yaml).",
     )
@@ -112,7 +113,7 @@ def _load_config(config_path: Path):
 
         # Return a minimal stand-in.
         class _FallbackPaths:
-            data = Path("data/ha")
+            data = DEFAULT_DATA_DIR
 
         class _FallbackCfg:
             paths = _FallbackPaths()

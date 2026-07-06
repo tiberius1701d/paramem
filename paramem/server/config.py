@@ -1684,10 +1684,23 @@ class ServerConfig:
         )
 
 
-DEFAULT_SERVER_CONFIG_PATH = Path("configs/server.yaml")
+# Project root — the nearest ``pyproject.toml`` ancestor. ParaMem deploys from
+# a repo checkout (editable install under systemd), so this always resolves;
+# there is no packaged copy. Anchors the default asset/data locations below so
+# they resolve identically regardless of the process's working directory.
+_PROJECT_ROOT = find_project_root(Path(__file__)) or Path(__file__).resolve().parents[2]
+
+# Absolute path to the operator-local server config (see ``_PROJECT_ROOT``).
+DEFAULT_SERVER_CONFIG_PATH = _PROJECT_ROOT / "configs" / "server.yaml"
+
+# Absolute fallback data root, mirroring the absolutized ``PathsConfig.data``
+# default. Consulted only where a loaded ``config.paths.data`` is unavailable
+# (``config`` is ``None`` or a test mock); a loaded config supplies its own
+# resolved ``paths.data`` and this constant is not used.
+DEFAULT_DATA_DIR = _PROJECT_ROOT / "data" / "ha"
 
 
-def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig:
+def load_server_config(path: str | Path = DEFAULT_SERVER_CONFIG_PATH) -> ServerConfig:
     """Load server configuration from YAML file.
 
     Supports ${VAR_NAME} env var interpolation in all string values.
@@ -1695,12 +1708,16 @@ def load_server_config(path: str | Path = "configs/server.yaml") -> ServerConfig
     Fresh-clone fallback: when ``path`` is the default operator-local
     location and the file does not exist (gitignored, never created), fall
     back to the shipped ``configs/server.yaml.example`` so CI runs and
-    fresh checkouts boot without a manual copy step.
+    fresh checkouts boot without a manual copy step. The comparison resolves
+    ``path`` so a caller may spell the default either as the absolute
+    ``DEFAULT_SERVER_CONFIG_PATH`` or as the cwd-relative ``configs/server.yaml``.
     """
     path = Path(path)
     if not path.exists():
-        if path == DEFAULT_SERVER_CONFIG_PATH:
-            template = path.parent / (path.name + ".example")
+        if path.resolve() == DEFAULT_SERVER_CONFIG_PATH:
+            template = DEFAULT_SERVER_CONFIG_PATH.parent / (
+                DEFAULT_SERVER_CONFIG_PATH.name + ".example"
+            )
             if template.exists():
                 logger.info(
                     "configs/server.yaml not found; loading shipped template "

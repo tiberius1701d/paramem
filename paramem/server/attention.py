@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from paramem.server.config import DEFAULT_SERVER_CONFIG_PATH
+
 logger = logging.getLogger(__name__)
 
 
@@ -1124,7 +1126,7 @@ def _collect_pre_flight_items(state: dict, config) -> list[AttentionItem]:
 
     live_config_path_raw = state.get("config_path")
     live_config_path = (
-        Path(live_config_path_raw) if live_config_path_raw else Path("configs/server.yaml")
+        Path(live_config_path_raw) if live_config_path_raw else DEFAULT_SERVER_CONFIG_PATH
     )
 
     try:

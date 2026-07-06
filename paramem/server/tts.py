@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from paramem.server.config import TTSConfig, TTSVoiceConfig
+from paramem.server.config import DEFAULT_DATA_DIR, TTSConfig, TTSVoiceConfig
 from paramem.server.vram_guard import safe_empty_cache
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ class PiperTTSEngine(TTSEngine):
 
     def __init__(self, model_name: str, model_dir: Path | None = None):
         self._model_name = model_name
-        self._model_dir = model_dir or Path("data/ha/tts/piper")
+        self._model_dir = model_dir or DEFAULT_DATA_DIR / "tts" / "piper"
         self._voice = None
         self._actual_device = "cpu"
 

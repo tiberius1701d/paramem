@@ -20,6 +20,43 @@ _DEFAULT_PROMPT_DIR = (
 _SPEAKER_DIRECTIVE_FILE = "speaker_directive.txt"
 _SPEAKER_DIRECTIVE_SENTINEL = "==="
 
+# Load-bearing prompt files. Absent, ``_load_prompt`` silently returns the empty
+# default (``required=False``), so the extraction pipeline degrades quietly
+# rather than failing. ``ensure_prompt_assets`` validates them at startup.
+_REQUIRED_PROMPT_FILES = (
+    "extraction.txt",
+    "extraction_system.txt",
+    "extraction_procedural.txt",
+)
+
+
+def ensure_prompt_assets() -> None:
+    """Fail loudly when the shared prompt assets are missing at startup.
+
+    ParaMem deploys from a repo checkout (editable install under systemd), so
+    ``configs/prompts/`` — the guaranteed final fallback in ``_load_prompt``'s
+    search order — is always present in a correct deployment. A missing
+    directory or file means a broken checkout or a non-editable ``pip install``
+    (prompts are not shipped as package data). Surface that at boot instead of
+    letting the extraction pipeline silently load empty prompts.
+
+    Raises:
+        RuntimeError: When ``_DEFAULT_PROMPT_DIR`` is not a directory, or a
+            required prompt file is absent from it.
+    """
+    if not _DEFAULT_PROMPT_DIR.is_dir():
+        raise RuntimeError(
+            f"Prompt asset directory not found: {_DEFAULT_PROMPT_DIR}. ParaMem "
+            "deploys from a repo checkout — run the server from the cloned "
+            "repository (editable install). Prompts are not shipped as package data."
+        )
+    missing = [f for f in _REQUIRED_PROMPT_FILES if not (_DEFAULT_PROMPT_DIR / f).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"Required prompt file(s) missing from {_DEFAULT_PROMPT_DIR}: "
+            f"{', '.join(missing)}. Restore configs/prompts/ from the repository."
+        )
+
 
 def _load_speaker_directive_section(section_name: str) -> str:
     """Load a named section from ``configs/prompts/speaker_directive.txt``.

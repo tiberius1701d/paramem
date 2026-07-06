@@ -49,7 +49,13 @@ from paramem.server import calibrate as calibrate_module
 from paramem.server.active_store_migration import migrate
 from paramem.server.background_trainer import BackgroundTrainer
 from paramem.server.cloud import get_cloud_agent
-from paramem.server.config import TTSConfig, TTSVoiceConfig, load_server_config
+from paramem.server.config import (
+    DEFAULT_DATA_DIR,
+    DEFAULT_SERVER_CONFIG_PATH,
+    TTSConfig,
+    TTSVoiceConfig,
+    load_server_config,
+)
 from paramem.server.consolidation import create_consolidation_loop
 from paramem.server.ha_graph import HAEntityGraph
 from paramem.server.incidents import (
@@ -1863,6 +1869,13 @@ async def lifespan(app: FastAPI):
     """Load model on startup, clean up on shutdown."""
     config = _state["config"]
 
+    # Deployment-integrity gate: fail loudly if the shared prompt assets are
+    # missing (broken checkout / non-editable pip install). Prompts are not
+    # packaged; a repo checkout always has them. Runs before anything expensive.
+    from paramem.graph.prompts import ensure_prompt_assets
+
+    ensure_prompt_assets()
+
     from paramem.backup.encryption import (
         assert_mode_consistency as _assert_mode,
     )
@@ -1973,9 +1986,7 @@ async def lifespan(app: FastAPI):
     # /migration/confirm before any request handler can observe stale state.
     try:
         live_config_path = (
-            Path(_state["config_path"])
-            if _state.get("config_path")
-            else Path("configs/server.yaml")
+            Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
         )
         state_dir = config.paths.data / "state"
         backups_root = config.paths.data / "backups"
@@ -2411,9 +2422,7 @@ async def lifespan(app: FastAPI):
     _bs_resume = _state.pop("_base_swap_resume_marker", None)
     if _bs_resume is not None and not cloud_only:
         _bs_live_cfg = (
-            Path(_state["config_path"])
-            if _state.get("config_path")
-            else Path("configs/server.yaml")
+            Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
         )
         _bs_state_dir = (config.paths.data / "state").resolve()
         _bs_backups_root = (config.paths.data / "backups").resolve()
@@ -4481,7 +4490,7 @@ async def gpu_acquire():
                         _live_cfg_resume = (
                             Path(_state["config_path"])
                             if _state.get("config_path")
-                            else Path("configs/server.yaml")
+                            else DEFAULT_SERVER_CONFIG_PATH
                         )
                         asyncio.create_task(
                             _run_base_swap_orchestration(
@@ -6160,7 +6169,7 @@ def _apply_config_live() -> dict:
         # ── no-op skip (disk hash == memory hash → rollback already applied config) ──
         config_path_str = _state.get("config_path")
         config_a = _state.get("config")
-        live_config_path = Path(config_path_str) if config_path_str else Path("configs/server.yaml")
+        live_config_path = Path(config_path_str) if config_path_str else DEFAULT_SERVER_CONFIG_PATH
         if live_config_path.exists():
             disk_hash = compute_config_hash(live_config_path)
             # Compare the on-disk hash against the hash of config A that was
@@ -7639,7 +7648,7 @@ async def migration_preview(request: PreviewRequest):
     # --- Validate path ---
     config = _state.get("config")
     live_config_path = (
-        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+        Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
     )
 
     try:
@@ -7680,7 +7689,7 @@ async def migration_preview(request: PreviewRequest):
     tier_diff = compute_tier_diff(live_yaml, parsed_candidate)
 
     # --- Shape-change detection ---
-    adapter_dir = config.adapter_dir if config is not None else Path("data/ha/adapters")
+    adapter_dir = config.adapter_dir if config is not None else DEFAULT_DATA_DIR / "adapters"
     live_registry_sha256 = ""
     if config is not None:
         registry_path = None
@@ -7724,7 +7733,7 @@ async def migration_preview(request: PreviewRequest):
     try:
         _backups_root_for_pf = (config.paths.data / "backups").resolve()
     except (AttributeError, TypeError):
-        _backups_root_for_pf = Path("data/ha/backups").resolve()
+        _backups_root_for_pf = (DEFAULT_DATA_DIR / "backups").resolve()
 
     pre_flight = None
     try:
@@ -7920,14 +7929,14 @@ async def migration_confirm(request: ConfirmRequest):
     # Prepare paths from config.
     config = _state.get("config")
     live_config_path = (
-        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+        Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
     )
     if config is not None:
         state_dir = (config.paths.data / "state").resolve()
         backups_root = (config.paths.data / "backups").resolve()
     else:
-        state_dir = (Path("data/ha/state")).resolve()
-        backups_root = (Path("data/ha/backups")).resolve()
+        state_dir = (DEFAULT_DATA_DIR / "state").resolve()
+        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
 
     trial_adapter_dir = str((state_dir / "trial_adapter").resolve())
     trial_graph_dir = str((state_dir / "trial_graph").resolve())
@@ -8337,9 +8346,7 @@ async def _run_trial_consolidation() -> None:
         from paramem.server.gpu_lock import gpu_lock_sync
 
         live_config_path = (
-            Path(_state["config_path"])
-            if _state.get("config_path")
-            else Path("configs/server.yaml")
+            Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
         )
 
         # Reload config from the newly-active candidate.  The trial runs in the
@@ -8541,7 +8548,7 @@ async def _run_trial_consolidation() -> None:
             trial_adapter_dir = (
                 Path(trial_adapter_dir_str)
                 if trial_adapter_dir_str
-                else Path("state/trial_adapter")
+                else DEFAULT_DATA_DIR / "state" / "trial_adapter"
             )
 
             # Use loop.model (the PeftModel wrapper) instead of the raw
@@ -9739,14 +9746,14 @@ async def migration_accept():
 
     config = _state.get("config")
     live_config_path = (
-        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+        Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
     )
     if config is not None:
         state_dir = (config.paths.data / "state").resolve()
         backups_root = (config.paths.data / "backups").resolve()
     else:
-        state_dir = Path("data/ha/state").resolve()
-        backups_root = Path("data/ha/backups").resolve()
+        state_dir = (DEFAULT_DATA_DIR / "state").resolve()
+        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
 
     trial_adapters_dir = backups_root / "trial_adapters"
 
@@ -10069,14 +10076,14 @@ async def migration_rollback():
 
     config = _state.get("config")
     live_config_path = (
-        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+        Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
     )
     if config is not None:
         state_dir = (config.paths.data / "state").resolve()
         backups_root = (config.paths.data / "backups").resolve()
     else:
-        state_dir = Path("data/ha/state").resolve()
-        backups_root = Path("data/ha/backups").resolve()
+        state_dir = (DEFAULT_DATA_DIR / "state").resolve()
+        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
 
     trial_adapters_dir = backups_root / "trial_adapters"
 
@@ -10852,9 +10859,9 @@ async def backup_list(kind: str | None = None):
         try:
             backups_root = (config.paths.data / "backups").resolve()
         except (AttributeError, TypeError):
-            backups_root = Path("data/ha/backups").resolve()
+            backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
     else:
-        backups_root = Path("data/ha/backups").resolve()
+        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
 
     # Validate and coerce kind query parameter.
     kind_enum = None
@@ -11025,7 +11032,7 @@ async def backup_create(req: BackupCreateRequest):
     state_dir = (config.paths.data / "state").resolve()
     backups_root = (config.paths.data / "backups").resolve()
     live_config_path = (
-        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+        Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
     )
     loop = _state.get("consolidation_loop")
 
@@ -11180,9 +11187,9 @@ async def backup_restore(req: BackupRestoreRequest):
         try:
             backups_root = (config.paths.data / "backups").resolve()
         except (AttributeError, TypeError):
-            backups_root = Path("data/ha/backups").resolve()
+            backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
     else:
-        backups_root = Path("data/ha/backups").resolve()
+        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
 
     # --- Step 2: Locate slot ---
     all_records = enumerate_backups(backups_root, kind=None)
@@ -11202,7 +11209,7 @@ async def backup_restore(req: BackupRestoreRequest):
         )
 
     live_config_path = (
-        Path(_state["config_path"]) if _state.get("config_path") else Path("configs/server.yaml")
+        Path(_state["config_path"]) if _state.get("config_path") else DEFAULT_SERVER_CONFIG_PATH
     )
 
     # --- Step 3: Dispatch by kind ---
@@ -11216,9 +11223,9 @@ async def backup_restore(req: BackupRestoreRequest):
             try:
                 data_dir = config.paths.data.resolve()
             except (AttributeError, TypeError):
-                data_dir = Path("data/ha").resolve()
+                data_dir = DEFAULT_DATA_DIR.resolve()
         else:
-            data_dir = Path("data/ha").resolve()
+            data_dir = DEFAULT_DATA_DIR.resolve()
 
         try:
             result = _restore_bundle(
@@ -11481,8 +11488,8 @@ async def backup_prune(req: BackupPruneRequest):
     else:
         from paramem.server.config import ServerBackupsConfig
 
-        backups_root = Path("data/ha/backups").resolve()
-        state_dir = Path("data/ha/state").resolve()
+        backups_root = (DEFAULT_DATA_DIR / "backups").resolve()
+        state_dir = (DEFAULT_DATA_DIR / "state").resolve()
         backups_cfg = ServerBackupsConfig()
 
     try:
