@@ -32,6 +32,24 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
+def grad_checkpointing_disabled(model):
+    """Disable gradient checkpointing for the scope and restore it to its
+    ENTRY state on exit. HF silently disables the KV cache while checkpointing
+    is active, so any generate() during a training-configured session must
+    toggle it off; a model that entered with checkpointing OFF exits OFF."""
+    was_checkpointing = bool(getattr(model, "is_gradient_checkpointing", False))
+    if was_checkpointing:
+        model.gradient_checkpointing_disable()
+    try:
+        yield
+    finally:
+        if was_checkpointing:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
+
+@contextmanager
 def base_model_inference(model):
     """Run generation on the base weights in a clean inference state.
 
@@ -56,21 +74,13 @@ def base_model_inference(model):
         PeftModel = None
 
     is_peft = PeftModel is not None and isinstance(model, PeftModel)
-    was_checkpointing = bool(getattr(model, "is_gradient_checkpointing", False))
-    if was_checkpointing:
-        model.gradient_checkpointing_disable()
 
-    try:
+    with grad_checkpointing_disabled(model):
         if is_peft:
             with model.disable_adapter():
                 yield
         else:
             yield
-    finally:
-        if was_checkpointing:
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
 
 
 # Cache for system role support per tokenizer class to avoid repeated try/except

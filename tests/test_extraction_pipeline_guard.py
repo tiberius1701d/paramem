@@ -1487,3 +1487,121 @@ def test_classify_via_llm_enters_base_model_inference():
         "`with base_model_inference(model):` — intent classification runs on the "
         "base weights, not the training-active adapter."
     )
+
+
+# ---------------------------------------------------------------------------
+# grad_checkpointing_disabled primitive — entry-state restoration + call-site guard
+# ---------------------------------------------------------------------------
+
+
+def test_grad_checkpointing_disabled_restores_when_entered_on():
+    """A model entering with gradient checkpointing ON must exit ON.
+
+    Inside the scope checkpointing is disabled (KV cache required for
+    ``generate``); the finally clause re-enables it with the non-reentrant
+    kwargs so the caller's training state is unchanged after the scope.
+    """
+    from paramem.models.loader import grad_checkpointing_disabled
+
+    m = MagicMock()
+    m.is_gradient_checkpointing = True
+    m.gradient_checkpointing_disable = MagicMock()
+    m.gradient_checkpointing_enable = MagicMock()
+
+    with grad_checkpointing_disabled(m):
+        m.gradient_checkpointing_disable.assert_called_once()
+        m.gradient_checkpointing_enable.assert_not_called()
+
+    m.gradient_checkpointing_enable.assert_called_once()
+    _, kwargs = m.gradient_checkpointing_enable.call_args
+    assert kwargs["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
+
+
+def test_grad_checkpointing_disabled_leaves_off_when_entered_off():
+    """A model entering with checkpointing OFF must exit OFF — the restore is
+    conditional on the pre-scope state, never an unconditional re-enable."""
+    from paramem.models.loader import grad_checkpointing_disabled
+
+    m = MagicMock()
+    m.is_gradient_checkpointing = False
+    m.gradient_checkpointing_disable = MagicMock()
+    m.gradient_checkpointing_enable = MagicMock()
+
+    with grad_checkpointing_disabled(m):
+        pass
+
+    m.gradient_checkpointing_disable.assert_not_called()
+    m.gradient_checkpointing_enable.assert_not_called()
+
+
+def _enters_grad_checkpointing_disabled(fn) -> bool:
+    """Return True if ``fn`` opens a ``with grad_checkpointing_disabled(...):`` scope."""
+    import ast as _ast
+
+    for node in _ast.walk(fn):
+        if isinstance(node, _ast.With):
+            for item in node.items:
+                call = item.context_expr
+                if (
+                    isinstance(call, _ast.Call)
+                    and isinstance(call.func, _ast.Name)
+                    and call.func.id == "grad_checkpointing_disabled"
+                ):
+                    return True
+    return False
+
+
+def test_debug_recall_run_enters_grad_checkpointing_disabled():
+    """``debug_recall``'s nested ``_run`` (paramem/server/app.py) must restore
+    gradient checkpointing on every exit.
+
+    ``_run`` used to disable checkpointing unconditionally at its top and never
+    re-enable it — a leak that left the KV cache silently disabled for every
+    ``generate()`` after the first ``/debug/recall`` call in a session where
+    checkpointing was on at entry. The fix wraps the region in
+    ``grad_checkpointing_disabled(model)`` so entry state is always restored.
+    """
+    import ast
+
+    repo_root = Path(__file__).resolve().parent.parent
+    app_file = repo_root / "paramem" / "server" / "app.py"
+    tree = ast.parse(app_file.read_text())
+
+    debug_recall_fn = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "debug_recall":
+            debug_recall_fn = node
+            break
+    assert debug_recall_fn is not None, "debug_recall not found in paramem/server/app.py"
+
+    run_fn = None
+    for node in ast.walk(debug_recall_fn):
+        if isinstance(node, ast.FunctionDef) and node.name == "_run":
+            run_fn = node
+            break
+    assert run_fn is not None, "_run not found nested inside debug_recall"
+
+    assert _enters_grad_checkpointing_disabled(run_fn), (
+        "debug_recall's _run must wrap its generation region in "
+        "`with grad_checkpointing_disabled(model):` — the manual "
+        "gradient_checkpointing_disable() with no restore is a KV-cache leak."
+    )
+
+
+def test_handle_chat_enters_grad_checkpointing_disabled():
+    """``handle_chat`` (paramem/server/inference.py) must restore gradient
+    checkpointing on every exit.
+
+    ``handle_chat`` used to call ``model.gradient_checkpointing_disable()``
+    unconditionally at its top with no restore — a leak that left the KV
+    cache silently disabled for every subsequent ``generate()`` in a session
+    where checkpointing was on at entry. The fix wraps the routing body in
+    ``grad_checkpointing_disabled(model)`` so entry state is always restored,
+    on every one of the function's return paths.
+    """
+    target = _find_function("paramem/server/inference.py", "handle_chat")
+    assert _enters_grad_checkpointing_disabled(target), (
+        "handle_chat must wrap its routing body in "
+        "`with grad_checkpointing_disabled(model):` — the manual "
+        "gradient_checkpointing_disable() with no restore is a KV-cache leak."
+    )

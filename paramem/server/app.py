@@ -7024,7 +7024,7 @@ async def debug_recall(request: DebugRecallRequest):
 
     from paramem.evaluation.recall import generate_answer
     from paramem.memory.entry import parse_recalled_entry
-    from paramem.models.loader import adapt_messages, switch_adapter
+    from paramem.models.loader import adapt_messages, grad_checkpointing_disabled, switch_adapter
     from paramem.server.gpu_lock import gpu_lock
     from paramem.training.dataset import SYSTEM_PROMPT
 
@@ -7050,17 +7050,20 @@ async def debug_recall(request: DebugRecallRequest):
         elif isinstance(raw_active, str):
             prior = [raw_active]
 
-        # Defensive: handle_chat (inference.py:305) disables gradient
-        # checkpointing at the top of every chat turn.  Replicate so this
-        # endpoint also avoids the silent KV-cache disable.
-        if hasattr(model, "gradient_checkpointing_disable"):
-            model.gradient_checkpointing_disable()
-
-        t0 = time.monotonic()
-        try:
-            if request.adapter == "none":
-                if isinstance(model, PeftModel):
-                    with model.disable_adapter():
+        with grad_checkpointing_disabled(model):
+            t0 = time.monotonic()
+            try:
+                if request.adapter == "none":
+                    if isinstance(model, PeftModel):
+                        with model.disable_adapter():
+                            raw = generate_answer(
+                                model,
+                                tokenizer,
+                                prompt,
+                                max_new_tokens=request.max_new_tokens,
+                                temperature=request.temperature,
+                            )
+                    else:
                         raw = generate_answer(
                             model,
                             tokenizer,
@@ -7068,7 +7071,9 @@ async def debug_recall(request: DebugRecallRequest):
                             max_new_tokens=request.max_new_tokens,
                             temperature=request.temperature,
                         )
+                    adapter_active_label = "disabled"
                 else:
+                    switch_adapter(model, request.adapter)
                     raw = generate_answer(
                         model,
                         tokenizer,
@@ -7076,24 +7081,14 @@ async def debug_recall(request: DebugRecallRequest):
                         max_new_tokens=request.max_new_tokens,
                         temperature=request.temperature,
                     )
-                adapter_active_label = "disabled"
-            else:
-                switch_adapter(model, request.adapter)
-                raw = generate_answer(
-                    model,
-                    tokenizer,
-                    prompt,
-                    max_new_tokens=request.max_new_tokens,
-                    temperature=request.temperature,
-                )
-                adapter_active_label = request.adapter
-        finally:
-            # Restore prior adapter so the next /chat starts predictable.
-            if prior and isinstance(model, PeftModel):
-                switch_adapter(model, prior[0] if len(prior) == 1 else prior)
+                    adapter_active_label = request.adapter
+            finally:
+                # Restore prior adapter so the next /chat starts predictable.
+                if prior and isinstance(model, PeftModel):
+                    switch_adapter(model, prior[0] if len(prior) == 1 else prior)
 
-        latency_ms = int((time.monotonic() - t0) * 1000)
-        return raw, adapter_active_label, latency_ms
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            return raw, adapter_active_label, latency_ms
 
     async with gpu_lock():
         loop = asyncio.get_running_loop()

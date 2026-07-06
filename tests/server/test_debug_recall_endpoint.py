@@ -219,11 +219,23 @@ class TestSideEffectInvariants:
 
     def test_gradient_checkpointing_disabled_before_generate(self, tmp_path, monkeypatch):
         state = _make_state(tmp_path)
+        # Enter the request with checkpointing ON so grad_checkpointing_disabled
+        # (paramem/models/loader.py) exercises its conditional toggle path: it
+        # only disables/restores when the model entered with checkpointing on.
+        # spec=PeftModel does not include is_gradient_checkpointing, so getattr
+        # would default to False and skip the toggle otherwise.
+        model = state["model"]
+        model.is_gradient_checkpointing = True
+        model.gradient_checkpointing_enable = MagicMock()
         client = _make_client(monkeypatch, state)
         with patch("paramem.evaluation.recall.generate_answer", return_value="x"):
             client.post("/debug/recall", json={"text": "Q", "adapter": "episodic"})
-        # Defensive disable mirrors handle_chat (inference.py:305).
-        assert state["model"].gradient_checkpointing_disable.called
+        # KV-cache invariant: checkpointing is disabled for the generate scope
+        # (HF silently drops the KV cache while checkpointing is active) and then
+        # restored to the entry state on exit — the restore guards the leak where
+        # a training-configured session would otherwise stay checkpointing-off.
+        assert model.gradient_checkpointing_disable.called
+        assert model.gradient_checkpointing_enable.called
 
     def test_bg_trainer_abort_invoked_when_training(self, tmp_path, monkeypatch):
         state = _make_state(tmp_path)

@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from paramem.evaluation.recall import generate_answer
 from paramem.graph.name_match import is_speaker_id
 from paramem.graph.prompts import _load_speaker_directive_section
-from paramem.models.loader import adapt_messages
+from paramem.models.loader import adapt_messages, grad_checkpointing_disabled
 from paramem.server.cloud.base import CloudAgent
 from paramem.server.config import ServerConfig
 from paramem.server.escalation import detect_escalation
@@ -241,138 +241,227 @@ def handle_chat(
         "is_residual": False,
     }
     try:
-        model.gradient_checkpointing_disable()
+        with grad_checkpointing_disabled(model):
+            plan = None
 
-        plan = None
+            # Dual-graph entity routing.  The temporal-query branch (filter
+            # keys by date range) was retired — its data source (combined
+            # registry with last_seen_at / status fields) was never populated
+            # by production paths, so the filter always returned an empty
+            # list and the branch was inert.  If we re-introduce temporal
+            # queries, the writer side needs to be designed first.
+            if router is not None:
+                plan = router.route(text, speaker_id=speaker_id)
+            if plan is not None:
+                routing_diags["intent"] = plan.intent.value
 
-        # Dual-graph entity routing.  The temporal-query branch (filter
-        # keys by date range) was retired in Plan A.3 — its data source
-        # (combined registry with last_seen_at / status fields) was never
-        # populated by production paths, so the filter always returned an
-        # empty list and the branch was inert.  If we re-introduce
-        # temporal queries, the writer side needs to be designed first.
-        if router is not None:
-            plan = router.route(text, speaker_id=speaker_id)
-        if plan is not None:
-            routing_diags["intent"] = plan.intent.value
+            intent = plan.intent if plan is not None else Intent.UNKNOWN
+            is_personal = intent == Intent.PERSONAL
 
-        intent = plan.intent if plan is not None else Intent.UNKNOWN
-        is_personal = intent == Intent.PERSONAL
-
-        # Pre-compute sanitization once for all cloud escalation paths.
-        # Personal-content detection is anchored on the graph's
-        # subject/object names (read directly from the MemoryStore — the
-        # same source the router uses for speaker scoping) plus the
-        # speaker's display name (M3 coverage: the display name must be
-        # flagged as a personal referent even when it is no longer a
-        # registry subject under the id-as-subject refactor) plus a
-        # first-person token-set + the resolved speaker_id — the same
-        # ground truth the extraction-path anonymizer uses, no static
-        # keyword list.  The set is rebuilt per /chat call; cost is O(N)
-        # over active keys (~hundreds in production).
-        if known_entities is None and memory_store is not None:
-            _entity_names: set[str] = set()
-            for _tier, _key, _entry in memory_store.iter_entries():
-                for _field in ("subject", "object"):
-                    _name = _entry.get(_field, "")
-                    if _name and len(_name) > 1:
-                        _entity_names.add(_name.lower().strip())
-            known_entities = _entity_names
-        # M3: ensure the speaker's display name is always a personal-referent
-        # signal regardless of what subjects appear in the registry.  Under
-        # id-as-subject (step 8+) the display name leaves the registry
-        # subjects; sourcing it here from the resolved ``speaker`` argument
-        # (P3-produced display name, None for anonymous) keeps the sanitizer
-        # coverage intact without coupling inference.py to SpeakerStore.
-        if speaker and len(speaker) > 1:
-            if known_entities is None:
-                known_entities = set()
-            known_entities = known_entities | {speaker.lower().strip()}
-        # B5: extend known_entities with non-anonymous household display names so
-        # the sanitizer covers all enrolled speakers, not just the active one.
-        # household_display_names() filters out anonymous profiles
-        # (enroll_method == "anonymous_voice") — only real-name disclosures are
-        # added.  This closes the gap where a fact mentioning another household
-        # member's display name was not recognised as personal content.
-        if speaker_store is not None:
-            _household_names = speaker_store.household_display_names()
-            if _household_names:
+            # Pre-compute sanitization once for all cloud escalation paths.
+            # Personal-content detection is anchored on the graph's
+            # subject/object names (read directly from the MemoryStore — the
+            # same source the router uses for speaker scoping) plus the
+            # speaker's display name (M3 coverage: the display name must be
+            # flagged as a personal referent even when it is no longer a
+            # registry subject under the id-as-subject refactor) plus a
+            # first-person token-set + the resolved speaker_id — the same
+            # ground truth the extraction-path anonymizer uses, no static
+            # keyword list.  The set is rebuilt per /chat call; cost is O(N)
+            # over active keys (~hundreds in production).
+            if known_entities is None and memory_store is not None:
+                _entity_names: set[str] = set()
+                for _tier, _key, _entry in memory_store.iter_entries():
+                    for _field in ("subject", "object"):
+                        _name = _entry.get(_field, "")
+                        if _name and len(_name) > 1:
+                            _entity_names.add(_name.lower().strip())
+                known_entities = _entity_names
+            # M3: ensure the speaker's display name is always a personal-referent
+            # signal regardless of what subjects appear in the registry.  Under
+            # id-as-subject (step 8+) the display name leaves the registry
+            # subjects; sourcing it here from the resolved ``speaker`` argument
+            # (P3-produced display name, None for anonymous) keeps the sanitizer
+            # coverage intact without coupling inference.py to SpeakerStore.
+            if speaker and len(speaker) > 1:
                 if known_entities is None:
                     known_entities = set()
-                known_entities = known_entities | {n.lower().strip() for n in _household_names if n}
+                known_entities = known_entities | {speaker.lower().strip()}
+            # B5: extend known_entities with non-anonymous household display names so
+            # the sanitizer covers all enrolled speakers, not just the active one.
+            # household_display_names() filters out anonymous profiles
+            # (enroll_method == "anonymous_voice") — only real-name disclosures are
+            # added.  This closes the gap where a fact mentioning another household
+            # member's display name was not recognised as personal content.
+            if speaker_store is not None:
+                _household_names = speaker_store.household_display_names()
+                if _household_names:
+                    if known_entities is None:
+                        known_entities = set()
+                    known_entities = known_entities | {
+                        n.lower().strip() for n in _household_names if n
+                    }
 
-        # B3: build the speaker resolver closure once per request.  Passed into
-        # memory_store.probe so raw speaker{N} tokens in recalled facts are
-        # replaced with display names at the render boundary.
-        # read-tolerance: .lower() before lookup so pre-migration cased tokens
-        # (e.g. "Speaker0") still resolve during the forward-only transition.
-        def _speaker_resolver(tok: str) -> str:
-            if not is_speaker_id(tok):
-                return tok
-            name = speaker_store.resolve_speaker_name(tok.lower()) if speaker_store else None
-            return name if name else THIRD_PARTY_DESCRIPTOR
+            # B3: build the speaker resolver closure once per request.  Passed into
+            # memory_store.probe so raw speaker{N} tokens in recalled facts are
+            # replaced with display names at the render boundary.
+            # read-tolerance: .lower() before lookup so pre-migration cased tokens
+            # (e.g. "Speaker0") still resolve during the forward-only transition.
+            def _speaker_resolver(tok: str) -> str:
+                if not is_speaker_id(tok):
+                    return tok
+                name = speaker_store.resolve_speaker_name(tok.lower()) if speaker_store else None
+                return name if name else THIRD_PARTY_DESCRIPTOR
 
-        sanitized_text, sanitization_findings = sanitize_for_cloud(
-            text,
-            mode=config.sanitization.mode,
-            speaker_id=speaker_id,
-            known_entities=known_entities,
-            personal_referent_config=config.personal_referent,
-        )
-
-        # Anonymous deny-by-default: an unauthenticated caller has no claim
-        # on the speaker's private parametric memory.  When the router
-        # classified the turn as PERSONAL but ``speaker_id`` did not
-        # resolve, the personal probe path is unreachable for this
-        # caller.  Interrogative form → canned abstention (avoids
-        # leaking the existence of indexed facts via an answer).
-        # Declarative form → demote to non-personal so the turn flows
-        # to the General/Unknown HA → SOTA path with cloud-side
-        # sanitization, instead of consulting the local store.  Pairs
-        # with the sanitizer paraphrase pass (Task #13) to keep
-        # CV-derived topics off the personal arm for anonymous callers.
-        if is_personal and not speaker_id:
-            routing_diags["paths_attempted"].append("anonymous_personal_deny")
-            abstention = _abstain_if_applicable(
+            sanitized_text, sanitization_findings = sanitize_for_cloud(
                 text,
-                config,
-                is_personal=True,
-                speaker_id=None,
-                router=router,
+                mode=config.sanitization.mode,
+                speaker_id=speaker_id,
+                known_entities=known_entities,
+                personal_referent_config=config.personal_referent,
             )
-            if abstention is not None:
-                result, label = abstention
-                routing_diags["exit_via"] = label
-                logger.info(
-                    "Anonymous caller + PERSONAL intent — abstaining (%s)",
-                    label,
+
+            # Anonymous deny-by-default: an unauthenticated caller has no claim
+            # on the speaker's private parametric memory.  When the router
+            # classified the turn as PERSONAL but ``speaker_id`` did not
+            # resolve, the personal probe path is unreachable for this
+            # caller.  Interrogative form → canned abstention (avoids
+            # leaking the existence of indexed facts via an answer).
+            # Declarative form → demote to non-personal so the turn flows
+            # to the General/Unknown HA → SOTA path with cloud-side
+            # sanitization, instead of consulting the local store.  Pairs
+            # with the sanitizer paraphrase pass (Task #13) to keep
+            # CV-derived topics off the personal arm for anonymous callers.
+            if is_personal and not speaker_id:
+                routing_diags["paths_attempted"].append("anonymous_personal_deny")
+                abstention = _abstain_if_applicable(
+                    text,
+                    config,
+                    is_personal=True,
+                    speaker_id=None,
+                    router=router,
                 )
-                return result
-            # Declarative turn from anonymous caller: do NOT consult the
-            # personal store; relay via the standard escalation chain.
-            is_personal = False
+                if abstention is not None:
+                    result, label = abstention
+                    routing_diags["exit_via"] = label
+                    logger.info(
+                        "Anonymous caller + PERSONAL intent — abstaining (%s)",
+                        label,
+                    )
+                    return result
+                # Declarative turn from anonymous caller: do NOT consult the
+                # personal store; relay via the standard escalation chain.
+                is_personal = False
 
-        # PERSONAL → local PA probe + reason.  No SOTA anywhere on this
-        # path: is_personal=True suppresses every internal _escalate_to_sota
-        # call (no-layers branch, post-reason [ESCALATE], base-model
-        # fallthrough).  HA stays reachable as a tool fallback.
-        if is_personal and plan is not None and plan.steps:
-            routing_diags["paths_attempted"].append("personal")
-            routing_diags["exit_via"] = "personal_probe"
-            # T2c: pre-task GPU cooldown gate — wait until GPU is cool before
-            # the local-PA probe + reason burst.  Placed here (after routing
-            # has committed to the local PA path) so HA/SOTA-routed requests
-            # never wait.  Bounded by cooldown_gate_max_wait_inference_s
-            # (default 30 s) — the caller proceeds with a WARNING on timeout.
-            _wait_for_cooldown(
-                config.vram.cooldown_gate_threshold_c,
-                config.vram.cooldown_gate_max_wait_inference_s,
-                config.vram.cooldown_gate_poll_s,
-                label="inference",
-            )
-            return _probe_and_reason(
+            # PERSONAL → local PA probe + reason.  No SOTA anywhere on this
+            # path: is_personal=True suppresses every internal _escalate_to_sota
+            # call (no-layers branch, post-reason [ESCALATE], base-model
+            # fallthrough).  HA stays reachable as a tool fallback.
+            if is_personal and plan is not None and plan.steps:
+                routing_diags["paths_attempted"].append("personal")
+                routing_diags["exit_via"] = "personal_probe"
+                # T2c: pre-task GPU cooldown gate — wait until GPU is cool before
+                # the local-PA probe + reason burst.  Placed here (after routing
+                # has committed to the local PA path) so HA/SOTA-routed requests
+                # never wait.  Bounded by cooldown_gate_max_wait_inference_s
+                # (default 30 s) — the caller proceeds with a WARNING on timeout.
+                _wait_for_cooldown(
+                    config.vram.cooldown_gate_threshold_c,
+                    config.vram.cooldown_gate_max_wait_inference_s,
+                    config.vram.cooldown_gate_poll_s,
+                    label="inference",
+                )
+                return _probe_and_reason(
+                    text,
+                    plan,
+                    history,
+                    model,
+                    tokenizer,
+                    config,
+                    sota_agent=sota_agent,
+                    ha_client=ha_client,
+                    speaker=speaker,
+                    speaker_id=speaker_id,
+                    language=language,
+                    effective_mode=effective_mode,
+                    is_personal=True,
+                    memory_store=memory_store,
+                    speaker_store=speaker_store,
+                    speaker_resolver=_speaker_resolver,
+                    known_entities=known_entities,
+                )
+
+            # COMMAND / GENERAL / UNKNOWN (and the defensive PERSONAL-without-
+            # steps path) → HA first, SOTA fallback.  is_personal still gates
+            # SOTA so a defensive PERSONAL request never reaches the cloud.
+            intent_label = intent.value
+            if sanitized_text is not None:
+                routing_diags["paths_attempted"].append(intent_label)
+                logger.info("Intent dispatch: %s → HA first", intent_label)
+                result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
+                if result is not None:
+                    routing_diags["exit_via"] = f"{intent_label}_ha"
+                    return result
+                sota_result = _escalate_via_cloud_policy(
+                    sanitized_text,
+                    sota_agent,
+                    config,
+                    is_personal=is_personal,
+                    model=model,
+                    tokenizer=tokenizer,
+                    speaker=speaker,
+                    speaker_id=speaker_id,
+                    history=history,
+                    language=language,
+                    known_entities=known_entities,
+                )
+                if sota_result is not None:
+                    routing_diags["exit_via"] = f"{intent_label}_sota"
+                    logger.info("HA failed, routing to SOTA agent")
+                    return sota_result
+            else:
+                routing_diags["fallthrough_reason"] = "sanitizer_blocked"
+                logger.info("Sanitizer blocked query: %s", sanitization_findings)
+
+            # Abstention: personal interrogative with no local match → canned response.
+            # The bare base model would otherwise confabulate personal data here
+            # (e.g. "Where do I live?" → "New York City" on an untrained adapter).
+            # Declarative personal turns (introductions, fact-sharing) are not a
+            # confabulation risk — the user is the source of the facts in the same
+            # turn — so they fall through to the base model for conversational
+            # acknowledgement.  The interrogative gate (inside the helper)
+            # distinguishes the two.
+            #
+            # Scoped to the sanitizer-blocked path here: when the sanitizer
+            # allowed the query, escalation has already been attempted above
+            # (HA → SOTA fallback) and either succeeded or failed for non-
+            # privacy reasons; only the sanitizer-blocked path falls through
+            # without trying anything.  The companion call site inside
+            # ``_probe_and_reason`` covers the parallel case where probes
+            # ran but recalled nothing.
+            if sanitized_text is None:
+                abstention = _abstain_if_applicable(
+                    text,
+                    config,
+                    is_personal=is_personal,
+                    speaker_id=speaker_id,
+                    router=router,
+                )
+                if abstention is not None:
+                    result, label = abstention
+                    routing_diags["paths_attempted"].append("abstention")
+                    routing_diags["exit_via"] = label
+                    logger.info(
+                        "Abstention: self-referential query + no local match (%s)",
+                        label,
+                    )
+                    return result
+
+            # All cloud services failed — local base model as last resort
+            routing_diags["paths_attempted"].append("base")
+            routing_diags["exit_via"] = "base_model"
+            return _base_model_answer(
                 text,
-                plan,
                 history,
                 model,
                 tokenizer,
@@ -382,96 +471,8 @@ def handle_chat(
                 speaker=speaker,
                 speaker_id=speaker_id,
                 language=language,
-                effective_mode=effective_mode,
-                is_personal=True,
-                memory_store=memory_store,
-                speaker_store=speaker_store,
-                speaker_resolver=_speaker_resolver,
-                known_entities=known_entities,
-            )
-
-        # COMMAND / GENERAL / UNKNOWN (and the defensive PERSONAL-without-
-        # steps path) → HA first, SOTA fallback.  is_personal still gates
-        # SOTA so a defensive PERSONAL request never reaches the cloud.
-        intent_label = intent.value
-        if sanitized_text is not None:
-            routing_diags["paths_attempted"].append(intent_label)
-            logger.info("Intent dispatch: %s → HA first", intent_label)
-            result = _escalate_to_ha_agent(sanitized_text, ha_client, config, language=language)
-            if result is not None:
-                routing_diags["exit_via"] = f"{intent_label}_ha"
-                return result
-            sota_result = _escalate_via_cloud_policy(
-                sanitized_text,
-                sota_agent,
-                config,
                 is_personal=is_personal,
-                model=model,
-                tokenizer=tokenizer,
-                speaker=speaker,
-                speaker_id=speaker_id,
-                history=history,
-                language=language,
-                known_entities=known_entities,
             )
-            if sota_result is not None:
-                routing_diags["exit_via"] = f"{intent_label}_sota"
-                logger.info("HA failed, routing to SOTA agent")
-                return sota_result
-        else:
-            routing_diags["fallthrough_reason"] = "sanitizer_blocked"
-            logger.info("Sanitizer blocked query: %s", sanitization_findings)
-
-        # Abstention: personal interrogative with no local match → canned response.
-        # The bare base model would otherwise confabulate personal data here
-        # (e.g. "Where do I live?" → "New York City" on an untrained adapter).
-        # Declarative personal turns (introductions, fact-sharing) are not a
-        # confabulation risk — the user is the source of the facts in the same
-        # turn — so they fall through to the base model for conversational
-        # acknowledgement.  The interrogative gate (inside the helper)
-        # distinguishes the two.
-        #
-        # Scoped to the sanitizer-blocked path here: when the sanitizer
-        # allowed the query, escalation has already been attempted above
-        # (HA → SOTA fallback) and either succeeded or failed for non-
-        # privacy reasons; only the sanitizer-blocked path falls through
-        # without trying anything.  The companion call site inside
-        # ``_probe_and_reason`` covers the parallel case where probes
-        # ran but recalled nothing.
-        if sanitized_text is None:
-            abstention = _abstain_if_applicable(
-                text,
-                config,
-                is_personal=is_personal,
-                speaker_id=speaker_id,
-                router=router,
-            )
-            if abstention is not None:
-                result, label = abstention
-                routing_diags["paths_attempted"].append("abstention")
-                routing_diags["exit_via"] = label
-                logger.info(
-                    "Abstention: self-referential query + no local match (%s)",
-                    label,
-                )
-                return result
-
-        # All cloud services failed — local base model as last resort
-        routing_diags["paths_attempted"].append("base")
-        routing_diags["exit_via"] = "base_model"
-        return _base_model_answer(
-            text,
-            history,
-            model,
-            tokenizer,
-            config,
-            sota_agent=sota_agent,
-            ha_client=ha_client,
-            speaker=speaker,
-            speaker_id=speaker_id,
-            language=language,
-            is_personal=is_personal,
-        )
     finally:
         if getattr(config, "debug", False):
             # is_residual: the routing plan landed with no probe steps and
