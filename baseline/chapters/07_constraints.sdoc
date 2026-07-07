@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: Constraints
+UID: CH07
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: Constraints
+
+[TEXT]
+STATEMENT: >>>
+Scope: imposed limits — regulatory, technical, environmental (CON-###).
+<<<
+
+[[/SECTION]]

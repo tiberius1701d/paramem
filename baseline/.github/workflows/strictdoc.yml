@@ -1,0 +1,29 @@
+# StrictDoc CI for the ParaMem requirements baseline.
+#
+# This workflow activates when baseline/ becomes its own standalone repo.
+# While baseline/ remains a gitignored subdirectory of the paramem repo,
+# it is DORMANT: GitHub Actions only discovers and runs workflows located
+# under <repo-root>/.github/workflows/, and this file lives under
+# baseline/.github/workflows/, which is not the paramem repo root. Until
+# the split happens, `make all` (see baseline/Makefile) is the local
+# equivalent of the job below.
+name: StrictDoc
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Export requirements tree
+        run: strictdoc export . --formats=html,reqif-sdoc,sdoc --output-dir _build

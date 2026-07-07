@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: Annex B. Verification Hooks
+UID: ANXB
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: Annex B. Verification Hooks
+
+[TEXT]
+STATEMENT: >>>
+Scope: how requirements are verified — test refs, measurements, TBDs.
+<<<
+
+[[/SECTION]]

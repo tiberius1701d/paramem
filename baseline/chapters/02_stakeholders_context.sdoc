@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: Stakeholders & Operational Context
+UID: CH02
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: Stakeholders & Operational Context
+
+[TEXT]
+STATEMENT: >>>
+Scope: who relies on the system and the operational setting it runs in.
+<<<
+
+[[/SECTION]]

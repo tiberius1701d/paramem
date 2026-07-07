@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: Annex A. Decision Records
+UID: ANXA
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: Annex A. Decision Records
+
+[TEXT]
+STATEMENT: >>>
+Scope: architecture and requirement decision records (ADR-###).
+<<<
+
+[[/SECTION]]

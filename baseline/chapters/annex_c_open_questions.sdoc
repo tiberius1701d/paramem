@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: Annex C. Open Questions
+UID: ANXC
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: Annex C. Open Questions
+
+[TEXT]
+STATEMENT: >>>
+Scope: unresolved questions to be closed before freeze (OQ-###).
+<<<
+
+[[/SECTION]]

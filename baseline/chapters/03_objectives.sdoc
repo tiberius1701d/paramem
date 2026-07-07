@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: Top-Level Objectives
+UID: CH03
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: Top-Level Objectives
+
+[TEXT]
+STATEMENT: >>>
+Scope: the high-level goals the system must achieve (OBJ-###).
+<<<
+
+[[/SECTION]]

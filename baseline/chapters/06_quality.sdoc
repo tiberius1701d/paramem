@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: Quality Requirements
+UID: CH06
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: Quality Requirements
+
+[TEXT]
+STATEMENT: >>>
+Scope: quality attributes and their measurable targets (QR-<AREA>-###).
+<<<
+
+[[/SECTION]]

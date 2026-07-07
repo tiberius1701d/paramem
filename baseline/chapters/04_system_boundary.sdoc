@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: System Boundary & External Interfaces
+UID: CH04
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: System Boundary & External Interfaces
+
+[TEXT]
+STATEMENT: >>>
+Scope: what is inside the system and the external interfaces it exposes.
+<<<
+
+[[/SECTION]]

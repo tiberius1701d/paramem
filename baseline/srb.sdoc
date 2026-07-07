@@ -1,0 +1,43 @@
+[DOCUMENT]
+TITLE: ParaMem System Requirements Baseline
+UID: SRB
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[TEXT]
+STATEMENT: >>>
+This document is the root of the ParaMem system requirements baseline.
+<<<
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/01_purpose_scope.sdoc
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/02_stakeholders_context.sdoc
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/03_objectives.sdoc
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/04_system_boundary.sdoc
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/05_functional.sdoc
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/06_quality.sdoc
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/07_constraints.sdoc
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/annex_a_decisions.sdoc
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/annex_b_verification.sdoc
+
+[DOCUMENT_FROM_FILE]
+FILE: chapters/annex_c_open_questions.sdoc

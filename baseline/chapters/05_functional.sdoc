@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: Functional Requirements
+UID: CH05
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: Functional Requirements
+
+[TEXT]
+STATEMENT: >>>
+Scope: capabilities the system provides; sections by capability, to be defined (FR-<CAPABILITY>-###).
+<<<
+
+[[/SECTION]]

@@ -1,0 +1,18 @@
+[DOCUMENT]
+TITLE: Purpose & Scope
+UID: CH01
+OPTIONS:
+  AUTO_LEVELS: On
+
+[GRAMMAR]
+IMPORT_FROM_FILE: @shared_grammar
+
+[[SECTION]]
+TITLE: Purpose & Scope
+
+[TEXT]
+STATEMENT: >>>
+Scope: why this baseline exists and what system scope it governs.
+<<<
+
+[[/SECTION]]
