@@ -4,6 +4,7 @@ These are unit tests that mock the model/extraction to test
 the consolidation logic without requiring GPU.
 """
 
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -13859,6 +13860,10 @@ class TestFullCycleDispatcherOverdueIncident:
         """Minimal _state for dispatcher tests with a real config.paths.data."""
         cfg = MagicMock()
         cfg.consolidation.training_idle_debounce_s = 0
+        # Calendar-exact cadence — keeps the suspend/power-off catch-up gate
+        # (systemd_timer.heartbeat_seconds) a no-op so these tests exercise
+        # only the overdue-incident wiring, not the catch-up gate.
+        cfg.consolidation.refresh_cadence = "12h"
         cfg.paths.data = tmp_path
         cfg.adapter_dir = tmp_path / "adapters"
         cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -15902,6 +15907,409 @@ class TestDispatchCountZeroRoutesToFull:
         assert result == "started_full", (
             f"Expected 'started_full' at count==0 (empty buffer), got {result!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Suspend/power-off catch-up gate: _maybe_trigger_scheduled_consolidation
+# gates non-calendar-exact refresh_cadence values on a durable last-attempt
+# stamp (paramem/server/schedule_state.py). See systemd_timer module
+# docstring for the design.
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerCatchUpGate:
+    def _make_state(self, tmp_path, *, refresh_cadence: str) -> dict:
+        from paramem.server.config import ConsolidationScheduleConfig, ServerConfig
+
+        config = MagicMock(spec=ServerConfig)
+        sched = ConsolidationScheduleConfig()
+        sched.refresh_cadence = refresh_cadence
+        sched.training_idle_debounce_s = 0
+        config.consolidation = sched
+        config.debug = False
+        config.debug_dir = tmp_path / "debug"
+        config.paths = MagicMock()
+        config.paths.data = tmp_path
+        config.adapter_dir = tmp_path / "adapters"
+        config.adapter_dir.mkdir(parents=True, exist_ok=True)
+
+        return {
+            "config": config,
+            "session_buffer": MagicMock(),
+            "speaker_store": None,
+            "consolidating": False,
+            "mode": "local",
+            "background_trainer": None,
+            "last_chat_monotonic": None,
+            "pending_rehydration": False,
+            "store_load_degraded": False,
+            "cloud_only_reason": None,
+        }
+
+    def _state_dir(self, tmp_path):
+        return tmp_path / "state"
+
+    def _call_tick_dispatching(self, state: dict, *, apply_schedule_gate: bool = True) -> tuple:
+        """Run the tick with _is_full_cycle_due forced True so a real dispatch
+        is SCHEDULED when the catch-up gate lets the tick through. Returns
+        (result, dispatch_call_count).
+
+        ``_run_full_consolidation_sync`` is passed to (mocked)
+        ``run_in_executor`` as a reference, never actually invoked under this
+        mocking scheme — matching the existing dispatcher-test pattern in
+        this file (e.g. TestFullCycleDispatcherOverdueIncident). The
+        dispatch count is therefore read off ``run_in_executor.call_count``.
+        """
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        mock_loop = MagicMock()
+        mock_future = MagicMock()
+        mock_future.add_done_callback = MagicMock()
+        mock_loop.run_in_executor = MagicMock(return_value=mock_future)
+
+        with (
+            patch.object(app_module, "_state", state),
+            patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch("paramem.server.app._is_full_cycle_due", return_value=True),
+            patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
+            patch("paramem.server.app._run_full_consolidation_sync"),
+            patch("asyncio.get_running_loop", return_value=mock_loop),
+        ):
+            result = app_module._maybe_trigger_scheduled_consolidation(
+                apply_schedule_gate=apply_schedule_gate
+            )
+        return result, mock_loop.run_in_executor.call_count
+
+    def _call_tick_gate_only(self, state: dict, *, apply_schedule_gate: bool = True) -> str:
+        """Run the tick with no further patching — used for the noop/seed
+        assertions that must never reach _is_full_cycle_due.
+        """
+        from unittest.mock import patch
+
+        import paramem.server.app as app_module
+
+        with (
+            patch.object(app_module, "_state", state),
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch(
+                "paramem.server.app._is_full_cycle_due",
+                side_effect=AssertionError(
+                    "_is_full_cycle_due must not be reached when the catch-up gate blocks"
+                ),
+            ),
+        ):
+            return app_module._maybe_trigger_scheduled_consolidation(
+                apply_schedule_gate=apply_schedule_gate
+            )
+
+    def test_due_stamp_dispatches_and_updates_stamp(self, tmp_path):
+        """last attempt 6h ago + 'every 5h' (period 5h) → due → dispatch
+        happens and the stamp is updated. Asserting the dispatch call count
+        (not just the return status) is load-bearing — a test that only
+        checks 'not noop_not_due' would also pass on the suspend/regression
+        path where the gate silently blocks the tick forever.
+        """
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+
+        state = self._make_state(tmp_path, refresh_cadence="every 5h")
+        state_dir = self._state_dir(tmp_path)
+        old_stamp = time.time() - 6 * 3600
+        write_last_scheduled_run(state_dir, old_stamp)
+
+        result, full_call_count = self._call_tick_dispatching(state)
+
+        assert result == "started_full"
+        assert full_call_count == 1
+        new_stamp = read_last_scheduled_run(state_dir)
+        assert new_stamp is not None
+        assert new_stamp > old_stamp
+
+    def test_not_due_stamp_blocks_and_leaves_stamp_unchanged(self, tmp_path):
+        """last attempt 2h ago + 'every 5h' (period 5h) → not due → noop,
+        stamp untouched.
+        """
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+
+        state = self._make_state(tmp_path, refresh_cadence="every 5h")
+        state_dir = self._state_dir(tmp_path)
+        recent_stamp = time.time() - 2 * 3600
+        write_last_scheduled_run(state_dir, recent_stamp)
+
+        result = self._call_tick_gate_only(state)
+
+        assert result == "noop_not_due"
+        assert read_last_scheduled_run(state_dir) == recent_stamp
+
+    def test_apply_schedule_gate_false_dispatches_when_not_due(self, tmp_path):
+        """The manual-trigger escape hatch (apply_schedule_gate=False) must
+        dispatch even when the catch-up gate would otherwise block.
+
+        Same stamp/cadence as test_not_due_stamp_blocks_and_leaves_stamp_unchanged
+        (last attempt 2h ago, 'every 5h' → not due under the gate) — proves
+        the flag, not the schedule, controls the outcome. Also proves the
+        dispatch still resets the stamp (a manual run must not leave the
+        cadence window stale for the next heartbeat).
+        """
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+
+        state_dir = self._state_dir(tmp_path)
+
+        # apply_schedule_gate=True (default) — not due, blocked, no dispatch.
+        state_gated = self._make_state(tmp_path, refresh_cadence="every 5h")
+        recent_stamp = time.time() - 2 * 3600
+        write_last_scheduled_run(state_dir, recent_stamp)
+        result_gated = self._call_tick_gate_only(state_gated, apply_schedule_gate=True)
+        assert result_gated == "noop_not_due"
+        assert read_last_scheduled_run(state_dir) == recent_stamp
+
+        # apply_schedule_gate=False — same stamp, same cadence — dispatches.
+        state_ungated = self._make_state(tmp_path, refresh_cadence="every 5h")
+        result, dispatch_count = self._call_tick_dispatching(
+            state_ungated, apply_schedule_gate=False
+        )
+        assert result == "started_full"
+        assert dispatch_count == 1
+        new_stamp = read_last_scheduled_run(state_dir)
+        assert new_stamp is not None
+        assert new_stamp != recent_stamp, "manual dispatch must reset the cadence window"
+
+    def test_absent_stamp_seeds_without_dispatching(self, tmp_path):
+        """No stamp file yet (fresh install / first tick after upgrade) →
+        seed the stamp and return noop_scheduler_seeded WITHOUT dispatching —
+        a surprise consolidation on first boot after upgrade is worse than a
+        one-tick delay.
+        """
+        from paramem.server.schedule_state import read_last_scheduled_run
+
+        state = self._make_state(tmp_path, refresh_cadence="every 5h")
+        state_dir = self._state_dir(tmp_path)
+        assert read_last_scheduled_run(state_dir) is None
+
+        result = self._call_tick_gate_only(state)
+
+        assert result == "noop_scheduler_seeded"
+        assert read_last_scheduled_run(state_dir) is not None
+
+    def test_apply_schedule_gate_false_virgin_install_dispatches_and_stamps(self, tmp_path):
+        """Virgin install (absent stamp) + apply_schedule_gate=False (manual
+        trigger) → dispatches and writes a stamp — does NOT seed-and-skip.
+        The seed-and-noop behaviour is specific to the scheduled-tick path;
+        a manual /consolidate on a fresh install must run.
+        """
+        from paramem.server.schedule_state import read_last_scheduled_run
+
+        state = self._make_state(tmp_path, refresh_cadence="every 5h")
+        state_dir = self._state_dir(tmp_path)
+        assert read_last_scheduled_run(state_dir) is None
+
+        result, dispatch_count = self._call_tick_dispatching(state, apply_schedule_gate=False)
+
+        assert result == "started_full"
+        assert dispatch_count == 1
+        assert read_last_scheduled_run(state_dir) is not None
+
+    # -----------------------------------------------------------------
+    # Route-level: POST /consolidate (manual, gate OFF) vs
+    # POST /scheduled-tick (systemd-driven, gate ON) — proves the flag is
+    # actually wired at the endpoint level, not just exercised via the
+    # dispatcher's default parameter.
+    # -----------------------------------------------------------------
+
+    def _make_client(self, monkeypatch, state: dict):
+        from fastapi.testclient import TestClient
+
+        import paramem.server.app as app_module
+
+        monkeypatch.setattr(app_module, "_state", state)
+        return TestClient(app_module.app, raise_server_exceptions=False)
+
+    def test_consolidate_route_dispatches_inside_due_window(self, tmp_path, monkeypatch):
+        """POST /consolidate inside the due-window (not yet due under the
+        gate) still dispatches — the manual escape hatch must not be
+        blocked. Asserts the dispatch actually happens, not merely that the
+        request wasn't rejected.
+        """
+        from unittest.mock import patch
+
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+
+        state = self._make_state(tmp_path, refresh_cadence="every 5h")
+        state_dir = self._state_dir(tmp_path)
+        recent_stamp = time.time() - 2 * 3600
+        write_last_scheduled_run(state_dir, recent_stamp)
+
+        mock_loop = MagicMock()
+        mock_future = MagicMock()
+        mock_future.add_done_callback = MagicMock()
+        mock_loop.run_in_executor = MagicMock(return_value=mock_future)
+
+        client = self._make_client(monkeypatch, state)
+        with (
+            patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch("paramem.server.app._is_full_cycle_due", return_value=True),
+            patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
+            patch("paramem.server.app._run_full_consolidation_sync"),
+            patch("asyncio.get_running_loop", return_value=mock_loop),
+        ):
+            resp = client.post("/consolidate")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "started_full"
+        assert mock_loop.run_in_executor.call_count == 1, (
+            "POST /consolidate must dispatch inside the due-window, not just avoid an error"
+        )
+        new_stamp = read_last_scheduled_run(state_dir)
+        assert new_stamp is not None
+        assert new_stamp != recent_stamp
+
+    def test_scheduled_tick_route_returns_noop_not_due_inside_same_window(
+        self, tmp_path, monkeypatch
+    ):
+        """POST /scheduled-tick with the IDENTICAL stamp/cadence as the
+        /consolidate test above → noop_not_due, no dispatch — proves the
+        two routes genuinely differ only by apply_schedule_gate.
+        """
+        from unittest.mock import patch
+
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+
+        state = self._make_state(tmp_path, refresh_cadence="every 5h")
+        state_dir = self._state_dir(tmp_path)
+        recent_stamp = time.time() - 2 * 3600
+        write_last_scheduled_run(state_dir, recent_stamp)
+
+        client = self._make_client(monkeypatch, state)
+        with (
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch(
+                "paramem.server.app._is_full_cycle_due",
+                side_effect=AssertionError(
+                    "_is_full_cycle_due must not be reached when the catch-up gate blocks"
+                ),
+            ),
+        ):
+            resp = client.post("/scheduled-tick")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "noop_not_due"
+        assert read_last_scheduled_run(state_dir) == recent_stamp
+
+    def test_scheduled_tick_route_virgin_install_seeds_without_dispatching(
+        self, tmp_path, monkeypatch
+    ):
+        """POST /scheduled-tick on a virgin install (absent stamp) →
+        noop_scheduler_seeded, no dispatch.
+        """
+        from unittest.mock import patch
+
+        from paramem.server.schedule_state import read_last_scheduled_run
+
+        state = self._make_state(tmp_path, refresh_cadence="every 5h")
+        state_dir = self._state_dir(tmp_path)
+        assert read_last_scheduled_run(state_dir) is None
+
+        client = self._make_client(monkeypatch, state)
+        with (
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch(
+                "paramem.server.app._is_full_cycle_due",
+                side_effect=AssertionError(
+                    "_is_full_cycle_due must not be reached when the catch-up gate blocks"
+                ),
+            ),
+        ):
+            resp = client.post("/scheduled-tick")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "noop_scheduler_seeded"
+        assert read_last_scheduled_run(state_dir) is not None
+
+    def test_consolidate_route_virgin_install_dispatches_and_stamps(self, tmp_path, monkeypatch):
+        """POST /consolidate on a virgin install (absent stamp) → dispatches
+        and writes a stamp — the manual trigger does not seed-and-skip.
+        """
+        from unittest.mock import patch
+
+        from paramem.server.schedule_state import read_last_scheduled_run
+
+        state = self._make_state(tmp_path, refresh_cadence="every 5h")
+        state_dir = self._state_dir(tmp_path)
+        assert read_last_scheduled_run(state_dir) is None
+
+        mock_loop = MagicMock()
+        mock_future = MagicMock()
+        mock_future.add_done_callback = MagicMock()
+        mock_loop.run_in_executor = MagicMock(return_value=mock_future)
+
+        client = self._make_client(monkeypatch, state)
+        with (
+            patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
+            patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
+            patch("paramem.server.app._is_full_cycle_due", return_value=True),
+            patch("paramem.server.app._full_consolidation_overdue_key", return_value=None),
+            patch("paramem.server.app._run_full_consolidation_sync"),
+            patch("asyncio.get_running_loop", return_value=mock_loop),
+        ):
+            resp = client.post("/consolidate")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "started_full"
+        assert mock_loop.run_in_executor.call_count == 1
+        assert read_last_scheduled_run(state_dir) is not None
+
+    def test_dispatch_guards_still_short_circuit_ahead_of_gate_both_routes(
+        self, tmp_path, monkeypatch
+    ):
+        """_consolidation_dispatch_guards() (already-running / cloud-only /
+        bg-training) must still defer BOTH routes ahead of the catch-up
+        gate — a manual /consolidate during background training must defer,
+        not force a concurrent run.
+        """
+        state = self._make_state(tmp_path, refresh_cadence="every 5h")
+        state["consolidating"] = True  # -> _consolidation_dispatch_guards() returns non-None
+
+        client = self._make_client(monkeypatch, state)
+
+        resp_manual = client.post("/consolidate")
+        assert resp_manual.status_code == 200
+        assert resp_manual.json()["status"] == "deferred_already_running"
+
+        resp_scheduled = client.post("/scheduled-tick")
+        assert resp_scheduled.status_code == 200
+        assert resp_scheduled.json()["status"] == "deferred_already_running"
+
+    def test_many_missed_periods_coalesce_into_one_dispatch(self, tmp_path):
+        """last attempt 5 days ago + 'every 720m' (non-exact, period 12h) →
+        many periods missed, but ONE tick call produces exactly ONE dispatch,
+        and the new stamp is floored-now — NOT last_stamp + period (which
+        would still be days in the past and immediately due again).
+        """
+        from paramem.server.schedule_state import read_last_scheduled_run, write_last_scheduled_run
+        from paramem.server.systemd_timer import floor_to_heartbeat, heartbeat_seconds
+
+        state = self._make_state(tmp_path, refresh_cadence="every 720m")
+        state_dir = self._state_dir(tmp_path)
+        old_stamp = time.time() - 5 * 86400
+        write_last_scheduled_run(state_dir, old_stamp)
+
+        result, full_call_count = self._call_tick_dispatching(state)
+
+        assert result == "started_full"
+        assert full_call_count == 1, "many missed periods must coalesce into exactly one dispatch"
+
+        period_s = 12 * 3600
+        new_stamp = read_last_scheduled_run(state_dir)
+        assert new_stamp is not None
+        assert new_stamp != old_stamp + period_s, (
+            "stamp must be floored-now, not last_stamp + period"
+        )
+        hb = heartbeat_seconds("every 720m")
+        expected = floor_to_heartbeat(time.time(), hb)
+        assert abs(new_stamp - expected) < 5, f"expected ~{expected}, got {new_stamp}"
 
 
 # ---------------------------------------------------------------------------

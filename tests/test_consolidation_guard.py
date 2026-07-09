@@ -116,12 +116,18 @@ class TestEndpointGuards:
         import paramem.server.app as app_module
 
         state = self._make_state("LIVE")
+
+        def _fake_maybe_trigger(*, apply_schedule_gate):
+            # /scheduled-tick must apply the suspend/power-off catch-up gate.
+            assert apply_schedule_gate is True
+            return "deferred"
+
         # Patch _maybe_trigger_scheduled_consolidation to avoid actual work.
         monkeypatch.setattr(app_module, "_state", state)
         monkeypatch.setattr(
             app_module,
             "_maybe_trigger_scheduled_consolidation",
-            lambda: "deferred",
+            _fake_maybe_trigger,
         )
         client = TestClient(app_module.app, raise_server_exceptions=False)
         resp = client.post("/scheduled-tick")

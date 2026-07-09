@@ -3989,7 +3989,7 @@ async def status():
     # refresh_cadence boundary measured from midnight, so the next
     # boundary is fully deterministic from the clock. None when cadence is
     # disabled (manual-only mode).
-    from paramem.memory.interim_adapter import compute_schedule_period_seconds
+    from paramem.server.schedule_grammar import compute_schedule_period_seconds
 
     next_interim_seconds: int | None = None
     _refresh_seconds = compute_schedule_period_seconds(config.consolidation.refresh_cadence)
@@ -4236,7 +4236,10 @@ async def status():
     try:
         from paramem.backup import retention as _backup_retention
         from paramem.backup import state as _backup_state
-        from paramem.backup.timer import _backup_timer_interval_seconds
+        from paramem.server.schedule_grammar import (
+            compute_schedule_period_seconds,
+            parse_schedule_atom,
+        )
 
         _backups_root = (config.paths.data / "backups").resolve()
         _state_dir = (config.paths.data / "state").resolve()
@@ -4291,7 +4294,15 @@ async def status():
                 "none",
             )
         ):
-            _interval_s = _backup_timer_interval_seconds(_schedule_str)
+            # compute_schedule_period_seconds raises on unparseable input;
+            # guard with parse_schedule_atom(...) is None rather than
+            # try/except (_schedule_str is operator-supplied config, already
+            # excluded from off/empty above, but may still be malformed).
+            _interval_s = (
+                compute_schedule_period_seconds(_schedule_str)
+                if parse_schedule_atom(_schedule_str) is not None
+                else 0
+            )
             if _interval_s and _interval_s > 0:
                 try:
                     _last_ok = datetime.fromisoformat(_backup_record.last_success_at)
@@ -7264,9 +7275,10 @@ async def scheduled_tick():
             },
         )
 
-    _state["scheduler_last_tick_epoch"] = time.time()
-    status = _maybe_trigger_scheduled_consolidation()
-    _state["scheduler_last_tick_status"] = status
+    # Gate ON: the systemd timer may fire a heartbeat wakeup well before a
+    # non-calendar-exact cadence is actually due — see systemd_timer module
+    # docstring. The catch-up gate decides whether THIS wakeup dispatches.
+    status = _maybe_trigger_scheduled_consolidation(apply_schedule_gate=True)
     return ConsolidateResponse(status=status)
 
 
@@ -7283,6 +7295,16 @@ async def consolidate():
     re-trigger a full cycle can clear the latest main slot's window_stamp
     and call this endpoint, but in normal operation the gate already
     decides correctly.
+
+    Unlike ``/scheduled-tick``, this endpoint calls the dispatcher with
+    ``apply_schedule_gate=False`` — the suspend/power-off catch-up gate
+    (see systemd_timer module docstring) exists to stop the systemd
+    heartbeat from over-firing a non-calendar-exact cadence; it must never
+    block an operator's deliberate manual trigger, which is the escape
+    hatch the gate itself cannot substitute for. A manual run still resets
+    the cadence window (the last-attempt stamp is written on dispatch
+    regardless of the gate), so it does not cause an extra tick immediately
+    after.
 
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
@@ -7302,7 +7324,9 @@ async def consolidate():
             },
         )
 
-    status = _maybe_trigger_scheduled_consolidation()
+    # Gate OFF: a manual trigger is the operator's deliberate escape hatch —
+    # it must never be refused for "not due yet" (see docstring above).
+    status = _maybe_trigger_scheduled_consolidation(apply_schedule_gate=False)
     return ConsolidateResponse(status=status)
 
 
@@ -11818,7 +11842,8 @@ def _seconds_until_next_full_consolidation(
         Override for "current time" (for testing).  Defaults to
         ``datetime.now()``.
     """
-    from paramem.memory.interim_adapter import compute_schedule_period_seconds, iter_interim_dirs
+    from paramem.memory.interim_adapter import iter_interim_dirs
+    from paramem.server.schedule_grammar import compute_schedule_period_seconds
 
     if now is None:
         now = datetime.now()
@@ -11995,7 +12020,7 @@ def _maybe_trigger_housekeeping() -> str:
     return "started_housekeeping"
 
 
-def _maybe_trigger_scheduled_consolidation() -> str:
+def _maybe_trigger_scheduled_consolidation(*, apply_schedule_gate: bool = True) -> str:
     """Gate + dispatch the scheduled tick.
 
     Two production routes share this entry:
@@ -12013,6 +12038,23 @@ def _maybe_trigger_scheduled_consolidation() -> str:
     the caller can distinguish a missed-but-rescheduled tick from a true
     no-op. The systemd timer fires again on its next wall-clock tick and
     retries.
+
+    Args:
+        apply_schedule_gate: When ``True`` (the ``/scheduled-tick`` caller,
+            the default), the suspend/power-off catch-up gate (see
+            ``systemd_timer`` module docstring) applies: on a
+            non-calendar-exact cadence, a heartbeat wakeup that fires before
+            the real cadence period has elapsed since the last attempt is a
+            no-op (``noop_not_due`` / ``noop_scheduler_seeded``). When
+            ``False`` (the ``/consolidate`` caller — the operator's manual
+            escape hatch), the gate is skipped entirely: a manual trigger
+            must never be refused for "not due yet". Only the due-check
+            itself is conditional — ``_consolidation_dispatch_guards()``
+            (already-running / cloud-only / bg-training) and the
+            idle-debounce gate apply unconditionally to BOTH callers, and
+            ``_stamp_scheduled_run()`` still fires on every real dispatch
+            regardless of this flag, so a manual run resets the cadence
+            window instead of leaving it stale.
     """
     _guard = _consolidation_dispatch_guards()
     if _guard is not None:
@@ -12070,6 +12112,56 @@ def _maybe_trigger_scheduled_consolidation() -> str:
         future.add_done_callback(_scheduled_extract_done_callback)
         return "started_migration"
 
+    # Suspend/power-off catch-up gate: for a non-calendar-exact cadence the
+    # rendered OnCalendar timer is a heartbeat wakeup only (see
+    # paramem.server.systemd_timer module docstring) — the durable
+    # last-ATTEMPT stamp (schedule_state.py) decides whether THIS tick
+    # actually dispatches. Calendar-exact cadences (the default "12h", and
+    # any anchored/exact-divisor cadence) get heartbeat_s=None and this
+    # entire block is a no-op — the timer alone remains the schedule.
+    from paramem.server import schedule_state as _schedule_state
+    from paramem.server import systemd_timer as _systemd_timer
+    from paramem.server.schedule_grammar import compute_schedule_period_seconds as _sched_period
+    from paramem.server.schedule_grammar import is_due as _sched_is_due
+
+    cadence = config.consolidation.refresh_cadence or ""
+    heartbeat_s = _systemd_timer.heartbeat_seconds(cadence)
+
+    def _stamp_scheduled_run() -> None:
+        """Record this dispatch's floored heartbeat boundary as the last attempt.
+
+        No-op when the cadence is calendar-exact (heartbeat_s is None) — the
+        timer alone is the schedule and no durable stamp is needed. Flooring
+        (not raw time.time()) is mandatory here — see
+        systemd_timer.floor_to_heartbeat's docstring for why an un-floored
+        stamp silently inflates the effective period every cycle.
+        """
+        if heartbeat_s is None:
+            return
+        _schedule_state.write_last_scheduled_run(
+            config.paths.data / "state",
+            _systemd_timer.floor_to_heartbeat(time.time(), heartbeat_s),
+        )
+
+    # apply_schedule_gate=False (the manual /consolidate escape hatch) skips
+    # this ENTIRE block — including the seed path, deliberately: a manual
+    # trigger on a virgin install must run (and stamp via
+    # _stamp_scheduled_run() below at the dispatch site), not seed-and-skip.
+    # _stamp_scheduled_run() itself is unconditional either way, so a manual
+    # run still resets the cadence window for the next heartbeat.
+    if apply_schedule_gate and heartbeat_s is not None:
+        last_attempt = _schedule_state.read_last_scheduled_run(config.paths.data / "state")
+        if last_attempt is None:
+            _stamp_scheduled_run()
+            logger.info(
+                "Scheduler tick: seeding catch-up stamp for non-calendar-exact "
+                "cadence %r — not dispatching this tick",
+                cadence,
+            )
+            return "noop_scheduler_seeded"
+        if not _sched_is_due(last_attempt, _sched_period(cadence)):
+            return "noop_not_due"
+
     # Full-cycle gate: when the period has elapsed, route to full
     # consolidation regardless of whether sessions are pending.
     # At max_interim_count > 0: pending sessions wait one tick (~refresh_cadence)
@@ -12108,6 +12200,7 @@ def _maybe_trigger_scheduled_consolidation() -> str:
             )
 
         _state["consolidating"] = True
+        _stamp_scheduled_run()
         event_loop = asyncio.get_running_loop()
         future = event_loop.run_in_executor(None, _run_full_consolidation_sync)
         future.add_done_callback(_scheduled_extract_done_callback)
@@ -12165,6 +12258,7 @@ def _maybe_trigger_scheduled_consolidation() -> str:
 
     logger.info("Scheduler tick: %d NAMED session(s), starting extract + train", named_count)
     _state["consolidating"] = True
+    _stamp_scheduled_run()
 
     # count==0 cannot reach this branch: _is_full_cycle_due returns True
     # at N==0 so the full-cycle gate at the top of this function (line ~11594)

@@ -92,6 +92,10 @@ def _make_scheduler_state(last_chat_monotonic=None, debounce_s: int = 30) -> tup
     """
     cfg = MagicMock()
     cfg.consolidation.training_idle_debounce_s = debounce_s
+    # Calendar-exact cadence — keeps the suspend/power-off catch-up gate
+    # (systemd_timer.heartbeat_seconds) a no-op so these tests exercise only
+    # the idle-debounce gate.
+    cfg.consolidation.refresh_cadence = "12h"
 
     buf = MagicMock()
     buf.pending_facts.return_value = []

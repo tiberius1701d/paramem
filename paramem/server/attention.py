@@ -878,7 +878,10 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
     try:
         from paramem.backup import retention as _retention
         from paramem.backup import state as _bk_state
-        from paramem.backup.timer import _backup_timer_interval_seconds
+        from paramem.server.schedule_grammar import (
+            compute_schedule_period_seconds,
+            parse_schedule_atom,
+        )
     except ImportError:
         return []
 
@@ -958,7 +961,15 @@ def _collect_backup_items(state: dict, config) -> list[AttentionItem]:
     # -- Alert 3: Backup STALE (level=info) --
     # Skipped when schedule="off" (or empty/disabled) or when no successful run yet.
     if record and record.last_success_at and schedule_str not in ("", "off", "disabled", "none"):
-        interval = _backup_timer_interval_seconds(schedule_str)
+        # compute_schedule_period_seconds raises on unparseable input; guard
+        # with parse_schedule_atom(...) is None rather than try/except
+        # (schedule_str is already excluded from off/empty above, but may
+        # still be malformed operator input).
+        interval = (
+            compute_schedule_period_seconds(schedule_str)
+            if parse_schedule_atom(schedule_str) is not None
+            else 0
+        )
         if interval and interval > 0:
             age = _age_seconds_from_iso(record.last_success_at)
             if age is not None and age > 2 * interval:

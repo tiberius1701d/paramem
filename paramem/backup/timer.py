@@ -1,18 +1,17 @@
 """Systemd user-timer reconciliation for the scheduled backup runner.
 
-Mirrors ``paramem/server/systemd_timer.py`` for the ``paramem-backup`` timer.
-Reuses ``parse_schedule`` / ``TimerSpec`` from the consolidation timer module
+Mirrors ``paramem/server/systemd_timer.py`` for the ``paramem-backup`` timer,
+sharing its reconciliation core (``_reconcile_timer``) via a ``TimerTarget``
+instead of carrying a second copy of the render/reconcile logic. Reuses
+``parse_schedule`` / ``TimerSpec`` from the consolidation timer module
 (Decision E — same grammar, same parser).
 
 Unit files point at ``python -m paramem.backup --tier daily`` (oneshot service).
 
-``render_service_unit(tier)`` is parameterised on ``tier`` so weekly /
-monthly / yearly timer units can be minted by passing ``tier="weekly"``
-etc. — no backward-incompatible change to this function needed.
-
-``_backup_timer_interval_seconds(schedule_str)`` maps a schedule string to
-seconds so the ``/status`` populator can derive the stale threshold without
-re-implementing the grammar.
+``daily HH:MM`` normalisation (the ``schedule: "daily 04:00"`` default in
+``server.yaml``) is handled once, centrally, by
+``schedule_grammar.strip_daily_prefix`` at the top of
+``parse_schedule_atom`` — this module no longer carries its own copy.
 """
 
 from __future__ import annotations
@@ -21,9 +20,8 @@ import logging
 from pathlib import Path
 
 from paramem.server.systemd_timer import (
-    TimerSpec,
-    _run_systemctl,  # noqa: PLC2701 – intentional private reuse
-    _write_if_changed,  # noqa: PLC2701 – intentional private reuse
+    TimerTarget,
+    _reconcile_timer,  # noqa: PLC2701 – intentional private reuse
     parse_schedule,
 )
 from paramem.utils.paths import find_project_root
@@ -42,9 +40,7 @@ TIMER_PATH = UNIT_DIR / f"{TIMER_NAME}.timer"
 __all__ = [
     "parse_schedule",
     "render_service_unit",
-    "render_timer_unit",
     "reconcile",
-    "_backup_timer_interval_seconds",
 ]
 
 
@@ -79,29 +75,6 @@ WorkingDirectory={project_root}
 EnvironmentFile=-{project_root}/.env
 ExecStart={python_path} -m paramem.backup --tier {tier}
 """
-
-
-def render_timer_unit(spec: TimerSpec) -> str:
-    """Render the systemd .timer unit for the backup schedule.
-
-    Same shape as ``systemd_timer.render_timer_unit`` but with the
-    backup-specific description and unit name.
-    """
-    lines = [
-        "[Unit]",
-        "Description=ParaMem scheduled backup",
-        "",
-        "[Timer]",
-        f"Unit={TIMER_NAME}.service",
-    ]
-    if spec.kind == "interval":
-        lines.append(f"OnBootSec={spec.on_boot_sec}")
-        lines.append(f"OnUnitActiveSec={spec.on_unit_active_sec}")
-    elif spec.kind in ("calendar", "daily"):
-        lines.append(f"OnCalendar={spec.on_calendar}")
-        lines.append("Persistent=true")
-    lines.extend(["", "[Install]", "WantedBy=timers.target", ""])
-    return "\n".join(lines)
 
 
 def reconcile(
@@ -145,131 +118,11 @@ def reconcile(
     if project_root is None:
         _r = find_project_root(Path(__file__))
         project_root = str(_r if _r is not None else Path(__file__).resolve().parents[2])
-    # "daily HH:MM" is a natural operator idiom. Normalise to "HH:MM" so
-    # parse_schedule (which expects either "daily" or "HH:MM", not both) can
-    # parse it.  Keep the original string for error messages.
-    import re as _re
-
-    _schedule_normalised = schedule
-    _daily_hhmm = _re.fullmatch(
-        r"daily\s+(\d{1,2}:\d{2})", (schedule or "").strip(), _re.IGNORECASE
+    target = TimerTarget(
+        timer_name=TIMER_NAME,
+        description="ParaMem scheduled backup",
+        service_path=SERVICE_PATH,
+        timer_path=TIMER_PATH,
+        service_content=render_service_unit(python_path, project_root, tier=tier),
     )
-    if _daily_hhmm:
-        _schedule_normalised = _daily_hhmm.group(1)
-
-    spec = parse_schedule(_schedule_normalised)
-    if spec is None:
-        logger.error(
-            "Invalid backup schedule: %r — expected '', 'off', "
-            "'HH:MM', 'daily HH:MM', 'every Nh', or 'every Nm'. Timer will be disabled.",
-            schedule,
-        )
-        spec = TimerSpec(kind="off")
-
-    if spec.kind == "off":
-        changed = False
-        if TIMER_PATH.exists():
-            _run_systemctl("stop", f"{TIMER_NAME}.timer")
-            _run_systemctl("disable", f"{TIMER_NAME}.timer")
-            TIMER_PATH.unlink(missing_ok=True)
-            SERVICE_PATH.unlink(missing_ok=True)
-            _run_systemctl("daemon-reload")
-            changed = True
-        return "backup timer: disabled" + (" (removed)" if changed else "")
-
-    svc_content = render_service_unit(python_path, project_root, tier=tier)
-    tmr_content = render_timer_unit(spec)
-
-    svc_changed = _write_if_changed(SERVICE_PATH, svc_content)
-    tmr_changed = _write_if_changed(TIMER_PATH, tmr_content)
-
-    if svc_changed or tmr_changed:
-        _run_systemctl("daemon-reload")
-
-    enable = _run_systemctl("enable", "--now", f"{TIMER_NAME}.timer")
-    if enable.returncode != 0:
-        logger.warning(
-            "systemctl enable --now %s.timer failed: %s",
-            TIMER_NAME,
-            enable.stderr.strip(),
-        )
-        return f"backup timer: enable failed ({enable.stderr.strip()[:80]})"
-
-    if svc_changed or tmr_changed:
-        _run_systemctl("restart", f"{TIMER_NAME}.timer")
-
-    if spec.kind == "interval":
-        detail = f"every {spec.on_unit_active_sec} (no catch-up)"
-    elif spec.kind == "calendar":
-        detail = f"calendar {spec.on_calendar} (with catch-up)"
-    else:
-        detail = f"daily at {spec.on_calendar} (with catch-up)"
-    state = "updated" if (svc_changed or tmr_changed) else "already current"
-    return f"backup timer: {state}, {detail}"
-
-
-# ---------------------------------------------------------------------------
-# Interval-seconds helper
-# ---------------------------------------------------------------------------
-
-
-def _backup_timer_interval_seconds(schedule_str: str) -> int:
-    """Return the schedule interval in seconds for stale-detection.
-
-    Maps a schedule string to the number of seconds between expected runs.
-    Used by the ``/status`` populator to derive the 2× cadence stale
-    threshold.
-
-    Rules:
-
-    - ``"off"`` / ``""`` / disabled → 0 (stale detection disabled).
-    - ``"every Nh"`` → ``N * 3600``.
-    - ``"every Nm"`` → ``N * 60``.
-    - ``"HH:MM"`` (daily at time) → 86400.
-    - ``"daily"`` → 86400.
-    - ``"weekly"`` → 604800.
-    - Invalid / unparseable → 0 (stale detection skipped).
-
-    Parameters
-    ----------
-    schedule_str:
-        Schedule string in the same grammar as ``consolidation.refresh_cadence``.
-
-    Returns
-    -------
-    int
-        Interval in seconds.  0 means "unknown / disabled".
-    """
-    import re
-
-    s = (schedule_str or "").strip().lower()
-    if s in ("", "off", "disabled", "none"):
-        return 0
-
-    if s in ("daily",):
-        return 86400
-
-    if s == "weekly":
-        return 604800
-
-    # HH:MM → daily.
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
-    if m:
-        return 86400
-
-    # "daily HH:MM" — shorthand for a daily schedule at a specific time.
-    m = re.fullmatch(r"daily\s+(\d{1,2}):(\d{2})", s)
-    if m:
-        return 86400
-
-    # "every Nh" / "Nh".
-    m = re.fullmatch(r"(?:every\s+)?(\d+)\s*h", s)
-    if m:
-        return int(m.group(1)) * 3600
-
-    # "every Nm" / "Nm".
-    m = re.fullmatch(r"(?:every\s+)?(\d+)\s*m(?:in)?", s)
-    if m:
-        return int(m.group(1)) * 60
-
-    return 0
+    return _reconcile_timer(target, schedule)

@@ -5,13 +5,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from paramem.backup import timer as backup_timer
-from paramem.backup.timer import (
-    _backup_timer_interval_seconds,
-    reconcile,
-    render_service_unit,
-    render_timer_unit,
-)
+from paramem.backup.timer import reconcile, render_service_unit
 from paramem.server import systemd_timer as server_systemd_timer
+from paramem.server.schedule_grammar import compute_schedule_period_seconds
 from paramem.server.systemd_timer import TimerSpec
 
 # ---------------------------------------------------------------------------
@@ -58,23 +54,37 @@ class TestRenderServiceUnit:
 
 
 # ---------------------------------------------------------------------------
-# render_timer_unit
+# render_timer_unit — backup timer renders through the shared
+# systemd_timer.render_timer_unit; paramem.backup.timer no longer carries
+# its own copy (dedup — see paramem/backup/timer.py module docstring).
 # ---------------------------------------------------------------------------
 
 
 class TestRenderTimerUnit:
     def test_render_timer_unit_calendar_daily(self):
         spec = TimerSpec(kind="daily", on_calendar="*-*-* 04:00:00")
-        content = render_timer_unit(spec)
+        content = server_systemd_timer.render_timer_unit(
+            spec, unit_name=backup_timer.TIMER_NAME, description="ParaMem scheduled backup"
+        )
         assert "OnCalendar=*-*-* 04:00:00" in content
         assert "Persistent=true" in content
 
-    def test_render_timer_unit_interval(self):
-        spec = TimerSpec(kind="interval", on_boot_sec="1h", on_unit_active_sec="1h")
-        content = render_timer_unit(spec)
-        assert "OnBootSec=1h" in content
-        assert "OnUnitActiveSec=1h" in content
-        assert "Persistent" not in content
+    def test_render_timer_unit_heartbeat_for_non_exact_cadence(self):
+        """A non-calendar-exact backup cadence ('every 5h') still renders as
+        OnCalendar + Persistent=true — there is no monotonic fallback left
+        (suspend/power-off catch-up gate rework). The durable last-attempt
+        stamp in backup.json decides which heartbeat wakeups actually run.
+        """
+        spec = backup_timer.parse_schedule("every 5h")
+        assert spec is not None
+        assert spec.kind == "calendar"
+        content = server_systemd_timer.render_timer_unit(
+            spec, unit_name=backup_timer.TIMER_NAME, description="ParaMem scheduled backup"
+        )
+        assert "OnCalendar=" in content
+        assert "Persistent=true" in content
+        assert "OnBootSec" not in content
+        assert "OnUnitActiveSec" not in content
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +110,7 @@ class TestReconcileOff:
             calls_made.append(args)
             return MagicMock(returncode=0, stderr="")
 
-        monkeypatch.setattr(backup_timer, "_run_systemctl", fake_systemctl)
+        monkeypatch.setattr(server_systemd_timer, "_run_systemctl", fake_systemctl)
 
         result = reconcile(
             "off",
@@ -119,7 +129,7 @@ class TestReconcileOff:
 
         calls_made = []
         monkeypatch.setattr(
-            backup_timer,
+            server_systemd_timer,
             "_run_systemctl",
             lambda *a: calls_made.append(a) or MagicMock(returncode=0),
         )
@@ -141,7 +151,7 @@ class TestReconcileWritesUnits:
         monkeypatch.setattr(backup_timer, "SERVICE_PATH", service_path)
         monkeypatch.setattr(backup_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(
-            backup_timer, "_run_systemctl", lambda *a: MagicMock(returncode=0, stderr="")
+            server_systemd_timer, "_run_systemctl", lambda *a: MagicMock(returncode=0, stderr="")
         )
         return timer_path, service_path
 
@@ -170,7 +180,7 @@ class TestReconcileWritesUnits:
                 daemon_reloads.append(1)
             return MagicMock(returncode=0, stderr="")
 
-        monkeypatch.setattr(backup_timer, "_run_systemctl", fake_systemctl)
+        monkeypatch.setattr(server_systemd_timer, "_run_systemctl", fake_systemctl)
         reconcile("daily 04:00", python_path="/usr/bin/python", project_root="/opt/paramem")
         count_after_first = len(daemon_reloads)
         reconcile("daily 04:00", python_path="/usr/bin/python", project_root="/opt/paramem")
@@ -179,39 +189,55 @@ class TestReconcileWritesUnits:
 
 
 # ---------------------------------------------------------------------------
-# _backup_timer_interval_seconds
+# compute_schedule_period_seconds — replaces the deleted
+# _backup_timer_interval_seconds (the third grammar copy; see
+# paramem/backup/timer.py module docstring). The VALUES below are unchanged
+# from the pre-dedup _backup_timer_interval_seconds table for every non-off
+# schedule.
+#
+# NOTE — one value is NOT preserved: _backup_timer_interval_seconds returned
+# 0 for "off"/"" (a non-raising convenience for the two /status stale-check
+# call sites); compute_schedule_period_seconds returns None for the same
+# inputs (its established, pre-existing contract — see
+# schedule_grammar.compute_schedule_period_seconds). The call sites
+# (app.py, attention.py) now guard on parse_schedule_atom(...) is None /
+# check for None explicitly rather than relying on a 0 sentinel — see the
+# TRAP note in the catch-up-gate spec. Flagged per spec instruction ("If any
+# expected value must change, STOP and report") rather than silently
+# absorbed.
 # ---------------------------------------------------------------------------
 
 
-class TestIntervalSeconds:
+class TestComputeSchedulePeriodSecondsBackupValues:
     def test_interval_seconds_for_daily_time(self):
-        """'daily 04:00' → 86400."""
-        assert _backup_timer_interval_seconds("daily 04:00") == 86400
+        """'daily 04:00' → 86400 (via strip_daily_prefix normalisation)."""
+        assert compute_schedule_period_seconds("daily 04:00") == 86400
 
     def test_interval_seconds_for_hhmm(self):
         """'04:00' → 86400."""
-        assert _backup_timer_interval_seconds("04:00") == 86400
+        assert compute_schedule_period_seconds("04:00") == 86400
 
     def test_interval_seconds_for_daily_bare(self):
         """'daily' → 86400."""
-        assert _backup_timer_interval_seconds("daily") == 86400
+        assert compute_schedule_period_seconds("daily") == 86400
 
     def test_interval_seconds_for_every_12h(self):
         """'every 12h' → 43200."""
-        assert _backup_timer_interval_seconds("every 12h") == 43200
+        assert compute_schedule_period_seconds("every 12h") == 43200
 
     def test_interval_seconds_for_every_6h(self):
-        assert _backup_timer_interval_seconds("every 6h") == 6 * 3600
+        assert compute_schedule_period_seconds("every 6h") == 6 * 3600
 
     def test_interval_seconds_for_weekly(self):
-        assert _backup_timer_interval_seconds("weekly") == 604800
+        assert compute_schedule_period_seconds("weekly") == 604800
 
     def test_interval_seconds_for_off(self):
-        """'off' → 0."""
-        assert _backup_timer_interval_seconds("off") == 0
+        """'off' → None (value CHANGED from the pre-dedup 0 — see class docstring)."""
+        assert compute_schedule_period_seconds("off") is None
 
     def test_interval_seconds_for_empty(self):
-        assert _backup_timer_interval_seconds("") == 0
+        """'' → None (value CHANGED from the pre-dedup 0 — see class docstring)."""
+        assert compute_schedule_period_seconds("") is None
 
     def test_interval_seconds_for_every_30m(self):
-        assert _backup_timer_interval_seconds("every 30m") == 1800
+        assert compute_schedule_period_seconds("every 30m") == 1800

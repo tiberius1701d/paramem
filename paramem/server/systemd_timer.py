@@ -1,46 +1,64 @@
 """Systemd user-timer reconciliation for the full-consolidation cycle.
 
-The server derives the full-consolidation period from
-``refresh_cadence × max_interim_count`` (see
-``ConsolidationScheduleConfig.consolidation_period_string``) and passes that
-derived period string to :func:`reconcile`. ``refresh_cadence`` is the only
-user-facing scheduling knob; this module never sees it directly. On startup
-the server renders the expected ``paramem-consolidate.timer`` and
-``paramem-consolidate.service`` units, diffs them against what is currently
-installed under ``~/.config/systemd/user/``, and reconciles with
-``daemon-reload`` + ``enable --now`` (or ``stop`` + ``disable`` when the
-derived period is "off"/empty).
+``refresh_cadence`` (``consolidation.refresh_cadence``) is the only
+user-facing scheduling knob and the only schedule string this module ever
+sees — it is passed directly to :func:`reconcile` (``app.py:2340,2350``).
+This module does not receive the derived full-consolidation period
+(``refresh_cadence × max_interim_count``); that derivation lives in
+``ConsolidationScheduleConfig`` and is consumed by ``_is_full_cycle_due``,
+not by the timer renderer.
 
-This replaces the in-process `_consolidation_scheduler` asyncio task. The
-in-process scheduler did not survive server restart — auto-reclaim restarts
-the service on GPU-free, and each restart reset the next-tick timestamp to
-now + interval, so interval schedules effectively never fired. A systemd
-timer is wall-clock driven and survives restarts.
+THE PRINCIPLE — the systemd timer IS the schedule when the cadence is
+exactly calendar-expressible; otherwise it degrades to a pure wakeup source
+and a durable last-attempt stamp becomes the schedule.
+
+``systemd``'s ``Persistent=true`` only affects ``OnCalendar=`` timers —
+monotonic ``OnBootSec``/``OnUnitActiveSec`` timers run on ``CLOCK_MONOTONIC``,
+which does not advance while the host is suspended, so a missed monotonic
+tick is gone forever (``WakeSystem=true`` would fix that, but it requires
+system-manager privileges this ``--user`` timer does not have). ``OnCalendar=``
+cannot express every rolling period, though: it can only land on exact
+divisors of its calendar field (24 for hours, 60 for minutes) and cannot
+express a period longer than 24h.
+
+So every cadence renders as ``OnCalendar`` + ``Persistent=true`` — there is
+no more monotonic ``TimerSpec`` kind:
+
+* Calendar-exact cadences (``daily``, ``weekly``, ``HH:MM``, and any
+  ``every Nh``/``every Nm`` that divides 24/60) render at their exact
+  period. The rendered timer alone is the schedule; systemd's catch-up
+  fires the (single, coalesced) missed run on resume.
+* Non-exact cadences (``every 5h``, ``every 90m``, ``every 48h``, ...)
+  render at a coarser HEARTBEAT grid (see :func:`heartbeat_seconds`) —
+  the timer is a wakeup source only. Each heartbeat, the dispatcher
+  (``app.py::_maybe_trigger_scheduled_consolidation``) checks a durable
+  last-attempt stamp (``schedule_state.py``) against the real cadence
+  period and no-ops until it is actually due. This is the same answer the
+  full fold already gives for its own due-ness (``_is_full_cycle_due``
+  reads durable on-disk state and wall clock, never timer identity) —
+  applied one level up, to the timer that drives the tick itself.
 
 Accepted schedule strings (same parser as before, plus "off"):
     ""  / "off" / "disabled"  → no timer (manual /consolidate only)
     "every Nh" (24 % N == 0)  → OnCalendar=*-*-* HH,...:00:00 + Persistent=true
-    "every Nh" (24 % N != 0)  → OnBootSec + OnUnitActiveSec (no catch-up)
+    "every Nh" (24 % N != 0)  → OnCalendar heartbeat (see heartbeat_seconds) + Persistent=true
     "every Nm" (60 % N == 0)  → OnCalendar=*:MM,...:00 + Persistent=true
-    "every Nm" (60 % N != 0)  → OnBootSec + OnUnitActiveSec (no catch-up)
+    "every Nm" (60 % N != 0)  → OnCalendar heartbeat + Persistent=true
     "weekly"                  → OnCalendar=Mon *-*-* 00:00:00 + Persistent=true
     "HH:MM"                   → OnCalendar daily + Persistent=true
     "daily"                   → OnCalendar *-*-* 03:00:00 + Persistent=true
-
-Interval cadences that divide evenly into 24h or 60min are converted to
-OnCalendar expressions so that systemd's ``Persistent=true`` can fire missed
-ticks on the next boot. Non-divisible cadences fall back to monotonic
-OnBootSec + OnUnitActiveSec; missed ticks are silently dropped in that case.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from paramem.server.schedule_grammar import parse_schedule_atom
+from paramem.server.schedule_grammar import is_calendar_exact, parse_schedule_atom
 from paramem.utils.paths import find_project_root
 
 logger = logging.getLogger(__name__)
@@ -60,19 +78,25 @@ class TimerSpec:
 
     kind values:
       "off"      — no timer installed.
-      "calendar" — OnCalendar + Persistent=true; catches up missed ticks on boot.
+      "calendar" — OnCalendar + Persistent=true; exact grid or heartbeat
+                    grid (see module docstring), always catches up missed
+                    ticks on boot/resume.
       "daily"    — OnCalendar + Persistent=true; fixed daily wall-clock time.
-      "interval" — OnBootSec + OnUnitActiveSec; missed ticks are silently dropped.
+
+    There is no monotonic kind — every non-"off" timer is OnCalendar-based.
     """
 
-    kind: str  # "off" | "interval" | "calendar" | "daily"
-    on_calendar: str | None = None  # calendar / daily mode
-    on_boot_sec: str | None = None  # interval mode
-    on_unit_active_sec: str | None = None  # interval mode
+    kind: str  # "off" | "calendar" | "daily"
+    on_calendar: str | None = None
 
 
 def _hours_to_calendar(n: int) -> str | None:
     """Return an OnCalendar expression for every-N-hours if 24 % n == 0, else None.
+
+    The exact-grid renderer — unchanged by the catch-up-gate rework.  Also
+    reused by :func:`_period_heartbeat_calendar` to render the coarser
+    heartbeat grid for non-exact cadences (``gcd(count, 24)`` always divides
+    24, so it is always a valid argument here).
 
     Examples::
 
@@ -90,6 +114,9 @@ def _hours_to_calendar(n: int) -> str | None:
 def _minutes_to_calendar(n: int) -> str | None:
     """Return an OnCalendar expression for every-N-minutes if 60 % n == 0, else None.
 
+    The exact-grid renderer — unchanged by the catch-up-gate rework.  Also
+    reused by :func:`_period_heartbeat_calendar` (see :func:`_hours_to_calendar`).
+
     Examples::
 
         _minutes_to_calendar(15) → "*:00,15,30,45:00"
@@ -102,6 +129,83 @@ def _minutes_to_calendar(n: int) -> str | None:
     return f"*:{','.join(minutes)}:00"
 
 
+def _period_heartbeat_calendar(count: int, unit: str) -> str:
+    """Return the OnCalendar heartbeat expression for an interval cadence.
+
+    Exact-grid cadences (``24 % count == 0`` for hours / ``60 % count == 0``
+    for minutes) render at the exact period boundaries via
+    ``_hours_to_calendar`` / ``_minutes_to_calendar`` — the timer alone is
+    the schedule.
+
+    Non-exact cadences render at the ``gcd(count, modulus)`` grid — the
+    coarsest grid on which every period boundary still lands, since
+    ``count`` is by construction a multiple of ``gcd(count, modulus)``.
+    The timer is a pure wakeup source here; ``heartbeat_seconds`` +
+    ``schedule_state.py`` decide which wakeups actually dispatch.
+    """
+    modulus = 24 if unit == "h" else 60
+    if modulus % count == 0:
+        cal = _hours_to_calendar(count) if unit == "h" else _minutes_to_calendar(count)
+        assert cal is not None  # modulus % count == 0 guarantees this
+        return cal
+    grid = math.gcd(count, modulus)
+    cal = _hours_to_calendar(grid) if unit == "h" else _minutes_to_calendar(grid)
+    assert cal is not None  # gcd(count, modulus) always divides modulus
+    return cal
+
+
+def heartbeat_seconds(schedule: str) -> int | None:
+    """Return the heartbeat grid, in seconds, for a non-calendar-exact cadence.
+
+    ``None`` when *schedule* is calendar-exact (anchored, an exact-divisor
+    interval, off, or unparseable — see
+    :func:`~paramem.server.schedule_grammar.is_calendar_exact`) — meaning
+    the rendered ``OnCalendar`` timer IS the schedule and no durable
+    last-attempt gate is needed.
+
+    For a non-exact interval cadence the grid is ``gcd(count, modulus)`` in
+    the cadence's own unit (modulus = 24 for hours, 60 for minutes), i.e.
+    the same grid :func:`_period_heartbeat_calendar` renders.
+    """
+    if is_calendar_exact(schedule):
+        return None
+    atom = parse_schedule_atom(schedule)
+    modulus = 24 if atom.unit == "h" else 60
+    grid = math.gcd(atom.count, modulus)
+    return grid * 3600 if atom.unit == "h" else grid * 60
+
+
+def floor_to_heartbeat(now: float, grid_seconds: int) -> float:
+    """Floor an epoch timestamp DOWN to the current heartbeat grid boundary.
+
+    ``grid_seconds`` is the value returned by :func:`heartbeat_seconds`.
+
+    Grid boundaries are computed in LOCAL time from local midnight —
+    matching ``interim_adapter.current_interim_stamp``'s flooring
+    convention and the LOCAL time base of rendered ``OnCalendar``
+    expressions. A UTC-epoch floor would only coincide with those LOCAL
+    grid marks when the local UTC offset is a whole number of hours (it
+    would misalign for e.g. UTC+05:30); flooring in local time is correct
+    for every offset.
+
+    Flooring (never rounding to nearest, never stamping raw wall-clock) is
+    mandatory: the dispatch stamp is written strictly AFTER the heartbeat
+    fires (guards, debounce, orphan-session claim, migration branch all run
+    first), so an un-floored stamp lands one instant past a grid mark —
+    pushing the next due-check to the FOLLOWING heartbeat and silently
+    inflating the effective period every cycle (``every 5h`` converges to a
+    real 6h, ``every 48h`` to 49h). A tolerance window would only narrow
+    that error, not eliminate it; flooring is exact.
+    """
+    if grid_seconds <= 0:
+        raise ValueError(f"grid_seconds must be positive, got {grid_seconds}")
+    dt = datetime.fromtimestamp(now)
+    midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    since_midnight = int((dt - midnight).total_seconds())
+    floored_since_midnight = (since_midnight // grid_seconds) * grid_seconds
+    return (midnight + timedelta(seconds=floored_since_midnight)).timestamp()
+
+
 def parse_schedule(schedule: str) -> TimerSpec | None:
     """Parse a schedule string into a systemd TimerSpec.
 
@@ -110,14 +214,16 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
     - ``""`` / ``"off"`` / ``"disabled"`` / ``"none"`` → disabled timer.
     - ``"weekly"`` → ``OnCalendar=Mon *-*-* 00:00:00`` + ``Persistent=true``.
     - ``"daily"`` → OnCalendar daily at 03:00 (same as ``"03:00"``).
-    - ``"every Nh"`` where ``24 % N == 0`` → calendar timer at each N-hour mark
-      with ``Persistent=true`` (catches up missed ticks on boot).
-    - ``"every Nh"`` where ``24 % N != 0`` → monotonic interval timer; missed
-      ticks during outages are silently dropped.
-    - ``"every Nm"`` where ``60 % N == 0`` → calendar timer at each N-minute mark
-      with ``Persistent=true``.
-    - ``"every Nm"`` where ``60 % N != 0`` → monotonic interval timer.
+    - ``"every Nh"`` where ``24 % N == 0`` → calendar timer at each N-hour mark.
+    - ``"every Nh"`` where ``24 % N != 0`` → calendar HEARTBEAT timer (see
+      :func:`heartbeat_seconds`); the dispatcher's durable stamp decides
+      whether a given wakeup actually runs.
+    - ``"every Nm"`` where ``60 % N == 0`` → calendar timer at each N-minute mark.
+    - ``"every Nm"`` where ``60 % N != 0`` → calendar HEARTBEAT timer.
     - ``"HH:MM"`` → daily OnCalendar timer at the given time.
+
+    Every non-off kind is ``OnCalendar`` + ``Persistent=true`` (see module
+    docstring) — there is no monotonic fallback.
 
     Returns TimerSpec(kind="off") for an explicit off setting.
     Returns None on malformed input (caller logs + falls back to off).
@@ -132,18 +238,8 @@ def parse_schedule(schedule: str) -> TimerSpec | None:
     if atom.kind == "daily":
         return TimerSpec(kind="daily", on_calendar="*-*-* 03:00:00")
     if atom.kind == "interval":
-        n = atom.count
-        if atom.unit == "h":
-            cal = _hours_to_calendar(n)
-            if cal is not None:
-                return TimerSpec(kind="calendar", on_calendar=cal)
-            sec = f"{n}h"
-        else:
-            cal = _minutes_to_calendar(n)
-            if cal is not None:
-                return TimerSpec(kind="calendar", on_calendar=cal)
-            sec = f"{n}min"
-        return TimerSpec(kind="interval", on_boot_sec=sec, on_unit_active_sec=sec)
+        cal = _period_heartbeat_calendar(atom.count, atom.unit)
+        return TimerSpec(kind="calendar", on_calendar=cal)
     if atom.kind == "hhmm":
         return TimerSpec(
             kind="daily",
@@ -212,26 +308,31 @@ def render_service_unit(endpoint: str, project_root: str) -> str:
     )
 
 
-def render_timer_unit(spec: TimerSpec) -> str:
+def render_timer_unit(
+    spec: TimerSpec,
+    *,
+    unit_name: str = TIMER_NAME,
+    description: str = "ParaMem consolidation scheduler",
+) -> str:
     """Render the systemd .timer unit text for the given spec.
 
-    Both ``"calendar"`` and ``"daily"`` kinds emit ``OnCalendar`` +
-    ``Persistent=true`` so that missed ticks fire on the next boot.
-    ``"interval"`` kind uses monotonic ``OnBootSec`` / ``OnUnitActiveSec``
-    and does NOT include ``Persistent=true`` (systemd ignores it for
-    monotonic timers; missed ticks during outages are silently dropped).
+    Every non-``"off"`` kind (``"calendar"``, ``"daily"``) emits
+    ``OnCalendar`` + ``Persistent=true`` so that missed ticks fire on the
+    next boot/resume — there is no monotonic kind left to special-case (see
+    module docstring).
+
+    Parameterised on ``unit_name``/``description`` so the backup timer
+    (``paramem.backup.timer``) renders through this one implementation
+    instead of carrying its own copy.
     """
     lines = [
         "[Unit]",
-        "Description=ParaMem consolidation scheduler",
+        f"Description={description}",
         "",
         "[Timer]",
-        f"Unit={TIMER_NAME}.service",
+        f"Unit={unit_name}.service",
     ]
-    if spec.kind == "interval":
-        lines.append(f"OnBootSec={spec.on_boot_sec}")
-        lines.append(f"OnUnitActiveSec={spec.on_unit_active_sec}")
-    elif spec.kind in ("calendar", "daily"):
+    if spec.kind in ("calendar", "daily"):
         lines.append(f"OnCalendar={spec.on_calendar}")
         lines.append("Persistent=true")
     lines.extend(["", "[Install]", "WantedBy=timers.target", ""])
@@ -258,6 +359,88 @@ def _write_if_changed(path: Path, content: str) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
     return True
+
+
+@dataclass(frozen=True)
+class TimerTarget:
+    """Identifies one systemd timer/service pair for :func:`_reconcile_timer`.
+
+    The consolidation timer (this module) and the backup timer
+    (``paramem.backup.timer``) reconcile identically except for these five
+    values — ``_reconcile_timer`` is the single reconciliation core both
+    build a ``TimerTarget`` for, rather than each carrying its own copy of
+    the reconcile/render logic.
+    """
+
+    timer_name: str
+    description: str
+    service_path: Path
+    timer_path: Path
+    service_content: str
+
+
+def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
+    """Shared reconciliation core for both the consolidation and backup timers.
+
+    Parses *schedule*, renders/writes the unit pair, and enables the timer.
+    Never raises on systemd errors — logs and returns a notice so the caller
+    (server startup) still proceeds.
+
+    Returns a short human-readable description of the action taken, which
+    the caller logs.
+    """
+    spec = parse_schedule(schedule)
+    if spec is None:
+        logger.error(
+            "Invalid %s schedule: %r — expected '', 'off', 'HH:MM', 'every Nh', "
+            "or 'every Nm'. Timer will be disabled.",
+            target.timer_name,
+            schedule,
+        )
+        spec = TimerSpec(kind="off")
+
+    if spec.kind == "off":
+        changed = False
+        if target.timer_path.exists():
+            _run_systemctl("stop", f"{target.timer_name}.timer")
+            _run_systemctl("disable", f"{target.timer_name}.timer")
+            target.timer_path.unlink(missing_ok=True)
+            target.service_path.unlink(missing_ok=True)
+            _run_systemctl("daemon-reload")
+            changed = True
+        return f"{target.timer_name}: disabled" + (" (removed)" if changed else "")
+
+    svc_changed = _write_if_changed(target.service_path, target.service_content)
+    tmr_changed = _write_if_changed(
+        target.timer_path,
+        render_timer_unit(spec, unit_name=target.timer_name, description=target.description),
+    )
+
+    if svc_changed or tmr_changed:
+        _run_systemctl("daemon-reload")
+
+    enable = _run_systemctl("enable", "--now", f"{target.timer_name}.timer")
+    if enable.returncode != 0:
+        logger.warning(
+            "systemctl enable --now %s.timer failed: %s",
+            target.timer_name,
+            enable.stderr.strip(),
+        )
+        return f"{target.timer_name}: enable failed ({enable.stderr.strip()[:80]})"
+
+    # If unit already enabled, systemd won't restart it on daemon-reload —
+    # force a restart so the new OnCalendar takes effect.
+    if svc_changed or tmr_changed:
+        _run_systemctl("restart", f"{target.timer_name}.timer")
+
+    # Every non-off kind is OnCalendar + Persistent=true — catch-up always
+    # applies, whether the grid is exact or a heartbeat (see module docstring).
+    if spec.kind == "calendar":
+        detail = f"calendar {spec.on_calendar} (with catch-up)"
+    else:
+        detail = f"daily at {spec.on_calendar} (with catch-up)"
+    state = "updated" if (svc_changed or tmr_changed) else "already current"
+    return f"{target.timer_name}: {state}, {detail}"
 
 
 def reconcile(
@@ -294,56 +477,14 @@ def reconcile(
     if project_root is None:
         _r = find_project_root(Path(__file__))
         project_root = str(_r if _r is not None else Path(__file__).resolve().parents[2])
-    spec = parse_schedule(schedule)
-    if spec is None:
-        logger.error(
-            "Invalid consolidation refresh cadence: %r — expected '', 'off', "
-            "'HH:MM', 'every Nh', or 'every Nm'. This is "
-            "consolidation.refresh_cadence; check it in "
-            "server.yaml. Timer will be disabled.",
-            schedule,
-        )
-        spec = TimerSpec(kind="off")
-
-    if spec.kind == "off":
-        changed = False
-        if TIMER_PATH.exists():
-            _run_systemctl("stop", f"{TIMER_NAME}.timer")
-            _run_systemctl("disable", f"{TIMER_NAME}.timer")
-            TIMER_PATH.unlink(missing_ok=True)
-            SERVICE_PATH.unlink(missing_ok=True)
-            _run_systemctl("daemon-reload")
-            changed = True
-        return "consolidation timer: disabled" + (" (removed)" if changed else "")
-
-    svc_changed = _write_if_changed(SERVICE_PATH, render_service_unit(endpoint, project_root))
-    tmr_changed = _write_if_changed(TIMER_PATH, render_timer_unit(spec))
-
-    if svc_changed or tmr_changed:
-        _run_systemctl("daemon-reload")
-
-    enable = _run_systemctl("enable", "--now", f"{TIMER_NAME}.timer")
-    if enable.returncode != 0:
-        logger.warning(
-            "systemctl enable --now %s.timer failed: %s",
-            TIMER_NAME,
-            enable.stderr.strip(),
-        )
-        return f"consolidation timer: enable failed ({enable.stderr.strip()[:80]})"
-
-    # If unit already enabled, systemd won't restart it on daemon-reload —
-    # force a restart so the new OnCalendar/OnUnitActiveSec takes effect.
-    if svc_changed or tmr_changed:
-        _run_systemctl("restart", f"{TIMER_NAME}.timer")
-
-    if spec.kind == "interval":
-        detail = f"every {spec.on_unit_active_sec} (no catch-up)"
-    elif spec.kind == "calendar":
-        detail = f"calendar {spec.on_calendar} (with catch-up)"
-    else:
-        detail = f"daily at {spec.on_calendar} (with catch-up)"
-    state = "updated" if (svc_changed or tmr_changed) else "already current"
-    return f"consolidation timer: {state}, {detail}"
+    target = TimerTarget(
+        timer_name=TIMER_NAME,
+        description="ParaMem consolidation scheduler",
+        service_path=SERVICE_PATH,
+        timer_path=TIMER_PATH,
+        service_content=render_service_unit(endpoint, project_root),
+    )
+    return _reconcile_timer(target, schedule)
 
 
 def current_timer_state(timer_name: str = TIMER_NAME) -> dict:

@@ -175,6 +175,19 @@ adapters:
 #   BackgroundTrainer's pause/resume — it yields to inference and resumes
 #   when idle.
 #
+# SUSPEND / POWER-OFF CATCH-UP
+# - A tick missed while the host was suspended (or powered off) is caught
+#   up on resume for every cadence, including non-divisor ones like "5h" or
+#   "90m" — not just cadences that divide evenly into a day/hour. Cadences
+#   that DON'T divide evenly render as a coarser systemd calendar "heartbeat"
+#   wakeup; a durable last-attempt stamp (not the timer itself) decides
+#   whether a given wakeup actually runs a cycle.
+# - systemd coalesces many missed elapses into ONE activation — "performed
+#   on resume" means one catch-up run, not one per missed window.
+# - The first gated tick after a fresh install (or an upgrade from a
+#   version without this stamp) seeds the stamp and does NOT run — a
+#   surprise consolidation on first boot is worse than a one-tick delay.
+#
 # INTERIM ADAPTER CAP — max_interim_count / interim_overflow_slack
 # - HARD CAP on concurrent interim adapters resident in VRAM.
 # - Each interim adapter is its own independently-trained, temporally-

@@ -94,7 +94,10 @@ def _populate_backup_block(
 
     from paramem.backup import retention as _backup_retention
     from paramem.backup import state as _backup_state
-    from paramem.backup.timer import _backup_timer_interval_seconds
+    from paramem.server.schedule_grammar import (
+        compute_schedule_period_seconds,
+        parse_schedule_atom,
+    )
 
     _backup_record = None
     try:
@@ -127,7 +130,11 @@ def _populate_backup_block(
         and _backup_record.last_success_at
         and _schedule_str not in ("", "off", "disabled", "none")
     ):
-        _interval_s = _backup_timer_interval_seconds(_schedule_str)
+        _interval_s = (
+            compute_schedule_period_seconds(_schedule_str)
+            if parse_schedule_atom(_schedule_str) is not None
+            else 0
+        )
         if _interval_s and _interval_s > 0:
             try:
                 _last_ok = datetime.fromisoformat(_backup_record.last_success_at)

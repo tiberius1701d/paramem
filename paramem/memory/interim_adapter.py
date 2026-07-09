@@ -6,13 +6,16 @@ consolidate_interim_adapters can call unload without importing app.py:
   create_interim_adapter  — live creation of the current episodic_interim_* adapter
   unload_interim_adapters — post-consolidation removal of all interim adapters
 
-It also provides timestamp and schedule helpers:
+It also provides a timestamp helper:
 
   current_interim_stamp(refresh_cadence) — returns the current
       sub-interval stamp as ``YYYYMMDDTHHMM``, floored to the boundary of the
       current sub-interval.
-  compute_schedule_period_seconds(schedule) — returns the full consolidation
-      period in seconds for a schedule string.
+
+Schedule-string parsing (``compute_schedule_period_seconds``) lives in
+``paramem.server.schedule_grammar`` — relocated there (2026-07) so the
+backup runner can share it without ``interim_adapter`` (a ``memory``-layer
+module) importing from ``backup``.
 
 Callers (wiring schedule):
   Scheduled consolidation path — calls create_interim_adapter when run_consolidation_cycle
@@ -39,7 +42,7 @@ from pathlib import Path
 from peft import PeftModel
 
 from paramem.models.loader import create_adapter
-from paramem.server.schedule_grammar import parse_schedule_atom
+from paramem.server.schedule_grammar import compute_schedule_period_seconds
 from paramem.utils.config import AdapterConfig
 
 logger = logging.getLogger(__name__)
@@ -130,44 +133,6 @@ def detect_legacy_adapter_layout(adapter_dir: Path) -> list[Path]:
         if path.is_dir():
             legacy.append(path)
     return sorted(legacy)
-
-
-def compute_schedule_period_seconds(schedule: str) -> int | None:
-    """Return the full consolidation period in seconds for a schedule string.
-
-    Grammar is shared with ``systemd_timer.parse_schedule`` via
-    :func:`paramem.server.schedule_grammar.parse_schedule_atom`.
-
-    - ``"weekly"``                → 604800 seconds (7 days)
-    - ``"daily"``                 → 86400 seconds (1 day)
-    - ``"every Nh"`` / ``"Nh"``   → N × 3600 seconds
-    - ``"every Nm"`` / ``"Nm"``   → N × 60 seconds
-    - ``"HH:MM"``                 → 86400 seconds (daily)
-    - ``""`` / ``"off"`` / ``"disabled"`` / ``"none"`` → ``None`` (manual only)
-
-    Returns:
-        Period in seconds, or ``None`` when no schedule is configured.
-
-    Raises:
-        ValueError: if *schedule* is not ``None`` / off / a valid period string.
-    """
-    atom = parse_schedule_atom(schedule)
-    if atom is None:
-        raise ValueError(
-            f"Unrecognised schedule string: {schedule!r}. Expected '', 'off', "
-            "'weekly', 'daily', 'HH:MM', 'Nh'/'Nm', or 'every Nh'/'every Nm'."
-        )
-    if atom.kind == "off":
-        return None
-    if atom.kind == "weekly":
-        return 604800
-    if atom.kind == "daily":
-        return 86400
-    if atom.kind == "interval":
-        return atom.count * 3600 if atom.unit == "h" else atom.count * 60
-    if atom.kind == "hhmm":
-        return 86400
-    raise ValueError(f"Unhandled schedule kind: {atom.kind!r}")
 
 
 def current_interim_stamp(

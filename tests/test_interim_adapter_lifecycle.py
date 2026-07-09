@@ -25,11 +25,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from paramem.memory.interim_adapter import (
-    compute_schedule_period_seconds,
     create_interim_adapter,
     current_interim_stamp,
     unload_interim_adapters,
 )
+from paramem.server.schedule_grammar import compute_schedule_period_seconds
 
 # ---------------------------------------------------------------------------
 # Helpers

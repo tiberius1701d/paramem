@@ -209,6 +209,177 @@ def test_missing_config_returns_1(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Suspend/power-off catch-up gate — non-calendar-exact backup schedules.
+# Mirrors the consolidation scheduler's gate (app.py) but keys off
+# backup.json::last_run.completed_at instead of a separate stamp file — see
+# paramem/backup/__main__.py's due-check block.
+# ---------------------------------------------------------------------------
+
+
+class TestBackupCatchUpGate:
+    def _write_last_run(self, state_dir: Path, *, completed_at: str, success: bool = True):
+        from paramem.backup.state import (
+            BACKUP_STATE_SCHEMA_VERSION,
+            BackupStateRecord,
+            write_backup_state,
+        )
+
+        record = BackupStateRecord(
+            schema_version=BACKUP_STATE_SCHEMA_VERSION,
+            last_run={"completed_at": completed_at, "success": success},
+            last_success_at=completed_at if success else None,
+            last_failure_at=None if success else completed_at,
+            last_failure_reason=None if success else "boom",
+        )
+        write_backup_state(state_dir, record)
+
+    def test_recent_attempt_skips_without_delegating(self, tmp_path, monkeypatch):
+        """Non-exact cadence ('every 5h') + a recent last-attempt → skip (exit 0),
+        no /backup/create call — the next heartbeat retries.
+        """
+        from datetime import datetime, timezone
+
+        cfg_path = tmp_path / "server.yaml"
+        cfg_path.write_text("model: mistral\n")
+        fake = _fake_config(tmp_path, schedule="every 5h")
+        monkeypatch.setattr("paramem.server.config.load_server_config", lambda _p: fake)
+
+        state_dir = (fake.paths.data / "state").resolve()
+        self._write_last_run(state_dir, completed_at=datetime.now(timezone.utc).isoformat())
+
+        def _boom(*a, **k):
+            raise AssertionError("must not delegate to the server when not yet due")
+
+        monkeypatch.setattr("paramem.cli.http_client.post_json", _boom)
+
+        rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+        assert rc == 0
+
+    def test_stale_attempt_proceeds(self, tmp_path, monkeypatch):
+        """Non-exact cadence + a last attempt older than the period → proceeds to delegate."""
+        from datetime import datetime, timedelta, timezone
+
+        cfg_path = tmp_path / "server.yaml"
+        cfg_path.write_text("model: mistral\n")
+        fake = _fake_config(tmp_path, schedule="every 5h")
+        monkeypatch.setattr("paramem.server.config.load_server_config", lambda _p: fake)
+
+        state_dir = (fake.paths.data / "state").resolve()
+        stale = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+        self._write_last_run(state_dir, completed_at=stale)
+
+        calls = {}
+
+        def fake_post(url, body, *, timeout, token=None):
+            calls["called"] = True
+            return {
+                "success": True,
+                "tier": "daily",
+                "written_slots": {},
+                "skipped_artifacts": [],
+                "error": None,
+            }
+
+        monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
+
+        rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+        assert rc == 0
+        assert calls.get("called") is True
+
+    def test_absent_last_run_proceeds(self, tmp_path, monkeypatch):
+        """Non-exact cadence + no backup.json yet → RUN.
+
+        Unlike consolidation's seed-and-noop, a first backup's stamp is never
+        faked: a surprise first backup is cheap and welcome, unlike a
+        surprise GPU-expensive first consolidation.
+        """
+        cfg_path = tmp_path / "server.yaml"
+        cfg_path.write_text("model: mistral\n")
+        fake = _fake_config(tmp_path, schedule="every 5h")
+        monkeypatch.setattr("paramem.server.config.load_server_config", lambda _p: fake)
+
+        calls = {}
+
+        def fake_post(url, body, *, timeout, token=None):
+            calls["called"] = True
+            return {
+                "success": True,
+                "tier": "daily",
+                "written_slots": {},
+                "skipped_artifacts": [],
+                "error": None,
+            }
+
+        monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
+
+        rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+        assert rc == 0
+        assert calls.get("called") is True
+
+    def test_anchor_schedule_never_gated(self, tmp_path, monkeypatch):
+        """Anchored schedule ('daily 04:00', the server.yaml default) is never
+        gated — even with a very recent last-attempt stamp, calendar-exact
+        cadences proceed unconditionally (the timer alone is the schedule).
+        """
+        from datetime import datetime, timezone
+
+        cfg_path = tmp_path / "server.yaml"
+        cfg_path.write_text("model: mistral\n")
+        fake = _fake_config(tmp_path, schedule="daily 04:00")
+        monkeypatch.setattr("paramem.server.config.load_server_config", lambda _p: fake)
+
+        state_dir = (fake.paths.data / "state").resolve()
+        self._write_last_run(state_dir, completed_at=datetime.now(timezone.utc).isoformat())
+
+        calls = {}
+
+        def fake_post(url, body, *, timeout, token=None):
+            calls["called"] = True
+            return {
+                "success": True,
+                "tier": "daily",
+                "written_slots": {},
+                "skipped_artifacts": [],
+                "error": None,
+            }
+
+        monkeypatch.setattr("paramem.cli.http_client.post_json", fake_post)
+
+        rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+        assert rc == 0
+        assert calls.get("called") is True
+
+    def test_recent_failed_attempt_still_gates(self, tmp_path, monkeypatch):
+        """A recent FAILED attempt still gates — the retry-storm regression check.
+
+        Gating on last_success_at instead of the last attempt would let a
+        persistently failing backup pass the gate on every heartbeat.
+        """
+        from datetime import datetime, timezone
+
+        cfg_path = tmp_path / "server.yaml"
+        cfg_path.write_text("model: mistral\n")
+        fake = _fake_config(tmp_path, schedule="every 5h")
+        monkeypatch.setattr("paramem.server.config.load_server_config", lambda _p: fake)
+
+        state_dir = (fake.paths.data / "state").resolve()
+        self._write_last_run(
+            state_dir, completed_at=datetime.now(timezone.utc).isoformat(), success=False
+        )
+
+        def _boom(*a, **k):
+            raise AssertionError(
+                "a recent FAILED attempt must still gate — gating on last_success_at "
+                "would retry-storm a persistently-failing backup on every heartbeat"
+            )
+
+        monkeypatch.setattr("paramem.cli.http_client.post_json", _boom)
+
+        rc = backup_main.main(["--config", str(cfg_path), "--tier", "daily"])
+        assert rc == 0
+
+
+# ---------------------------------------------------------------------------
 # http_client.post_json — token / Authorization header
 # ---------------------------------------------------------------------------
 

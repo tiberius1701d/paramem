@@ -10,7 +10,12 @@ from unittest.mock import patch
 import pytest
 
 from paramem.server import systemd_timer
-from paramem.server.systemd_timer import TimerSpec, parse_schedule
+from paramem.server.systemd_timer import (
+    TimerSpec,
+    _hours_to_calendar,
+    _minutes_to_calendar,
+    parse_schedule,
+)
 
 
 class TestParseSchedule:
@@ -27,20 +32,26 @@ class TestParseSchedule:
             kind="calendar", on_calendar="*-*-* 00:00:00"
         )
 
-    def test_interval_hours_odd_stays_monotonic(self):
+    def test_interval_hours_odd_becomes_heartbeat_calendar(self):
+        """Non-divisor hour cadences no longer stay monotonic — they render at
+        the gcd(count, 24) heartbeat grid (suspend/power-off catch-up gate;
+        see systemd_timer module docstring). gcd(5, 24) == gcd(7, 24) == 1,
+        so both land on the hourly grid.
+        """
         assert parse_schedule("every 5h") == TimerSpec(
-            kind="interval", on_boot_sec="5h", on_unit_active_sec="5h"
+            kind="calendar", on_calendar=_hours_to_calendar(1)
         )
         assert parse_schedule("every 7h") == TimerSpec(
-            kind="interval", on_boot_sec="7h", on_unit_active_sec="7h"
+            kind="calendar", on_calendar=_hours_to_calendar(1)
         )
 
     def test_interval_minutes_calendar(self):
         assert parse_schedule("every 30m") == TimerSpec(kind="calendar", on_calendar="*:00,30:00")
 
-    def test_interval_minutes_odd_stays_monotonic(self):
+    def test_interval_minutes_odd_becomes_heartbeat_calendar(self):
+        """gcd(13, 60) == 1 → every-13m renders at the per-minute heartbeat grid."""
         assert parse_schedule("every 13m") == TimerSpec(
-            kind="interval", on_boot_sec="13min", on_unit_active_sec="13min"
+            kind="calendar", on_calendar=_minutes_to_calendar(1)
         )
 
     def test_interval_whitespace_and_case(self):
@@ -66,13 +77,16 @@ class TestParseSchedule:
         )
         assert parse_schedule("30m") == TimerSpec(kind="calendar", on_calendar="*:00,30:00")
 
-    def test_bare_shorthand_odd_stays_monotonic(self):
-        """Bare ``Nh``/``Nm`` shorthand with non-divisible cadence stays monotonic."""
+    def test_bare_shorthand_odd_becomes_heartbeat_calendar(self):
+        """Bare ``Nh``/``Nm`` shorthand with a non-divisor cadence renders at
+        the gcd(count, modulus) heartbeat grid instead of staying monotonic.
+        gcd(48, 24) == 24 → daily grid; gcd(90, 60) == 30 → half-hour grid.
+        """
         assert parse_schedule("48H") == TimerSpec(
-            kind="interval", on_boot_sec="48h", on_unit_active_sec="48h"
+            kind="calendar", on_calendar=_hours_to_calendar(24)
         )
         assert parse_schedule("90M") == TimerSpec(
-            kind="interval", on_boot_sec="90min", on_unit_active_sec="90min"
+            kind="calendar", on_calendar=_minutes_to_calendar(30)
         )
 
     def test_weekly_returns_calendar(self):
@@ -128,16 +142,21 @@ class TestReconcile:
         svc = (tmp_path / "paramem-consolidate.service").read_text()
         assert "/scheduled-tick" in svc
 
-    def test_monotonic_interval_writes_units(self, tmp_path, monkeypatch):
+    def test_heartbeat_interval_writes_units(self, tmp_path, monkeypatch):
+        """A non-divisor cadence ('every 5h') still renders OnCalendar +
+        Persistent=true — it is a heartbeat grid, not a monotonic timer.
+        """
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
         with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
             msg = systemd_timer.reconcile("every 5h")
-        assert "no catch-up" in msg
+        assert "with catch-up" in msg
         timer = (tmp_path / "paramem-consolidate.timer").read_text()
-        assert "OnUnitActiveSec=5h" in timer
-        assert "Persistent=true" not in timer
+        assert "OnCalendar=" in timer
+        assert "Persistent=true" in timer
+        assert "OnBootSec" not in timer
+        assert "OnUnitActiveSec" not in timer
 
     def test_daily_writes_oncalendar(self, tmp_path, monkeypatch):
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)

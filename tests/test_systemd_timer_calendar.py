@@ -1,10 +1,13 @@
 """Tests for the interval→calendar conversion in systemd_timer.
 
-Covers every common divisible cadence, a representative set of odd (non-divisible)
-cadences that must stay monotonic, weekly, and rendered unit text assertions.
+Covers every common divisible cadence, a representative set of odd
+(non-divisible) cadences that now render at a coarser heartbeat grid instead
+of staying monotonic (suspend/power-off catch-up gate — see systemd_timer
+module docstring), weekly, and rendered unit text assertions.
 """
 
 import subprocess
+from datetime import datetime
 from unittest.mock import patch
 
 import pytest
@@ -107,8 +110,10 @@ class TestParseScheduleCalendarConversions:
         assert spec is not None
         assert spec.kind == "calendar"
         assert spec.on_calendar == expected_calendar
-        assert spec.on_boot_sec is None
-        assert spec.on_unit_active_sec is None
+        # TimerSpec no longer carries on_boot_sec/on_unit_active_sec fields at
+        # all (monotonic kind deleted — see systemd_timer module docstring).
+        assert not hasattr(spec, "on_boot_sec")
+        assert not hasattr(spec, "on_unit_active_sec")
 
     @pytest.mark.parametrize(
         "schedule,expected_calendar",
@@ -125,20 +130,25 @@ class TestParseScheduleCalendarConversions:
         assert spec.on_calendar == expected_calendar
 
     @pytest.mark.parametrize("schedule", ["every 5h", "every 7h", "every 11h"])
-    def test_odd_hour_cadences_stay_monotonic(self, schedule):
+    def test_odd_hour_cadences_become_heartbeat_calendar(self, schedule):
+        """Non-divisor hour cadences render at the gcd(count, 24) heartbeat
+        grid instead of staying monotonic (suspend/power-off catch-up gate;
+        every non-off TimerSpec is now OnCalendar-based).
+        """
         spec = parse_schedule(schedule)
         assert spec is not None
-        assert spec.kind == "interval"
-        assert spec.on_boot_sec is not None
-        assert spec.on_unit_active_sec is not None
-        assert spec.on_calendar is None
+        assert spec.kind == "calendar"
+        assert spec.on_calendar is not None
+        assert not hasattr(spec, "on_boot_sec")
+        assert not hasattr(spec, "on_unit_active_sec")
 
     @pytest.mark.parametrize("schedule", ["every 7m", "every 13m", "every 17m"])
-    def test_odd_minute_cadences_stay_monotonic(self, schedule):
+    def test_odd_minute_cadences_become_heartbeat_calendar(self, schedule):
+        """Non-divisor minute cadences render at the gcd(count, 60) heartbeat grid."""
         spec = parse_schedule(schedule)
         assert spec is not None
-        assert spec.kind == "interval"
-        assert spec.on_calendar is None
+        assert spec.kind == "calendar"
+        assert spec.on_calendar is not None
 
     def test_weekly_becomes_calendar(self):
         spec = parse_schedule("weekly")
@@ -167,13 +177,19 @@ class TestRenderTimerUnitCalendar:
         assert "OnCalendar=*-*-* 03:00:00" in text
         assert "Persistent=true" in text
 
-    def test_interval_kind_has_no_persistent(self):
-        spec = TimerSpec(kind="interval", on_boot_sec="5h", on_unit_active_sec="5h")
+    def test_heartbeat_calendar_kind_has_persistent_and_no_monotonic_fields(self):
+        """A heartbeat-grid TimerSpec ('every 5h' → gcd(5,24)=1 hourly grid)
+        still renders OnCalendar + Persistent=true — there is no monotonic
+        "interval" TimerSpec kind left to special-case.
+        """
+        spec = parse_schedule("every 5h")
+        assert spec is not None
+        assert spec.kind == "calendar"
         text = systemd_timer.render_timer_unit(spec)
-        assert "OnBootSec=5h" in text
-        assert "OnUnitActiveSec=5h" in text
-        assert "Persistent=true" not in text
-        assert "OnCalendar" not in text
+        assert "OnCalendar=" in text
+        assert "Persistent=true" in text
+        assert "OnBootSec" not in text
+        assert "OnUnitActiveSec" not in text
 
     @pytest.mark.parametrize(
         "schedule,expected_calendar",
@@ -192,13 +208,183 @@ class TestRenderTimerUnitCalendar:
         assert f"OnCalendar={expected_calendar}" in text
         assert "Persistent=true" in text
 
-    def test_every_5h_rendered_unit_no_persistent(self):
+    def test_every_5h_rendered_unit_has_persistent(self):
+        """'every 5h' renders as a heartbeat OnCalendar with Persistent=true
+        (catch-up gate rework) — it no longer renders as a bare monotonic
+        OnBootSec/OnUnitActiveSec timer with no catch-up.
+        """
         spec = parse_schedule("every 5h")
         assert spec is not None
         text = systemd_timer.render_timer_unit(spec)
-        assert "OnBootSec=5h" in text
-        assert "OnUnitActiveSec=5h" in text
-        assert "Persistent=true" not in text
+        assert "OnBootSec" not in text
+        assert "OnUnitActiveSec" not in text
+        assert "OnCalendar=" in text
+        assert "Persistent=true" in text
+
+
+# ---------------------------------------------------------------------------
+# heartbeat_seconds
+# ---------------------------------------------------------------------------
+
+
+class TestHeartbeatSeconds:
+    @pytest.mark.parametrize("schedule", ["", "off", "disabled", "none"])
+    def test_off_returns_none(self, schedule):
+        assert systemd_timer.heartbeat_seconds(schedule) is None
+
+    @pytest.mark.parametrize("schedule", ["daily", "weekly", "04:00", "daily 04:00"])
+    def test_anchored_returns_none(self, schedule):
+        assert systemd_timer.heartbeat_seconds(schedule) is None
+
+    @pytest.mark.parametrize("schedule", ["every 12h", "every 30m"])
+    def test_calendar_exact_period_returns_none(self, schedule):
+        assert systemd_timer.heartbeat_seconds(schedule) is None
+
+    def test_every_5h_returns_3600(self):
+        """gcd(5, 24) == 1 → hourly grid."""
+        assert systemd_timer.heartbeat_seconds("every 5h") == 3600
+
+    def test_every_90m_returns_1800(self):
+        """gcd(90, 60) == 30 → half-hour grid (48 ticks/day, not 1440)."""
+        assert systemd_timer.heartbeat_seconds("every 90m") == 1800
+
+    def test_every_48h_returns_86400(self):
+        """gcd(48, 24) == 24 → daily grid (1 tick/day, not 24)."""
+        assert systemd_timer.heartbeat_seconds("every 48h") == 86400
+
+    def test_every_7m_returns_60(self):
+        """gcd(7, 60) == 1 → per-minute grid."""
+        assert systemd_timer.heartbeat_seconds("every 7m") == 60
+
+
+# ---------------------------------------------------------------------------
+# floor_to_heartbeat — drift regression
+# ---------------------------------------------------------------------------
+
+
+class TestFloorToHeartbeatDriftRegression:
+    """The highest-value regression in the catch-up-gate change.
+
+    Without flooring, stamping raw ``time.time()`` after a non-zero dispatch
+    delay pushes every subsequent due-check one heartbeat late, silently
+    inflating the effective period forever (``every 5h`` converges to a real
+    6h). Flooring makes the stamp grid-aligned so ``last_run + period`` is
+    exactly a grid mark, however large the per-cycle delay.
+    """
+
+    # Anchored at local midnight on a fixed, DST-transition-free date (mid-
+    # January, CET/CEST transitions land in March/October) so the test is
+    # deterministic regardless of the host's local timezone.
+    _BASE_EPOCH = datetime(2024, 1, 15, 0, 0, 0).timestamp()
+
+    def test_consecutive_dispatches_stay_exactly_period_apart(self):
+        """Simulate 3 consecutive 'every 5h' gated cycles with a non-zero,
+        varying dispatch delay between heartbeat-fire and stamp-write.
+        Flooring must keep every dispatch exactly ``period`` (18000s) apart.
+        """
+        heartbeat_s = systemd_timer.heartbeat_seconds("every 5h")
+        assert heartbeat_s == 3600
+        period_s = 5 * 3600
+
+        # Heartbeat fires exactly on the grid; each cycle's dispatch happens
+        # some seconds AFTER the heartbeat fired (guards, debounce,
+        # orphan-session claim, migration branch — see app.py). The delay
+        # varies per cycle to prove flooring, not a fixed offset, is doing
+        # the work.
+        heartbeat_fire_times = [
+            self._BASE_EPOCH,
+            self._BASE_EPOCH + period_s,
+            self._BASE_EPOCH + 2 * period_s,
+        ]
+        dispatch_delays = [7.0, 143.0, 1.0]  # non-zero, varying
+
+        stamps: list[float] = []
+        for fire_t, delay in zip(heartbeat_fire_times, dispatch_delays):
+            dispatch_t = fire_t + delay
+            stamps.append(systemd_timer.floor_to_heartbeat(dispatch_t, heartbeat_s))
+
+        gaps = [stamps[i + 1] - stamps[i] for i in range(len(stamps) - 1)]
+        assert gaps == [period_s, period_s], (
+            f"Consecutive dispatch stamps must be exactly {period_s}s apart; got gaps={gaps}"
+        )
+
+    def test_unfloored_stamp_would_drift(self):
+        """Sanity check that the regression is real: stamping raw dispatch
+        time (no flooring) does NOT stay period-apart under the same delays.
+        """
+        period_s = 5 * 3600
+        heartbeat_fire_times = [
+            self._BASE_EPOCH,
+            self._BASE_EPOCH + period_s,
+            self._BASE_EPOCH + 2 * period_s,
+        ]
+        dispatch_delays = [7.0, 143.0, 1.0]
+
+        raw_stamps = [
+            fire_t + delay for fire_t, delay in zip(heartbeat_fire_times, dispatch_delays)
+        ]
+        raw_gaps = [raw_stamps[i + 1] - raw_stamps[i] for i in range(len(raw_stamps) - 1)]
+        assert raw_gaps != [period_s, period_s], (
+            "Expected the un-floored gaps to drift with delay — if this fails, "
+            "the regression this test guards no longer reproduces"
+        )
+
+    def test_floor_is_idempotent_on_an_already_floored_stamp(self):
+        heartbeat_s = 3600
+        once = systemd_timer.floor_to_heartbeat(12345.0, heartbeat_s)
+        twice = systemd_timer.floor_to_heartbeat(once, heartbeat_s)
+        assert once == twice
+
+    def test_non_positive_grid_raises(self):
+        with pytest.raises(ValueError):
+            systemd_timer.floor_to_heartbeat(100.0, 0)
+
+
+# ---------------------------------------------------------------------------
+# No rendered timer unit ever lacks Persistent=true — both render paths
+# (consolidation timer + backup timer share render_timer_unit / TimerTarget).
+# ---------------------------------------------------------------------------
+
+
+class TestNoRenderedUnitLacksPersistent:
+    _REPRESENTATIVE_SCHEDULES = [
+        "daily",
+        "weekly",
+        "04:00",
+        "daily 04:00",
+        "every 12h",
+        "every 30m",
+        "every 5h",
+        "every 90m",
+        "every 48h",
+        "every 7m",
+    ]
+
+    @pytest.mark.parametrize("schedule", _REPRESENTATIVE_SCHEDULES)
+    def test_consolidation_render_path(self, schedule):
+        spec = parse_schedule(schedule)
+        assert spec is not None
+        text = systemd_timer.render_timer_unit(spec)
+        assert "OnCalendar=" in text
+        assert "Persistent=true" in text
+        assert "OnBootSec" not in text
+        assert "OnUnitActiveSec" not in text
+        assert not hasattr(spec, "on_boot_sec")
+
+    @pytest.mark.parametrize("schedule", _REPRESENTATIVE_SCHEDULES)
+    def test_backup_render_path(self, schedule):
+        from paramem.backup import timer as backup_timer
+
+        spec = backup_timer.parse_schedule(schedule)
+        assert spec is not None
+        text = systemd_timer.render_timer_unit(
+            spec, unit_name=backup_timer.TIMER_NAME, description="ParaMem scheduled backup"
+        )
+        assert "OnCalendar=" in text
+        assert "Persistent=true" in text
+        assert "OnBootSec" not in text
+        assert "OnUnitActiveSec" not in text
+        assert not hasattr(spec, "on_boot_sec")
 
 
 class TestRenderServiceUnitAuth:
@@ -394,14 +580,17 @@ class TestReconcileDetailString:
         assert "with catch-up" in msg
         assert "no catch-up" not in msg
 
-    def test_interval_detail_says_no_catchup(self, tmp_path, monkeypatch):
+    def test_heartbeat_detail_says_with_catchup(self, tmp_path, monkeypatch):
+        """'every 5h' (a heartbeat-grid, non-exact cadence) still reports
+        'with catch-up' — the 'no catch-up' detail branch no longer exists.
+        """
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
         monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
         monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
         with patch.object(systemd_timer, "_run_systemctl", self._mock_run):
             msg = systemd_timer.reconcile("every 5h")
-        assert "no catch-up" in msg
-        assert "with catch-up" not in msg
+        assert "with catch-up" in msg
+        assert "no catch-up" not in msg
 
     def test_daily_detail_says_with_catchup(self, tmp_path, monkeypatch):
         monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)

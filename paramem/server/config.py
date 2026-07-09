@@ -1163,7 +1163,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
 
         if self.max_interim_count == 0:
             try:
-                from paramem.memory.interim_adapter import compute_schedule_period_seconds
+                from paramem.server.schedule_grammar import compute_schedule_period_seconds
 
                 _period = compute_schedule_period_seconds(self.refresh_cadence)
             except ValueError as exc:
@@ -1192,7 +1192,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
         # orphan_retirement: validate the schedule string early so the operator
         # sees a clear error at startup, not at the first tick.
         try:
-            from paramem.memory.interim_adapter import compute_schedule_period_seconds
+            from paramem.server.schedule_grammar import compute_schedule_period_seconds
 
             compute_schedule_period_seconds(self.orphan_retirement)
         except ValueError as exc:
@@ -1237,7 +1237,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
         runs every ``refresh_cadence`` directly, so this returns
         ``refresh_seconds`` rather than ``refresh_seconds * 0``.
         """
-        from paramem.memory.interim_adapter import compute_schedule_period_seconds
+        from paramem.server.schedule_grammar import compute_schedule_period_seconds
 
         refresh_seconds = compute_schedule_period_seconds(self.refresh_cadence)
         if refresh_seconds is None:
@@ -1268,10 +1268,10 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
         ``None`` means holdable sessions (anonymous-voice or embedding-only)
         are held pending indefinitely — they are never retired by age.
 
-        Uses :func:`~paramem.memory.interim_adapter.compute_schedule_period_seconds`
+        Uses :func:`~paramem.server.schedule_grammar.compute_schedule_period_seconds`
         with the same grammar as :attr:`refresh_cadence`.
         """
-        from paramem.memory.interim_adapter import compute_schedule_period_seconds
+        from paramem.server.schedule_grammar import compute_schedule_period_seconds
 
         return compute_schedule_period_seconds(self.orphan_retirement)
 
