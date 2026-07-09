@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from paramem.memory.store import MemoryStore as _MS
+from tests._guard_utils import tracked_python_files
 
 # Files allowed to call the extractors directly:
 # - extractor.py: the module defining them.
@@ -102,7 +103,7 @@ def test_no_direct_extract_graph_calls_outside_whitelist():
     repo_root = Path(__file__).resolve().parent.parent
     offenders: list[tuple[str, int, str]] = []
 
-    for py_file in repo_root.rglob("*.py"):
+    for py_file in tracked_python_files(repo_root):
         rel = py_file.relative_to(repo_root).as_posix()
         if _is_allowed(rel):
             continue

@@ -26,6 +26,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests._guard_utils import tracked_python_files
+
 # ---------------------------------------------------------------------------
 # Files allowed to reference ``_known_simhashes`` / ``_active_simhashes``
 # directly — these are the implementation sites and authorised callers.
@@ -168,7 +170,7 @@ def test_no_simhashes_in_tier_calls():
     repo_root = Path(__file__).resolve().parent.parent
     offenders: list[tuple[str, str, int, str]] = []
 
-    for py_file in sorted(repo_root.rglob("*.py")):
+    for py_file in sorted(tracked_python_files(repo_root)):
         rel = py_file.relative_to(repo_root).as_posix()
         # Allow archive/ — historical scripts that are not executed.
         # Allow the guard test itself — its error strings mention the old API names.
@@ -213,7 +215,7 @@ def test_no_simhash_sidecar_string_in_live_code():
     )
 
     guard_self = "tests/test_simhash_unification_guard.py"
-    for py_file in sorted(repo_root.rglob("*.py")):
+    for py_file in sorted(tracked_python_files(repo_root)):
         rel = py_file.relative_to(repo_root).as_posix()
         # Scope: production code and tests only. Experiments and scripts are
         # standalone historical artifacts that may reference the old sidecar name
@@ -247,7 +249,7 @@ def test_no_private_simhash_accessor_calls_outside_allowlist():
     offenders: list[tuple[str, int, str]] = []
 
     guard_self = "tests/test_simhash_unification_guard.py"
-    for py_file in sorted(repo_root.rglob("*.py")):
+    for py_file in sorted(tracked_python_files(repo_root)):
         rel = py_file.relative_to(repo_root).as_posix()
         if rel.startswith("archive/") or rel == guard_self:
             continue
