@@ -580,6 +580,153 @@ class TestStagingAdapterGPU:
                 break
         assert checked, "No episodic weights found to verify"
 
+    @staticmethod
+    def _numbered_checkpoints(output_dir) -> list:
+        """Return ``checkpoint-N`` dirs under *output_dir*, sorted NUMERICALLY."""
+        return sorted(
+            (p for p in output_dir.glob("checkpoint-*") if p.is_dir()),
+            key=lambda p: int(p.name.split("-")[1]),
+        )
+
+    @staticmethod
+    def _adapter_subdirs(checkpoint_dir) -> list[str]:
+        """Names of *checkpoint_dir* subdirs that hold a full PEFT adapter.
+
+        Format-independent: under Security ON, ``EncryptCheckpointCallback``
+        age-wraps the *contents* of ``adapter_model.safetensors`` /
+        ``adapter_config.json`` in place but never renames or removes them
+        (``write_infra_bytes`` round-trips through the same path), so
+        checking for the two filenames' existence is correct whether or not
+        this environment has a daily age identity loaded.
+        """
+        return sorted(
+            d.name
+            for d in checkpoint_dir.iterdir()
+            if d.is_dir()
+            and (d / "adapter_config.json").exists()
+            and (d / "adapter_model.safetensors").exists()
+        )
+
+    def test_checkpoint_saves_single_adapter_and_resumes(self, staging_model, tmp_path):
+        """Real ``train_adapter`` writes exactly one adapter subdir per
+        checkpoint and a real HF resume can reload and continue from it.
+
+        Guards ``ParamemTrainer._save``'s ``selected_adapters=[save_adapter_name]``
+        fix (trainer.py) on real hardware — ``tests/training/test_paramem_trainer_save.py``
+        proves the call is *made* with mocks, but never exercises PEFT's real
+        ``save_pretrained`` fan-out or HF's real ``_load_from_checkpoint``.
+
+        Two legs:
+
+        1. Train the staging slot (``in_training``) for 2 epochs with the
+           ``episodic`` production adapter ALSO attached (via the class-scoped
+           ``staging_model`` fixture) so ``selected_adapters`` is meaningful.
+           If ``ParamemTrainer._save`` reverted to stock ``Trainer._save``
+           (``selected_adapters=None``), PEFT would serialize BOTH attached
+           adapters into every ``checkpoint-N/`` — the ``== ["in_training"]``
+           assertion below fails in that case, giving it teeth.
+        2. Resume a fresh ``train_adapter`` call from that single-adapter
+           checkpoint. HF's ``Trainer._load_from_checkpoint`` (real, not
+           mocked) walks ``checkpoint-N/`` for adapter subdirs and calls
+           ``model.load_adapter(checkpoint-N/in_training, "in_training",
+           is_trainable=True)`` — proving a checkpoint containing only ONE of
+           the model's attached PEFT adapters loads and resumes correctly.
+           Continuation (not a silent no-op) is proven by asserting the
+           resumed run's own retained checkpoint step number is strictly
+           greater than leg 1's.
+        """
+        from paramem.memory.entry import assign_keys, format_entry_training
+        from paramem.training.trainer import train_adapter
+        from paramem.utils.config import AdapterConfig, TrainingConfig
+
+        model, tokenizer = staging_model
+
+        # This test owns the full staging lifecycle end-to-end (train_adapter
+        # creates + deletes `in_training` itself) — drop the fixture's
+        # pre-created slot first, same pattern as
+        # test_abort_for_inference_does_not_clobber_production_weights above.
+        if "in_training" in model.peft_config:
+            model.delete_adapter("in_training")
+
+        keyed = assign_keys([("Alex", f"fact_{i}", f"value_{i}") for i in range(5)])
+        examples = format_entry_training(keyed, tokenizer)
+        ac = AdapterConfig()
+
+        # --- Leg 1: train + retain the checkpoint tree -----------------
+        # retain_scratch_until_external_commit=True is the documented
+        # mechanism (trainer.py train_adapter docstring, Step 6a) for
+        # skipping the post-success _clean_scratch() call so checkpoint-N/
+        # survives for inspection instead of being deleted on normal
+        # completion.
+        leg1_dir = tmp_path / "leg1"
+        tc1 = TrainingConfig(num_epochs=2, batch_size=1)
+        metrics1 = train_adapter(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=examples,
+            adapter_name="episodic",
+            training_config=tc1,
+            adapter_config=ac,
+            output_dir=leg1_dir,
+            retain_scratch_until_external_commit=True,
+        )
+        assert metrics1.get("aborted") is False
+
+        leg1_checkpoints = self._numbered_checkpoints(leg1_dir)
+        assert leg1_checkpoints, "train_adapter produced no checkpoint-N directories"
+        leg1_latest = leg1_checkpoints[-1]
+        leg1_step = int(leg1_latest.name.split("-")[1])
+
+        subdirs = self._adapter_subdirs(leg1_latest)
+        assert subdirs == ["in_training"], (
+            f"Expected checkpoint {leg1_latest} to contain exactly one adapter "
+            f"subdir ('in_training'); got {subdirs}. A reverted _save "
+            "(selected_adapters=None) would serialize every attached adapter "
+            "('episodic' + 'in_training') instead."
+        )
+
+        # --- Leg 2: resume from the single-adapter checkpoint ----------
+        # A fresh output_dir decouples this leg's own staging_resume.json
+        # from leg 1's — resume_from_checkpoint is passed explicitly so
+        # crash-resume auto-detection is not exercised here, only the
+        # explicit-resume path.
+        leg2_dir = tmp_path / "leg2"
+        tc2 = TrainingConfig(num_epochs=4, batch_size=1)
+        metrics2 = train_adapter(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=examples,
+            adapter_name="episodic",
+            training_config=tc2,
+            adapter_config=ac,
+            output_dir=leg2_dir,
+            resume_from_checkpoint=str(leg1_latest),
+            retain_scratch_until_external_commit=True,
+        )
+        assert metrics2.get("aborted") is False
+        assert "train_loss" in metrics2
+
+        leg2_checkpoints = self._numbered_checkpoints(leg2_dir)
+        assert leg2_checkpoints, "resumed train_adapter produced no checkpoint-N directories"
+        leg2_latest = leg2_checkpoints[-1]
+        leg2_step = int(leg2_latest.name.split("-")[1])
+
+        # Proves genuine continuation (not a re-run from step 0 and not a
+        # silent immediate return): the resumed run's step count picks up
+        # strictly past leg 1's.
+        assert leg2_step > leg1_step, (
+            f"Resumed run did not continue past leg 1's checkpoint step "
+            f"({leg1_step}); got step {leg2_step}. Resume may have silently "
+            "restarted from scratch instead of loading leg 1's checkpoint."
+        )
+
+        # Same regression proof as leg 1, on the resumed run's own save path.
+        resumed_subdirs = self._adapter_subdirs(leg2_latest)
+        assert resumed_subdirs == ["in_training"], (
+            f"Expected resumed checkpoint {leg2_latest} to contain exactly "
+            f"one adapter subdir ('in_training'); got {resumed_subdirs}."
+        )
+
 
 # --- 7c. ExtractionPipeline.run chokepoint end-to-end on GPU ---
 
@@ -677,7 +824,10 @@ class TestBatchConsolidationE2E:
             model=model,
             tokenizer=tokenizer,
             consolidation_config=ConsolidationConfig(indexed_key_replay=True),
-            training_config=TrainingConfig(num_epochs=2),
+            # 30 epochs: indexed-key recall floor — the post-save disk-integrity
+            # probe requires recall == recall_sanity_threshold (default 1.0),
+            # which 2 epochs cannot reach.
+            training_config=TrainingConfig(num_epochs=30),
             episodic_adapter_config=AdapterConfig(),
             semantic_adapter_config=AdapterConfig(),
             memory_store=MemoryStore(replay_enabled=True),
