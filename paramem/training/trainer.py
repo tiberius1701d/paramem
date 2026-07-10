@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+import torch
 from peft import PeftModel
 from transformers import (
     PreTrainedTokenizer,
@@ -18,6 +19,7 @@ from transformers import (
     TrainingArguments,
     default_data_collator,
 )
+from transformers.trainer import TRAINING_ARGS_NAME
 
 from paramem.training.thermal_throttle import ThermalPolicy, ThermalThrottleCallback
 from paramem.utils.config import AdapterConfig, TrainingConfig, WandbConfig
@@ -173,26 +175,87 @@ class LossEarlyStoppingCallback(TrainerCallback):
             self._below_count = 0
 
 
-class _FixedDecayTrainer(Trainer):
-    """Trainer that decays LR over a fixed step count instead of the budget.
+class ParamemTrainer(Trainer):
+    """HF ``Trainer`` subclass carrying ParaMem's two cross-cutting behaviours.
 
-    HF's stock schedulers compute their decay window from
-    ``num_training_steps`` (= ``len(dataloader) * num_train_epochs``). When
-    ``lr_decay_steps`` is set, this subclass substitutes that value so the
-    LR trajectory at any given step is invariant to ``num_train_epochs``.
-    Steps past ``lr_decay_steps`` sit at the scheduler's tail (LR=0 for
-    ``linear``); training continues so an early-stopping callback can
-    decide when to halt.
+    1. **Fixed-decay scheduler.** HF's stock schedulers compute their decay
+       window from ``num_training_steps`` (= ``len(dataloader) *
+       num_train_epochs``). When ``lr_decay_steps`` is set, ``create_scheduler``
+       substitutes that value so the LR trajectory at any given step is
+       invariant to ``num_train_epochs``. Steps past ``lr_decay_steps`` sit at
+       the scheduler's tail (LR=0 for ``linear``); training continues so an
+       early-stopping callback can decide when to halt. When
+       ``lr_decay_steps`` is ``None`` (the production default), this is a
+       verbatim no-op delegating to ``super().create_scheduler(...)``.
+    2. **Selective checkpoint save.** Under the staging+promote contract,
+       ``self.model`` carries every production adapter tier plus the
+       transient staging slot, but only ``save_adapter_name`` was mutated by
+       this training event. ``_save`` overrides HF's stock behaviour (which
+       serializes every attached PEFT adapter) to pass
+       ``selected_adapters=[save_adapter_name]`` explicitly, so each epoch
+       checkpoint contains exactly one adapter subdir instead of one per
+       attached tier.
     """
 
-    def __init__(self, *args, lr_decay_steps: Optional[int] = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        lr_decay_steps: Optional[int] = None,
+        save_adapter_name: Optional[str] = None,
+        **kwargs,
+    ):
         self._lr_decay_steps = lr_decay_steps
+        # Adapter to serialize on every _save. Captured as a literal at
+        # construction time — NEVER derived from ``model.active_adapter``.
+        # A step-yield (``on_step_yield``) can hand VRAM to inference, which
+        # may ``switch_adapter`` to ``inference_fallback_adapter`` mid-run; if
+        # ``on_save`` fires while that fallback is active, deriving the
+        # target from ``model.active_adapter`` would serialize the wrong
+        # adapter into the checkpoint. The captured literal is immune.
+        self._save_adapter_name = save_adapter_name
         super().__init__(*args, **kwargs)
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
         if self._lr_decay_steps is not None:
             num_training_steps = self._lr_decay_steps
         return super().create_scheduler(num_training_steps, optimizer)
+
+    def _save(self, output_dir: str | None = None, state_dict: dict | None = None) -> None:
+        """Save model weights, configuration, and processing class to ``output_dir``.
+
+        Faithful to the installed ``transformers==5.5.0`` ``Trainer._save``
+        PeftModel branch, with exactly one change: ``selected_adapters`` is
+        passed explicitly so only ``self._save_adapter_name`` is serialized
+        instead of every adapter attached to ``self.model``. Non-``PeftModel``
+        instances delegate to ``super()._save(...)`` unchanged — no
+        ``ParamemTrainer`` instantiation in this codebase passes a non-Peft
+        model, but the fallback preserves stock behaviour if that ever
+        changes.
+        """
+        if not isinstance(self.model, PeftModel):
+            return super()._save(output_dir, state_dict)
+
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info("Saving model checkpoint to %s", output_dir)
+
+        # ONLY change vs stock _save: selected_adapters is passed explicitly.
+        self.model.save_pretrained(
+            output_dir,
+            state_dict=state_dict,
+            selected_adapters=[self._save_adapter_name],
+        )
+
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
+        elif (
+            self.data_collator is not None
+            and hasattr(self.data_collator, "tokenizer")
+            and self.data_collator.tokenizer is not None
+        ):
+            self.data_collator.tokenizer.save_pretrained(output_dir)
+
+        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
 
 class _RamEpochCopyCallback(TrainerCallback):
@@ -1075,18 +1138,16 @@ def train_adapter(
             if isinstance(_cb, RecallEarlyStopCallback):
                 _cb.set_probe_adapter(_STAGING_ADAPTER)
 
-    trainer_cls = _FixedDecayTrainer if training_config.lr_decay_steps is not None else Trainer
-    trainer_kwargs = {}
-    if training_config.lr_decay_steps is not None:
-        trainer_kwargs["lr_decay_steps"] = training_config.lr_decay_steps
-    trainer = trainer_cls(
+    _save_target = _STAGING_ADAPTER if _use_staging else adapter_name
+    trainer = ParamemTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=default_data_collator,
         callbacks=callbacks,
-        **trainer_kwargs,
+        lr_decay_steps=training_config.lr_decay_steps,
+        save_adapter_name=_save_target,
     )
 
     logger.info(

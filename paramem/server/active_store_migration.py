@@ -593,7 +593,7 @@ def _migrate_tier_simulate_to_train(
         raise _TierSkipped(f"_format_training produced no examples for store {name}")
     dataset = loop._indexed_dataset(examples)
     loop._enable_gradient_checkpointing()
-    training_config = loop._make_training_config(num_epochs=loop.training_config.num_epochs)
+    training_config = loop.training_config
 
     # Step 5: train. Output dir under a migration-scoped subdir so checkpoint
     # debris doesn't pollute the main slot layout.

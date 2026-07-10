@@ -10,7 +10,7 @@ import logging
 import os
 import random
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
@@ -1553,27 +1553,17 @@ class ConsolidationLoop:
         return _IndexedDataset(examples)
 
     def _make_training_config(self, num_epochs: int) -> TrainingConfig:
-        """Build a TrainingConfig for consolidation training.
+        """Return the loop's canonical TrainingConfig with num_epochs overridden.
 
-        Propagates all yaml-configurable hyperparameters from
-        ``self.training_config``, including the three fields that were
-        previously dropped (``warmup_steps``, ``lr_scheduler_type``,
-        ``lr_decay_steps``), so yaml overrides reach ``train_adapter``.
+        ``self.training_config`` is already the fully-populated, single
+        source of truth (built once from yaml at ``ServerConfig.training_config``).
+        This method must never hand-copy individual fields off it — that
+        silently drops any field not explicitly listed. ``dataclasses.replace``
+        propagates every current AND future field automatically, so the only
+        override callers ever need (``num_epochs``, per call-site training
+        budget) is applied without risk of drift.
         """
-        return TrainingConfig(
-            batch_size=self.training_config.batch_size,
-            gradient_accumulation_steps=self.training_config.gradient_accumulation_steps,
-            max_seq_length=self.training_config.max_seq_length,
-            num_epochs=num_epochs,
-            warmup_steps=self.training_config.warmup_steps,
-            warmup_ratio=self.training_config.warmup_ratio,
-            lr_scheduler_type=self.training_config.lr_scheduler_type,
-            lr_decay_steps=self.training_config.lr_decay_steps,
-            weight_decay=self.training_config.weight_decay,
-            gradient_checkpointing=self.training_config.gradient_checkpointing,
-            max_grad_norm=self.training_config.max_grad_norm,
-            seed=self.training_config.seed,
-        )
+        return replace(self.training_config, num_epochs=num_epochs)
 
     def _save_adapters(
         self,

@@ -514,7 +514,7 @@ class TestTrainAdapterAbortReturn:
         dataset = [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
 
         with (
-            patch("paramem.training.trainer.Trainer", new=_MinimalTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_MinimalTrainer),
             patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
             patch(
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
@@ -561,7 +561,7 @@ class TestTrainAdapterAbortReturn:
         dataset = [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
 
         with (
-            patch("paramem.training.trainer.Trainer", new=_NullTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_NullTrainer),
             patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
             patch(
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
@@ -651,7 +651,7 @@ class TestRamCheckpointMode:
         tc = self._make_tc(save_steps_ram=50)
 
         with (
-            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_CapturingTrainer),
             patch(
                 "paramem.training.trainer.TrainingArguments",
                 side_effect=lambda **kw: MagicMock(**kw),
@@ -712,7 +712,7 @@ class TestRamCheckpointMode:
             return _original_mkdir(self_path, **kwargs)
 
         with (
-            patch("paramem.training.trainer.Trainer", new=_NullTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_NullTrainer),
             patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
             patch(
                 "paramem.training.encrypted_checkpoint_callback.EncryptCheckpointCallback",
@@ -763,7 +763,7 @@ class TestRamCheckpointMode:
         )
 
         with (
-            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_CapturingTrainer),
             patch(
                 "paramem.training.trainer.TrainingArguments",
                 side_effect=lambda **kw: MagicMock(**kw),

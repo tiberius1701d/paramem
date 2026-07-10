@@ -13,8 +13,8 @@ The ``TestStagingPromoteContract`` class verifies the staging+promote invariants
 - crash path preserves scratch for crash-resume
 - 3-way resume resolution (RAM → disk → absent)
 
-No GPU required: the test patches ``Trainer``, PEFT, and encryption helpers so
-staging+promote logic runs without a real training run.
+No GPU required: the test patches ``ParamemTrainer``, PEFT, and encryption
+helpers so staging+promote logic runs without a real training run.
 """
 
 from __future__ import annotations
@@ -88,11 +88,7 @@ def _capture_callbacks(**train_adapter_kwargs):
     with (
         tempfile.TemporaryDirectory() as tmpdir,
         patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock()),
-        patch("paramem.training.trainer.Trainer", side_effect=_capture_init),
-        patch(
-            "paramem.training.trainer._FixedDecayTrainer",
-            side_effect=_capture_init,
-        ),
+        patch("paramem.training.trainer.ParamemTrainer", side_effect=_capture_init),
         # Bypass the staging lifecycle guard for callback-ordering tests.
         patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
     ):
@@ -433,7 +429,7 @@ def _staging_patches(tmp_path, *, trainer_cls=_NullTrainer, abort_shutdown=False
 
     Patches:
     - TrainingArguments (no HF validation)
-    - Trainer / _FixedDecayTrainer
+    - ParamemTrainer
     - paramem.models.loader.create_adapter (no real PEFT)
     - paramem.models.loader.copy_adapter_weights (no real tensor copy)
     - paramem.models.loader.switch_adapter (no real adapter activation)
@@ -457,8 +453,7 @@ def _staging_patches(tmp_path, *, trainer_cls=_NullTrainer, abort_shutdown=False
     stack.enter_context(
         patch("paramem.training.trainer.TrainingArguments", return_value=MagicMock())
     )
-    stack.enter_context(patch("paramem.training.trainer.Trainer", new=trainer_cls))
-    stack.enter_context(patch("paramem.training.trainer._FixedDecayTrainer", new=trainer_cls))
+    stack.enter_context(patch("paramem.training.trainer.ParamemTrainer", new=trainer_cls))
 
     # --- Loader helpers (deferred import inside _ensure_staging_slot et al) ---
     mock_create = stack.enter_context(

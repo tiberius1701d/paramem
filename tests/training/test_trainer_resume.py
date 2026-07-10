@@ -142,7 +142,7 @@ class TestTrainAdapterResumeParam:
         """
         with (
             patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
-            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_CapturingTrainer),
             patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             mock_args = MagicMock()
@@ -271,7 +271,7 @@ class TestTrainAdapterEncryptedResume:
     def train_adapter_mocks(self, tmp_path):
         with (
             patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
-            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_CapturingTrainer),
             patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             mock_args = MagicMock()
@@ -386,7 +386,7 @@ class TestTrainAdapterEncryptedResume:
                 raise RuntimeError("boom")
 
         with (
-            patch("paramem.training.trainer.Trainer", new=_BoomTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_BoomTrainer),
             patch("paramem.backup.key_store.daily_identity_loadable", return_value=True),
             patch(
                 "paramem.backup.checkpoint_shard.materialize_checkpoint_to_shm",
@@ -422,7 +422,7 @@ class TestTrainAdapterSavePath:
     def train_adapter_mocks(self, tmp_path):
         with (
             patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
-            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_CapturingTrainer),
             patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             mock_args = MagicMock()
@@ -860,7 +860,7 @@ class TestFreshStartStaleCheckpointPurge:
         """Patch TrainingArguments and Trainer to avoid GPU / real HF objects."""
         with (
             patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
-            patch("paramem.training.trainer.Trainer", new=_CapturingTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_CapturingTrainer),
             patch("paramem.training.trainer._ensure_staging_slot", return_value=None),
         ):
             mock_args_cls.return_value = MagicMock()
@@ -955,7 +955,7 @@ class TestFreshStartStaleCheckpointPurge:
         read_plain = lambda p: Path(p).read_bytes()  # noqa: E731
         write_plain = lambda p, d: Path(p).write_bytes(d)  # noqa: E731
         with (
-            patch("paramem.training.trainer.Trainer", new=_MarkerCapturingTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_MarkerCapturingTrainer),
             patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
             patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain),
             patch("paramem.backup.encryption.write_infra_bytes", side_effect=write_plain),
@@ -1049,7 +1049,7 @@ class TestFreshStartStaleCheckpointPurge:
         read_plain = lambda p: Path(p).read_bytes()  # noqa: E731
         write_plain = lambda p, d: Path(p).write_bytes(d)  # noqa: E731
         with (
-            patch("paramem.training.trainer.Trainer", new=_ExistenceCapturingTrainer),
+            patch("paramem.training.trainer.ParamemTrainer", new=_ExistenceCapturingTrainer),
             patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
             patch("paramem.backup.encryption.read_maybe_encrypted", side_effect=read_plain),
             patch("paramem.backup.encryption.write_infra_bytes", side_effect=write_plain),
