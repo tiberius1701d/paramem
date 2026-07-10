@@ -1415,7 +1415,7 @@ class ServerAdaptersConfig:
     )
     procedural: ServerAdapterConfig = field(
         default_factory=lambda: ServerAdapterConfig(
-            enabled=False,
+            enabled=True,
             rank=8,
             alpha=16,
             learning_rate=5e-5,

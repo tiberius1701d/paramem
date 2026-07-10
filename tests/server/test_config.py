@@ -349,9 +349,10 @@ class TestAdaptersFactoryDefaultMerge:
             """,
         )
         cfg = load_server_config(yaml_file)
-        # Procedural factory ships MLP-targeting + enabled=False.
+        # Procedural factory ships MLP-targeting + enabled=True (symmetric with
+        # episodic and semantic — all three main tiers default on).
         assert "gate_proj" in cfg.adapters.procedural.target_modules
-        assert cfg.adapters.procedural.enabled is False
+        assert cfg.adapters.procedural.enabled is True
 
 
 # ---------------------------------------------------------------------------
