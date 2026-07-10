@@ -56,6 +56,27 @@ _MISTRAL_ADAPTER = AdapterConfig(
     dropout=0.05,
 )
 
+# Procedural adapter config (attention + MLP, 7 modules) — matches
+# configs/server.yaml adapters.procedural.target_modules.
+_PROCEDURAL_ADAPTER = AdapterConfig(
+    rank=8,
+    alpha=16,
+    target_modules=[
+        "q_proj",
+        "v_proj",
+        "k_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    dropout=0.05,
+)
+
+# Real production 3-tier topology (episodic, semantic, procedural) — matches
+# configs/server.yaml with all three main tiers enabled.
+_MAIN_ADAPTER_CONFIGS = [_MISTRAL_ADAPTER, _MISTRAL_ADAPTER, _PROCEDURAL_ADAPTER]
+
 # Mistral 7B NF4 base model footprint (conservative estimate)
 _BASE_MODEL_BYTES = 4_000_000_000  # ~3.8 GiB
 
@@ -133,7 +154,9 @@ def test_math_includes_in_training_slot():
     with_staging = required_working_set_bytes(
         base_model_bytes=_BASE_MODEL_BYTES,
         adapter_bytes=adapter_bytes,
-        main_adapter_count=3,
+        main_adapter_bytes_total=3 * adapter_bytes,
+        backup_adapter_bytes_total=0,
+        staging_adapter_bytes=adapter_bytes,
         max_interim_count=7,
         headroom_bytes=int(1.0 * _GiB),
     )
@@ -166,6 +189,7 @@ def test_assess_topology_returns_assessment():
 
     result = assess_topology(
         _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
         max_interim_count=7,
         base_bytes=_BASE_MODEL_BYTES,
         hidden_size=_HIDDEN,
@@ -185,6 +209,7 @@ def test_assess_topology_too_many_interims_overflows_baseline():
     """max_interim_count=300 should overflow the 8 GiB baseline."""
     result = assess_topology(
         _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
         max_interim_count=300,
         base_bytes=_BASE_MODEL_BYTES,
         hidden_size=_HIDDEN,
@@ -201,6 +226,7 @@ def test_assess_topology_realistic_config_fits_baseline():
     """Mistral 7B NF4 + rank-8 + 4 modules + 7 interims + 3 mains fits 8 GiB baseline."""
     result = assess_topology(
         _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
         max_interim_count=7,
         base_bytes=_BASE_MODEL_BYTES,
         hidden_size=_HIDDEN,
@@ -217,6 +243,7 @@ def test_assess_topology_breakdown_contains_required_strings():
     """Breakdown must contain model_id, base model, adapters, headroom."""
     result = assess_topology(
         _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
         max_interim_count=7,
         base_bytes=_BASE_MODEL_BYTES,
         hidden_size=_HIDDEN,
@@ -233,6 +260,7 @@ def test_assess_topology_breakdown_contains_required_strings():
         "main adapters",
         "interim adapters",
         "in_training staging slot",
+        "transient full-fold backup reserve",
         "KV cache headroom",
         "fragmentation safety margin",
         "required total",
@@ -675,18 +703,21 @@ def test_default_headroom_is_1_gib_via_config():
 
 
 def test_headroom_1_5_gib_fits_within_drain_time_free():
-    """Regression guard: with headroom=1.5 GiB and the Mistral 7B NF4 topology
-    (7 interims, rank=8, 4 modules, 3 mains), required_bytes must be < 6.83 GiB
-    — the device-wide free measured at boot time in the live failure that prompted
-    Change 1.
+    """Regression guard: with headroom=1.5 GiB and the real Mistral 7B NF4 3-tier
+    topology (episodic + semantic at rank=8/4 modules, procedural at rank=8/7
+    modules, 7 interims), required_bytes must be < 6.83 GiB — the device-wide
+    free measured at boot time in the live failure that prompted Change 1.
 
     Concrete numbers (all derived from the working-set formula):
       base ≈ 4597 MiB  (inferred from the pre-fix failure: 7187 MiB total with
                          headroom=2.0 → 7187 - 2*1024 - 256 - 11*26 = 4597 MiB)
-      11 adapters × 26 MiB = 286 MiB
+      main adapters (real per-tier shapes): 26 + 26 + 38 = 90 MiB
+      7 interims × 26 MiB (episodic-shaped) = 182 MiB
+      staging slot (worst-case tier shape, procedural) = 38 MiB
+      transient full-fold backup reserve = 90 MiB
       headroom = 1.5 × 1024 = 1536 MiB
       safety margin = 256 MiB
-      total = 4597 + 286 + 1536 + 256 = 6675 MiB = 6.519 GiB < 6.83 GiB ✓
+      total = 4597 + 90 + 182 + 38 + 90 + 1536 + 256 = 6789 MiB = 6.630 GiB < 6.83 GiB ✓
     """
     _MiB = 1024 * 1024
 
@@ -696,6 +727,7 @@ def test_headroom_1_5_gib_fits_within_drain_time_free():
 
     result = assess_topology(
         _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
         max_interim_count=7,
         base_bytes=base_bytes,
         hidden_size=_HIDDEN,
@@ -711,8 +743,8 @@ def test_headroom_1_5_gib_fits_within_drain_time_free():
         f"With headroom=1.5 GiB, required_bytes should be < 6.83 GiB (drain-time free), "
         f"got {result.required_bytes / _GiB:.3f} GiB ({result.required_bytes // _MiB} MiB)"
     )
-    # Concrete sanity: must be ≈ 6675 MiB ± 10 MiB (rounding from float GiB).
-    expected_mib = 6675
+    # Concrete sanity: must be ≈ 6789 MiB ± 10 MiB (rounding from float GiB).
+    expected_mib = 6789
     actual_mib = result.required_bytes // _MiB
     assert abs(actual_mib - expected_mib) <= 15, (
         f"required_bytes with headroom=1.5 GiB expected ~{expected_mib} MiB, got {actual_mib} MiB"
@@ -864,14 +896,18 @@ def test_required_working_set_bytes_slack_zero_is_identical_to_pre_s5():
     without_slack = required_working_set_bytes(
         base_model_bytes=_BASE_MODEL_BYTES,
         adapter_bytes=adapter_bytes,
-        main_adapter_count=3,
+        main_adapter_bytes_total=3 * adapter_bytes,
+        backup_adapter_bytes_total=0,
+        staging_adapter_bytes=adapter_bytes,
         max_interim_count=7,
         headroom_bytes=int(1.0 * _GiB),
     )
     with_slack_zero = required_working_set_bytes(
         base_model_bytes=_BASE_MODEL_BYTES,
         adapter_bytes=adapter_bytes,
-        main_adapter_count=3,
+        main_adapter_bytes_total=3 * adapter_bytes,
+        backup_adapter_bytes_total=0,
+        staging_adapter_bytes=adapter_bytes,
         max_interim_count=7,
         headroom_bytes=int(1.0 * _GiB),
         interim_overflow_slack=0,
@@ -891,7 +927,9 @@ def test_required_working_set_bytes_slack_grows_by_slack_times_adapter_bytes():
     base = required_working_set_bytes(
         base_model_bytes=_BASE_MODEL_BYTES,
         adapter_bytes=adapter_bytes,
-        main_adapter_count=3,
+        main_adapter_bytes_total=3 * adapter_bytes,
+        backup_adapter_bytes_total=0,
+        staging_adapter_bytes=adapter_bytes,
         max_interim_count=7,
         headroom_bytes=int(1.0 * _GiB),
         interim_overflow_slack=0,
@@ -899,7 +937,9 @@ def test_required_working_set_bytes_slack_grows_by_slack_times_adapter_bytes():
     with_slack_2 = required_working_set_bytes(
         base_model_bytes=_BASE_MODEL_BYTES,
         adapter_bytes=adapter_bytes,
-        main_adapter_count=3,
+        main_adapter_bytes_total=3 * adapter_bytes,
+        backup_adapter_bytes_total=0,
+        staging_adapter_bytes=adapter_bytes,
         max_interim_count=7,
         headroom_bytes=int(1.0 * _GiB),
         interim_overflow_slack=2,
@@ -913,6 +953,7 @@ def test_required_working_set_bytes_slack_grows_by_slack_times_adapter_bytes():
 def test_assess_topology_slack_zero_matches_no_slack_call():
     """assess_topology with interim_overflow_slack=0 must match a call without the param."""
     kwargs = dict(
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
         max_interim_count=7,
         base_bytes=_BASE_MODEL_BYTES,
         hidden_size=_HIDDEN,
@@ -932,6 +973,7 @@ def test_assess_topology_slack_overflows_baseline():
     """A large interim_overflow_slack that exceeds the baseline must mark fits_baseline=False."""
     result = assess_topology(
         _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
         max_interim_count=7,
         interim_overflow_slack=300,
         base_bytes=_BASE_MODEL_BYTES,
@@ -963,12 +1005,14 @@ def test_breakdown_slack_zero_unchanged():
         main_adapter_count=3,
         adapter_bytes=adapter_bytes,
         max_interim_count=max_interim,
-        num_modules=8,
         rank=8,
         headroom_bytes=int(1.0 * _GiB),
         total_required_bytes=0,
         total_with_margin_bytes=0,
         available_bytes=0,
+        main_adapter_bytes_total=3 * adapter_bytes,
+        backup_adapter_bytes_total=3 * adapter_bytes,
+        staging_adapter_bytes=adapter_bytes,
         suppress_available_row=True,
         interim_overflow_slack=0,
     )
@@ -1004,12 +1048,14 @@ def test_breakdown_slack_nonzero_shows_expanded_count():
         main_adapter_count=3,
         adapter_bytes=adapter_bytes,
         max_interim_count=max_interim,
-        num_modules=8,
         rank=8,
         headroom_bytes=int(1.0 * _GiB),
         total_required_bytes=0,
         total_with_margin_bytes=0,
         available_bytes=0,
+        main_adapter_bytes_total=3 * adapter_bytes,
+        backup_adapter_bytes_total=3 * adapter_bytes,
+        staging_adapter_bytes=adapter_bytes,
         suppress_available_row=True,
         interim_overflow_slack=slack,
     )
@@ -1034,6 +1080,7 @@ def test_breakdown_slack_assess_topology_label_matches():
     max_interim = 7
     result = assess_topology(
         _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
         max_interim_count=max_interim,
         interim_overflow_slack=slack,
         base_bytes=_BASE_MODEL_BYTES,
@@ -1049,3 +1096,202 @@ def test_breakdown_slack_assess_topology_label_matches():
     assert expected_label in result.breakdown, (
         f"assess_topology slack={slack} breakdown must contain '{expected_label}'"
     )
+
+
+# ---------------------------------------------------------------------------
+# Real per-tier adapter shapes + transient full-fold backup reserve
+# ---------------------------------------------------------------------------
+
+
+def test_estimated_adapter_bytes_four_module_is_26_mib():
+    """4-module config (episodic/semantic) at Mistral 7B dims is exactly 26 MiB."""
+    result = estimated_adapter_bytes(
+        _MISTRAL_ADAPTER, _HIDDEN, _LAYERS, _BF16_BYTES, _PEFT_OVERHEAD_BYTES
+    )
+    assert result == 26 * 1024 * 1024
+
+
+def test_estimated_adapter_bytes_seven_module_is_38_mib():
+    """7-module config (procedural: attention + MLP) at Mistral 7B dims is exactly 38 MiB."""
+    result = estimated_adapter_bytes(
+        _PROCEDURAL_ADAPTER, _HIDDEN, _LAYERS, _BF16_BYTES, _PEFT_OVERHEAD_BYTES
+    )
+    assert result == 38 * 1024 * 1024
+
+
+def test_required_working_set_bytes_real_shapes_backup_and_staging_delta_is_114_mib():
+    """main_adapter_bytes_total=90 MiB (real per-tier) + backup_adapter_bytes_total=90 MiB
+    + staging_adapter_bytes=38 MiB (worst-case tier shape) must exceed a
+    uniform-11-adapter total (3 mains + 7 interim + 1 staging, all 26 MiB, no
+    backup reserve) by exactly 12 + 90 + 12 = 114 MiB.
+
+    Uniform: (3 main + 7 interim + 1 staging) * 26 MiB, backup=0.
+    Real mains: 26 + 26 + 38 = 90 MiB (vs uniform 3*26=78 MiB) → +12 MiB.
+    Backup reserve: 90 MiB (transient <tier>_backup, same per-tier shapes).
+    Staging slot at worst-case (procedural) shape: 38 MiB (vs uniform 26 MiB) → +12 MiB.
+    Combined delta: 12 + 90 + 12 = 114 MiB.
+    """
+    _MiB = 1024 * 1024
+    adapter_bytes = _adapter_bytes()
+    assert adapter_bytes == 26 * _MiB
+
+    uniform_baseline = required_working_set_bytes(
+        base_model_bytes=_BASE_MODEL_BYTES,
+        adapter_bytes=adapter_bytes,
+        main_adapter_bytes_total=3 * adapter_bytes,
+        backup_adapter_bytes_total=0,
+        staging_adapter_bytes=adapter_bytes,
+        max_interim_count=7,
+        headroom_bytes=int(1.0 * _GiB),
+    )
+
+    real_mains_bytes = 90 * _MiB
+    backup_bytes = 90 * _MiB
+    staging_bytes = 38 * _MiB
+    with_real_shapes = required_working_set_bytes(
+        base_model_bytes=_BASE_MODEL_BYTES,
+        adapter_bytes=adapter_bytes,
+        main_adapter_bytes_total=real_mains_bytes,
+        backup_adapter_bytes_total=backup_bytes,
+        staging_adapter_bytes=staging_bytes,
+        max_interim_count=7,
+        headroom_bytes=int(1.0 * _GiB),
+    )
+
+    delta = with_real_shapes - uniform_baseline
+    assert delta == 114 * _MiB, f"expected +114 MiB delta, got {delta / _MiB} MiB"
+
+
+def test_assess_topology_real_per_tier_configs_fits_baseline_at_6981_style_config():
+    """assess_topology with the real 3-tier (episodic/semantic/procedural) config
+    must produce the pinned 90/90/38 MiB main/backup/staging totals and fit the
+    8 GiB baseline — the config this whole refactor exists to keep byte-exact."""
+    result = assess_topology(
+        _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
+        max_interim_count=7,
+        base_bytes=_BASE_MODEL_BYTES,
+        hidden_size=_HIDDEN,
+        num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
+    )
+    assert result.fits_baseline, (
+        f"real per-tier 3-tier config must fit 8 GiB baseline "
+        f"(margin={result.margin_bytes / _GiB:.4f} GiB)"
+    )
+    assert result.margin_bytes > 0
+
+
+def test_assess_topology_real_per_tier_configs_sizes_staging_at_procedural_worst_case():
+    """The staging term must be sized at the LARGEST per-tier shape (procedural,
+    38 MiB) — the in_training slot is created fresh per training event, shaped like
+    whichever tier is currently training, so the budget must model the worst case."""
+    result = assess_topology(
+        _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
+        max_interim_count=7,
+        base_bytes=_BASE_MODEL_BYTES,
+        hidden_size=_HIDDEN,
+        num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
+    )
+    _MiB = 1024 * 1024
+    assert "in_training staging slot (worst-case tier shape)" in result.breakdown
+    expected_staging_mib = f"{38 * _MiB // _MiB:>6,} MiB"
+    assert expected_staging_mib in result.breakdown
+
+
+def test_assess_topology_real_per_tier_configs_breakdown_shows_backup_reserve():
+    """The breakdown must surface the transient backup reserve as its own row, not
+    silently fold it into another line."""
+    result = assess_topology(
+        _MISTRAL_ADAPTER,
+        main_adapter_configs=_MAIN_ADAPTER_CONFIGS,
+        max_interim_count=7,
+        base_bytes=_BASE_MODEL_BYTES,
+        hidden_size=_HIDDEN,
+        num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
+    )
+    assert "transient full-fold backup reserve" in result.breakdown
+    _MiB = 1024 * 1024
+    expected_backup_mib = f"{90 * _MiB // _MiB:>6,} MiB"
+    assert expected_backup_mib in result.breakdown
+    # The main-adapters row must reflect the real 90 MiB total.
+    expected_main_mib = f"{90 * _MiB // _MiB:>6,} MiB"
+    assert expected_main_mib in result.breakdown
+
+
+def test_assess_topology_dropping_a_tier_reduces_bytes_by_exactly_that_tiers_shape():
+    """This is the test the whole refactor exists for: a disabled tier is excluded
+    from the main-adapter total, the backup reserve, AND (when it was the
+    worst-case tier) the staging term — all three derived from ONE
+    main_adapter_configs list, so the adapter count and the byte total can never
+    disagree.
+
+    Dropping procedural (the worst-case 38 MiB tier) from the real 3-tier config:
+      main total:    90 MiB -> 52 MiB  (-38 MiB, procedural's own shape)
+      backup total:  90 MiB -> 52 MiB  (-38 MiB, mirrors main)
+      staging term:  38 MiB -> 26 MiB  (-12 MiB, worst case shifts to episodic/semantic)
+      combined delta: 38 + 38 + 12 = 88 MiB
+    """
+    _MiB = 1024 * 1024
+    kwargs = dict(
+        max_interim_count=7,
+        base_bytes=_BASE_MODEL_BYTES,
+        hidden_size=_HIDDEN,
+        num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
+    )
+    full = assess_topology(_MISTRAL_ADAPTER, main_adapter_configs=_MAIN_ADAPTER_CONFIGS, **kwargs)
+    procedural_dropped = assess_topology(
+        _MISTRAL_ADAPTER,
+        main_adapter_configs=[_MISTRAL_ADAPTER, _MISTRAL_ADAPTER],
+        **kwargs,
+    )
+
+    delta = full.required_bytes - procedural_dropped.required_bytes
+    assert delta == 88 * _MiB, f"expected -88 MiB when dropping procedural, got {delta / _MiB} MiB"
+
+    assert "3 main adapters" in full.breakdown
+    assert "2 main adapters" in procedural_dropped.breakdown
+
+
+def test_assess_topology_empty_main_adapter_configs_yields_zero_and_does_not_raise():
+    """main_adapter_configs=[] (no enabled main tiers) must yield 0 for main/backup/
+    staging bytes without raising — the empty case is a deterministic guard on
+    ``max()``, not an error state."""
+    result = assess_topology(
+        _MISTRAL_ADAPTER,
+        main_adapter_configs=[],
+        max_interim_count=7,
+        base_bytes=_BASE_MODEL_BYTES,
+        hidden_size=_HIDDEN,
+        num_layers=_LAYERS,
+        lora_dtype_bytes=_BF16_BYTES,
+        peft_overhead_bytes=_PEFT_OVERHEAD_BYTES,
+        baseline_vram_gib=_BASELINE_GIB,
+    )
+    _MiB = 1024 * 1024
+    assert "0 main adapters" in result.breakdown
+    assert f"{0:>6,} MiB" in result.breakdown
+
+    adapter_bytes = _adapter_bytes()
+    expected_required = (
+        _BASE_MODEL_BYTES
+        + 0  # main_adapter_bytes_total
+        + 7 * adapter_bytes  # interim ring
+        + 0  # staging_adapter_bytes
+        + 0  # backup_adapter_bytes_total
+        + int(_DEFAULT_HEADROOM_GIB * _GiB)
+        + 256 * _MiB  # _SAFETY_MARGIN_BYTES
+    )
+    assert result.required_bytes == expected_required

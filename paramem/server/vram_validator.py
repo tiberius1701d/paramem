@@ -7,7 +7,7 @@ Two roles, both consumed by the server lifespan:
    per-hardware-tier fit verdict. Logged at boot for operator visibility;
    cached on ``_state["topology_assessment"]`` for the live-reload path's
    drain-wait pre-flight. No CUDA calls, safe before the model is loaded.
-2. :func:`enforce_post_load_budget` — the authoritative reject. Runs in the
+2. :func:`check_post_load_budget` — the authoritative reject. Runs in the
    lifespan AFTER the base model + STT/TTS are on the device, reads
    ``torch.cuda.memory_allocated(0)``, refuses startup (``sys.exit(1)``)
    when the measured allocation leaves less than the configured headroom.
@@ -15,27 +15,34 @@ Two roles, both consumed by the server lifespan:
 Pre-load math gates were removed: the boot path uses
 ``_wait_for_gpu_drain`` (in ``app.py``) to wait for VRAM and degrade to
 cloud-only on timeout; the live-reload path uses the same drain-wait.
-``enforce_post_load_budget`` is the only check that can actually reject
+``check_post_load_budget`` is the only check that can actually reject
 the configured topology.
 
 Working set formula (informational, used by :func:`assess_topology`)::
 
     working_set_bytes =
           base_model_bytes
-        + main_adapter_count        × adapter_bytes   # episodic, semantic, procedural = 3
+        + main_adapter_bytes_total  # sum of the ENABLED main tiers' real per-tier
+                                     # shapes (episodic, semantic, procedural)
         + max_interim_count         × adapter_bytes   # configurable, default 7
-        + 1                         × adapter_bytes   # in_training staging slot
+        + staging_adapter_bytes     # in_training slot, worst-case enabled-tier shape
+        + backup_adapter_bytes_total  # transient full-fold <tier>_backup reserve
         + stt_bytes + tts_bytes
         + kv_cache_headroom_bytes
         + safety_margin
 
-Adapter bytes assume inference-only LoRA (no optimizer state); training
-reuses the ``in_training`` staging slot.
+``main_adapter_bytes_total``, ``staging_adapter_bytes``, and
+``backup_adapter_bytes_total`` are all derived from the single
+``main_adapter_configs`` list passed to :func:`assess_topology` — a disabled
+tier is excluded from all three, so the adapter count and the byte total can
+never disagree. Adapter bytes assume inference-only LoRA (no optimizer
+state); training reuses the ``in_training`` staging slot.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from paramem.server.vram_predict import predict_stt_bytes, predict_tts_bytes
@@ -199,9 +206,11 @@ def estimated_adapter_bytes(
 def required_working_set_bytes(
     base_model_bytes: int,
     adapter_bytes: int,
-    main_adapter_count: int,
     max_interim_count: int,
     headroom_bytes: int,
+    main_adapter_bytes_total: int,
+    backup_adapter_bytes_total: int,
+    staging_adapter_bytes: int,
     stt_bytes: int = 0,
     tts_bytes: int = 0,
     interim_overflow_slack: int = 0,
@@ -212,28 +221,43 @@ def required_working_set_bytes(
 
         working_set_bytes =
               base_model_bytes
-            + main_adapter_count * adapter_bytes             # main adapters
+            + main_adapter_bytes_total                       # real summed per-tier main
+                                                               # adapter shapes (episodic +
+                                                               # semantic + procedural)
             + (max_interim_count + interim_overflow_slack)
               * adapter_bytes                                # rolling + overflow interim
-            + 1 * adapter_bytes                             # in_training staging slot
+            + staging_adapter_bytes                          # in_training staging slot,
+                                                               # worst-case tier shape
+            + backup_adapter_bytes_total                     # transient full-fold backup reserve
             + stt_bytes                                     # Whisper (0 if CPU/disabled)
             + tts_bytes                                     # TTS voices on GPU (0 if CPU)
             + headroom_bytes                                # KV cache + activation headroom
 
     Note: adapter byte count assumes inference-only LoRA (no optimizer state).
     Training reuses the ``in_training`` staging slot, accounted separately as
-    the ``+1 × adapter_bytes`` term.  ``interim_overflow_slack`` reserves
-    capacity for overflow slots that may be minted when the ring is full but
-    the full fold has not yet drained it; at 0 (default) the total is
-    identical to the pre-S5 formula.
+    the staging term.  ``interim_overflow_slack`` reserves capacity for
+    overflow slots that may be minted when the ring is full but the full fold
+    has not yet drained it; at 0 (default) no extra slots are reserved.
 
     Args:
         base_model_bytes: GPU footprint of the quantized base model.
-        adapter_bytes: Per-adapter LoRA footprint (from :func:`estimated_adapter_bytes`).
-        main_adapter_count: Number of always-resident main adapters (e.g. 3 for
-            episodic + semantic + procedural).
+        adapter_bytes: Per-adapter LoRA footprint (from :func:`estimated_adapter_bytes`);
+            the episodic-shaped estimate, used for the interim-ring term (interims are
+            always episodic-shaped).
         max_interim_count: Maximum concurrent interim adapters (configurable; default 7).
         headroom_bytes: Reserved bytes for KV cache, activations, and CUDA overhead.
+        main_adapter_bytes_total: Real summed bytes of the resident main adapters
+            (episodic + semantic + procedural, each at its own target-module count).
+        backup_adapter_bytes_total: Transient ``<tier>_backup`` adapters co-resident
+            during a full fold (created in ``main_tier_backup_scope.__enter__``,
+            freed in its ``finally``) — same per-tier shapes as the mains.
+        staging_adapter_bytes: Size of the ``in_training`` staging slot. The
+            slot is created fresh per training event, shaped like whichever
+            tier is currently training (``train_adapter`` hands its
+            ``adapter_config`` straight to ``_ensure_staging_slot``), so a
+            procedural fold leaves it procedural-shaped. Sized at the
+            worst-case (largest) tier shape, since the budget models the
+            worst-case working set.
         stt_bytes: Estimated Whisper VRAM footprint. 0 if STT is CPU-bound or disabled.
         tts_bytes: Estimated TTS VRAM footprint across all GPU voices. 0 if CPU-bound.
         interim_overflow_slack: Extra overflow adapter slots beyond ``max_interim_count``
@@ -246,7 +270,10 @@ def required_working_set_bytes(
     """
     return (
         base_model_bytes
-        + (main_adapter_count + max_interim_count + interim_overflow_slack + 1) * adapter_bytes
+        + main_adapter_bytes_total
+        + (max_interim_count + interim_overflow_slack) * adapter_bytes
+        + staging_adapter_bytes
+        + backup_adapter_bytes_total
         + stt_bytes
         + tts_bytes
         + headroom_bytes
@@ -287,6 +314,7 @@ class TopologyAssessment:
 def assess_topology(
     adapter_config: AdapterConfig,
     *,
+    main_adapter_configs: Sequence[AdapterConfig],
     max_interim_count: int,
     base_bytes: int,
     hidden_size: int,
@@ -296,7 +324,6 @@ def assess_topology(
     baseline_vram_gib: int,
     model_id: str = "",
     quant_label: str = "nf4",
-    main_adapter_count: int = 3,
     headroom_gib: float = _DEFAULT_HEADROOM_GIB,
     stt_bytes: int = 0,
     tts_bytes: int = 0,
@@ -311,7 +338,15 @@ def assess_topology(
     model is on the device.
 
     Args:
-        adapter_config: LoRA config for interim/episodic adapters.
+        adapter_config: LoRA config for interim/episodic adapters — interims
+            are always episodic-shaped regardless of which main tiers are
+            enabled (``paramem/memory/interim_adapter.py`` always passes
+            ``episodic_config``).
+        main_adapter_configs: LoRA configs for the ENABLED main tiers, in tier
+            order (episodic, semantic, procedural). The main-adapter total,
+            the transient full-fold backup reserve, and the worst-case
+            staging-slot size are all derived from this one list — an empty
+            list (no enabled main tiers) yields 0 for all three.
         max_interim_count: Rolling interim cap (``consolidation.max_interim_count``).
         base_bytes: Base-model GPU bytes (from predict_base_bytes or live measurement).
         hidden_size: Hidden dimension of the base model (from AutoConfig or known value).
@@ -324,14 +359,13 @@ def assess_topology(
             (``vram.baseline_vram_gib``).
         model_id: HF model id for the breakdown label.
         quant_label: Quantization scheme label for display only.
-        main_adapter_count: Always-resident main adapters (default 3).
         headroom_gib: KV cache + activation headroom.
         stt_bytes: Whisper STT footprint (0 if CPU/disabled).
         tts_bytes: TTS footprint (0 if CPU/disabled).
         interim_overflow_slack: Extra overflow adapter slots beyond
             ``max_interim_count`` to include in the budget.  Mirrors
             ``consolidation.interim_overflow_slack`` from the server config.
-            At 0 (default) no extra slots are reserved (identical to pre-S5).
+            At 0 (default) no extra slots are reserved.
 
     Returns:
         :class:`TopologyAssessment` — pure data, no side effects.
@@ -344,12 +378,31 @@ def assess_topology(
         adapter_config, hidden_size, num_layers, lora_dtype_bytes, peft_overhead_bytes
     )
 
+    per_tier_bytes = [
+        estimated_adapter_bytes(
+            tier_config, hidden_size, num_layers, lora_dtype_bytes, peft_overhead_bytes
+        )
+        for tier_config in main_adapter_configs
+    ]
+    main_adapter_count = len(main_adapter_configs)
+    main_adapter_bytes_total = sum(per_tier_bytes)
+    # Transient <tier>_backup adapters co-resident during a full fold
+    # (main_tier_backup_scope) — one per enabled main tier, same shapes as the mains.
+    backup_adapter_bytes_total = main_adapter_bytes_total
+    # The in_training staging slot is created fresh per training event,
+    # shaped like whichever tier is currently training (train_adapter hands
+    # its adapter_config straight to _ensure_staging_slot) — the budget
+    # models the worst-case (largest) enabled tier shape.
+    staging_adapter_bytes = max(per_tier_bytes) if per_tier_bytes else 0
+
     total_required = required_working_set_bytes(
         base_model_bytes=base_bytes,
         adapter_bytes=adapter_bytes,
-        main_adapter_count=main_adapter_count,
         max_interim_count=max_interim_count,
         headroom_bytes=headroom_bytes,
+        main_adapter_bytes_total=main_adapter_bytes_total,
+        backup_adapter_bytes_total=backup_adapter_bytes_total,
+        staging_adapter_bytes=staging_adapter_bytes,
         stt_bytes=stt_bytes,
         tts_bytes=tts_bytes,
         interim_overflow_slack=interim_overflow_slack,
@@ -367,7 +420,6 @@ def assess_topology(
         main_adapter_count=main_adapter_count,
         adapter_bytes=adapter_bytes,
         max_interim_count=max_interim_count,
-        num_modules=len(adapter_config.target_modules),
         rank=adapter_config.rank,
         headroom_bytes=headroom_bytes,
         total_required_bytes=total_required,
@@ -377,6 +429,9 @@ def assess_topology(
         tts_bytes=tts_bytes,
         suppress_available_row=True,
         interim_overflow_slack=interim_overflow_slack,
+        main_adapter_bytes_total=main_adapter_bytes_total,
+        backup_adapter_bytes_total=backup_adapter_bytes_total,
+        staging_adapter_bytes=staging_adapter_bytes,
     )
 
     return TopologyAssessment(
@@ -455,12 +510,14 @@ def _format_breakdown(
     main_adapter_count: int,
     adapter_bytes: int,
     max_interim_count: int,
-    num_modules: int,
     rank: int,
     headroom_bytes: int,
     total_required_bytes: int,
     total_with_margin_bytes: int,
     available_bytes: int,
+    main_adapter_bytes_total: int,
+    backup_adapter_bytes_total: int,
+    staging_adapter_bytes: int,
     stt_bytes: int = 0,
     tts_bytes: int = 0,
     stt_label: str = "STT (Whisper)",
@@ -481,12 +538,16 @@ def _format_breakdown(
         main_adapter_count: Number of always-resident main adapters.
         adapter_bytes: Per-adapter LoRA footprint in bytes.
         max_interim_count: Maximum concurrent interim adapters.
-        num_modules: Number of LoRA target modules per adapter.
         rank: LoRA rank.
         headroom_bytes: KV cache + activation headroom in bytes.
         total_required_bytes: Sum of all components (excluding safety margin).
         total_with_margin_bytes: ``total_required_bytes + _SAFETY_MARGIN_BYTES``.
         available_bytes: Free VRAM bytes available at startup.
+        main_adapter_bytes_total: Real summed main-adapter bytes (episodic +
+            semantic + procedural, each at its own ``target_modules`` count).
+        backup_adapter_bytes_total: Transient full-fold ``<tier>_backup`` reserve.
+        staging_adapter_bytes: Size of the ``in_training`` staging slot
+            (worst-case enabled-tier shape).
         interim_overflow_slack: Extra overflow slots beyond ``max_interim_count``
             reserved in the budget (mirrors ``consolidation.interim_overflow_slack``).
             At 0 (default) the interim row is identical to the pre-S5 output.
@@ -510,7 +571,8 @@ def _format_breakdown(
         return f"  {label:<{col_w}}:  {value}"
 
     base_label = f"base model ({model_id}, {quant_label})"
-    main_label = f"{main_adapter_count} main adapters (rank={rank}, modules={num_modules})"
+    main_label = f"{main_adapter_count} main adapters (rank={rank}, real per-tier shapes)"
+    main_bytes = main_adapter_bytes_total
     _total_interim = max_interim_count + interim_overflow_slack
     if interim_overflow_slack > 0:
         session_label = (
@@ -522,13 +584,15 @@ def _format_breakdown(
             f"{max_interim_count} interim adapters (max_interim_count={max_interim_count})"
         )
     margin_val = f"{margin_sign}{margin // _MiB:>5,} MiB"
+    staging_label = "in_training staging slot (worst-case tier shape)"
 
     lines = [
         "VRAM Working Set Breakdown",
         _row(base_label, _mib(base_bytes)),
-        _row(main_label, _mib(main_adapter_count * adapter_bytes)),
+        _row(main_label, _mib(main_bytes)),
         _row(session_label, _mib(_total_interim * adapter_bytes)),
-        _row("in_training staging slot", _mib(adapter_bytes)),
+        _row(staging_label, _mib(staging_adapter_bytes)),
+        _row("transient full-fold backup reserve", _mib(backup_adapter_bytes_total)),
     ]
     if stt_bytes > 0:
         lines.append(_row(stt_label, _mib(stt_bytes)))

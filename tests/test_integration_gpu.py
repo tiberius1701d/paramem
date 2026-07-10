@@ -969,8 +969,18 @@ class TestVRAMBudget:
                 [], dtype=getattr(torch, server_cfg.model_config.compute_dtype)
             ).element_size()
             peft_overhead_bytes = server_cfg.vram.peft_overhead_per_adapter_mib * 1024 * 1024
+            main_adapter_configs = [
+                tier_cfg
+                for tier_cfg, tier_server_cfg in (
+                    (server_cfg.episodic_adapter_config, server_cfg.adapters.episodic),
+                    (server_cfg.semantic_adapter_config, server_cfg.adapters.semantic),
+                    (server_cfg.procedural_adapter_config, server_cfg.adapters.procedural),
+                )
+                if tier_server_cfg.enabled
+            ]
             assessment = assess_topology(
                 adapter_cfg,
+                main_adapter_configs=main_adapter_configs,
                 max_interim_count=max_interim,
                 base_bytes=base_pred,
                 hidden_size=hidden_size,
@@ -979,7 +989,6 @@ class TestVRAMBudget:
                 peft_overhead_bytes=peft_overhead_bytes,
                 baseline_vram_gib=server_cfg.vram.baseline_vram_gib,
                 model_id=server_cfg.model_config.model_id,
-                main_adapter_count=3,
                 headroom_gib=self._HARDWARE_CAP_GIB,
                 stt_bytes=stt_bytes,
                 tts_bytes=tts_bytes,

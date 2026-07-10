@@ -1668,8 +1668,20 @@ def _compute_topology_assessment(config, base_pred: int | None):
     ).element_size()
     peft_overhead_bytes = config.vram.peft_overhead_per_adapter_mib * 1024 * 1024
     piper_ort_context_bytes = config.vram.tts_piper_ort_context_mib * 1024 * 1024
+    main_adapter_configs = [
+        tier_cfg
+        for tier_cfg, server_cfg in (
+            (config.episodic_adapter_config, config.adapters.episodic),
+            (config.semantic_adapter_config, config.adapters.semantic),
+            (config.procedural_adapter_config, config.adapters.procedural),
+        )
+        if server_cfg.enabled
+    ]
     assessment = assess_topology(
+        # Interims are always episodic-shaped, regardless of whether episodic
+        # is itself an enabled main tier.
         config.episodic_adapter_config,
+        main_adapter_configs=main_adapter_configs,
         max_interim_count=config.consolidation.max_interim_count,
         interim_overflow_slack=config.consolidation.interim_overflow_slack,
         base_bytes=base_pred,
@@ -1680,15 +1692,6 @@ def _compute_topology_assessment(config, base_pred: int | None):
         baseline_vram_gib=config.vram.baseline_vram_gib,
         model_id=config.model_config.model_id,
         quant_label=config.model_config.quantization,
-        main_adapter_count=sum(
-            1
-            for adapter_cfg in (
-                config.adapters.episodic,
-                config.adapters.semantic,
-                config.adapters.procedural,
-            )
-            if adapter_cfg.enabled
-        ),
         headroom_gib=config.vram.vram_cache_headroom_gib,
         stt_bytes=estimate_stt_bytes(
             config.stt,
