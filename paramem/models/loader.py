@@ -7,7 +7,9 @@ Swapping the base model requires only changing the model_id in config.
 import contextlib
 import logging
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -81,6 +83,162 @@ def base_model_inference(model):
                 yield
         else:
             yield
+
+
+@dataclass
+class _BackupScope:
+    """Handle yielded by :func:`main_tier_backup_scope`.
+
+    Carries the live ``model`` reference so callers can sync their own copy
+    after entry — ``create_adapter`` may return a new object (the
+    ``get_peft_model`` re-wrap branch), so the CM's own working reference
+    (``scope.model``) must be reassigned on every ``create_adapter`` call
+    rather than trusted to stay identical.
+    """
+
+    model: PeftModel
+
+
+def _switch_off(model: PeftModel, adapter_name: str, tiers: tuple[str, ...]) -> None:
+    """Move the active adapter off ``adapter_name`` onto a resident main tier.
+
+    No-op when ``adapter_name`` is not currently active — callers must never
+    delete an adapter without first confirming it is not the active one.
+    """
+    if active_adapter_name(model) != adapter_name:
+        return
+    for tier in tiers:
+        if tier in model.peft_config:
+            model.set_adapter(tier)
+            return
+
+
+def _switch_off_all_backups(model: PeftModel, tiers: tuple[str, ...]) -> None:
+    """Move the active adapter onto a resident main tier if it is any ``<tier>_backup``.
+
+    Called immediately before the backup-delete loop in
+    :func:`main_tier_backup_scope` so a backup is never the active adapter
+    when it is deleted.
+    """
+    active = active_adapter_name(model)
+    if active is None or not active.endswith("_backup"):
+        return
+    for tier in tiers:
+        if tier in model.peft_config:
+            model.set_adapter(tier)
+            return
+
+
+@contextmanager
+def main_tier_backup_scope(
+    model: PeftModel,
+    tier_configs: dict[str, AdapterConfig],
+    *,
+    tiers: tuple[str, ...] = ("episodic", "semantic", "procedural"),
+) -> Iterator[_BackupScope]:
+    """Snapshot every resident main tier into a transient ``<tier>_backup`` adapter.
+
+    Manages BACKUP adapters ONLY — never interim adapters, never the on-disk
+    scratch a training event leaves behind.  On entry, every tier in
+    ``tiers`` that is resident in ``model.peft_config`` is copied into a
+    ``<tier>_backup`` adapter (any pre-existing, leaked backup is discarded
+    first so a stale snapshot can never be restored over good weights).  On
+    ANY exception raised inside the ``with`` body, every snapshotted tier is
+    restored from its backup before the ORIGINAL exception propagates
+    unchanged — a caller that deletes+recreates a tier mid-scope (as
+    ``_run_fold``'s tier loop does) can never leave production holding a
+    zero-init adapter.  On every exit (success or exception), all backup
+    adapters are freed — they are VRAM-only and never read by anything
+    outside this scope.
+
+    The caller must keep the ``with`` body open for as long as any tier in
+    ``tiers`` may be deleted and recreated — the backups are what make that
+    delete safe (the model is never left with the deleted tier as its last
+    adapter, since the corresponding backup is still resident).
+
+    Args:
+        model: The live ``PeftModel`` carrying the main tiers.  Must already
+            be a ``PeftModel`` — this CM does not perform the initial
+            ``get_peft_model`` wrap.
+        tier_configs: ``{tier_name: AdapterConfig}`` used to size each
+            ``<tier>_backup`` adapter identically to its source tier.
+        tiers: The tier names to snapshot, in order.
+
+    Yields:
+        _BackupScope: carries ``.model`` — the (possibly reassigned)
+            ``PeftModel``.  Callers must sync their own reference from this
+            after the ``with`` block starts, since ``create_adapter`` may
+            return a new object.
+
+    Raises:
+        RuntimeError: if ``model`` is not a ``PeftModel`` (runtime contract
+            check — NOT an ``assert``, which is stripped under ``-O``).
+    """
+    if not isinstance(model, PeftModel):
+        raise RuntimeError("main_tier_backup_scope requires a PeftModel with main tiers resident")
+
+    scope = _BackupScope(model=model)
+    snapshotted: list[str] = []
+    try:
+        for tier in tiers:
+            if tier not in scope.model.peft_config:
+                continue  # tier not resident (disabled / first fold) — skip
+            backup = f"{tier}_backup"
+            if backup in scope.model.peft_config:
+                # Leaked from a prior aborted fold — discard before
+                # re-snapshotting so the stale backup can never clobber good
+                # weights on a later restore.
+                _switch_off(scope.model, backup, tiers)
+                scope.model.delete_adapter(backup)
+            scope.model = create_adapter(scope.model, tier_configs[tier], backup)
+            copy_adapter_weights(scope.model, src=tier, dst=backup)
+            snapshotted.append(tier)
+        yield scope
+    except BaseException:
+        # Restore ONLY tiers snapshotted at enter — a tier whose backup was
+        # never populated (partial-enter double-fault) must not be touched.
+        for tier in snapshotted:
+            backup = f"{tier}_backup"
+            if backup in scope.model.peft_config and tier in scope.model.peft_config:
+                try:
+                    copy_adapter_weights(scope.model, src=backup, dst=tier)
+                except Exception:  # noqa: BLE001  # boundary: best-effort per-tier
+                    # restore on an exception path — the original exception
+                    # below must always propagate unchanged, so a restore
+                    # failure here is logged and swallowed, not raised.
+                    logger.warning(
+                        "main_tier_backup_scope: restore failed for tier %s",
+                        tier,
+                        exc_info=True,
+                    )
+        raise  # re-raise the ORIGINAL exception, untransformed
+    finally:
+        # Every exit (success or exception) frees the backups — they are
+        # VRAM-only and outlive nothing outside this scope.  This block runs
+        # on the exception path too (Python runs `finally` after `except`
+        # re-raises), so a teardown failure here must NEVER replace the
+        # in-flight exception — e.g. an AbortedDuringConsolidation must still
+        # reach app.py's abort handler unchanged, not get swapped for a
+        # delete_adapter error and misrouted to the crash-incident path.
+        # Every step is therefore best-effort: log and continue, never raise.
+        # A leaked backup adapter is vastly preferable to a misrouted abort.
+        try:
+            _switch_off_all_backups(scope.model, tiers)
+        except Exception:  # noqa: BLE001  # boundary: best-effort teardown; must
+            # never replace an in-flight exception — see the block comment above.
+            logger.warning("main_tier_backup_scope: switch-off-backups failed", exc_info=True)
+        for tier in tiers:
+            backup = f"{tier}_backup"
+            if backup in scope.model.peft_config:
+                try:
+                    scope.model.delete_adapter(backup)
+                except Exception:  # noqa: BLE001  # boundary: best-effort teardown; must
+                    # never replace an in-flight exception — see the block comment above.
+                    logger.warning(
+                        "main_tier_backup_scope: could not delete backup %s",
+                        backup,
+                        exc_info=True,
+                    )
 
 
 # Cache for system role support per tokenizer class to avoid repeated try/except
@@ -391,6 +549,18 @@ def switch_adapter(model: PeftModel, adapter_name: str) -> None:
     """Switch the active adapter on a multi-adapter model."""
     model.set_adapter(adapter_name)
     logger.debug("Switched to adapter: %s", adapter_name)
+
+
+def active_adapter_name(model: PeftModel) -> Optional[str]:
+    """Return the single active adapter name, normalizing PEFT's str/list return.
+
+    PEFT 0.18+ normally exposes ``model.active_adapter`` as a string, but some
+    layouts return a list.
+    """
+    raw = model.active_adapter
+    if isinstance(raw, list):
+        return raw[0] if raw else None
+    return raw
 
 
 def save_adapter(

@@ -29,6 +29,7 @@ from paramem.memory.interim_adapter import (
     current_interim_stamp,
     unload_interim_adapters,
 )
+from paramem.models.loader import main_tier_backup_scope
 from paramem.server.schedule_grammar import compute_schedule_period_seconds
 
 # ---------------------------------------------------------------------------
@@ -593,3 +594,358 @@ class TestCurrentInterimStampWithCadence:
         now = datetime(2026, 4, 18, 14, 47, 0)
         stamp = current_interim_stamp("every 2h", _now=now)
         assert stamp == "20260418T1400"
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — main_tier_backup_scope (paramem.models.loader)
+# ---------------------------------------------------------------------------
+
+
+def _configure_backup_mock(
+    model: MagicMock, *adapter_names: str, weights: dict | None = None
+) -> None:
+    """Configure a MagicMock as a minimal PeftModel-like stub in place.
+
+    ``peft_config``/``weights`` are plain dicts so the patched
+    create_adapter/copy_adapter_weights fakes below can mutate them
+    directly.  ``delete_adapter`` raises if asked to delete the currently
+    active adapter, mirroring PEFT's real hazard — the CM must always
+    switch active off a backup before deleting it.
+    """
+    model.peft_config = {name: MagicMock() for name in adapter_names}
+    model.weights = dict(weights) if weights is not None else dict.fromkeys(adapter_names, "orig")
+    model.active_adapter = adapter_names[0] if adapter_names else None
+    model.set_adapter_calls: list[str] = []
+    model.delete_adapter_calls: list[str] = []
+
+    def _set_adapter(name: str) -> None:
+        if name not in model.peft_config:
+            raise KeyError(name)
+        model.active_adapter = name
+        model.set_adapter_calls.append(name)
+
+    def _delete_adapter(name: str) -> None:
+        if name == model.active_adapter:
+            raise RuntimeError(f"cannot delete active adapter {name!r} without switching first")
+        del model.peft_config[name]
+        model.weights.pop(name, None)
+        model.delete_adapter_calls.append(name)
+
+    model.set_adapter.side_effect = _set_adapter
+    model.delete_adapter.side_effect = _delete_adapter
+
+
+def _make_backup_model(*adapter_names: str, weights: dict | None = None) -> MagicMock:
+    """Build a MagicMock configured as a PeftModel-like stub.
+
+    ``__class__`` is reassigned to PeftModel so ``isinstance(model,
+    PeftModel)`` passes — the same pattern used across this test suite
+    (e.g. ``test_procedural.py``).  Mock's own permissive attribute
+    machinery (not PeftModel's ``peft_config`` property descriptor) still
+    handles every read/write, since ``type(model)`` stays ``MagicMock``;
+    only ``isinstance`` is fooled.
+    """
+    from peft import PeftModel
+
+    model = MagicMock()
+    _configure_backup_mock(model, *adapter_names, weights=weights)
+    model.__class__ = PeftModel  # satisfies main_tier_backup_scope's runtime contract check
+    return model
+
+
+def _fake_create_adapter(model, config, name):  # noqa: ANN001
+    """Fake paramem.models.loader.create_adapter — mints a zero-init slot."""
+    model.peft_config[name] = config
+    model.weights[name] = "zero-init"
+    model.set_adapter(name)
+    return model
+
+
+def _fake_copy_adapter_weights(model, src, dst):  # noqa: ANN001
+    """Fake paramem.models.loader.copy_adapter_weights — copies the weight marker."""
+    model.weights[dst] = model.weights[src]
+
+
+class TestMainTierBackupScope:
+    """Unit tests for main_tier_backup_scope (paramem.models.loader).
+
+    Fake PeftModel (dict-like peft_config, stub delete_adapter/set_adapter),
+    monkeypatched create_adapter/copy_adapter_weights — no GPU.  Mirrors the
+    production caller: consolidation.py's _run_fold main_tiers branch.
+    """
+
+    def _configs(self) -> dict:
+        return {"episodic": MagicMock(), "semantic": MagicMock(), "procedural": MagicMock()}
+
+    def test_cleanup_on_success(self) -> None:
+        """A clean exit leaves no *_backup adapter resident."""
+        model = _make_backup_model("episodic", "semantic", "procedural")
+        with (
+            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=_fake_copy_adapter_weights,
+            ),
+        ):
+            with main_tier_backup_scope(model, self._configs()) as scope:
+                assert "episodic_backup" in scope.model.peft_config
+                assert "semantic_backup" in scope.model.peft_config
+                assert "procedural_backup" in scope.model.peft_config
+
+        assert [k for k in model.peft_config if k.endswith("_backup")] == []
+
+    def test_cleanup_on_aborted_during_consolidation(self) -> None:
+        """AbortedDuringConsolidation propagates unchanged; backups are freed."""
+        from paramem.training.consolidation import AbortedDuringConsolidation
+
+        model = _make_backup_model("episodic", "semantic", "procedural")
+        with (
+            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=_fake_copy_adapter_weights,
+            ),
+        ):
+            with pytest.raises(AbortedDuringConsolidation):
+                with main_tier_backup_scope(model, self._configs()):
+                    raise AbortedDuringConsolidation("training aborted on tier 'episodic'")
+
+        assert [k for k in model.peft_config if k.endswith("_backup")] == []
+
+    def test_finally_teardown_failure_does_not_mask_in_flight_exception(self) -> None:
+        """A delete_adapter failure during the finally teardown must not
+        replace the in-flight exception — AbortedDuringConsolidation still
+        propagates unchanged (not the teardown RuntimeError), and every
+        OTHER backup is still cleaned up despite one delete failing."""
+        from paramem.training.consolidation import AbortedDuringConsolidation
+
+        model = _make_backup_model("episodic", "semantic", "procedural")
+        real_delete_fn = model.delete_adapter.side_effect
+
+        def _delete(name):
+            if name == "semantic_backup":
+                raise RuntimeError("delete_adapter exploded for semantic_backup")
+            real_delete_fn(name)
+
+        model.delete_adapter = _delete
+
+        with (
+            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=_fake_copy_adapter_weights,
+            ),
+        ):
+            with pytest.raises(AbortedDuringConsolidation):
+                with main_tier_backup_scope(model, self._configs()):
+                    raise AbortedDuringConsolidation("training aborted on tier 'episodic'")
+
+        # episodic_backup and procedural_backup deleted fine; semantic_backup's
+        # delete failure is logged and swallowed, never raised — a leaked
+        # backup is preferable to a misrouted abort.
+        assert "episodic_backup" not in model.peft_config
+        assert "procedural_backup" not in model.peft_config
+        assert "semantic_backup" in model.peft_config
+
+    def test_cleanup_on_generic_runtime_error(self) -> None:
+        """A generic RuntimeError also propagates unchanged; backups are freed."""
+        model = _make_backup_model("episodic", "semantic", "procedural")
+        with (
+            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=_fake_copy_adapter_weights,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                with main_tier_backup_scope(model, self._configs()):
+                    raise RuntimeError("boom")
+
+        assert [k for k in model.peft_config if k.endswith("_backup")] == []
+
+    def test_restore_fires_before_delete_for_both_exception_kinds(self) -> None:
+        """Restore (backup→tier copy) happens for every snapshotted tier BEFORE
+        the backup-delete loop, for both AbortedDuringConsolidation and a
+        generic exception."""
+        from paramem.training.consolidation import AbortedDuringConsolidation
+
+        for exc_cls in (AbortedDuringConsolidation, RuntimeError):
+            model = _make_backup_model("episodic", "semantic", "procedural")
+            call_order: list[tuple] = []
+
+            def _create(m, config, name, _order=call_order):  # noqa: ANN001
+                m.peft_config[name] = config
+                m.weights[name] = "zero-init"
+                m.set_adapter(name)
+                return m
+
+            def _copy(m, src, dst, _order=call_order):  # noqa: ANN001
+                _order.append(("copy", src, dst))
+                m.weights[dst] = m.weights[src]
+
+            real_delete = model.delete_adapter
+
+            def _delete(name, _order=call_order, _real=real_delete):  # noqa: ANN001
+                _order.append(("delete", name))
+                _real(name)
+
+            model.delete_adapter = _delete
+
+            with (
+                patch("paramem.models.loader.create_adapter", side_effect=_create),
+                patch("paramem.models.loader.copy_adapter_weights", side_effect=_copy),
+            ):
+                with pytest.raises(exc_cls):
+                    with main_tier_backup_scope(model, self._configs()):
+                        raise exc_cls("boom")
+
+            restore_calls = [c for c in call_order if c[0] == "copy" and c[1].endswith("_backup")]
+            delete_calls = [c for c in call_order if c[0] == "delete"]
+            assert restore_calls, f"no restore fired for {exc_cls}"
+            assert delete_calls, f"no delete fired for {exc_cls}"
+            last_restore_index = max(call_order.index(c) for c in restore_calls)
+            first_delete_index = min(call_order.index(c) for c in delete_calls)
+            assert last_restore_index < first_delete_index, (
+                f"restore must complete before any backup delete for {exc_cls}: {call_order}"
+            )
+
+    def test_no_restore_on_success(self) -> None:
+        """A clean exit performs no backup→tier restore copy."""
+        model = _make_backup_model("episodic", "semantic", "procedural")
+        copy_calls: list[tuple] = []
+
+        def _copy(m, src, dst):  # noqa: ANN001
+            copy_calls.append((src, dst))
+            m.weights[dst] = m.weights[src]
+
+        with (
+            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
+            patch("paramem.models.loader.copy_adapter_weights", side_effect=_copy),
+        ):
+            with main_tier_backup_scope(model, self._configs()):
+                pass
+
+        restore_calls = [c for c in copy_calls if c[0].endswith("_backup")]
+        assert restore_calls == []
+
+    def test_stale_backup_discarded_and_resnapshotted(self) -> None:
+        """A leaked pre-existing backup is deleted and re-created from the
+        CURRENT tier weights on entry — never left stale to clobber a later
+        restore."""
+        model = _make_backup_model(
+            "episodic",
+            "semantic",
+            "procedural",
+            "episodic_backup",
+            weights={
+                "episodic": "current",
+                "semantic": "current",
+                "procedural": "current",
+                "episodic_backup": "STALE",
+            },
+        )
+        model.active_adapter = "episodic"
+
+        with (
+            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=_fake_copy_adapter_weights,
+            ),
+        ):
+            with main_tier_backup_scope(model, self._configs()) as scope:
+                assert scope.model.weights["episodic_backup"] == "current", (
+                    "stale backup must be discarded and re-snapshotted from the live tier"
+                )
+
+    def test_never_deletes_active_adapter_and_never_empties_peft_config(self) -> None:
+        """Active is always switched to a main tier before any backup delete;
+        peft_config never drops below the 3 main tiers."""
+        model = _make_backup_model("episodic", "semantic", "procedural")
+        min_size: list[int] = []
+        real_delete = model.delete_adapter
+
+        def _delete(name, _real=real_delete):  # noqa: ANN001
+            _real(name)  # raises if name is still active — the invariant under test
+            min_size.append(len(model.peft_config))
+
+        model.delete_adapter = _delete
+
+        with (
+            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=_fake_copy_adapter_weights,
+            ),
+        ):
+            with main_tier_backup_scope(model, self._configs()) as scope:
+                # Leave active on a backup right before exit — the CM's finally
+                # must move it back to a main tier before deleting anything.
+                scope.model.set_adapter("procedural_backup")
+
+        assert min_size, "expected at least one backup delete"
+        assert all(size >= 3 for size in min_size), (
+            "peft_config must never drop below the 3 main tiers"
+        )
+        assert model.active_adapter in ("episodic", "semantic", "procedural")
+
+    def test_partial_enter_double_fault_preserves_original_exception(self) -> None:
+        """tier-2's enter copy_adapter_weights raises: tier-1's backup is
+        cleaned up, tier-2's half-populated backup is cleaned up (never
+        restored — it was never snapshotted), the with body never runs, and
+        the ORIGINAL exception type propagates unchanged."""
+        model = _make_backup_model("episodic", "semantic", "procedural")
+        restore_calls: list[tuple] = []
+
+        def _copy(m, src, dst):  # noqa: ANN001
+            restore_calls.append((src, dst))
+            if dst == "semantic_backup":
+                raise RuntimeError("copy failed for semantic_backup")
+            m.weights[dst] = m.weights.get(src, "orig")
+
+        body_ran = False
+
+        with (
+            patch("paramem.models.loader.create_adapter", side_effect=_fake_create_adapter),
+            patch("paramem.models.loader.copy_adapter_weights", side_effect=_copy),
+        ):
+            with pytest.raises(RuntimeError, match="copy failed for semantic_backup"):
+                with main_tier_backup_scope(model, self._configs()):
+                    body_ran = True
+
+        assert not body_ran, "the with body must not run when __enter__ itself fails"
+        # tier-2 (semantic) was never snapshotted — no restore copy targeting
+        # "semantic" (dst) with src="semantic_backup" may have fired.
+        assert ("semantic_backup", "semantic") not in restore_calls
+        # Both the tier-1 backup and the half-populated tier-2 backup are freed.
+        assert [k for k in model.peft_config if k.endswith("_backup")] == []
+
+    def test_create_adapter_return_value_captured(self) -> None:
+        """scope.model reflects whatever create_adapter returns, even a new object.
+
+        ``replacement`` is a plain (non-PeftModel-classed) MagicMock — the CM
+        never re-checks isinstance after entry, only reads/writes attributes
+        on whatever ``create_adapter`` hands back.
+        """
+        model = _make_backup_model("episodic")
+        replacement = MagicMock()
+        _configure_backup_mock(replacement, "episodic")
+        replacement.peft_config = model.peft_config
+        replacement.weights = model.weights
+
+        def _create_new_object(m, config, name):  # noqa: ANN001
+            m.peft_config[name] = config
+            m.weights[name] = "zero-init"
+            replacement.set_adapter(name)
+            return replacement
+
+        with (
+            patch("paramem.models.loader.create_adapter", side_effect=_create_new_object),
+            patch(
+                "paramem.models.loader.copy_adapter_weights",
+                side_effect=_fake_copy_adapter_weights,
+            ),
+        ):
+            with main_tier_backup_scope(model, self._configs(), tiers=("episodic",)) as scope:
+                assert scope.model is replacement
+                assert scope.model is not model

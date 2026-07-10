@@ -16,6 +16,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
+import torch
 from torch.utils.data import Dataset
 
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
@@ -43,6 +44,7 @@ from paramem.memory.entry import (
     format_entry_training,
 )
 from paramem.models.loader import atomic_save_adapter, switch_adapter
+from paramem.server.fold_telemetry import record_fold_telemetry
 from paramem.server.vram_guard import safe_empty_cache
 from paramem.training.key_registry import KeyRegistry
 from paramem.training.thermal_throttle import ThermalPolicy
@@ -415,6 +417,12 @@ class ConsolidationLoop:
     7. Decay unreinforced episodic memories
     """
 
+    # Class-level default so instances built via ``object.__new__`` (test
+    # harnesses that skip ``__init__`` to avoid loading a model — see
+    # tests/test_procedural.py, tests/test_run_consolidation_cycle.py,
+    # tests/test_adapter_verification.py) still resolve this attribute.
+    _telemetry_dir: "Path | None" = None
+
     def __init__(
         self,
         model,
@@ -454,6 +462,7 @@ class ConsolidationLoop:
         state_provider=None,
         thermal_policy: ThermalPolicy | None = None,
         keep_prior_slots: int = 3,
+        telemetry_dir: str | Path | None = None,
     ):
         # Optional callable that returns the server ``_state`` dict.  When
         # provided, ``run_cycle`` calls ``self.guard_trial_state(state_provider())``
@@ -461,6 +470,18 @@ class ConsolidationLoop:
         # Experiment scripts pass nothing (default ``None``) so the guard is a
         # no-op and experiment paths are unaffected.
         self.state_provider = state_provider
+        # Bounded fold VRAM/adapter telemetry ring (paths.telemetry). ``None``
+        # (the default for every experiment/test construction site) skips all
+        # telemetry writes — only the production site
+        # (paramem/server/consolidation.py) passes ``config.telemetry_dir``,
+        # which is always a Path (ServerConfig.telemetry_dir ->
+        # self.paths.telemetry, a dataclass field always Path-wrapped by the
+        # yaml loader) — never an empty string in practice, but ``is not
+        # None`` (not truthiness) is the correct check regardless.
+        # Always-on when set; NOT gated on ``debug``.
+        self._telemetry_dir: Path | None = (
+            Path(telemetry_dir) if telemetry_dir is not None else None
+        )
         self._keep_prior_slots = keep_prior_slots
         # BASE-MODEL HOLDER (ConsolidationLoop): released via
         # _state["consolidation_loop"]=None in _release_base_model_in_process.
@@ -1820,6 +1841,20 @@ class ConsolidationLoop:
         d = self.output_dir.parent / "state"
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    @staticmethod
+    def _new_telemetry_run_stamp() -> str:
+        """Mint a per-run telemetry ring key, unique per fold *run*.
+
+        Microsecond-precision UTC timestamp (``%f``) — distinct from
+        ``_compute_fold_stamp``, which hashes the SPO keyset and is
+        therefore IDENTICAL across two runs over an unchanged keyset (the
+        common steady-state case). Reusing that content fingerprint as the
+        ring key would upsert unrelated runs into one growing cycle entry;
+        this stamp instead identifies the run itself, minted once at fold
+        entry and threaded to every telemetry write of that run.
+        """
+        return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
 
     def _compute_fold_stamp(self, *, tier: "str | None" = None) -> str:
         """SHA-256 over the active registry-true SPO keyset at ``_run_fold`` entry.
@@ -3682,6 +3717,10 @@ class ConsolidationLoop:
             # --- interim-slot fold-stamp (minted before any store mutation) ---
             # scope.tier gives the logical tier; adapter_name is the PEFT slot name.
             _fold_stamp_b = self._compute_fold_stamp(tier=adapter_name or scope.tier)
+            # Per-run telemetry ring key (see _new_telemetry_run_stamp) — NOT
+            # _fold_stamp_b, which is a content fingerprint shared by every
+            # run over an unchanged keyset.
+            _telemetry_run_stamp_b = self._new_telemetry_run_stamp()
 
             # --- Crash-resume marker detection (interim fold) ---
             # Mirrors the main_tiers fold_stamp + fold_resume.json check below
@@ -3951,17 +3990,89 @@ class ConsolidationLoop:
                 # --- Train (weights source) or skip (disk source) ---
                 epi_train_loss: "float | None" = None
                 if scope.source == "weights" and all_interim_keyed:
-                    epi_metrics, recall_state = self._train_tier_adapter(
-                        all_interim_keyed,
-                        adapter_name=adapter_name,
-                        adapter_config=self.episodic_config,
-                        training_config=self._make_training_config(
-                            num_epochs=self.training_config.num_epochs
-                        ),
-                        output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
-                        run_name=f"interim-{adapter_name}-{run_label}",
-                        phase_name=f"interim-{adapter_name}-{run_label}",
-                    )
+                    # --- Per-tier device-saturation telemetry ---
+                    # Same pattern as the main-tiers train call (see comment
+                    # there): bare snapshots only, never vram_measure; the
+                    # peak is process-wide, not adapter-attributable. This
+                    # try/finally exists only to run the measurement — it has
+                    # no ``except``, so it never alters the exception type
+                    # reaching the caller.
+                    from paramem.memory.interim_adapter import INTERIM_NAME_PREFIX
+
+                    _telemetry_int_free_before: int | None = None
+                    _telemetry_int_total: int | None = None
+                    if torch.cuda.is_available():
+                        torch.cuda.reset_peak_memory_stats()
+                        _telemetry_int_free_before, _telemetry_int_total = torch.cuda.mem_get_info()
+                    try:
+                        epi_metrics, recall_state = self._train_tier_adapter(
+                            all_interim_keyed,
+                            adapter_name=adapter_name,
+                            adapter_config=self.episodic_config,
+                            training_config=self._make_training_config(
+                                num_epochs=self.training_config.num_epochs
+                            ),
+                            output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
+                            run_name=f"interim-{adapter_name}-{run_label}",
+                            phase_name=f"interim-{adapter_name}-{run_label}",
+                        )
+                    finally:
+                        if torch.cuda.is_available() and _telemetry_int_free_before is not None:
+                            _telemetry_int_peak = torch.cuda.max_memory_allocated()
+                            # peak_reserved is the OOM-relevant quantity: the
+                            # caching allocator raises when it cannot reserve,
+                            # not when driver-free (mem_get_info) drops —
+                            # driver-free counts cached-but-unused allocator
+                            # segments as used, which peak_reserved does not.
+                            _telemetry_int_peak_reserved = torch.cuda.max_memory_reserved()
+                            _telemetry_int_free_after = torch.cuda.mem_get_info()[0]
+                            logger.info(
+                                "_run_fold[interim]: telemetry interim-train[%s] "
+                                "(device-saturation indicator, not adapter cost) — "
+                                "free_before=%d free_after=%d peak_alloc=%d peak_reserved=%d",
+                                adapter_name,
+                                _telemetry_int_free_before,
+                                _telemetry_int_free_after,
+                                _telemetry_int_peak,
+                                _telemetry_int_peak_reserved,
+                            )
+                            if self._telemetry_dir is not None:
+                                try:
+                                    record_fold_telemetry(
+                                        self._telemetry_dir,
+                                        cycle_stamp=_telemetry_run_stamp_b,
+                                        kind="interim_tier_train",
+                                        record={
+                                            "tier": adapter_name,
+                                            "fold_stamp": _fold_stamp_b,
+                                            "free_before": _telemetry_int_free_before,
+                                            "free_after": _telemetry_int_free_after,
+                                            "peak_alloc": _telemetry_int_peak,
+                                            "peak_reserved": _telemetry_int_peak_reserved,
+                                            "total": _telemetry_int_total,
+                                            "adapter_count": len(self.model.peft_config),
+                                            "interim_count": len(
+                                                [
+                                                    a
+                                                    for a in self.model.peft_config
+                                                    if a.startswith(INTERIM_NAME_PREFIX)
+                                                ]
+                                            ),
+                                            "epochs": self.training_config.num_epochs,
+                                        },
+                                    )
+                                except Exception:  # noqa: BLE001  # boundary: telemetry
+                                    # runs in a finally on the exception path too — a
+                                    # write failure (disk full, permissions, corrupt
+                                    # store) must never replace the in-flight
+                                    # exception (e.g. AbortedDuringConsolidation would
+                                    # get swapped for an OSError and misrouted). Losing
+                                    # a telemetry record is strictly preferable.
+                                    logger.warning(
+                                        "_run_fold[interim]: telemetry write failed for %s",
+                                        adapter_name,
+                                        exc_info=True,
+                                    )
                     epi_train_loss = (
                         epi_metrics.get("train_loss") if epi_metrics is not None else None
                     )
@@ -4137,8 +4248,11 @@ class ConsolidationLoop:
         # Multi-tier training loop; promote=scope.promote, tier_floor=scope.tier_floor.
         # Extracted from consolidate_interim_adapters.
         # ------------------------------------------------------------------
-        from paramem.memory.interim_adapter import unload_interim_adapters
-        from paramem.models.loader import create_adapter
+        from paramem.memory.interim_adapter import (
+            INTERIM_NAME_PREFIX,
+            unload_interim_adapters,
+        )
+        from paramem.models.loader import create_adapter, main_tier_backup_scope
 
         # --- Fold-stamp + crash-resume marker (full fold) ---
         # Mint fold_stamp BEFORE any store mutation (promote/tier-floor/
@@ -4146,6 +4260,10 @@ class ConsolidationLoop:
         # reflect the pristine on-disk registry so it is byte-identical on
         # re-entry after a crash).
         _fold_stamp_c = self._compute_fold_stamp(tier=None)
+        # Per-run telemetry ring key (see _new_telemetry_run_stamp) — NOT
+        # _fold_stamp_c, which is a content fingerprint shared by every run
+        # over an unchanged keyset (the common steady-state refresh case).
+        _telemetry_run_stamp_c = self._new_telemetry_run_stamp()
         _resume_marker = self._read_fold_resume()
         _resume_c = (
             _resume_marker is not None
@@ -4372,7 +4490,6 @@ class ConsolidationLoop:
                                 " (left by prior aborted fold) on accumulating return",
                                 _bname,
                             )
-                    self._current_interim_stamp = None  # type: ignore[assignment]
                     return {
                         "status": "accumulating",
                         "accumulating_reason": {
@@ -4616,306 +4733,413 @@ class ConsolidationLoop:
                 "semantic": self.semantic_config,
                 "procedural": self.procedural_config or self.episodic_config,
             }
-            for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
-                if backup_name not in self.model.peft_config:
-                    base_tier = backup_name.replace("_backup", "")
-                    if base_tier in self.model.peft_config:
-                        from paramem.models.loader import copy_adapter_weights
-
-                        backup_config = tier_config_for_backup[base_tier]
-                        self.model = create_adapter(self.model, backup_config, backup_name)
-                        copy_adapter_weights(self.model, src=base_tier, dst=backup_name)
-                        logger.info(
-                            "_run_fold[main_tiers]: created in-memory backup %s from %s",
-                            backup_name,
-                            base_tier,
-                        )
-
-            tiers_rebuilt: list[str] = []
-            recall_per_tier: dict[str, float] = {}
-            last_per_key_by_tier: dict[str, "list | None"] = {}
-
-            # Completed-tier set from resume marker (empty on fresh fold).
-            _completed_in_marker: set[str] = (
-                set(_resume_marker.get("completed_tiers", []))  # type: ignore[union-attr]
-                if _resume_c
-                else set()
+            # --- Backup-creation window telemetry (adapter-attributable) ---
+            # The only measurement in this module that is attributable to
+            # adapter VRAM cost — main_tier_backup_scope creates up to three
+            # transient <tier>_backup adapters. free_before is sampled
+            # immediately before the CM opens; free_after is the first
+            # statement inside its body, after backup creation.
+            _telemetry_free_before = (
+                torch.cuda.mem_get_info()[0] if torch.cuda.is_available() else None
             )
-            _marker_checkpoints: dict[str, str] = (
-                _resume_marker.get("tier_checkpoints", {})  # type: ignore[union-attr]
-                if _resume_c
-                else {}
-            )
-
-            for tier in ("episodic", "semantic", "procedural"):
-                backup_name = f"{tier}_backup"
-                job = jobs_by_tier[tier]
-
-                if not job.entries and tier not in _fast_start_graduating:
-                    logger.info(
-                        "_run_fold[main_tiers]: no keys for tier %s — skipping rebuild", tier
+            with main_tier_backup_scope(self.model, tier_config_for_backup) as _bscope:
+                self.model = _bscope.model
+                if torch.cuda.is_available() and _telemetry_free_before is not None:
+                    _telemetry_free_after, _telemetry_total = torch.cuda.mem_get_info()
+                    _telemetry_adapter_count = len(self.model.peft_config)
+                    _telemetry_interim_count = len(
+                        [a for a in self.model.peft_config if a.startswith(INTERIM_NAME_PREFIX)]
                     )
-                    continue
-
-                # --- Crash-resume: reload completed tiers from durable checkpoint ---
-                if _resume_c and tier in _completed_in_marker:
-                    # The checkpoint path stored in the marker (may be absent for
-                    # fast-start tiers, which have no checkpoint-N dir).
-                    _ckpt_path = _marker_checkpoints.get(tier)
                     logger.info(
-                        "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading from"
-                        " durable checkpoint (no retrain); checkpoint=%s",
-                        tier,
-                        _ckpt_path or "production-slot",
+                        "_run_fold[main_tiers]: telemetry backup_creation — "
+                        "free_before=%d free_after=%d adapter_count=%d interim_count=%d",
+                        _telemetry_free_before,
+                        _telemetry_free_after,
+                        _telemetry_adapter_count,
+                        _telemetry_interim_count,
                     )
-                    # Delete the stale production slot (pre-crash _save_adapters never
-                    # ran — weights are stale) and reload from the checkpoint dir or the
-                    # existing production slot for fast-start tiers.
-                    # Per-tier backups created above (lines 4533-4551) mean the deleted
-                    # slot is never the last adapter on the PeftModel (no base-unwrap needed).
-                    if tier in self.model.peft_config:
-                        if backup_name in self.model.peft_config:
-                            from paramem.models.loader import switch_adapter as _sw_pre
-
-                            _sw_pre(self.model, backup_name)
-                        self.model.delete_adapter(tier)
-                        logger.debug(
-                            "_run_fold[main_tiers]: crash-resume deleted stale slot %s", tier
-                        )
-                    if _ckpt_path and Path(_ckpt_path).is_dir():
-                        # checkpoint-N dir present — load the staged adapter
-                        # from it.  HF Trainer saves all PEFT adapters under
-                        # checkpoint-N/<adapter_name>/ (one subdir per adapter).
-                        # The training adapter staging slot is "in_training"
-                        # (trainer._STAGING_ADAPTER), so the weights live at
-                        # checkpoint-N/in_training/adapter_model.safetensors.
-                        # Decrypt into /dev/shm when security is ON (mirrors
-                        # trainer.py:962-976).
-                        from paramem.backup import key_store as _ks
-                        from paramem.training.trainer import _STAGING_ADAPTER as _STAGING_SLOT
-
-                        # Resolve to the staging-adapter subdir within the checkpoint.
-                        _ckpt_staging_path = Path(_ckpt_path) / _STAGING_SLOT
-                        _ckpt_effective = (
-                            str(_ckpt_staging_path) if _ckpt_staging_path.is_dir() else _ckpt_path
-                        )
-                        _ckpt_shm_dir = None
-                        if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
-                            from paramem.backup.checkpoint_shard import (
-                                materialize_checkpoint_to_shm,
-                            )
-
-                            _ckpt_shm_dir = materialize_checkpoint_to_shm(Path(_ckpt_effective))
-                            _ckpt_load_path = str(_ckpt_shm_dir)
-                        else:
-                            _ckpt_load_path = _ckpt_effective
+                    if self._telemetry_dir is not None:
                         try:
-                            self.model.load_adapter(_ckpt_load_path, adapter_name=tier)
-                            logger.info(
-                                "_run_fold[main_tiers]: crash-resume loaded %s from checkpoint %s"
-                                " (staging slot=%s)",
-                                tier,
-                                _ckpt_path,
-                                _STAGING_SLOT,
+                            record_fold_telemetry(
+                                self._telemetry_dir,
+                                cycle_stamp=_telemetry_run_stamp_c,
+                                kind="backup_creation",
+                                record={
+                                    "fold_stamp": _fold_stamp_c,
+                                    "free_before": _telemetry_free_before,
+                                    "free_after": _telemetry_free_after,
+                                    "total": _telemetry_total,
+                                    "adapter_count": _telemetry_adapter_count,
+                                    "interim_count": _telemetry_interim_count,
+                                },
                             )
-                        finally:
-                            if _ckpt_shm_dir is not None and Path(str(_ckpt_shm_dir)).exists():
-                                import shutil as _s
+                        except Exception:  # noqa: BLE001  # boundary: telemetry runs
+                            # inside the CM's entered body — a write failure must
+                            # never replace an in-flight exception (e.g. an
+                            # AbortedDuringConsolidation raised later in the tier
+                            # loop). Losing a telemetry record is strictly
+                            # preferable to a misrouted abort.
+                            logger.warning(
+                                "_run_fold[main_tiers]: telemetry write failed for backup_creation",
+                                exc_info=True,
+                            )
+                tiers_rebuilt: list[str] = []
+                recall_per_tier: dict[str, float] = {}
+                last_per_key_by_tier: dict[str, "list | None"] = {}
 
-                                _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
-                    else:
-                        # no checkpoint dir (fast-start tier, or checkpoint missing).
-                        # Reload from the EXISTING production slot on disk — it was not
-                        # overwritten (final _save_adapters never ran on crash).
-                        from paramem.memory.interim_adapter import (
-                            adapter_slot_root_for_name as _asr_fn,
-                        )
-                        from paramem.models.loader import load_adapter as _la
-
-                        _prod_root = _asr_fn(self.output_dir, tier)
-                        _la(self.model, _prod_root.parent, tier)
-                        logger.info(
-                            "_run_fold[main_tiers]: crash-resume (fast-start/no-ckpt)"
-                            " loaded %s from production slot %s",
-                            tier,
-                            _prod_root.parent,
-                        )
-                    from paramem.models.loader import switch_adapter as _sw_resume
-
-                    _sw_resume(self.model, tier)
-                    last_per_key_by_tier[tier] = None
-                    tiers_rebuilt.append(tier)
-                    continue
-
-                if backup_name in self.model.peft_config:
-                    from paramem.models.loader import switch_adapter as _sw_backup
-
-                    _sw_backup(self.model, backup_name)
-
-                if tier in self.model.peft_config:
-                    self.model.delete_adapter(tier)
-                    logger.debug("_run_fold[main_tiers]: deleted adapter %s", tier)
-
-                tier_cfg = (
-                    self.episodic_config
-                    if tier == "episodic"
-                    else (
-                        self.semantic_config
-                        if tier == "semantic"
-                        else (self.procedural_config or self.episodic_config)
-                    )
+                # Completed-tier set from resume marker (empty on fresh fold).
+                _completed_in_marker: set[str] = (
+                    set(_resume_marker.get("completed_tiers", []))  # type: ignore[union-attr]
+                    if _resume_c
+                    else set()
                 )
-                self.model = create_adapter(self.model, tier_cfg, tier)
-                logger.debug("_run_fold[main_tiers]: created fresh adapter %s", tier)
+                _marker_checkpoints: dict[str, str] = (
+                    _resume_marker.get("tier_checkpoints", {})  # type: ignore[union-attr]
+                    if _resume_c
+                    else {}
+                )
 
-                from paramem.models.loader import switch_adapter as _sw
+                for tier in ("episodic", "semantic", "procedural"):
+                    backup_name = f"{tier}_backup"
+                    job = jobs_by_tier[tier]
 
-                _sw(self.model, tier)
-
-                # --- Fast-start graduation branch ---
-                if tier in _fast_start_graduating:
-                    from paramem.models.loader import copy_adapter_weights as _copy_aw
-                    from paramem.models.loader import (
-                        copy_adapter_weights_subset as _copy_aw_subset,
-                    )
-
-                    if tier == "procedural":
-                        _copy_aw_subset(self.model, src="episodic", dst=tier)
+                    if not job.entries and tier not in _fast_start_graduating:
                         logger.info(
-                            "_run_fold[main_tiers]: fast-start graduation — "
-                            "copied episodic attn weights into procedural (mlp stays zero-init)"
-                        )
-                    else:
-                        _copy_aw(self.model, src="episodic", dst=tier)
-                        logger.info(
-                            "_run_fold[main_tiers]: fast-start graduation — "
-                            "copied episodic weights into %s (full param set)",
-                            tier,
-                        )
-
-                    _serve_entries = serve_assignment[tier]
-                    _probe_passing = self._probe_passing_keys(tier, _serve_entries)
-                    _probe_rate = (
-                        len(_probe_passing) / len(_serve_entries) if _serve_entries else 1.0
-                    )
-                    logger.info(
-                        "_run_fold[main_tiers]: fast-start graduation probe %s"
-                        " — %d/%d passed (%.3f), threshold %.3f",
-                        tier,
-                        len(_probe_passing),
-                        len(_serve_entries),
-                        _probe_rate,
-                        recall_sanity_threshold,
-                    )
-
-                    if _probe_rate >= recall_sanity_threshold:
-                        for _fse in _serve_entries:
-                            self.store.move(_fse["key"], tier)
-                        last_per_key_by_tier[tier] = None
-                        tiers_rebuilt.append(tier)
-                        # mark fast-start tier complete (no checkpoint-N dir
-                        # exists; _mark_tier_complete stores None for reload-from-
-                        # production-slot on a subsequent crash-resume).
-                        self._mark_tier_complete(tier, None)
-                        logger.info(
-                            "_run_fold[main_tiers]: fast-start graduation accepted"
-                            " for %s (%d keys rebooked)",
-                            tier,
-                            len(_serve_entries),
+                            "_run_fold[main_tiers]: no keys for tier %s — skipping rebuild", tier
                         )
                         continue
 
-                    logger.warning(
-                        "_run_fold[main_tiers]: fast-start probe FAILED for %s"
-                        " (%.3f < %.3f) — falling back to train-from-scratch",
-                        tier,
-                        _probe_rate,
-                        recall_sanity_threshold,
-                    )
-                    _fast_start_graduating.discard(tier)
-                    job.entries = list(_serve_entries)
-                    for _fse in _serve_entries:
-                        self.store.move(_fse["key"], tier)
-                    if tier in self.model.peft_config:
-                        if backup_name in self.model.peft_config:
-                            _sw(self.model, backup_name)
-                        self.model.delete_adapter(tier)
-                    self.model = create_adapter(self.model, tier_cfg, tier)
-                    _sw(self.model, tier)
-                    logger.debug(
-                        "_run_fold[main_tiers]: recreated fresh adapter %s for fallback training",
-                        tier,
-                    )
+                    # --- Crash-resume: reload completed tiers from durable checkpoint ---
+                    if _resume_c and tier in _completed_in_marker:
+                        # The checkpoint path stored in the marker (may be absent for
+                        # fast-start tiers, which have no checkpoint-N dir).
+                        _ckpt_path = _marker_checkpoints.get(tier)
+                        logger.info(
+                            "_run_fold[main_tiers]: CRASH-RESUME tier=%s — reloading from"
+                            " durable checkpoint (no retrain); checkpoint=%s",
+                            tier,
+                            _ckpt_path or "production-slot",
+                        )
+                        # Delete the stale production slot (pre-crash _save_adapters never
+                        # ran — weights are stale) and reload from the checkpoint dir or the
+                        # existing production slot for fast-start tiers.
+                        # Per-tier backups created above (lines 4533-4551) mean the deleted
+                        # slot is never the last adapter on the PeftModel (no base-unwrap needed).
+                        if tier in self.model.peft_config:
+                            if backup_name in self.model.peft_config:
+                                from paramem.models.loader import switch_adapter as _sw_pre
 
-                prior_job = None
-                recall_state = None
-                if trainer is not None:
-                    prior_job = trainer._current_job
-                    trainer._current_job = job
-                    trainer._set_is_training(True)
-                try:
-                    _tier_metrics, recall_state = self._train_tier_adapter(
-                        job.entries,
-                        adapter_name=tier,
-                        adapter_config=tier_cfg,
-                        training_config=refresh_training_config,
-                        output_dir=self.output_dir / "consolidation_refresh" / tier,
-                        run_name=f"consolidate-{tier}",
-                        phase_name=f"consolidate-{tier}",
-                        num_epochs=refresh_epochs,
-                        retain_scratch_until_external_commit=True,
-                    )
-                    if _tier_metrics is not None:
-                        if _tier_metrics.get("aborted"):
-                            logger.info(
-                                "_run_fold[main_tiers]: training aborted on tier %s "
-                                "— restoring all tiers from backups",
-                                tier,
+                                _sw_pre(self.model, backup_name)
+                            self.model.delete_adapter(tier)
+                            logger.debug(
+                                "_run_fold[main_tiers]: crash-resume deleted stale slot %s", tier
                             )
-                            from paramem.models.loader import copy_adapter_weights as _copy_w
+                        if _ckpt_path and Path(_ckpt_path).is_dir():
+                            # checkpoint-N dir present — load the staged adapter
+                            # from it.  HF Trainer saves all PEFT adapters under
+                            # checkpoint-N/<adapter_name>/ (one subdir per adapter).
+                            # The training adapter staging slot is "in_training"
+                            # (trainer._STAGING_ADAPTER), so the weights live at
+                            # checkpoint-N/in_training/adapter_model.safetensors.
+                            # Decrypt into /dev/shm when security is ON (mirrors
+                            # trainer.py:962-976).
+                            from paramem.backup import key_store as _ks
+                            from paramem.training.trainer import _STAGING_ADAPTER as _STAGING_SLOT
 
-                            for _t in ("episodic", "semantic", "procedural"):
-                                _backup = f"{_t}_backup"
-                                if (
-                                    _backup in self.model.peft_config
-                                    and _t in self.model.peft_config
-                                ):
-                                    _copy_w(self.model, src=_backup, dst=_t)
-                            self._current_interim_stamp = None  # type: ignore[assignment]
-                            raise AbortedDuringConsolidation(f"training aborted on tier {tier!r}")
+                            # Resolve to the staging-adapter subdir within the checkpoint.
+                            _ckpt_staging_path = Path(_ckpt_path) / _STAGING_SLOT
+                            _ckpt_effective = (
+                                str(_ckpt_staging_path)
+                                if _ckpt_staging_path.is_dir()
+                                else _ckpt_path
+                            )
+                            _ckpt_shm_dir = None
+                            if _ks.daily_identity_loadable(_ks.DAILY_KEY_PATH_DEFAULT):
+                                from paramem.backup.checkpoint_shard import (
+                                    materialize_checkpoint_to_shm,
+                                )
+
+                                _ckpt_shm_dir = materialize_checkpoint_to_shm(Path(_ckpt_effective))
+                                _ckpt_load_path = str(_ckpt_shm_dir)
+                            else:
+                                _ckpt_load_path = _ckpt_effective
+                            try:
+                                self.model.load_adapter(_ckpt_load_path, adapter_name=tier)
+                                logger.info(
+                                    "_run_fold[main_tiers]: crash-resume loaded %s from"
+                                    " checkpoint %s (staging slot=%s)",
+                                    tier,
+                                    _ckpt_path,
+                                    _STAGING_SLOT,
+                                )
+                            finally:
+                                if _ckpt_shm_dir is not None and Path(str(_ckpt_shm_dir)).exists():
+                                    import shutil as _s
+
+                                    _s.rmtree(_ckpt_shm_dir, ignore_errors=True)
                         else:
-                            logger.info(
-                                "_run_fold[main_tiers]: trained %s on %d keys",
-                                tier,
-                                len(job.entries),
+                            # no checkpoint dir (fast-start tier, or checkpoint missing).
+                            # Reload from the EXISTING production slot on disk — it was not
+                            # overwritten (final _save_adapters never ran on crash).
+                            from paramem.memory.interim_adapter import (
+                                adapter_slot_root_for_name as _asr_fn,
                             )
-                finally:
-                    if trainer is not None:
-                        trainer._set_is_training(False)
-                        trainer._current_job = prior_job
+                            from paramem.models.loader import load_adapter as _la
 
-                last_per_key_by_tier[tier] = (
-                    recall_state.last_per_key if recall_state is not None else None
-                )
-                if recall_state is not None and recall_state.last_per_key is not None:
-                    self._debug_writer.on_recall_probe(
-                        recall_state.last_per_key,
-                        phase="train_fill",
-                        adapter_name=tier,
+                            _prod_root = _asr_fn(self.output_dir, tier)
+                            _la(self.model, _prod_root.parent, tier)
+                            logger.info(
+                                "_run_fold[main_tiers]: crash-resume (fast-start/no-ckpt)"
+                                " loaded %s from production slot %s",
+                                tier,
+                                _prod_root.parent,
+                            )
+                        from paramem.models.loader import switch_adapter as _sw_resume
+
+                        _sw_resume(self.model, tier)
+                        last_per_key_by_tier[tier] = None
+                        tiers_rebuilt.append(tier)
+                        continue
+
+                    if backup_name in self.model.peft_config:
+                        from paramem.models.loader import switch_adapter as _sw_backup
+
+                        _sw_backup(self.model, backup_name)
+
+                    if tier in self.model.peft_config:
+                        self.model.delete_adapter(tier)
+                        logger.debug("_run_fold[main_tiers]: deleted adapter %s", tier)
+
+                    tier_cfg = (
+                        self.episodic_config
+                        if tier == "episodic"
+                        else (
+                            self.semantic_config
+                            if tier == "semantic"
+                            else (self.procedural_config or self.episodic_config)
+                        )
                     )
-                tiers_rebuilt.append(tier)
-                # Mark this tier complete in the fold_resume.json marker so that a
-                # crash AFTER training but BEFORE _save_adapters can reload it without
-                # retraining on the next re-entry.  Locate the retained checkpoint-N dir
-                # (retain_scratch_until_external_commit=True keeps it alive until
-                # _save_adapters below).
-                _tier_ckpt_path = self._latest_checkpoint_in_dir(
-                    self.output_dir / "consolidation_refresh" / tier
-                )
-                self._mark_tier_complete(tier, _tier_ckpt_path)
+                    self.model = create_adapter(self.model, tier_cfg, tier)
+                    logger.debug("_run_fold[main_tiers]: created fresh adapter %s", tier)
 
-            if trainer is not None:
-                trainer._set_is_training(False)
+                    from paramem.models.loader import switch_adapter as _sw
+
+                    _sw(self.model, tier)
+
+                    # --- Fast-start graduation branch ---
+                    if tier in _fast_start_graduating:
+                        from paramem.models.loader import copy_adapter_weights as _copy_aw
+                        from paramem.models.loader import (
+                            copy_adapter_weights_subset as _copy_aw_subset,
+                        )
+
+                        if tier == "procedural":
+                            _copy_aw_subset(self.model, src="episodic", dst=tier)
+                            logger.info(
+                                "_run_fold[main_tiers]: fast-start graduation — "
+                                "copied episodic attn weights into procedural"
+                                " (mlp stays zero-init)"
+                            )
+                        else:
+                            _copy_aw(self.model, src="episodic", dst=tier)
+                            logger.info(
+                                "_run_fold[main_tiers]: fast-start graduation — "
+                                "copied episodic weights into %s (full param set)",
+                                tier,
+                            )
+
+                        _serve_entries = serve_assignment[tier]
+                        _probe_passing = self._probe_passing_keys(tier, _serve_entries)
+                        _probe_rate = (
+                            len(_probe_passing) / len(_serve_entries) if _serve_entries else 1.0
+                        )
+                        logger.info(
+                            "_run_fold[main_tiers]: fast-start graduation probe %s"
+                            " — %d/%d passed (%.3f), threshold %.3f",
+                            tier,
+                            len(_probe_passing),
+                            len(_serve_entries),
+                            _probe_rate,
+                            recall_sanity_threshold,
+                        )
+
+                        if _probe_rate >= recall_sanity_threshold:
+                            for _fse in _serve_entries:
+                                self.store.move(_fse["key"], tier)
+                            last_per_key_by_tier[tier] = None
+                            tiers_rebuilt.append(tier)
+                            # mark fast-start tier complete (no checkpoint-N dir
+                            # exists; _mark_tier_complete stores None for reload-from-
+                            # production-slot on a subsequent crash-resume).
+                            self._mark_tier_complete(tier, None)
+                            logger.info(
+                                "_run_fold[main_tiers]: fast-start graduation accepted"
+                                " for %s (%d keys rebooked)",
+                                tier,
+                                len(_serve_entries),
+                            )
+                            continue
+
+                        logger.warning(
+                            "_run_fold[main_tiers]: fast-start probe FAILED for %s"
+                            " (%.3f < %.3f) — falling back to train-from-scratch",
+                            tier,
+                            _probe_rate,
+                            recall_sanity_threshold,
+                        )
+                        _fast_start_graduating.discard(tier)
+                        job.entries = list(_serve_entries)
+                        for _fse in _serve_entries:
+                            self.store.move(_fse["key"], tier)
+                        if tier in self.model.peft_config:
+                            if backup_name in self.model.peft_config:
+                                _sw(self.model, backup_name)
+                            self.model.delete_adapter(tier)
+                        self.model = create_adapter(self.model, tier_cfg, tier)
+                        _sw(self.model, tier)
+                        logger.debug(
+                            "_run_fold[main_tiers]: recreated fresh adapter %s for"
+                            " fallback training",
+                            tier,
+                        )
+
+                    prior_job = None
+                    recall_state = None
+                    if trainer is not None:
+                        prior_job = trainer._current_job
+                        trainer._current_job = job
+                        trainer._set_is_training(True)
+                    # --- Per-tier device-saturation telemetry ---
+                    # max_memory_allocated() is a process-wide PyTorch-allocator
+                    # counter, polluted by the per-epoch recall probe's
+                    # model.generate() and by inference served during
+                    # BackgroundTrainer step-yields — NOT an adapter cost.
+                    # Bare snapshots only (never vram_measure: that captures
+                    # endpoint free-deltas, not the intra-training peak this
+                    # needs, and its OOM->VramExhausted transform is beside the
+                    # point here since abort/rollback is gated on
+                    # _tier_metrics.get("aborted"), a normal return value).
+                    _telemetry_tier_free_before: int | None = None
+                    _telemetry_tier_total: int | None = None
+                    if torch.cuda.is_available():
+                        torch.cuda.reset_peak_memory_stats()
+                        _telemetry_tier_free_before, _telemetry_tier_total = (
+                            torch.cuda.mem_get_info()
+                        )
+                    try:
+                        _tier_metrics, recall_state = self._train_tier_adapter(
+                            job.entries,
+                            adapter_name=tier,
+                            adapter_config=tier_cfg,
+                            training_config=refresh_training_config,
+                            output_dir=self.output_dir / "consolidation_refresh" / tier,
+                            run_name=f"consolidate-{tier}",
+                            phase_name=f"consolidate-{tier}",
+                            num_epochs=refresh_epochs,
+                            retain_scratch_until_external_commit=True,
+                        )
+                        if _tier_metrics is not None:
+                            if _tier_metrics.get("aborted"):
+                                logger.info(
+                                    "_run_fold[main_tiers]: training aborted on tier %s "
+                                    "— restoring all tiers from backups",
+                                    tier,
+                                )
+                                raise AbortedDuringConsolidation(
+                                    f"training aborted on tier {tier!r}"
+                                )
+                            else:
+                                logger.info(
+                                    "_run_fold[main_tiers]: trained %s on %d keys",
+                                    tier,
+                                    len(job.entries),
+                                )
+                    finally:
+                        if trainer is not None:
+                            trainer._set_is_training(False)
+                            trainer._current_job = prior_job
+                        if torch.cuda.is_available() and _telemetry_tier_free_before is not None:
+                            _telemetry_tier_peak = torch.cuda.max_memory_allocated()
+                            # peak_reserved is the OOM-relevant quantity: the
+                            # caching allocator raises when it cannot reserve,
+                            # not when driver-free (mem_get_info) drops —
+                            # driver-free counts cached-but-unused allocator
+                            # segments as used, which peak_reserved does not.
+                            _telemetry_tier_peak_reserved = torch.cuda.max_memory_reserved()
+                            _telemetry_tier_free_after = torch.cuda.mem_get_info()[0]
+                            logger.info(
+                                "_run_fold[main_tiers]: telemetry tier_train[%s] "
+                                "(device-saturation indicator, not adapter cost) — "
+                                "free_before=%d free_after=%d peak_alloc=%d peak_reserved=%d",
+                                tier,
+                                _telemetry_tier_free_before,
+                                _telemetry_tier_free_after,
+                                _telemetry_tier_peak,
+                                _telemetry_tier_peak_reserved,
+                            )
+                            if self._telemetry_dir is not None:
+                                try:
+                                    record_fold_telemetry(
+                                        self._telemetry_dir,
+                                        cycle_stamp=_telemetry_run_stamp_c,
+                                        kind="tier_train",
+                                        record={
+                                            "tier": tier,
+                                            "fold_stamp": _fold_stamp_c,
+                                            "free_before": _telemetry_tier_free_before,
+                                            "free_after": _telemetry_tier_free_after,
+                                            "peak_alloc": _telemetry_tier_peak,
+                                            "peak_reserved": _telemetry_tier_peak_reserved,
+                                            "total": _telemetry_tier_total,
+                                            "adapter_count": len(self.model.peft_config),
+                                            "interim_count": len(
+                                                [
+                                                    a
+                                                    for a in self.model.peft_config
+                                                    if a.startswith(INTERIM_NAME_PREFIX)
+                                                ]
+                                            ),
+                                            "epochs": refresh_epochs,
+                                        },
+                                    )
+                                except Exception:  # noqa: BLE001  # boundary: this
+                                    # finally runs on the abort path too — e.g.
+                                    # AbortedDuringConsolidation is raised in the try
+                                    # above and would reach main_tier_backup_scope's
+                                    # except only if this finally does not itself
+                                    # raise. A telemetry write failure here (disk
+                                    # full, permissions, corrupt store) must never
+                                    # replace the in-flight exception and misroute an
+                                    # abort to the crash-incident path. Losing a
+                                    # telemetry record is strictly preferable.
+                                    logger.warning(
+                                        "_run_fold[main_tiers]: telemetry write failed for tier %s",
+                                        tier,
+                                        exc_info=True,
+                                    )
+
+                    last_per_key_by_tier[tier] = (
+                        recall_state.last_per_key if recall_state is not None else None
+                    )
+                    if recall_state is not None and recall_state.last_per_key is not None:
+                        self._debug_writer.on_recall_probe(
+                            recall_state.last_per_key,
+                            phase="train_fill",
+                            adapter_name=tier,
+                        )
+                    tiers_rebuilt.append(tier)
+                    # Mark this tier complete in the fold_resume.json marker so that a
+                    # crash AFTER training but BEFORE _save_adapters can reload it without
+                    # retraining on the next re-entry.  Locate the retained checkpoint-N dir
+                    # (retain_scratch_until_external_commit=True keeps it alive until
+                    # _save_adapters below).
+                    _tier_ckpt_path = self._latest_checkpoint_in_dir(
+                        self.output_dir / "consolidation_refresh" / tier
+                    )
+                    self._mark_tier_complete(tier, _tier_ckpt_path)
+
+                if trainer is not None:
+                    trainer._set_is_training(False)
 
             # --- Atomic finalize ---
             if self.store.replay_enabled:
@@ -4947,11 +5171,7 @@ class ConsolidationLoop:
                     )
 
             if self.store.replay_enabled and tiers_rebuilt:
-                try:
-                    self._persist_fold(scope, window_stamp_override=window_stamp_override)
-                except Exception:
-                    self._current_interim_stamp = None  # type: ignore[assignment]
-                    raise
+                self._persist_fold(scope, window_stamp_override=window_stamp_override)
                 logger.info("_run_fold[main_tiers]: merged main weights persisted+verified")
                 # Clean fold-resume marker + retained scratch checkpoints after
                 # _save_adapters succeeds.  On _save_adapters FAILURE (the except
@@ -4986,11 +5206,6 @@ class ConsolidationLoop:
                 except Exception:
                     logger.exception("_run_fold[main_tiers]: router reload failed")
 
-            for backup_name in ("episodic_backup", "semantic_backup", "procedural_backup"):
-                if backup_name in self.model.peft_config:
-                    self.model.delete_adapter(backup_name)
-                    logger.debug("_run_fold[main_tiers]: unloaded backup adapter %s", backup_name)
-
             if "episodic" in self.model.peft_config:
                 from paramem.models.loader import switch_adapter as _sw2
 
@@ -5003,8 +5218,6 @@ class ConsolidationLoop:
                 minted_by_tier=minted_by_tier,
             )
             self._debug_writer.on_tier_delta(_train_tier_delta)
-
-            self._current_interim_stamp = None  # type: ignore[assignment]
 
             logger.info(
                 "_run_fold[main_tiers]: complete — rebuilt %s, drift=%d"
@@ -5034,6 +5247,7 @@ class ConsolidationLoop:
                 "tier_delta": _train_tier_delta,
             }
         finally:
+            self._current_interim_stamp = None  # type: ignore[assignment]
             self.merger.reset_graph()
 
     def consolidate_simulate_fold(self, *, housekeeping: bool = False) -> dict:

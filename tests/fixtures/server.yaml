@@ -122,6 +122,7 @@ paths:
   sessions: tests/fixtures/sandbox/data/ha/sessions    # conversation transcripts pending consolidation
   debug: tests/fixtures/sandbox/data/ha/debug          # cycle snapshots, diagnostic output (debug=true)
   prompts: configs/prompts                              # extraction and voice prompt templates (read-only, shared with live)
+  telemetry: tests/fixtures/sandbox/data/ha/telemetry  # bounded fold VRAM/adapter telemetry ring (always written)
 
 adapters:
   episodic:

@@ -227,6 +227,7 @@ def test_factory_threads_every_config_knob(
     assert captured["state_provider"] is None
     assert captured["extraction_temperature"] == 0.0
     assert captured["keep_prior_slots"] == cfg.consolidation.training_keep_prior_slots
+    assert captured["telemetry_dir"] == cfg.telemetry_dir
 
 
 # ---------------------------------------------------------------------------

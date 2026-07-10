@@ -251,6 +251,23 @@ class TestInfraPathsIncludesSafetensors:
         assert safe1 in paths
         assert safe2 in paths
 
+    def test_telemetry_file_never_enumerated(self, tmp_path):
+        """fold_telemetry.json under data_dir/telemetry/ is never a candidate.
+
+        Telemetry (paths.telemetry, integers-only VRAM/adapter metrics) must
+        stay plaintext and greppable during an incident — unlike
+        fold_resume.json and checkpoints, which are age blobs you cannot
+        ``cat`` mid-incident.
+        """
+        data_dir = tmp_path / "data"
+        telemetry_dir = data_dir / "telemetry"
+        telemetry_dir.mkdir(parents=True)
+        telemetry_file = telemetry_dir / "fold_telemetry.json"
+        telemetry_file.write_text('{"version": 1, "cycles": []}')
+
+        paths = infra_paths(data_dir)
+        assert telemetry_file not in paths
+
 
 # ---------------------------------------------------------------------------
 # atomic_save_adapter — encrypt step wired in

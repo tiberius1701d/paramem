@@ -84,6 +84,7 @@ paths:
   sessions: data/ha/sessions    # conversation transcripts pending consolidation
   debug: data/ha/debug          # cycle snapshots, diagnostic output (only when debug=true)
   prompts: configs/prompts      # extraction and voice prompt templates
+  telemetry: data/ha/telemetry  # bounded fold VRAM/adapter telemetry ring (always written)
 
 adapters:
   episodic:

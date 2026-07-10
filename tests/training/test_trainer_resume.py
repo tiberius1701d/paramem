@@ -410,6 +410,164 @@ class TestTrainAdapterEncryptedResume:
         mock_rmtree.assert_called_once_with(shm_dir, ignore_errors=True)
 
 
+class TestStagingSlotCrashCleanup:
+    """A non-abort exception must delete the transient in_training VRAM slot
+    (success and abort already do) so the NEXT training event's
+    ``_ensure_staging_slot`` does not trip its lifecycle-invariant guard and
+    permanently block consolidation until a restart.  On-disk scratch
+    (``staging_resume.json`` + checkpoint dirs) must survive — crash-resume
+    depends on it.
+
+    Unlike ``TestTrainAdapterEncryptedResume``, ``_ensure_staging_slot`` is
+    left UN-mocked here so the real staging-slot lifecycle (create → crash →
+    delete → re-create) can be exercised end to end.
+    """
+
+    def setup_method(self):
+        _CapturingTrainer.captured_train_kwargs.clear()
+
+    @staticmethod
+    def _make_crash_test_model() -> MagicMock:
+        """PeftModel-like stub with REAL add_adapter/set_adapter/delete_adapter
+        side effects (dict-backed peft_config) so create_adapter's add_adapter
+        branch and the staging-slot delete under test have real effects to
+        assert against — mirrors the pattern in test_interim_adapter_lifecycle.py.
+        """
+        import torch
+        from peft import PeftModel
+
+        model = MagicMock()
+        model.peft_config = {}
+        model.active_adapter = None
+
+        def _add_adapter(name, lora_config):
+            model.peft_config[name] = lora_config
+
+        def _set_adapter(name):
+            model.active_adapter = name
+
+        def _delete_adapter(name):
+            del model.peft_config[name]
+
+        model.add_adapter.side_effect = _add_adapter
+        model.set_adapter.side_effect = _set_adapter
+        model.delete_adapter.side_effect = _delete_adapter
+        model.named_parameters.return_value = []
+        model.parameters.return_value = [torch.zeros(1)]
+        model.gradient_checkpointing_enable.return_value = None
+        model.save_pretrained.return_value = None
+        model.__class__ = PeftModel  # satisfies create_adapter's isinstance branch check
+        return model
+
+    @staticmethod
+    def _make_boom_trainer():
+        class _BoomTrainer(_CapturingTrainer):
+            def train(self, resume_from_checkpoint=None):
+                _CapturingTrainer.captured_train_kwargs.append(
+                    {"resume_from_checkpoint": resume_from_checkpoint}
+                )
+                raise RuntimeError("boom")
+
+        return _BoomTrainer
+
+    def test_staging_slot_deleted_scratch_preserved_and_reusable(self, tmp_path):
+        """After a RuntimeError raised inside training: in_training is ABSENT
+        from peft_config, the on-disk resume marker is untouched (the crash
+        path never calls _clean_scratch — only success/abort do), and a
+        subsequent _ensure_staging_slot call succeeds (consolidation is not
+        permanently blocked)."""
+        from paramem.training.trainer import _STAGING_ADAPTER, _ensure_staging_slot
+
+        model = self._make_crash_test_model()
+        tokenizer = _make_tokenizer()
+        output_dir = tmp_path / "adapter"
+        output_dir.mkdir(parents=True)
+
+        with (
+            patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
+            patch("paramem.training.trainer.ParamemTrainer", new=self._make_boom_trainer()),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            mock_args_cls.return_value = MagicMock()
+            train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=_make_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_training_config(),
+                adapter_config=_minimal_adapter_config(),
+                output_dir=output_dir,
+            )
+
+        assert _STAGING_ADAPTER not in model.peft_config, (
+            "in_training must be deleted after a non-abort training exception"
+        )
+        # staging_resume.json is written before the crash (Step 4) and must
+        # survive it — crash-resume on the next process start depends on it.
+        assert (output_dir / "staging_resume.json").exists(), (
+            "staging_resume.json must survive the crash — needed for crash-resume"
+        )
+
+        # The next training event's staging-slot creation must succeed —
+        # the lifecycle-invariant guard is not tripped by a leaked slot.
+        _ensure_staging_slot(model, _minimal_adapter_config())
+        assert _STAGING_ADAPTER in model.peft_config
+
+    def test_active_adapter_guard_skips_delete_when_switch_fails(self, tmp_path):
+        """If the best-effort switch_adapter(model, adapter_name) restore
+        fails, active stays on the staging slot — the guard must then skip
+        the delete (never remove the active adapter)."""
+        import torch
+        from peft import PeftModel
+
+        from paramem.training.trainer import _STAGING_ADAPTER
+
+        model = MagicMock()
+        model.peft_config = {}
+        model.active_adapter = None
+
+        def _add_adapter(name, lora_config):
+            model.peft_config[name] = lora_config
+
+        def _set_adapter(name):
+            if name == "episodic":
+                raise RuntimeError("switch failed")
+            model.active_adapter = name
+
+        model.add_adapter.side_effect = _add_adapter
+        model.set_adapter.side_effect = _set_adapter
+        model.named_parameters.return_value = []
+        model.parameters.return_value = [torch.zeros(1)]
+        model.gradient_checkpointing_enable.return_value = None
+        model.save_pretrained.return_value = None
+        model.__class__ = PeftModel
+        tokenizer = _make_tokenizer()
+        output_dir = tmp_path / "adapter"
+        output_dir.mkdir(parents=True)
+
+        with (
+            patch("paramem.training.trainer.TrainingArguments") as mock_args_cls,
+            patch("paramem.training.trainer.ParamemTrainer", new=self._make_boom_trainer()),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            mock_args_cls.return_value = MagicMock()
+            train_adapter(
+                model=model,
+                tokenizer=tokenizer,
+                train_dataset=_make_dataset(),
+                adapter_name="episodic",
+                training_config=_minimal_training_config(),
+                adapter_config=_minimal_adapter_config(),
+                output_dir=output_dir,
+            )
+
+        # switch_adapter("episodic") raised, so active_adapter never left
+        # in_training — the guard must have skipped delete_adapter entirely.
+        model.delete_adapter.assert_not_called()
+        assert _STAGING_ADAPTER in model.peft_config
+        assert model.active_adapter == _STAGING_ADAPTER
+
+
 class TestTrainAdapterSavePath:
     """Regression: save_pretrained gets output_dir.parent so PEFT's auto-append
     of the adapter name lands the weights at output_dir, not at

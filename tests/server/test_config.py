@@ -724,3 +724,11 @@ class TestDefaultServerConfigPathIsCwdIndependent:
         assert DEFAULT_DATA_DIR.parent.name == "data"
         assert DEFAULT_DATA_DIR.parent.parent == DEFAULT_SERVER_CONFIG_PATH.parent.parent
         assert (DEFAULT_DATA_DIR.parent.parent / "pyproject.toml").is_file()
+
+    def test_fixture_telemetry_path_is_absolute(self):
+        # paths.telemetry must go through the same relative-path anchoring
+        # loop as data/sessions/debug/prompts (config.py's ``for path_field
+        # in (...)`` tuple). A relative path here means the loop was missed —
+        # a regression of the 8f173a4 cwd-independence fix.
+        cfg = load_server_config(Path("tests/fixtures/server.yaml"))
+        assert cfg.paths.telemetry.is_absolute()

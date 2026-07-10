@@ -194,6 +194,7 @@ def create_consolidation_loop(
             if keep_prior_slots is not None
             else config.consolidation.training_keep_prior_slots
         ),
+        telemetry_dir=config.telemetry_dir,
     )
 
     # Wire the base-model weight-hash cache from server _state into the loop so

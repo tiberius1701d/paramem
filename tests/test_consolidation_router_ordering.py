@@ -88,7 +88,17 @@ def _faithful_reconstruct(loop, *, tier=None, strict=False) -> ReconstructionRes
 
 
 def _make_stub_model(*adapter_names: str) -> MagicMock:
-    """Return a MagicMock that behaves like a minimal PeftModel."""
+    """Return a MagicMock that behaves like a minimal PeftModel.
+
+    ``__class__`` is reassigned to PeftModel so ``isinstance(model,
+    PeftModel)`` passes — required by ``main_tier_backup_scope``'s runtime
+    contract check.  ``type(model)`` stays ``MagicMock`` (only the reported
+    ``__class__`` is faked), so Mock's own permissive attribute machinery
+    still handles every read/write; the codebase's established pattern
+    (e.g. ``tests/test_interim_adapter_lifecycle.py``, ``test_procedural.py``).
+    """
+    from peft import PeftModel
+
     model = MagicMock()
     model.peft_config = {name: MagicMock() for name in adapter_names}
 
@@ -96,6 +106,7 @@ def _make_stub_model(*adapter_names: str) -> MagicMock:
         model.peft_config.pop(name, None)
 
     model.delete_adapter.side_effect = _delete_adapter
+    model.__class__ = PeftModel
     return model
 
 

@@ -453,6 +453,14 @@ class PathsConfig:
     sessions: Path = Path("data/ha/sessions")
     debug: Path = Path("data/ha/debug")
     prompts: Path = Path("configs/prompts")
+    # Bounded machine-lifetime telemetry ring (VRAM/adapter integers only —
+    # see paramem/server/fold_telemetry.py). Separate root from ``data``: a
+    # knowledge wipe deletes ``state/``, but telemetry describes the machine,
+    # not the knowledge, and must survive that wipe. Always written
+    # regardless of ``debug`` — it is not a privacy/artifact-persistence
+    # switch. Deliberately absent from ``infra_paths()`` (encryption.py) so
+    # it stays plaintext and greppable during an incident.
+    telemetry: Path = Path("data/ha/telemetry")
 
     @property
     def adapters(self) -> Path:
@@ -1575,6 +1583,10 @@ class ServerConfig:
         return self.paths.debug
 
     @property
+    def telemetry_dir(self) -> Path:
+        return self.paths.telemetry
+
+    @property
     def prompts_dir(self) -> Path:
         return self.paths.prompts
 
@@ -1763,9 +1775,10 @@ def load_server_config(path: str | Path = DEFAULT_SERVER_CONFIG_PATH) -> ServerC
             sessions=Path(paths_raw.get("sessions", config.paths.sessions)),
             debug=Path(paths_raw.get("debug", config.paths.debug)),
             prompts=Path(paths_raw.get("prompts", config.paths.prompts)),
+            telemetry=Path(paths_raw.get("telemetry", config.paths.telemetry)),
         )
     # Make relative paths absolute (anchored to project root)
-    for path_field in ("data", "sessions", "debug", "prompts"):
+    for path_field in ("data", "sessions", "debug", "prompts", "telemetry"):
         p = getattr(config.paths, path_field)
         if not p.is_absolute():
             setattr(config.paths, path_field, config_dir / p)

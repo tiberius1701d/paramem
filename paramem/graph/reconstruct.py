@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 import networkx as nx
 
-from paramem.models.loader import switch_adapter
+from paramem.models.loader import active_adapter_name, switch_adapter
 from paramem.training.recall_eval import probe_entries
 
 logger = logging.getLogger(__name__)
@@ -127,16 +127,8 @@ def reconstruct_graph(
     model = loop.model
     tokenizer = loop.tokenizer
 
-    # Capture the currently-active adapter so we can restore it. PEFT 0.18+
-    # normally exposes a string here, but some PeftModel layouts return a list
-    # (the same defensive unwrap is used in ``app.py`` around
-    # ``model.active_adapter``) — defending against that here keeps the restore
-    # path passing a string to ``switch_adapter`` under any PEFT minor-version.
-    _raw_active = model.active_adapter
-    if isinstance(_raw_active, list):
-        original_adapter: str | None = _raw_active[0] if _raw_active else None
-    else:
-        original_adapter = _raw_active
+    # Capture the currently-active adapter so we can restore it.
+    original_adapter: str | None = active_adapter_name(model)
 
     graph = nx.MultiDiGraph()
     failures: list[dict] = []

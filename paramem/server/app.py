@@ -44,7 +44,12 @@ from paramem.backup.backup import write_bundle
 from paramem.backup.types import ArtifactKind
 from paramem.graph.extractor import ExtractionFailed
 from paramem.graph.name_match import is_speaker_id as _is_speaker_id
-from paramem.models.loader import load_base_model, switch_adapter, unload_model
+from paramem.models.loader import (
+    active_adapter_name,
+    load_base_model,
+    switch_adapter,
+    unload_model,
+)
 from paramem.server import calibrate as calibrate_module
 from paramem.server.active_store_migration import migrate
 from paramem.server.background_trainer import BackgroundTrainer
@@ -3912,11 +3917,7 @@ async def status():
     # model hasn't loaded (cloud-only) or no adapters exist yet.
     active_adapter: str | None = None
     if model is not None and hasattr(model, "active_adapter"):
-        raw_active = model.active_adapter
-        if isinstance(raw_active, list):
-            active_adapter = raw_active[0] if raw_active else None
-        else:
-            active_adapter = raw_active
+        active_adapter = active_adapter_name(model)
 
     # Active key count comes from the one authoritative MemoryStore — the same
     # store /debug/dump and the recall path read.  It is loaded from disk (main

@@ -927,7 +927,11 @@ def train_adapter(
             adapter_name,
         )
     else:
-        # Step 1: Ensure the staging slot exists and matches shape.
+        # Step 1: Create the transient staging slot for this training event.
+        # ``_ensure_staging_slot`` never rebuilds an existing slot — it raises
+        # RuntimeError when one is already present, which signals missing
+        # cleanup at the prior event's success (1213-1239), abort (1240-1259),
+        # or exception (1272-1293) path.
         _ensure_staging_slot(model, adapter_config)
 
         # Step 2: Copy production → staging (best-effort; first-time tiers
@@ -1289,5 +1293,31 @@ def train_adapter(
                     adapter_name,
                     exc_info=True,
                 )
+            # Delete the transient in_training VRAM slot — success (1238) and
+            # abort (1255) both already do this; leaving it resident here
+            # trips _ensure_staging_slot's lifecycle-invariant guard on the
+            # next training event, permanently blocking consolidation until a
+            # restart.  The guard below skips the delete if active is still
+            # the staging slot (the switch_adapter above may have failed) —
+            # the active adapter must never be deleted.
+            from paramem.models.loader import active_adapter_name
+
+            if (
+                _STAGING_ADAPTER in model.peft_config
+                and active_adapter_name(model) != _STAGING_ADAPTER
+            ):
+                try:
+                    model.delete_adapter(_STAGING_ADAPTER)  # VRAM slot only; on-disk scratch kept
+                    logger.info(
+                        "Staging: deleted %s after exception (lifecycle: per-training-event)",
+                        _STAGING_ADAPTER,
+                    )
+                except Exception:  # noqa: BLE001  # best-effort teardown; original exception must
+                    # still propagate — see the try/except above for the same contract.
+                    logger.warning(
+                        "Staging: could not delete %s after exception",
+                        _STAGING_ADAPTER,
+                        exc_info=True,
+                    )
         # Do NOT clean scratch — it is needed for crash-resume on next start.
         raise
