@@ -6,18 +6,22 @@ Contradiction resolution:
   Cardinality judgment is cached per predicate (one model call per unique predicate).
   Active whenever a model is present and ``resolve_contradictions=True``.
 - COEXIST: both values are independent and multi-valued; keep both edges.
-- REPLACE (single-valued): recency selection over ``{incoming} ∪ rivals``.
+- REPLACE (single-valued): recency selection over ``{incoming} ∪ rivals``, treating an
+  empty ``last_seen`` ("") as the oldest possible timestamp (dated always beats undated).
   Rule (applied uniformly at ingest, interim, and fold; no positional fork):
-  1. ANY candidate ``last_seen`` is empty (``""``) → COEXIST: insert incoming, remove
-     nothing.  Covers legacy timestamp-less keys at fold (all ""), and mixed registries
-     where one side is a dated key and the other is a legacy "".
-  2. All candidates have datestamps: ``max_ls = max(candidates)``.  Strictly-older rivals
-     (``last_seen < max_ls``) are retired and ledgered.  Ties at ``max_ls`` coexist.
-     Incoming: if ``incoming_ls == max_ls`` → insert (fall through to Case-3);
-     if ``incoming_ls < max_ls`` → incoming loses → NOT inserted, ledgered.
+  1. ALL candidates' ``last_seen`` are empty (``""``) → COEXIST: insert incoming, remove
+     nothing.  Covers legacy timestamp-less keys at fold (all "") where no candidate
+     carries a recency signal.
+  2. At least one candidate is dated: ``max_ls = max(candidates)`` (empty "" sorts below
+     every ISO-8601 string, so it can never win unless every candidate is empty).
+     Strictly-older rivals (``last_seen < max_ls``, including undated ones) are retired
+     and ledgered.  Ties at ``max_ls`` coexist.  Incoming: if ``incoming_ls == max_ls`` →
+     insert (fall through to Case-3); if ``incoming_ls < max_ls`` → incoming loses → NOT
+     inserted, ledgered.  An undated incoming fact never wins against a dated rival; a
+     dated incoming fact always outranks an undated rival.
   At fold, the session ``timestamp`` passed to the merger is ``""`` so the fallback
-  ``relation.last_seen or timestamp`` yields ``""`` for legacy relations — they hit
-  rule 1 (coexist) rather than fabricating a NOW value.
+  ``relation.last_seen or timestamp`` yields ``""`` for legacy relations — they only
+  coexist when every rival is likewise undated; a dated rival supersedes them.
 - When no model is present (experiments, after release): all triples coexist (no removal).
 """
 
@@ -540,12 +544,15 @@ class GraphMerger:
 
            - ``COEXIST``: both values are independent; all edges kept.
            - ``REPLACE`` (single-valued): recency selection over
-             ``{incoming} ∪ rivals``.  If ANY candidate ``last_seen`` is ``""``
-             → COEXIST (no removal; covers legacy fold keys and mixed
-             dated/legacy registries).  Otherwise all are dated: strictly-older
-             rivals retired + ledgered; ties at ``max_ls`` coexist; incoming
-             NOT inserted (returns ``None``) and ledgered when strictly older
-             than ``max_ls``.  ``incoming_ls = relation.last_seen or timestamp``
+             ``{incoming} ∪ rivals``, treating an empty ``last_seen`` (``""``)
+             as the oldest possible timestamp.  If EVERY candidate's
+             ``last_seen`` is ``""`` → COEXIST (no removal; no recency signal
+             anywhere).  Otherwise at least one candidate is dated:
+             strictly-older rivals (including undated ones) are retired +
+             ledgered; ties at ``max_ls`` coexist; incoming NOT inserted
+             (returns ``None``) and ledgered when strictly older than
+             ``max_ls``.  A dated candidate always outranks an undated one.
+             ``incoming_ls = relation.last_seen or timestamp``
              (``timestamp=""`` at fold/recon/simulate; ``now()`` at ingest).
 
            When ``resolve_contradictions=False``, Case-2 is short-circuited:
@@ -685,14 +692,19 @@ class GraphMerger:
         #   1. Gather ALL rival edges (same subject+predicate, different object).
         #   2. Run ONE cardinality verdict (cached per predicate).
         #   3. COEXIST → fall through.
-        #   4. REPLACE → recency selection across {incoming} ∪ rivals:
-        #      - incoming_ls = relation.last_seen or timestamp (never empty)
+        #   4. REPLACE → recency selection across {incoming} ∪ rivals, "" sorts as the
+        #      oldest possible timestamp (dated always beats undated):
+        #      - incoming_ls = relation.last_seen or timestamp (may be "" at fold)
         #      - rival_ls  = each rival's stored last_seen (may be "")
-        #      - max_ls = lexicographic max across the full set
-        #      - n_at_max >= 2 (empty or tied) → coexist; fall through, no removal
-        #      - incoming uniquely freshest → retire ALL rivals, fall through
-        #      - rival uniquely freshest → that rival survives; other rivals retired;
-        #        incoming is NOT inserted (return None after ledgering its key)
+        #      - max_ls = lexicographic max across the full set ("" only wins when
+        #        every candidate in the set is "")
+        #      - every candidate "" → coexist; fall through, no removal
+        #      - incoming uniquely freshest (dated, beats any undated rival) → retire
+        #        ALL rivals, fall through
+        #      - rival uniquely freshest (dated, beats an undated incoming) → that
+        #        rival survives; other rivals retired; incoming is NOT inserted
+        #        (return None after ledgering its key)
+        #      - ties at max_ls (including an all-"" set) coexist
         if resolve_contradictions and self.model is not None and self.graph.has_node(subject):
             # Gather all rival (obj, edge_key, edge_data) triples.
             rivals: list[tuple[str, int, dict]] = []
@@ -738,14 +750,18 @@ class GraphMerger:
                     incoming_ls = relation.last_seen or timestamp
                     rival_ls_list = [data.get("last_seen", "") for _, _, data in rivals]
 
-                    if any(ls == "" for ls in [incoming_ls, *rival_ls_list]):
-                        # ANY candidate last_seen is empty (unknown recency) → COEXIST.
-                        # Covers: legacy timestamp-less keys at fold (all ""), and mixed
-                        # registries where a legacy "" key is a rival of a dated incoming
-                        # (or vice versa).  Safe no-op: insert incoming, remove nothing.
+                    if incoming_ls == "" and all(ls == "" for ls in rival_ls_list):
+                        # EVERY candidate last_seen is empty (no recency signal anywhere)
+                        # → COEXIST.  Covers legacy timestamp-less keys at fold (all "").
+                        # Safe no-op: insert incoming, remove nothing.
                         pass
                     else:
-                        # All candidates have datestamps; freshest wins.
+                        # At least one candidate is dated; freshest wins.  An empty
+                        # last_seen sorts as the oldest possible timestamp (Python
+                        # string comparison: "" < any non-empty ISO-8601 string), so a
+                        # dated candidate always outranks an undated one — a dated
+                        # incoming fact supersedes an undated rival, and an undated
+                        # incoming fact never wins against a dated rival.
                         # Strictly-older rivals (last_seen < max_ls) are retired.
                         # Ties at max_ls coexist (rivals AND incoming if at max_ls).
                         max_ls = max([incoming_ls, *rival_ls_list])

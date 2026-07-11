@@ -143,12 +143,16 @@ class ConsolidationConfig:
     refinement_normalization: str = "on"  # full-fold predicate-synonym collapse. off|on
     # Whether the merger resolves same-predicate/different-object cardinality
     # conflicts (Case-2 COEXIST/REPLACE) at ingest, interim, and fold.
-    # Unified recency rule (REPLACE cardinality): if ANY candidate last_seen is ""
-    # → coexist (covers legacy keys and mixed dated/legacy registries).  Otherwise
-    # all are dated: strictly-older rivals retired; ties coexist; incoming loses if
-    # strictly older.  The model determines the cardinality axis (COEXIST vs REPLACE);
-    # recency fires only when REPLACE is returned.  Applied uniformly at ingest,
-    # interim, and fold; no positional fork.  off|on.
+    # Unified recency rule (REPLACE cardinality): an empty last_seen ("") sorts as
+    # the oldest possible timestamp, so a dated candidate always outranks an
+    # undated one.  Coexist fires ONLY when EVERY candidate (incoming + all
+    # rivals) is undated (covers fully-legacy registries with no recency signal
+    # anywhere).  Otherwise at least one candidate is dated: strictly-older
+    # rivals (including undated ones) are retired; ties at the max timestamp
+    # coexist; incoming loses if strictly older than the winner.  The model
+    # determines the cardinality axis (COEXIST vs REPLACE); recency fires only
+    # when REPLACE is returned.  Applied uniformly at ingest, interim, and fold;
+    # no positional fork.  off|on.
     refinement_contradiction: str = "off"
     # Minimum recall fraction (0, 1] that every recall gate must reach before the
     # adapter fold is accepted.  Applied to: post-save disk-integrity probes

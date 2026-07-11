@@ -852,3 +852,149 @@ class TestStartedAtEndedAt:
         turns = buf._turns[session["session_id"]]
         assert session["started_at"] == turns[0]["timestamp"]
         assert session["ended_at"] == turns[-1]["timestamp"]
+
+
+# ---------------------------------------------------------------------------
+# Durability: fsync on per-turn append, atomic rewrite in
+# claim_sessions_for_speaker, torn-tail tolerance in _read_jsonl.
+# ---------------------------------------------------------------------------
+
+
+class TestAppendTurnFsync:
+    def test_append_calls_fsync(self, tmp_path, monkeypatch):
+        """_append_turn's JSONL write is followed by an explicit fsync, not
+        just a buffered write — a served turn must survive a host power
+        loss, not just an ordinary process exit."""
+        import os
+
+        buf = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+
+        calls = []
+        real_fsync = os.fsync
+        monkeypatch.setattr(
+            "paramem.server.session_buffer.os.fsync",
+            lambda fd: (calls.append(fd), real_fsync(fd))[1],
+        )
+
+        buf.append("conv-1", "user", "hello")
+
+        assert calls, "os.fsync must be called after writing a turn"
+
+    def test_turn_readable_after_reopen(self, tmp_path):
+        """A behavioral proxy for durability: a turn appended by one
+        SessionBuffer instance is readable by a fresh instance that
+        rehydrates from the same session_dir (simulating a restart after
+        the writing process exited)."""
+        buf1 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf1.append("conv-1", "user", "hello durable world")
+
+        buf2 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf2.rehydrate_from_disk()
+
+        pending = buf2.get_pending()
+        assert len(pending) == 1
+        assert "hello durable world" in pending[0]["transcript"]
+
+
+class TestClaimSessionsAtomicRewrite:
+    def _enroll_and_embed(self, tmp_path):
+        import math
+
+        from paramem.server.speaker import SpeakerStore
+
+        v = [0.5, 0.3, 0.7, 0.1, 0.4, 0.6, 0.2, 0.8]
+        norm = math.sqrt(sum(x * x for x in v))
+        embedding = [x / norm for x in v]
+        store = SpeakerStore(tmp_path / "profiles.json")
+        speaker_id = store.enroll("Alex", embedding)
+        return store, speaker_id, embedding
+
+    def test_in_memory_claim_rewrite_leaves_no_tmp_file(self, buf, tmp_path):
+        """claim_sessions_for_speaker's in-memory rewrite site writes via the
+        atomic tmp + fsync + rename helper — no ``.tmp`` sibling survives a
+        successful call, and the rewritten file holds every turn."""
+        store, speaker_id, embedding = self._enroll_and_embed(tmp_path)
+
+        buf.append("conv-orphan", "user", "hello there", embedding=embedding)
+        buf.append("conv-orphan", "assistant", "hi back")
+        session_id = buf.get_pending()[0]["session_id"]
+
+        claimed = buf.claim_sessions_for_speaker(speaker_id, "Alex", store)
+        assert claimed == 1
+
+        jsonl_path = buf.session_dir / f"{session_id}.jsonl"
+        tmp_files = list(buf.session_dir.glob("*.tmp"))
+        assert not tmp_files, f"leftover tmp files after claim rewrite: {tmp_files}"
+
+        turns = buf._read_jsonl(jsonl_path)
+        assert len(turns) == 2
+        assert all(t["speaker_id"] == speaker_id for t in turns)
+
+    def test_disk_only_claim_rewrite_leaves_no_tmp_file(self, tmp_path):
+        """Same atomicity guarantee for the disk-only-session branch of
+        claim_sessions_for_speaker (session not yet loaded into RAM)."""
+        store, speaker_id, embedding = self._enroll_and_embed(tmp_path)
+
+        buf1 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        buf1.append("conv-orphan", "user", "hello there", embedding=embedding)
+        session_id = buf1.get_pending()[0]["session_id"]
+
+        # Fresh buffer that has NOT loaded this session into RAM — forces
+        # the disk-only branch.
+        buf2 = SessionBuffer(session_dir=tmp_path / "sessions", state_dir=tmp_path / "state")
+        claimed = buf2.claim_sessions_for_speaker(speaker_id, "Alex", store)
+        assert claimed == 1
+
+        jsonl_path = buf2.session_dir / f"{session_id}.jsonl"
+        tmp_files = list(buf2.session_dir.glob("*.tmp"))
+        assert not tmp_files, f"leftover tmp files after claim rewrite: {tmp_files}"
+
+        turns = buf2._read_jsonl(jsonl_path)
+        assert len(turns) == 1
+        assert turns[0]["speaker_id"] == speaker_id
+
+
+class TestReadJsonlTornTail:
+    def test_tolerates_torn_final_line(self, tmp_path, caplog):
+        """A torn (partially-written) final line does not blow up the read —
+        the well-formed turns before it are still returned, and the
+        malformed line is logged, not silently dropped without a trace."""
+        import json
+        import logging
+
+        path = tmp_path / "conv-1.jsonl"
+        good_turn = {"role": "user", "text": "hello", "speaker": None, "speaker_id": None}
+        with open(path, "w") as f:
+            f.write(json.dumps(good_turn) + "\n")
+            f.write('{"role": "user", "text": "cut off mid-wri')  # torn, no closing brace
+
+        # Explicitly wire caplog handler into the session_buffer logger
+        # (pattern from tests/test_run_consolidation_cycle.py) so the
+        # WARNING emitted by _read_jsonl is captured.
+        sb_logger = logging.getLogger("paramem.server.session_buffer")
+        sb_logger.addHandler(caplog.handler)
+        sb_logger.setLevel(logging.WARNING)
+        try:
+            turns = SessionBuffer._read_jsonl(path)
+        finally:
+            sb_logger.removeHandler(caplog.handler)
+
+        assert turns == [good_turn]
+        assert any("malformed" in r.message for r in caplog.records), (
+            f"Expected WARNING about malformed line; got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_well_formed_file_unaffected(self, tmp_path):
+        """No regression for the common case: a clean file with no torn
+        lines round-trips exactly."""
+        import json
+
+        path = tmp_path / "conv-1.jsonl"
+        turn_a = {"role": "user", "text": "a"}
+        turn_b = {"role": "assistant", "text": "b"}
+        with open(path, "w") as f:
+            f.write(json.dumps(turn_a) + "\n")
+            f.write(json.dumps(turn_b) + "\n")
+
+        turns = SessionBuffer._read_jsonl(path)
+        assert turns == [turn_a, turn_b]

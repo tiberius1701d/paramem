@@ -12922,8 +12922,11 @@ class TestMergeRegistryRelationsTimestamp:
     appear as the unique freshest and wrongly retiring a genuinely-dated rival.
 
     With the fix, timestamp="" (the new default param), so incoming_ls = "" or "" = ""
-    which triggers the any-empty COEXIST rule.  Dated keys are never retired by a
-    legacy "".
+    for legacy relations.  An empty last_seen sorts as the oldest possible timestamp:
+    a dated candidate always outranks an undated one, so a legacy "" key is retired
+    in favor of any genuinely-dated rival.  The any-empty COEXIST rule applies only
+    when EVERY candidate (incoming + all rivals) is undated — the fold-wide legacy
+    case with no recency signal anywhere.
     """
 
     @staticmethod
@@ -12986,8 +12989,8 @@ class TestMergeRegistryRelationsTimestamp:
         loop.store = store
         return loop
 
-    def test_mixed_dated_legacy_recon_coexist_c1_regression(self, tmp_path):
-        """C1 fix: mixed registry (one dated key, one legacy "") through recon merge.
+    def test_mixed_dated_legacy_recon_dated_wins(self, tmp_path):
+        """Dated-wins-over-undated: mixed registry (dated key, legacy "") through recon merge.
 
         Simulates a fold _merge_registry_relations call with:
           - Relation A (lives in → munich), last_seen="2026-01-01T00:00:00Z" (dated)
@@ -12995,12 +12998,14 @@ class TestMergeRegistryRelationsTimestamp:
 
         Both share the same (subject=alex, predicate=lives in) so Case-2 fires.
 
-        Before C1 fix: timestamp=now() was passed to the SessionGraph; the merger
-        evaluated incoming_ls = "" or now() = now() for the legacy relation, making it
-        the unique freshest → the dated munich key was wrongly retired.
-
-        After C1 fix: timestamp="" (default) → incoming_ls = "" → any-empty rule →
-        COEXIST.  Both edges survive and the removal_ledger is empty.
+        An empty last_seen sorts as the oldest possible timestamp, so a dated
+        candidate always outranks an undated one: the dated munich relation is
+        processed first (net-new insert, no rivals yet); the legacy berlin
+        relation is then evaluated as incoming against the dated munich rival —
+        incoming_ls="" loses to rival max_ls="2026-01-01T00:00:00Z", so berlin is
+        NOT inserted and is ledgered as retired in favor of munich.  COEXIST only
+        applies when EVERY candidate (incoming + rivals) is undated, which is not
+        the case here.
         """
         from paramem.graph.schema import Relation
 
@@ -13044,22 +13049,25 @@ class TestMergeRegistryRelationsTimestamp:
             if d.get("predicate") == "lives in"
         ]
         assert "munich" in lives_in_objects, (
-            "C1 regression: dated munich key must NOT be retired by a legacy '' relation"
+            "Dated munich key must survive: a dated candidate always outranks an undated rival"
         )
-        assert "berlin" in lives_in_objects, "Legacy berlin relation must be inserted (coexist)"
-        # No removal_ledger entry: any-empty → coexist → no ledger write.
-        assert not loop.merger.removal_ledger, (
-            f"No removal_ledger entry expected for any-empty coexist; "
-            f"got {loop.merger.removal_ledger}"
+        assert "berlin" not in lives_in_objects, (
+            "Legacy '' berlin relation must be retired: it loses to the dated munich rival"
         )
+        assert loop.merger.removal_ledger.get("key_berlin_legacy") == {
+            "reason": "contradiction_same_pred",
+            "old_object": "berlin",
+            "new_object": "munich",
+        }, f"Expected key_berlin_legacy retired for munich; got {loop.merger.removal_ledger}"
 
     def test_capture_pending_propagates_last_seen(self, tmp_path):
         """_capture_pending_relations carries the edge last_seen onto the captured Relation.
 
         Pending graph edges are stamped with the real ingest-time last_seen by the
         merger's Case-3 path (merger.py:821).  Without this propagation the captured
-        Relation would carry last_seen="" and the any-empty COEXIST rule would
-        prevent a newer pending fact from superseding an older dated rival.
+        Relation would carry last_seen="" (undated) and lose outright to a dated
+        rival — a dated candidate always outranks an undated one — preventing a
+        newer pending fact from superseding an older dated rival.
         """
         loop = self._make_loop_for_recon_merge(tmp_path)
         loop.merger.graph.add_node("alex")
@@ -13093,8 +13101,10 @@ class TestMergeRegistryRelationsTimestamp:
         carries its genuine recency.  The all-dated path fires: incoming_ls="2026-01-02"
         > rival_ls="2026-01-01" → munich retired, berlin inserted.
 
-        Without the fix (last_seen=""), incoming_ls="" → any-empty COEXIST → munich
-        survives (regression: NEW never supersedes OLD).
+        Without the fix (last_seen=""), incoming_ls="" (undated) would lose outright
+        to the dated munich rival — a dated candidate always outranks an undated one
+        — so munich survives and berlin is never inserted (regression: NEW never
+        supersedes OLD).
         """
         from paramem.graph.schema import Relation
         from paramem.memory.persistence import _IK_KEY_ATTR
@@ -13165,11 +13175,14 @@ class TestMergeRegistryRelationsTimestamp:
         )
         assert loop.merger.removal_ledger["key_munich_old"]["reason"] == "contradiction_same_pred"
 
-    def test_pending_dated_vs_legacy_empty_rival_coexist(self, tmp_path):
-        """Pending dated relation vs legacy "" registry-true rival → COEXIST (any-empty rule).
+    def test_pending_dated_vs_legacy_empty_rival_dated_wins(self, tmp_path):
+        """Pending dated relation vs legacy "" registry-true rival → dated wins (REPLACE).
 
-        A pending fact with a real last_seen must NOT retire a legacy "" registry key —
-        the any-empty COEXIST rule protects them.
+        A pending fact with a real last_seen retires a legacy "" registry rival —
+        an empty last_seen sorts as the oldest possible timestamp, so the dated
+        incoming relation always outranks the undated rival.  COEXIST only applies
+        when EVERY candidate is undated, which is not the case here (the pending
+        relation is dated).
         """
         from paramem.graph.schema import Relation
         from paramem.memory.persistence import _IK_KEY_ATTR
@@ -13229,12 +13242,15 @@ class TestMergeRegistryRelationsTimestamp:
             if d.get("predicate") == "lives in"
         ]
         assert "berlin" in lives_in_objects, "Dated pending Berlin must be inserted"
-        assert "munich" in lives_in_objects, (
-            "Legacy '' Munich must survive (any-empty COEXIST: rival has last_seen='')"
+        assert "munich" not in lives_in_objects, (
+            "Legacy '' Munich must be retired: a dated incoming relation always "
+            "outranks an undated rival"
         )
-        assert not loop.merger.removal_ledger, (
-            f"No removal for any-empty coexist; got {loop.merger.removal_ledger}"
-        )
+        assert loop.merger.removal_ledger.get("key_munich_legacy") == {
+            "reason": "contradiction_same_pred",
+            "old_object": "munich",
+            "new_object": "berlin",
+        }, f"Expected key_munich_legacy retired for berlin; got {loop.merger.removal_ledger}"
 
 
 # ---------------------------------------------------------------------------

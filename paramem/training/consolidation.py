@@ -3243,7 +3243,10 @@ class ConsolidationLoop:
                   ``_merge_registry_relations`` call so a newer pending fact can
                   supersede a strictly-older dated registry-true rival.  Without
                   this field the captured relation would have ``last_seen=""``
-                  and the any-empty COEXIST rule would suppress all supersession.
+                  (undated) and lose outright to the dated registry-true rival —
+                  a dated candidate always outranks an undated one — suppressing
+                  the intended supersession (COEXIST only applies when every
+                  candidate is undated, which would not be the case here).
                 - ``first_seen`` from the edge ``"first_seen"`` attribute (empty
                   string when absent) — symmetric carry so the re-merge's
                   ``min_nonempty`` window-start logic sees the real earliest
@@ -6081,8 +6084,11 @@ class ConsolidationLoop:
                 Default ``""`` (empty string) for all HISTORICAL callers
                 (recon/registry-true/simulate-disk/enrichment), which ensures the
                 merger's ``relation.last_seen or timestamp`` fallback yields ``""``
-                for legacy relations — triggering the any-empty COEXIST rule instead
-                of fabricating a NOW recency value.  Pass ``datetime.now()`` only for
+                for legacy relations instead of fabricating a NOW recency value.
+                A legacy ``""`` relation coexists with its rivals only when every
+                rival is also undated; a genuinely dated rival always outranks it
+                (dated wins over undated) and the legacy relation is retired.
+                Pass ``datetime.now()`` only for
                 genuinely FRESH sessions where an empty ``last_seen`` should resolve
                 to the current wall-clock time.  Currently all callers are historical
                 and omit this parameter (receive the ``""`` default).
@@ -6263,8 +6269,10 @@ class ConsolidationLoop:
                 :meth:`_merge_registry_relations` for the registry-true recon
                 merge.  Driven by ``config.refinement_contradiction == "on"``.
                 At fold, ``timestamp=""`` is passed to the merger so legacy
-                relations (``last_seen=""``) trigger the any-empty COEXIST rule
-                rather than fabricating a NOW value — a safe no-op for legacy keys.
+                relations (``last_seen=""``) never fabricate a NOW recency value.
+                A legacy relation coexists with its rivals only when every rival
+                is also undated; a genuinely dated rival always outranks it
+                (dated wins over undated) and the legacy relation is retired.
                 Ignored when ``source="disk"`` (no recon merge performed).
             resolve_contradictions_extra: Forwarded to
                 :meth:`_merge_registry_relations` for the ``extra_relations``
@@ -6305,8 +6313,10 @@ class ConsolidationLoop:
             # Merge the disk-loaded relations through the extra_relations channel.
             # resolve_contradictions mirrors the train path: driven by
             # config.refinement_contradiction.  With timestamp="" (default), legacy
-            # relations (last_seen="") trigger the any-empty COEXIST rule rather
-            # than fabricating a NOW recency value — simulate==train invariant holds.
+            # relations (last_seen="") never fabricate a NOW recency value; a legacy
+            # relation coexists only when every rival is also undated, and is
+            # retired when a genuinely dated rival outranks it (dated wins over
+            # undated) — simulate==train invariant holds.
             self._merge_registry_relations(
                 extra_relations or [],
                 session_id="__simulate_consolidation_merge__",
@@ -6399,10 +6409,12 @@ class ConsolidationLoop:
         # GraphMerger.merge() onto the merged edge (provenance keying).
         #
         # resolve_contradictions_recon is driven by config.refinement_contradiction.
-        # When "on": the merger may retire strictly-older registry-true edges; but since
-        # timestamp="" is passed (default), legacy relations (last_seen="") always trigger
-        # the any-empty COEXIST rule — no removal for legacy keys.  Only fully-dated
-        # rival sets participate in recency selection.
+        # When "on": the merger may retire strictly-older registry-true edges; since
+        # timestamp="" is passed (default), a legacy relation (last_seen="") never
+        # fabricates a NOW recency value.  An empty last_seen sorts as the oldest
+        # possible timestamp, so a legacy key coexists with its rivals only when
+        # every rival is ALSO undated; a genuinely dated rival always outranks it
+        # (dated wins over undated) and the legacy key is retired.
         # Two registry keys sharing identical (s,p,o) STILL fire Case-1 (the merger
         # identity is correct given correct inputs), and the collapsed key is recorded
         # in merger.collapsed.  The drift-partition step below soft-stales that key.
@@ -6418,8 +6430,10 @@ class ConsolidationLoop:
         # entity_type="person" + speaker_id from bookkeeping.  Before unification
         # this block used entities=[] → concept nodes with no speaker_id.
         # resolve_contradictions_recon is driven by config.refinement_contradiction.
-        # timestamp="" (default) ensures legacy keys (last_seen="") hit the any-empty
-        # COEXIST rule rather than fabricating a NOW recency value.
+        # timestamp="" (default) ensures legacy keys (last_seen="") never fabricate a
+        # NOW recency value; a legacy key coexists only when every rival is also
+        # undated, and is retired when a genuinely dated rival outranks it (dated
+        # wins over undated).
         self._merge_registry_relations(
             recon_relations,
             session_id="__full_consolidation_recon__",

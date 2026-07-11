@@ -1551,7 +1551,8 @@ class TestReinforcementTracking:
         tied datestamps → coexist; both edges survive, no ledger entry.
 
         Covers the within-session tie case (shared real timestamp).  Empty/legacy
-        keys are a separate rule (any-empty → coexist) tested in TestRecencyAnyEmpty.
+        keys are a separate rule (empty sorts as oldest; all-empty → coexist)
+        tested in TestRecencyAnyEmpty.
         """
         from unittest.mock import MagicMock, patch
 
@@ -2017,12 +2018,16 @@ class TestRemovalLedger:
 
 
 class TestRecencyAnyEmpty:
-    """Recency rule: ANY empty last_seen among candidates → COEXIST (no removal).
+    """Recency rule: an empty last_seen sorts as the oldest possible timestamp.
+
+    COEXIST only when EVERY candidate (incoming + all rivals) has last_seen="".
+    As soon as any candidate is dated, freshest-wins applies and an empty
+    last_seen can never be the winner (A2 fix — "dated wins over undated").
 
     Covers:
-    - incoming last_seen="" with a dated rival → coexist (C1 regression test)
-    - dated incoming with a rival last_seen="" → coexist
-    - both incoming and rival last_seen="" → coexist
+    - dated rival vs undated incoming → REPLACE: rival survives, incoming dropped
+    - dated incoming vs undated rival → REPLACE: incoming survives, rival removed
+    - both incoming and rival last_seen="" → coexist (no recency signal anywhere)
     - 3+ dated rivals with a unique max → strictly-older pair retired, max survives
     - 3+ dated rivals with a top tie → strictly-older retired, tied pair coexist
     """
@@ -2096,40 +2101,44 @@ class TestRecencyAnyEmpty:
             if d.get("predicate") == "lives in"
         ]
 
-    def test_incoming_empty_rival_dated_coexist(self):
-        """C1 regression: incoming last_seen="" vs dated rival → COEXIST.
+    def test_incoming_empty_rival_dated_replace_rival_wins(self):
+        """A2: incoming last_seen="" vs a dated rival → REPLACE, rival wins.
 
-        Before C1 fix, timestamp=now() was passed to the merger's SessionGraph so
-        the merger evaluated incoming_ls = "" or now() = now(), making the legacy key
-        appear as the unique freshest → the dated rival was wrongly retired.
-        With the fix, timestamp="" so incoming_ls = "" → any-empty rule → COEXIST.
+        An empty last_seen sorts as the oldest possible timestamp, so the dated
+        rival is the unique freshest.  The undated incoming loses and is NOT
+        inserted; the dated rival survives untouched.
         """
         m = self._make_graph_with_rival(rival_last_seen="2026-01-01T00:00:00Z")
-        self._upsert_berlin(m, incoming_last_seen="")  # legacy incoming
+        self._upsert_berlin(m, incoming_last_seen="")  # undated incoming
 
         objects = self._get_lives_in_objects(m)
-        assert "munich" in objects, (
-            "Dated rival Munich must survive — C1: legacy incoming must NOT beat a dated rival"
+        assert "munich" in objects, "Dated rival Munich must survive"
+        assert "berlin" not in objects, (
+            "Undated incoming Berlin must NOT be inserted — it loses to a dated rival"
         )
-        assert "berlin" in objects, "Legacy incoming Berlin must be inserted (coexist)"
-        assert not m.removal_ledger, (
-            f"No ledger entry for any-empty coexist; got {m.removal_ledger}"
-        )
+        assert "key_berlin" in m.removal_ledger, "Loser incoming key must be ledgered"
+        assert "key_munich" not in m.removal_ledger, "Winner Munich key must NOT be ledgered"
 
-    def test_rival_empty_incoming_dated_coexist(self):
-        """Dated incoming vs rival last_seen="" → COEXIST (any-empty rule)."""
-        m = self._make_graph_with_rival(rival_last_seen="")  # legacy rival
+    def test_rival_empty_incoming_dated_replace_incoming_wins(self):
+        """A2: dated incoming vs rival last_seen="" → REPLACE, incoming wins.
+
+        An empty last_seen sorts as the oldest possible timestamp, so the dated
+        incoming is the unique freshest.  The undated rival is retired
+        (removed) and the dated incoming is inserted.
+        """
+        m = self._make_graph_with_rival(rival_last_seen="")  # undated rival
         self._upsert_berlin(m, incoming_last_seen="2026-01-02T00:00:00Z")  # dated incoming
 
         objects = self._get_lives_in_objects(m)
-        assert "munich" in objects, "Legacy rival Munich must survive (any-empty → coexist)"
-        assert "berlin" in objects, "Dated incoming Berlin must be inserted (coexist)"
-        assert not m.removal_ledger, (
-            f"No ledger entry for any-empty coexist; got {m.removal_ledger}"
+        assert "munich" not in objects, (
+            "Undated rival Munich must be retired — it loses to a dated incoming"
         )
+        assert "berlin" in objects, "Dated incoming Berlin must be inserted (wins)"
+        assert "key_munich" in m.removal_ledger, "Retired undated rival key must be ledgered"
+        assert "key_berlin" not in m.removal_ledger, "Winner incoming key must NOT be ledgered"
 
     def test_both_empty_coexist(self):
-        """Both incoming and rival last_seen="" → COEXIST (any-empty rule covers all-empty)."""
+        """Both incoming and rival last_seen="" → COEXIST (no recency signal anywhere)."""
         m = self._make_graph_with_rival(rival_last_seen="")
         self._upsert_berlin(m, incoming_last_seen="")
 

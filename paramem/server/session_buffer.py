@@ -8,10 +8,15 @@ Every user turn stores a voice embedding fingerprint alongside the text.
 When a speaker enrolls, pending sessions are retroactively claimed by
 matching stored embeddings against the new profile.
 
-Privacy mode (persist=False): transcripts live only in RAM. After
-consolidation the knowledge is in the adapter weights — no textual
-traces remain on disk. Set persist=True (debug mode) to write JSONL
-files for inspection.
+Session turns are always written to a per-session JSONL file under
+``session_dir`` as they are appended — there is no RAM-only mode (see
+:meth:`SessionBuffer._append_turn`'s 2026-05-14 invariant). After
+consolidation, ``retain_sessions``/``debug`` decide the JSONL's fate:
+moved under ``retention_dir`` when either is True, unlinked outright
+when both are False (see :meth:`SessionBuffer.mark_consolidated`).
+``debug`` additionally exposes disk-only pending sessions through
+:meth:`SessionBuffer.get_session_turns` / ``pending_count`` for
+inspection.
 
 Document ingest: each chunk becomes a separate session whose id is
 ``<doc_id>-c<chunk_index:03d>``.  All chunk sessions for the same
@@ -23,6 +28,7 @@ The original document bytes are stored as ``<doc_id>.origdoc`` in
 
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -31,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from paramem.backup.encryption import (
+    _atomic_write_bytes,
     envelope_decrypt_bytes,
     envelope_encrypt_bytes,
 )
@@ -77,9 +84,15 @@ def _mint_session_id(conversation_id: str) -> str:
 class SessionBuffer:
     """Buffers conversation transcripts for later consolidation.
 
-    When persist=True (debug mode), each conversation gets a JSONL file
-    on disk. When persist=False (production), transcripts live only in
-    RAM and are discarded after consolidation.
+    Every conversation's turns are written to a per-session JSONL file
+    under ``session_dir`` as they are appended — persistence is
+    unconditional, not gated by a constructor flag (see
+    :meth:`_append_turn`'s 2026-05-14 invariant). ``retain_sessions`` and
+    ``debug`` govern what happens to that JSONL once a session retires:
+    :meth:`mark_consolidated` moves it under ``retention_dir`` when
+    either flag is True, or deletes it when both are False. ``debug``
+    additionally makes disk-only pending sessions visible through
+    :meth:`get_session_turns` / ``pending_count`` for inspection.
 
     Two in-memory maps, split by concept (each field has exactly one home):
 
@@ -275,9 +288,13 @@ class SessionBuffer:
 
         # Pending sessions ALWAYS persist on disk until consumed by a
         # consolidation (2026-05-14 invariant — independent of debug / mode).
+        # fsync before the handle closes so a served turn survives a host
+        # power loss, not just an ordinary process exit.
         path = self.session_dir / f"{session_id}.jsonl"
         with open(path, "a") as f:
             f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     def _resolve_session_id(self, conversation_id: str) -> str:
         """Resolve the concrete session_id for a conversation turn, rotating
@@ -439,12 +456,13 @@ class SessionBuffer:
             logger.info("Claimed session %s for speaker %s", conv_id, speaker_name)
 
             # Sync to disk — JSONL is the durable representation of pending
-            # sessions (2026-05-14 invariant, always-on).
+            # sessions (2026-05-14 invariant, always-on). Written via the
+            # atomic tmp-file + fsync + rename helper so a crash mid-rewrite
+            # leaves the original file intact rather than truncated.
             path = self.session_dir / f"{conv_id}.jsonl"
             if path.exists():
-                with open(path, "w") as f:
-                    for turn in turns:
-                        f.write(json.dumps(turn) + "\n")
+                content = "".join(json.dumps(turn) + "\n" for turn in turns).encode()
+                _atomic_write_bytes(path, content)
 
         # Also check disk-only sessions (pending JSONL files not yet loaded
         # into RAM, e.g. after a graceful exit before consolidation).
@@ -473,11 +491,13 @@ class SessionBuffer:
             if not has_match:
                 continue
 
-            with open(path, "w") as f:
-                for turn in lines:
-                    turn["speaker"] = speaker_name
-                    turn["speaker_id"] = speaker_id
-                    f.write(json.dumps(turn) + "\n")
+            for turn in lines:
+                turn["speaker"] = speaker_name
+                turn["speaker_id"] = speaker_id
+            # Atomic tmp-file + fsync + rename — a crash mid-rewrite must
+            # leave the original file intact, not truncated.
+            content = "".join(json.dumps(turn) + "\n" for turn in lines).encode()
+            _atomic_write_bytes(path, content)
 
             claimed += 1
             logger.info("Claimed session %s for speaker %s (disk)", path.stem, speaker_name)
@@ -1237,14 +1257,25 @@ class SessionBuffer:
 
     @staticmethod
     def _read_jsonl(path: Path) -> list[dict]:
-        """Read all turns from a JSONL file."""
+        """Read all turns from a JSONL file.
+
+        Tolerates a torn tail line (e.g. a crash mid-``write`` left a
+        partial final line): a line that fails to parse as JSON is skipped
+        with a warning rather than raising, so the well-formed turns that
+        precede it are still returned. Only malformed lines are skipped —
+        a parse failure on a non-tail line is equally tolerated since a
+        torn write can, in principle, land anywhere in the file.
+        """
         turns = []
         with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                turns.append(json.loads(line))
+                try:
+                    turns.append(json.loads(line))
+                except json.JSONDecodeError:
+                    logger.warning("_read_jsonl: skipping malformed line in %s: %r", path, line)
         return turns
 
     def save_snapshot(self) -> bool:
