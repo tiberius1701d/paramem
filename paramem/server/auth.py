@@ -5,9 +5,11 @@ and/or a populated :class:`~paramem.server.user_tokens.UserTokenStore` (per-user
 tokens, wired by the app lifespan).
 
 Behavior:
-- Token **unset** and no user-token store wired → middleware is a no-op.  A
-  single WARN is emitted at startup ("auth disabled").  Preserves current
-  behavior for existing deployments.
+- Token **unset** and no user-token store wired → no token check is performed
+  (any request passes through), but the request is stamped with the non-admin
+  ``"chat"`` scope, so administrative endpoints (gated by ``require_admin``)
+  stay locked until a credential is configured — fail-closed admin.  A single
+  WARN is emitted at startup ("auth disabled").
 - Token **set** or a user-token store is wired → every REST request must carry
   a valid token in ``Authorization: Bearer <token>`` or the configured cookie.
   Missing or invalid tokens return HTTP 401 with a JSON error.  A wired store
@@ -17,7 +19,9 @@ Behavior:
 Two-mode (Security OFF/ON) model:
 
 - **OFF** — ``_enabled`` (static shared-token check) is ``False`` AND no
-  user-token store is wired (getter is ``None`` or returns ``None``).
+  user-token store is wired (getter is ``None`` or returns ``None``).  Chat/
+  voice endpoints (unguarded by any scope check) remain reachable; admin
+  endpoints 403 via ``require_admin`` until a token/store is configured.
 - **ON-shared** — ``PARAMEM_API_TOKEN`` is set.  All requests validated via
   constant-time comparison.  No ``speaker_id`` attached (legacy = unattributed).
 - **ON-per-user** — a :class:`~paramem.server.user_tokens.UserTokenStore` is
@@ -86,9 +90,12 @@ class BearerTokenMiddleware:
       ``scope["state"]["speaker_id"]``.
 
     When *token* is empty and *user_token_getter* is ``None`` (or returns
-    ``None``), the middleware is a **pass-through** (Security OFF).  A wired
-    store with zero active tokens is **fail-closed** (401) so that revoking
-    the last token does not silently open every endpoint.
+    ``None``), no token is required (Security OFF), but the request is
+    stamped with the non-admin ``"chat"`` scope rather than ``"admin"`` —
+    fail-closed admin: chat/voice endpoints stay reachable, administrative
+    endpoints 403 via ``require_admin`` until a credential is configured.  A
+    wired store with zero active tokens is **fail-closed** (401) so that
+    revoking the last token does not silently open every endpoint.
 
     The ``enabled`` property reflects the *static* shared-token part only.
     Dynamic per-user enablement is computed per request from the store.
@@ -152,11 +159,13 @@ class BearerTokenMiddleware:
         )
         enabled = bool(self._token) or (store is not None)
         if not enabled:
-            # Security OFF — the whole server is open by design (no credential
-            # configured).  Stamp admin scope so the ``require_admin`` gate
-            # stays a pure ``scope == "admin"`` check and OFF-mode requests
-            # reach every endpoint as before.
-            scope.setdefault("state", {})["scope"] = "admin"
+            # Security OFF — fail-closed admin: the server is usable (chat/voice
+            # endpoints reachable, no scope gate on them) but administrative
+            # endpoints stay locked until a credential is configured.  Stamp the
+            # same non-admin sentinel used for a per-user "chat" token (see
+            # ``user_tokens._DEFAULT_SCOPE``) so ``require_admin`` 403s exactly
+            # as it does for a real chat-scope token — no separate sentinel.
+            scope.setdefault("state", {})["scope"] = "chat"
             await self.app(scope, receive, send)
             return
 

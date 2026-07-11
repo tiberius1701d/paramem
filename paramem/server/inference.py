@@ -8,9 +8,14 @@ Dispatch is on ``RoutingPlan.intent`` populated by the router:
    :func:`_handle_escalation`.
 2. ``COMMAND`` → HA conversation agent first (verbatim sanitized
    query), SOTA fallback only when HA is unreachable.
-3. ``GENERAL`` / ``UNKNOWN`` → HA first, SOTA fallback.  ``UNKNOWN``
-   is resolved per :class:`IntentConfig.fail_closed_intent` at the
-   tier-selection step (router-side).
+3. ``GENERAL`` → HA first, SOTA fallback.
+4. ``UNKNOWN`` (intent could not be established — no classifier
+   config, no encoder/exemplars loaded, below-margin confidence) is
+   treated as personal at the ``is_personal`` gate below (fail
+   closed): SOTA is never reached.  HA stays reachable as a tool
+   fallback.  Tier selection resolves ``UNKNOWN`` separately per
+   :class:`IntentConfig.fail_closed_intent` (router-side); this gate
+   controls only the cloud-escalation boundary.
 
 Speaker scoping (``RoutingPlan.steps``) is the privacy boundary — only
 the resolved speaker's keys can populate ``keys_to_probe``.  The
@@ -221,8 +226,11 @@ def handle_chat(
       tool fallback.  **SOTA is never reached** — personal-class queries
       stay off the cloud (privacy invariant, threaded as ``is_personal``
       through the call tree).
-    * ``COMMAND`` / ``GENERAL`` / ``UNKNOWN`` → HA first (tools, live
-      state), SOTA fallback (reasoning).
+    * ``COMMAND`` / ``GENERAL`` → HA first (tools, live state), SOTA
+      fallback (reasoning).
+    * ``UNKNOWN`` — intent could not be established; ``is_personal``
+      treats it the same as ``PERSONAL`` (fail closed), so it never
+      reaches SOTA even when the routing plan carries no probe steps.
 
     The ``is_residual`` diagnostic tracks "did any graph signal fire?"
     for the routing-quality metric independent of the intent decision —
@@ -256,7 +264,11 @@ def handle_chat(
                 routing_diags["intent"] = plan.intent.value
 
             intent = plan.intent if plan is not None else Intent.UNKNOWN
-            is_personal = intent == Intent.PERSONAL
+            # Fail closed: an intent that could not be established (no
+            # IntentConfig, classifier unavailable, below-margin confidence)
+            # is treated as personal here so it is never escalated to an
+            # external cloud provider.
+            is_personal = intent in (Intent.PERSONAL, Intent.UNKNOWN)
 
             # Pre-compute sanitization once for all cloud escalation paths.
             # Personal-content detection is anchored on the graph's

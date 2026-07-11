@@ -817,17 +817,18 @@ class TestScopeOnRequestState:
         assert resp.json()["scope"] == "chat"
         assert resp.json()["speaker_id"] is None
 
-    def test_off_mode_stamps_admin_scope(self):
-        """OFF mode (no token, no store) → handler runs, scope stamped 'admin'.
+    def test_off_mode_stamps_chat_scope(self):
+        """OFF mode (no token, no store) → handler runs, scope stamped 'chat'.
 
-        OFF is the deliberate open posture: the middleware stamps
-        admin scope on pass-through requests so the ``require_admin`` gate stays
-        a pure ``scope == 'admin'`` check and every endpoint stays reachable
-        without credentials.
+        Fail-closed admin: OFF mode is open for use (no token check performed),
+        but the request is stamped with the non-admin 'chat' scope — the same
+        sentinel a per-user chat token carries — so ``require_admin`` denies
+        admin endpoints until a credential is configured, while unguarded
+        (chat/voice) endpoints stay reachable without credentials.
         """
         app = _make_scope_app(shared_token="", user_token_getter=None)
         client = TestClient(app)
 
         resp = client.get("/ping")
-        assert resp.status_code == 200  # OFF mode passes through
-        assert resp.json()["scope"] == "admin"
+        assert resp.status_code == 200  # OFF mode passes through (no scope gate here)
+        assert resp.json()["scope"] == "chat"

@@ -2637,11 +2637,11 @@ def require_admin(request: Request) -> None:
     Accept condition: ``request.state.scope == "admin"`` — default-deny.
     Fail-closed: a chat-scope per-user token has ``scope == "chat"`` and is
     denied.  In auth-OFF mode (no shared token AND no user-token store) the
-    server is open by design — ``BearerTokenMiddleware`` stamps
-    ``scope == "admin"`` on every pass-through request (see
-    ``auth.py`` OFF branch), so admin endpoints stay reachable, preserving the
-    prior open-in-OFF behaviour.  The gate therefore enforces only in ON mode
-    (shared token set OR user-token store wired), where a chat-scope token 403s.
+    server is open for use — ``BearerTokenMiddleware`` stamps the same
+    non-admin ``scope == "chat"`` on every pass-through request (see
+    ``auth.py`` OFF branch), so admin endpoints 403 here until a shared token
+    or a per-user store is configured (fail-closed admin), while unguarded
+    endpoints (chat/voice) remain reachable without a credential.
 
     Raising ``HTTPException`` is FastAPI-idiomatic boundary rejection — NOT a
     suppressing try/except.
@@ -6459,9 +6459,10 @@ async def gpu_release():
     a server already in cloud-only returns 200 immediately.
 
     During an in-flight consolidation cycle the server returns 503; the
-    caller may retry. Mid-cycle release would corrupt extraction state:
-    the cycle re-extracts on next start, but losing partial-cycle work is
-    wasteful (the older signal-exit release path had the same flaw).
+    caller may retry. This is a policy choice, not a correctness necessity:
+    the cycle re-extracts/resumes cleanly on next start with no persistent
+    corruption, but releasing mid-cycle would discard the in-progress work
+    of the current cycle, so the refusal avoids that waste.
 
     On success the response is synchronous — by the time the POST returns,
     the model is unloaded and ``_state["mode"]`` is ``"cloud-only"``. The

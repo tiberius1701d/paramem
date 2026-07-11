@@ -6,7 +6,8 @@ CPU-only — no model load.  Uses a minimal FastAPI app with
 - chat-scope tokens are denied on admin endpoints (403 admin_scope_required).
 - admin-scope tokens are accepted on admin endpoints.
 - chat-scope tokens reach /chat, /voice (path-level), /push/* without 403.
-- auth-OFF mode allows admin endpoints (server open by design — no credential).
+- auth-OFF mode denies admin endpoints (fail-closed admin) while non-admin
+  endpoints stay reachable without a credential.
 - The real app route table has ``require_admin`` on every audited admin path.
 - /admin/assign-orphans is reachable by a per-user admin token (ON-per-user
   mode, shared env token unset).
@@ -131,21 +132,35 @@ class TestChatScopeOnAdminRoute:
         resp = client.post("/admin-post", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 403
 
-    def test_off_mode_allows_admin_endpoint(self, tmp_path, monkeypatch):
-        """Auth OFF (no token, no store) → admin endpoint reachable (open by design).
+    def test_off_mode_denies_admin_endpoint(self, tmp_path, monkeypatch):
+        """Auth OFF (no token, no store) → admin endpoint 403s (fail-closed admin).
 
-        OFF mode is fully open: no credential is configured.
-        The middleware stamps ``scope == "admin"`` on every OFF-mode pass-through,
-        so admin endpoints stay reachable as they were before the scope gate.
+        OFF mode is open for use — no credential is required to reach the
+        server at all — but the middleware stamps the non-admin ``"chat"``
+        scope on every pass-through request, so ``require_admin`` denies admin
+        endpoints until a shared token or per-user store is configured.
         """
         # Build an app with no shared token and no store → OFF mode.
         app = _make_app(shared_token="", user_token_getter=None)
         client = TestClient(app)
 
-        # OFF mode: middleware stamps admin scope; require_admin allows.
+        # OFF mode: middleware stamps chat scope; require_admin denies.
         resp = client.get("/admin-only")
+        assert resp.status_code == 403
+
+    def test_off_mode_allows_chat_endpoint(self, tmp_path, monkeypatch):
+        """Auth OFF (no token, no store) → non-admin endpoint stays reachable.
+
+        Fail-closed admin only locks the admin surface; endpoints with no
+        scope gate (e.g. /chat) remain open by design when no credential is
+        configured.
+        """
+        app = _make_app(shared_token="", user_token_getter=None)
+        client = TestClient(app)
+
+        resp = client.post("/chat")
         assert resp.status_code == 200
-        assert resp.json()["admin"] is True
+        assert resp.json()["scope"] == "chat"
 
 
 # ---------------------------------------------------------------------------

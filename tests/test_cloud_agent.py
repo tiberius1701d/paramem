@@ -257,12 +257,18 @@ class TestPrivacyRouting:
 
     def _make_mock_router(self, known_entities=None):
         """Create a mock router that emits a PERSONAL plan when *known_entities*
-        appear in the query (or the speaker name).
+        appear in the query (or the speaker name), and a GENERAL plan
+        otherwise.
 
         Production routing no longer derives PERSONAL from entity matches —
         intent is encoder-driven.  This mock continues to use entity matching
         as a convenient way to simulate "encoder says PERSONAL" for the
-        privacy-invariant tests below, without standing up the encoder.
+        privacy-invariant tests below, without standing up the encoder.  The
+        no-match branch uses ``Intent.GENERAL`` (a genuinely non-personal
+        classification) rather than ``Intent.UNKNOWN`` — since the fail-
+        closed gate in ``handle_chat`` now treats UNKNOWN as personal (see
+        ``test_unknown_intent_never_reaches_cloud``), UNKNOWN is no longer a
+        valid stand-in for "non-personal" here.
         """
         from paramem.server.router import Intent, RoutingPlan, RoutingStep
 
@@ -283,9 +289,27 @@ class TestPrivacyRouting:
                     strategy="targeted_probe",
                     intent=Intent.PERSONAL,
                 )
-            return RoutingPlan(strategy="direct", intent=Intent.UNKNOWN)
+            return RoutingPlan(strategy="direct", intent=Intent.GENERAL)
 
         router.route = route
+        return router
+
+    def _make_unknown_router(self):
+        """Create a mock router returning ``Intent.UNKNOWN`` with no steps.
+
+        Simulates the "intent could not be established" case (no
+        ``IntentConfig``, classifier unavailable, below-margin confidence):
+        ``RoutingPlan.intent`` carries the raw ``UNKNOWN`` value and
+        ``plan.steps`` is empty, exercising the defensive fallthrough
+        branch in ``handle_chat`` rather than the direct personal-probe
+        branch.
+        """
+        from paramem.server.router import Intent, RoutingPlan
+
+        router = MagicMock()
+        router.route = lambda text, speaker_id=None: RoutingPlan(
+            strategy="direct", intent=Intent.UNKNOWN
+        )
         return router
 
     def _make_ha_only_router(self):
@@ -434,6 +458,72 @@ class TestPrivacyRouting:
         cloud_agent.call.assert_called_once()
         assert result.escalated is True
         assert result.text == "cloud answer"
+
+    def test_unknown_intent_never_reaches_cloud(self):
+        """Regression: Intent.UNKNOWN must fail closed to personal.
+
+        Without an ``IntentConfig`` (or below the confidence margin),
+        ``classify_intent`` returns ``Intent.UNKNOWN``.  The privacy gate in
+        ``handle_chat`` must treat that identically to ``PERSONAL`` — an
+        unclassifiable query is never escalated to the external SOTA
+        provider, even though the routing plan carries no probe steps and
+        falls through the same HA-first/SOTA-fallback branch a GENERAL
+        query would use.
+        """
+        from paramem.server.inference import handle_chat
+
+        cloud_agent = self._make_mock_cloud_agent()
+        router = self._make_unknown_router()
+
+        model = MagicMock()
+        model.gradient_checkpointing_disable = MagicMock()
+        tokenizer = MagicMock()
+
+        config = MagicMock()
+        config.voice.load_prompt.return_value = "You are a helper."
+        config.sanitization.mode = "off"
+
+        # Mock HA client that returns None (simulates HA unavailable) so the
+        # SOTA fallback is the next stop — same shape as the GENERAL case
+        # in test_non_personal_query_goes_to_cloud.
+        ha_client = MagicMock()
+        ha_client.conversation_process.return_value = None
+
+        # HA fails and SOTA is blocked (is_personal), so handle_chat falls
+        # through to the local base-model answer as the last resort — mock
+        # its generation the same way test_no_cloud_falls_back_to_local
+        # does so the assertions below exercise the routing/privacy gate,
+        # not real (unmocked) model.generate() output.
+        with (
+            patch(
+                "paramem.server.inference.generate_answer",
+                return_value="I'm not sure about that.",
+            ),
+            patch(
+                "paramem.server.inference.detect_escalation",
+                return_value=(False, ""),
+            ),
+        ):
+            result = handle_chat(
+                text="What is the weather today?",
+                conversation_id="test",
+                speaker=None,
+                speaker_id="spk-test",
+                history=None,
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                router=router,
+                ha_client=ha_client,
+                sota_agent=cloud_agent,
+                memory_store=_MS(replay_enabled=False),
+            )
+
+        # HA (local) is still reachable as a tool fallback for UNKNOWN...
+        ha_client.conversation_process.assert_called_once()
+        # ...but SOTA (external cloud) must NOT have been called.
+        cloud_agent.call.assert_not_called()
+        assert result.escalated is False
 
     def test_no_cloud_falls_back_to_local(self):
         """Without cloud agent, non-personal query uses local model."""

@@ -169,6 +169,35 @@ def _isolate_paramem_security_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _admin_scope_default():
+    """Grant admin scope by default on the module-singleton ``app_module.app``.
+
+    Endpoint tests across ``tests/server/*`` and a handful of root-level
+    files (``test_consolidation.py``, ``test_consolidation_guard.py``,
+    ``test_lang_id.py``) build ``TestClient(app_module.app)`` with no auth
+    configured and call ``require_admin``-gated routes — they exist to test
+    endpoint LOGIC, not the auth boundary. A fail-closed-admin security fix
+    (unconfigured auth now stamps the non-admin ``chat`` scope instead of
+    ``admin``) made every one of those calls 403 ``admin_scope_required``.
+
+    Auth behavior itself is independently covered by
+    ``tests/server/test_require_admin.py`` and
+    ``tests/server/test_auth_middleware.py`` — both build their OWN
+    ``FastAPI()`` instance (never ``app_module.app``), so overriding the
+    dependency on the shared singleton cannot mask those.
+
+    ``dependency_overrides`` lives on the shared ``app`` object, so the
+    override is popped on teardown (not just cleared) to guarantee it never
+    leaks into a test that deliberately wants the real admin gate.
+    """
+    from paramem.server.app import app, require_admin
+
+    app.dependency_overrides[require_admin] = lambda: None
+    yield
+    app.dependency_overrides.pop(require_admin, None)
+
+
+@pytest.fixture(autouse=True)
 def _extraction_trace_scope():
     """Auto-wrap every test in an :func:`extraction_trace` scope.
 
