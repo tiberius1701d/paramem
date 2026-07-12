@@ -83,8 +83,15 @@ class TestEndpointGuards:
             "background_trainer": None,
         }
 
-    def test_scheduled_tick_409_when_trial_active(self, monkeypatch):
-        """POST /scheduled-tick returns 409 trial_active when TRIAL is active."""
+    @pytest.mark.parametrize(
+        "path",
+        ["/scheduled-tick", "/consolidate", "/consolidate/interim", "/reconsolidate"],
+    )
+    def test_consolidation_routes_409_when_trial_active(self, monkeypatch, path):
+        """Every consolidation door returns 409 trial_active — via require_no_trial.
+
+        One dependency, four routes: the refusal cannot drift between them.
+        """
         from fastapi.testclient import TestClient
 
         import paramem.server.app as app_module
@@ -92,22 +99,59 @@ class TestEndpointGuards:
         state = self._make_state("TRIAL")
         monkeypatch.setattr(app_module, "_state", state)
         client = TestClient(app_module.app, raise_server_exceptions=False)
-        resp = client.post("/scheduled-tick")
+        resp = client.post(path)
         assert resp.status_code == 409
         assert resp.json()["detail"]["error"] == "trial_active"
 
-    def test_consolidate_409_when_trial_active(self, monkeypatch):
-        """POST /consolidate returns 409 trial_active when TRIAL is active."""
+    def test_ingest_sessions_keeps_its_own_trial_guard_behind_body_validation(
+        self, monkeypatch, tmp_path
+    ):
+        """/ingest-sessions is deliberately NOT on ``require_no_trial``.
+
+        A route-level dependency is resolved BEFORE body validation, so a
+        malformed body would come back 409 instead of 422, and the ingest CLI's
+        400/404 payloads would be pre-empted under TRIAL.  Its guard stays
+        in-handler, after those checks.
+        """
         from fastapi.testclient import TestClient
 
         import paramem.server.app as app_module
 
         state = self._make_state("TRIAL")
+        state["speaker_store"] = None
+        state["session_buffer"] = None
         monkeypatch.setattr(app_module, "_state", state)
         client = TestClient(app_module.app, raise_server_exceptions=False)
-        resp = client.post("/consolidate")
-        assert resp.status_code == 409
-        assert resp.json()["detail"]["error"] == "trial_active"
+
+        # Malformed body under TRIAL → 422 (body validation still runs first).
+        malformed = client.post("/ingest-sessions", json={"speaker_id": "speaker1"})
+        assert malformed.status_code == 422
+
+        # Empty speaker_id under TRIAL → the CLI's 400 payload, not a 409.
+        empty_speaker = client.post(
+            "/ingest-sessions",
+            json={
+                "speaker_id": "",
+                "sessions": [],
+                "document_filename": "d.txt",
+                "document_b64": "",
+            },
+        )
+        assert empty_speaker.status_code == 400
+        assert empty_speaker.json()["rejected_no_speaker_id"] is True
+
+        # Unknown speaker under TRIAL → the CLI's 404 payload, not a 409.
+        unknown_speaker = client.post(
+            "/ingest-sessions",
+            json={
+                "speaker_id": "speaker9",
+                "sessions": [],
+                "document_filename": "d.txt",
+                "document_b64": "",
+            },
+        )
+        assert unknown_speaker.status_code == 404
+        assert unknown_speaker.json()["rejected_unknown_speaker"] is True
 
     def test_scheduled_tick_proceeds_when_live(self, monkeypatch):
         """POST /scheduled-tick does NOT return 409 when state is LIVE."""
@@ -117,18 +161,15 @@ class TestEndpointGuards:
 
         state = self._make_state("LIVE")
 
-        def _fake_maybe_trigger(*, apply_schedule_gate):
+        def _fake_dispatch(action, *, apply_schedule_gate):
             # /scheduled-tick must apply the suspend/power-off catch-up gate.
             assert apply_schedule_gate is True
-            return "deferred"
+            assert action is app_module.ConsolidationAction.AUTO
+            return "deferred", action
 
-        # Patch _maybe_trigger_scheduled_consolidation to avoid actual work.
+        # Patch the arbitrator to avoid actual work.
         monkeypatch.setattr(app_module, "_state", state)
-        monkeypatch.setattr(
-            app_module,
-            "_maybe_trigger_scheduled_consolidation",
-            _fake_maybe_trigger,
-        )
+        monkeypatch.setattr(app_module, "_dispatch_consolidation", _fake_dispatch)
         client = TestClient(app_module.app, raise_server_exceptions=False)
         resp = client.post("/scheduled-tick")
         # Should NOT be 409 trial_active.

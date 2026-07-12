@@ -166,6 +166,9 @@ adapters:
 #   (daily) / "daily" / "" (manual only, no timer).
 # - The FULL consolidation period is DERIVED, not configured:
 #       full_cycle = refresh_cadence × max_interim_count
+#   Exception: when max_interim_count=0 (full-fold-only consume-pending
+#   mode, no interim adapters) the full-cycle period equals refresh_cadence
+#   itself — not refresh_cadence × 0.
 #   Example (default): refresh_cadence="12h", max_interim_count=7
 #       → full consolidation every 84h (3.5 days), with at most 7
 #         concurrent interim adapters before the cycle fires.
@@ -238,6 +241,8 @@ consolidation:
   refresh_cadence: "12h"       # "every Nh" / "every Nm" / "HH:MM" / "daily" / "" (manual)
                                # 12h + max_interim_count=7 → full cycle every 84h (derived).
   mode: train                  # "train" persists to LoRA weights; "simulate" persists graph.json under adapter_dir/<tier>/ (no weight training)
+                               # Closed vocabulary: any other value is rejected at config load.
+                               # "simulate" + max_interim_count: 0 is also rejected (no training venue at all).
   promotion_threshold: 3       # reinforcement_count threshold for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism

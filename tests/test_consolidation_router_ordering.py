@@ -1,4 +1,4 @@
-"""Unit tests for consolidate_interim_adapters.
+"""Unit tests for consolidate.
 
 Covers:
   - Lock-leak guard: calling without the GPU lock held raises RuntimeError;
@@ -208,7 +208,7 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     loop._thermal_policy = None
     # _bg_trainer is wired by the server lifespan; None in tests (experiment path).
     loop._bg_trainer = None
-    # consolidate_interim_adapters calls _run_graph_enrichment() via _refine_consolidation_graph
+    # consolidate calls _run_graph_enrichment() via _refine_consolidation_graph
     # when scope.enrich is True.  The config default (refinement_enrichment="off",
     # sota_enabled=False) yields enrich=False — no enrichment runs in these ordering tests.
     # Admit-all probe stub for the registration fail-safe: when no recall verdict is
@@ -217,7 +217,7 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     # TypeErrors.  Admitting every key matches the prior no-gate behavior, so it is
     # inert for these ordering/registry tests.
     loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
-    # _promote_mature_keys_inline (called inside consolidate_interim_adapters) reads
+    # _promote_mature_keys_inline (called inside consolidate) reads
     # cycle_count, promoted_keys, and store.  Wire sensible defaults so the method
     # runs without error.
     loop.cycle_count = 0
@@ -274,7 +274,7 @@ class TestLockLeakGuard:
     """
 
     def test_raises_when_lock_not_held(self, tmp_path: Path) -> None:
-        """consolidate_interim_adapters raises RuntimeError if caller does not hold GPU lock."""
+        """consolidate raises RuntimeError if caller does not hold GPU lock."""
         from paramem.server.gpu_lock import _gpu_thread_lock
 
         model = _make_stub_model("episodic", "semantic", "procedural", "in_training")
@@ -282,14 +282,14 @@ class TestLockLeakGuard:
 
         # Call WITHOUT holding the lock — should raise RuntimeError.
         with pytest.raises(RuntimeError, match="_gpu_thread_lock"):
-            loop.consolidate_interim_adapters()
+            loop.consolidate(mode="train")
 
         # The lock must NOT be held after the raise (no leak).
         lock_is_free = _gpu_thread_lock.acquire(blocking=False)
         if lock_is_free:
             _gpu_thread_lock.release()
         assert lock_is_free, (
-            "GPU lock is still held after consolidate_interim_adapters raised RuntimeError — "
+            "GPU lock is still held after consolidate raised RuntimeError — "
             "the lock was leaked. The entry guard must release before raising."
         )
 
@@ -321,7 +321,7 @@ class TestLockLeakGuard:
                 ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
-                result = loop.consolidate_interim_adapters()
+                result = loop.consolidate(mode="train")
         finally:
             _gpu_thread_lock.release()
 
@@ -416,7 +416,7 @@ class TestTrainingFlagBracketing:
                 ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
-                loop.consolidate_interim_adapters(trainer=stub_trainer)
+                loop.consolidate(mode="train", trainer=stub_trainer)
         finally:
             _gpu_thread_lock.release()
 
@@ -511,7 +511,7 @@ class TestTrainingFlagBracketing:
         # buckets; consolidation then reads the registry to split episodic vs
         # semantic.  Patch the name bound in paramem.training.consolidation (the
         # module-local import), NOT paramem.graph.qa_generator — the latter does
-        # not affect the call inside consolidate_interim_adapters.  Route each
+        # not affect the call inside consolidate.  Route each
         # triple to its registry tier so all three tiers train.
         _gpu_thread_lock.acquire()
         try:
@@ -555,7 +555,7 @@ class TestTrainingFlagBracketing:
                 ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
-                loop.consolidate_interim_adapters(trainer=stub_trainer)
+                loop.consolidate(mode="train", trainer=stub_trainer)
         finally:
             _gpu_thread_lock.release()
 
@@ -664,7 +664,7 @@ class TestPerTierInferenceFallbackAdapter:
 
         def _spy_train_adapter(**kwargs) -> dict:
             # At this point trainer._current_job should already be set to the
-            # per-tier job by the manual swap in consolidate_interim_adapters.
+            # per-tier job by the manual swap in consolidate.
             fallback = (
                 stub_trainer._current_job.inference_fallback_adapter
                 if stub_trainer._current_job is not None
@@ -717,7 +717,7 @@ class TestPerTierInferenceFallbackAdapter:
                 ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
-                loop.consolidate_interim_adapters(trainer=stub_trainer)
+                loop.consolidate(mode="train", trainer=stub_trainer)
         finally:
             _gpu_thread_lock.release()
 
@@ -742,7 +742,7 @@ class TestPerTierInferenceFallbackAdapter:
 
         Verifies the save/restore invariant: between tier training calls, the
         _current_job on the stub trainer must revert to the value that was set
-        before consolidate_interim_adapters started iterating.
+        before consolidate started iterating.
         """
         from paramem.server.gpu_lock import _gpu_thread_lock
 
@@ -838,7 +838,7 @@ class TestPerTierInferenceFallbackAdapter:
                 ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
-                loop.consolidate_interim_adapters(trainer=stub_trainer)
+                loop.consolidate(mode="train", trainer=stub_trainer)
         finally:
             _gpu_thread_lock.release()
 
@@ -893,13 +893,13 @@ class TestPerTierInferenceFallbackAdapter:
 class TestCapacityCeilingRollback:
     """The pre-save in-RAM recall probe has been removed.
 
-    consolidate_interim_adapters always returns rolled_back=False now.
+    consolidate always returns rolled_back=False now.
     Disk-integrity is gated post-save by _save_adapters via
     _verify_saved_adapter_from_disk.
     """
 
     def test_no_rollback_even_when_recall_probe_returns_low(self, tmp_path: Path) -> None:
-        """consolidate_interim_adapters returns rolled_back=False regardless of probe.
+        """consolidate returns rolled_back=False regardless of probe.
 
         The pre-save in-RAM recall probe has been removed; _run_recall_sanity_probe
         is no longer called here.  Even if the experiment harness would have
@@ -972,7 +972,7 @@ class TestCapacityCeilingRollback:
                 ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
-                result = loop.consolidate_interim_adapters()
+                result = loop.consolidate(mode="train")
         finally:
             _gpu_thread_lock.release()
 
@@ -1047,7 +1047,7 @@ class TestCapacityCeilingRollback:
                 ),
                 patch("paramem.training.consolidation.ConsolidationLoop._save_adapters"),
             ):
-                result = loop.consolidate_interim_adapters()
+                result = loop.consolidate(mode="train")
         finally:
             _gpu_thread_lock.release()
 
@@ -1155,7 +1155,7 @@ class TestAtomicFinalizeOrdering:
                 # instance's save attribute.
                 patch("paramem.training.key_registry.KeyRegistry.save", new=_registry_save),
             ):
-                loop.consolidate_interim_adapters(router=mock_router)
+                loop.consolidate(mode="train", router=mock_router)
         finally:
             _gpu_thread_lock.release()
 
@@ -1269,7 +1269,7 @@ class TestAtomicFinalizeOrdering:
                 # Suppress real disk I/O in the finalize save.
                 patch("paramem.training.key_registry.KeyRegistry.save"),
             ):
-                result = loop.consolidate_interim_adapters()
+                result = loop.consolidate(mode="train")
         finally:
             _gpu_thread_lock.release()
 
@@ -1291,7 +1291,7 @@ class TestMainWeightsSavedBeforeInterimPurge:
     """The merged main weights must be durably saved+verified BEFORE any
     interim slot is deleted.
 
-    Regression for the data-loss window: ``consolidate_interim_adapters``
+    Regression for the data-loss window: ``consolidate``
     historically did NOT persist the rebuilt main weights itself — the caller
     (``app.py::_run_full_cycle``) called ``loop._save_adapters()`` only AFTER
     the method returned, while the method's finalize block already purged the
@@ -1332,7 +1332,7 @@ class TestMainWeightsSavedBeforeInterimPurge:
         }
 
     def _run_finalize(self, loop, *, save_side_effect, unload_side_effect):
-        """Drive consolidate_interim_adapters through finalize with mocks.
+        """Drive consolidate through finalize with mocks.
 
         ``save_side_effect`` patches ``ConsolidationLoop._save_adapters``;
         ``unload_side_effect`` patches ``unload_interim_adapters``.  Returns
@@ -1382,7 +1382,7 @@ class TestMainWeightsSavedBeforeInterimPurge:
                     ConsolidationLoop, "_save_adapters", autospec=True, side_effect=save_side_effect
                 ),
             ):
-                return loop.consolidate_interim_adapters()
+                return loop.consolidate(mode="train")
         finally:
             _gpu_thread_lock.release()
 
@@ -1413,7 +1413,7 @@ class TestMainWeightsSavedBeforeInterimPurge:
         self._run_finalize(loop, save_side_effect=_save, unload_side_effect=_unload)
 
         assert "save_adapters" in call_order, (
-            "consolidate_interim_adapters must persist merged main weights itself "
+            "consolidate must persist merged main weights itself "
             "(no durable copy exists between interim purge and a caller-side save)"
         )
         assert "unload_interim_adapters" in call_order

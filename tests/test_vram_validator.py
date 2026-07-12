@@ -882,15 +882,15 @@ def test_lifespan_budget_includes_gpu_voice_bytes_under_default_local():
 
 
 # ---------------------------------------------------------------------------
-# S5 — interim_overflow_slack in required_working_set_bytes / assess_topology
+# interim_overflow_slack in required_working_set_bytes / assess_topology
 # ---------------------------------------------------------------------------
 
 
-def test_required_working_set_bytes_slack_zero_is_identical_to_pre_s5():
-    """slack=0 (default) must produce the same total as the pre-S5 formula.
+def test_required_working_set_bytes_slack_zero_is_identical_to_no_slack_formula():
+    """slack=0 (default) must produce the same total as the no-slack formula.
 
-    Pre-S5: (main + N + 1) * adapter_bytes.
-    S5 at slack=0: (main + N + 0 + 1) * adapter_bytes — identical.
+    Without slack: (main + N + 1) * adapter_bytes.
+    With slack=0:  (main + N + 0 + 1) * adapter_bytes — identical.
     """
     adapter_bytes = _adapter_bytes()
     without_slack = required_working_set_bytes(
@@ -988,7 +988,7 @@ def test_assess_topology_slack_overflows_baseline():
 
 
 # ---------------------------------------------------------------------------
-# S5 FIX-4 — _format_breakdown interim row includes slack
+# _format_breakdown interim row includes slack
 # ---------------------------------------------------------------------------
 
 

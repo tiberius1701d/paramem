@@ -2,7 +2,8 @@
 
 ``refresh_cadence`` (``consolidation.refresh_cadence``) is the only
 user-facing scheduling knob and the only schedule string this module ever
-sees — it is passed directly to :func:`reconcile` (``app.py:2340,2350``).
+sees — it is passed directly to :func:`reconcile` from the single call site in
+``app.py``'s ``lifespan``.
 This module does not receive the derived full-consolidation period
 (``refresh_cadence × max_interim_count``); that derivation lives in
 ``ConsolidationScheduleConfig`` and is consumed by ``_is_full_cycle_due``,
@@ -31,7 +32,7 @@ no more monotonic ``TimerSpec`` kind:
 * Non-exact cadences (``every 5h``, ``every 90m``, ``every 48h``, ...)
   render at a coarser HEARTBEAT grid (see :func:`heartbeat_seconds`) —
   the timer is a wakeup source only. Each heartbeat, the dispatcher
-  (``app.py::_maybe_trigger_scheduled_consolidation``) checks a durable
+  (``app.py::_dispatch_consolidation``) checks a durable
   last-attempt stamp (``schedule_state.py``) against the real cadence
   period and no-ops until it is actually due. This is the same answer the
   full fold already gives for its own due-ness (``_is_full_cycle_due``

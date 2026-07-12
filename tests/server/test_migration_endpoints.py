@@ -36,14 +36,17 @@ from paramem.server.migration import initial_migration_state
 # Fixtures
 # ---------------------------------------------------------------------------
 
-_LIVE_YAML = (
-    b"model: mistral\ndebug: false\nadapters:\n"
+# Both YAMLs must be constructible configs: /migration/preview now builds the
+# candidate (as if it already sat at the live path) and rejects one that cannot
+# boot.  An enabled adapter tier that omits target_modules is exactly such a
+# candidate — see the loader guard in paramem/server/config.py.
+_ADAPTER_BLOCK = (
+    b"adapters:\n"
     b"  episodic:\n    enabled: true\n    rank: 8\n    alpha: 16\n"
+    b'    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]\n'
 )
-_CAND_YAML = (
-    b"model: mistral\ndebug: true\nadapters:\n"
-    b"  episodic:\n    enabled: true\n    rank: 8\n    alpha: 16\n"
-)
+_LIVE_YAML = b"model: mistral\ndebug: false\n" + _ADAPTER_BLOCK
+_CAND_YAML = b"model: mistral\ndebug: true\n" + _ADAPTER_BLOCK
 
 
 def _make_state(tmp_path: Path) -> dict:
@@ -208,6 +211,34 @@ class TestPreviewErrors:
         assert resp.status_code == 400
         detail = resp.json().get("detail", {})
         assert detail.get("error") == "candidate_unparseable"
+
+    def test_preview_400_on_unconstructible_candidate(self, client, state, tmp_path):
+        """Parses, but cannot be built into a bootable config → 400 candidate_invalid_config.
+
+        The sibling of candidate_unparseable: ``mode: simulated`` is valid YAML and a
+        dead server.  Rejecting it at preview keeps the state LIVE and stashes nothing,
+        so the operator cannot confirm a config the server cannot boot.
+        """
+        cand = tmp_path / "typo.yaml"
+        cand.write_bytes(b"model: mistral\nconsolidation:\n  mode: simulated\n")
+        resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
+        assert resp.status_code == 400, resp.text
+        detail = resp.json().get("detail", {})
+        assert detail.get("error") == "candidate_invalid_config"
+        assert "consolidation.mode" in detail.get("message", "")
+        assert state["migration"]["state"] == "LIVE"
+        assert state["migration"]["candidate_path"] == ""
+
+    def test_preview_400_when_enabled_adapter_omits_target_modules(self, client, state, tmp_path):
+        """The loader's adapter guard is part of construction → surfaces at preview."""
+        cand = tmp_path / "no_targets.yaml"
+        cand.write_bytes(
+            b"model: mistral\nadapters:\n  episodic:\n    enabled: true\n    rank: 16\n"
+        )
+        resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["error"] == "candidate_invalid_config"
+        assert state["migration"]["state"] == "LIVE"
 
     def test_preview_409_when_consolidating(self, client, state, tmp_path):
         """_state["consolidating"]=True → 409 consolidating."""
@@ -399,11 +430,13 @@ class TestTierDiffClassification:
         live_yaml.write_bytes(
             b"model: mistral\nadapters:\n  episodic:\n"
             b"    enabled: true\n    rank: 8\n    alpha: 16\n"
+            b'    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]\n'
         )
         cand = tmp_path / "rank_change.yaml"
         cand.write_bytes(
             b"model: mistral\nadapters:\n  episodic:\n"
             b"    enabled: true\n    rank: 16\n    alpha: 16\n"
+            b'    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]\n'
         )
         resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
         body = resp.json()
@@ -418,11 +451,13 @@ class TestTierDiffClassification:
         live_yaml.write_bytes(
             b"model: mistral\nadapters:\n  episodic:\n"
             b"    enabled: true\n    rank: 8\n    alpha: 16\n"
+            b'    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]\n'
         )
         cand = tmp_path / "alpha_change.yaml"
         cand.write_bytes(
             b"model: mistral\nadapters:\n  episodic:\n"
             b"    enabled: true\n    rank: 8\n    alpha: 32\n"
+            b'    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]\n'
         )
         resp = client.post("/migration/preview", json={"candidate_path": str(cand)})
         body = resp.json()

@@ -268,7 +268,8 @@ class TrialActiveError(RuntimeError):
 
 
 class AbortedDuringConsolidation(Exception):
-    """Raised by ``consolidate_interim_adapters`` when training is aborted mid-tier.
+    """Raised by the train fold (:meth:`ConsolidationLoop.consolidate`) when training
+    is aborted mid-tier.
 
     The caller (app.py ``_run_full_cycle``) catches this, restores all three
     production tiers from their ``<tier>_backup`` slots via
@@ -578,7 +579,7 @@ class ConsolidationLoop:
         self.last_session_graph = None
 
         # The cumulative graph is NOT loaded at construction.  The fold
-        # (consolidate_interim_adapters) calls merger.reset_graph() before
+        # (consolidate) calls merger.reset_graph() before
         # re-merging registry-true relations so the keying surface is always
         # fresh; any prior graph state would be discarded at fold entry and
         # loading it here would only populate ingest-time data that nobody reads.
@@ -839,7 +840,7 @@ class ConsolidationLoop:
 
         Using this helper for every cache-write site ensures the uniform shape
         is maintained by construction — every downstream reader (promotion-match,
-        ``consolidate_interim_adapters`` triple-lookup) reads the canonical field
+        full-fold triple-lookup) reads the canonical field
         names.
 
         Args:
@@ -1372,12 +1373,11 @@ class ConsolidationLoop:
         Delegates to :meth:`run_consolidation_cycle` (unified episodic +
         procedural pipeline) so experiment scripts exercise the same code path
         as the scheduled interim training path.  After the cycle, calls
-        :meth:`consolidate_interim_adapters` to fold the freshly-trained interim
+        :meth:`consolidate` in train mode to fold the freshly-trained interim
         slot into the main ``"episodic"`` adapter so callers that probe
         ``model.set_adapter("episodic")`` read the trained weights, not the
-        stale main slot.  This mirrors production's full-cycle
-        consolidate-interim-adapters step, compressed for the one-shot
-        experiment use case.
+        stale main slot.  This mirrors production's full fold, compressed for the
+        one-shot experiment use case.
 
         The method is retained as the stable public API used by experiment
         scripts; its body is a single-call delegation — not a parallel
@@ -1408,9 +1408,9 @@ class ConsolidationLoop:
         # --- Roll interim slot into main ---
         # run_consolidation_cycle trains into episodic_interim_<stamp>.  Callers
         # that probe model.set_adapter("episodic") need the trained weights in the
-        # main slot.  Submit consolidate_interim_adapters via an ephemeral
-        # BackgroundTrainer so the GPU lock is held for the full per-tier rebuild
-        # (consolidate_interim_adapters requires this — see its entry guard).
+        # main slot.  Submit the train fold via an ephemeral BackgroundTrainer so
+        # the GPU lock is held for the full per-tier rebuild (consolidate requires
+        # this in train mode — see its entry guard).
         # submit_and_wait blocks until the worker finishes and re-raises on error.
         _folded = False
         if "episodic" in self.model.peft_config or any(
@@ -1427,7 +1427,7 @@ class ConsolidationLoop:
             )
 
             def _consolidate() -> None:
-                self.consolidate_interim_adapters(trainer=_bt)
+                self.consolidate(mode="train", trainer=_bt)
 
             try:
                 _bt.submit_and_wait(_consolidate)
@@ -1436,8 +1436,8 @@ class ConsolidationLoop:
                 _bt.close()
 
         # --- SAVE main slots ---
-        # consolidate_interim_adapters now persists+verifies the merged main
-        # weights itself (between its registry rewrite and interim purge), so a
+        # The train fold persists+verifies the merged main weights itself
+        # (between its registry rewrite and interim purge), so a
         # successful fold already wrote durable main slots.  Re-saving here would
         # just re-run the same atomic save + disk-integrity verify.  Only save
         # when the fold branch did NOT run (no interim/episodic adapter to roll),
@@ -1586,11 +1586,7 @@ class ConsolidationLoop:
         """
         return replace(self.training_config, num_epochs=num_epochs)
 
-    def _save_adapters(
-        self,
-        *,
-        window_stamp_override: "str | None" = None,
-    ) -> None:
+    def _save_adapters(self) -> None:
         """Save adapters and registries to disk using the atomic registry-last ordering.
 
         Saves to two locations:
@@ -1624,13 +1620,9 @@ class ConsolidationLoop:
         while the on-disk registry still carries the old hash.
         ``find_live_slot`` won't match → slot is latent, harmless.
 
-        Args:
-            window_stamp_override: When not ``None``, write this value as the
-                ``window_stamp`` on all saved main slots instead of computing a
-                fresh floor.  Used by :meth:`run_housekeeping` to preserve the
-                existing window stamp so :func:`_is_full_cycle_due` is not
-                perturbed by the re-groom (a housekeeping fold must not advance
-                the cadence window).
+        Every saved main slot is stamped with the cadence-window floor that is
+        current at save time.  ``window_stamp`` is provenance only — no code
+        compares stamps to decide whether a fold is due.
 
         The recall gate threshold is read from ``self.config.recall_sanity_threshold``
         (set once at construction from the YAML field of the same name).
@@ -1642,12 +1634,7 @@ class ConsolidationLoop:
 
         fingerprint_cache = getattr(self, "fingerprint_cache", None)
         full_period = getattr(self, "full_consolidation_period_string", "")
-        # Use the override when supplied (housekeeping path — preserve the existing
-        # window so scheduling is not perturbed); otherwise floor to the current period.
-        if window_stamp_override is not None:
-            full_window_stamp = window_stamp_override
-        else:
-            full_window_stamp = current_full_consolidation_stamp(full_period)
+        full_window_stamp = current_full_consolidation_stamp(full_period)
 
         # Serialise each tier's registry to bytes and hash them — no disk I/O at this point.
         # Per-tier: tier_name → (payload_bytes, sha256_hex)
@@ -2127,8 +2114,7 @@ class ConsolidationLoop:
                 ``"episodic_interim_<stamp>"``.
             interim_stamp: Optional YYYYMMDDTHHMM stamp passed directly by
                 ``run_consolidation_cycle``.  Falls back to the
-                ``_current_interim_stamp`` instance attribute when set (e.g.
-                during housekeeping folds).
+                ``_current_interim_stamp`` instance attribute when set.
 
         Returns:
             Absolute :class:`~pathlib.Path` to give HF Trainer.
@@ -2402,8 +2388,8 @@ class ConsolidationLoop:
         """Consume ``merger.removal_ledger`` entries and soft-stale their keys.
 
         This is the shared soft-stale stage called by BOTH
-        ``run_consolidation_cycle`` (interim) and ``consolidate_interim_adapters``
-        (fold) after every merge that can produce subtractive removals.  The
+        ``run_consolidation_cycle`` (interim) and ``consolidate`` (full fold)
+        after every merge that can produce subtractive removals.  The
         shared body is identical for both scopes; the persist/registry-seed step
         that follows is scope-specific and stays in the caller.
 
@@ -2420,8 +2406,8 @@ class ConsolidationLoop:
           because a timestamp-less key that tied would never appear here.
 
         ``"enrichment_same_as"`` and other retain-only reasons stay in the fold's
-        ``drift_intended_removal`` bucket (handled inline in
-        ``consolidate_interim_adapters``); this helper does NOT soft-stale those.
+        ``drift_intended_removal`` bucket (handled inline in the fold spine);
+        this helper does NOT soft-stale those.
 
         Args:
             scope: ``"interim"`` or ``"fold"``.  The stale logic is identical at
@@ -3130,10 +3116,12 @@ class ConsolidationLoop:
            edge count as ``active_before_count`` (must be captured here, before
            the merger reset in :meth:`_materialize_consolidation_graph`).
         2. Build :class:`Relation` objects from every edge in the canonical graph.
-        3. For each ``episodic/interim_<stamp>`` directory via
-           :func:`~paramem.memory.interim_adapter.iter_interim_dirs`: skip slots
-           without a ``graph.json`` (train-mode interim slots carry only PEFT
-           weights); build :class:`Relation` objects from the slot graph.
+        3. For each simulate-venue ``episodic/interim_<stamp>`` slot via
+           :func:`~paramem.memory.interim_adapter.iter_interim_dirs` with
+           ``mode="simulate"`` (the primitive yields only slots carrying a
+           ``graph.json``; train-mode slots hold PEFT weights instead and are
+           not part of this venue): build :class:`Relation` objects from the
+           slot graph.
         4. Return a :class:`DiskFoldInput` with the accumulated relations, the interim
            directory list, and the pre-merge edge count.
 
@@ -3174,12 +3162,11 @@ class ConsolidationLoop:
                 )
             )
 
-        # Build Relations from each simulate-mode interim slot.
-        for _interim_name, interim_dir in iter_interim_dirs(adapter_dir):
+        # Build Relations from each simulate-mode interim slot.  The payload
+        # filter lives in iter_interim_dirs: mode="simulate" yields only slots
+        # that carry a graph.json.
+        for _interim_name, interim_dir in iter_interim_dirs(adapter_dir, mode="simulate"):
             interim_graph_path = interim_dir / "graph.json"
-            if not interim_graph_path.exists():
-                # Skip train-mode interim slots (no graph.json — only PEFT weights).
-                continue
             slot_graph = load_memory_from_disk(interim_graph_path)
             for _entry in iter_entries(slot_graph):
                 _pred = _entry.get("predicate", "")
@@ -3370,8 +3357,6 @@ class ConsolidationLoop:
         adapter_name: "str | None" = None,
         stamp: "str | None" = None,
         all_keyed: "list[dict] | None" = None,
-        # main_tiers input
-        window_stamp_override: "str | None" = None,
         # graph_json input
         graph_path: "Path | None" = None,
     ) -> None:
@@ -3408,8 +3393,6 @@ class ConsolidationLoop:
                 (``interim_slot`` path only).
             all_keyed: Full keyed-pair list for the interim slot
                 (``interim_slot`` path only).
-            window_stamp_override: Forwarded to :meth:`_save_adapters`
-                (``main_tiers`` path only).
             graph_path: Destination path for the merged graph
                 (``graph_json`` path only).
         """
@@ -3443,7 +3426,7 @@ class ConsolidationLoop:
         elif scope.persist == "main_tiers":
             # main tiers full fold: rebuild main adapter weights.  Disk verify is inside
             # _save_adapters (already had it pre-unification).
-            self._save_adapters(window_stamp_override=window_stamp_override)
+            self._save_adapters()
 
     def _run_fold(
         self,
@@ -3453,8 +3436,6 @@ class ConsolidationLoop:
         router=None,
         recall_sanity_threshold: "float | None" = None,
         refresh_epochs: int = 30,
-        housekeeping: bool = False,
-        window_stamp_override: "str | None" = None,
         # interim-scope extras (only consumed when scope.persist == "interim_slot")
         adapter_name: "str | None" = None,
         stamp: "str | None" = None,
@@ -3471,10 +3452,14 @@ class ConsolidationLoop:
           training + :func:`~paramem.memory.persistence.commit_tier_slot`.
           Replaces the pipeline body of ``run_consolidation_cycle``.
         - ``scope.persist == "main_tiers"`` (full-fold train): multi-tier rebuild
-          + :meth:`_save_adapters`.  Extracted from ``consolidate_interim_adapters``.
+          + :meth:`_save_adapters`.  Reached via :meth:`consolidate` in train mode.
         - ``scope.persist == "graph_json"`` (full-fold simulate): disk-source merge
           + :func:`~paramem.memory.persistence.save_memory_to_disk`.
-          Replaces the deleted ``consolidate_interim_to_canonical_graph``.
+          Reached via :meth:`consolidate` in simulate mode.
+
+        The fold does what it is told.  Whether there is anything to do at all is
+        decided by the caller — the spine carries no content gate and no notion of
+        who asked for the fold.
 
         The three paths differ ONLY in ``scope.source`` (weights vs disk) and the
         persist tail (``scope.persist``).  All grooming stages
@@ -3513,10 +3498,6 @@ class ConsolidationLoop:
             refresh_epochs: Training epochs for the full per-tier rebuild
                 (``main_tiers`` path only; ``interim_slot`` uses
                 ``self.training_config.num_epochs``).
-            housekeeping: When ``True`` (``graph_json`` path), bypass the noop gate so
-                the re-groomed graph is persisted even with no interim slots.
-            window_stamp_override: Forwarded to :meth:`_save_adapters` (``main_tiers``
-                path).  Preserves the prior fold's window stamp for housekeeping runs.
             adapter_name: Interim adapter name (``interim_slot`` path only).  Matches
                 ``scope.tier``.
             stamp: Sub-interval stamp for :func:`~paramem.memory.persistence.commit_tier_slot`
@@ -3590,28 +3571,6 @@ class ConsolidationLoop:
                 len(inp.relations),
                 len(inp.interim_dirs),
             )
-
-            # Noop gate: when housekeeping=False and no interim slots are present,
-            # there is nothing to merge — return the full schema with zero values.
-            if not housekeeping and not inp.interim_dirs:
-                logger.info("_run_fold[graph_json]: no simulate-mode slots — noop")
-                self._current_interim_stamp = None  # type: ignore[assignment]
-                return {
-                    "tiers_rebuilt": [],
-                    "graph_drift_count": 0,
-                    "drift_deduplicated": 0,
-                    "drift_orphan": 0,
-                    "drift_genuine_loss": 0,
-                    "drift_intended_removal": 0,
-                    "drift_intended_removal_by_reason": {},
-                    "recall_miss_keys": [],
-                    "keys_per_tier": {},
-                    "recall_per_tier": {},
-                    "tier_keyed": {},
-                    "rolled_back": False,
-                    "rollback_tier": None,
-                    "tier_delta": {},
-                }
 
             try:
                 # Materialize: merge disk relations via the shared helper.
@@ -4249,7 +4208,7 @@ class ConsolidationLoop:
         # Source: weights (reconstruct all tiers from adapter weights).
         # Persist: _save_adapters (rebuild main adapter weights + manifest).
         # Multi-tier training loop; promote=scope.promote, tier_floor=scope.tier_floor.
-        # Extracted from consolidate_interim_adapters.
+        # The full-fold train venue; reached via consolidate(mode="train").
         # ------------------------------------------------------------------
         from paramem.memory.interim_adapter import (
             INTERIM_NAME_PREFIX,
@@ -4469,10 +4428,12 @@ class ConsolidationLoop:
 
                 # --- Whole-fold accumulate guard ---
                 _total_trainable = sum(len(v) for v in serve_assignment.values())
-                if not housekeeping and _total_trainable < _floor:
+                if _total_trainable < _floor:
                     logger.info(
                         "_run_fold[main_tiers]: total trainable keys %d < floor %d"
-                        " — returning accumulating (sessions stay pending)",
+                        " — returning accumulating.  At max_interim_count == 0 the"
+                        " caller leaves the consumed sessions pending; above 0 the"
+                        " keys stay in their interim slots until the floor is met.",
                         _total_trainable,
                         _floor,
                     )
@@ -5174,7 +5135,7 @@ class ConsolidationLoop:
                     )
 
             if self.store.replay_enabled and tiers_rebuilt:
-                self._persist_fold(scope, window_stamp_override=window_stamp_override)
+                self._persist_fold(scope)
                 logger.info("_run_fold[main_tiers]: merged main weights persisted+verified")
                 # Clean fold-resume marker + retained scratch checkpoints after
                 # _save_adapters succeeds.  On _save_adapters FAILURE (the except
@@ -5253,114 +5214,140 @@ class ConsolidationLoop:
             self._current_interim_stamp = None  # type: ignore[assignment]
             self.merger.reset_graph()
 
-    def consolidate_simulate_fold(self, *, housekeeping: bool = False) -> dict:
-        """Thin public entry for the simulate full fold — routes to :meth:`_run_fold`.
-
-        Replaces the deleted ``consolidate_interim_to_canonical_graph``.  Builds the
-        :class:`FoldScope` for the ``graph_json`` persist venue and delegates all logic
-        to :meth:`_run_fold`.  Callers (``run_housekeeping``, ``app.py``) never
-        construct :class:`FoldScope` directly (layering rule).
-
-        Args:
-            housekeeping: Forwarded to :meth:`_run_fold`; bypasses the noop gate when
-                ``True`` so the re-groomed graph is persisted even with no interim slots.
-        """
-        if housekeeping:
-            _hk_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            self._current_interim_stamp = f"housekeeping_{_hk_ts}"
-        else:
-            self._current_interim_stamp = None  # type: ignore[assignment]
-
-        return self._run_fold(
-            FoldScope(
-                name="full",
-                source="disk",
-                persist="graph_json",
-                tier=None,
-                extra_relations_source="disk",
-                defer=False,
-                tag_new=False,
-                normalize=(self.config.refinement_normalization == "on"),
-                enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
-                promote=False,
-                tier_floor=False,
-                subtractive_scope="fold",
-            ),
-            housekeeping=housekeeping,
-        )
-
-    def run_housekeeping(
+    def consolidate(
         self,
+        *,
+        mode: str,
+        consume_pending: bool = False,
         trainer=None,
         router=None,
         recall_sanity_threshold: "float | None" = None,
         refresh_epochs: int = 30,
-        mode: str = "simulate",
     ) -> dict:
-        """On-demand fold that re-grooms the canonical knowledge graph without advancing sessions.
+        """Run the full consolidation fold — the single public fold entry.
 
-        This is a thin dispatcher for the ``POST /consolidate/housekeeping`` endpoint.
-        It routes to the correct underlying fold method depending on ``mode``:
+        The fold does what it is told.  Whether there is anything to consolidate at
+        all is decided by the caller (the server's dispatch layer): this method has
+        no content gate, no notion of who asked for the fold, and no way to bypass
+        the per-tier floor or the whole-fold accumulate guard.
 
-        - **simulate**: calls :meth:`consolidate_simulate_fold`
-          with ``housekeeping=True``.
-          Re-runs the GraphMerger topology over the persisted main graph (with no interim
-          slots required).  Writes the canonicalized/deduped graph back to disk.  Clears
-          stale surface variants; emits ``tier_delta`` + ``removal_ledger`` (with
-          ``pre_surfaces`` per discarded key) in the debug artifacts.  No model is required.
-        - **train**: calls :meth:`consolidate_interim_adapters` with ``housekeeping=True``.
-          Bypasses gate (d) (the per-tier floor accumulate guard) so the fold runs even
-          when the active key count is below the floor.  Retrains adapter weights from
-          registry-true content; emits ``tier_delta`` in the result and debug artifacts.
-          The GPU lock must be held by the caller (same contract as the normal train fold).
+        Two venues, selected by *mode*:
 
-        In both modes:
-        - Sessions are NOT marked consolidated (window stamp not advanced).
-        - ``_current_interim_stamp`` is set to ``"housekeeping_<ts>"`` during the fold
-          so debug artifacts land under a housekeeping-labelled dir, distinct from a
-          scheduled fold's artifacts.  Cleared on return.
-        - The ``tier_delta`` key is present in the result dict and in the debug snapshot.
+        - **train**: reconstruct every active key from adapter weights, re-merge
+          registry-true relations, rebuild the main ``episodic`` / ``semantic`` /
+          ``procedural`` adapters, persist + verify them, then unload the interim
+          slots and reload the router.  Requires the caller to already hold
+          ``_gpu_thread_lock`` (submit via ``BackgroundTrainer.submit()``); the entry
+          guard below raises when it does not.  On a failed per-tier recall-sanity
+          check the tier is restored from its backup slot and the fold aborts.
+        - **simulate**: merge the canonical ``episodic/graph.json`` with every
+          simulate-mode interim slot graph, run the same grooming topology, and write
+          the merged graph back to disk.  No model, no GPU, no registry mutation.
+
+        Both venues route through :meth:`_run_fold`; the ``mode`` string is translated
+        into a :class:`FoldScope` here and never travels further (the mode-fork guard
+        requires downstream dispatch on ``scope.source`` / ``scope.persist``).
 
         Args:
-            trainer: BackgroundTrainer (train mode only).  Must hold the GPU lock.
-            router: Router instance for reload at fold completion (train mode only).
+            mode: ``"train"`` or ``"simulate"``.  Required — ``ConsolidationConfig``
+                carries no ``mode`` field; the server passes
+                ``config.consolidation.mode``.
+            consume_pending: When ``True`` (train only), the fold snapshots the
+                pending-session relations already deposited in ``merger.graph`` by the
+                caller's extraction pre-stage and trains them into the main tiers.  The
+                caller derives this from its schedule config
+                (``max_interim_count == 0 and mode != "simulate"``).
+            trainer: :class:`~paramem.server.background_trainer.BackgroundTrainer`
+                holding the GPU lock (train only).  Required for the per-tier re-arm
+                pattern.
+            router: Router instance whose ``reload()`` is called at the end of the
+                atomic finalize sequence (train only).  ``None`` is safe — skipped.
             recall_sanity_threshold: Override for the recall gate (train only).  When
-                ``None`` (default), the value is read from
-                ``self.config.recall_sanity_threshold``.
-            refresh_epochs: Forwarded to the underlying adapter fold (train only).
-            mode: Consolidation mode — ``"simulate"`` (default, no GPU/model required) or
-                ``"train"`` (retrains adapter weights).  Passed by the app layer from
-                ``config.consolidation.mode``; ``self.config`` (``ConsolidationConfig``)
-                does not carry a ``mode`` attribute.
+                ``None``, ``self.config.recall_sanity_threshold`` is used.
+            refresh_epochs: Training epochs for the full per-tier rebuild (train only;
+                default 30 — the per-key baseline from Tests 1-7b).
 
         Returns:
-            Result dict from the underlying fold, with ``tier_delta`` guaranteed present.
-        """
-        if mode == "simulate":
-            return self.consolidate_simulate_fold(housekeeping=True)
-        else:
-            # Read the window stamp that was written by the last scheduled fold and
-            # pass it as window_stamp_override so _save_adapters re-writes the SAME
-            # stamp onto every re-saved main slot.  This keeps _is_full_cycle_due's
-            # identity check stable — a housekeeping run must not advance the cadence
-            # window, only a scheduled fold may.
-            from paramem.server.app import _last_full_consolidation_window as _lfw
+            The full-fold result dict (see :meth:`_run_fold`).  ``tier_delta`` is
+            always present; the simulate venue returns zero/empty equivalents for the
+            weight-venue fields.
 
-            _preserved_stamp = _lfw(self.output_dir)
-            return self.consolidate_interim_adapters(
-                trainer=trainer,
-                router=router,
-                recall_sanity_threshold=recall_sanity_threshold,
-                refresh_epochs=refresh_epochs,
-                housekeeping=True,
-                window_stamp_override=_preserved_stamp,
+        Raises:
+            ValueError: When ``consume_pending`` is requested on the simulate venue.
+                The simulate fold has no weight venue to train pending sessions into,
+                so it would discard the flag; callers derive ``consume_pending`` from
+                ``max_interim_count == 0 and mode != "simulate"``, which cannot produce
+                that pairing today.  The guard exists so a future caller that gets the
+                derivation wrong fails loudly instead of silently ingesting nothing.
+            RuntimeError: When ``mode="train"`` is called without the GPU lock held.
+        """
+        self._current_interim_stamp = None  # type: ignore[assignment]
+
+        if mode == "simulate" and consume_pending:
+            raise ValueError(
+                "consolidate(mode='simulate') cannot consume pending sessions: the "
+                "simulate venue writes graph.json and trains nothing. Pass "
+                "consume_pending=False, or run the train venue."
             )
+
+        if mode == "simulate":
+            return self._run_fold(
+                FoldScope(
+                    name="full",
+                    source="disk",
+                    persist="graph_json",
+                    tier=None,
+                    extra_relations_source="disk",
+                    defer=False,
+                    tag_new=False,
+                    normalize=(self.config.refinement_normalization == "on"),
+                    enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
+                    promote=False,
+                    tier_floor=False,
+                    subtractive_scope="fold",
+                ),
+            )
+
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        # --- Entry guard: verify the GPU lock is held by the caller (leak-safe) ---
+        acquired = _gpu_thread_lock.acquire(blocking=False)
+        if acquired:
+            # The lock was NOT held — we just accidentally acquired it ourselves.
+            # Release immediately before raising so the process is recoverable.
+            _gpu_thread_lock.release()
+            raise RuntimeError(
+                "consolidate(mode='train') requires the caller to hold "
+                "_gpu_thread_lock (submit via BackgroundTrainer.submit())"
+            )
+
+        return self._run_fold(
+            FoldScope(
+                name="full",
+                source="weights",
+                persist="main_tiers",
+                tier=None,
+                extra_relations_source="pending" if consume_pending else "none",
+                defer=False,
+                tag_new=False,
+                normalize=(self.config.refinement_normalization == "on"),
+                enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
+                promote=True,
+                tier_floor=True,
+                subtractive_scope="fold",
+                consume_pending=consume_pending,
+            ),
+            trainer=trainer,
+            router=router,
+            recall_sanity_threshold=recall_sanity_threshold,
+            refresh_epochs=refresh_epochs,
+        )
 
     def _promote_mature_keys_inline(self) -> list[str]:
         """Promote episodic keys whose reinforcement_count has reached the promotion threshold.
 
         Mirrors the logic of the removed ``server.consolidation._promote_mature_keys``
-        helper but runs INSIDE the fold (``consolidate_interim_adapters``), AFTER the
+        helper but runs INSIDE the fold spine, AFTER the
         recurrence-bump step and BEFORE ``tier_keyed`` is built.  This ordering
         guarantees that reconstruction probes each key against the adapter tier
         where its weights actually live (episodic) rather than against the
@@ -6338,7 +6325,7 @@ class ConsolidationLoop:
         recon_result = reconstruct_graph(self, tier=tier, strict=False)
         if recon_result.failures:
             logger.warning(
-                "consolidate_interim_adapters: %d key(s) failed reconstruction "
+                "_materialize_consolidation_graph: %d key(s) failed reconstruction "
                 "(retry signal — keys kept in training set with registry-true content)",
                 len(recon_result.failures),
             )
@@ -6384,7 +6371,7 @@ class ConsolidationLoop:
 
         if recall_miss_keys:
             logger.info(
-                "consolidate_interim_adapters: %d key(s) in recall-miss set "
+                "_materialize_consolidation_graph: %d key(s) in recall-miss set "
                 "(kept in training with registry-true content): %s",
                 len(recall_miss_keys),
                 sorted(recall_miss_keys),
@@ -6400,7 +6387,7 @@ class ConsolidationLoop:
         # loses nothing; the transient graph edge counts were the broken store.
         self.merger.reset_graph()
         logger.info(
-            "consolidate_interim_adapters: keying graph reset to empty for the"
+            "_materialize_consolidation_graph: keying graph reset to empty for the"
             " reconstruct→re-merge pass"
         )
 
@@ -6605,7 +6592,7 @@ class ConsolidationLoop:
                         first_seen=_rein_fs,
                     )
                     logger.debug(
-                        "consolidate_interim_adapters: bumped recurrence for key=%s "
+                        "_refine_consolidation_graph: bumped recurrence for key=%s "
                         "(intra-fold duplicate-SPO collapse)",
                         _rein_key,
                     )
@@ -6636,172 +6623,10 @@ class ConsolidationLoop:
                         first_seen=_rein_fs,
                     )
                     logger.debug(
-                        "consolidate_interim_adapters: bumped recurrence for key=%s "
+                        "_refine_consolidation_graph: bumped recurrence for key=%s "
                         "(recital-dedup adopt)",
                         _rein_key,
                     )
-
-    def consolidate_interim_adapters(
-        self,
-        trainer=None,
-        router=None,
-        recall_sanity_threshold: "float | None" = None,
-        refresh_epochs: int = 30,
-        *,
-        consume_pending: bool = False,
-        housekeeping: bool = False,
-        window_stamp_override: "str | None" = None,
-    ) -> dict:
-        """Weekly refresh: collapse all episodic_interim_* adapters into the main tiers.
-
-        This method MUST be invoked via BackgroundTrainer.submit() so that the
-        GPU lock is held for the entire call duration.  It MUST NOT be called
-        directly without the lock, and MUST NOT call gpu_lock_sync() internally
-        (non-reentrant threading.Lock would deadlock).
-
-        Invariants (enforced by the entry guard):
-        - _gpu_thread_lock is held by the caller on entry.
-        - The finalize block (registry rewrite → interim purge → router reload)
-          runs as plain sequential statements — no training calls, no HF Trainer-
-          driven routines.  Do not smuggle a training call into the finalize
-          section; the abort-via-shutdown-predicate hook installed by
-          ``train_adapter`` only fires at step boundaries inside HF Trainer's
-          loop and would not protect non-training code paths.
-
-        Steps:
-        1. Verify the GPU lock is held (entry guard — leak-safe pattern).
-        2. Reconstruct: probe every active key from adapter weights via
-           ``reconstruct_graph``; recover (subject, predicate, object).
-        3. Re-merge registry-true relations: for each active key source the
-           authoritative (subject, predicate, object) from the registry (not from
-           reconstruction), inject ``relation_type`` from persisted bookkeeping,
-           then feed through ``merger.merge()`` so the cumulative graph edges are
-           re-stamped.
-        4. Optional SOTA graph enrichment (runs after re-merge on the populated
-           graph so second-order relations are captured).
-        5. Dedup + tier assignment: walk merged graph edges; for each edge, read
-           the ``ik_key`` attribute stamped by the merger, derive tier from
-           ``relation_type`` via ``partition_relations``; build ``tier_keyed``
-           lists.  The merged graph is the dedup authority (duplicate triples
-           collapse to one key).
-        6. Load backup adapters (if available) and all interim adapters into PEFT.
-        7. For each tier (episodic → semantic → procedural):
-           a. Set active adapter to <tier>_backup before deleting the main.
-           b. delete_adapter(<tier>) + create_adapter(<tier>).
-           c. Set <tier>_is_training=True, call _train_adapter, set False.
-           d. Recall-sanity check; on failure roll back and abort.
-        8. Atomic finalize: registry rewrite → durable main-weight persist+verify
-           (_save_adapters) → unload_interim_adapters → router reload.  The
-           weight persist runs BEFORE the interim purge so the merged knowledge
-           always has a verified on-disk copy before any interim slot is deleted
-           (closes the full-cycle data-loss crash window).  _save_adapters runs
-           a recall PROBE on the reloaded slot — it is not an HF Trainer routine,
-           so the finalize invariant (no training calls) holds.
-        9. On success: unload backup adapters.
-
-        Args:
-            trainer: BackgroundTrainer instance (must be the one holding the GPU
-                lock via submit()).  Required for the per-tier re-arm pattern.
-            router: Router instance whose reload() is called at the end of the
-                atomic finalize sequence.  Optional — skipped when None.
-            recall_sanity_threshold: Override for the minimum recall rate for the
-                post-save disk-integrity probe in ``_save_adapters``.  When
-                ``None`` (default), the value is read from
-                ``self.config.recall_sanity_threshold``.
-            refresh_epochs: Number of training epochs for the full per-tier
-                rebuild (default 30; matches the per-key baseline from Tests 1-7b).
-            consume_pending: When ``True``, the fold captures pending-session
-                relations from ``merger.graph`` and injects them into the fold via
-                the ``extra_relations`` channel.  The full-fold :class:`FoldScope`
-                sets ``consume_pending=True`` and
-                ``extra_relations_source="pending"``.  When ``False`` (default),
-                the fold ignores pending-session relations (normal non-consume
-                behaviour).  The caller is responsible for translating
-                server-schedule config (e.g. ``config.consolidation.max_interim_count
-                == 0``) into this boolean decision before calling.
-            housekeeping: When ``True``, bypass gate (d) (the whole-fold
-                ``_total_trainable < _floor`` accumulating early-return) and
-                proceed to retrain even when the total key count is below the
-                per-tier floor.  Used by :meth:`run_housekeeping` so an
-                on-demand grooming fold runs regardless of accumulation state.
-                Sessions are NOT marked consolidated; window stamp is not advanced.
-            window_stamp_override: When not ``None``, forwarded verbatim to
-                :meth:`_save_adapters` so the saved main slots carry this value
-                as ``window_stamp`` instead of the fresh floor computed at save
-                time.  Used by :meth:`run_housekeeping` to preserve the window
-                stamp that was already written by the last scheduled fold, so
-                :func:`_is_full_cycle_due` is not perturbed by a housekeeping
-                run (a housekeeping fold must not advance the cadence window).
-                ``None`` is the correct value for every non-housekeeping call.
-
-        Returns:
-            Result dict with keys:
-                {
-                    "tiers_rebuilt": list[str],
-                    # total absent keys (backward-compat)
-                    "graph_drift_count": int,
-                    # exact-SPO collapse; fact preserved
-                    "drift_deduplicated": int,
-                    # no SPO content; correctly dropped
-                    "drift_orphan": int,
-                    # reconstruction failure / hydration-miss
-                    "drift_genuine_loss": int,
-                    # merger-recorded intentional removal
-                    "drift_intended_removal": int,
-                    # reason → count breakdown
-                    "drift_intended_removal_by_reason": dict,
-                    "keys_per_tier": dict[str, int],
-                    "recall_per_tier": dict[str, float],
-                    "rolled_back": bool,
-                    "rollback_tier": str | None,
-                }
-        """
-        from paramem.server.gpu_lock import _gpu_thread_lock
-
-        # --- Entry guard: verify the GPU lock is held by the caller (leak-safe) ---
-        acquired = _gpu_thread_lock.acquire(blocking=False)
-        if acquired:
-            # The lock was NOT held — we just accidentally acquired it ourselves.
-            # Release immediately before raising so the process is recoverable.
-            _gpu_thread_lock.release()
-            raise RuntimeError(
-                "consolidate_interim_adapters requires the caller to hold "
-                "_gpu_thread_lock (submit via BackgroundTrainer.submit())"
-            )
-
-        # --- Housekeeping debug-dir labeling ---
-        # Set a distinct interim stamp so debug artifacts for a housekeeping fold
-        # land under ``housekeeping_<ts>/`` rather than a scheduled fold name.
-        # Cleared inside _run_fold (main_tiers path) at success / abort.
-        if housekeeping:
-            _hk_ts_adp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            self._current_interim_stamp = f"housekeeping_{_hk_ts_adp}"
-        else:
-            self._current_interim_stamp = None  # type: ignore[assignment]
-
-        return self._run_fold(
-            FoldScope(
-                name="full",
-                source="weights",
-                persist="main_tiers",
-                tier=None,
-                extra_relations_source="pending" if consume_pending else "none",
-                defer=False,
-                tag_new=False,
-                normalize=(self.config.refinement_normalization == "on"),
-                enrich=(self.config.refinement_enrichment == "on" and self.config.sota_enabled),
-                promote=True,
-                tier_floor=True,
-                subtractive_scope="fold",
-                consume_pending=consume_pending,
-            ),
-            trainer=trainer,
-            router=router,
-            recall_sanity_threshold=recall_sanity_threshold,
-            refresh_epochs=refresh_epochs,
-            housekeeping=housekeeping,
-            window_stamp_override=window_stamp_override,
-        )
 
     def _run_recall_sanity_probe(
         self,
@@ -7159,7 +6984,7 @@ class ConsolidationLoop:
         Production-reachable callers (must pass full per-tier active set):
           - ConsolidationLoop._train_tier_adapter — single funnel for the
             episodic / interim / fold training path; run_consolidation_cycle
-            and consolidate_interim_adapters reach this callback transitively
+            and the full fold reach this callback transitively
             via _train_tier_adapter and do not call it directly.
           - active_store_migration._migrate_tier_simulate_to_train (direct)
             (paramem/server/active_store_migration.py)
@@ -7182,8 +7007,8 @@ class ConsolidationLoop:
                 call.  When provided, the callback's forced final-epoch probe
                 fires at this epoch rather than at
                 ``self.training_config.num_epochs``.  Callers that train with
-                a different epoch budget (e.g. ``consolidate_interim_adapters``
-                using ``refresh_epochs``) MUST pass this so
+                a different epoch budget (e.g. the full fold using
+                ``refresh_epochs``) MUST pass this so
                 ``RecallEarlyStopCallback._num_epochs`` matches the trainer's
                 epoch count.  Defaults to ``None`` which resolves to
                 ``self.training_config.num_epochs`` — the correct value for

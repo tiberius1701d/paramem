@@ -299,7 +299,7 @@ def handle_chat(
                 if known_entities is None:
                     known_entities = set()
                 known_entities = known_entities | {speaker.lower().strip()}
-            # B5: extend known_entities with non-anonymous household display names so
+            # Extend known_entities with non-anonymous household display names so
             # the sanitizer covers all enrolled speakers, not just the active one.
             # household_display_names() filters out anonymous profiles
             # (enroll_method == "anonymous_voice") — only real-name disclosures are
@@ -314,7 +314,7 @@ def handle_chat(
                         n.lower().strip() for n in _household_names if n
                     }
 
-            # B3: build the speaker resolver closure once per request.  Passed into
+            # Build the speaker resolver closure once per request.  Passed into
             # memory_store.probe so raw speaker{N} tokens in recalled facts are
             # replaced with display names at the render boundary.
             # read-tolerance: .lower() before lookup so pre-migration cased tokens

@@ -1335,7 +1335,7 @@ class TestRetireDecision:
 
 
 class TestTickGateNoNamed:
-    """_maybe_trigger_scheduled_consolidation returns noop_no_named when no NAMED sessions."""
+    """_dispatch_consolidation returns noop_no_named when no NAMED sessions."""
 
     def _make_minimal_state(self, tmp_path, buffer, store=None):
         """Inject minimal _state overrides for the tick function."""
@@ -1365,14 +1365,14 @@ class TestTickGateNoNamed:
         return store
 
     def _call_tick(self, state_overrides: dict) -> str:
-        """Run _maybe_trigger_scheduled_consolidation with mocked _state."""
+        """Run the scheduled-tick dispatch (AUTO) with mocked _state."""
         from unittest.mock import patch
 
         import paramem.server.app as _app
 
         # Patch _consolidation_dispatch_guards to return None (no pre-emption),
-        # _is_full_cycle_due to return False (not a full cycle tick),
-        # and _retro_claim_orphan_sessions to no-op.
+        # _is_full_cycle_due to return False (not a full cycle tick → AUTO
+        # resolves to INTERIM), and _retro_claim_orphan_sessions to no-op.
         with (
             patch.object(_app, "_state", state_overrides),
             patch(
@@ -1382,7 +1382,10 @@ class TestTickGateNoNamed:
             patch("paramem.server.app._is_full_cycle_due", return_value=False),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
         ):
-            return _app._maybe_trigger_scheduled_consolidation()
+            status, _action = _app._dispatch_consolidation(
+                _app.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
+            return status
 
     def test_all_unidentifiable_returns_noop_no_named(self, tmp_path):
         """When all sessions are UNIDENTIFIABLE, tick returns noop_no_named."""
@@ -1878,11 +1881,8 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
 class TestFullCycleGateHelpers:
     """Helpers that decide whether the scheduled tick should run a full cycle.
 
-    ``_last_full_consolidation_window`` tests exercise the manifest-reader
-    helper (retained; still used by ``_save_adapters`` / ``run_housekeeping``).
-
-    ``_is_full_cycle_due`` tests exercise the new count/phase primary +
-    oldest-interim-age deadline gate (S2).  The gate no longer reads
+    ``_is_full_cycle_due`` tests exercise the count/phase primary +
+    oldest-interim-age deadline gate.  The gate no longer reads
     window_stamps; it counts on-disk ``episodic/interim_*`` dirs and
     compares the oldest dir's age to ``consolidation_period_seconds``.
     """
@@ -1894,61 +1894,42 @@ class TestFullCycleGateHelpers:
         payload = {"trained_at": trained_at, "window_stamp": window_stamp}
         (slot_dir / "meta.json").write_text(_json.dumps(payload))
 
-    def _make_interim_dir(self, adapter_dir, stamp: str) -> None:
-        """Create a bare on-disk interim dir at ``episodic/interim_<stamp>/``.
+    def _make_interim_dir(self, adapter_dir, stamp: str, *, mode: "str | None" = "train"):
+        """Create an on-disk interim slot at ``episodic/interim_<stamp>/``.
 
-        The dir needs to exist and match the ``INTERIM_DIR_PREFIX`` pattern so
-        ``iter_interim_dirs`` picks it up.  No content is needed for gate tests.
+        The dir must match the ``INTERIM_DIR_PREFIX`` pattern so
+        ``iter_interim_dirs`` sees it, and it must carry the venue's payload so
+        the schedule gate counts it: the gate scans with
+        ``mode=config.consolidation.mode`` and skips payload-less slots (a slot
+        whose payload write never landed holds nothing to fold).
+
+        Args:
+            adapter_dir: Adapter root.
+            stamp: ``YYYYMMDDTHHMM`` interim stamp.
+            mode: ``"train"`` writes ``<slot_date>/adapter_model.safetensors``;
+                ``"simulate"`` writes ``graph.json``; ``None`` writes no payload
+                at all (a torn/empty shell — the case the gate must ignore).
+
+        Returns:
+            The interim directory path.
         """
-        (adapter_dir / "episodic" / f"interim_{stamp}").mkdir(parents=True, exist_ok=True)
-
-    def test_last_full_consolidation_window_returns_none_when_no_episodic_dir(self, tmp_path):
-        from paramem.server.app import _last_full_consolidation_window
-
-        assert _last_full_consolidation_window(tmp_path) is None
-
-    def test_last_full_consolidation_window_returns_none_when_no_slots(self, tmp_path):
-        from paramem.server.app import _last_full_consolidation_window
-
-        (tmp_path / "episodic").mkdir()
-        assert _last_full_consolidation_window(tmp_path) is None
-
-    def test_last_full_consolidation_window_returns_none_on_corrupt_meta(self, tmp_path):
-        from paramem.server.app import _last_full_consolidation_window
-
-        slot = tmp_path / "episodic" / "20260427-072940"
-        slot.mkdir(parents=True)
-        (slot / "meta.json").write_text("not valid json {")
-        assert _last_full_consolidation_window(tmp_path) is None
-
-    def test_last_full_consolidation_window_returns_none_on_empty_window_stamp(self, tmp_path):
-        """Legacy v1 manifest (no window_stamp / empty) → None → 'unknown'."""
-        from paramem.server.app import _last_full_consolidation_window
-
-        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp="")
-        assert _last_full_consolidation_window(tmp_path) is None
-
-    def test_last_full_consolidation_window_picks_lex_max_slot(self, tmp_path):
-        """Multiple slots → take the lex-max (latest timestamp dir name)."""
-        from paramem.server.app import _last_full_consolidation_window
-
-        self._write_meta(tmp_path / "episodic" / "20260420-120000", window_stamp="20260420T0000")
-        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp="20260427T0000")
-        self._write_meta(tmp_path / "episodic" / "20260425-080000", window_stamp="20260424T0000")
-
-        assert _last_full_consolidation_window(tmp_path) == "20260427T0000"
-
-    def test_last_full_consolidation_window_skips_pending_dir(self, tmp_path):
-        """The .pending side-slot must not be picked even if it sorts last."""
-        from paramem.server.app import _last_full_consolidation_window
-
-        self._write_meta(tmp_path / "episodic" / "20260427-072940", window_stamp="20260427T0000")
-        (tmp_path / "episodic" / ".pending").mkdir()  # no meta.json
-
-        assert _last_full_consolidation_window(tmp_path) == "20260427T0000"
+        interim_dir = adapter_dir / "episodic" / f"interim_{stamp}"
+        interim_dir.mkdir(parents=True, exist_ok=True)
+        if mode == "train":
+            slot = interim_dir / f"{stamp}-slot"
+            slot.mkdir(parents=True, exist_ok=True)
+            (slot / "adapter_model.safetensors").write_bytes(b"")
+        elif mode == "simulate":
+            (interim_dir / "graph.json").write_text("{}")
+        return interim_dir
 
     def _make_config(
-        self, adapter_dir, *, max_interim_count: int = 7, period_seconds: "int | None" = 302400
+        self,
+        adapter_dir,
+        *,
+        max_interim_count: int = 7,
+        period_seconds: "int | None" = 302400,
+        mode: str = "train",
     ):
         """Build a minimal config mock for ``_is_full_cycle_due`` tests.
 
@@ -1959,11 +1940,14 @@ class TestFullCycleGateHelpers:
             period_seconds: Value of ``config.consolidation.consolidation_period_seconds``
                 (= refresh_cadence_seconds × N).  Default 302400 = 12h × 7 × 3600.
                 Pass ``None`` to simulate a disabled (manual-only) cadence.
+            mode: Value of ``config.consolidation.mode`` — the venue whose payload
+                the gate requires of an interim slot before counting it.
         """
         cfg = MagicMock()
         cfg.adapter_dir = adapter_dir
         cfg.consolidation.max_interim_count = max_interim_count
         cfg.consolidation.consolidation_period_seconds = period_seconds
+        cfg.consolidation.mode = mode
         return cfg
 
     def test_is_full_cycle_due_zero_count_returns_true(self, tmp_path):
@@ -2072,40 +2056,6 @@ class TestFullCycleGateHelpers:
 
     # --- interim-only / catch-up gate tests ---
 
-    def test_last_full_consolidation_window_skips_interim_dirs(self, tmp_path):
-        """Interim dirs (interim_<stamp>/) must NOT be treated as main slots.
-
-        The interim layout is ``episodic/interim_<stamp>/<ts>/meta.json``.
-        Only the top-level ``episodic/<ts>/meta.json`` paths belong to the
-        main slot scan.  An interim dir at the top level should be invisible
-        to ``_last_full_consolidation_window``.
-        """
-        from paramem.server.app import _last_full_consolidation_window
-
-        # Realistic interim layout: episodic/interim_<stamp>/<ts>/meta.json
-        interim_ts = "20260524T0000"
-        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
-        self._write_meta(inner_slot, window_stamp=interim_ts)
-        # No top-level main slot → must return None
-        assert _last_full_consolidation_window(tmp_path) is None
-
-    def test_last_full_consolidation_window_main_slot_shadows_interim(self, tmp_path):
-        """When a main slot AND interim dirs both exist, return the main stamp.
-
-        The interim dirs must not shadow or replace the main slot result.
-        """
-        from paramem.server.app import _last_full_consolidation_window
-
-        main_stamp = "20260520T0000"
-        # Main slot at top level
-        self._write_meta(tmp_path / "episodic" / "20260520-080000", window_stamp=main_stamp)
-        # Interim slot nested under episodic/interim_*/
-        interim_ts = "20260524T0000"
-        inner_slot = tmp_path / "episodic" / f"interim_{interim_ts}" / "20260524-120000"
-        self._write_meta(inner_slot, window_stamp=interim_ts)
-
-        assert _last_full_consolidation_window(tmp_path) == main_stamp
-
     def test_is_full_cycle_due_interim_only_no_main_single_interim_deadline_fires(self, tmp_path):
         """Interim-only store with one very old interim: deadline backstop fires.
 
@@ -2113,16 +2063,12 @@ class TestFullCycleGateHelpers:
         and checks the oldest dir's age.  A single interim (n=1) cannot satisfy
         the count/phase primary (needs n>1 and (n-1)%N==0), but the deadline
         backstop fires when the interim is older than ``full_period_seconds``.
-        ``_last_full_consolidation_window`` is NOT called from the gate; we also
-        confirm it correctly returns None for this layout (helper still live for
-        housekeeping).
         """
-        from paramem.server.app import _is_full_cycle_due, _last_full_consolidation_window
+        from paramem.server.app import _is_full_cycle_due
 
         # Create an interim dir whose stamp is in the distant past.
         self._make_interim_dir(tmp_path, "20200101T0000")
 
-        assert _last_full_consolidation_window(tmp_path) is None
         # period_seconds=1 so a 2020 stamp is astronomically over the deadline.
         cfg = self._make_config(tmp_path, period_seconds=1)
         assert _is_full_cycle_due(cfg) is True
@@ -2130,7 +2076,7 @@ class TestFullCycleGateHelpers:
     def test_is_full_cycle_due_fresh_install_no_interim_returns_false(self, tmp_path):
         """Fresh install: no interim dirs (n=0) → gate stays False.
 
-        The full cycle (consolidate_interim_adapters) would be a no-op with
+        The full cycle (consolidate) would be a no-op with
         nothing to fold.  Returning False keeps the dispatcher on the interim
         path (which extracts pending sessions into the first interim slot).
         """
@@ -2172,10 +2118,222 @@ class TestFullCycleGateHelpers:
         assert _is_full_cycle_due(cfg) is True
 
 
+class TestInterimSlotPayloadFilter:
+    """``iter_interim_dirs`` yields a directory only when it carries the venue's payload.
+
+    An interim *directory* is not an interim slot with *content*: a slot whose
+    payload write never landed (crash between the mkdir and the payload flush)
+    carries nothing to fold, and must not drive the schedule gate on its own.
+    The venue→payload mapping lives inside the primitive — simulate keys on
+    ``graph.json``, train on ``adapter_model.safetensors`` — and the reap keeps
+    the unfiltered default because a filtered reap would leak orphan dirs.
+    """
+
+    def _slot(self, adapter_dir, stamp: str, *, payload: "str | None"):
+        """Create ``episodic/interim_<stamp>/`` with (or without) a venue payload.
+
+        Args:
+            adapter_dir: Adapter root.
+            stamp: ``YYYYMMDDTHHMM`` interim stamp.
+            payload: ``"graph"`` writes ``graph.json`` (simulate venue);
+                ``"weights"`` writes ``<slot>/adapter_model.safetensors`` (train
+                venue); ``None`` writes nothing (payload-less shell).
+
+        Returns:
+            The interim directory path.
+        """
+        d = adapter_dir / "episodic" / f"interim_{stamp}"
+        d.mkdir(parents=True, exist_ok=True)
+        if payload == "graph":
+            (d / "graph.json").write_text("{}")
+        elif payload == "weights":
+            (d / f"{stamp}-slot").mkdir(parents=True, exist_ok=True)
+            (d / f"{stamp}-slot" / "adapter_model.safetensors").write_bytes(b"")
+        return d
+
+    def _cfg(self, adapter_dir, *, mode: str, max_interim_count: int = 3):
+        """Config mock for the four schedule-side helpers."""
+        cfg = MagicMock()
+        cfg.adapter_dir = adapter_dir
+        cfg.consolidation.mode = mode
+        cfg.consolidation.max_interim_count = max_interim_count
+        cfg.consolidation.consolidation_period_seconds = 10 * 365 * 86400
+        cfg.consolidation.refresh_cadence = "every 12h"
+        return cfg
+
+    def test_default_mode_yields_every_dir(self, tmp_path):
+        """``mode=None`` (default) is byte-identical to the pre-payload behaviour."""
+        from paramem.memory.interim_adapter import iter_interim_dirs
+
+        self._slot(tmp_path, "20260701T0000", payload=None)
+        self._slot(tmp_path, "20260701T1200", payload="graph")
+        self._slot(tmp_path, "20260702T0000", payload="weights")
+
+        names = [n for n, _ in iter_interim_dirs(tmp_path)]
+        assert names == [
+            "episodic_interim_20260701T0000",
+            "episodic_interim_20260701T1200",
+            "episodic_interim_20260702T0000",
+        ]
+
+    def test_simulate_yields_only_graph_json_slots(self, tmp_path):
+        from paramem.memory.interim_adapter import iter_interim_dirs
+
+        self._slot(tmp_path, "20260701T0000", payload=None)
+        self._slot(tmp_path, "20260701T1200", payload="graph")
+        self._slot(tmp_path, "20260702T0000", payload="weights")
+
+        names = [n for n, _ in iter_interim_dirs(tmp_path, mode="simulate")]
+        assert names == ["episodic_interim_20260701T1200"]
+
+    def test_train_yields_only_weight_slots(self, tmp_path):
+        """Train keys on the safetensors file, not adapter_config.json.
+
+        A config without weights is a broken slot — payload-less by definition —
+        and must not be counted.
+        """
+        from paramem.memory.interim_adapter import iter_interim_dirs
+
+        self._slot(tmp_path, "20260701T0000", payload=None)
+        self._slot(tmp_path, "20260701T1200", payload="graph")
+        weights_slot = self._slot(tmp_path, "20260702T0000", payload="weights")
+        # A config-only slot: adapter_config.json present, weights missing → broken.
+        broken = self._slot(tmp_path, "20260702T1200", payload=None)
+        (broken / "adapter_config.json").write_text("{}")
+
+        found = list(iter_interim_dirs(tmp_path, mode="train"))
+        assert [n for n, _ in found] == ["episodic_interim_20260702T0000"]
+        assert [p for _, p in found] == [weights_slot]
+
+    def test_unknown_mode_raises(self, tmp_path):
+        """A typo must fail loudly, not silently degrade to the unfiltered set."""
+        from paramem.memory.interim_adapter import iter_interim_dirs
+
+        self._slot(tmp_path, "20260701T0000", payload="graph")
+        with pytest.raises(ValueError, match="unknown mode"):
+            list(iter_interim_dirs(tmp_path, mode="graph_json"))
+
+    def test_payload_less_dir_does_not_trigger_full_cycle(self, tmp_path):
+        """N+1 payload-less dirs must NOT satisfy the count/phase gate.
+
+        Pre-fix, `_is_full_cycle_due` counted directories, so empty shells alone
+        could trigger a full consolidation cycle.
+        """
+        from paramem.server.app import _is_full_cycle_due
+
+        N = 3
+        for i in range(N + 1):
+            self._slot(tmp_path, f"20260701T{i:02d}00", payload=None)
+
+        cfg = self._cfg(tmp_path, mode="train", max_interim_count=N)
+        assert _is_full_cycle_due(cfg) is False
+
+    def test_payload_bearing_dirs_still_trigger_full_cycle(self, tmp_path):
+        """The same N+1 slots WITH payloads do fire the gate (math unchanged)."""
+        from paramem.server.app import _is_full_cycle_due
+
+        N = 3
+        for i in range(N + 1):
+            self._slot(tmp_path, f"20260701T{i:02d}00", payload="weights")
+
+        cfg = self._cfg(tmp_path, mode="train", max_interim_count=N)
+        assert _is_full_cycle_due(cfg) is True
+
+    def test_gate_counts_the_configured_venue_only(self, tmp_path):
+        """A train-venue payload does not count in simulate mode, and vice versa."""
+        from paramem.server.app import _is_full_cycle_due
+
+        N = 2
+        for i in range(N + 1):
+            self._slot(tmp_path, f"20260701T{i:02d}00", payload="weights")
+
+        assert _is_full_cycle_due(self._cfg(tmp_path, mode="train", max_interim_count=N)) is True
+        assert (
+            _is_full_cycle_due(self._cfg(tmp_path, mode="simulate", max_interim_count=N)) is False
+        )
+
+    def test_schedule_helpers_agree_on_the_same_set(self, tmp_path):
+        """Gate, incident key, deadline backstop and /status ETA see one set.
+
+        Two payload-less dirs are OLDER than the one payload-bearing slot.  If any
+        of the four helpers scanned unfiltered, it would anchor on the empty shell
+        and the four would disagree about which cycle is in flight.
+        """
+        from datetime import datetime, timedelta
+
+        from paramem.server.app import (
+            _full_cycle_deadline_dt,
+            _is_full_cycle_due,
+            _oldest_interim_stamp,
+            _seconds_until_next_full_consolidation,
+        )
+
+        self._slot(tmp_path, "20200101T0000", payload=None)  # ancient empty shell
+        self._slot(tmp_path, "20200102T0000", payload=None)  # ancient empty shell
+        self._slot(tmp_path, "20260701T0000", payload="weights")  # the only real slot
+
+        cfg = self._cfg(tmp_path, mode="train", max_interim_count=3)
+
+        # Incident/cycle key anchors on the payload-bearing slot, not the shells.
+        assert _oldest_interim_stamp(cfg) == "20260701T0000"
+        # Deadline is derived from that same slot — not from the 2020 shells.
+        deadline = _full_cycle_deadline_dt(cfg)
+        assert deadline == datetime(2026, 7, 1) + timedelta(seconds=10 * 365 * 86400)
+        # n == 1 payload-bearing → neither the count primary nor (with a 10y period)
+        # the deadline backstop fires.  Unfiltered, n would be 3 and the ancient
+        # shells would have blown the deadline.
+        assert _is_full_cycle_due(cfg) is False
+        assert _seconds_until_next_full_consolidation(cfg) is not None
+
+    def test_unload_interim_adapters_reaps_payload_less_dirs(self, tmp_path):
+        """The reap must stay UNFILTERED — a filtered reap leaks orphan dirs forever."""
+        from paramem.memory.interim_adapter import unload_interim_adapters
+
+        shell = self._slot(tmp_path, "20260701T0000", payload=None)
+        graph_slot = self._slot(tmp_path, "20260701T1200", payload="graph")
+        weight_slot = self._slot(tmp_path, "20260702T0000", payload="weights")
+
+        model = MagicMock()
+        model.peft_config = {"episodic": object(), "semantic": object()}
+
+        unload_interim_adapters(model, tmp_path)
+
+        assert not shell.exists()
+        assert not graph_slot.exists()
+        assert not weight_slot.exists()
+
+    def test_collect_disk_fold_relations_skips_payload_less_slots(self, tmp_path):
+        """The simulate fold collector sources its filter from the primitive."""
+        import networkx as nx
+
+        from paramem.memory.persistence import save_memory_to_disk
+        from paramem.training.consolidation import ConsolidationLoop
+
+        (tmp_path / "episodic").mkdir(parents=True, exist_ok=True)
+        self._slot(tmp_path, "20260701T0000", payload=None)
+        graph_slot = self._slot(tmp_path, "20260701T1200", payload="graph")
+
+        g = nx.MultiDiGraph()
+        g.add_edge(
+            "speaker1",
+            "berlin",
+            ik_key="graph1",
+            predicate="lives in",
+            speaker_id="speaker1",
+        )
+        save_memory_to_disk(g, graph_slot / "graph.json", encrypted=False)
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        result = loop._collect_disk_fold_relations(tmp_path)
+
+        assert [r.indexed_key for r in result.relations] == ["graph1"]
+        assert result.interim_dirs == [graph_slot]
+
+
 class TestRunFullConsolidationSyncAccumulating:
     """App-layer: _run_full_consolidation_sync honours the accumulating return.
 
-    When ``consolidate_interim_adapters`` returns ``status="accumulating"``,
+    When ``consolidate`` returns ``status="accumulating"``,
     the orchestrator in ``_run_full_cycle`` must:
     - NOT call ``session_buffer.mark_consolidated``
     - NOT stamp ``_state["last_consolidation"]``
@@ -2218,7 +2376,7 @@ class TestRunFullConsolidationSyncAccumulating:
 
         mock_loop = MagicMock()
         mock_loop.model = MagicMock(name="model")
-        mock_loop.consolidate_interim_adapters.return_value = {
+        mock_loop.consolidate.return_value = {
             "status": "accumulating",
             "accumulating_reason": {"floor": 30, "episodic": 5, "parked": {}},
             "tiers_rebuilt": [],
@@ -2352,14 +2510,14 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
 
     Bug (fixed): the post-full-cycle bookkeeping block called
     ``session_buffer.mark_consolidated(pending_ids, ...)`` on the scheduled
-    (``not housekeeping``) path, permanently discarding sessions that were
-    never extracted.  This test asserts the corrected contract.
+    path, permanently discarding sessions that were never extracted.  This test
+    asserts the corrected contract.
     """
 
     def _make_state_full_trained(self) -> dict:
         """Minimal ``_state`` producing a successful full-trained result.
 
-        ``consolidate_interim_adapters`` returns ``tiers_rebuilt=["episodic"]``
+        ``consolidate`` returns ``tiers_rebuilt=["episodic"]``
         so the full-trained bookkeeping path is exercised (not noop/accumulating).
         ``_save_key_metadata`` is mocked at the consolidation module level so
         no real loop or filesystem is needed.
@@ -2376,7 +2534,7 @@ class TestRunFullConsolidationSyncPendingSessionsUntouched:
         mock_loop.model = MagicMock(name="model")
         mock_loop.store = MagicMock()
         mock_loop.store.replay_enabled = False
-        mock_loop.consolidate_interim_adapters.return_value = {
+        mock_loop.consolidate.return_value = {
             "status": "full_trained",
             "tiers_rebuilt": ["episodic"],
             "rolled_back": False,
@@ -2636,7 +2794,7 @@ class TestIndexedKeyCacheSchemaInvariant:
 
 
 class TestResetMainTierRegistriesAndSimhashes:
-    """Regression guard for the consolidate_interim_adapters finalize step.
+    """Regression guard for the consolidate finalize step.
 
     The fold rewrites each main tier's KeyRegistry from the post-consolidation
     ``tier_keyed`` layout.  It MUST repopulate the per-tier SimHash registry in
@@ -3101,7 +3259,7 @@ class TestAbortSkipsCommit:
 
     1. run_consolidation_cycle: aborted episodic → returns {"mode": "aborted"}
     2. _run_indexed_key_procedural: aborted proc → deferred store.put/delete skipped
-    3. consolidate_interim_adapters: aborted tier → backup restored, raises
+    3. consolidate: aborted tier → backup restored, raises
        AbortedDuringConsolidation
     """
 
@@ -3382,10 +3540,8 @@ class TestAbortSkipsCommit:
             f"store.put must not be called after abort; called for {store_put_calls}"
         )
 
-    def test_consolidate_interim_adapters_raises_and_rolls_back_on_aborted(
-        self, monkeypatch, tmp_path
-    ):
-        """When a tier's train_adapter returns aborted=True, consolidate_interim_adapters
+    def test_consolidate_raises_and_rolls_back_on_aborted(self, monkeypatch, tmp_path):
+        """When a tier's train_adapter returns aborted=True, consolidate
         restores backup adapter weights via copy_adapter_weights and raises
         AbortedDuringConsolidation.
 
@@ -3459,7 +3615,7 @@ class TestAbortSkipsCommit:
             # Simulate GPU lock already held: acquire returns False so the entry
             # guard does NOT raise (it only raises when acquire returns True).
             patch("paramem.server.gpu_lock._gpu_thread_lock") as mock_lock,
-            # consolidate_interim_adapters imports train_adapter and
+            # consolidate imports train_adapter and
             # copy_adapter_weights locally; patch at the source modules.
             patch("paramem.training.trainer.train_adapter", return_value=aborted_metrics),
             patch("paramem.models.loader.copy_adapter_weights", side_effect=_spy_copy),
@@ -3490,7 +3646,7 @@ class TestAbortSkipsCommit:
             mock_lock.acquire.return_value = False
 
             with pytest.raises(AbortedDuringConsolidation):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
 
         # Backup restore: at least one copy_adapter_weights(src=<tier>_backup, dst=<tier>)
         # call must have fired for the tiers whose backup slot exists in peft_config.
@@ -3580,7 +3736,7 @@ class TestAbortSkipsCommit:
             mock_lock.acquire.return_value = False
 
             with pytest.raises(RuntimeError, match="boom"):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
 
         rollback_dsts = {dst for (src, dst) in copy_calls if src.endswith("_backup")}
         assert rollback_dsts, f"expected a backup->tier restore copy; copy_calls={copy_calls}"
@@ -3674,7 +3830,7 @@ class TestAbortSkipsCommit:
             mock_lock.acquire.return_value = False
 
             with pytest.raises(RuntimeError, match="registry rewrite exploded"):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
 
         # Snapshot-direction copies (dst ends with "_backup") are expected;
         # a restore-direction copy (src ends with "_backup") would mean the
@@ -3775,7 +3931,7 @@ class TestAbortSkipsCommit:
             mock_lock.acquire.return_value = False
 
             with pytest.raises(RuntimeError, match="disk write failed"):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
 
         mock_save.assert_called_once()
         restore_calls = [c for c in copy_calls if c[0].endswith("_backup")]
@@ -3873,7 +4029,7 @@ class TestAbortSkipsCommit:
             mock_lock.acquire.return_value = False
 
             with pytest.raises(_DistinctiveError, match="boom"):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
 
         mock_telemetry.assert_not_called()
 
@@ -3960,7 +4116,7 @@ class TestAbortSkipsCommit:
             mock_lock.acquire.return_value = False
 
             with pytest.raises(AbortedDuringConsolidation):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
 
     def test_telemetry_write_failure_does_not_fail_successful_fold(self, monkeypatch, tmp_path):
         """A telemetry write failure must not turn an otherwise-successful
@@ -4050,7 +4206,7 @@ class TestAbortSkipsCommit:
         ):
             mock_lock.acquire.return_value = False
 
-            result = loop.consolidate_interim_adapters(trainer=None, router=None)
+            result = loop.consolidate(mode="train", trainer=None, router=None)
 
         assert result is not None
         mock_save.assert_called_once()
@@ -4145,7 +4301,7 @@ class TestAbortSkipsCommit:
         ):
             mock_lock.acquire.return_value = False
 
-            loop.consolidate_interim_adapters(trainer=None, router=None)
+            loop.consolidate(mode="train", trainer=None, router=None)
 
         assert mock_telemetry.called, (
             "record_fold_telemetry was not called with save_cycle_snapshots=False —"
@@ -4506,7 +4662,7 @@ class TestInterimCommitFailureRollbackSimulate:
 
 # ---------------------------------------------------------------------------
 # Tests for the new full-consolidation pipeline stages 1–5 in
-# consolidate_interim_adapters (reconstruct → re-merge → dedup → tier)
+# consolidate (reconstruct → re-merge → dedup → tier)
 # ---------------------------------------------------------------------------
 
 
@@ -4642,7 +4798,7 @@ class TestConsolidateInterimAdaptersFullFlow:
 
     @staticmethod
     def _run_with_mocks(loop, tmp_path, reconstruct_return):
-        """Run consolidate_interim_adapters with all heavy operations mocked.
+        """Run consolidate with all heavy operations mocked.
 
         Patches: GPU lock (held), reconstruct_graph (returns supplied value),
         graph enrichment (skipped), train_adapter (no-op), all PEFT helpers.
@@ -4688,7 +4844,7 @@ class TestConsolidateInterimAdaptersFullFlow:
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                return loop.consolidate_interim_adapters(trainer=None, router=None)
+                return loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -5719,7 +5875,7 @@ class TestConsolidateInterimAdaptersFullFlow:
 class TestDriftPartitioning:
     """3-way drift partition: deduplicated / orphan / genuine_loss.
 
-    Guards that the drift-accounting site in consolidate_interim_adapters
+    Guards that the drift-accounting site in consolidate
     correctly separates intended deduplication (duplicate-SPO collapse, fact
     preserved under surviving twin) from orphan keys (no SPO content) and
     genuine reconstruction losses (content present, no merged edge produced).
@@ -6183,7 +6339,7 @@ class TestDriftIntendedRemoval:
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -7327,9 +7483,9 @@ class TestTierFloor:
         probe_side_effect=None,
         train_adapter_spy=None,
     ):
-        """Run consolidate_interim_adapters with heavy ops mocked.
+        """Run consolidate with heavy ops mocked.
 
-        Wraps consolidate_interim_adapters (the full-fold thin wrapper), which now
+        Wraps consolidate (the full-fold thin wrapper), which now
         delegates its body to _run_fold(FoldScope(persist="main_tiers", ...)).
         Heavy GPU ops are mocked so this runs without hardware.
 
@@ -7394,7 +7550,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                return loop.consolidate_interim_adapters(trainer=None, router=None)
+                return loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -7646,7 +7802,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -7858,7 +8014,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -7996,7 +8152,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -8105,7 +8261,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -8199,7 +8355,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -8369,7 +8525,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -8541,7 +8697,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -8675,7 +8831,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -8851,7 +9007,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset", subset_copy_spy),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -8980,7 +9136,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -9113,7 +9269,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -9242,7 +9398,7 @@ class TestTierFloor:
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -10518,7 +10674,7 @@ class TestInterimRecitalDedup:
         assert loop.merger.removal_ledger == {}, (
             f"primary recital path must not soft-stale anything; got {loop.merger.removal_ledger}"
         )
-        # R2: the recital-dedup Case-1-adopt branch records the main key in
+        # The recital-dedup Case-1-adopt branch records the main key in
         # adopt_reinforcements -- exactly once -- NOT in reinforcements (that
         # dict is reserved for the both-keyed-collision elif).
         assert loop.merger.adopt_reinforcements == {"graph1": ("", "")}, (
@@ -11122,7 +11278,7 @@ class TestInterimRecitalDedup:
         assert "graph_slot" in loop.merger.reinforcements, (
             "the surviving slot key is recorded for the fold's bump_recurrence pass"
         )
-        # R2: the R1 collision rides the both-keyed-collision elif, never the
+        # The R1 collision rides the both-keyed-collision elif, never the
         # Case-1-adopt branch -- graph_main must never enter adopt_reinforcements.
         assert "graph_main" not in loop.merger.adopt_reinforcements, (
             "R1 collision must not credit the main key via adopt_reinforcements; "
@@ -11181,7 +11337,7 @@ class TestInterimRecitalDedup:
         removal_ledger[reason="dedup", surviving_twin="graph_slot"].
 
         A SUBSEQUENT full fold is then driven through the production entry
-        (consolidate_interim_adapters, via
+        (consolidate, via
         TestConsolidateInterimAdaptersFullFlow's real-GraphMerger harness --
         the same pattern TestDriftPartitioning uses).  Both keys are still
         active with identical SPO, so the full fold's OWN registry-true
@@ -11582,7 +11738,7 @@ class TestInterimRecitalDedup:
             "the main-tier dedup target must remain excluded on resume too"
         )
 
-        # R2 resume no-double-credit: the recital-dedup adopt bump is applied
+        # Resume no-double-credit: the recital-dedup adopt bump is applied
         # ONLY on the pre-crash fresh-derivation pass (inside _refine_consolidation_graph,
         # itself only reachable from the fresh-derivation branch).  The resume
         # fast-path never re-enters materialize/refine, so the credit must land
@@ -14499,7 +14655,7 @@ class TestNormalizationLevelGating:
 
 
 # ---------------------------------------------------------------------------
-# S3 — _full_consolidation_overdue_key unit tests
+# _full_consolidation_overdue_key unit tests
 # ---------------------------------------------------------------------------
 
 
@@ -14514,17 +14670,27 @@ class TestFullConsolidationOverdueKey:
     - Returns None when ``max_interim_count`` <= 0.
     """
 
-    def _make_config(self, adapter_dir, *, max_interim_count: int = 7, period_seconds=302400):
+    def _make_config(
+        self, adapter_dir, *, max_interim_count: int = 7, period_seconds=302400, mode: str = "train"
+    ):
         """Minimal config mock reusing the same shape as TestFullCycleGateHelpers._make_config."""
         cfg = MagicMock()
         cfg.adapter_dir = adapter_dir
         cfg.consolidation.max_interim_count = max_interim_count
         cfg.consolidation.consolidation_period_seconds = period_seconds
+        cfg.consolidation.mode = mode
         return cfg
 
     def _make_interim_dir(self, adapter_dir, stamp: str) -> None:
-        """Create a bare on-disk interim dir at ``episodic/interim_<stamp>/``."""
-        (adapter_dir / "episodic" / f"interim_{stamp}").mkdir(parents=True, exist_ok=True)
+        """Create an on-disk interim slot with a train-venue payload.
+
+        The overdue key is derived from the venue-filtered interim set, so the
+        slot must carry ``adapter_model.safetensors`` to be seen.
+        """
+        interim_dir = adapter_dir / "episodic" / f"interim_{stamp}"
+        slot = interim_dir / f"{stamp}-slot"
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
 
     def _stamp_seconds_ago(self, seconds: float) -> str:
         """Return a YYYYMMDDTHHMM stamp for a datetime ``seconds`` ago.
@@ -14615,7 +14781,7 @@ class TestFullConsolidationOverdueKey:
 
 
 # ---------------------------------------------------------------------------
-# S3 — Dispatcher incident wiring tests
+# Dispatcher incident wiring tests
 # ---------------------------------------------------------------------------
 
 
@@ -14630,19 +14796,34 @@ class TestFullCycleDispatcherOverdueIncident:
     """
 
     def _make_interim_dir(self, adapter_dir, stamp: str) -> None:
-        (adapter_dir / "episodic" / f"interim_{stamp}").mkdir(parents=True, exist_ok=True)
+        """Create a CONTENT-BEARING train-venue interim slot.
+
+        The dispatcher's content gate counts slots that carry the venue payload,
+        so a bare directory would be invisible to it (and to the gate's
+        deadline/incident helpers).
+        """
+        slot = adapter_dir / "episodic" / f"interim_{stamp}" / f"{stamp}-slot"
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
 
     def _make_minimal_state(self, tmp_path) -> dict:
-        """Minimal _state for dispatcher tests with a real config.paths.data."""
+        """Minimal _state for dispatcher tests with a real config.paths.data.
+
+        Seeds one content-bearing interim slot so the dispatcher's content gate
+        passes and these tests exercise the overdue-incident wiring in
+        isolation.
+        """
         cfg = MagicMock()
         cfg.consolidation.training_idle_debounce_s = 0
         # Calendar-exact cadence — keeps the suspend/power-off catch-up gate
         # (systemd_timer.heartbeat_seconds) a no-op so these tests exercise
         # only the overdue-incident wiring, not the catch-up gate.
         cfg.consolidation.refresh_cadence = "12h"
+        cfg.consolidation.mode = "train"
         cfg.paths.data = tmp_path
         cfg.adapter_dir = tmp_path / "adapters"
         cfg.adapter_dir.mkdir(parents=True, exist_ok=True)
+        self._make_interim_dir(cfg.adapter_dir, "20260101T0000")
         return {
             "config": cfg,
             "session_buffer": MagicMock(),
@@ -14693,7 +14874,9 @@ class TestFullCycleDispatcherOverdueIncident:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
-            result = app_module._maybe_trigger_scheduled_consolidation()
+            result, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
 
         assert result == "started_full"
         assert len(recorded) == 1, f"Expected exactly one incident; got: {recorded}"
@@ -14731,7 +14914,9 @@ class TestFullCycleDispatcherOverdueIncident:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
-            result = app_module._maybe_trigger_scheduled_consolidation()
+            result, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
 
         assert result == "started_full"
         overdue_incidents = [t for t in recorded_types if t == "full_consolidation_overdue"]
@@ -14772,13 +14957,15 @@ class TestFullCycleDispatcherOverdueIncident:
             patch("paramem.server.retry_state.bump_retry_count") as mock_bump,
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
-            app_module._maybe_trigger_scheduled_consolidation()
+            app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
 
         mock_bump.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# S3 — Two-tick sequencing lock
+# Two-tick sequencing lock: the overdue incident fires once per cycle key
 # ---------------------------------------------------------------------------
 
 
@@ -14792,15 +14979,26 @@ class TestTwoTickSequencing:
     helpers (mirrors TestFullCycleGateHelpers without inheritance).
     """
 
-    def _make_config(self, adapter_dir, *, N: int = 3, period_seconds: int = 10 * 365 * 86400):
+    def _make_config(
+        self,
+        adapter_dir,
+        *,
+        N: int = 3,
+        period_seconds: int = 10 * 365 * 86400,
+        mode: str = "train",
+    ):
         cfg = MagicMock()
         cfg.adapter_dir = adapter_dir
         cfg.consolidation.max_interim_count = N
         cfg.consolidation.consolidation_period_seconds = period_seconds
+        cfg.consolidation.mode = mode
         return cfg
 
     def _make_interim_dir(self, adapter_dir, stamp: str) -> None:
-        (adapter_dir / "episodic" / f"interim_{stamp}").mkdir(parents=True, exist_ok=True)
+        """Create a train-venue interim slot (the gate counts payload-bearing slots only)."""
+        slot = adapter_dir / "episodic" / f"interim_{stamp}" / f"{stamp}-slot"
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
 
     def test_count_n_is_not_due(self, tmp_path):
         """Exactly N interim dirs on disk (T0 pre-mint state): gate returns False.
@@ -14837,7 +15035,7 @@ class TestTwoTickSequencing:
 
 
 # ---------------------------------------------------------------------------
-# S3 — Resolution on clean full-cycle completion
+# Overdue-incident resolution on clean full-cycle completion
 # ---------------------------------------------------------------------------
 
 
@@ -14941,7 +15139,7 @@ class TestFullCycleOverdueResolution:
 
 
 # ---------------------------------------------------------------------------
-# S3 — /status surfaces full_consolidation_overdue via _consolidation_incident_types
+# /status surfaces full_consolidation_overdue via _consolidation_incident_types
 # ---------------------------------------------------------------------------
 
 
@@ -14977,7 +15175,7 @@ class TestFullConsolidationOverdueStatusSurface:
 
 
 # ---------------------------------------------------------------------------
-# S5 — config validator + _oldest_interim_stamp + 3-way gate + incidents
+# Config validator + _oldest_interim_stamp + 3-way gate + incidents
 # ---------------------------------------------------------------------------
 
 
@@ -15039,28 +15237,117 @@ class TestInterimOverflowSlackConfig:
             ConsolidationScheduleConfig(max_interim_count=-1)
 
 
+class TestConsolidationVenueConfig:
+    """ConsolidationScheduleConfig validates the consolidation venue at load.
+
+    Two load-time guards:
+
+    * ``mode`` must be "train" or "simulate".  Downstream code treats anything
+      that is not "train" as simulate, so an unvalidated typo would boot
+      cleanly and only explode at request time.
+    * ``max_interim_count == 0`` + ``mode == "simulate"`` stalls session
+      ingestion: at count 0 no interim adapter is ever minted, and in simulate
+      mode the scheduled full fold does not consume pending sessions
+      (``_consume_pending`` in ``paramem/server/app.py`` carries a
+      ``mode != "simulate"`` term).  Nothing would consume the buffer.
+
+    Both are boot-time guards only — a post-construction mutation
+    (``cfg.consolidation.mode = "simulate"``) bypasses ``__post_init__``.
+    """
+
+    def test_count_zero_cadence_error_precedes_pairing_error(self):
+        """The pre-existing cadence check fires before the venue-pairing check.
+
+        max_interim_count=0 + mode='simulate' + refresh_cadence='' has TWO
+        independently-true defects. The cadence check (``:1163-1189``, ahead
+        of the pairing check added at ``:1207-1228``) must win — it is checked
+        first in ``__post_init__``. Pins the ordering so a future reorder of
+        the two blocks changes the error an operator sees, loudly, in a
+        failing test rather than silently.
+        """
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        # The pairing error never mentions refresh_cadence, so this pins that
+        # the cadence error — not the pairing error — is the one raised.
+        with pytest.raises(ValueError, match="refresh_cadence"):
+            ConsolidationScheduleConfig(max_interim_count=0, mode="simulate", refresh_cadence="")
+
+    def test_count_zero_with_simulate_raises_naming_both_keys(self):
+        """max_interim_count=0 + mode='simulate' raises, naming both keys."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError) as exc:
+            ConsolidationScheduleConfig(max_interim_count=0, mode="simulate")
+
+        message = str(exc.value)
+        assert "max_interim_count" in message
+        assert "mode" in message
+        assert "simulate" in message
+
+    def test_count_zero_with_train_accepted(self):
+        """max_interim_count=0 + mode='train' (consume-pending mode) still loads."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig(max_interim_count=0, mode="train")
+        assert cfg.max_interim_count == 0
+        assert cfg.mode == "train"
+
+    def test_count_positive_with_simulate_accepted(self):
+        """max_interim_count>0 + mode='simulate' still loads — interims carry the sessions."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig(max_interim_count=7, mode="simulate")
+        assert cfg.max_interim_count == 7
+        assert cfg.mode == "simulate"
+
+    def test_unknown_mode_raises_at_load(self):
+        """A typo'd mode raises at construction, not at the first request."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        with pytest.raises(ValueError, match="consolidation.mode"):
+            ConsolidationScheduleConfig(mode="simulated")
+
+    @pytest.mark.parametrize("mode", ["train", "simulate"])
+    def test_known_modes_accepted(self, mode):
+        """Both members of the venue vocabulary construct without error."""
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig(mode=mode)
+        assert cfg.mode == mode
+
+
 class TestOldestInterimStamp:
     """_oldest_interim_stamp returns the oldest stamp with no age gate."""
 
     def _write_interim_dir(self, adapter_dir, stamp: str) -> None:
-        # On-disk layout: <adapter_dir>/episodic/interim_<stamp>/
-        d = adapter_dir / "episodic" / f"interim_{stamp}"
-        d.mkdir(parents=True, exist_ok=True)
+        """Create a train-venue interim slot at ``episodic/interim_<stamp>/``.
+
+        The stamp helper scans venue-filtered, so the slot carries the train
+        payload (``adapter_model.safetensors``) — a payload-less dir is skipped.
+        """
+        slot = adapter_dir / "episodic" / f"interim_{stamp}" / f"{stamp}-slot"
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
+
+    def _make_config(self, adapter_dir):
+        """Config mock with the consolidation venue the helpers filter on."""
+        cfg = MagicMock()
+        cfg.adapter_dir = adapter_dir
+        cfg.consolidation.mode = "train"
+        return cfg
 
     def test_returns_none_when_no_interim_dirs(self, tmp_path):
         """No interim directories → None."""
         from paramem.server.app import _oldest_interim_stamp
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path
+        cfg = self._make_config(tmp_path)
         assert _oldest_interim_stamp(cfg) is None
 
     def test_returns_oldest_stamp(self, tmp_path):
         """Returns the lexically-first (chronologically oldest) stamp."""
         from paramem.server.app import _oldest_interim_stamp
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path
+        cfg = self._make_config(tmp_path)
         self._write_interim_dir(tmp_path, "20260101T0000")
         self._write_interim_dir(tmp_path, "20260201T0000")
         self._write_interim_dir(tmp_path, "20260301T0000")
@@ -15074,8 +15361,7 @@ class TestOldestInterimStamp:
 
         from paramem.server.app import _oldest_interim_stamp
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path
+        cfg = self._make_config(tmp_path)
         # Use a recent timestamp that would NOT be overdue.
         now_stamp = datetime.now().strftime("%Y%m%dT%H%M")
         self._write_interim_dir(tmp_path, now_stamp)
@@ -15089,8 +15375,7 @@ class TestOldestInterimStamp:
         but adds a 2×period age gate — a young interim returns None."""
         from paramem.server.app import _full_consolidation_overdue_key
 
-        cfg = MagicMock()
-        cfg.adapter_dir = tmp_path
+        cfg = self._make_config(tmp_path)
         cfg.consolidation.max_interim_count = 7
         cfg.consolidation.consolidation_period_seconds = 10 * 365 * 86400  # 10 years
         # Write a very recent stamp — age << 2×period.
@@ -15385,9 +15670,13 @@ class TestS5IncidentEmission:
         from paramem.server.app import _oldest_interim_stamp, _overflow_incident_for
 
         adapter_dir = tmp_path / "adapters"
-        (adapter_dir / "episodic" / "interim_20260101T0000").mkdir(parents=True, exist_ok=True)
+        # Train-venue payload: the stamp helper counts payload-bearing slots only.
+        slot = adapter_dir / "episodic" / "interim_20260101T0000" / "20260101T0000-slot"
+        slot.mkdir(parents=True, exist_ok=True)
+        (slot / "adapter_model.safetensors").write_bytes(b"")
         cfg = MagicMock()
         cfg.adapter_dir = adapter_dir
+        cfg.consolidation.mode = "train"
 
         inc = _overflow_incident_for("cap_pending", False)
         key = _oldest_interim_stamp(cfg) or "unknown"
@@ -15765,7 +16054,7 @@ class TestFoldResumeHelpers:
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(trainer=None, router=None)
+                result = loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -15894,7 +16183,7 @@ class TestFoldResumeHelpers:
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
                 patch("paramem.backup.key_store.daily_identity_loadable", return_value=False),
             ):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -16000,7 +16289,7 @@ class TestFoldResumeHelpers:
                 patch("paramem.models.loader.copy_adapter_weights"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                loop.consolidate_interim_adapters(trainer=None, router=None)
+                loop.consolidate(mode="train", trainer=None, router=None)
         finally:
             _gpu_thread_lock.release()
 
@@ -16230,7 +16519,7 @@ class TestConsumePendingFullFold:
         """Minimal ConsolidationLoop stub for consume-pending full-fold tests.
 
         The consume_pending decision is NOT stored on the loop — it is a
-        caller decision passed to ``consolidate_interim_adapters(consume_pending=...)``
+        caller decision passed to ``consolidate(mode="train", consume_pending=...)``
         at call time.  Tests that need a specific value pass it there.
         """
         from unittest.mock import MagicMock
@@ -16291,7 +16580,7 @@ class TestConsumePendingFullFold:
 
     @staticmethod
     def _run_full_fold_with_materialize_spy(loop, *, consume_pending=True, materialize_spy=None):
-        """Run consolidate_interim_adapters, spying on _materialize_consolidation_graph.
+        """Run consolidate, spying on _materialize_consolidation_graph.
 
         Returns (result, materialize_calls) where materialize_calls is the list of
         kwargs dicts passed to _materialize_consolidation_graph on each invocation.
@@ -16354,8 +16643,8 @@ class TestConsumePendingFullFold:
                 patch("paramem.models.loader.copy_adapter_weights_subset"),
                 patch("paramem.memory.interim_adapter.unload_interim_adapters", return_value=[]),
             ):
-                result = loop.consolidate_interim_adapters(
-                    trainer=None, router=None, consume_pending=consume_pending
+                result = loop.consolidate(
+                    mode="train", trainer=None, router=None, consume_pending=consume_pending
                 )
         finally:
             _gpu_thread_lock.release()
@@ -16400,7 +16689,7 @@ class TestConsumePendingFullFold:
         _gpu_thread_lock.acquire()
         try:
             with patch.object(ConsolidationLoop, "_run_fold", _spy_run_fold):
-                loop.consolidate_interim_adapters(trainer=None, router=None, consume_pending=True)
+                loop.consolidate(mode="train", trainer=None, router=None, consume_pending=True)
         finally:
             _gpu_thread_lock.release()
 
@@ -16445,7 +16734,7 @@ class TestConsumePendingFullFold:
         _gpu_thread_lock.acquire()
         try:
             with patch.object(ConsolidationLoop, "_run_fold", _spy_run_fold):
-                loop.consolidate_interim_adapters(trainer=None, router=None, consume_pending=False)
+                loop.consolidate(mode="train", trainer=None, router=None, consume_pending=False)
         finally:
             _gpu_thread_lock.release()
 
@@ -16581,11 +16870,14 @@ class TestConsumePendingFullFold:
 
 
 class TestDispatchCountZeroRoutesToFull:
-    """_maybe_trigger_scheduled_consolidation at count==0 → always full, never interim.
+    """Dispatch at count==0 → full when there is content, never interim.
 
-    At max_interim_count==0, _is_full_cycle_due returns True unconditionally,
-    so every scheduled tick routes to the full consolidation path ("started_full")
-    and the interim slot-minting path (_extract_and_start_training) is never reached.
+    At max_interim_count==0, _is_full_cycle_due returns True unconditionally, so
+    an AUTO tick always resolves to the full path and the interim slot-minting
+    path (_extract_and_start_training) is never reached.  Whether that full path
+    actually DISPATCHES is the content gate's decision: at count==0 the fold's
+    only input is the pending sessions it consumes directly, so with none
+    pending there is nothing to learn and the tick must noop.
     """
 
     def _make_minimal_state(self, tmp_path, buffer, store=None) -> dict:
@@ -16597,15 +16889,26 @@ class TestDispatchCountZeroRoutesToFull:
         config = MagicMock()
         config.consolidation.max_interim_count = 0
         config.consolidation.refresh_cadence = "12h"
+        config.consolidation.mode = "train"
         config.consolidation.training_idle_debounce_s = 0
         config.consolidation.orphan_retirement_seconds = None
+        config.consolidation.retain_sessions = False
         config.debug = False
         config.debug_dir = tmp_path / "debug"
+        config.adapter_dir = tmp_path / "adapters"
+        config.adapter_dir.mkdir(parents=True, exist_ok=True)
+
+        if store is None:
+            store = MagicMock()
+            # Enrolled (non-anonymous) speaker → a session carrying a speaker_id
+            # classifies as NAMED.  The count==0 full path now runs the same
+            # session triage as the interim path, so this must be a real answer.
+            store.is_anonymous.return_value = False
 
         return {
             "config": config,
             "session_buffer": buffer,
-            "speaker_store": store or MagicMock(),
+            "speaker_store": store,
             "consolidating": False,
             "mode": "local",
             "last_chat_monotonic": None,
@@ -16613,36 +16916,44 @@ class TestDispatchCountZeroRoutesToFull:
             "store_load_degraded": False,
         }
 
-    def _call_tick_count_zero(self, state_overrides: dict) -> str:
-        """Run _maybe_trigger_scheduled_consolidation with count==0 real _is_full_cycle_due.
+    def _call_tick_count_zero(self, state_overrides: dict):
+        """Run the scheduled AUTO dispatch at count==0 with the real _is_full_cycle_due.
 
         Does NOT patch _is_full_cycle_due — at count==0 the real function returns True
         unconditionally so the test exercises the real routing logic.  Patches out the
-        asyncio event loop and the side-effectful dispatch functions so no GPU work runs.
+        asyncio event loop so no GPU work runs, and reports what actually reached the
+        executor (nothing submitted = nothing dispatched).
         """
         from unittest.mock import MagicMock, patch
 
         import paramem.server.app as _app
 
-        # Provide a mock event loop so asyncio.get_running_loop() doesn't raise.
+        submitted: list[object] = []
+
+        def _submit(_executor, fn):
+            submitted.append(fn)
+            future = MagicMock()
+            future.add_done_callback = MagicMock()
+            return future
+
         mock_loop = MagicMock()
-        mock_future = MagicMock()
-        mock_future.add_done_callback = MagicMock()
-        mock_loop.run_in_executor = MagicMock(return_value=mock_future)
+        mock_loop.run_in_executor = MagicMock(side_effect=_submit)
 
         with (
             patch.object(_app, "_state", state_overrides),
             patch("paramem.server.app._consolidation_dispatch_guards", return_value=None),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
-            patch("paramem.server.app._run_full_consolidation_sync") as _mock_full,
-            patch("paramem.server.app._extract_and_start_training") as _mock_interim,
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
-            result = _app._maybe_trigger_scheduled_consolidation()
-        return result, _mock_full.call_count, _mock_interim.call_count
+            result, _action = _app._dispatch_consolidation(
+                _app.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
+        full_count = submitted.count(_app._run_full_consolidation_sync)
+        interim_count = submitted.count(_app._extract_and_start_training)
+        return result, full_count, interim_count
 
     def test_count_zero_every_tick_routes_to_full(self, tmp_path):
-        """At max_interim_count==0, every tick returns started_full (never started)."""
+        """At max_interim_count==0, a tick with pending sessions returns started_full."""
         from paramem.server.session_buffer import SessionBuffer
 
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
@@ -16651,8 +16962,9 @@ class TestDispatchCountZeroRoutesToFull:
         buffer.append("conv-named", "assistant", "Hi")
 
         state = self._make_minimal_state(tmp_path, buffer)
-        result, full_count, interim_count = self._call_tick_count_zero(state)
+        result, full_count, _interim_count = self._call_tick_count_zero(state)
         assert result == "started_full", f"Expected 'started_full' at count==0, got {result!r}"
+        assert full_count == 1
 
     def test_count_zero_never_reaches_extract_and_start_training(self, tmp_path):
         """The interim slot-minting path is never invoked at count==0."""
@@ -16669,25 +16981,33 @@ class TestDispatchCountZeroRoutesToFull:
             f"was called {interim_count} time(s)"
         )
 
-    def test_count_zero_empty_buffer_still_routes_to_full(self, tmp_path):
-        """At count==0, even with no pending sessions the tick routes to started_full.
+    def test_count_zero_empty_buffer_is_a_noop_not_a_full_retrain(self, tmp_path):
+        """At count==0 with no pending sessions the tick noops — nothing is submitted.
 
-        The noop/accumulating decision lives in _run_full_cycle, not in the dispatcher.
+        The regression test for the defect the content gate closes: at count==0
+        every tick is a full-cycle tick, so an ungated full path retrained every
+        main tier on every cadence with nothing new to learn.  The status alone
+        is not enough — the load-bearing assertion is that NOTHING reached the
+        executor.
         """
         from paramem.server.session_buffer import SessionBuffer
 
         buffer = SessionBuffer(tmp_path / "sessions", state_dir=tmp_path / "state", debug=False)
         # No sessions at all.
         state = self._make_minimal_state(tmp_path, buffer)
-        result, _full_count, _interim_count = self._call_tick_count_zero(state)
-        assert result == "started_full", (
-            f"Expected 'started_full' at count==0 (empty buffer), got {result!r}"
+        result, full_count, interim_count = self._call_tick_count_zero(state)
+        assert result == "noop_no_pending", (
+            f"Expected 'noop_no_pending' at count==0 (empty buffer), got {result!r}"
         )
+        assert (full_count, interim_count) == (0, 0), (
+            "a full GPU retrain was dispatched with nothing to consolidate"
+        )
+        assert state["consolidating"] is False
 
 
 # ---------------------------------------------------------------------------
-# Suspend/power-off catch-up gate: _maybe_trigger_scheduled_consolidation
-# gates non-calendar-exact refresh_cadence values on a durable last-attempt
+# Suspend/power-off catch-up gate: _dispatch_consolidation gates
+# non-calendar-exact refresh_cadence values on a durable last-attempt
 # stamp (paramem/server/schedule_state.py). See systemd_timer module
 # docstring for the design.
 # ---------------------------------------------------------------------------
@@ -16708,6 +17028,11 @@ class TestSchedulerCatchUpGate:
         config.paths.data = tmp_path
         config.adapter_dir = tmp_path / "adapters"
         config.adapter_dir.mkdir(parents=True, exist_ok=True)
+        # One content-bearing interim slot (train venue, the config default) so
+        # the content gate passes and these tests isolate the catch-up gate.
+        _slot = config.adapter_dir / "episodic" / "interim_20260101T0000" / "slot"
+        _slot.mkdir(parents=True, exist_ok=True)
+        (_slot / "adapter_model.safetensors").write_bytes(b"")
 
         return {
             "config": config,
@@ -16754,8 +17079,9 @@ class TestSchedulerCatchUpGate:
             patch("paramem.server.app._run_full_consolidation_sync"),
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
-            result = app_module._maybe_trigger_scheduled_consolidation(
-                apply_schedule_gate=apply_schedule_gate
+            result, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO,
+                apply_schedule_gate=apply_schedule_gate,
             )
         return result, mock_loop.run_in_executor.call_count
 
@@ -16777,9 +17103,11 @@ class TestSchedulerCatchUpGate:
                 ),
             ),
         ):
-            return app_module._maybe_trigger_scheduled_consolidation(
-                apply_schedule_gate=apply_schedule_gate
+            status, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO,
+                apply_schedule_gate=apply_schedule_gate,
             )
+            return status
 
     def test_due_stamp_dispatches_and_updates_stamp(self, tmp_path):
         """last attempt 6h ago + 'every 5h' (period 5h) → due → dispatch
@@ -17098,7 +17426,7 @@ class TestRunFullCycleConsumePending:
 
     Tests verify:
     - extract_session called per pending NAMED session
-    - consolidate_interim_adapters receives consume_pending=True
+    - consolidate receives consume_pending=True
     - mark_consolidated called on fold SUCCESS (Site B)
     - mark_consolidated called on fold NOOP with extraction success (Site A)
     - mark_consolidated NOT called on AbortedDuringConsolidation
@@ -17130,8 +17458,8 @@ class TestRunFullCycleConsumePending:
         mock_loop.shutdown_requested = False
         mock_loop.store.replay_enabled = False
 
-        # consolidate_interim_adapters returns success by default.
-        mock_loop.consolidate_interim_adapters.return_value = {
+        # consolidate returns success by default.
+        mock_loop.consolidate.return_value = {
             "tiers_rebuilt": ["episodic"],
             "graph_drift_count": 0,
             "rolled_back": False,
@@ -17228,7 +17556,7 @@ class TestRunFullCycleConsumePending:
         )
 
     def test_count_zero_consume_pending_true_passed_to_fold(self, monkeypatch, tmp_path):
-        """At count==0, consolidate_interim_adapters receives consume_pending=True."""
+        """At count==0, consolidate receives consume_pending=True."""
         from unittest.mock import patch
 
         state = self._make_state(tmp_path)
@@ -17248,15 +17576,15 @@ class TestRunFullCycleConsumePending:
         ):
             self._run_sync(state, monkeypatch)
 
-        call_kwargs = loop.consolidate_interim_adapters.call_args
+        call_kwargs = loop.consolidate.call_args
         assert call_kwargs is not None
         assert call_kwargs.kwargs.get("consume_pending") is True, (
-            f"consolidate_interim_adapters must receive consume_pending=True at count==0; "
+            f"consolidate must receive consume_pending=True at count==0; "
             f"kwargs={call_kwargs.kwargs}"
         )
 
     def test_count_greater_zero_consume_pending_false(self, monkeypatch, tmp_path):
-        """At count>0 (standard mode), consolidate_interim_adapters gets consume_pending=False."""
+        """At count>0 (standard mode), consolidate gets consume_pending=False."""
         state = self._make_state(tmp_path, max_interim_count=7)
         from unittest.mock import patch
 
@@ -17272,11 +17600,11 @@ class TestRunFullCycleConsumePending:
         ):
             self._run_sync(state, monkeypatch)
 
-        call_kwargs = loop.consolidate_interim_adapters.call_args
+        call_kwargs = loop.consolidate.call_args
         assert call_kwargs is not None
         consume = call_kwargs.kwargs.get("consume_pending", False)
         assert consume is False, (
-            f"consolidate_interim_adapters must receive consume_pending=False at count>0; "
+            f"consolidate must receive consume_pending=False at count>0; "
             f"kwargs={call_kwargs.kwargs}"
         )
         loop.extract_session.assert_not_called()
@@ -17289,7 +17617,7 @@ class TestRunFullCycleConsumePending:
         loop = state["consolidation_loop"]
         loop.extract_session.return_value = ([], [])
         # Fold returns success (tiers_rebuilt non-empty).
-        loop.consolidate_interim_adapters.return_value = {
+        loop.consolidate.return_value = {
             "tiers_rebuilt": ["episodic"],
             "graph_drift_count": 0,
             "rolled_back": False,
@@ -17324,7 +17652,7 @@ class TestRunFullCycleConsumePending:
         loop = state["consolidation_loop"]
         loop.extract_session.return_value = ([], [])
         # Fold returns noop.
-        loop.consolidate_interim_adapters.return_value = {
+        loop.consolidate.return_value = {
             "tiers_rebuilt": [],
             "graph_drift_count": 0,
             "rolled_back": False,
@@ -17351,7 +17679,7 @@ class TestRunFullCycleConsumePending:
         state = self._make_state(tmp_path)
         loop = state["consolidation_loop"]
         loop.extract_session.return_value = ([], [])
-        loop.consolidate_interim_adapters.return_value = {
+        loop.consolidate.return_value = {
             "status": "accumulating",
             "accumulating_reason": {"floor": 30},
             "tiers_rebuilt": [],
@@ -17378,9 +17706,7 @@ class TestRunFullCycleConsumePending:
         state = self._make_state(tmp_path)
         loop = state["consolidation_loop"]
         loop.extract_session.return_value = ([], [])
-        loop.consolidate_interim_adapters.side_effect = AbortedDuringConsolidation(
-            "aborted for chat"
-        )
+        loop.consolidate.side_effect = AbortedDuringConsolidation("aborted for chat")
 
         sb = state["session_buffer"]
         sb.get_pending.return_value = [self._pending_session()]
@@ -17401,7 +17727,7 @@ class TestRunFullCycleConsumePending:
         state = self._make_state(tmp_path)
         loop = state["consolidation_loop"]
         loop.extract_session.return_value = ([], [])
-        loop.consolidate_interim_adapters.side_effect = RuntimeError("fold exploded")
+        loop.consolidate.side_effect = RuntimeError("fold exploded")
 
         sb = state["session_buffer"]
         sb.get_pending.return_value = [self._pending_session()]
@@ -17472,7 +17798,7 @@ class TestRunFullCycleConsumePending:
         """ExtractionFailed on any session aborts the whole batch at count==0.
 
         All sessions must remain pending (mark_consolidated never called), and
-        the fold (consolidate_interim_adapters) must never be reached.
+        the fold (consolidate) must never be reached.
         """
         from unittest.mock import patch
 
@@ -17500,5 +17826,88 @@ class TestRunFullCycleConsumePending:
         ):
             self._run_sync(state, monkeypatch)
 
-        loop.consolidate_interim_adapters.assert_not_called()
+        loop.consolidate.assert_not_called()
         sb.mark_consolidated.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# The single fold entry: mode and fold inputs, pinned exactly
+# ---------------------------------------------------------------------------
+
+
+class TestConsolidateEntry:
+    """``ConsolidationLoop.consolidate`` is the only public fold entry.
+
+    The fold takes the caller's *mode*, the config-derived *consume_pending*
+    decision, and its training collaborators. Each signature below the
+    dispatch layer is pinned by exact set equality, so every gate stays
+    unbypassable.
+    """
+
+    def test_consolidate_takes_mode_and_fold_inputs_only(self):
+        """The entry's parameter set is the mode plus its training collaborators, pinned exactly."""
+        import inspect
+
+        params = inspect.signature(ConsolidationLoop.consolidate).parameters
+        assert set(params) == {
+            "self",
+            "mode",
+            "consume_pending",
+            "trainer",
+            "router",
+            "recall_sanity_threshold",
+            "refresh_epochs",
+        }, f"unexpected fold-entry parameters: {sorted(params)}"
+        assert params["mode"].default is inspect.Parameter.empty, "mode is required"
+
+    def test_fold_spine_and_save_take_fold_inputs_only(self):
+        """The spine, the persist tail and the adapter save take fold inputs only.
+
+        Each signature is pinned by exact set equality: the spine takes its scope
+        plus the training inputs, the persist tail takes its scope plus the
+        venue-specific payload, and the save takes nothing.  Any parameter added
+        below the fold entry — a caller-intent flag, a gate bypass, a stamp
+        override — fails these assertions on arrival.
+        """
+        import inspect
+
+        assert set(inspect.signature(ConsolidationLoop._run_fold).parameters) == {
+            "self",
+            "scope",
+            "trainer",
+            "router",
+            "recall_sanity_threshold",
+            "refresh_epochs",
+            "adapter_name",
+            "stamp",
+            "run_label",
+            "triples_extracted",
+            "episodic_rels",
+            "procedural_rels",
+        }, "unexpected _run_fold parameters"
+
+        assert set(inspect.signature(ConsolidationLoop._persist_fold).parameters) == {
+            "self",
+            "scope",
+            "adapter_name",
+            "stamp",
+            "all_keyed",
+            "graph_path",
+        }, "unexpected _persist_fold parameters"
+
+        assert set(inspect.signature(ConsolidationLoop._save_adapters).parameters) == {"self"}, (
+            "unexpected _save_adapters parameters"
+        )
+
+    def test_train_entry_requires_the_gpu_lock(self):
+        """The train venue still refuses to run without the caller's GPU lock."""
+        from paramem.server.gpu_lock import _gpu_thread_lock
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+
+        with pytest.raises(RuntimeError, match="_gpu_thread_lock"):
+            loop.consolidate(mode="train")
+
+        assert not _gpu_thread_lock.locked(), (
+            "the entry guard must release the lock it probed before raising"
+        )

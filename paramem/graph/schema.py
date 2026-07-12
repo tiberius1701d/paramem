@@ -55,7 +55,7 @@ class Relation(BaseModel):
 
     ``indexed_key`` is a transient merge-DTO carry-slot populated ONLY by
     the full-consolidation fold (the key-propagation re-merge pass inside
-    ``consolidate_interim_adapters``) to propagate the registered indexed
+    ``ConsolidationLoop.consolidate``) to propagate the registered indexed
     key from the reconstruction graph through ``GraphMerger.merge()`` onto
     the merged edge.  It is ``None`` for every normal extraction ``Relation``
     and is never serialised to the registry, ``cumulative_graph.json``, or
@@ -79,7 +79,7 @@ class Relation(BaseModel):
         description=(
             "Transient carry-slot for the registered indexed key during the "
             "full-consolidation fold.  Set by the key-propagation re-merge pass "
-            "inside consolidate_interim_adapters so the key travels through "
+            "inside ConsolidationLoop.consolidate so the key travels through "
             "GraphMerger.merge() onto the merged edge via _IK_KEY_ATTR.  Always "
             "None for extraction-time Relations; never persisted to disk or the "
             "registry schema."

@@ -269,9 +269,9 @@ class GraphMerger:
         ``self.collapsed`` is the parallel list of INCOMING ``ik_key`` strings
         that were deduplicated away in each such collapse.  Where
         ``reinforcements`` records the surviving key, ``collapsed`` records the
-        key whose edge was dropped.  Used by the drift-accounting site in
-        ``consolidate_interim_adapters`` to distinguish intended dedup (fact
-        preserved under the twin key) from genuine reconstruction loss.
+        key whose edge was dropped.  Used by the drift-accounting site in the
+        full consolidation fold to distinguish intended dedup (fact preserved
+        under the twin key) from genuine reconstruction loss.
         """
         self.reinforcements: dict[str, tuple[str, str]] = {}
         self.collapsed: list[str] = []
@@ -642,7 +642,7 @@ class GraphMerger:
                         edge.get("first_seen", ""),
                     )
                 # Record the incoming (drifting) key so the drift-accounting site
-                # in consolidate_interim_adapters can distinguish intended dedup
+                # in the full consolidation fold can distinguish intended dedup
                 # (fact preserved under the surviving twin) from genuine loss.
                 self.collapsed.append(relation.indexed_key)
                 # Raw-surface evidence for dedup collapses (observability hook).
@@ -872,7 +872,7 @@ class GraphMerger:
     def reset_graph(self) -> None:
         """Reset the keying surface to an empty graph, clearing per-fold caches.
 
-        Called by ``consolidate_interim_adapters`` BEFORE the reconstruction-
+        Called by the full consolidation fold BEFORE the reconstruction-
         and-re-merge pass so the keying surface is empty and provenance keying
         is unconditional: reconstructed-key edges are always net-new (Case 3)
         or intra-fold-collapsed (Case 1 among recon edges), with no dependence

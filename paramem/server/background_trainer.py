@@ -361,7 +361,7 @@ class BackgroundTrainer:
     def _set_is_training(self, value: bool) -> None:
         """Override the ``_is_training`` flag from inside a submitted callable.
 
-        Used by ``consolidate_interim_adapters`` to mark non-training phases
+        Used by the full consolidation fold to mark non-training phases
         (between per-tier ``_train_adapter`` calls; the entire finalize block)
         so ``abort_for_inference()`` short-circuits and ``/chat`` waits on the
         GPU lock alone — there's no in-flight HF training step to abort at

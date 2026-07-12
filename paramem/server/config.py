@@ -1108,7 +1108,7 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     orphan_retirement: str = "off"
 
     def __post_init__(self) -> None:
-        """Validate privacy-critical config combinations at construction time.
+        """Validate privacy-critical and ingestion-critical config combinations.
 
         Raises ValueError if a cloud SOTA provider is configured as the
         plausibility judge AND the stage is set to "deanon". That combination
@@ -1119,6 +1119,20 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
         - judge="auto"  + any stage  → local model, no cloud exposure
         - judge="off"   + any stage  → plausibility disabled, no cloud exposure
         - judge=<cloud> + stage="anon" → cloud judge on anonymized data only
+
+        Also validates the consolidation venue:
+        - ``mode`` must be "train" or "simulate". Downstream code treats any
+          other value as simulate, so an unvalidated typo would boot cleanly
+          and only surface at request time.
+        - ``max_interim_count == 0`` together with ``mode == "simulate"`` is
+          rejected: it stalls session ingestion silently (no interim adapter is
+          minted at count 0, and the full fold does not consume pending
+          sessions in simulate mode).
+
+        Scope note: these are load-time guards only. A post-construction
+        mutation (``cfg.consolidation.mode = "simulate"``, the sanctioned
+        per-test override) does not re-run ``__post_init__`` and is therefore
+        not caught. No production path mutates ``mode`` after load.
         """
         super().__post_init__()
         if self.training_save_steps_ram < 0:
@@ -1187,6 +1201,31 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
                     f"every refresh_cadence — with no cadence configured the full fold "
                     f"never runs and pending sessions accumulate unboundedly."
                 )
+
+        # Consolidation venue vocabulary.  Downstream code treats anything that
+        # is not "train" as simulate (see paramem/memory/persistence.py's
+        # commit_tier_slot venue switch), so a typo such as "simulated" would
+        # silently select the simulate venue and only surface later, at request
+        # time.  Reject unknown values here, at load.
+        if self.mode not in ("train", "simulate"):
+            raise ValueError(
+                f"consolidation.mode must be 'train' or 'simulate'; got {self.mode!r}. "
+                f"'train' persists to LoRA weights; 'simulate' persists graph.json "
+                f"under adapter_dir/<tier>/ (no weight training)."
+            )
+
+        if self.max_interim_count == 0 and self.mode == "simulate":
+            raise ValueError(
+                "consolidation.max_interim_count=0 together with "
+                "consolidation.mode='simulate' stalls session ingestion. "
+                "At max_interim_count=0 no interim adapter is ever minted, so the "
+                "scheduled full fold is the only training venue — and in simulate "
+                "mode the full fold does not consume pending sessions. Pending "
+                "sessions would then accumulate in the buffer forever with nothing "
+                "to consume them, silently. Use consolidation.mode='train' with "
+                "max_interim_count=0, or consolidation.max_interim_count >= 1 with "
+                "mode='simulate'."
+            )
 
         if self.interim_overflow_slack < 0:
             raise ValueError(
@@ -1715,6 +1754,12 @@ DEFAULT_DATA_DIR = _PROJECT_ROOT / "data" / "ha"
 def load_server_config(path: str | Path = DEFAULT_SERVER_CONFIG_PATH) -> ServerConfig:
     """Load server configuration from YAML file.
 
+    Four-stage pipeline: parse (``yaml.safe_load``) → interpolate → construct →
+    validate.  Stages 2–4 live in :func:`build_server_config`; this function owns
+    only the file read and the fresh-clone fallback, so any caller that already
+    holds parsed YAML (the migration candidate-validation path) can run the
+    identical construction stage without re-reading a file.
+
     Supports ${VAR_NAME} env var interpolation in all string values.
 
     Fresh-clone fallback: when ``path`` is the default operator-local
@@ -1744,6 +1789,55 @@ def load_server_config(path: str | Path = DEFAULT_SERVER_CONFIG_PATH) -> ServerC
 
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
+
+    return build_server_config(raw, source_path=path)
+
+
+def build_server_config(raw: dict, *, source_path: str | Path) -> ServerConfig:
+    """Construct and validate a :class:`ServerConfig` from parsed YAML.
+
+    The single construction stage of the config pipeline — the one boot performs
+    (via :func:`load_server_config`) and the one the migration path performs when
+    it validates a candidate before promoting it.  There is no second
+    implementation of construction, so candidate validation cannot drift from boot.
+
+    Construction is **path-anchored**: relative ``paths.*`` entries resolve against
+    the project root of *source_path*'s directory, and the adapter guard's error
+    text names *source_path*.  The same *raw* mapping therefore builds a different
+    config depending on where the YAML is said to live.  Callers validating a file
+    that is about to be promoted to the live config location must pass the **live**
+    config path, not the staging path.
+
+    Privacy note: ``_interpolate_env_vars`` returns new containers and never mutates
+    in place, so *raw* is left exactly as parsed — ``${VAR}`` templates in the
+    caller's dict are never replaced with secret values.  The migration stash, the
+    unified diff, and the tier diff depend on this.
+
+    Parameters
+    ----------
+    raw:
+        Parsed YAML mapping (``yaml.safe_load`` output).  Not mutated.
+    source_path:
+        Path the YAML is to be interpreted as living at.  Used for project-root
+        anchoring of relative ``paths.*`` and for error-message text.
+
+    Returns
+    -------
+    ServerConfig
+        Fully constructed and validated config.
+
+    Raises
+    ------
+    FatalConfigError
+        An enabled adapter tier is partially specified without ``target_modules``.
+    ValueError
+        A field-level or cross-field validation guard rejected the config.
+    TypeError
+        An unknown YAML key reached a dataclass constructor, or a typed field
+        holds a value of the wrong type (e.g. an uninterpolated ``${VAR}`` in an
+        int field).
+    """
+    path = Path(source_path)
 
     # Interpolate env vars in all string values
     raw = _interpolate_env_vars(raw)

@@ -424,6 +424,75 @@ class TestRestoreHappyPathConfig:
 
 
 # ---------------------------------------------------------------------------
+# /backup/restore — a config-kind backup that cannot be constructed → 400
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreUnbootableConfigReturns400:
+    """A backup is a config that was validated against a POSSIBLY OLDER schema.
+
+    New load-time guards (e.g. ``max_interim_count=0`` + ``mode=simulate``) can
+    reject bytes that were bootable when the backup was written.  Restoring such a
+    backup must be refused — the safety backup is written first so refusing costs
+    the operator nothing, and the live config must be left untouched.
+    """
+
+    def test_unbootable_config_backup_rejected(self, tmp_path: Path, monkeypatch) -> None:
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        unbootable_content = b"consolidation:\n  mode: simulate\n  max_interim_count: 0\n"
+        slot_dir = backup_write(
+            ArtifactKind.CONFIG,
+            unbootable_content,
+            meta_fields={"tier": "daily"},
+            base_dir=backups_root / "config",
+        )
+        backup_id = slot_dir.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+        live_path = Path(state["config_path"])
+        live_bytes_before = live_path.read_bytes()
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["error"] == "backup_unbootable"
+        assert live_path.read_bytes() == live_bytes_before, "live config was mutated on rejection"
+
+        # The safety backup is written before the construction check — it should
+        # exist even though the restore itself was refused.
+        config_dir = backups_root / "config"
+        slots = [d for d in config_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert len(slots) >= 2, "expected the source slot plus a pre_restore safety slot"
+
+    def test_bootable_config_backup_still_restores(self, tmp_path: Path, monkeypatch) -> None:
+        """Control: an ordinary bootable backup restores exactly as before this change."""
+        config = _make_config(tmp_path)
+        backups_root = config.paths.data / "backups"
+        backups_root.mkdir(parents=True, exist_ok=True)
+
+        backup_content = b"model: gemma\n"
+        slot_dir = backup_write(
+            ArtifactKind.CONFIG,
+            backup_content,
+            meta_fields={"tier": "daily"},
+            base_dir=backups_root / "config",
+        )
+        backup_id = slot_dir.name
+
+        state = _make_state(tmp_path, config)
+        client = _make_client(monkeypatch, state)
+
+        resp = client.post("/backup/restore", json={"backup_id": backup_id})
+
+        assert resp.status_code == 200, resp.text
+        assert Path(state["config_path"]).read_bytes() == backup_content
+
+
+# ---------------------------------------------------------------------------
 # Test 36 — /backup/restore not found → 404
 # ---------------------------------------------------------------------------
 

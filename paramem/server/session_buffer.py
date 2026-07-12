@@ -1008,7 +1008,7 @@ class SessionBuffer:
         released: list[str] = []
         for sid in failed_ids:
             if sid not in self._sessions:
-                # R3: not a buffered session (already retired or a synthetic id
+                # Not a buffered session (already retired, or a synthetic id
                 # that slipped through).  Skip silently — do not mutate state.
                 continue
             new_count = _retry_state.bump_retry_count(self._state_dir, sid)

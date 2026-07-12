@@ -339,7 +339,11 @@ def _handle_ingest_http_error(exc: ServerHTTPError) -> None:
 
 
 def request_consolidate(server_url: str) -> dict:
-    """POST ``/consolidate`` to start a full consolidation cycle.
+    """POST ``/consolidate`` to run the scheduled consolidation now.
+
+    The server's schedule decides whether that resolves to an interim cycle or
+    a full fold; the response's ``action`` field reports which.  The call is
+    non-blocking — it returns as soon as the run is submitted.
 
     Args:
         server_url: Base URL of the running ParaMem server.

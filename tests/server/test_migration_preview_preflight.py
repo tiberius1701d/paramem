@@ -27,14 +27,16 @@ from paramem.server.migration import initial_migration_state
 # Sample YAML content
 # ---------------------------------------------------------------------------
 
-_LIVE_YAML = (
-    b"model: mistral\ndebug: false\nadapters:\n"
+# Both YAMLs must be constructible configs: /migration/preview builds the
+# candidate and rejects one that cannot boot.  An enabled adapter tier that omits
+# target_modules is rejected by the loader guard in paramem/server/config.py.
+_ADAPTER_BLOCK = (
+    b"adapters:\n"
     b"  episodic:\n    enabled: true\n    rank: 8\n    alpha: 16\n"
+    b'    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]\n'
 )
-_CAND_YAML = (
-    b"model: mistral\ndebug: true\nadapters:\n"
-    b"  episodic:\n    enabled: true\n    rank: 8\n    alpha: 16\n"
-)
+_LIVE_YAML = b"model: mistral\ndebug: false\n" + _ADAPTER_BLOCK
+_CAND_YAML = b"model: mistral\ndebug: true\n" + _ADAPTER_BLOCK
 
 
 # ---------------------------------------------------------------------------

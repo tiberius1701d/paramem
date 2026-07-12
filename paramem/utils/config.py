@@ -157,8 +157,7 @@ class ConsolidationConfig:
     # Minimum recall fraction (0, 1] that every recall gate must reach before the
     # adapter fold is accepted.  Applied to: post-save disk-integrity probes
     # (_verify_saved_adapter_from_disk), interim-cycle training
-    # (run_consolidation_cycle), full-fold training
-    # (consolidate_interim_adapters), housekeeping re-train (run_housekeeping),
+    # (run_consolidation_cycle), the full fold (ConsolidationLoop.consolidate),
     # and simulate→train migration (_migrate_tier_simulate_to_train).
     # 1.0 = sharp recall (all keys must be recalled, no tolerance); lower only with
     # empirical evidence and explicit operator acknowledgment.
@@ -184,7 +183,9 @@ class ConsolidationConfig:
             )
 
     # Floor below which a tier's keys park in episodic until the tier's own
-    # population reaches this count.  30 is the conservative default (Test 19).
+    # population reaches this count.  30 is an UNVALIDATED conservative default —
+    # no experiment on the production model establishes it (calibration-pending).
+    # The floor is general: no consolidation trigger bypasses it.
     min_tier_key_floor: int = 30
     # Graduation strategy when a parked tier first crosses min_tier_key_floor.
     # True = copy episodic's LoRA weights into the graduating tier and rebook

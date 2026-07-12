@@ -224,8 +224,9 @@ class TestConfirmStepFailures:
             return original_write_fn(*args, **kwargs)
 
         monkeypatch.setattr(backup_module, "write", _failing_write)
-        # Re-patch the app import of backup_write.
-        with patch("paramem.server.app.backup_write", _failing_write):
+        # Re-patch the migration-module import of backup_write — the pre-migration
+        # config slot is written by migration.backup_live_config.
+        with patch("paramem.server.migration.backup_write", _failing_write):
             resp = client.post("/migration/confirm", json={})
 
         assert resp.status_code == 500
@@ -253,9 +254,10 @@ class TestConfirmStepFailures:
             assert len(slots) == 0, f"Orphan slot in {kind_dir}: {slots}"
 
     def test_confirm_step4_failure_rollback(self, client, state, tmp_path, monkeypatch):
-        """Patch _rename_config → 500 config_swap_failed; marker + backups deleted."""
+        """Patch promote_config → 500 config_swap_failed; marker + backups deleted."""
         with patch(
-            "paramem.server.app._rename_config", side_effect=OSError("EXDEV: cross-device rename")
+            "paramem.server.migration.promote_config",
+            side_effect=OSError("EXDEV: cross-device rename"),
         ):
             resp = client.post("/migration/confirm", json={})
 
@@ -297,12 +299,12 @@ class TestConfirmStepFailures:
         )
 
     def test_confirm_releases_lock_on_step4_failure(self, client, state, tmp_path, monkeypatch):
-        """Step 4 (_rename_config) failure: lock is released; second confirm is not blocked.
+        """Step 4 (promote_config) failure: lock is released; second confirm is not blocked.
 
         Correction 1: the confirm handler's try/finally unconditionally releases
         the migration lock even when step 4 raises.
         """
-        with patch("paramem.server.app._rename_config", side_effect=OSError("EXDEV")):
+        with patch("paramem.server.migration.promote_config", side_effect=OSError("EXDEV")):
             resp1 = client.post("/migration/confirm", json={})
         assert resp1.status_code == 500
         assert resp1.json()["detail"]["error"] == "config_swap_failed"
@@ -505,6 +507,177 @@ class TestConfirmModeSwitch:
         assert body["state"] == "TRIAL"
         assert body.get("mode_switch") is None
         assert state["migration"]["state"] == "TRIAL"
+
+
+# ---------------------------------------------------------------------------
+# Unbootable candidates are rejected before ANY mutation
+# ---------------------------------------------------------------------------
+
+_MODE_TIER_DIFF = [
+    {
+        "dotted_path": "consolidation.mode",
+        "old_value": "train",
+        "new_value": "simulate",
+        "tier": "pipeline_altering",
+    }
+]
+
+# Parses fine; cannot be constructed — max_interim_count=0 + simulate stalls ingestion.
+_STALLED_INGESTION_CANDIDATE = b"consolidation:\n  mode: simulate\n  max_interim_count: 0\n"
+# Parses fine; cannot be constructed — 'simulated' is not a venue.
+_MODE_TYPO_CANDIDATE = b"consolidation:\n  mode: simulated\n"
+
+
+def _restage(state: dict, tmp_path: Path, candidate: bytes) -> Path:
+    """Re-point the STAGING stash at a candidate file holding *candidate* bytes."""
+    cand_path = Path(state["migration"]["candidate_path"])
+    cand_path.write_bytes(candidate)
+    state["migration"]["candidate_bytes"] = candidate
+    state["migration"]["candidate_text"] = candidate.decode("utf-8")
+    state["migration"]["candidate_hash"] = _sha256(candidate)
+    return cand_path
+
+
+def _config_backup_slots(state: dict) -> list[Path]:
+    """Return the backup slot dirs under <data>/backups/config (empty when none)."""
+    kind_dir = state["config"].paths.data / "backups" / "config"
+    if not kind_dir.exists():
+        return []
+    return [d for d in kind_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+
+
+class TestConfirmRejectsUnbootableCandidate:
+    """A candidate that parses but cannot be constructed never reaches the live config.
+
+    Before this gate, confirm renamed first and validated at the next
+    ``load_server_config`` — leaving an unbootable server.yaml live (and, on the
+    fast mode-switch path, no backup slot to roll back to).
+    """
+
+    @pytest.mark.parametrize(
+        "candidate",
+        [_STALLED_INGESTION_CANDIDATE, _MODE_TYPO_CANDIDATE],
+        ids=["stalled_ingestion", "mode_typo"],
+    )
+    def test_mode_switch_invalid_candidate_mutates_nothing(
+        self, client, state, tmp_path, candidate
+    ):
+        state["migration"]["tier_diff"] = list(_MODE_TIER_DIFF)
+        cand_path = _restage(state, tmp_path, candidate)
+        live_path = Path(state["config_path"])
+
+        resp = client.post("/migration/confirm", json={})
+
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"] == "candidate_invalid_config"
+        # Nothing moved: live config intact, candidate still staged, STAGING held.
+        assert live_path.read_bytes() == _LIVE_YAML
+        assert cand_path.read_bytes() == candidate
+        assert state["migration"]["state"] == "STAGING"
+        assert read_trial_marker(state["config"].paths.data / "state") is None
+        assert _config_backup_slots(state) == []
+
+    def test_mode_switch_valid_candidate_swaps_and_backs_up(self, client, state, tmp_path):
+        """The valid fast path writes the pre_migration slot and reports it."""
+        state["migration"]["tier_diff"] = list(_MODE_TIER_DIFF)
+        _restage(state, tmp_path, b"consolidation:\n  mode: simulate\n")
+        live_path = Path(state["config_path"])
+        # Resolve the backups root up front: on success the handler replaces
+        # _state["config"] with the config it re-loads from disk.
+        kind_dir = (state["config"].paths.data / "backups" / "config").resolve()
+
+        resp = client.post("/migration/confirm", json={})
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["state"] == "LIVE"
+        assert live_path.read_bytes() == b"consolidation:\n  mode: simulate\n"
+
+        slots = [d for d in kind_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        assert len(slots) == 1, f"expected one pre_migration config slot, got {slots}"
+        assert body["backup_paths"]["config"] == str(slots[0].resolve())
+        assert body["pre_trial_config_sha256"] == _sha256(_LIVE_YAML)
+        meta_files = list(slots[0].glob("*.meta.json"))
+        assert meta_files, f"no meta sidecar in {slots[0]}"
+        assert json.loads(meta_files[0].read_text(encoding="utf-8"))["tier"] == "pre_migration"
+
+    def test_general_trial_invalid_candidate_mutates_nothing(self, client, state, tmp_path):
+        """Validation precedes the backup write and the marker write."""
+        cand_path = _restage(state, tmp_path, _MODE_TYPO_CANDIDATE)
+        state["migration"]["tier_diff"] = [
+            {
+                "dotted_path": "consolidation.mode",
+                "old_value": "train",
+                "new_value": "simulated",
+                "tier": "pipeline_altering",
+            },
+            {
+                "dotted_path": "debug",
+                "old_value": False,
+                "new_value": True,
+                "tier": "pipeline_altering",
+            },
+        ]
+        live_path = Path(state["config_path"])
+
+        resp = client.post("/migration/confirm", json={})
+
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"] == "candidate_invalid_config"
+        assert live_path.read_bytes() == _LIVE_YAML
+        assert cand_path.read_bytes() == _MODE_TYPO_CANDIDATE
+        assert state["migration"]["state"] == "STAGING"
+        assert read_trial_marker(state["config"].paths.data / "state") is None
+        assert _config_backup_slots(state) == []
+
+    def test_candidate_changed_on_disk_is_rejected(self, client, state, tmp_path):
+        """The file promoted is the file previewed — an edit after staging is a 409."""
+        live_path = Path(state["config_path"])
+        cand_path = Path(state["migration"]["candidate_path"])
+        cand_path.write_bytes(
+            b"model: mistral\ndebug: true\ncloud_only: true\n"
+        )  # stash hash stale
+
+        resp = client.post("/migration/confirm", json={})
+
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"] == "candidate_changed"
+        assert live_path.read_bytes() == _LIVE_YAML
+        assert state["migration"]["state"] == "STAGING"
+        assert read_trial_marker(state["config"].paths.data / "state") is None
+        assert _config_backup_slots(state) == []
+
+
+class TestConfirmBaseSwapRejectsUnbootableCandidate:
+    """Base swap validates before TRIAL and before the orchestration task is created.
+
+    Phase A deletes the adapter weight slots and releases the base model; an
+    unbootable candidate must be rejected before any of that is set in motion.
+    """
+
+    def test_base_swap_invalid_candidate_never_starts_orchestration(self, tmp_path, monkeypatch):
+        fresh = _make_base_swap_state(tmp_path)
+        invalid = b"model: qwen3-4b\nconsolidation:\n  mode: simulated\n"
+        Path(fresh["migration"]["candidate_path"]).write_bytes(invalid)
+        fresh["migration"]["candidate_bytes"] = invalid
+        fresh["migration"]["candidate_hash"] = hashlib.sha256(invalid).hexdigest()
+        monkeypatch.setattr(app_module, "_state", fresh)
+
+        calls: list[dict] = []
+
+        async def _record_orchestration(**kwargs):
+            calls.append(kwargs)
+
+        monkeypatch.setattr(app_module, "_run_base_swap_orchestration", _record_orchestration)
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/confirm", json={})
+
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["error"] == "candidate_invalid_config"
+        assert calls == [], "base-swap orchestration was started for an unbootable candidate"
+        assert fresh["migration"]["state"] == "STAGING", "state advanced to TRIAL on a rejection"
+        assert fresh["migration"]["trial"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +886,7 @@ class TestRunBaseSwapPhaseA:
     """Unit tests for _run_base_swap_orchestration coroutine.
 
     Mocks write_bundle, active-store dispatch (BackgroundTrainer.submit +
-    migrate), _rename_config, and gpu_release/gpu_acquire to assert ordering
+    migrate), promote_config, and gpu_release/gpu_acquire to assert ordering
     and state transitions without GPU.  The existing Phase A methods validate
     the behaviour up to and including phaseA_done.  Later tests in this class
     validate the full orchestration: reload + Phase B + success / deferred
@@ -903,8 +1076,8 @@ class TestRunBaseSwapPhaseA:
             patch("paramem.server.app.write_bundle", _fake_write_bundle),
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
             patch(
-                "paramem.server.app._rename_config",
-                lambda s, d: rename_calls.append((str(s), str(d))),
+                "paramem.server.migration.promote_config",
+                lambda s, d, **kw: rename_calls.append((str(s), str(d))),
             ),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
@@ -1165,7 +1338,7 @@ class TestBaseSwapOrchestration:
         with (
             patch("paramem.server.app.write_bundle", _fake_write_bundle),
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
-            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
             patch(
@@ -1335,7 +1508,7 @@ class TestBaseSwapOrchestration:
         with (
             patch("paramem.server.app.write_bundle", lambda **kw: bundle_slot),
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
-            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates_noop),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
             patch(
@@ -1528,7 +1701,7 @@ class TestBaseSwapOrchestration:
         with (
             patch("paramem.server.app.write_bundle", lambda **kw: bundle_slot),
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
-            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
             patch(
@@ -1776,7 +1949,7 @@ class TestBaseSwapResumePhaseAware:
         with (
             patch("paramem.server.app.write_bundle", _fake_write_bundle),
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
-            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
             patch(
@@ -1950,7 +2123,7 @@ class TestBaseSwapResumePhaseAware:
         with (
             patch("paramem.server.app.write_bundle", side_effect=AssertionError("should not call")),
             patch("paramem.server.app.migrate", return_value=fake_b),
-            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _noop_gates),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
             patch(
@@ -2144,7 +2317,7 @@ class TestBaseSwapStep3ResumeReload:
         with (
             patch("paramem.server.app.write_bundle", return_value=bundle_slot),
             patch("paramem.server.app.migrate", return_value=fake_b),
-            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
             patch(
@@ -2331,7 +2504,7 @@ class TestBaseSwapStep3ResumeReload:
 
 
 # ---------------------------------------------------------------------------
-# R2: in-flight guard — base_swap_active flag
+# In-flight guard — base_swap_active flag
 # ---------------------------------------------------------------------------
 
 
@@ -2553,7 +2726,7 @@ class TestBaseSwapActiveFlag:
         with (
             patch("paramem.server.app.write_bundle", return_value=bundle_slot),
             patch("paramem.server.app.migrate", return_value=fake_a),
-            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _noop_gates),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
             patch(
@@ -2664,7 +2837,7 @@ class TestBaseSwapActiveFlag:
 
 
 # ---------------------------------------------------------------------------
-# R1: /gpu/acquire re-launches deferred base-swap
+# /gpu/acquire re-launches a deferred base-swap
 # ---------------------------------------------------------------------------
 
 
@@ -3068,7 +3241,7 @@ class TestPhaseBModelIdentityGuard:
         with (
             patch("paramem.server.app.write_bundle", return_value=bundle_slot),
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
-            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
             patch(
@@ -3295,7 +3468,7 @@ class TestPhaseBModelIdentityGuard:
         with (
             patch("paramem.server.app.write_bundle", return_value=bundle_slot),
             patch("paramem.server.app.migrate", side_effect=_fake_migrate),
-            patch("paramem.server.app._rename_config", lambda s, d: None),
+            patch("paramem.server.migration.promote_config", lambda s, d, **kw: None),
             patch("paramem.server.app._update_trial_gates", _fake_update_gates),
             patch("paramem.server.app.create_consolidation_loop", return_value=MagicMock()),
             patch(

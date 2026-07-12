@@ -702,7 +702,7 @@ class TestRestoredAdaptersList:
 
 
 # ---------------------------------------------------------------------------
-# S3 — RestoreAbortedError surfaces safety_slot on mid-restore failure
+# RestoreAbortedError surfaces safety_slot on mid-restore failure
 # ---------------------------------------------------------------------------
 
 

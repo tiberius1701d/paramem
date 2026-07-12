@@ -2,7 +2,7 @@
 
 Tests cover:
 1. ConsolidationScheduleConfig.training_idle_debounce_s field validation.
-2. _maybe_trigger_scheduled_consolidation idle-debounce gate.
+2. _dispatch_consolidation idle-debounce gate.
 
 All GPU/model calls are mocked — no hardware required.
 """
@@ -79,7 +79,7 @@ class TestAbortQuiesceTimeoutConfig:
 
 
 # ---------------------------------------------------------------------------
-# TestSchedulerIdleDebounce — _maybe_trigger_scheduled_consolidation gate
+# TestSchedulerIdleDebounce — _dispatch_consolidation gate
 # ---------------------------------------------------------------------------
 
 
@@ -115,7 +115,7 @@ def _make_scheduler_state(last_chat_monotonic=None, debounce_s: int = 30) -> tup
 
 
 class TestSchedulerIdleDebounce:
-    """_maybe_trigger_scheduled_consolidation returns 'deferred_idle' within the window."""
+    """_dispatch_consolidation returns 'deferred_idle' within the window."""
 
     def test_scheduled_tick_returns_deferred_idle_within_debounce_window(self) -> None:
         """Tick arriving 5 s after /chat with debounce=30 returns 'deferred_idle'."""
@@ -129,7 +129,9 @@ class TestSchedulerIdleDebounce:
             patch.dict(app_module._state, state_patch, clear=False),
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
         ):
-            result = app_module._maybe_trigger_scheduled_consolidation()
+            result, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
 
         assert result == "deferred_idle", (
             f"Expected 'deferred_idle' within debounce window but got {result!r}"
@@ -152,7 +154,9 @@ class TestSchedulerIdleDebounce:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
             patch("paramem.server.app._is_full_cycle_due", return_value=False),
         ):
-            result = app_module._maybe_trigger_scheduled_consolidation()
+            result, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
 
         assert result != "deferred_idle", (
             f"Expected tick to proceed past debounce gate but got {result!r}"
@@ -173,7 +177,9 @@ class TestSchedulerIdleDebounce:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
             patch("paramem.server.app._is_full_cycle_due", return_value=False),
         ):
-            result = app_module._maybe_trigger_scheduled_consolidation()
+            result, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
 
         assert result != "deferred_idle", f"debounce_s=0 must disable gate; got {result!r}"
 
@@ -189,6 +195,8 @@ class TestSchedulerIdleDebounce:
             patch("paramem.server.app._retro_claim_orphan_sessions", return_value=0),
             patch("paramem.server.app._is_full_cycle_due", return_value=False),
         ):
-            result = app_module._maybe_trigger_scheduled_consolidation()
+            result, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
 
         assert result != "deferred_idle", f"No chat yet must not defer; got {result!r}"

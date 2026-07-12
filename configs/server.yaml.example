@@ -204,6 +204,8 @@ consolidation:
                                # 12h + max_interim_count=7 → full cycle every 84h (derived).
                                # At max_interim_count=0: full cycle every refresh_cadence itself.
   mode: train                  # "train" persists to LoRA weights; "simulate" persists graph.json under adapter_dir/<tier>/ (no weight training)
+                               # Closed vocabulary: any other value is rejected at config load.
+                               # "simulate" + max_interim_count: 0 is also rejected (no training venue at all).
   promotion_threshold: 3       # reinforcement_count threshold for key promotion to semantic
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
@@ -217,9 +219,9 @@ consolidation:
   # Floor below which a tier's keys park in episodic (the always-trained large
   # tier) instead of training a small under-separated adapter. semantic/procedural
   # keys accumulate in episodic until the tier's own population reaches this floor,
-  # then graduate. Calibration-pending (GPU set-size sweep); 30 is the conservative
-  # default. Test 19: a small near-duplicate key set under-separates (7/10 recall);
-  # the same keys reach 51/51 once diluted into a large set — set size is the lever.
+  # then graduate. 30 is an UNVALIDATED conservative default — no experiment on the
+  # production model establishes it. Calibration-pending (GPU set-size sweep).
+  # The floor is general: no consolidation trigger bypasses it.
   min_tier_key_floor: 30
   # Graduation strategy when a parked tier first crosses min_tier_key_floor.
   #   true (DEFAULT): copy the episodic adapter's LoRA weights into the graduating
@@ -316,7 +318,10 @@ consolidation:
   # Special value 0 = full-fold-only consume-pending mode: no interim
   # adapters are minted, pending sessions are consumed by the scheduled
   # full fold on refresh_cadence itself (full_cycle = refresh_cadence,
-  # not × 0). Requires a non-empty refresh_cadence.
+  # not × 0). Requires a non-empty refresh_cadence AND mode: train —
+  # 0 + mode: simulate is rejected at config load, because simulate's full
+  # fold does not consume pending sessions and there is no interim venue
+  # either, so ingestion would stall silently.
   max_interim_count: 7
   # Overflow slots beyond the max_interim_count ring before keep-pending
   # kicks in. Default 0 = sessions are kept pending immediately when the ring

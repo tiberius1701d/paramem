@@ -37,13 +37,16 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
     [
         # persistence layer — the one sanctioned fork point for venue dispatch
         ("paramem/memory/persistence.py", "commit_tier_slot"),
-        # housekeeping re-grooming: train retrains adapters, simulate writes graph.json —
-        # persistence-tail divergence only; grooming logic is identical in both branches.
-        ("paramem/training/consolidation.py", "run_housekeeping"),
+        # the interim-slot scan primitive: the venue→payload mapping (simulate → graph.json,
+        # train → adapter weights) lives here in ONE place so no caller re-implements it.
+        ("paramem/memory/interim_adapter.py", "iter_interim_dirs"),
+        # the single public fold entry: it translates the caller's mode string into a
+        # FoldScope once — train retrains adapters, simulate writes graph.json.  A
+        # persistence-tail divergence only; the grooming spine is shared.
+        ("paramem/training/consolidation.py", "consolidate"),
         # server — hydration, extraction dispatch, training dispatch
         ("paramem/server/app.py", "_run_extraction_phase"),
         ("paramem/server/app.py", "_extract_and_start_training"),
-        ("paramem/server/app.py", "_run_full_cycle"),
         # migration trial graph readout — sources the comparison-report graph per the
         # 2-way storage mode: simulate reads the persisted interim-slot graph.json, train
         # reconstructs from adapter weights. Intentional, mirrors active_store_migration's split.
@@ -61,6 +64,12 @@ _ALLOWLIST: frozenset[tuple[str, str | None]] = frozenset(
         ("paramem/server/migration.py", "detect_simulate_mode"),
         # integrity checker — required/optional matrix depends on persist mode
         ("paramem/backup/integrity.py", "verify_infrastructure_integrity"),
+        # config load-time validator — rejects the illegal max_interim_count=0 +
+        # mode="simulate" combination before boot. NOT a behavioural venue fork:
+        # it does not dispatch different logic per mode, it refuses one specific
+        # (count, mode) pairing. The vocabulary check on the same line range
+        # (`self.mode not in (...)`) does not match this scanner's pattern.
+        ("paramem/server/config.py", "__post_init__"),
     ]
 )
 

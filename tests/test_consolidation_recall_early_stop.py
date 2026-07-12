@@ -6,7 +6,7 @@ Covers the wiring at the THREE production-reachable train_adapter call sites:
       Site #1 run_consolidation_cycle (unified episodic interim path; formerly
               _run_indexed_key_episodic + _train_extracted_into_interim)
       Site #2 _run_indexed_key_procedural
-      Site #3 consolidate_interim_adapters (per-tier loop body)
+      Site #3 the full fold, ConsolidationLoop.consolidate (per-tier loop body)
   - paramem/server/active_store_migration.py:
       Site #4 _migrate_tier_simulate_to_train
 
@@ -151,7 +151,7 @@ class TestMaybeMakeRecallCallback:
         assert cb._pause_file is None  # production pause via gpu_lock_sync
 
     def test_num_epochs_override_propagates_to_callback(self, tmp_path: Path) -> None:
-        """Regression: consolidate_interim_adapters trains with refresh_epochs,
+        """Regression: the full fold trains with refresh_epochs,
         not num_epochs.  When num_epochs != refresh_epochs the forced
         final-epoch probe must fire at refresh_epochs, not at num_epochs.
 
@@ -238,14 +238,14 @@ class _Captured:
 # Class B — TestCallSiteWiringSourcePresence
 #
 # After the _train_tier_adapter dedup (2026-06-17), the recall callback is
-# no longer wired directly in run_consolidation_cycle or
-# consolidate_interim_adapters.  It is funnelled through the single shared
-# helper _train_tier_adapter, which both methods call.
+# no longer wired directly in run_consolidation_cycle or in the full fold.
+# It is funnelled through the single shared helper _train_tier_adapter, which
+# both paths call.
 #
 # The invariant is now two-part:
 #   1. _train_tier_adapter calls _maybe_make_recall_callback (the funnel).
-#   2. run_consolidation_cycle and consolidate_interim_adapters call
-#      _train_tier_adapter (they use the funnel, not a direct bypass).
+#   2. run_consolidation_cycle and the full fold (ConsolidationLoop.consolidate)
+#      call _train_tier_adapter (they use the funnel, not a direct bypass).
 #
 # Class F's structural gate (TestProbeTargetIsFullReplaySet) independently
 # checks that every function containing a train_adapter call also contains
@@ -306,9 +306,9 @@ class TestCallSiteWiringSourcePresence:
 
     def test_funnel_contains_recall_callback(self) -> None:
         """_train_tier_adapter is the single training-invocation site and must
-        call _maybe_make_recall_callback.  Both run_consolidation_cycle and
-        consolidate_interim_adapters delegate to it instead of calling
-        train_adapter directly.
+        call _maybe_make_recall_callback.  Both run_consolidation_cycle and the
+        full fold (ConsolidationLoop.consolidate) delegate to it instead of
+        calling train_adapter directly.
         """
         assert self._function_contains_attr_call(
             PROJECT_ROOT / "paramem/training/consolidation.py",
@@ -318,8 +318,8 @@ class TestCallSiteWiringSourcePresence:
 
     def test_run_fold_calls_funnel(self) -> None:
         """_run_fold must call _train_tier_adapter (the funnel), not invoke
-        train_adapter directly.  Both run_consolidation_cycle and
-        consolidate_interim_adapters now delegate their training to _run_fold,
+        train_adapter directly.  Both run_consolidation_cycle and the full fold
+        (ConsolidationLoop.consolidate) delegate their training to _run_fold,
         so a single check on _run_fold is sufficient.
         """
         assert self._function_contains_attr_call(

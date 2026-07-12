@@ -41,6 +41,7 @@ def _make_state(
     gates_status: str = "fail",
     write_marker: bool = True,
     config_artifact_filename: str = "config-20260422-010000.bin",
+    a_yaml_bytes: bytes = _A_YAML,
 ) -> dict:
     """Build a TRIAL _state for rollback tests.
 
@@ -98,7 +99,7 @@ def _make_state(
     # fires before backup.read() is reached.
     config_slot = backup_write(
         ArtifactKind.CONFIG,
-        _A_YAML,
+        a_yaml_bytes,
         {"tier": "pre_migration"},
         base_dir=backups_root / "config",
     )
@@ -120,7 +121,7 @@ def _make_state(
         marker = TrialMarker(
             schema_version=TRIAL_MARKER_SCHEMA_VERSION,
             started_at="2026-04-22T01:00:00+00:00",
-            pre_trial_config_sha256=_sha256(_A_YAML),
+            pre_trial_config_sha256=_sha256(a_yaml_bytes),
             candidate_config_sha256=_sha256(_LIVE_YAML),
             backup_paths={
                 "config": str(config_slot.resolve()),
@@ -135,7 +136,7 @@ def _make_state(
 
     trial_stash = TrialStash(
         started_at="2026-04-22T01:00:00+00:00",
-        pre_trial_config_sha256=_sha256(_A_YAML),
+        pre_trial_config_sha256=_sha256(a_yaml_bytes),
         candidate_config_sha256=_sha256(_LIVE_YAML),
         backup_paths={
             "config": str(config_slot.resolve()),
@@ -396,6 +397,47 @@ class TestRollback4xx:
         finally:
             lock.release()
             loop.close()
+
+
+class TestRollbackRejectsUnbootableBackup:
+    """A restore is a second door onto the "unbootable config goes live" defect.
+
+    Config A was validated against the schema in force when it was captured; new
+    load-time guards (e.g. ``max_interim_count=0`` + ``mode=simulate``, which is
+    only rejected in this codebase version) can reject bytes that were bootable
+    when the backup was written.  Rollback must refuse rather than rename.
+    """
+
+    def test_unbootable_a_config_rejected_live_config_untouched(self, tmp_path, monkeypatch):
+        unbootable_a = b"consolidation:\n  mode: simulate\n  max_interim_count: 0\n"
+        fresh = _make_state(tmp_path, a_yaml_bytes=unbootable_a)
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _default_apply_stub_rollback())
+        live_yaml = Path(fresh["config_path"])
+        live_bytes_before = live_yaml.read_bytes()
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/rollback")
+
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["error"] == "backup_unbootable"
+        assert live_yaml.read_bytes() == live_bytes_before, "live config was mutated on rejection"
+        # State remains TRIAL — the operator can retry with a different backup or
+        # inspect the store; rollback did not silently drop them into no-state.
+        assert fresh["migration"]["state"] == "TRIAL"
+
+    def test_bootable_a_config_still_restores(self, tmp_path, monkeypatch):
+        """Control: a bootable A config restores exactly as before this change."""
+        fresh = _make_state(tmp_path)  # default _A_YAML is bootable
+        monkeypatch.setattr(app_module, "_state", fresh)
+        monkeypatch.setattr(app_module, "_apply_config_live", _default_apply_stub_rollback())
+        live_yaml = Path(fresh["config_path"])
+
+        client = TestClient(app_module.app, raise_server_exceptions=False)
+        resp = client.post("/migration/rollback")
+
+        assert resp.status_code in (200, 207), resp.text
+        assert live_yaml.read_bytes() == _A_YAML
 
 
 # ---------------------------------------------------------------------------

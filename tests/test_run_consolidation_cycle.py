@@ -1110,7 +1110,7 @@ class TestRecallFailedSessionStaysPending:
         failed = result.get("recall_failed_session_ids", [])
 
         if not new_keys:
-            # R2 expected path: "off" mints no new episodic keys from the pending
+            # Expected path: "off" mints no new episodic keys from the pending
             # graph, so the recall gate is never reached.  Bug cannot manifest.
             assert failed == [], (
                 f"Under 'off' with no new keys, recall_failed_session_ids must be []; got {failed}"

@@ -1,7 +1,7 @@
 """Interim-adapter lifecycle helpers for multi-adapter interim routing.
 
-This module owns two operations that must stay co-located so
-consolidate_interim_adapters can call unload without importing app.py:
+This module owns two operations that must stay co-located so the full
+consolidation fold can call unload without importing app.py:
 
   create_interim_adapter  — live creation of the current episodic_interim_* adapter
   unload_interim_adapters — post-consolidation removal of all interim adapters
@@ -20,8 +20,8 @@ module) importing from ``backup``.
 Callers (wiring schedule):
   Scheduled consolidation path — calls create_interim_adapter when run_consolidation_cycle
       mints a new interim adapter slot during an interim training tick.
-  consolidate_interim_adapters — calls unload_interim_adapters as phase 3 of the
-            atomic finalize sequence.
+  Full consolidation fold (ConsolidationLoop.consolidate) — calls
+      unload_interim_adapters as phase 3 of the atomic finalize sequence.
 
 SOLE-ADAPTER TRAP NOTE: unload_interim_adapters is only safe to call while
 the three main adapters (episodic, semantic, procedural) are still loaded.
@@ -90,17 +90,54 @@ def interim_dir_for_name(adapter_dir: Path, name: str) -> Path:
     return adapter_dir / "episodic" / f"{INTERIM_DIR_PREFIX}{interim_stamp_from_name(name)}"
 
 
-def iter_interim_dirs(adapter_dir: Path) -> Iterator[tuple[str, Path]]:
-    """Yield ``(adapter_name, dir_path)`` for every interim slot on disk.
+def iter_interim_dirs(
+    adapter_dir: Path,
+    *,
+    mode: str | None = None,
+) -> Iterator[tuple[str, Path]]:
+    """Yield ``(adapter_name, dir_path)`` for interim slots on disk.
 
     Scans ``<adapter_dir>/episodic/interim_*`` and synthesises the PEFT
     adapter name as ``"episodic_interim_<stamp>"``.
+
+    An interim *directory* is not the same thing as an interim slot that holds
+    *content*: a slot whose payload write never landed (crash between the
+    directory creation and the payload flush) is an empty shell that carries
+    nothing to fold.  ``mode`` selects which of the two sets the caller wants,
+    and the venue→payload mapping lives here — in one place — so no caller has
+    to re-implement it.
+
+    Args:
+        adapter_dir: Adapter root (``config.adapter_dir``).
+        mode: Payload filter.
+
+            * ``None`` (default) — every interim directory on disk, regardless
+              of payload.  Required by the reaper, backup, registry hydration
+              and every other caller that must see the whole on-disk set.
+            * ``"simulate"`` — only slots carrying a ``graph.json`` (the
+              simulate venue's payload).
+            * ``"train"`` — only slots carrying ``adapter_model.safetensors``
+              anywhere beneath the slot dir (the train venue's payload).  Keyed
+              on the weights file, not ``adapter_config.json``: a config without
+              weights is a broken slot, hence payload-less.
+
+    Raises:
+        ValueError: On an unknown *mode* string.  Silently degrading to the
+            unfiltered set would let a typo re-open the payload-blind
+            behaviour this parameter exists to close.
     """
+    if mode not in (None, "simulate", "train"):
+        raise ValueError(f"iter_interim_dirs: unknown mode {mode!r} (expected None/simulate/train)")
+
     episodic = adapter_dir / "episodic"
     if not episodic.is_dir():
         return
     for path in sorted(episodic.glob(f"{INTERIM_DIR_PREFIX}*")):
         if not path.is_dir():
+            continue
+        if mode == "simulate" and not (path / "graph.json").exists():
+            continue
+        if mode == "train" and not any(path.rglob("adapter_model.safetensors")):
             continue
         stamp = path.name[len(INTERIM_DIR_PREFIX) :]
         yield f"{INTERIM_NAME_PREFIX}{stamp}", path
@@ -271,6 +308,12 @@ def unload_interim_adapters(model: PeftModel, adapter_dir: Path) -> list[str]:
         model.delete_adapter(name)
         logger.info("Deleted interim adapter from PEFT: %s", name)
 
+    # UNFILTERED ON PURPOSE — never pass ``mode`` here.  The reap must see EVERY
+    # interim directory, payload-bearing or not.  A payload-filtered reap would
+    # leave empty/torn slot dirs behind on every fold and they would accumulate
+    # forever.  ``mode`` narrows the set to slots that carry content; that is the
+    # right question for the schedule gate and the fold collector, and the wrong
+    # question for a reaper.
     for _name, path in iter_interim_dirs(adapter_dir):
         shutil.rmtree(path)
         logger.info("Removed interim adapter directory: %s", path)

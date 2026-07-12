@@ -5,7 +5,7 @@ It requires a free GPU and a stopped production server before running.
 
 What it does
 ------------
-Validates that ``_maybe_trigger_scheduled_consolidation`` (``paramem/server/app.py``)
+Validates that ``_dispatch_consolidation`` (``paramem/server/app.py``)
 routes pending sessions correctly via ``classify_session``
 (``paramem/server/consolidation.py``):
 
@@ -313,7 +313,7 @@ def _build_test_config() -> Path:
     cfg["consolidation"]["mode"] = "simulate"
     cfg["consolidation"]["orphan_retirement"] = "every 1m"
     # Disable the idle debounce so the tick runs immediately after we inject
-    # chats — otherwise _maybe_trigger_scheduled_consolidation returns
+    # chats — otherwise _dispatch_consolidation returns
     # "deferred_idle" (chat too recent) and never reaches classification.
     cfg["consolidation"]["training_idle_debounce_s"] = 0
     cfg["consolidation"]["extraction_ha_validation"] = False

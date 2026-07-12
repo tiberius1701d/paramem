@@ -27,16 +27,22 @@ def _make_config(
     consolidation_period_seconds: int | None = 7 * 12 * 3600,
     adapter_dir: Path | None = None,
     tmp_path: Path | None = None,
+    mode: str = "train",
 ) -> object:
     """Construct a minimal config-like object for consolidation helper tests.
 
     Uses real dataclasses where available; otherwise returns a MagicMock
     with the attrs set directly.
+
+    ``mode`` is the consolidation venue: the schedule helpers scan interim
+    slots with ``mode=config.consolidation.mode`` and count only slots that
+    carry that venue's payload.
     """
     cfg = MagicMock()
     cfg.consolidation.refresh_cadence = refresh_cadence
     cfg.consolidation.max_interim_count = max_interim_count
     cfg.consolidation.consolidation_period_seconds = consolidation_period_seconds
+    cfg.consolidation.mode = mode
     if adapter_dir is not None:
         cfg.adapter_dir = adapter_dir
     elif tmp_path is not None:
@@ -46,16 +52,21 @@ def _make_config(
 
 
 def _make_interim_dir(adapter_dir: Path, stamp: str) -> Path:
-    """Create an episodic/interim_<stamp> directory structure.
+    """Create an episodic/interim_<stamp> slot carrying a train-venue payload.
 
     ``iter_interim_dirs`` scans <adapter_dir>/episodic/interim_*; the
     function returns (adapter_name, path) where adapter_name includes the
-    "interim_" prefix.
+    "interim_" prefix.  The schedule helpers scan it venue-filtered, so the
+    slot needs the train payload (``adapter_model.safetensors``) to be counted
+    — a payload-less directory carries nothing to fold and is skipped.
     """
     p = adapter_dir / "episodic" / f"interim_{stamp}"
     p.mkdir(parents=True, exist_ok=True)
     # Write a minimal meta.json so the dir is recognised as a valid interim slot.
     (p / "meta.json").write_text(json.dumps({"window_stamp": stamp}))
+    slot = p / f"{stamp}-slot"
+    slot.mkdir(parents=True, exist_ok=True)
+    (slot / "adapter_model.safetensors").write_bytes(b"")
     return p
 
 

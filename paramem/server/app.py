@@ -25,6 +25,7 @@ import uuid
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal
 
@@ -108,23 +109,6 @@ from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 from paramem.utils.paths import find_project_root
 
 logger = logging.getLogger(__name__)
-
-
-def _rename_config(src: "str | Path", dst: "str | Path") -> None:
-    """Rename *src* to *dst* for the atomic config swap in step 4 of confirm.
-
-    Extracted to a module-level function so integration tests can patch it
-    independently from os.rename (which is also used by backup.atomic and
-    trial_state for their own atomic renames).
-
-    Parameters
-    ----------
-    src:
-        Source path (candidate config file).
-    dst:
-        Destination path (live config file).
-    """
-    os.rename(src, dst)
 
 
 # Resolve nvidia-smi at import time. On WSL2 it lives in /usr/lib/wsl/lib
@@ -469,7 +453,24 @@ class IntegrityResponse(BaseModel):
 
 
 class ConsolidateResponse(BaseModel):
+    """Response schema for every consolidation endpoint.
+
+    Attributes
+    ----------
+    status:
+        Terminal status of the dispatch: ``started*`` (the run was submitted),
+        ``noop_*`` (nothing to do), or ``deferred_*`` (blocked, retry later).
+    action:
+        What the request actually resolved to — ``"full"`` (main memory
+        rebuilt from stored knowledge), ``"interim"`` (recent conversations
+        absorbed), or ``"auto"`` when the dispatch was refused before the
+        schedule could resolve it.  ``POST /consolidate`` and
+        ``POST /scheduled-tick`` let the schedule decide, so this is how their
+        caller learns which of the two ran.
+    """
+
     status: str
+    action: str = "none"
 
 
 # --- Document ingest schemas ---
@@ -1371,16 +1372,21 @@ def _mount_adapters_from_slots(model, tokenizer, config, state: dict):
     # trigger is "neither weights NOR graph.json present anywhere under
     # the interim dir".  Hash mismatch is a separate failure mode and is
     # surfaced via I4 ``manifest_status``.
+    #
+    # The payload predicate is NOT re-implemented here: ``iter_interim_dirs``
+    # owns it.  The two venue-filtered scans give the payload-bearing slots;
+    # the torn set is the complement — every interim dir that appears in
+    # neither.
+    _weight_slots = {_p for _n, _p in iter_interim_dirs(config.adapter_dir, mode="train")}
+    _graph_slots = {_p for _n, _p in iter_interim_dirs(config.adapter_dir, mode="simulate")}
     for _interim_name, _interim_reg_dir in iter_interim_dirs(config.adapter_dir):
         _interim_reg_path = _interim_reg_dir / "indexed_key_registry.json"
         if not _interim_reg_path.exists():
             continue
-        _has_weights = any(_interim_reg_dir.rglob("adapter_model.safetensors"))
-        if _has_weights:
-            # Train-mode slot — already handled above.
+        if _interim_reg_dir in _weight_slots:
+            # Train-mode slot (carries adapter weights) — already handled above.
             continue
-        _has_graph = (_interim_reg_dir / "graph.json").exists()
-        if _has_graph:
+        if _interim_reg_dir in _graph_slots:
             # Simulate-mode slot — keep.
             logger.debug(
                 "Startup registry check: interim adapter %s is a simulate-mode "
@@ -5495,7 +5501,7 @@ def _refresh_config_from_disk_into_state():
     without a subsequent model reload is correct for a pure ``consolidation.mode`` change
     because the mode affects consolidation persistence only — not the base model, adapters,
     router, or inference.  The rebuild runs later at ``/consolidate`` (pre-empted by
-    ``pending_rehydration`` in ``_maybe_trigger_scheduled_consolidation``) with its own 1.0
+    ``pending_rehydration`` in ``_dispatch_consolidation``) with its own 1.0
     gate + source-mode fallback.
 
     Returns
@@ -5624,7 +5630,8 @@ def _live_reload_base_model(
     When ``refresh_config_from_disk=True`` the CALLER (``_apply_config_live``)
     sets ``_state["mode"]="cloud-only"`` + ``cloud_only_reason="live_reload"``
     on the event loop BEFORE dispatching this function via ``run_in_executor``,
-    so the scheduler's ``mode != "local"`` defer at ``app.py:6831`` fires.
+    so the consolidation dispatcher's ``mode != "local"`` defer fires
+    (:func:`_consolidation_dispatch_guards` → ``deferred_cloud_only``).
     This function is NOT responsible for setting that guard.
     """
     # When refreshing config from disk, load the new config BEFORE releasing
@@ -6110,8 +6117,9 @@ def _apply_config_live() -> dict:
         _state["cloud_only_reason"] = "live_reload"
         await loop.run_in_executor(None, _apply_config_live)
 
-    This ensures the scheduler's ``mode != "local"`` defer at ``app.py:6831``
-    fires before the executor runs.  This function does NOT set the guard
+    This ensures the consolidation dispatcher's ``mode != "local"`` defer
+    (:func:`_consolidation_dispatch_guards` → ``deferred_cloud_only``) fires
+    before the executor runs.  This function does NOT set the guard
     internally (it runs in an executor thread, not on the event loop).
 
     Note: ``_live_reload_base_model`` also sets ``mode="cloud-only"`` directly
@@ -7249,25 +7257,24 @@ async def calibrate_name_route(req: calibrate_module.CalibrateNameRequest):
     return calibrate_module.calibrate_name(_state, req)
 
 
-@app.post(
-    "/scheduled-tick",
-    response_model=ConsolidateResponse,
-    dependencies=[Depends(require_admin)],
-)
-async def scheduled_tick():
-    """Systemd user-timer entrypoint (paramem-consolidate.timer).
+async def require_no_trial() -> None:
+    """FastAPI dependency: refuse consolidation while a migration TRIAL is active.
 
-    Runs the cooperative extract + background-train path. If the GPU is
-    unavailable (cloud-only or bg training active), returns a 'deferred'
-    status — the timer will fire again on its next wall-clock tick.
+    During a TRIAL the candidate store is live but unaccepted; starting a
+    consolidation run would train against a store the operator may still roll
+    back.  Every consolidation door carries this guard, so the refusal is
+    identical whoever knocks.
 
-    Returns 409 ``trial_active`` when a migration TRIAL is in progress
-    ("refuses new cycles" while TRIAL is active).
+    Applied to the four consolidation routes only.  It is deliberately NOT a
+    router-wide dependency: FastAPI resolves dependencies BEFORE request-body
+    validation, so on a body-carrying route (``/ingest-sessions``) it would turn
+    a malformed body's 422 into a 409 — those routes keep their in-handler
+    guard.
+
+    Raises:
+        HTTPException 409 ``trial_active``: A migration TRIAL is in progress.
     """
-    from fastapi import HTTPException
-
-    # Guard: block new cycles while a migration TRIAL is active.
-    migration = _state.get("migration", {})
+    migration = _state.get("migration") or {}
     if migration.get("state") == "TRIAL":
         raise HTTPException(
             status_code=409,
@@ -7280,26 +7287,56 @@ async def scheduled_tick():
             },
         )
 
+
+@app.post(
+    "/scheduled-tick",
+    response_model=ConsolidateResponse,
+    dependencies=[Depends(require_admin), Depends(require_no_trial)],
+)
+async def scheduled_tick():
+    """Systemd user-timer entrypoint (paramem-consolidate.timer).
+
+    Dispatches exactly as ``POST /consolidate`` does — :func:`_is_full_cycle_due`
+    resolves the tick to an interim cycle (the cooperative extract +
+    background-train path) or to a full fold — except that this route also
+    applies the catch-up gate, so a heartbeat wakeup that is not yet due does
+    not fire a cycle.  Skipped when there is nothing new to consume.
+
+    Non-blocking; HTTP 200 in every case, read ``status``.  If the GPU is
+    unavailable (cloud-only, or bg training already active) the status is
+    ``deferred_*`` — the timer will fire again on its next wall-clock tick.
+
+    Takes no request body.
+
+    Returns 409 ``trial_active`` when a migration TRIAL is in progress
+    ("refuses new cycles" while TRIAL is active).
+    """
     # Gate ON: the systemd timer may fire a heartbeat wakeup well before a
     # non-calendar-exact cadence is actually due — see systemd_timer module
     # docstring. The catch-up gate decides whether THIS wakeup dispatches.
-    status = _maybe_trigger_scheduled_consolidation(apply_schedule_gate=True)
-    return ConsolidateResponse(status=status)
+    status, action = _dispatch_consolidation(ConsolidationAction.AUTO, apply_schedule_gate=True)
+    return ConsolidateResponse(status=status, action=action.value)
 
 
-@app.post("/consolidate", response_model=ConsolidateResponse, dependencies=[Depends(require_admin)])
+@app.post(
+    "/consolidate",
+    response_model=ConsolidateResponse,
+    dependencies=[Depends(require_admin), Depends(require_no_trial)],
+)
 async def consolidate():
-    """Trigger consolidation manually — alias for the scheduled tick.
+    """Run the scheduled consolidation now, without waiting for the timer.
 
     Manual ``/consolidate`` and the systemd-driven ``/scheduled-tick`` share
-    the same dispatcher: the gate decides between full-cycle (collapse
-    interim slots into main) and interim-cycle (extract pending sessions
-    into a new ``episodic_interim_<stamp>`` slot) based on the
-    ``window_stamp`` recorded on the lex-max main episodic slot. There is
-    no separate "force-full" semantic — operators that genuinely need to
-    re-trigger a full cycle can clear the latest main slot's window_stamp
-    and call this endpoint, but in normal operation the gate already
-    decides correctly.
+    the same dispatcher: :func:`_is_full_cycle_due` decides between a full
+    cycle (collapse the interim slots into main) and an interim cycle (extract
+    pending sessions into a new ``episodic_interim_<stamp>`` slot), from the
+    count and age of the payload-bearing interim slots on disk.  ``window_stamp``
+    is manifest provenance only — no gate reads it, so there is no
+    "clear the stamp to force a full cycle" escape hatch.  To rebuild main
+    memory on demand, use ``POST /reconsolidate``.
+
+    Skipped when there is nothing new to consume (``noop_*``) — in both train
+    and simulate mode, on both the interim and the full path.
 
     Unlike ``/scheduled-tick``, this endpoint calls the dispatcher with
     ``apply_schedule_gate=False`` — the suspend/power-off catch-up gate
@@ -7311,89 +7348,91 @@ async def consolidate():
     regardless of the gate), so it does not cause an extra tick immediately
     after.
 
+    Takes no request body.  ``action`` in the response reports which of the two
+    the schedule resolved to.
+
+    Non-blocking: the run is submitted to an executor and this returns at once.
+    Poll ``GET /status`` (``consolidating``).  Every outcome below is HTTP 200 —
+    read ``status``:
+
+    - ``started`` / ``started_full`` — submitted.
+    - ``noop_*`` — nothing new to consume; no GPU work was done.
+    - ``deferred_*`` — busy (a run is already going, someone is chatting, the
+      GPU is held, or the server is cloud-only).  Retry later.
+
     Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
-    from fastapi import HTTPException
-
-    # Guard: block consolidation while a migration TRIAL is active.
-    migration = _state.get("migration", {})
-    if migration.get("state") == "TRIAL":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "trial_active",
-                "message": (
-                    "A migration TRIAL is active — consolidation is blocked. "
-                    "Use POST /migration/accept or POST /migration/rollback to proceed."
-                ),
-            },
-        )
-
     # Gate OFF: a manual trigger is the operator's deliberate escape hatch —
     # it must never be refused for "not due yet" (see docstring above).
-    status = _maybe_trigger_scheduled_consolidation(apply_schedule_gate=False)
-    return ConsolidateResponse(status=status)
+    status, action = _dispatch_consolidation(ConsolidationAction.AUTO, apply_schedule_gate=False)
+    return ConsolidateResponse(status=status, action=action.value)
 
 
 @app.post(
-    "/consolidate/housekeeping",
+    "/consolidate/interim",
     response_model=ConsolidateResponse,
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_admin), Depends(require_no_trial)],
 )
-async def consolidate_housekeeping():
-    """On-demand housekeeping fold — re-groom without consuming sessions.
+async def consolidate_interim():
+    """Absorb recent conversations into memory now, without waiting for the schedule.
 
-    Triggers a full GraphMerger re-grooming pass over the canonical knowledge
-    graph (all tiers in ``train`` mode; the main episodic graph in ``simulate``
-    mode).  Runs the identical grooming pipeline as the scheduled full fold
-    (``canonical()`` node identity + Case-1/Case-2 dedup via GraphMerger +
-    SOTA enrichment) without advancing session watermarks or marking any
-    pending sessions as consolidated.
+    Extracts every attributable conversation that is still pending and learns it
+    into memory.  Use it when something was just said that the assistant should
+    know immediately.  Main memory is untouched — that is what
+    ``POST /reconsolidate`` is for.
 
-    Use cases:
+    Takes no request body.
 
-    - Surface and collapse canonical duplicates after a canonicalization schema
-      change (e.g. deploying the Unicode-grounded ``canonical()`` over an
-      existing production knowledge base).
-    - Re-run SOTA enrichment on the groomed graph without waiting for the next
-      scheduled full-cycle tick.
-    - Validate that the current adapter weights are consistent with the
-      registry-true graph (train mode: adapters are retrained on the
-      registry-true content, bypassing the per-tier floor gate).
+    Returns (HTTP 200 in every case below; read ``status``):
 
-    Gate (d) bypass: unlike the scheduled fold, this endpoint proceeds even
-    when the total active key count is below ``min_tier_key_floor``.
+    - ``started`` — the run was submitted; poll ``GET /status`` (``consolidating``).
+    - ``noop_no_pending`` / ``noop_no_named`` — nothing is waiting to be
+      absorbed, or nothing waiting can be attributed to a known speaker.  There
+      is no point running: the request is refused rather than learning nothing.
+    - ``noop_no_interim_tier`` — the deployment is configured with
+      ``consolidation.max_interim_count: 0``, so recent conversations are never
+      staged separately; they are absorbed by the scheduled consolidation
+      itself.  Use ``POST /consolidate`` there.
+    - ``deferred_*`` — busy (a run is already going, someone is chatting, the
+      GPU is held, or the server is cloud-only).  Retry later.
 
-    Session non-consumption: pending sessions are left pending; the full-cycle
-    window stamp is not advanced; the next scheduled tick will still fire on
-    schedule.
-
-    Returns ``409`` when a consolidation fold is already running, when the
-    server is in cloud-only mode, or when the background trainer holds the GPU.
+    Returns 409 ``trial_active`` when a migration TRIAL is in progress.
     """
-    from fastapi import HTTPException
+    status, action = _dispatch_consolidation(ConsolidationAction.INTERIM, apply_schedule_gate=False)
+    return ConsolidateResponse(status=status, action=action.value)
 
-    # Guard: block housekeeping while a migration TRIAL is active.
-    migration = _state.get("migration", {})
-    if migration.get("state") == "TRIAL":
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "trial_active",
-                "message": (
-                    "A migration TRIAL is active — housekeeping is blocked. "
-                    "Use POST /migration/accept or POST /migration/rollback to proceed."
-                ),
-            },
-        )
 
-    status = _maybe_trigger_housekeeping()
-    if status.startswith("deferred_"):
-        raise HTTPException(
-            status_code=409,
-            detail={"error": status, "message": f"Housekeeping deferred: {status}"},
-        )
-    return ConsolidateResponse(status=status)
+@app.post(
+    "/reconsolidate",
+    response_model=ConsolidateResponse,
+    dependencies=[Depends(require_admin), Depends(require_no_trial)],
+)
+async def reconsolidate():
+    """Rebuild main memory from stored knowledge — even when nothing is new.
+
+    This is the operation to run after changing the model, the extraction
+    prompts, or the extraction config: it re-grooms the whole knowledge base and
+    re-learns the main memory from it, absorbing anything recent that has not
+    been absorbed yet.
+
+    Unlike ``POST /consolidate``, it is never skipped for "nothing new to learn"
+    — its input is the knowledge already stored, so there is always something to
+    rebuild from.  It is otherwise the same operation the schedule performs, and
+    is indistinguishable from it afterwards.
+
+    Takes no request body.
+
+    Returns (HTTP 200; read ``status``):
+
+    - ``started_full`` — the rebuild was submitted; poll ``GET /status``
+      (``consolidating``).  It seizes the GPU for the duration.
+    - ``deferred_*`` — busy (a run is already going, someone is chatting, the
+      GPU is held, or the server is cloud-only).  Retry later.
+
+    Returns 409 ``trial_active`` when a migration TRIAL is in progress.
+    """
+    status, action = _dispatch_consolidation(ConsolidationAction.FULL, apply_schedule_gate=False)
+    return ConsolidateResponse(status=status, action=action.value)
 
 
 # --- Document ingest endpoints ---
@@ -7632,6 +7671,7 @@ async def migration_preview(request: PreviewRequest):
     from fastapi import HTTPException
 
     from paramem.server.migration import (
+        CandidateConfigInvalid,
         _parse_candidate,
         _sha256_bytes,
         compute_shape_changes,
@@ -7640,6 +7680,7 @@ async def migration_preview(request: PreviewRequest):
         detect_simulate_mode,
         initial_migration_state,
         render_preview_response,
+        validate_candidate,
         validate_candidate_path,
     )
 
@@ -7697,12 +7738,26 @@ async def migration_preview(request: PreviewRequest):
         candidate_text = candidate_bytes.decode("latin-1")
 
     # --- Parse candidate (yaml.safe_load, NOT load_server_config) ---
+    # The stash keeps ${VAR} templates verbatim, so the parse stage stays
+    # substitution-free.  Construction runs separately below and its result is
+    # discarded — it must never reach the stash or a diff.
     try:
         parsed_candidate = _parse_candidate(candidate_bytes)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail={"error": "candidate_unparseable", "message": str(exc)},
+        ) from exc
+
+    # --- Construct the candidate as if it already sat at the live config path ---
+    # Parseable YAML is not a bootable config.  Reject here, at LIVE, so an
+    # unbootable candidate is never staged: state stays LIVE, nothing is stashed.
+    try:
+        validate_candidate(candidate_bytes, live_config_path)
+    except CandidateConfigInvalid as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "candidate_invalid_config", "message": str(exc)},
         ) from exc
 
     # --- Read live yaml for diff ---
@@ -7874,10 +7929,15 @@ async def migration_confirm(request: ConfirmRequest):
 
     Implements the 5-step atomic ordering:
 
-    1. Acquire migration lock + verify STAGING + verify not consolidating.
-    2. Write 3 pre-migration backup slots (config, graph, registry).
+    1. Acquire migration lock + verify STAGING + verify not consolidating +
+       **construct the candidate config** (``validate_candidate``).  All three
+       confirm branches (pure mode-switch, base swap, general trial) share this
+       gate, so an unbootable candidate is rejected before the first mutation —
+       before any backup, marker, ``state="TRIAL"``, or background task.
+    2. Write the pre-migration config backup slot (``backup_live_config``).
     3. Write ``state/trial.json`` marker.
-    4. ``os.rename(candidate → configs/server.yaml)`` — atomic config swap.
+    4. ``promote_config(candidate → configs/server.yaml)`` — re-read, re-hash-check,
+       re-validate, atomic swap.
     5. Set ``_state["migration"]["state"] = "TRIAL"``; kick off trial
        consolidation via ``asyncio.create_task``.
 
@@ -7895,6 +7955,11 @@ async def migration_confirm(request: ConfirmRequest):
         A concurrent confirm is already holding the lock.
     409 ``trial_active``
         The server is already in TRIAL (post-recovery edge case).
+    409 ``candidate_invalid_config``
+        The candidate parses but cannot be constructed into a bootable config.
+        STAGING is preserved; nothing on disk changed.
+    409 ``candidate_changed``
+        The candidate file changed on disk after it was staged.  Re-preview.
     500 ``backup_write_failed``
         Step 2 failed; no state change.
     500 ``marker_write_failed``
@@ -7905,9 +7970,14 @@ async def migration_confirm(request: ConfirmRequest):
     from fastapi import HTTPException
 
     from paramem.server.migration import (
+        CandidateChanged,
+        CandidateConfigInvalid,
         TrialStash,
         _build_mode_switch_block,
+        backup_live_config,
         initial_migration_state,
+        promote_config,
+        validate_candidate,
     )
 
     # --- Step 1: Pre-checks (outside the lock for fast fail) ---
@@ -7998,7 +8068,7 @@ async def migration_confirm(request: ConfirmRequest):
                     "message": "Consolidation started while acquiring lock.",
                 },
             )
-        # R2: Reject confirm if a base-swap orchestration is actively running.
+        # Reject confirm if a base-swap orchestration is actively running.
         # In practice the state=TRIAL check above fires first, but this guard
         # is explicit in case the state flag lags the base_swap_active flag.
         if migration.get("base_swap_active", False):
@@ -8016,6 +8086,21 @@ async def migration_confirm(request: ConfirmRequest):
         # Snapshot the STAGING stash fields we need.
         candidate_path_str = migration.get("candidate_path", "")
         candidate_hash = migration.get("candidate_hash", "")
+
+        # --- Construct the candidate before ANY mutation ---
+        # Shared by all three branches below (pure mode-switch, base swap,
+        # general trial): each of them renames the candidate over the live
+        # config, so each of them must first prove the candidate can boot.
+        # A candidate that cannot be constructed would otherwise go live and
+        # the next boot would die on it.  The constructed config is discarded —
+        # it carries interpolated secrets; the live config is re-loaded from disk.
+        try:
+            validate_candidate(migration.get("candidate_bytes", b""), live_config_path)
+        except CandidateConfigInvalid as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "candidate_invalid_config", "message": str(exc)},
+            ) from exc
 
         # Steps 2–4 are wrapped in try/finally so the lock is always released
         # even on partial failure (Correction 1).
@@ -8062,19 +8147,50 @@ async def migration_confirm(request: ConfirmRequest):
                     },
                 )
 
-            pre_trial_hash = ""
-            if live_config_path.exists():
-                pre_trial_hash = _hashlib.sha256(live_config_path.read_bytes()).hexdigest()
+            # Back up the live config BEFORE the swap — symmetric with the
+            # general-trial path.  This branch drops straight back to LIVE (no
+            # trial marker), so the backup slot is the only restore point for a
+            # mode switch the operator wants to undo.
             try:
-                _rename_config(Path(candidate_path_str), live_config_path)
-                dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
+                pre_trial_hash, ms_config_slot = backup_live_config(live_config_path, backups_root)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "backup_write_failed",
+                        "message": f"Failed to write pre-migration config backup: {exc}",
+                    },
+                ) from exc
+
+            try:
+                promote_config(
+                    Path(candidate_path_str),
+                    live_config_path,
+                    expected_sha256=candidate_hash,
+                )
+            except CandidateChanged as exc:
                 try:
-                    os.fsync(dir_fd)
+                    shutil.rmtree(ms_config_slot)
                 except OSError:
                     pass
-                finally:
-                    os.close(dir_fd)
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "candidate_changed", "message": str(exc)},
+                ) from exc
+            except CandidateConfigInvalid as exc:
+                try:
+                    shutil.rmtree(ms_config_slot)
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "candidate_invalid_config", "message": str(exc)},
+                ) from exc
             except Exception as exc:
+                try:
+                    shutil.rmtree(ms_config_slot)
+                except OSError:
+                    pass
                 raise HTTPException(
                     status_code=500,
                     detail={
@@ -8085,6 +8201,9 @@ async def migration_confirm(request: ConfirmRequest):
 
             # Refresh _state["config"] to the new mode and arm the per-tier
             # rebuild (lifespan-mirror; no model reload), then return to LIVE.
+            # The candidate was constructed twice before the rename (in-lock gate
+            # and inside promote_config), so this load cannot raise on config
+            # content — the live file is known-constructible.
             _refresh_config_from_disk_into_state()
             _state["migration"] = initial_migration_state()
 
@@ -8093,7 +8212,7 @@ async def migration_confirm(request: ConfirmRequest):
                 trial_started_at=now_iso,
                 pre_trial_config_sha256=pre_trial_hash,
                 candidate_config_sha256=candidate_hash,
-                backup_paths={},
+                backup_paths={"config": str(ms_config_slot.resolve())},
                 trial_adapter_dir="",
                 trial_graph_dir="",
                 mode_switch=_build_mode_switch_block(
@@ -8218,19 +8337,9 @@ async def migration_confirm(request: ConfirmRequest):
         # (graph.json) both write only to the trial-isolated output paths.
         # Backing up graph / registry here would be dead writes; nothing reads
         # backup_paths["graph"] / ["registry"].
-        pre_trial_hash = ""
-        if live_config_path.exists():
-            pre_trial_hash = _hashlib.sha256(live_config_path.read_bytes()).hexdigest()
-
         written_slots: list[Path] = []
         try:
-            config_bytes = live_config_path.read_bytes() if live_config_path.exists() else b""
-            config_slot = backup_write(
-                ArtifactKind.CONFIG,
-                config_bytes,
-                meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_trial_hash},
-                base_dir=backups_root / "config",
-            )
+            pre_trial_hash, config_slot = backup_live_config(live_config_path, backups_root)
             written_slots.append(config_slot)
 
         except Exception as exc:
@@ -8288,22 +8397,14 @@ async def migration_confirm(request: ConfirmRequest):
                 },
             ) from exc
 
-        # --- Step 4: Atomic rename candidate → live config ---
-        # Uses _rename_config (module-level) so tests can patch it independently
-        # from os.rename (which backup.atomic also uses for its own renames).
+        # --- Step 4: Promote the candidate over the live config ---
+        # promote_config re-reads the candidate from disk, re-checks its hash
+        # against the staged one, re-constructs it at the live path, and only
+        # then renames.  Any rejection here leaves the filesystem untouched.
         candidate_path = Path(candidate_path_str)
-        try:
-            _rename_config(candidate_path, live_config_path)
-            # fsync parent for rename durability.
-            dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            except OSError:
-                pass
-            finally:
-                os.close(dir_fd)
-        except Exception as exc:
-            # Step 4 failure: delete marker and all backups.
+
+        def _undo_steps_2_and_3() -> None:
+            """Delete the trial marker and every backup slot written above."""
             try:
                 clear_trial_marker(state_dir)
             except OSError:
@@ -8313,6 +8414,24 @@ async def migration_confirm(request: ConfirmRequest):
                     shutil.rmtree(slot)
                 except OSError:
                     pass
+
+        try:
+            promote_config(candidate_path, live_config_path, expected_sha256=candidate_hash)
+        except CandidateChanged as exc:
+            _undo_steps_2_and_3()
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "candidate_changed", "message": str(exc)},
+            ) from exc
+        except CandidateConfigInvalid as exc:
+            _undo_steps_2_and_3()
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "candidate_invalid_config", "message": str(exc)},
+            ) from exc
+        except Exception as exc:
+            # Step 4 failure: delete marker and all backups.
+            _undo_steps_2_and_3()
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -8737,7 +8856,7 @@ async def _run_base_swap_orchestration(
       the on-disk marker; skip steps 1–3; resume at step 4 (Phase B setup).
       ``write_bundle`` is NOT called.
 
-    **In-flight guard** (R2)
+    **In-flight guard**
 
     ``_state["migration"]["base_swap_active"]`` is ``True`` while this
     coroutine is actively executing phases.  It is cleared in ``finally`` so it
@@ -8792,6 +8911,7 @@ async def _run_base_swap_orchestration(
         Default ``""`` (fresh start).
     """
     from paramem.server.active_store_migration import MigrationState, save_state
+    from paramem.server.migration import promote_config
 
     # ── In-flight guard: set base_swap_active so confirm/rollback can reject ──
     migration = _state.get("migration")
@@ -8960,14 +9080,11 @@ async def _run_base_swap_orchestration(
             # not from a worker job — so _release_base_model_in_process →
             # bt._stop_callable_worker() stops only an idle worker.
             # No worker-kill hazard.
-            _rename_config(Path(candidate_path_str), live_config_path)
-            dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            except OSError:
-                pass
-            finally:
-                os.close(dir_fd)
+            promote_config(
+                Path(candidate_path_str),
+                live_config_path,
+                expected_sha256=candidate_hash,
+            )
 
             phase_a_done_marker = TrialMarker(
                 schema_version=1,
@@ -10039,7 +10156,11 @@ async def migration_rollback():
 
     1. Re-verify inside lock (state=TRIAL).
     2. Snapshot B into rollback_pre_mortem backup.
-    3. Resolve A config artifact from marker.
+    3. Resolve A config artifact from marker; decrypt it and **construct it as if
+       it already sat at the live config path** (``validate_candidate``) — a
+       backup is a config that was validated against a schema that may since have
+       grown new load-time guards, so restoring it is a second door onto the same
+       "unbootable config goes live" defect a candidate promotion closes.
     4. Atomic rename A artifact → live config path.
     5. **Clear trial marker** (BEFORE rotation — IMPROVEMENT 8).
     6. Rotate trial adapter + graph (non-fatal; triggers 207 on failure).
@@ -10061,6 +10182,8 @@ async def migration_rollback():
         Step 2 snapshot failed; state=TRIAL preserved.
     500 ``rollback_precondition_failed``
         A config artifact missing; pre-mortem backup deleted.
+    400 ``backup_unbootable``
+        Step 3 construction failed; live config untouched; pre-mortem backup deleted.
     500 ``config_restore_failed``
         Step 4 rename failed; pre-mortem backup deleted.
     500 ``marker_clear_failed``
@@ -10069,7 +10192,11 @@ async def migration_rollback():
     from fastapi import HTTPException
 
     from paramem.backup.types import ArtifactKind
-    from paramem.server.migration import initial_migration_state
+    from paramem.server.migration import (
+        CandidateConfigInvalid,
+        initial_migration_state,
+        validate_candidate,
+    )
     from paramem.server.trial_state import read_trial_marker
 
     # --- Pre-checks outside lock ---
@@ -10414,6 +10541,30 @@ async def migration_rollback():
                 detail={
                     "error": "config_restore_failed",
                     "message": f"Failed to read/decrypt A config artifact: {exc}",
+                },
+            ) from exc
+
+        # --- Step 3b: Construct A as if it already sat at the live config path ---
+        # A backup is a config that was validated against a POSSIBLY OLDER schema.
+        # New load-time guards (e.g. max_interim_count=0 + mode=simulate) can reject
+        # bytes that were bootable when the backup was written. The pre-mortem
+        # backup (step 2) already exists, so refusing here costs nothing — the
+        # operator can still recover the artifact manually if they need it.
+        try:
+            validate_candidate(plaintext_bytes, live_config_path)
+        except CandidateConfigInvalid as exc:
+            try:
+                shutil.rmtree(pre_mortem_slot, ignore_errors=True)
+            except OSError:
+                pass
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "backup_unbootable",
+                    "message": (
+                        f"A-config backup cannot be constructed into a bootable config: {exc}. "
+                        "The live config was NOT modified."
+                    ),
                 },
             ) from exc
 
@@ -11145,6 +11296,10 @@ async def backup_restore(req: BackupRestoreRequest):
         Decryption failed (stale daily identity or corrupted backup).
     500 ``bundle_corrupt``
         A file hash in ``bundle.meta.json`` does not match on-disk bytes.
+    400 ``backup_unbootable``
+        (``kind="config"`` only) The decrypted backup cannot be constructed into a
+        bootable config.  The safety backup of the current live config was already
+        written; the live config itself was NOT modified.
     500 ``config_restore_failed``
         Atomic rename of the restore temp file failed.
     500 ``bundle_restore_failed``
@@ -11161,7 +11316,11 @@ async def backup_restore(req: BackupRestoreRequest):
         FingerprintMismatchError,
         RestoreAbortedError,
     )
-    from paramem.server.migration import initial_migration_state
+    from paramem.server.migration import (
+        CandidateConfigInvalid,
+        initial_migration_state,
+        validate_candidate,
+    )
 
     # --- Step 1: Precondition checks ---
     migration = _state.get("migration") or initial_migration_state()
@@ -11432,6 +11591,25 @@ async def backup_restore(req: BackupRestoreRequest):
             },
         ) from exc
 
+    # --- Step 5b: Construct the backup as if it already sat at the live path ---
+    # A backup is a config that was validated against a POSSIBLY OLDER schema; new
+    # load-time guards can reject bytes that were bootable when the backup was
+    # written.  The safety backup above already exists, so refusing here costs
+    # nothing — the operator's current live config is unharmed and recoverable.
+    try:
+        validate_candidate(plaintext_bytes, live_config_path)
+    except CandidateConfigInvalid as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "backup_unbootable",
+                "message": (
+                    f"Backup cannot be constructed into a bootable config: {exc}. "
+                    f"The live config was NOT modified. Safety backup at {safety_slot_path}."
+                ),
+            },
+        ) from exc
+
     # --- Step 6: Atomic restore ---
     restore_pending = live_config_path.with_suffix(live_config_path.suffix + ".restore-pending")
     try:
@@ -11627,56 +11805,11 @@ def _cloud_only_route(
 # --- Internal ---
 
 
-def _last_full_consolidation_window(adapter_dir: Path) -> "str | None":
-    """Return the window_stamp recorded on the most recent main episodic slot.
-
-    The canonical main ``episodic`` adapter is only written by full
-    consolidation paths (``_save_adapters`` and
-    ``consolidate_interim_adapters``); both stamp ``window_stamp`` with the
-    full-consolidation cadence boundary that was active at save time. So the
-    lex-max slot's ``meta.json.window_stamp`` is the canonical record of
-    "which window did the last full cycle consolidate?"
-
-    Returns ``None`` when:
-      * There is no main episodic slot yet (fresh install).
-      * ``meta.json`` is missing or unreadable.
-      * The recorded ``window_stamp`` is empty (legacy v1 manifest, or a
-        synthesized fallback that did not know its window).
-
-    Callers treat ``None`` as "no main slot exists yet — defer to the
-    interim path." Fresh installs and post-migration states bootstrap by
-    extracting pending sessions into an interim adapter first; only after
-    at least one interim has been written does the full cycle have anything
-    to consolidate (see ``_is_full_cycle_due``).
-    """
-    from paramem.memory.interim_adapter import INTERIM_DIR_PREFIX
-
-    episodic_dir = adapter_dir / "episodic"
-    if not episodic_dir.is_dir():
-        return None
-    slots = sorted(
-        d
-        for d in episodic_dir.iterdir()
-        if d.is_dir() and not d.name.startswith(".") and not d.name.startswith(INTERIM_DIR_PREFIX)
-    )
-    if not slots:
-        return None
-    meta_path = slots[-1] / "meta.json"
-    if not meta_path.is_file():
-        return None
-    try:
-        meta = json.loads(meta_path.read_text())
-        ws = meta.get("window_stamp", "")
-        return ws if ws else None
-    except Exception:
-        return None
-
-
 def _is_full_cycle_due(config) -> bool:
     """Count/phase primary gate + oldest-interim-age deadline backstop.
 
     Replaces the window-stamp identity gate with a content-driven signal that
-    is robust to skipped ticks, restarts, and the ≥24h stamp-collapse bug (D2):
+    is robust to skipped ticks, restarts, and the ≥24h stamp-collapse bug:
 
     **Primary (count/phase):** the full fold is due when the on-disk interim
     count ``n`` equals ``N + 1`` (first slot of the next cycle), where
@@ -11684,6 +11817,16 @@ def _is_full_cycle_due(config) -> bool:
     count is restart-safe and derived from durable state.  The boundary
     ``(n - 1) % N == 0`` detects the (N+1)-th slot; ``n > 1`` ensures there is
     at least one completed interim cycle before triggering.
+
+    **What is counted:** only interim slots that carry the configured venue's
+    payload (``iter_interim_dirs(..., mode=config.consolidation.mode)`` — a
+    ``graph.json`` in simulate, adapter weights in train).  A slot directory
+    whose payload write never landed holds nothing to fold, so it must not
+    drive the gate on its own.  The count/deadline arithmetic below is
+    unchanged; only its input set is venue-filtered.  ``_oldest_interim_stamp``,
+    ``_full_cycle_deadline_dt`` and ``_seconds_until_next_full_consolidation``
+    filter the same way — the gate, its deadline backstop, its incident dedup
+    key and ``/status``'s ETA must all describe one set.
 
     **Backstop (deadline):** even if count never reaches N+1 (sparse / broken
     chain), the fold is also due when the **oldest un-folded interim tier's
@@ -11697,10 +11840,16 @@ def _is_full_cycle_due(config) -> bool:
     ``max_interim_count == 0`` there are no interim adapter slots — the
     interim path never mints any, so ``n`` is always 0 and the count/deadline
     logic below does not apply.  Every scheduled tick IS a full-cycle tick at
-    ``count == 0``; there is no interim path to route to.  The "no pending
-    sessions → don't train" decision is made downstream in ``_run_full_cycle``
-    (the existing noop/accumulating machinery).  At ``N == 0`` return ``True``
-    unconditionally.
+    ``count == 0``; there is no interim path to route to.  This function does
+    not decide whether there is anything to train on — that "no pending
+    sessions → don't dispatch" decision is the arbitrator's content gate
+    (:func:`_consolidation_content_gate`, evaluated on the resolved action
+    after this function returns), which returns ``noop_no_pending`` /
+    ``noop_no_named`` before the fold is ever entered.  The separate
+    ``accumulating`` outcome is a different case: the fold *was* dispatched
+    (content existed) but the total trainable key count fell below
+    ``min_tier_key_floor``.  At ``N == 0`` this function itself returns
+    ``True`` unconditionally.
 
     ``N < 0`` is rejected at config load; the defensive belt below guards
     against any future code path that bypasses the validator.
@@ -11708,11 +11857,10 @@ def _is_full_cycle_due(config) -> bool:
     Timestamps are in LOCAL time throughout, consistent with
     ``current_interim_stamp``'s ``datetime.now()`` basis.
 
-    ``current_full_consolidation_stamp`` and ``_last_full_consolidation_window``
-    are NOT used here (their full-consolidation trigger use was removed).  They remain
-    live: ``_save_adapters`` still stamps ``window_stamp`` via
-    ``current_full_consolidation_stamp``, and ``run_housekeeping`` reads the
-    stamp via ``_last_full_consolidation_window``.
+    ``window_stamp`` is not read here, nor anywhere else.  ``_save_adapters``
+    still writes it on every main slot via ``current_full_consolidation_stamp``,
+    but purely as provenance — no code compares stamps to decide whether a fold
+    is due.
     """
     from paramem.memory.interim_adapter import iter_interim_dirs
 
@@ -11727,7 +11875,7 @@ def _is_full_cycle_due(config) -> bool:
     if N < 0:
         return False
 
-    dirs = list(iter_interim_dirs(config.adapter_dir))
+    dirs = list(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode))
     n = len(dirs)
     if n == 0:
         return False
@@ -11746,10 +11894,12 @@ def _is_full_cycle_due(config) -> bool:
 def _oldest_interim_stamp(config) -> "str | None":
     """Return the oldest un-folded interim stamp, or ``None`` when none exist.
 
-    Reads ``iter_interim_dirs(config.adapter_dir)``, sorted ascending (oldest
-    first), and extracts the timestamp from the directory name via
-    ``interim_stamp_from_name``.  No age gate — returns the stamp regardless
-    of how old it is.
+    Reads ``iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode)``,
+    sorted ascending (oldest first), and extracts the timestamp from the directory
+    name via ``interim_stamp_from_name``.  No age gate — returns the stamp regardless
+    of how old it is.  Payload-less slot dirs are skipped: this stamp is the cycle key
+    for the gate's incidents, so it must describe the same set ``_is_full_cycle_due``
+    counts.
 
     Used as the per-cycle dedup key for ``record_incident`` calls that fire
     when the ring is full (``interim_cap_reached``, ``interim_overflow_pending``)
@@ -11768,7 +11918,7 @@ def _oldest_interim_stamp(config) -> "str | None":
     """
     from paramem.memory.interim_adapter import interim_stamp_from_name, iter_interim_dirs
 
-    dirs = list(iter_interim_dirs(config.adapter_dir))
+    dirs = list(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode))
     if not dirs:
         return None
     oldest_name, _ = dirs[0]  # sorted ascending; [0] is oldest
@@ -11793,7 +11943,8 @@ def _full_cycle_deadline_dt(config) -> "datetime | None":
     The deadline is ``oldest_interim_dt + consolidation_period_seconds``.
     Returns ``None`` when:
 
-    - No un-folded interim dirs exist.
+    - No un-folded, payload-bearing interim slots exist (the scan is venue-filtered
+      via ``mode=config.consolidation.mode``, same set as :func:`_is_full_cycle_due`).
     - ``consolidation_period_seconds`` is ``None`` (manual-only cadence).
 
     Timestamps are in LOCAL time throughout, consistent with
@@ -11807,7 +11958,7 @@ def _full_cycle_deadline_dt(config) -> "datetime | None":
     full_period_seconds = config.consolidation.consolidation_period_seconds
     if full_period_seconds is None:
         return None
-    dirs = list(iter_interim_dirs(config.adapter_dir))
+    dirs = list(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode))
     if not dirs:
         return None
     oldest_name, _ = dirs[0]
@@ -11829,7 +11980,10 @@ def _seconds_until_next_full_consolidation(
       seconds to the next cadence boundary (same as ``next_interim_seconds``).
     - Cadence disabled (``refresh_cadence`` maps to ``None``): returns ``None``
       (manual-only, no scheduled ticks).
-    - No interim dirs exist yet: returns ``None`` (nothing to fold).
+    - No payload-bearing interim slots exist yet: returns ``None`` (nothing to
+      fold).  The scan is venue-filtered (``mode=config.consolidation.mode``)
+      exactly as the gate's is — an unfiltered predictor would contradict the
+      gate in ``/status``.
     - Count-primary condition already holds (``n > 1 and (n-1) % N == 0``):
       returns seconds to the next tick.
     - Otherwise: ``deadline = oldest_interim_dt + full_period_seconds``; the
@@ -11869,7 +12023,7 @@ def _seconds_until_next_full_consolidation(
     if N == 0:
         return _next_tick_seconds()
 
-    dirs = list(iter_interim_dirs(config.adapter_dir))
+    dirs = list(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode))
     n = len(dirs)
     if n == 0:
         return None  # no interims yet — nothing to fold
@@ -11967,11 +12121,28 @@ def _full_consolidation_overdue_key(config) -> "str | None":
     return oldest_stamp if age >= 2 * period else None
 
 
+class ConsolidationAction(str, Enum):
+    """What a consolidation dispatch is asked to do — the internal vocabulary.
+
+    ``AUTO`` is the only action the schedule resolves: it becomes ``FULL`` or
+    ``INTERIM`` in :func:`_dispatch_consolidation` according to
+    :func:`_is_full_cycle_due`.  ``FULL`` and ``INTERIM`` are the operator's
+    explicit requests and never consult the schedule gate.
+
+    The arbitrator resolves this action and keeps it: the training layer below
+    receives only the fold's mode and its fold inputs.
+    """
+
+    AUTO = "auto"
+    FULL = "full"
+    INTERIM = "interim"
+
+
 def _consolidation_dispatch_guards() -> "str | None":
-    """Shared pre-dispatch guard for consolidation dispatchers.
+    """Shared pre-dispatch guard for consolidation dispatch.
 
     Checks the three cross-cutting block conditions that prevent any
-    consolidation fold from starting (both scheduled and housekeeping):
+    consolidation fold from starting, for every action:
 
     - ``_state["consolidating"]`` — another fold is already running.
     - ``_state["mode"] != "local"`` — cloud-only mode (no model loaded).
@@ -11980,7 +12151,7 @@ def _consolidation_dispatch_guards() -> "str | None":
     Returns:
         A non-None ``"deferred_*"`` reason string when a block is in effect,
         ``None`` when clear (caller should proceed).  The string mirrors the
-        vocabulary used by ``_maybe_trigger_scheduled_consolidation``.
+        vocabulary used by :func:`_dispatch_consolidation`.
     """
     if _state["consolidating"]:
         return "deferred_already_running"
@@ -11992,237 +12163,88 @@ def _consolidation_dispatch_guards() -> "str | None":
     return None
 
 
-def _maybe_trigger_housekeeping() -> str:
-    """Gate + dispatch an on-demand housekeeping fold.
+def _stamp_scheduled_run(config) -> None:
+    """Record this dispatch's floored heartbeat boundary as the last attempt.
 
-    On-demand grooming fold (``POST /consolidate/housekeeping``): re-runs the
-    full GraphMerger topology over the canonical knowledge graph without
-    advancing session watermarks.  Sessions stay pending; the window stamp is
-    not updated.  Bypasses the scheduled-tick's interim-vs-full gate and gate
-    (d) (the per-tier floor accumulate guard), so it runs regardless of how
-    many active keys exist.
+    No-op when the cadence is calendar-exact (``heartbeat_seconds`` is ``None``)
+    — the timer alone is the schedule and no durable stamp is needed.  Flooring
+    (not raw ``time.time()``) is mandatory here — see
+    ``systemd_timer.floor_to_heartbeat``'s docstring for why an un-floored stamp
+    silently inflates the effective period every cycle.
 
-    Mirrors the guard vocabulary of ``_maybe_trigger_scheduled_consolidation``
-    so callers can treat the return string uniformly.
-
-    Returns:
-        ``"deferred_*"`` when a cross-cutting guard fires; ``"started_housekeeping"``
-        when the fold was successfully dispatched to the BG executor.
+    Fires on every real dispatch (FULL and INTERIM), regardless of who asked, so
+    an operator-triggered run resets the cadence window instead of leaving it
+    stale.
     """
-    _guard = _consolidation_dispatch_guards()
-    if _guard is not None:
-        logger.info("Housekeeping tick: %s — deferred", _guard)
-        return _guard
-
-    logger.info("Housekeeping: dispatching on-demand re-grooming fold")
-    _state["consolidating"] = True
-    event_loop = asyncio.get_running_loop()
-    future = event_loop.run_in_executor(
-        None,
-        lambda: _run_full_consolidation_sync(housekeeping=True),
-    )
-    future.add_done_callback(_scheduled_extract_done_callback)
-    return "started_housekeeping"
-
-
-def _maybe_trigger_scheduled_consolidation(*, apply_schedule_gate: bool = True) -> str:
-    """Gate + dispatch the scheduled tick.
-
-    Two production routes share this entry:
-
-    1. **Full cycle** (every ``refresh_cadence × max_interim_count``): collapse
-       all ``episodic_interim_*`` slots into the main episodic / semantic /
-       procedural adapters via ``loop.consolidate_interim_adapters``. Re-saves
-       main slot manifests in lockstep with the latest registry, restoring
-       boot-time mount-ability that interim cycles otherwise drift away from.
-    2. **Interim cycle** (every other tick): extract any pending sessions and
-       train them into ``episodic_interim_<stamp>`` via
-       ``_extract_and_start_training``. Main adapters are not touched.
-
-    Returns a short status string. GPU-busy states return ``deferred_*`` so
-    the caller can distinguish a missed-but-rescheduled tick from a true
-    no-op. The systemd timer fires again on its next wall-clock tick and
-    retries.
-
-    Args:
-        apply_schedule_gate: When ``True`` (the ``/scheduled-tick`` caller,
-            the default), the suspend/power-off catch-up gate (see
-            ``systemd_timer`` module docstring) applies: on a
-            non-calendar-exact cadence, a heartbeat wakeup that fires before
-            the real cadence period has elapsed since the last attempt is a
-            no-op (``noop_not_due`` / ``noop_scheduler_seeded``). When
-            ``False`` (the ``/consolidate`` caller — the operator's manual
-            escape hatch), the gate is skipped entirely: a manual trigger
-            must never be refused for "not due yet". Only the due-check
-            itself is conditional — ``_consolidation_dispatch_guards()``
-            (already-running / cloud-only / bg-training) and the
-            idle-debounce gate apply unconditionally to BOTH callers, and
-            ``_stamp_scheduled_run()`` still fires on every real dispatch
-            regardless of this flag, so a manual run resets the cadence
-            window instead of leaving it stale.
-    """
-    _guard = _consolidation_dispatch_guards()
-    if _guard is not None:
-        if _guard == "deferred_cloud_only":
-            logger.info(
-                "Scheduler tick: mode=%s (reason=%s) — deferred, will retry on next tick",
-                _state["mode"],
-                _state.get("cloud_only_reason"),
-            )
-        elif _guard == "deferred_bg_training":
-            logger.info("Scheduler tick: background training active — deferred")
-        else:
-            logger.info("Scheduler tick: consolidation already running — deferred")
-        return _guard
-
-    config = _state["config"]
-
-    debounce_s = config.consolidation.training_idle_debounce_s
-    last_chat = _state.get("last_chat_monotonic")
-    # Check last_chat first so MagicMock configs (tests that patch _state with
-    # a minimal mock config) short-circuit before the int comparison fires.
-    if last_chat is not None and debounce_s > 0 and (time.monotonic() - last_chat) < debounce_s:
-        elapsed = time.monotonic() - last_chat
-        logger.info(
-            "Scheduler tick: chat %.1fs ago < debounce %ds — deferred",
-            elapsed,
-            debounce_s,
-        )
-        return "deferred_idle"
-
-    buffer = _state["session_buffer"]
-
-    # Retroactive voice-match claim: scan orphan sessions against every
-    # enrolled speaker. Attributes sessions whose embeddings match an
-    # existing profile at high confidence. Cheap — centroids are cached.
-    _retro_claim_orphan_sessions()
-
-    # Active-store migration gate: when a mode-switch was detected at startup
-    # (or an in-progress migration was interrupted), every consolidation tick
-    # routes to the migration sync until all tiers have cleared the 1.0
-    # recall gate. This pre-empts the full/interim cycle gates because the
-    # active store is not yet coherent with the operator's yaml mode.
-    if _state.get("pending_rehydration", False):
-        if _state.get("store_load_degraded", False):
-            logger.warning(
-                "Scheduler tick: active-store migration pending but store_load_degraded=True "
-                "— refusing to dispatch (boot-time registry load failed; resolve the corrupt "
-                "registry file and restart the server to retry)"
-            )
-            return "migration_skipped_degraded"
-        logger.info("Scheduler tick: active-store migration pending — running migration")
-        _state["consolidating"] = True
-        event_loop = asyncio.get_running_loop()
-        future = event_loop.run_in_executor(None, _run_active_store_migration_sync)
-        future.add_done_callback(_scheduled_extract_done_callback)
-        return "started_migration"
-
-    # Suspend/power-off catch-up gate: for a non-calendar-exact cadence the
-    # rendered OnCalendar timer is a heartbeat wakeup only (see
-    # paramem.server.systemd_timer module docstring) — the durable
-    # last-ATTEMPT stamp (schedule_state.py) decides whether THIS tick
-    # actually dispatches. Calendar-exact cadences (the default "12h", and
-    # any anchored/exact-divisor cadence) get heartbeat_s=None and this
-    # entire block is a no-op — the timer alone remains the schedule.
     from paramem.server import schedule_state as _schedule_state
     from paramem.server import systemd_timer as _systemd_timer
-    from paramem.server.schedule_grammar import compute_schedule_period_seconds as _sched_period
-    from paramem.server.schedule_grammar import is_due as _sched_is_due
 
-    cadence = config.consolidation.refresh_cadence or ""
-    heartbeat_s = _systemd_timer.heartbeat_seconds(cadence)
+    heartbeat_s = _systemd_timer.heartbeat_seconds(config.consolidation.refresh_cadence or "")
+    if heartbeat_s is None:
+        return
+    _schedule_state.write_last_scheduled_run(
+        config.paths.data / "state",
+        _systemd_timer.floor_to_heartbeat(time.time(), heartbeat_s),
+    )
 
-    def _stamp_scheduled_run() -> None:
-        """Record this dispatch's floored heartbeat boundary as the last attempt.
 
-        No-op when the cadence is calendar-exact (heartbeat_s is None) — the
-        timer alone is the schedule and no durable stamp is needed. Flooring
-        (not raw time.time()) is mandatory here — see
-        systemd_timer.floor_to_heartbeat's docstring for why an un-floored
-        stamp silently inflates the effective period every cycle.
-        """
-        if heartbeat_s is None:
-            return
-        _schedule_state.write_last_scheduled_run(
-            config.paths.data / "state",
-            _systemd_timer.floor_to_heartbeat(time.time(), heartbeat_s),
-        )
+def _dispatch_to_executor(fn: Callable[[], None], status: str) -> str:
+    """Submit a consolidation fold to the default executor and return *status*.
 
-    # apply_schedule_gate=False (the manual /consolidate escape hatch) skips
-    # this ENTIRE block — including the seed path, deliberately: a manual
-    # trigger on a virgin install must run (and stamp via
-    # _stamp_scheduled_run() below at the dispatch site), not seed-and-skip.
-    # _stamp_scheduled_run() itself is unconditional either way, so a manual
-    # run still resets the cadence window for the next heartbeat.
-    if apply_schedule_gate and heartbeat_s is not None:
-        last_attempt = _schedule_state.read_last_scheduled_run(config.paths.data / "state")
-        if last_attempt is None:
-            _stamp_scheduled_run()
-            logger.info(
-                "Scheduler tick: seeding catch-up stamp for non-calendar-exact "
-                "cadence %r — not dispatching this tick",
-                cadence,
-            )
-            return "noop_scheduler_seeded"
-        if not _sched_is_due(last_attempt, _sched_period(cadence)):
-            return "noop_not_due"
+    The single dispatch ritual for every consolidation path.  ``consolidating``
+    is set HERE — on the event-loop thread, before the executor submission —
+    which is what makes the guard in :func:`_consolidation_dispatch_guards`
+    free of a check-then-act race: every route is ``async def`` on that same
+    loop, so no other dispatch can interleave between the guard's read and this
+    write.  Structuring it in one place is the point: a hand-copied dispatch
+    that forgets the flag would let two folds run concurrently, and the second
+    would die in ``_ensure_staging_slot`` (``paramem/training/trainer.py``).
 
-    # Full-cycle gate: when the period has elapsed, route to full
-    # consolidation regardless of whether sessions are pending.
-    # At max_interim_count > 0: pending sessions wait one tick (~refresh_cadence)
-    # for their interim write — acceptable given the period is much longer than
-    # the cadence.  At max_interim_count == 0: no interim write; the full cycle
-    # consumes pending sessions directly via the consume-pending pre-stage.
-    if _is_full_cycle_due(config):
-        logger.info("Scheduler tick: full cycle due — running consolidate_interim_adapters")
-        # Do NOT clear last_consolidation_error here.  A failure row stays visible
-        # until the next op of that type SUCCEEDS (auto-resolved in the success paths
-        # below).  Clear-on-attempt hid still-failing conditions.
+    Args:
+        fn: The zero-arg sync entry point (``_run_full_consolidation_sync``,
+            ``_extract_and_start_training``, ``_run_active_store_migration_sync``).
+        status: The status string to return to the caller on submission.
 
-        # Overdue check: fire a loud incident when the prior cycle's full fold
-        # missed its runway (oldest interim aged ≥ 2× the full period).  This is
-        # purely informational — the fold still dispatches.  Deduped by the oldest
-        # interim stamp (stable per stuck cycle; reopens on a new cycle's failure).
-        # NOT a scheduling state — does NOT bump per-session retry counters.
-        _overdue_key = _full_consolidation_overdue_key(config)
-        if _overdue_key is not None:
-            logger.warning(
-                "Scheduler tick: full consolidation OVERDUE — oldest interim %s "
-                "has aged ≥ 2× the full period without being folded",
-                _overdue_key,
-            )
-            _state_dir_for_incident = config.paths.data / "state"
-            record_incident(
-                _state_dir_for_incident,
-                type="full_consolidation_overdue",
-                key=_overdue_key,
-                severity="failed",
-                summary="Full consolidation overdue — fold has not completed within its runway",
-                detail={
-                    "oldest_interim_stamp": _overdue_key,
-                    "type": "full_consolidation_overdue",
-                },
-            )
+    Returns:
+        *status*, unchanged — so call sites read as ``return
+        _dispatch_to_executor(fn, "started_full")``.
+    """
+    _state["consolidating"] = True
+    event_loop = asyncio.get_running_loop()
+    future = event_loop.run_in_executor(None, fn)
+    future.add_done_callback(_scheduled_extract_done_callback)
+    return status
 
-        _state["consolidating"] = True
-        _stamp_scheduled_run()
-        event_loop = asyncio.get_running_loop()
-        future = event_loop.run_in_executor(None, _run_full_consolidation_sync)
-        future.add_done_callback(_scheduled_extract_done_callback)
-        return "started_full"
 
-    facts = buffer.pending_facts()
-    if not facts:
-        logger.info("Scheduler tick: no pending sessions — noop")
-        return "noop_no_pending"
+def _triage_pending_sessions(config, buffer, store) -> "tuple[int, int]":
+    """Classify pending sessions, retire the unusable ones, count the NAMED ones.
 
+    UNIDENTIFIABLE sessions (no speaker id, no voice embedding — nothing can
+    ever attribute them) and HOLDABLE sessions past
+    ``orphan_retirement_seconds`` are marked consolidated here so they cannot
+    accumulate in the buffer forever.  Everything else is left pending.
+
+    Args:
+        config: Live server config.
+        buffer: The ``SessionBuffer``.
+        store: The ``SpeakerStore`` (or ``None`` when no speakers are enrolled).
+
+    Returns:
+        ``(pending_count, named_count)`` — the number of pending sessions seen
+        BEFORE retirement, and the number classified NAMED.  Both are needed:
+        the caller distinguishes "nothing pending at all" (``noop_no_pending``)
+        from "pending, but none attributable" (``noop_no_named``).
+    """
     from paramem.server.consolidation import (
         SessionClass,
         classify_session,
         discard_session_sink,
     )
 
-    store = _state.get("speaker_store")
+    facts = buffer.pending_facts()
+    if not facts:
+        return 0, 0
+
     ttl_seconds = config.consolidation.orphan_retirement_seconds
     drop_ids: list[str] = []
     named_count = 0
@@ -12248,7 +12270,7 @@ def _maybe_trigger_scheduled_consolidation(*, apply_schedule_gate: bool = True) 
 
     if drop_ids:
         logger.info(
-            "Scheduler tick: retiring %d unattributable/expired-holdable session(s)",
+            "Consolidation dispatch: retiring %d unattributable/expired-holdable session(s)",
             len(drop_ids),
         )
         _retain = config.consolidation.retain_sessions or config.debug
@@ -12257,22 +12279,320 @@ def _maybe_trigger_scheduled_consolidation(*, apply_schedule_gate: bool = True) 
             retention_dir=discard_session_sink(config) if _retain else None,
         )
 
-    if named_count == 0:
-        logger.info("Scheduler tick: no NAMED sessions remain — noop")
-        return "noop_no_named"
+    return len(facts), named_count
 
-    logger.info("Scheduler tick: %d NAMED session(s), starting extract + train", named_count)
-    _state["consolidating"] = True
-    _stamp_scheduled_run()
 
-    # count==0 cannot reach this branch: _is_full_cycle_due returns True
-    # at N==0 so the full-cycle gate at the top of this function (line ~11594)
-    # short-circuits before this interim path executes.  This branch mints
-    # episodic_interim_* slots — that is never correct at count==0.
-    event_loop = asyncio.get_running_loop()
-    future = event_loop.run_in_executor(None, _extract_and_start_training)
-    future.add_done_callback(_scheduled_extract_done_callback)
-    return "started"
+def _consolidation_content_gate(
+    action: ConsolidationAction, config, *, force: bool
+) -> "tuple[str | None, bool]":
+    """The ONE "is there anything to consolidate?" check.
+
+    Both actions have an input set, and dispatching with an empty one seizes the
+    GPU to learn nothing:
+
+    - **INTERIM** — its only input is pending sessions.  With none there is
+      nothing to extract, and the tick would still mint an ``episodic_interim_*``
+      slot: a burnt ring slot and a wasted training run.  **Not bypassable, not
+      even for an explicit request** — hence ``force`` has no effect here.
+    - **FULL** — its input is the content-bearing interim slots plus (at
+      ``max_interim_count == 0``, where no interim slot is ever minted) the
+      pending NAMED sessions the fold consumes directly.  With neither, a
+      scheduled full fold would retrain every main tier on exactly what they
+      already hold.  **Bypassable when forced**: an explicitly requested
+      rebuild runs off the existing adapter weights, which are content by
+      definition — but the evaluation below still runs in full even when
+      forced, because the caller needs to know whether real input existed
+      (see ``has_content``), not just whether the dispatch may proceed.
+
+    Interim slots are counted through the payload-aware primitive
+    (``iter_interim_dirs(..., mode=config.consolidation.mode)``): a slot whose
+    payload write never landed is a directory, not content, and must not satisfy
+    the gate.  When content-bearing interim slots exist, the pending-session
+    triage is skipped entirely (for both forced and unforced FULL) — the
+    existing comment on that short-circuit still holds: at
+    ``max_interim_count > 0`` those sessions are left untouched for their own
+    interim tick.
+
+    Takes *config* as a parameter (rather than re-reading ``_state["config"]``)
+    so it is a pure function of its arguments — testable in isolation and
+    guaranteed to see the same config object its one caller resolved ``AUTO``
+    against.
+
+    Args:
+        action: The RESOLVED action (never ``AUTO``).
+        config: Live server config — the SAME object the caller used to resolve
+            ``AUTO`` and to compute ``force``.
+        force: Arbitrator-local; True only for an explicitly requested FULL.
+            Never passed below this layer — the fold has no such parameter.
+            Widens what dispatches (a forced FULL proceeds even with nothing
+            found) but never changes what counts as content.
+
+    Returns:
+        ``(status, has_content)``. *status* is a terminal ``"noop_*"`` string
+        when there is nothing to consolidate and the dispatch is not forced
+        past it, ``None`` when the dispatch may proceed. *has_content* is
+        ``True`` iff content-bearing interim slots exist OR named pending
+        sessions exist — i.e. iff the dispatch has something real to consume,
+        independent of ``force``. The caller uses it to decide whether a
+        dispatch should advance the schedule stamp: only a dispatch that
+        consumes something may do so, and a forced FULL that passed only
+        because it was forced consumed nothing.
+    """
+    from paramem.memory.interim_adapter import iter_interim_dirs
+
+    if action is ConsolidationAction.FULL:
+        # Content-bearing interim slots are content: the fold folds them into
+        # main.  Short-circuits before the triage, so at max_interim_count > 0
+        # the pending sessions are left untouched for their own interim tick.
+        # Evaluated before the force check — force widens the dispatch
+        # decision, it never substitutes for evaluating whether real input
+        # exists.
+        if any(iter_interim_dirs(config.adapter_dir, mode=config.consolidation.mode)):
+            return None, True
+
+    pending_count, named_count = _triage_pending_sessions(
+        config,
+        _state["session_buffer"],
+        _state.get("speaker_store"),
+    )
+    has_content = named_count > 0
+
+    if has_content:
+        logger.info("Consolidation dispatch: %d NAMED session(s) pending", named_count)
+        return None, True
+
+    if action is ConsolidationAction.FULL and force:
+        logger.info(
+            "Consolidation dispatch: forced full fold with nothing to consume — "
+            "content gate bypassed"
+        )
+        return None, False
+
+    if pending_count == 0:
+        logger.info("Consolidation dispatch: no pending sessions — noop")
+        return "noop_no_pending", False
+    logger.info("Consolidation dispatch: no NAMED sessions remain — noop")
+    return "noop_no_named", False
+
+
+def _dispatch_consolidation(
+    action: ConsolidationAction,
+    *,
+    apply_schedule_gate: bool,
+) -> "tuple[str, ConsolidationAction]":
+    """Gate + dispatch one consolidation run.  The single arbitrator.
+
+    Every consolidation door — the systemd tick and every operator endpoint —
+    comes through here.  Nothing below this function knows who asked.
+
+    Order (unconditional gates first, so an explicit request cannot walk past a
+    safety property):
+
+    1. ``_consolidation_dispatch_guards()`` — already-running / cloud-only /
+       bg-training.  All actions.
+    2. **Idle debounce** — all actions.  This protects a live chat turn from a
+       long GPU seizure; it is a safety property, not a schedule, so an explicit
+       request defers on it too.
+    3. Retroactive orphan-session voice claim (cheap, side-effect only).
+    4. ``pending_rehydration`` — an incoherent active store pre-empts every
+       action until the migration completes.
+    5. The suspend/power-off catch-up gate — **only when**
+       *apply_schedule_gate* (the ``/scheduled-tick`` caller).  A deliberate
+       operator trigger is never refused for "not due yet".
+    6. Resolve ``AUTO`` via :func:`_is_full_cycle_due` — **the only call site,
+       and only on AUTO**.  An explicit FULL or INTERIM does not consult the
+       schedule gate at all: the bypass is the arbitrator not asking, not a flag
+       threaded through the gate.
+    7. :func:`_consolidation_content_gate` — the ONE content check.  Also
+       reports ``has_content``: whether the dispatch has something real to
+       consume, independent of ``force``.
+    8. Dispatch via :func:`_dispatch_to_executor`.  A FULL dispatch advances
+       the schedule stamp (:func:`_stamp_scheduled_run`) iff ``has_content`` —
+       a forced full fold that passed the gate only because it was forced
+       consumed nothing and must not perturb the cadence.  INTERIM always
+       stamps (it cannot dispatch without consuming pending sessions).
+
+    ``force`` is derived from the REQUESTED action (before AUTO resolves), so a
+    scheduled tick that resolves to FULL is never forced.  It is arbitrator-local
+    and is never passed downward.
+
+    Args:
+        action: ``AUTO`` (let the schedule decide), ``FULL`` (rebuild the main
+            tiers from stored knowledge — forced), or ``INTERIM`` (absorb
+            pending sessions into a new interim slot).
+        apply_schedule_gate: True only for the systemd heartbeat tick.
+
+    Returns:
+        ``(status, action)`` — the terminal status string and the action as
+        resolved (the requested action when the dispatch never got as far as
+        resolving ``AUTO``).  ``deferred_*`` means "blocked, retry next tick";
+        ``noop_*`` means "nothing to do"; ``started*`` means the fold was
+        submitted to the executor.
+    """
+    _guard = _consolidation_dispatch_guards()
+    if _guard is not None:
+        if _guard == "deferred_cloud_only":
+            logger.info(
+                "Consolidation dispatch (%s): mode=%s (reason=%s) — deferred, "
+                "will retry on next tick",
+                action.value,
+                _state["mode"],
+                _state.get("cloud_only_reason"),
+            )
+        elif _guard == "deferred_bg_training":
+            logger.info(
+                "Consolidation dispatch (%s): background training active — deferred", action.value
+            )
+        else:
+            logger.info(
+                "Consolidation dispatch (%s): consolidation already running — deferred",
+                action.value,
+            )
+        return _guard, action
+
+    config = _state["config"]
+
+    # Idle debounce — every action.  A fold seizes the GPU for minutes; firing
+    # one seconds after a chat turn would strand the next one.
+    debounce_s = config.consolidation.training_idle_debounce_s
+    last_chat = _state.get("last_chat_monotonic")
+    # Check last_chat first so MagicMock configs (tests that patch _state with
+    # a minimal mock config) short-circuit before the int comparison fires.
+    if last_chat is not None and debounce_s > 0 and (time.monotonic() - last_chat) < debounce_s:
+        elapsed = time.monotonic() - last_chat
+        logger.info(
+            "Consolidation dispatch (%s): chat %.1fs ago < debounce %ds — deferred",
+            action.value,
+            elapsed,
+            debounce_s,
+        )
+        return "deferred_idle", action
+
+    # Retroactive voice-match claim: scan orphan sessions against every
+    # enrolled speaker. Attributes sessions whose embeddings match an
+    # existing profile at high confidence. Cheap — centroids are cached.
+    _retro_claim_orphan_sessions()
+
+    # Active-store migration gate: when a mode-switch was detected at startup
+    # (or an in-progress migration was interrupted), every consolidation
+    # dispatch routes to the migration sync until all tiers have cleared the
+    # 1.0 recall gate. This pre-empts the action's own gates because the active
+    # store is not yet coherent with the operator's yaml mode.
+    if _state.get("pending_rehydration", False):
+        if _state.get("store_load_degraded", False):
+            logger.warning(
+                "Consolidation dispatch: active-store migration pending but "
+                "store_load_degraded=True — refusing to dispatch (boot-time registry load "
+                "failed; resolve the corrupt registry file and restart the server to retry)"
+            )
+            return "migration_skipped_degraded", action
+        logger.info("Consolidation dispatch: active-store migration pending — running migration")
+        return _dispatch_to_executor(_run_active_store_migration_sync, "started_migration"), action
+
+    # Suspend/power-off catch-up gate: for a non-calendar-exact cadence the
+    # rendered OnCalendar timer is a heartbeat wakeup only (see
+    # paramem.server.systemd_timer module docstring) — the durable
+    # last-ATTEMPT stamp (schedule_state.py) decides whether THIS tick
+    # actually dispatches. Calendar-exact cadences (the default "12h", and
+    # any anchored/exact-divisor cadence) get heartbeat_s=None and this
+    # entire block is a no-op — the timer alone remains the schedule.
+    #
+    # apply_schedule_gate=False (every operator endpoint) skips this ENTIRE
+    # block — including the seed path, deliberately: a deliberate trigger on a
+    # virgin install must run (and stamp via _stamp_scheduled_run() at the
+    # dispatch site below), not seed-and-skip.
+    if apply_schedule_gate:
+        from paramem.server import schedule_state as _schedule_state
+        from paramem.server import systemd_timer as _systemd_timer
+        from paramem.server.schedule_grammar import compute_schedule_period_seconds as _sched_period
+        from paramem.server.schedule_grammar import is_due as _sched_is_due
+
+        cadence = config.consolidation.refresh_cadence or ""
+        heartbeat_s = _systemd_timer.heartbeat_seconds(cadence)
+        if heartbeat_s is not None:
+            last_attempt = _schedule_state.read_last_scheduled_run(config.paths.data / "state")
+            if last_attempt is None:
+                _stamp_scheduled_run(config)
+                logger.info(
+                    "Scheduler tick: seeding catch-up stamp for non-calendar-exact "
+                    "cadence %r — not dispatching this tick",
+                    cadence,
+                )
+                return "noop_scheduler_seeded", action
+            if not _sched_is_due(last_attempt, _sched_period(cadence)):
+                return "noop_not_due", action
+
+    # force is derived from what was REQUESTED, before AUTO resolves: a
+    # scheduled tick that lands on the full path is never forced.  It is
+    # arbitrator-local — it gates the content check below and goes no further;
+    # the fold entry is handed the mode and its fold inputs only.
+    force = action is ConsolidationAction.FULL
+
+    if action is ConsolidationAction.AUTO:
+        action = (
+            ConsolidationAction.FULL if _is_full_cycle_due(config) else ConsolidationAction.INTERIM
+        )
+
+    # An interim tick mints an episodic_interim_* slot.  At max_interim_count==0
+    # there is no interim tier to mint into — AUTO can never resolve here
+    # (_is_full_cycle_due returns True unconditionally at N==0), and an explicit
+    # request for a tier that does not exist is meaningless, not a fold to run.
+    if action is ConsolidationAction.INTERIM and config.consolidation.max_interim_count == 0:
+        logger.info(
+            "Consolidation dispatch: interim requested but max_interim_count==0 "
+            "(no interim tier exists) — noop"
+        )
+        return "noop_no_interim_tier", action
+
+    _gate_status, _has_content = _consolidation_content_gate(action, config, force=force)
+    if _gate_status is not None:
+        return _gate_status, action
+
+    if action is ConsolidationAction.FULL:
+        logger.info("Consolidation dispatch: running the full fold")
+        # Do NOT clear last_consolidation_error here.  A failure row stays visible
+        # until the next op of that type SUCCEEDS (auto-resolved in the success paths
+        # of the fold itself).  Clear-on-attempt hid still-failing conditions.
+
+        # Overdue check: fire a loud incident when the prior cycle's full fold
+        # missed its runway (oldest interim aged ≥ 2× the full period).  This is
+        # purely informational — the fold still dispatches.  Deduped by the oldest
+        # interim stamp (stable per stuck cycle; reopens on a new cycle's failure).
+        # NOT a scheduling state — does NOT bump per-session retry counters.
+        _overdue_key = _full_consolidation_overdue_key(config)
+        if _overdue_key is not None:
+            logger.warning(
+                "Consolidation dispatch: full consolidation OVERDUE — oldest interim %s "
+                "has aged ≥ 2× the full period without being folded",
+                _overdue_key,
+            )
+            record_incident(
+                config.paths.data / "state",
+                type="full_consolidation_overdue",
+                key=_overdue_key,
+                severity="failed",
+                summary="Full consolidation overdue — fold has not completed within its runway",
+                detail={
+                    "oldest_interim_stamp": _overdue_key,
+                    "type": "full_consolidation_overdue",
+                },
+            )
+
+        # A forced full fold keys its telemetry and outputs exactly like a
+        # scheduled one — same stamp, same family of rows.  There is no
+        # manual/forced flavour of a fold.  The schedule stamp itself only
+        # advances when the dispatch actually consumes something
+        # (``_has_content``, from the content gate above): an unforced FULL
+        # never reaches here without it, but a forced FULL that passed only
+        # because it was forced (nothing on disk, nothing pending) is a pure
+        # idempotent re-groom and must not perturb the cadence.
+        if _has_content:
+            _stamp_scheduled_run(config)
+        return _dispatch_to_executor(_run_full_consolidation_sync, "started_full"), action
+
+    logger.info("Consolidation dispatch: starting interim extract + train")
+    _stamp_scheduled_run(config)
+    return _dispatch_to_executor(_extract_and_start_training, "started"), action
 
 
 def _retro_claim_orphan_sessions() -> int:
@@ -12501,9 +12821,11 @@ def _build_bg_trainer(config) -> "BackgroundTrainer":
 
     Does NOT store the result into ``_state`` — callers decide lifecycle.
     Use :func:`_active_bg_trainer` for the singleton get-or-create path;
-    call this directly only at migration rebuild sites that deliberately build
-    a fresh trainer AFTER ``_release_base_model_in_process`` has already
-    released the prior one (app.py:8300 / :8564).
+    call this directly only at the migration rebuild sites that deliberately
+    build a fresh trainer AFTER ``_release_base_model_in_process`` has already
+    released the prior one — the Phase-A and Phase-B trainer rebuilds inside
+    :func:`_run_base_swap_orchestration`, the only callers outside
+    :func:`_active_bg_trainer`.
 
     Args:
         config: Live :class:`~paramem.server.config.ServerConfig` from
@@ -12540,9 +12862,10 @@ def _active_bg_trainer(config) -> "BackgroundTrainer":
     ``_state`` so the singleton always tracks the current PeftModel wrapper
     (create_interim_adapter may rebind ``_state["model"]`` between cycles).
 
-    Migration rebuild sites (app.py:8300 / :8564) deliberately bypass
-    this accessor and call :func:`_build_bg_trainer` directly — they build a
-    FRESH trainer bound to a reloaded model AFTER ``_release_base_model_in_process``
+    The migration rebuild sites — the Phase-A and Phase-B trainer rebuilds
+    inside :func:`_run_base_swap_orchestration` — deliberately bypass this
+    accessor and call :func:`_build_bg_trainer` directly: they build a FRESH
+    trainer bound to a reloaded model AFTER ``_release_base_model_in_process``
     has already released the prior one via ``bt.release()``.  These are NOT leaks.
 
     Args:
@@ -13186,6 +13509,275 @@ def _finalize_interim(loop, result: dict, *, session_ids: list, released_sids: l
     )
 
 
+@dataclass
+class _PendingExtraction:
+    """Outcome of one pending-session extraction stage.
+
+    Returned by :func:`_extract_pending_sessions` to BOTH consolidation
+    paths (interim tick and the full cycle's consume-pending pre-stage).
+    The stage NEVER raises ``ExtractionFailed``: an abort is reported in
+    *aborted* so the caller can restore the voice pipeline with the
+    ``lock_held`` value its own lock context demands.  Raising would leave
+    the caller no way to learn whether voice was evicted, and a
+    ``finally``-based restore would fire with the GPU lock still held.
+
+    Attributes
+    ----------
+    episodic_rels:
+        Episodic relations from every session that extracted successfully,
+        stamped with ``speaker_id`` / ``session_id`` provenance.
+    procedural_rels:
+        Procedural relations, same provenance stamping.
+    session_ids:
+        Every session the stage attempted, in extraction order (including
+        the OOM-skipped ones — ``failed_session_ids`` is the filter).
+    failed_session_ids:
+        Sessions whose extraction exhausted VRAM.  They are NOT retired;
+        they stay pending for the next cycle.  ALIASING CONTRACT: the interim
+        caller binds this set by reference (``failed_session_ids =
+        extraction.failed_session_ids``) and the recall gate mutates it in
+        place after the stage returns — ``update(_pin_sids)`` /
+        ``difference_update(_released_sids)`` — with retirement reading the
+        mutated set back through :meth:`completed_session_ids`.  Do NOT give
+        this field a defensive copy; that would silently detach pin/release
+        from retirement.
+    speaker_ids:
+        Speaker id per successfully-extracted session (the interim path
+        takes the last one as the cycle's primary speaker).
+    evicted_voice:
+        ``True`` when the batch contained a document session and the stage
+        moved the voice pipeline to CPU.  The CALLER owns the restore.
+    aborted:
+        The ``ExtractionFailed`` that aborted the whole batch, or ``None``
+        on a normal return.  When set, no session may be retired.
+    """
+
+    episodic_rels: list[dict]
+    procedural_rels: list[dict]
+    session_ids: list[str]
+    failed_session_ids: set[str]
+    speaker_ids: list[str]
+    evicted_voice: bool
+    aborted: "ExtractionFailed | None" = None
+
+    def completed_session_ids(self, session_buffer) -> list[str]:
+        """Sessions that may be retired: extraction-succeeded AND retirable.
+
+        Failed chunks stay pending so the next cycle retries them.  Document
+        chunk sessions are held back unless ALL chunks of the same ``doc_id``
+        completed in this cycle — partial success leaves the whole document
+        pending (``SessionBuffer.retirable``).
+        """
+        raw = {sid for sid in self.session_ids if sid not in self.failed_session_ids}
+        return session_buffer.retirable(raw)
+
+
+def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
+    """Extract every NAMED pending session into ``loop``'s cumulative graph.
+
+    The single extraction stage shared by the interim tick
+    (:func:`_extract_and_start_training`) and the full cycle's
+    consume-pending pre-stage (inside :func:`_run_full_consolidation_sync`,
+    which runs at ``max_interim_count == 0``, where no interim slot is ever
+    minted so pending sessions must be consumed by the full fold itself).
+
+    Sessions are filtered to ``SessionClass.NAMED``: the tick already dropped
+    UNIDENTIFIABLE sessions and retired expired HOLDABLE ones; this filters the
+    executor-time snapshot so extraction never runs on an unattributed session.
+
+    Voice eviction fires when the pending batch contains ANY document session.
+    Document chunks have no density bound — a dense ~1500-word chunk is the
+    regime that exhausts VRAM on this 8 GiB host once the ~1.5 GiB STT+TTS GPU
+    pair sits on top of the 4-bit base and the extraction chain's working-set
+    peak.  A *mixed* batch (one transcript probe + several dense docs) is the
+    case that bit us: one transcript session used to keep voice resident through
+    the dense doc extraction and the plausibility filter's KV-cache growth OOM'd
+    mid-generate.  Eviction is cheap — the CPU STT/TTS pair stays resident, so
+    voice still works during the cycle, just on CPU.  A pure-transcript batch
+    keeps the GPU voice pair resident: turn-by-turn dialog is not the dense
+    regime and likely implies recent voice activity where the lazy GPU reload
+    would add latency.
+
+    Failure handling:
+
+    - ``VramExhausted`` is per-chunk isolation: log, record in
+      ``_state["chunk_failures"]``, skip, continue on a fresh cache
+      (``vram_scope``'s finally already ran ``empty_cache``).  The chunk stays
+      pending.
+    - ``ExtractionFailed`` aborts the WHOLE batch: the extractor actively
+      refused to bake a degraded snapshot, and proceeding with the other chunks
+      would silently commit a partial CV / document set.  Everything extracted
+      so far is dropped, ALL sessions stay pending, an ``extraction_failed``
+      incident is recorded, and the abort is RETURNED in
+      :attr:`_PendingExtraction.aborted` — never raised, so the caller can still
+      see :attr:`_PendingExtraction.evicted_voice` and restore voice itself.
+
+    Args:
+        loop: The process-lifetime ``ConsolidationLoop``.  ``extract_session``
+            merges each session graph into its cumulative graph, which is what
+            the consume-pending fold later captures.
+        lock_held: ``True`` when the caller already holds ``gpu_lock_sync()``
+            (the consume-pending pre-stage runs on the BackgroundTrainer worker
+            thread, which holds it for the whole fold — a second acquisition on
+            the non-reentrant lock would deadlock).  ``False`` when the caller
+            does not (the interim tick runs in an executor thread), in which
+            case this function acquires the lock for the extraction and RELEASES
+            it before returning — so the caller's voice restore then runs
+            OUTSIDE the lock (``lock_held=False``).  The eviction itself always
+            happens inside the lock (``lock_held=True``).
+    """
+    from paramem.server.consolidation import SessionClass, classify_session
+    from paramem.server.gpu_lock import gpu_lock_sync
+
+    config = _state["config"]
+    session_buffer = _state["session_buffer"]
+    speaker_store = _state.get("speaker_store")
+
+    def _is_anon(sid: "str | None") -> bool:
+        return bool(speaker_store is not None and sid and speaker_store.is_anonymous(sid))
+
+    named_ids: set[str] = {
+        f["session_id"]
+        for f in session_buffer.pending_facts()
+        if classify_session(
+            speaker_id=f["speaker_id"],
+            is_anonymous=_is_anon(f["speaker_id"]),
+            has_voice_embedding=f["has_voice_embedding"],
+        )
+        == SessionClass.NAMED
+    }
+    pending = [s for s in session_buffer.get_pending() if s["session_id"] in named_ids]
+
+    ha_context = None
+    ha_client = _state.get("ha_client")
+    if ha_client is not None:
+        ha_context = ha_client.get_home_context()
+
+    result = _PendingExtraction(
+        episodic_rels=[],
+        procedural_rels=[],
+        session_ids=[],
+        failed_session_ids=set(),
+        speaker_ids=[],
+        evicted_voice=bool(pending) and any(s.get("source_type") == "document" for s in pending),
+    )
+
+    with nullcontext() if lock_held else gpu_lock_sync():
+        if result.evicted_voice:
+            _set_voice_pipeline_profile("cpu", lock_held=True)
+
+        for session in pending:
+            session_id = session["session_id"]
+            session_speaker_id = session.get("speaker_id")
+            result.session_ids.append(session_id)
+
+            if loop.shutdown_requested:
+                logger.info("Shutdown — stopping extraction early")
+                break
+
+            speaker_name = None
+            if speaker_store is not None:
+                speaker_name = speaker_store.resolve_speaker_name(session_speaker_id)
+
+            try:
+                # Pre-chunk headroom check: warn (no abort) when free VRAM has
+                # dropped below the configured KV-cache buffer.  vram_scope
+                # catches an actual OOM mid-generate and re-raises it as
+                # VramExhausted (so /status shows the failure without log
+                # scraping); this is the early operator signal that the booked
+                # headroom is being consumed.
+                check_vram_headroom(
+                    session_id,
+                    int(config.vram.vram_cache_headroom_gib * 2**30),
+                    _state,
+                )
+                with vram_scope(session_id):
+                    episodic_rels, procedural_rels = loop.extract_session(
+                        session["transcript"],
+                        session_id,
+                        speaker_id=session_speaker_id,
+                        speaker_name=speaker_name,
+                        ha_context=ha_context,
+                        ha_validation=config.consolidation.extraction_ha_validation,
+                        noise_filter=config.consolidation.extraction_noise_filter,
+                        noise_filter_model=config.consolidation.extraction_noise_filter_model,
+                        noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint
+                        or None,
+                        ner_check=config.consolidation.extraction_ner_check,
+                        ner_model=config.consolidation.extraction_ner_model,
+                        plausibility_judge=config.consolidation.extraction_plausibility_judge,
+                        plausibility_stage=config.consolidation.extraction_plausibility_stage,
+                        verify_anonymization=config.consolidation.extraction_verify_anonymization,
+                        source_type=session.get("source_type", "transcript"),
+                        event_time=session["started_at"],
+                    )
+            except VramExhausted as exc:
+                phase = exc.args[0] if exc.args else "unknown"
+                logger.warning(
+                    "Chunk %s OOM at phase=%s — skipping; remains pending for retry",
+                    session_id,
+                    phase,
+                )
+                result.failed_session_ids.add(session_id)
+                _state.setdefault("chunk_failures", []).append(
+                    {
+                        "session_id": session_id,
+                        "phase": phase,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                continue
+            except ExtractionFailed as exc:
+                logger.error(
+                    "Cycle aborted: chunk %s extraction failed at phase=%s — %s. "
+                    "All %d session(s) in this batch remain pending; next cycle will retry.",
+                    session_id,
+                    exc.phase,
+                    exc.reason,
+                    len(result.session_ids),
+                )
+                _state.setdefault("chunk_failures", []).append(
+                    {
+                        "session_id": session_id,
+                        "phase": exc.phase,
+                        "reason": exc.reason,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                record_incident(
+                    config.paths.data / "state",
+                    type="extraction_failed",
+                    key=str(exc.phase),
+                    severity="failed",
+                    summary=f"Consolidation: extraction failed at phase {exc.phase}",
+                    detail={
+                        "type": "extraction_failed",
+                        "phase": exc.phase,
+                        "reason": exc.reason,
+                        "session_id": session_id,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                result.aborted = exc
+                return result
+
+            for qa in episodic_rels:
+                qa["speaker_id"] = session_speaker_id
+                # Stamp the real session id so provenance survives the
+                # GraphMerger union into edge["sessions"].  Co-located with
+                # the speaker_id stamp.
+                qa["session_id"] = session_id
+            for rel in procedural_rels:
+                rel["speaker_id"] = session_speaker_id
+                rel["session_id"] = session_id
+
+            result.episodic_rels.extend(episodic_rels)
+            result.procedural_rels.extend(procedural_rels)
+            result.speaker_ids.append(session_speaker_id)
+
+    return result
+
+
 def _extract_and_start_training():
     """Extract pending sessions and submit a single interim-training job.
 
@@ -13206,14 +13798,9 @@ def _extract_and_start_training():
     cap (when ``interim_overflow_slack > 0``) or ``cap_pending`` (sessions
     stay pending for the next tick), never absorption into an existing
     slot.  Main adapters are only updated by the full-cycle path that
-    calls ``consolidate_interim_adapters``.
+    calls ``loop.consolidate(...)``.
     """
-    from paramem.server.consolidation import (
-        SessionClass,
-        _save_key_metadata,
-        classify_session,
-        session_retention_dir,
-    )
+    from paramem.server.consolidation import _save_key_metadata, session_retention_dir
 
     config = _state["config"]
     session_buffer = _state["session_buffer"]
@@ -13222,219 +13809,33 @@ def _extract_and_start_training():
     # earlier than _run_stage_b_cycle's own get-or-create (Phase 2, below).
     loop = _get_or_create_consolidation_loop(config)
 
-    # Read HA home context for location validation
-    ha_context = None
-    ha_client = _state.get("ha_client")
-    if ha_client is not None:
-        ha_context = ha_client.get_home_context()
+    # --- Phase 1: Extract all sessions ---
+    # ``lock_held=False``: this runs in an executor thread that holds no GPU
+    # lock, so the extraction stage acquires ``gpu_lock_sync()`` itself and
+    # releases it before returning.  Every voice restore below therefore runs
+    # OUTSIDE the lock (``lock_held=False``) — including the abort restore.
+    extraction = _extract_pending_sessions(loop, lock_held=False)
+    all_episodic_rels = extraction.episodic_rels
+    all_procedural_rels = extraction.procedural_rels
+    session_ids = extraction.session_ids
+    failed_session_ids = extraction.failed_session_ids
+    evict_voice_for_cycle = extraction.evicted_voice
 
-    # --- Phase 1: Extract all sessions (holds GPU lock) ---
-    from paramem.server.gpu_lock import gpu_lock_sync
-
-    # Build the NAMED-only set from pending_facts() + classify_session().
-    # The tick already dropped UNIDENTIFIABLE sessions and retired expired
-    # HOLDABLE sessions; here we filter the executor-time snapshot to
-    # NAMED only so extraction never runs on an unattributed session.
-    _extract_store = _state.get("speaker_store")
-
-    def _is_anon_ex(sid: str | None) -> bool:
-        return bool(_extract_store is not None and sid and _extract_store.is_anonymous(sid))
-
-    _named_ids: set[str] = {
-        f["session_id"]
-        for f in session_buffer.pending_facts()
-        if classify_session(
-            speaker_id=f["speaker_id"],
-            is_anonymous=_is_anon_ex(f["speaker_id"]),
-            has_voice_embedding=f["has_voice_embedding"],
-        )
-        == SessionClass.NAMED
-    }
-
-    pending = [s for s in session_buffer.get_pending() if s["session_id"] in _named_ids]
-    all_episodic_rels = []
-    all_procedural_rels = []
-    session_ids = []
-    speaker_ids = []
-    # Sessions whose extract_session call exhausted VRAM. Per-chunk
-    # isolation: a single bad chunk (e.g. a pathologically dense
-    # document) must not poison the whole cycle. Failed chunks are NOT
-    # marked_consolidated so they remain pending for the next cycle,
-    # which starts on a fresh cache (lazy STT/TTS reload only happens
-    # on voice activity, so the bg cycle still sees the headroom).
-    failed_session_ids: set[str] = set()
-
-    # Voice eviction triggers when the pending batch contains ANY document
-    # session. Document chunks have no density bound — a dense ~1500-word
-    # resume chunk is the regime that exhausts VRAM on this 8 GiB host once
-    # the ~1.5 GiB STT(Whisper)+TTS(Piper) GPU pair is added on top of the
-    # 4-bit Mistral 7B base and the extraction chain's ~6 GiB working-set
-    # peak. A *mixed* batch (one transcript probe + several dense docs) is
-    # the case that bit us: under the prior all()-predicate one transcript
-    # session kept voice resident through the dense doc extraction and the
-    # plausibility filter's KV-cache growth OOM'd mid-generate. Eviction is
-    # cheap — the CPU STT/TTS pair stays resident (loaded at startup), so
-    # voice still works during the cycle, just on CPU; the GPU pair is
-    # lazily reconstructed on the next voice activity or restored to
-    # _target_profile() at cycle end. A pure-transcript batch keeps the GPU
-    # voice pair resident: those sessions are produced by turn-by-turn
-    # dialog, are not in the dense-document regime, and likely imply recent
-    # voice activity where the lazy GPU reload would add latency.
-    evict_voice_for_cycle = bool(pending) and any(
-        s.get("source_type") == "document" for s in pending
-    )
-
-    with gpu_lock_sync():
+    if extraction.aborted is not None:
+        # Whole-batch abort (ExtractionFailed): every session stays pending and
+        # the next tick retries the batch.  The stage already logged it and
+        # recorded the incident; reclaim the voice pipeline it evicted (the
+        # cycle drops out without reaching any finalize) and clear the flag so
+        # the retry path is not blocked by "deferred_already_running".
         if evict_voice_for_cycle:
-            _set_voice_pipeline_profile("cpu", lock_held=True)
-        for session in pending:
-            session_id = session["session_id"]
-            transcript = session["transcript"]
-            session_speaker_id = session.get("speaker_id")
-            session_ids.append(session_id)
-
-            if loop.shutdown_requested:
-                logger.info("Shutdown — stopping extraction early")
-                break
-
-            speaker_name = None
-            if _state.get("speaker_store") is not None:
-                speaker_name = _state["speaker_store"].resolve_speaker_name(session_speaker_id)
-
-            # vram_scope mirrors the full-cycle path in paramem/server/
-            # consolidation.py:335 — empty_cache between sessions and OOM
-            # → VramExhausted so the done-callback populates
-            # last_consolidation_error visibly via /status.
-            try:
-                # Pre-chunk headroom check: warn (no abort) when free VRAM has
-                # dropped below the configured KV-cache buffer. vram_scope catches
-                # an actual OOM mid-generate; this is the early operator signal
-                # that the booked headroom is being consumed.
-                check_vram_headroom(
-                    session_id,
-                    int(config.vram.vram_cache_headroom_gib * 2**30),
-                    _state,
-                )
-                with vram_scope(session_id):
-                    episodic_rels, procedural_rels = loop.extract_session(
-                        transcript,
-                        session_id,
-                        speaker_id=session_speaker_id,
-                        speaker_name=speaker_name,
-                        ha_context=ha_context,
-                        ha_validation=config.consolidation.extraction_ha_validation,
-                        noise_filter=config.consolidation.extraction_noise_filter,
-                        noise_filter_model=config.consolidation.extraction_noise_filter_model,
-                        noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint
-                        or None,
-                        ner_check=config.consolidation.extraction_ner_check,
-                        ner_model=config.consolidation.extraction_ner_model,
-                        plausibility_judge=config.consolidation.extraction_plausibility_judge,
-                        plausibility_stage=config.consolidation.extraction_plausibility_stage,
-                        verify_anonymization=config.consolidation.extraction_verify_anonymization,
-                        source_type=session.get("source_type", "transcript"),
-                        event_time=session["started_at"],
-                    )
-            except VramExhausted as exc:
-                # Per-chunk isolation: log, record, skip — continue to next
-                # chunk under a fresh cache (vram_scope's finally clause
-                # already ran empty_cache before re-raising). Do NOT mark
-                # this chunk consolidated; it stays pending for next cycle.
-                phase = exc.args[0] if exc.args else "unknown"
-                logger.warning(
-                    "Chunk %s OOM at phase=%s — skipping; remains pending for retry",
-                    session_id,
-                    phase,
-                )
-                failed_session_ids.add(session_id)
-                _state.setdefault("chunk_failures", []).append(
-                    {
-                        "session_id": session_id,
-                        "phase": phase,
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-                continue
-            except ExtractionFailed as exc:
-                # Whole-cycle abort: unlike VramExhausted (resource constraint, per-
-                # chunk isolation OK), ExtractionFailed means the extractor
-                # actively refused to bake a degraded snapshot — proceeding
-                # with the OTHER chunks would silently commit a partial CV /
-                # document set, which is exactly the "keep pre-enrichment
-                # facts and proceed" anti-pattern the design rejects.  Drop
-                # everything extracted so far, leave ALL sessions pending
-                # (including the ones already processed in this loop), and
-                # let the next tick retry the whole batch.
-                logger.error(
-                    "Cycle aborted: chunk %s extraction failed at phase=%s — %s. "
-                    "All %d session(s) in this batch remain pending; next cycle will retry.",
-                    session_id,
-                    exc.phase,
-                    exc.reason,
-                    len(session_ids),
-                )
-                _state.setdefault("chunk_failures", []).append(
-                    {
-                        "session_id": session_id,
-                        "phase": exc.phase,
-                        "reason": exc.reason,
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-                _ef_at = datetime.now(timezone.utc).isoformat()
-                record_incident(
-                    _state["config"].paths.data / "state",
-                    type="extraction_failed",
-                    key=str(exc.phase),
-                    severity="failed",
-                    summary=f"Consolidation: extraction failed at phase {exc.phase}",
-                    detail={
-                        "type": "extraction_failed",
-                        "phase": exc.phase,
-                        "reason": exc.reason,
-                        "session_id": session_id,
-                        "at": _ef_at,
-                    },
-                )
-                # Reclaim voice pipeline if we evicted it earlier — the cycle
-                # is dropping out without going through the normal finalize.
-                # This abort handler runs inside the `with gpu_lock_sync():` at
-                # L7190, so pass ``lock_held=True`` (the lock is non-reentrant;
-                # ``lock_held=False`` would deadlock the executor thread and
-                # leave ``_state["consolidating"]`` stuck at True, blocking the
-                # retry path mandated by project_extraction_failure_fails_cycle).
-                if evict_voice_for_cycle:
-                    _set_voice_pipeline_profile(_target_profile(), lock_held=True)
-                _state["consolidating"] = False
-                return
-            for qa in episodic_rels:
-                qa["speaker_id"] = session_speaker_id
-                # Stamp the real session id so provenance survives the
-                # GraphMerger union into edge["sessions"].  Co-located with
-                # the speaker_id stamp.
-                qa["session_id"] = session_id
-            for rel in procedural_rels:
-                rel["speaker_id"] = session_speaker_id
-                rel["session_id"] = session_id
-
-            all_episodic_rels.extend(episodic_rels)
-            all_procedural_rels.extend(procedural_rels)
-            speaker_ids.append(session_speaker_id)
-
-    # Helper: mark only sessions whose extract_session call succeeded, further
-    # filtered by document-atomic retirement rules (SessionBuffer.retirable).
-    # Failed chunks remain pending so the next cycle retries them.
-    # Document chunk sessions are held back unless ALL chunks for the same
-    # doc_id completed in this cycle — partial success leaves the whole
-    # document pending for retry.
-    def _completed_session_ids() -> list[str]:
-        raw_completed = {sid for sid in session_ids if sid not in failed_session_ids}
-        return session_buffer.retirable(raw_completed)
+            _set_voice_pipeline_profile(_target_profile(), lock_held=False)
+        _state["consolidating"] = False
+        return
 
     if not all_episodic_rels and not all_procedural_rels:
         logger.info("No relations extracted — skipping")
         session_buffer.mark_consolidated(
-            _completed_session_ids(),
+            extraction.completed_session_ids(session_buffer),
             retention_dir=session_retention_dir(loop, config),
         )
 
@@ -13483,7 +13884,7 @@ def _extract_and_start_training():
     # the graph.json via DiskMemorySource at retrieval time.
 
     if config.consolidation.mode == "simulate":
-        primary_speaker_sim = speaker_ids[-1] if speaker_ids else ""
+        primary_speaker_sim = extraction.speaker_ids[-1] if extraction.speaker_ids else ""
         # Callsite 3: scheduled-tick simulate.  The caller does NOT hold the GPU
         # lock at this point (the old ``with gpu_lock_sync()`` wrapper is
         # dropped — the BG worker thread acquires the lock internally via
@@ -13516,7 +13917,7 @@ def _extract_and_start_training():
         # Simulate is peer storage — retire successfully-extracted sessions
         # like train. OOM-skipped chunks stay pending for retry.
         session_buffer.mark_consolidated(
-            _completed_session_ids(),
+            extraction.completed_session_ids(session_buffer),
             retention_dir=session_retention_dir(loop, config),
         )
 
@@ -13571,7 +13972,7 @@ def _extract_and_start_training():
     # window opens.  ``max_interim_count`` is the overflow ceiling for that
     # mint (overflow slot or cap_pending), never absorption into an
     # existing slot.  Main adapters are NOT touched here — they only
-    # change at the full-cycle boundary, where consolidate_interim_adapters()
+    # change at the full-cycle boundary, where the full fold
     # collapses the accumulated interim slots into episodic / semantic /
     # procedural.  Freshness-wins router order: probing the newest interim
     # before main means recently
@@ -13579,7 +13980,7 @@ def _extract_and_start_training():
     if not loop.config.indexed_key_replay:
         logger.warning("Indexed key replay disabled — skipping training")
         session_buffer.mark_consolidated(
-            _completed_session_ids(),
+            extraction.completed_session_ids(session_buffer),
             retention_dir=session_retention_dir(loop, config),
         )
         if evict_voice_for_cycle:
@@ -13587,7 +13988,7 @@ def _extract_and_start_training():
         _state["consolidating"] = False
         return
 
-    primary_speaker = speaker_ids[-1] if speaker_ids else ""
+    primary_speaker = extraction.speaker_ids[-1] if extraction.speaker_ids else ""
     schedule = config.consolidation.refresh_cadence
     max_interim_count = config.consolidation.max_interim_count
     interim_overflow_slack = config.consolidation.interim_overflow_slack
@@ -13777,12 +14178,12 @@ def _extract_and_start_training():
         # Disk I/O — safe from any thread.  Key-metadata persistence mirrors the
         # previous main-write callback; the interim helper already handled the
         # registry / simhash writes atomically.  Promotion runs at the full fold
-        # (consolidate_interim_adapters) rather than here, so the key is still in
-        # episodic when its adapter weights are probed during reconstruction.
+        # rather than here, so the key is still in episodic when its adapter
+        # weights are probed during reconstruction.
         try:
             _save_key_metadata(loop, config)
             session_buffer.mark_consolidated(
-                _completed_session_ids(),
+                extraction.completed_session_ids(session_buffer),
                 retention_dir=session_retention_dir(loop, config),
             )
         except Exception:
@@ -13880,8 +14281,7 @@ def _finalize_full(
 
     Args:
         loop: The cycle's ``ConsolidationLoop`` (post-fold PEFT rebind).
-        result: The ``consolidate_interim_adapters`` / ``run_housekeeping``
-            return dict.
+        result: The ``loop.consolidate(...)`` return dict.
         staged_e: Staged ``tier -> key -> entry`` map built off-store on the
             worker thread by ``_build_store_contents``.
         staged_r: Staged ``tier -> KeyRegistry`` map.
@@ -13950,34 +14350,27 @@ def _finalize_full(
     logger.info("Full cycle bookkeeping complete — %d total keys", total_keys)
 
 
-def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
+def _run_full_consolidation_sync() -> None:
     """Submit a full-cycle consolidation: collapse interims into main.
 
-    Runs ``loop.consolidate_interim_adapters`` (or ``loop.run_housekeeping``
-    when ``housekeeping=True``) on the BG trainer so the GPU lock is held for
-    the entire per-tier rebuild (the helper's docstring requires this —
-    calling without the lock raises). The function deletes each main adapter,
-    recreates it, trains on the cumulative keyed-pair set derived from every
-    interim slot's keys, and on success unloads the interim adapters and
+    Runs ``loop.consolidate(mode=...)`` on the BG trainer so the GPU lock is held
+    for the entire per-tier rebuild (the train fold's entry guard requires this —
+    calling without the lock raises). In train mode the fold deletes each main
+    adapter, recreates it, trains on the cumulative keyed-pair set derived from
+    every interim slot's keys, and on success unloads the interim adapters and
     reloads the router. On a failed recall-sanity check it rolls back to the
-    snapshot and aborts that tier.
+    snapshot and aborts that tier. In simulate mode it merges the per-cycle
+    ``graph.json`` sidecars into the canonical main-tier graph without touching
+    PEFT weights.
+
+    Whether there is anything to consolidate is decided before dispatch; the fold
+    itself has no content gate.
 
     After a successful merge the main adapter manifests are stamped with
     the current registry hash, restoring boot-time mount-ability that
     interim cycles otherwise drift away from.
-
-    Args:
-        housekeeping: When ``True``, route through ``loop.run_housekeeping``
-            instead of ``loop.consolidate_interim_adapters``. Gate (d) is
-            bypassed so the fold runs regardless of accumulation state.
-            Sessions are NOT marked consolidated; window stamp is not advanced.
     """
-    from paramem.server.consolidation import (
-        SessionClass,
-        _save_key_metadata,
-        classify_session,
-        session_retention_dir,
-    )
+    from paramem.server.consolidation import _save_key_metadata, session_retention_dir
 
     config = _state["config"]
 
@@ -13987,21 +14380,6 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         The entry cooldown gate, the try/except crash envelope, and the
         model-handle refresh are owned by ``_run_stage_b_cycle``.
         """
-        # Voice eviction: the standard full cycle (count > 0) collapses existing
-        # interim slots (already-trained keys) into main — it does not run the
-        # extraction chain, so the KV-cache spikes that motivate eviction do not
-        # apply.  At count == 0 (consume-pending mode) we DO run the extraction
-        # chain below.  The eviction decision is made inside the consume-pending
-        # pre-stage and the restore fires in its finally block, so it correctly
-        # covers all exits including abort, exception, accumulating, and noop.
-        #
-        # Mode dispatch: simulate mode has no PEFT interim adapters —
-        # calling consolidate_interim_adapters would trigger
-        # delete_adapter / create_adapter on a non-existent slot.
-        # Simulate mode uses consolidate_simulate_fold instead, which
-        # merges the per-cycle graph.json sidecars into the canonical
-        # main-tier graph without touching PEFT weights.
-
         # ------------------------------------------------------------------
         # Consume-pending pre-stage (max_interim_count == 0 only).
         #
@@ -14009,206 +14387,53 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # must be extracted directly here, before the fold, depositing their
         # relations into loop.merger.graph.  The full fold's consume_pending
         # capture stage then snapshots merger.graph into extra_relations and
-        # trains them into the main tiers.
+        # trains them into the main tiers.  The standard full cycle (count > 0)
+        # collapses already-trained interim slots into main and runs no
+        # extraction chain at all — hence no pre-stage and no voice eviction.
         #
-        # HARD CONSTRAINT: extract_session is called DIRECTLY here —
-        # NOT via bt.submit / gpu_lock_sync / gpu_lock / acquire_gpu.  This
-        # function already runs under the BG trainer worker's GPU lock
-        # (background_trainer.py:345).  Any second lock acquisition on the
-        # non-reentrant _gpu_thread_lock would deadlock the worker thread.
-        # extract_session / ExtractionPipeline / GraphMerger acquire zero
-        # locks and never call .submit() (grep-confirmed safe).
+        # HARD CONSTRAINT: the extraction stage is called with lock_held=True.
+        # This closure already runs under the BG trainer worker's GPU lock
+        # (BackgroundTrainer._run_callable_queue), and any second acquisition of
+        # the non-reentrant _gpu_thread_lock would deadlock the worker thread.
+        # extract_session / ExtractionPipeline / GraphMerger acquire zero locks
+        # and never call .submit() (grep-confirmed safe).
         #
-        # Locals track extraction-succeeded sessions for mark_consolidated.
-        # Extraction-failed sessions are NOT marked; they stay pending for
-        # the next tick.  A successfully-extracted session is marked on BOTH
-        # fold success and fold noop (extraction succeeded but no NEW facts
-        # after dedup — session is processed, not retried).  This prevents
-        # already-processed sessions from accumulating unboundedly in pending.
+        # Extraction-failed sessions are NOT marked consolidated; they stay
+        # pending for the next tick.  A successfully-extracted session is marked
+        # on BOTH fold success and fold noop (extraction succeeded but no NEW
+        # facts after dedup — the session is processed, not retried).  This
+        # prevents already-processed sessions from accumulating unboundedly.
         # ------------------------------------------------------------------
         _consume_pending = (
-            config.consolidation.max_interim_count == 0
-            and not housekeeping
-            and config.consolidation.mode != "simulate"
+            config.consolidation.max_interim_count == 0 and config.consolidation.mode != "simulate"
         )
-        # Extraction tracking locals (populated in consume-pending pre-stage).
         _cp_session_buffer = _state["session_buffer"]
-        _cp_session_ids: list[str] = []
-        _cp_failed_session_ids: set[str] = set()
-        _cp_speaker_ids: list[str] = []
-        _cp_evict_voice = False
+        extraction: _PendingExtraction | None = None
 
         if _consume_pending:
-            # Build NAMED-only set — mirror _extract_and_start_training:12430-12438.
-            _cp_store = _state.get("speaker_store")
+            extraction = _extract_pending_sessions(loop, lock_held=True)
 
-            def _cp_is_anon(sid: "str | None") -> bool:
-                return bool(_cp_store is not None and sid and _cp_store.is_anonymous(sid))
+            # Restore voice INSIDE the worker's GPU lock (lock_held=True —
+            # lock_held=False would re-acquire the non-reentrant lock and
+            # deadlock).  Fires on every pre-stage exit: normal, empty batch,
+            # OOM-skipped chunks, and the ExtractionFailed abort below.  An
+            # uncaught exception skips this and is restored by
+            # _run_stage_b_cycle's crash envelope (also lock_held=True).
+            if extraction.evicted_voice:
+                _set_voice_pipeline_profile(_target_profile(), lock_held=True)
 
-            _named_ids: set[str] = {
-                f["session_id"]
-                for f in _cp_session_buffer.pending_facts()
-                if classify_session(
-                    speaker_id=f["speaker_id"],
-                    is_anonymous=_cp_is_anon(f["speaker_id"]),
-                    has_voice_embedding=f["has_voice_embedding"],
-                )
-                == SessionClass.NAMED
-            }
-            pending = [s for s in _cp_session_buffer.get_pending() if s["session_id"] in _named_ids]
+            if extraction.aborted is not None:
+                # Whole-batch abort: all sessions stay pending, next tick
+                # retries.  The stage logged it and recorded the incident.
+                return "extraction_failed", None
 
-            # Voice eviction: evict when the pending batch contains ANY document
-            # session (same regime as _extract_and_start_training:12470-12472).
-            # We are already under the GPU lock (lock_held=True throughout).
-            _cp_evict_voice = bool(pending) and any(
-                s.get("source_type") == "document" for s in pending
-            )
-
-            ha_context = None
-            ha_client = _state.get("ha_client")
-            if ha_client is not None:
-                ha_context = ha_client.get_home_context()
-
-            try:
-                if _cp_evict_voice:
-                    _set_voice_pipeline_profile("cpu", lock_held=True)
-
-                for session in pending:
-                    session_id = session["session_id"]
-                    session_speaker_id = session.get("speaker_id")
-                    _cp_session_ids.append(session_id)
-
-                    if loop.shutdown_requested:
-                        logger.info("consume-pending: shutdown — stopping extraction early")
-                        break
-
-                    speaker_name = None
-                    if _state.get("speaker_store") is not None:
-                        speaker_name = _state["speaker_store"].resolve_speaker_name(
-                            session_speaker_id
-                        )
-
-                    try:
-                        check_vram_headroom(
-                            session_id,
-                            int(config.vram.vram_cache_headroom_gib * 2**30),
-                            _state,
-                        )
-                        with vram_scope(session_id):
-                            episodic_rels, procedural_rels = loop.extract_session(
-                                session["transcript"],
-                                session_id,
-                                speaker_id=session_speaker_id,
-                                speaker_name=speaker_name,
-                                ha_context=ha_context,
-                                ha_validation=config.consolidation.extraction_ha_validation,
-                                noise_filter=config.consolidation.extraction_noise_filter,
-                                noise_filter_model=config.consolidation.extraction_noise_filter_model,
-                                noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint
-                                or None,
-                                ner_check=config.consolidation.extraction_ner_check,
-                                ner_model=config.consolidation.extraction_ner_model,
-                                plausibility_judge=config.consolidation.extraction_plausibility_judge,
-                                plausibility_stage=config.consolidation.extraction_plausibility_stage,
-                                verify_anonymization=config.consolidation.extraction_verify_anonymization,
-                                source_type=session.get("source_type", "transcript"),
-                                event_time=session["started_at"],
-                            )
-                    except VramExhausted as exc:
-                        phase = exc.args[0] if exc.args else "unknown"
-                        logger.warning(
-                            "consume-pending: chunk %s OOM at phase=%s — skipping; "
-                            "remains pending for retry",
-                            session_id,
-                            phase,
-                        )
-                        _cp_failed_session_ids.add(session_id)
-                        _state.setdefault("chunk_failures", []).append(
-                            {
-                                "session_id": session_id,
-                                "phase": phase,
-                                "at": datetime.now(timezone.utc).isoformat(),
-                            }
-                        )
-                        continue
-                    except ExtractionFailed as exc:
-                        # Whole-batch abort: leave ALL sessions pending, restore
-                        # voice, and return so the next tick retries.
-                        logger.error(
-                            "consume-pending: chunk %s extraction failed at phase=%s"
-                            " — %s. All %d session(s) remain pending; next tick retries.",
-                            session_id,
-                            exc.phase,
-                            exc.reason,
-                            len(_cp_session_ids),
-                        )
-                        _state.setdefault("chunk_failures", []).append(
-                            {
-                                "session_id": session_id,
-                                "phase": exc.phase,
-                                "reason": exc.reason,
-                                "at": datetime.now(timezone.utc).isoformat(),
-                            }
-                        )
-                        record_incident(
-                            _state["config"].paths.data / "state",
-                            type="extraction_failed",
-                            key=str(exc.phase),
-                            severity="failed",
-                            summary=f"consume-pending: extraction failed at phase {exc.phase}",
-                            detail={
-                                "type": "extraction_failed",
-                                "phase": exc.phase,
-                                "reason": exc.reason,
-                                "session_id": session_id,
-                                "at": datetime.now(timezone.utc).isoformat(),
-                            },
-                        )
-                        return "extraction_failed", None
-
-                    for qa in episodic_rels:
-                        qa["speaker_id"] = session_speaker_id
-                        qa["session_id"] = session_id
-                    for rel in procedural_rels:
-                        rel["speaker_id"] = session_speaker_id
-                        rel["session_id"] = session_id
-                    _cp_speaker_ids.append(session_speaker_id)
-
-            finally:
-                # Restore voice on ALL exits: success, noop (empty pending),
-                # accumulating, abort, uncaught exception, and ExtractionFailed
-                # (Python finally runs even when an enclosing try-block returns).
-                # lock_held=True: this closure runs inside the BG worker's GPU lock
-                # (lock_held=False would re-acquire the non-reentrant lock and deadlock).
-                if _cp_evict_voice:
-                    _set_voice_pipeline_profile(_target_profile(), lock_held=True)
-
-        # Helper: mark only extraction-succeeded sessions, further filtered by
-        # document-atomic retirement rules (SessionBuffer.retirable).
-        # Failed chunks remain pending so the next cycle retries them.
-        def _cp_completed_session_ids() -> list[str]:
-            raw = {sid for sid in _cp_session_ids if sid not in _cp_failed_session_ids}
-            return _cp_session_buffer.retirable(raw)
-
-        _mode = config.consolidation.mode
         try:
-            if housekeeping:
-                # run_housekeeping dispatches to the mode-correct underlying method
-                # (consolidate_simulate_fold for simulate, consolidate_interim_adapters
-                # for train) with housekeeping=True so gate (d) is bypassed.
-                result = loop.run_housekeeping(
-                    trainer=bt,
-                    router=_state.get("router"),
-                    mode=_mode,
-                )
-            elif _mode == "simulate":
-                result = loop.consolidate_simulate_fold()
-            else:
-                result = loop.consolidate_interim_adapters(
-                    trainer=bt,
-                    router=_state.get("router"),
-                    consume_pending=_consume_pending,
-                )
+            result = loop.consolidate(
+                mode=config.consolidation.mode,
+                trainer=bt,
+                router=_state.get("router"),
+                consume_pending=_consume_pending,
+            )
         except AbortedDuringConsolidation as exc:
             # aborted = normal yield-to-chat outcome; NOT an incident — a
             # normal terminal return, never raised past this point (raising
@@ -14229,7 +14454,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
             result.get("rolled_back"),
         )
 
-        # Layering boundary. ``consolidate_interim_adapters`` already
+        # Layering boundary. ``loop.consolidate(...)`` already
         # finished its internal finalize on its way out (registry rewrite,
         # WEIGHT-LEVEL persist+verify of the rebuilt main slots, interim
         # purge, router reload — see its internal finalize block) regardless of whether
@@ -14247,16 +14472,19 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
         # than retrofitting each downstream helper with no-op tolerance.
         # Clear the consolidating flag, record the no-op as a successful
         # cycle outcome, and return.
-        # R3: accumulating status must be distinguished from noop BEFORE the
+        # Accumulating status must be distinguished from noop BEFORE the
         # noop branch fires.  An accumulating fold returns tiers_rebuilt=[] AND
-        # status="accumulating" — sessions stay pending (same as noop), but the
-        # window stamp must NOT be updated so _is_full_cycle_due keeps returning
-        # True and the fold re-fires next window.  Do not call mark_consolidated.
+        # status="accumulating" — sessions stay pending (same as noop).  No
+        # interim slot is purged on this outcome (purging is part of the
+        # rebuilt-mains finalize, which never runs here), so on the next tick
+        # _is_full_cycle_due still sees the same un-folded count/deadline and
+        # fires again — window_stamp plays no part; it is not read by the gate.
+        # Do not call mark_consolidated.
         if result.get("status") == "accumulating":
             _acc_reason = result.get("accumulating_reason", {})
             logger.info(
                 "Full cycle accumulating — total keys below floor %d; "
-                "sessions left pending, window stamp NOT updated so next tick re-fires. "
+                "sessions left pending, no interim slots purged so next tick re-fires. "
                 "Reason: %s",
                 _acc_reason.get("floor", "?"),
                 _acc_reason,
@@ -14268,27 +14496,23 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
                 detail={"accumulating_reason": _acc_reason, "tiers_rebuilt": []},
             )
 
-        # Under housekeeping=True, DO NOT treat tiers_rebuilt==[]
-        # as a noop.  The housekeeping fold ran the full merger topology even with
-        # no interim slots; its result is the groomed graph, not an absence of work.
-        # Only the SCHEDULED path returns early on the empty-tiers-rebuilt signal.
-        if not housekeeping and not result.get("tiers_rebuilt"):
+        if not result.get("tiers_rebuilt"):
             # MF-A Site A: at count==0 the consume-pending pre-stage extracted
             # sessions into merger.graph, but the fold found nothing new to train
             # (all facts already present after dedup).  Mark extraction-succeeded
             # sessions consolidated so they do not accumulate unboundedly.
             # Extraction-failed sessions keep their pending status for retry.
-            if _consume_pending and _cp_session_ids:
+            if extraction is not None and extraction.session_ids:
                 try:
                     _cp_session_buffer.mark_consolidated(
-                        _cp_completed_session_ids(),
+                        extraction.completed_session_ids(_cp_session_buffer),
                         retention_dir=session_retention_dir(loop, config),
                     )
                 except Exception:
                     logger.exception("consume-pending noop: mark_consolidated failed (non-fatal)")
             logger.info(
                 "Full cycle no-op — nothing to rebuild, inner finalize already "
-                "ran inside consolidate_interim_adapters; consolidating flag cleared"
+                "ran inside the fold; consolidating flag cleared"
             )
             return "noop", functools.partial(
                 _finalize_full_status_only,
@@ -14302,7 +14526,7 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
             )
 
         # The rebuilt main slots were already persisted+verified to disk inside
-        # consolidate_interim_adapters' finalize (between the registry rewrite
+        # the fold's finalize (between the registry rewrite
         # and the interim purge), so the on-disk main meta.json carries a fresh
         # window_stamp + registry_sha256 and the slots remount on restart. If
         # that persist/verify had failed, the method would have raised and
@@ -14330,10 +14554,10 @@ def _run_full_consolidation_sync(*, housekeeping: bool = False) -> None:
 
         # MF-A Site B: mark extraction-succeeded sessions consolidated after
         # successful fold training (count==0 consume-pending mode only).
-        if _consume_pending and _cp_session_ids:
+        if extraction is not None and extraction.session_ids:
             try:
                 _cp_session_buffer.mark_consolidated(
-                    _cp_completed_session_ids(),
+                    extraction.completed_session_ids(_cp_session_buffer),
                     retention_dir=session_retention_dir(loop, config),
                 )
             except Exception:
@@ -14515,7 +14739,7 @@ def _finalize_migration(loop, updated) -> None:
 def _run_active_store_migration_sync() -> None:
     """Execute the pending active-store migration on a worker thread.
 
-    Triggered by ``_maybe_trigger_scheduled_consolidation`` when
+    Triggered by ``_dispatch_consolidation`` when
     ``_state["pending_rehydration"]`` is True — meaning startup detection
     (or an interrupted prior migration) saw a divergence between the
     operator's yaml ``consolidation.mode`` and the on-disk active store.

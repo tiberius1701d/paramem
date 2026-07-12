@@ -399,7 +399,7 @@ class TestMigrationSchedulerDegraded:
     def test_scheduler_returns_migration_skipped_degraded(self, tmp_path, monkeypatch):
         """Scheduler tick with store_load_degraded=True returns 'migration_skipped_degraded'.
 
-        Calls the real _maybe_trigger_scheduled_consolidation production code
+        Calls the real _dispatch_consolidation production code
         with store_load_degraded=True and pending_rehydration=True.
         """
         state = _make_minimal_state(tmp_path)
@@ -415,7 +415,9 @@ class TestMigrationSchedulerDegraded:
 
         monkeypatch.setattr(app_module, "_state", state)
 
-        result = app_module._maybe_trigger_scheduled_consolidation()
+        result, _action = app_module._dispatch_consolidation(
+            app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+        )
         assert result == "migration_skipped_degraded", (
             f"Expected 'migration_skipped_degraded' but got {result!r}"
         )
@@ -514,7 +516,7 @@ class TestMigrationConfirmModeSwitchIntegrityGate:
     def test_mode_switch_corrupt_store_returns_409(self, tmp_path, monkeypatch):
         """POST /migration/confirm on a mode-switch candidate with corrupt store → 409.
 
-        This is the Fix-1 path: the integrity gate must fire BEFORE _rename_config.
+        This is the Fix-1 path: the integrity gate must fire BEFORE the config promotion.
         """
         cfg = _make_config(tmp_path, mode="train")
 

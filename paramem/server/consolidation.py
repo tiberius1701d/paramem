@@ -207,10 +207,11 @@ def create_consolidation_loop(
             loop.fingerprint_cache = state.setdefault("base_model_hash_cache", {})
 
     # Wire the full-consolidation period string so _save_adapters can stamp
-    # main slots with the current full-cycle window. Empty string in
-    # experiment paths (state_provider=None) → window_stamp="" → the
-    # full-cycle window gate treats those slots as unknown-window and forces
-    # a first full cycle on adoption.
+    # main slots with the current full-cycle window.  The stamp is manifest
+    # PROVENANCE only — nothing reads it back and no gate compares stamps
+    # (_is_full_cycle_due counts payload-bearing interim slots instead).  An
+    # empty string in experiment paths (state_provider=None) therefore only
+    # means "window unknown" on those slots; it changes no scheduling decision.
     loop.full_consolidation_period_string = config.consolidation.consolidation_period_string
 
     if seed_state_from_disk:
@@ -239,10 +240,12 @@ def session_retention_dir(loop, config) -> Path | None:
     """
     if not (config.consolidation.retain_sessions or config.debug):
         return None
-    # _current_interim_stamp is never set on the loop (the attribute was removed
-    # when the context-variable pattern was replaced by explicit parameter passing
-    # in run_consolidation_cycle).  Pass None so snapshot_dir_for uses the
-    # cycle-scoped path (paths.debug/episodic/cycle_<N>/run_<run_id>/).
+    # The loop DOES carry a ``_current_interim_stamp`` attribute (ConsolidationLoop
+    # assigns it around the fold), but no production path ever assigns a stamp to
+    # it — every assignment is ``None``, and the interim stamp travels as an
+    # explicit parameter instead.  Reading it here would therefore add nothing;
+    # pass None so snapshot_dir_for uses the cycle-scoped path
+    # (paths.debug/episodic/cycle_<N>/run_<run_id>/).
     snap = None
     snap_fn = getattr(loop, "snapshot_dir_for", None)
     if callable(snap_fn):

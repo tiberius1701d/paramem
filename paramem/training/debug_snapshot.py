@@ -365,8 +365,7 @@ class DebugSnapshotWriter:
         fold result dict — a mapping of tier name to
         ``{active_before, active_after, staled_by_reason, minted}``.
 
-        Called once per fold (scheduled and housekeeping paths share the
-        same fold body) after ``serve_assignment`` and ``minted_by_tier``
+        Called once per fold, after ``serve_assignment`` and ``minted_by_tier``
         are finalised.  Emitted for BOTH the train and simulate fold paths.
         ``staled_by_reason`` is derived from ``merger.removal_ledger`` and
         includes all removal reasons (dedup, enrichment_same_as, etc.).  For

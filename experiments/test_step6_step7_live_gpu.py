@@ -1,4 +1,4 @@
-"""Live GPU smoke: Step 6 post_session_train + Step 7 consolidate_interim_adapters.
+"""Live GPU smoke: Step 6 post_session_train + Step 7 consolidate.
 
 Exercises the full multi-adapter chain end-to-end on real GPU before the
 Step 6+7 commit lands. Not a full regression suite (that is Step 8's job) —
@@ -7,7 +7,7 @@ a sanity gate that proves:
   * a small synthetic transcript extracts → trains an interim adapter
     (Step 6 hook),
   * two interim adapters collapse into the three main adapters via
-    `consolidate_interim_adapters` (Step 7) with the outer GPU lock held,
+    `consolidate` (Step 7) with the outer GPU lock held,
   * registry rewrite + interim purge + router reload run without error,
   * per-tier recall after the rebuild is ≥ 0.9.
 
@@ -143,10 +143,11 @@ def main() -> int:
     )
 
     # Step 7 runs under the outer GPU lock (matches BackgroundTrainer.submit() contract).
-    logger.info("Step 7 — consolidate_interim_adapters (outer GPU lock held) …")
+    logger.info("Step 7 — consolidate (outer GPU lock held) …")
     t0 = time.time()
     with gpu_lock_sync():
-        step7_result = loop.consolidate_interim_adapters(
+        step7_result = loop.consolidate(
+            mode="train",
             trainer=None,  # no BackgroundTrainer in this standalone run
             router=None,
             # Use production defaults: refresh_epochs=30, recall_sanity_threshold=1.0.

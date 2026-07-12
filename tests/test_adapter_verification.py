@@ -605,7 +605,7 @@ class TestSaveAdaptersCallsVerify:
 
 class TestPreSaveProbeRemoved:
     """_run_recall_sanity_probe must NOT be called in the interim-adapter and
-    consolidate_interim_adapters paths (pre-save probes have been removed).
+    full-fold paths (pre-save probes have been removed).
     Disk-integrity is now gated post-save by _save_adapters via
     _verify_saved_adapter_from_disk.
     """

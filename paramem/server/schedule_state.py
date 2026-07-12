@@ -8,7 +8,7 @@ only, not the schedule itself).
 
 Deliberately NOT in ``systemd_timer.py``: the consumer is the runtime
 dispatcher in ``app.py`` (``scheduled_tick`` →
-``_maybe_trigger_scheduled_consolidation``), not the unit-rendering module —
+``_dispatch_consolidation``), not the unit-rendering module —
 and ``systemd_timer.py`` already carries three responsibilities (rendering,
 reconciling, timer-state reading) without taking on run-state I/O too.
 

@@ -3273,9 +3273,9 @@ Two adapter tiers share the GPU:
 - **Interim adapters** (`episodic_interim_<stamp>`) — minted at each
   `refresh_cadence` tick, activity-gated, capped by `max_interim_count`
   (default 7, VRAM-gated via pre-load validator). At the full boundary,
-  `consolidate_interim_adapters` rebuilds the mains from
-  `keyed_pairs ∪ all_interim_keys`, sanity-checks recall, and purges interim
-  state atomically.
+  the full consolidation fold (`ConsolidationLoop.consolidate`) rebuilds the
+  mains from `keyed_pairs ∪ all_interim_keys`, sanity-checks recall, and
+  purges interim state atomically.
 
 Operational invariant: every consolidation still retrains the full key set
 via replay. True incremental learning without replay remains unsolved

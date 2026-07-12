@@ -662,7 +662,7 @@ def test_apply_config_live_real_hash_different_file_proceeds():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  S1-test: plain-reclaim skips STT/TTS and HA reconnect (full_rebuild=False)
+#  Plain reclaim skips STT/TTS and HA reconnect (full_rebuild=False)
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -717,7 +717,7 @@ def test_plain_reclaim_does_not_rebuild_stt_tts_or_ha_client():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  S3-test: retain_sessions / debug delta threads to rebuild_session_buffer
+#  retain_sessions / debug delta threads to rebuild_session_buffer
 # ════════════════════════════════════════════════════════════════════════════
 
 

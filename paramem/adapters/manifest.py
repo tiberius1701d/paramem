@@ -5,16 +5,15 @@ Schema version: MANIFEST_SCHEMA_VERSION = 4.
 Schema history:
   * v1: original schema (no ``window_stamp``).
   * v2: adds ``window_stamp`` — the cadence-window the slot represents.
-    Set at write time by the producer (interim or full-cycle path) and
-    used by the Phase 4 full-cycle gate to decide "have we already
-    consolidated the current window?" via stamp identity comparison.
+    Set at write time by the producer (interim or full-cycle path).
+    Provenance only: no code reads it back to decide whether a fold is due
+    (the full-cycle gate, ``_is_full_cycle_due``, counts payload-bearing
+    interim slots and an oldest-interim-age deadline instead).
   * v3: retired — the ``keyed_pairs_sha256`` field it added is dropped on load.
   * v4 (current): ``window_stamp`` is the only evolving field since v2.
 
 Forward-compat: ``_dict_to_manifest`` accepts v1–v2 manifests on read.
-Absent ``window_stamp`` defaults to ``""``.  Empty ``window_stamp`` on the
-canonical main ``episodic`` slot is interpreted by the gate as "unknown
-window — first full cycle is due".
+Absent ``window_stamp`` defaults to ``""``.
 ``synthesized`` retains the same forward-compat default of ``False`` when absent.
 
 On-disk layout
@@ -208,8 +207,7 @@ def _dict_to_manifest(d: dict) -> AdapterManifest:
     Schema-version handling:
       * v1 (legacy): auto-upgraded in-memory by defaulting ``window_stamp``
         to ``""``. The on-disk file is left untouched until the next save.
-        Empty ``window_stamp`` is interpreted by the Phase 4 gate as
-        "unknown window — first full cycle is due".
+        ``window_stamp`` is manifest provenance only — no gate reads it back.
       * v2: adds ``window_stamp``. v1 manifests have it absent; read back
         with ``window_stamp`` defaulted to ``""``.
       * v3: legacy ``keyed_pairs_sha256`` field silently dropped on load.

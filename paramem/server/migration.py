@@ -1,12 +1,23 @@
-"""STAGING state machine and preview helpers for the ParaMem migration subsystem.
+"""STAGING state machine, candidate validation, and config promotion for migrations.
 
 Covers the in-memory stash of a candidate ``server.yaml``, diff computation,
-tier classification, and shape-change detection.  **No files are written** by
-the preview endpoint — disk writes, atomic swap, and trial markers are handled
-by ``/migration/confirm``.
+tier classification, shape-change detection, candidate construction/validation,
+and the atomic promotion of a candidate over the live config.  **The preview
+endpoint writes no files** — the pre-migration backup slot, the trial marker,
+and the atomic swap are all driven from ``/migration/confirm``, which reaches
+disk exclusively through :func:`backup_live_config` and :func:`promote_config`.
 
 Design notes
 ------------
+- ``promote_config`` is the **only** route by which the live ``server.yaml``
+  changes.  It re-reads the candidate bytes from disk, re-checks them against the
+  hash the operator previewed, constructs the candidate **as if it already sat at
+  the live config path** (:func:`validate_candidate`), and only then renames.  A
+  candidate that cannot boot therefore never becomes the live config.
+- ``validate_candidate`` calls ``build_server_config`` — the construction stage
+  boot itself runs — so validation cannot drift from boot.  It discards the
+  resulting ``ServerConfig`` object at every call site: the config that goes live
+  is the one boot (or ``_refresh_config_from_disk_into_state``) loads from disk.
 - ``MigrationStashState`` mirrors ``ConfigDriftState`` in ``drift.py`` as a
   TypedDict so the slot on ``_state["migration"]`` is self-describing.
 - ``validate_candidate_path`` enforces that the candidate lives on the same
@@ -40,7 +51,10 @@ from paramem.adapters.manifest import (
     find_live_slot,
     read_manifest,
 )
+from paramem.backup.backup import write as backup_write
+from paramem.backup.types import ArtifactKind
 from paramem.config.classification import Tier, classify, walk_dict_leaves
+from paramem.server.config import ServerConfig, build_server_config
 
 logger = logging.getLogger(__name__)
 
@@ -749,6 +763,197 @@ def _parse_candidate(candidate_bytes: bytes) -> dict:
 def _sha256_bytes(data: bytes) -> str:
     """Return lowercase hex SHA-256 of *data*."""
     return hashlib.sha256(data).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Candidate validation + atomic promotion
+# ---------------------------------------------------------------------------
+
+
+class CandidateConfigInvalid(ValueError):
+    """The candidate ``server.yaml`` parses but cannot be constructed into a config.
+
+    Raised by :func:`validate_candidate`.  The HTTP layer maps it to
+    ``400 candidate_invalid_config`` (preview) / ``409 candidate_invalid_config``
+    (confirm).  The message is the original construction error verbatim.
+    """
+
+
+class CandidateChanged(ValueError):
+    """The candidate file on disk no longer hashes to what the operator previewed.
+
+    Raised by :func:`promote_config` before any mutation.  The HTTP layer maps it
+    to ``409 candidate_changed``: what was previewed is what gets promoted, or
+    nothing gets promoted.
+    """
+
+
+def validate_candidate(candidate_bytes: bytes, live_config_path: Path) -> ServerConfig:
+    """Construct the candidate config as if it already sat at the live config path.
+
+    Runs the same construction stage boot runs (``build_server_config``), so a
+    candidate that passes here is a candidate the server can boot from.  The
+    ``live_config_path`` anchor is load-bearing: ``paths.*`` resolve against the
+    project root of the YAML's directory, so validating with the staging path
+    would build a *different* config than the one that goes live.
+
+    Every caller **discards** the returned ``ServerConfig``.  It is never stashed,
+    serialised, or written: it carries interpolated secrets, whereas the stash and
+    the diffs keep ``${VAR}`` templates verbatim.
+
+    Boundary error handling: operator-supplied YAML can fail construction with
+    ``ValueError`` (validation guards), ``FatalConfigError`` (adapter guard), or
+    ``TypeError`` (unknown key reaching ``**kwargs``; an uninterpolated ``${VAR}``
+    left in a typed non-str field).  All are re-raised as
+    :class:`CandidateConfigInvalid` so the HTTP layer answers 4xx, not 500.
+
+    Parameters
+    ----------
+    candidate_bytes:
+        Raw bytes of the candidate ``server.yaml``.
+    live_config_path:
+        Absolute path of the **live** ``configs/server.yaml`` — the location the
+        candidate will occupy after promotion.
+
+    Returns
+    -------
+    ServerConfig
+        The constructed candidate config.  Discarded by all callers.
+
+    Raises
+    ------
+    CandidateConfigInvalid
+        The candidate is unparseable or cannot be constructed/validated.
+    """
+    try:
+        parsed = _parse_candidate(candidate_bytes)
+        return build_server_config(parsed, source_path=live_config_path)
+    except Exception as exc:  # noqa: BLE001 — boundary: operator-supplied file
+        raise CandidateConfigInvalid(str(exc)) from exc
+
+
+def promote_config(
+    candidate_path: Path,
+    live_config_path: Path,
+    *,
+    expected_sha256: str,
+) -> None:
+    """Atomically promote *candidate_path* over *live_config_path*.
+
+    The **only** route by which the live config file ever changes.  Ordering is
+    load-bearing — every check that can reject runs before the first mutation:
+
+    1. Read the candidate bytes **from disk** (authoritative; the stash is a
+       mirror, not the source of truth).
+    2. Reject when the bytes no longer match *expected_sha256* — what the operator
+       previewed is what gets promoted.
+    3. Construct + validate the candidate at the live path (:func:`validate_candidate`).
+       The constructed ``ServerConfig`` is discarded — it carries interpolated
+       secrets.  Callers re-load the live config from disk after promotion.
+    4. ``os.rename`` — atomic swap.
+    5. ``fsync`` the parent directory for rename durability.
+
+    A failure at 1–3 leaves the filesystem untouched, so the caller can reject with
+    a 4xx and keep the server bootable.
+
+    Parameters
+    ----------
+    candidate_path:
+        Path to the staged candidate file.
+    live_config_path:
+        Path to the live ``configs/server.yaml``.
+    expected_sha256:
+        Hex SHA-256 the candidate had when it was staged (the stash's
+        ``candidate_hash``).  Required and non-empty: every production caller
+        stages a candidate via ``/migration/preview``, which always computes this
+        hash, so there is no legitimate call with nothing to compare against.
+
+    Raises
+    ------
+    ValueError
+        *expected_sha256* is empty.
+    CandidateChanged
+        The on-disk candidate no longer matches *expected_sha256*.
+    CandidateConfigInvalid
+        The candidate cannot be constructed as the live config.
+    OSError
+        The rename failed (e.g. EXDEV across filesystems).
+    """
+    if not expected_sha256:
+        raise ValueError(
+            "promote_config requires a non-empty expected_sha256 — every caller "
+            "stages a candidate via /migration/preview first, which always "
+            "computes one. An empty hash would promote without checking that the "
+            "file on disk is still the one the operator previewed."
+        )
+
+    candidate_path = Path(candidate_path)
+    live_config_path = Path(live_config_path)
+
+    candidate_bytes = candidate_path.read_bytes()
+
+    actual_sha256 = _sha256_bytes(candidate_bytes)
+    if actual_sha256 != expected_sha256:
+        raise CandidateChanged(
+            f"candidate file {candidate_path!s} changed after it was staged "
+            f"(staged sha256 {expected_sha256}, on-disk sha256 {actual_sha256}). "
+            "Re-run POST /migration/preview so the diff you approve is the diff "
+            "that is applied."
+        )
+
+    validate_candidate(candidate_bytes, live_config_path)
+
+    os.rename(candidate_path, live_config_path)
+    dir_fd = os.open(str(live_config_path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        # Durability best-effort: some filesystems reject directory fsync.
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def backup_live_config(live_config_path: Path, backups_root: Path) -> tuple[str, Path]:
+    """Write the ``pre_migration`` backup slot for the live config.
+
+    Config is the only required pre-migration artifact: a migration's sole live
+    mutation is the atomic config swap, so rollback (and crash recovery) only ever
+    restore the config.  Callers invoke this **before** :func:`promote_config`, so
+    every path that renames the live config leaves a restore point behind.
+
+    Parameters
+    ----------
+    live_config_path:
+        Path to the live ``configs/server.yaml``.  A missing file yields an empty
+        pre-hash and an empty artifact (fresh install).
+    backups_root:
+        Backups root directory; the slot is written under ``<backups_root>/config``.
+
+    Returns
+    -------
+    tuple[str, Path]
+        ``(pre_hash, slot)`` — hex SHA-256 of the live config bytes (``""`` when
+        the file does not exist) and the slot directory that was written.
+
+    Raises
+    ------
+    OSError
+        The backup write failed.  The caller must map this to
+        ``500 backup_write_failed``; no other mutation has happened yet.
+    """
+    live_config_path = Path(live_config_path)
+    exists = live_config_path.exists()
+    config_bytes = live_config_path.read_bytes() if exists else b""
+    pre_hash = _sha256_bytes(config_bytes) if exists else ""
+
+    slot = backup_write(
+        ArtifactKind.CONFIG,
+        config_bytes,
+        meta_fields={"tier": "pre_migration", "pre_trial_hash": pre_hash},
+        base_dir=Path(backups_root) / "config",
+    )
+    return pre_hash, slot
 
 
 # ---------------------------------------------------------------------------

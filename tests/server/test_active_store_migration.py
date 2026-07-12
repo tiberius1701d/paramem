@@ -1427,8 +1427,35 @@ class TestNegativeCouplingGuard:
     def test_no_run_graph_enrichment_import(self):
         assert "_run_graph_enrichment" not in self._module_source()
 
-    def test_no_consolidate_interim_adapters_import(self):
-        assert "consolidate_interim_adapters" not in self._module_source()
+    def test_no_fold_entry_call(self):
+        """Migration must never reach into the consolidation fold.
+
+        The fold's single public entry is ``ConsolidationLoop.consolidate``.
+        Scanned via ``ast`` for any ``x.consolidate(...)`` method call,
+        regardless of the receiver name — this also catches an aliased
+        receiver (``l = loop; l.consolidate(...)``) that a literal
+        ``"loop.consolidate("`` substring check would miss.  Matching on the
+        attribute name rather than the bare word ``consolidate`` is required
+        because the bare word collides with this module's own vocabulary (it
+        names the loop, imports from ``paramem.training.consolidation``, and
+        talks about consolidation in prose).  The predecessor of this test
+        asserted on ``consolidate_interim_adapters``, a symbol that no longer
+        exists anywhere, so it passed unconditionally and enforced nothing.
+        """
+        import ast
+
+        tree = ast.parse(self._module_source())
+        call_sites = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "consolidate"
+        ]
+        assert not call_sites, (
+            f"active_store_migration.py must not call .consolidate(...) — found "
+            f"{[node.lineno for node in call_sites]}"
+        )
 
     def test_no_merger_graph_access(self):
         assert ".merger.graph" not in self._module_source()
@@ -1464,7 +1491,7 @@ class TestTerminologyGuard:
 
 
 class TestStoreLoadDegradedDispatchGuard:
-    """_maybe_trigger_scheduled_consolidation must not dispatch migration when
+    """_dispatch_consolidation must not dispatch migration when
     store_load_degraded is True.
 
     This is the second half of the fix for the silent data-loss bug: even if
@@ -1477,7 +1504,7 @@ class TestStoreLoadDegradedDispatchGuard:
 
     def test_degraded_store_skips_migration_dispatch(self):
         """With store_load_degraded=True and pending_rehydration=True,
-        _maybe_trigger_scheduled_consolidation returns 'migration_skipped_degraded'
+        _dispatch_consolidation returns 'migration_skipped_degraded'
         and does NOT call _run_active_store_migration_sync.
         """
         from paramem.server import app as app_module
@@ -1510,7 +1537,9 @@ class TestStoreLoadDegradedDispatchGuard:
                 side_effect=lambda: run_migration_calls.append(1),
             ),
         ):
-            result = app_module._maybe_trigger_scheduled_consolidation()
+            result, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
 
         assert result == "migration_skipped_degraded", (
             f"Expected 'migration_skipped_degraded' but got {result!r}; "
@@ -1522,7 +1551,7 @@ class TestStoreLoadDegradedDispatchGuard:
 
     def test_healthy_store_dispatches_migration(self):
         """With store_load_degraded=False and pending_rehydration=True,
-        _maybe_trigger_scheduled_consolidation proceeds to dispatch the migration.
+        _dispatch_consolidation proceeds to dispatch the migration.
 
         Verifies that the degraded guard does not block healthy stores.
         """
@@ -1556,7 +1585,9 @@ class TestStoreLoadDegradedDispatchGuard:
             ),
             patch("asyncio.get_running_loop", return_value=mock_loop),
         ):
-            result = app_module._maybe_trigger_scheduled_consolidation()
+            result, _action = app_module._dispatch_consolidation(
+                app_module.ConsolidationAction.AUTO, apply_schedule_gate=True
+            )
 
         assert result == "started_migration", (
             f"Expected 'started_migration' but got {result!r}; "
