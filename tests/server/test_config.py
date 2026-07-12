@@ -516,8 +516,7 @@ class TestTrainingHyperparamsFromYaml:
         cfg = load_server_config(Path("tests/fixtures/server.yaml"))
         tc = cfg.training_config
         assert tc.weight_decay == 0.1
-        assert tc.warmup_steps == 30
-        assert tc.warmup_ratio == 0.0
+        assert tc.warmup_steps == 0
         assert tc.lr_scheduler_type == "linear"
         assert tc.max_seq_length == 1024
         assert tc.batch_size == 1
@@ -537,7 +536,6 @@ class TestTrainingHyperparamsFromYaml:
               training_batch_size: 2
               training_weight_decay: 0.05
               training_warmup_steps: 10
-              training_warmup_ratio: 0.0
               training_lr_scheduler_type: constant
               training_max_seq_length: 512
               training_gradient_accumulation_steps: 4
@@ -552,7 +550,6 @@ class TestTrainingHyperparamsFromYaml:
         assert tc.batch_size == 2
         assert tc.weight_decay == 0.05
         assert tc.warmup_steps == 10
-        assert tc.warmup_ratio == 0.0
         assert tc.lr_scheduler_type == "constant"
         assert tc.max_seq_length == 512
         assert tc.gradient_accumulation_steps == 4
@@ -560,60 +557,6 @@ class TestTrainingHyperparamsFromYaml:
         assert tc.max_grad_norm == 0.5
         assert tc.gradient_checkpointing is False
         assert tc.lr_decay_steps == 200
-
-
-class TestMakeTrainingConfigPropagation:
-    """Propagation guard: _make_training_config must forward warmup_steps,
-    lr_scheduler_type, and lr_decay_steps from self.training_config.
-
-    Regression guard for a latent propagation bug where these three fields
-    were silently dropped, so yaml overrides never reached train_adapter.
-    """
-
-    def test_make_training_config_propagates_three_fixed_fields(self, tmp_path):
-        """warmup_steps, lr_scheduler_type, lr_decay_steps survive _make_training_config."""
-        from paramem.server.config import load_server_config
-
-        yaml_file = _write_yaml(
-            tmp_path,
-            """\
-            model: mistral
-            consolidation:
-              training_warmup_steps: 15
-              training_lr_scheduler_type: constant
-              training_lr_decay_steps: 300
-            """,
-        )
-        config = load_server_config(yaml_file)
-
-        # Verify the values are on training_config first.
-        assert config.training_config.warmup_steps == 15
-        assert config.training_config.lr_scheduler_type == "constant"
-        assert config.training_config.lr_decay_steps == 300
-
-        # Now verify _make_training_config propagates them (import ConsolidationLoop
-        # is heavy; test via a lightweight stub that mimics its interface).
-        from paramem.utils.config import TrainingConfig
-
-        class _StubLoop:
-            """Minimal stub exposing _make_training_config for isolation testing."""
-
-            training_config = config.training_config
-
-            _make_training_config = (
-                # borrow the real implementation without importing ConsolidationLoop
-                __import__(
-                    "paramem.training.consolidation", fromlist=["ConsolidationLoop"]
-                ).ConsolidationLoop._make_training_config
-            )
-
-        stub = _StubLoop()
-        rebuilt = stub._make_training_config(num_epochs=5)
-        assert isinstance(rebuilt, TrainingConfig)
-        assert rebuilt.warmup_steps == 15
-        assert rebuilt.lr_scheduler_type == "constant"
-        assert rebuilt.lr_decay_steps == 300
-        assert rebuilt.num_epochs == 5  # caller-supplied, not propagated
 
 
 class TestTierFloorConfigPlumbing:

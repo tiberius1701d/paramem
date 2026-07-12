@@ -78,7 +78,6 @@ def _minimal_training_config(**overrides) -> TrainingConfig:
         gradient_accumulation_steps=1,
         max_seq_length=64,
         warmup_steps=0,
-        warmup_ratio=0.0,
         lr_scheduler_type="linear",
         weight_decay=0.01,
         max_grad_norm=1.0,
@@ -757,6 +756,34 @@ class TestFingerprintDatasetContentStable:
 
         assert isinstance(fp1, str) and len(fp1) == 64  # 32 bytes → 64 hex chars
         assert fp1 == fp2
+
+
+class TestFingerprintTrainingConfigScheduleFields:
+    """``_fingerprint_training_config`` must cover every schedule-load-bearing
+    field, not just the ones present when the digest was first written.
+
+    ``gradient_accumulation_steps`` sets the per-epoch optimizer-step count
+    and ``lr_decay_steps`` drives ``ParamemTrainer.create_scheduler`` — both
+    silently changed the actual training schedule while being absent from
+    the digest, so a resumed run could pick up a stale checkpoint trained
+    under a different schedule.
+    """
+
+    def test_differing_gradient_accumulation_steps_produces_different_digest(self):
+        from paramem.training.trainer import _fingerprint_training_config
+
+        ac = _minimal_adapter_config()
+        tc_a = _minimal_training_config(gradient_accumulation_steps=2)
+        tc_b = _minimal_training_config(gradient_accumulation_steps=4)
+        assert _fingerprint_training_config(tc_a, ac) != _fingerprint_training_config(tc_b, ac)
+
+    def test_differing_lr_decay_steps_produces_different_digest(self):
+        from paramem.training.trainer import _fingerprint_training_config
+
+        ac = _minimal_adapter_config()
+        tc_a = _minimal_training_config(lr_decay_steps=100)
+        tc_b = _minimal_training_config(lr_decay_steps=200)
+        assert _fingerprint_training_config(tc_a, ac) != _fingerprint_training_config(tc_b, ac)
 
 
 # ---------------------------------------------------------------------------

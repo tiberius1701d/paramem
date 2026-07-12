@@ -31,7 +31,6 @@ def _minimal_training_config(**overrides) -> TrainingConfig:
         gradient_accumulation_steps=1,
         max_seq_length=64,
         warmup_steps=0,
-        warmup_ratio=0.0,
         lr_scheduler_type="linear",
         weight_decay=0.01,
         max_grad_norm=1.0,

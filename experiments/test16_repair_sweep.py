@@ -528,7 +528,6 @@ def _training_config(
         gradient_accumulation_steps=2,
         max_seq_length=1024,
         num_epochs=num_epochs,
-        warmup_ratio=0.0,
         warmup_steps=10,
         weight_decay=weight_decay,
         gradient_checkpointing=True,

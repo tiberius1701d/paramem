@@ -419,6 +419,11 @@ def _fingerprint_training_config(
     budget, and adapter architecture.  Changes to any of these fields
     invalidate a cached staging_resume.json so a fresh run starts.
 
+    ``gradient_accumulation_steps`` and ``lr_decay_steps`` are included
+    because both are schedule-load-bearing: the former sets the per-epoch
+    optimizer-step count, the latter drives
+    ``ParamemTrainer.create_scheduler``.
+
     Args:
         training_config: The ``TrainingConfig`` for the current job.
         adapter_config: The ``AdapterConfig`` for the adapter being trained.
@@ -432,10 +437,11 @@ def _fingerprint_training_config(
         "save_steps_ram": training_config.save_steps_ram,
         "num_epochs": training_config.num_epochs,
         "batch_size": training_config.batch_size,
+        "gradient_accumulation_steps": training_config.gradient_accumulation_steps,
         "lr_scheduler_type": training_config.lr_scheduler_type,
+        "lr_decay_steps": training_config.lr_decay_steps,
         "weight_decay": training_config.weight_decay,
         "warmup_steps": training_config.warmup_steps,
-        "warmup_ratio": training_config.warmup_ratio,
         "rank": adapter_config.rank,
         "alpha": adapter_config.alpha,
         "learning_rate": adapter_config.learning_rate,
@@ -1041,8 +1047,7 @@ def train_adapter(
         per_device_train_batch_size=training_config.batch_size,
         gradient_accumulation_steps=training_config.gradient_accumulation_steps,
         learning_rate=adapter_config.learning_rate,
-        warmup_steps=training_config.warmup_steps if training_config.warmup_steps > 0 else 0,
-        warmup_ratio=training_config.warmup_ratio if training_config.warmup_steps == 0 else 0.0,
+        warmup_steps=training_config.warmup_steps,
         lr_scheduler_type=training_config.lr_scheduler_type,
         weight_decay=training_config.weight_decay,
         max_grad_norm=training_config.max_grad_norm,

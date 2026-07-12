@@ -338,7 +338,6 @@ def _minimal_tc(**overrides) -> TrainingConfig:
         batch_size=1,
         gradient_accumulation_steps=1,
         warmup_steps=0,
-        warmup_ratio=0.0,
         lr_scheduler_type="linear",
         weight_decay=0.01,
         max_grad_norm=1.0,

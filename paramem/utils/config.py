@@ -55,8 +55,13 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 8
     max_seq_length: int = 512
     num_epochs: int = 3
-    warmup_ratio: float = 0.1
-    warmup_steps: int = 0  # If > 0, overrides warmup_ratio
+    # Absolute-step warmup count, passed straight to HF TrainingArguments as
+    # the sole warmup knob. There is deliberately no ratio-based sibling
+    # field — that HF field is deprecated, banned by project rule, and was
+    # the mechanism that silently zeroed warmup in every fold ever trained
+    # under transformers 5.5 (see paramem.training.trainer's
+    # TrainingArguments call). 0 (default) means no warmup.
+    warmup_steps: int = 0
     lr_scheduler_type: str = "linear"  # HF default; use "constant" for grokking
     # When set, the LR scheduler decays over this many steps regardless of
     # num_train_epochs. Steps past it sit at the scheduler's tail value

@@ -363,8 +363,9 @@ consolidation:
   training_batch_size: 1
   training_gradient_accumulation_steps: 2
   training_max_seq_length: 1024
-  training_warmup_steps: 30          # fixed steps; overrides warmup_ratio when > 0
-  training_warmup_ratio: 0.0         # explicit 0.0 so the TrainingConfig default (0.1) cannot leak
+  # Absolute-step warmup count. 0 = warmup is currently disabled in
+  # production; see configs/server.yaml.example for the full rationale.
+  training_warmup_steps: 0
   training_lr_scheduler_type: linear
   training_weight_decay: 0.1
   training_gradient_checkpointing: true

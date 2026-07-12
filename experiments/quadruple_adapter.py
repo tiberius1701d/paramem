@@ -875,11 +875,11 @@ def train_phase(
         )
 
         # Training config: mirrors Test 8's proven 550-key config.
-        # - Linear LR scheduler with fixed warmup_steps (NOT warmup_ratio) so
-        #   the warmup budget is decoupled from num_train_epochs (CLAUDE.md
-        #   extended-training rule).
-        # - warmup_ratio=0.0 explicitly set to prevent TrainingConfig's default
-        #   0.1 from leaking when warmup_steps > 0.
+        # - Linear LR scheduler with a fixed absolute-step warmup so the
+        #   warmup budget is decoupled from num_train_epochs (CLAUDE.md
+        #   extended-training rule). TrainingConfig has no ratio-based
+        #   warmup field — it was deleted (deprecated by transformers 5.5,
+        #   and the field that silently zeroed warmup in production).
         # - save_strategy="epoch" + save_total_limit=2 so checkpoints exist
         #   for epoch-level resume (test8 uses save_strategy="no" because it
         #   never pauses mid-training).
@@ -889,8 +889,7 @@ def train_phase(
             gradient_accumulation_steps=2,
             max_seq_length=1024,
             num_epochs=args.num_epochs,
-            warmup_steps=30,  # Fixed steps, not ratio — per CLAUDE.md rule
-            warmup_ratio=0.0,  # Explicitly zero to suppress default 0.1
+            warmup_steps=30,  # Fixed absolute-step count — per CLAUDE.md rule
             lr_scheduler_type="linear",
             weight_decay=0.1,  # >= 0.1 per CLAUDE.md extended-training rule
             gradient_checkpointing=True,

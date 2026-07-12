@@ -511,7 +511,6 @@ class TestConsolidationArbitrator:
             "trainer",
             "router",
             "recall_sanity_threshold",
-            "refresh_epochs",
         }, f"unexpected fold-entry parameters: {sorted(params)}"
 
     def test_interim_with_no_pending_is_not_bypassable(self, tmp_path, monkeypatch) -> None:

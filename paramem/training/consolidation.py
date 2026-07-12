@@ -10,7 +10,7 @@ import logging
 import os
 import random
 import secrets
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import cached_property
 from pathlib import Path
@@ -1572,19 +1572,6 @@ class ConsolidationLoop:
                 return self.items[idx]
 
         return _IndexedDataset(examples)
-
-    def _make_training_config(self, num_epochs: int) -> TrainingConfig:
-        """Return the loop's canonical TrainingConfig with num_epochs overridden.
-
-        ``self.training_config`` is already the fully-populated, single
-        source of truth (built once from yaml at ``ServerConfig.training_config``).
-        This method must never hand-copy individual fields off it — that
-        silently drops any field not explicitly listed. ``dataclasses.replace``
-        propagates every current AND future field automatically, so the only
-        override callers ever need (``num_epochs``, per call-site training
-        budget) is applied without risk of drift.
-        """
-        return replace(self.training_config, num_epochs=num_epochs)
 
     def _save_adapters(self) -> None:
         """Save adapters and registries to disk using the atomic registry-last ordering.
@@ -3435,7 +3422,6 @@ class ConsolidationLoop:
         trainer=None,
         router=None,
         recall_sanity_threshold: "float | None" = None,
-        refresh_epochs: int = 30,
         # interim-scope extras (only consumed when scope.persist == "interim_slot")
         adapter_name: "str | None" = None,
         stamp: "str | None" = None,
@@ -3495,9 +3481,6 @@ class ConsolidationLoop:
                 (``main_tiers`` path only).  ``None`` is safe — skipped.
             recall_sanity_threshold: Override for the recall gate (``main_tiers`` path).
                 Reads ``self.config.recall_sanity_threshold`` when ``None``.
-            refresh_epochs: Training epochs for the full per-tier rebuild
-                (``main_tiers`` path only; ``interim_slot`` uses
-                ``self.training_config.num_epochs``).
             adapter_name: Interim adapter name (``interim_slot`` path only).  Matches
                 ``scope.tier``.
             stamp: Sub-interval stamp for :func:`~paramem.memory.persistence.commit_tier_slot`
@@ -3971,9 +3954,7 @@ class ConsolidationLoop:
                             all_interim_keyed,
                             adapter_name=adapter_name,
                             adapter_config=self.episodic_config,
-                            training_config=self._make_training_config(
-                                num_epochs=self.training_config.num_epochs
-                            ),
+                            training_config=self.training_config,
                             output_dir=self._training_output_dir(adapter_name, interim_stamp=stamp),
                             run_name=f"interim-{adapter_name}-{run_label}",
                             phase_name=f"interim-{adapter_name}-{run_label}",
@@ -4668,7 +4649,7 @@ class ConsolidationLoop:
             # --- Build per-tier TrainingJob objects ---
             from paramem.server.background_trainer import TrainingJob
 
-            refresh_training_config = self._make_training_config(num_epochs=refresh_epochs)
+            refresh_training_config = self.training_config
 
             jobs_by_tier = {
                 "episodic": TrainingJob(
@@ -4999,7 +4980,6 @@ class ConsolidationLoop:
                             output_dir=self.output_dir / "consolidation_refresh" / tier,
                             run_name=f"consolidate-{tier}",
                             phase_name=f"consolidate-{tier}",
-                            num_epochs=refresh_epochs,
                             retain_scratch_until_external_commit=True,
                         )
                         if _tier_metrics is not None:
@@ -5063,7 +5043,7 @@ class ConsolidationLoop:
                                                     if a.startswith(INTERIM_NAME_PREFIX)
                                                 ]
                                             ),
-                                            "epochs": refresh_epochs,
+                                            "epochs": refresh_training_config.num_epochs,
                                         },
                                     )
                                 except Exception:  # noqa: BLE001  # boundary: this
@@ -5222,7 +5202,6 @@ class ConsolidationLoop:
         trainer=None,
         router=None,
         recall_sanity_threshold: "float | None" = None,
-        refresh_epochs: int = 30,
     ) -> dict:
         """Run the full consolidation fold — the single public fold entry.
 
@@ -5264,8 +5243,6 @@ class ConsolidationLoop:
                 atomic finalize sequence (train only).  ``None`` is safe — skipped.
             recall_sanity_threshold: Override for the recall gate (train only).  When
                 ``None``, ``self.config.recall_sanity_threshold`` is used.
-            refresh_epochs: Training epochs for the full per-tier rebuild (train only;
-                default 30 — the per-key baseline from Tests 1-7b).
 
         Returns:
             The full-fold result dict (see :meth:`_run_fold`).  ``tier_delta`` is
@@ -5340,7 +5317,6 @@ class ConsolidationLoop:
             trainer=trainer,
             router=router,
             recall_sanity_threshold=recall_sanity_threshold,
-            refresh_epochs=refresh_epochs,
         )
 
     def _promote_mature_keys_inline(self) -> list[str]:
@@ -7007,8 +6983,7 @@ class ConsolidationLoop:
                 call.  When provided, the callback's forced final-epoch probe
                 fires at this epoch rather than at
                 ``self.training_config.num_epochs``.  Callers that train with
-                a different epoch budget (e.g. the full fold using
-                ``refresh_epochs``) MUST pass this so
+                a different epoch budget MUST pass this so
                 ``RecallEarlyStopCallback._num_epochs`` matches the trainer's
                 epoch count.  Defaults to ``None`` which resolves to
                 ``self.training_config.num_epochs`` — the correct value for

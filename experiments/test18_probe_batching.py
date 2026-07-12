@@ -507,7 +507,6 @@ def train_bench_adapter(model, tokenizer, entries: list[dict], num_epochs: int):
         batch_size=1,
         gradient_accumulation_steps=4,
         warmup_steps=20,
-        warmup_ratio=0.0,
         lr_decay_steps=num_epochs * len(examples) // 4,
         weight_decay=0.1,
         gradient_checkpointing=True,

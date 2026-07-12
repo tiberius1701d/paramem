@@ -5,93 +5,12 @@ the consolidation logic without requiring GPU.
 """
 
 import time
-import types
-from dataclasses import fields, replace
 from unittest.mock import MagicMock
 
 import pytest
 
 from paramem.memory.store import MemoryStore as _MS  # noqa: F401
 from paramem.training.consolidation import ConsolidationLoop, _mentions_any
-from paramem.utils.config import TrainingConfig
-
-
-class TestMakeTrainingConfigDriftGuard:
-    """Drift-guard: _make_training_config must propagate EVERY TrainingConfig
-    field except num_epochs.
-
-    ConsolidationLoop._make_training_config previously hand-copied a subset
-    of TrainingConfig's fields, silently dropping the rest to dataclass
-    defaults (the "two implementations of one rule" anti-pattern). The fix
-    is `dataclasses.replace(self.training_config, num_epochs=num_epochs)`,
-    which propagates every current AND future field automatically. This
-    test fails loudly if a future edit re-introduces a hand-copy that drops
-    any field.
-    """
-
-    def _all_distinct_config(self) -> TrainingConfig:
-        """Build a TrainingConfig with every field set to a non-default value.
-
-        A field left at its default would be indistinguishable from a
-        silently-dropped field, so every value here must differ from
-        TrainingConfig()'s default for that field.
-        """
-        return TrainingConfig(
-            batch_size=2,
-            gradient_accumulation_steps=4,
-            max_seq_length=1024,
-            num_epochs=99,
-            warmup_ratio=0.2,
-            warmup_steps=5,
-            lr_scheduler_type="constant",
-            lr_decay_steps=123,
-            weight_decay=0.05,
-            gradient_checkpointing=False,
-            max_grad_norm=2.0,
-            seed=7,
-            save_strategy="steps",
-            save_steps=50,
-            save_total_limit=5,
-            logging_steps=2,
-            save_steps_ram=10,
-            early_stopping=True,
-            early_stopping_threshold=0.05,
-            early_stopping_floor=3,
-            early_stopping_patience=1,
-            recall_early_stopping=True,
-            recall_window=1,
-            recall_probe_every_n_epochs=1,
-            recall_probe_batch_size=4,
-        )
-
-    def test_config_differs_from_defaults_on_droppable_fields(self):
-        """Guard the guard: cfg must actually differ from TrainingConfig()
-        defaults on every field except num_epochs, or this test would
-        silently rot into a no-op if someone edits _all_distinct_config.
-        """
-        cfg = self._all_distinct_config()
-        default = TrainingConfig()
-        for f in fields(TrainingConfig):
-            if f.name == "num_epochs":
-                continue
-            assert getattr(cfg, f.name) != getattr(default, f.name), (
-                f"field {f.name!r} must differ from the default for this "
-                "drift guard to be able to detect it being dropped"
-            )
-
-    def test_every_field_except_num_epochs_propagated(self):
-        """result == replace(cfg, num_epochs=SENTINEL) proves no field was
-        dropped — the frozen/plain dataclass __eq__ compares all fields.
-        """
-        cfg = self._all_distinct_config()
-        sentinel_epochs = 4242
-        fake_self = types.SimpleNamespace(training_config=cfg)
-
-        result = ConsolidationLoop._make_training_config(fake_self, num_epochs=sentinel_epochs)
-
-        assert result == replace(cfg, num_epochs=sentinel_epochs)
-        assert result.num_epochs == sentinel_epochs
-        assert result.num_epochs != cfg.num_epochs
 
 
 class TestMentionsAny:
@@ -17856,7 +17775,6 @@ class TestConsolidateEntry:
             "trainer",
             "router",
             "recall_sanity_threshold",
-            "refresh_epochs",
         }, f"unexpected fold-entry parameters: {sorted(params)}"
         assert params["mode"].default is inspect.Parameter.empty, "mode is required"
 
@@ -17877,7 +17795,6 @@ class TestConsolidateEntry:
             "trainer",
             "router",
             "recall_sanity_threshold",
-            "refresh_epochs",
             "adapter_name",
             "stamp",
             "run_label",

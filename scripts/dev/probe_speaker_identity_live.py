@@ -288,7 +288,6 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         max_seq_length=512,
         num_epochs=1,
         warmup_steps=0,
-        warmup_ratio=0.0,
     )
     consolidation_cfg = ConsolidationConfig(
         indexed_key_replay=False,

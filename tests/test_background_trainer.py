@@ -509,7 +509,6 @@ class TestTrainAdapterAbortReturn:
             gradient_checkpointing=False,
             batch_size=1,
             warmup_steps=0,
-            warmup_ratio=0.0,
         )
         dataset = [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
 
@@ -556,7 +555,6 @@ class TestTrainAdapterAbortReturn:
             gradient_checkpointing=False,
             batch_size=1,
             warmup_steps=0,
-            warmup_ratio=0.0,
         )
         dataset = [{"input_ids": [1], "labels": [1], "attention_mask": [1]}]
 
@@ -629,7 +627,6 @@ class TestRamCheckpointMode:
             gradient_checkpointing=False,
             batch_size=1,
             warmup_steps=0,
-            warmup_ratio=0.0,
             save_steps_ram=save_steps_ram,
         )
 
@@ -758,7 +755,6 @@ class TestRamCheckpointMode:
             gradient_checkpointing=False,
             batch_size=1,
             warmup_steps=0,
-            warmup_ratio=0.0,
             save_steps_ram=0,
         )
 

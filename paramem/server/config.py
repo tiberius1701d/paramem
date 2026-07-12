@@ -942,8 +942,15 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     training_batch_size: int = 1
     training_gradient_accumulation_steps: int = 2
     training_max_seq_length: int = 1024
-    training_warmup_steps: int = 30  # fixed steps; overrides warmup_ratio when > 0
-    training_warmup_ratio: float = 0.0  # explicit 0.0 so TrainingConfig default (0.1) cannot leak
+    # Absolute-step warmup count, passed straight through to TrainingConfig.
+    # warmup=0: warmup is currently disabled in production. Every fold ever
+    # trained ran at effectively zero warmup — transformers 5.5's deprecated
+    # ratio-based warmup field (deleted from this codebase; see
+    # TrainingConfig.warmup_steps) silently overwrote the previously-set
+    # `training_warmup_steps: 30` to 0 at every call, so the value that
+    # actually ran was always 0 despite the config claiming 30. Turning
+    # warmup on requires re-validating the main-tier folds.
+    training_warmup_steps: int = 0
     training_lr_scheduler_type: str = "linear"
     training_weight_decay: float = 0.1
     training_gradient_checkpointing: bool = True
@@ -1683,7 +1690,6 @@ class ServerConfig:
                 self.consolidation.max_epochs if self.consolidation.max_epochs is not None else 30
             ),
             warmup_steps=self.consolidation.training_warmup_steps,
-            warmup_ratio=self.consolidation.training_warmup_ratio,
             lr_scheduler_type=self.consolidation.training_lr_scheduler_type,
             lr_decay_steps=self.consolidation.training_lr_decay_steps,
             weight_decay=self.consolidation.training_weight_decay,
