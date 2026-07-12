@@ -152,6 +152,51 @@ def _is_training_marker(exc: BaseException) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _registry_key_population(parsed: dict) -> list[str]:
+    """Return the indexed-key population from a parsed registry dict.
+
+    Two registry shapes exist on disk and both reach this function (via
+    :func:`_sample_registry_keys` and gate 4's registry-size precondition):
+
+    - KeyRegistry per-tier schema (``KeyRegistry.save_bytes()``,
+      ``paramem/training/key_registry.py:393-399``)::
+
+          {"active_keys": [...], "fidelity_history": {...}, "health": ...,
+           "stale": {...}, "simhash": {key: int}}
+
+    - ``key_metadata.json`` schema (``_save_key_metadata``,
+      ``paramem/server/consolidation.py:436-440``) — the file gate 4's
+      ``live_registry_path`` actually points at
+      (``live_config.paths.key_metadata``, ``paramem/server/app.py:8695``)::
+
+          {"cycle_count": int, "promoted_keys": [...], "keys": {key: bookkeeping}}
+
+      The indexed-key names are the KEYS of the nested ``"keys"`` dict —
+      the three top-level fields (``cycle_count``, ``promoted_keys``,
+      ``keys``) are bookkeeping, not key names.  Treating
+      ``len(parsed)``/``parsed.keys()`` directly against this shape counts
+      3 always, never the real key population.
+
+    Falls back to the dict's own top-level keys for legacy/flat
+    ``{key: simhash}`` registries.
+
+    Parameters
+    ----------
+    parsed:
+        A JSON-decoded registry dict (either schema above, or legacy flat).
+
+    Returns
+    -------
+    list[str]
+        Sorted list of indexed-key names.
+    """
+    if "active_keys" in parsed:
+        return sorted(parsed["active_keys"])
+    if isinstance(parsed.get("keys"), dict):
+        return sorted(parsed["keys"].keys())
+    return sorted(parsed.keys())
+
+
 def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") -> list[str]:
     """Sample up to :data:`GATE_4_SAMPLE_SIZE` keys deterministically.
 
@@ -180,13 +225,7 @@ def _sample_registry_keys(registry_content: bytes, *, seed_suffix: bytes = b"") 
     seed_int = int(seed_hex, 16)
     rng = random.Random(seed_int)
     parsed = json.loads(registry_content)
-    # New per-tier KeyRegistry schema: {active_keys: [...], fidelity_history: {...}, health: ...}
-    # The active_keys list is the sample population; fall back to dict keys for
-    # legacy/flat registries so the gate remains upgradeable.
-    if isinstance(parsed, dict) and "active_keys" in parsed:
-        population = sorted(parsed["active_keys"])
-    else:
-        population = sorted(parsed.keys())
+    population = _registry_key_population(parsed) if isinstance(parsed, dict) else []
     n = min(GATE_4_SAMPLE_SIZE, len(population))
     return rng.sample(population, n)
 
@@ -696,6 +735,65 @@ def _find_tier_registry(trial_adapter_dir: Path) -> tuple[str, Path] | None:
     return None
 
 
+def _load_simhash_registry(path: Path) -> dict[str, int]:
+    """Extract the ``{key: simhash}`` fingerprint map from a registry file.
+
+    Reads the on-disk :class:`~paramem.training.key_registry.KeyRegistry`
+    serialization written by ``KeyRegistry.save_bytes()``
+    (``paramem/training/key_registry.py:393-399``)::
+
+        {"active_keys": [...], "fidelity_history": {...}, "health": ...,
+         "stale": {...}, "simhash": {key: int}}
+
+    and returns the ``"simhash"`` map verbatim — the active-plus-stale
+    fingerprint superset.  This is the ``indexed_key_registry.json`` shape
+    written by every tier, trial (``trial_adapter_dir/<kind>/``) and live
+    (``config.adapter_dir/<kind>/``) alike, and is the ONLY source of
+    per-key SimHash fingerprints anywhere in the system.
+
+    Deliberately does NOT understand ``key_metadata.json``
+    (``_save_key_metadata``, ``paramem/server/consolidation.py:436-440`` —
+    ``{"cycle_count", "promoted_keys", "keys": {key: bookkeeping}}``): that
+    file carries per-key bookkeeping (``speaker_id``, ``relation_type``,
+    ``reinforcement_count``, ``last_reinforced_cycle``, ``last_seen``,
+    ``first_seen`` — see ``paramem/memory/store.py::bookkeeping_for_key``),
+    never a SimHash fingerprint.  A file lacking a dict-valued ``"simhash"``
+    field raises rather than silently returning an empty or wrong map — a
+    caller that points this helper at the wrong file finds out immediately,
+    not via a gate that mysteriously never fails.
+
+    Parameters
+    ----------
+    path:
+        Path to one tier's ``indexed_key_registry.json``.
+
+    Returns
+    -------
+    dict[str, int]
+        ``{key: simhash}``.  Empty when *path* does not exist (fresh
+        install / tier not yet trained).
+
+    Raises
+    ------
+    ValueError
+        When the parsed JSON is not a dict, or lacks a dict-valued
+        ``"simhash"`` field — i.e. it is not a KeyRegistry-shaped file.
+    """
+    if not path.exists():
+        return {}
+
+    from paramem.backup.encryption import read_maybe_encrypted as _rme
+
+    raw = json.loads(_rme(path))
+    if not isinstance(raw, dict) or not isinstance(raw.get("simhash"), dict):
+        raise ValueError(
+            f"{path} is not a KeyRegistry-shaped registry file "
+            "(missing dict-valued 'simhash' field) — refusing to silently "
+            "coerce a different registry schema into a simhash map"
+        )
+    return {k: v for k, v in raw["simhash"].items() if isinstance(v, int)}
+
+
 def _gate_3_reload_smoke(
     *,
     session_buffer_empty: bool,
@@ -729,8 +827,13 @@ def _gate_3_reload_smoke(
     was loaded — the gate's purpose is ADAPTER LOAD verification, not
     enforcement of a specific kind.
 
-    Probes via ``probe_entries`` which returns ``failure_reason`` on any parse
-    or recall failure — no secondary parse check is needed.
+    Probes via ``probe_entries`` with ``registry=`` wired to the trial
+    tier's own SimHash map (:func:`_load_simhash_registry` on
+    ``tier_registry_path``), so ``verify_confidence`` actually scores the
+    recalled content against the trained fingerprint instead of trivially
+    returning 1.0 (its no-registry default). ``probe_entries`` returns
+    ``failure_reason`` on any parse failure, key mismatch, or low-confidence
+    recall — no secondary parse check is needed.
 
     The first key to probe is taken from the per-tier
     ``indexed_key_registry.json``.
@@ -825,6 +928,17 @@ def _gate_3_reload_smoke(
         )
 
     try:
+        simhash_map = _load_simhash_registry(tier_registry_path)
+    except ValueError as exc:
+        return GateResult(
+            gate=3,
+            name="adapter_reload",
+            status="fail",
+            reason=f"failed to load simhash registry: {exc}",
+            metrics=None,
+        )
+
+    try:
         _ensure_trial_probe_mounted(model, trial_adapter_dir, mount_state)
     except Exception as exc:  # noqa: BLE001
         return GateResult(
@@ -838,11 +952,25 @@ def _gate_3_reload_smoke(
     try:
         from paramem.training.recall_eval import probe_entries
 
-        # single-key liveness probe — batching N/A (1 key)
-        _, result = next(iter(probe_entries(model, tokenizer, [{"key": first_key}], batch_size=1)))
+        # single-key liveness probe — batching N/A (1 key). registry=simhash_map
+        # wires SimHash confidence verification into finalize_recalled(); omitting
+        # it makes verify_confidence() return 1.0 unconditionally (no registry ==
+        # no verification), which passes ANY well-formed JSON regardless of content.
+        _, result = next(
+            iter(
+                probe_entries(
+                    model,
+                    tokenizer,
+                    [{"key": first_key}],
+                    registry=simhash_map,
+                    batch_size=1,
+                )
+            )
+        )
 
         # probe_entries returns failure_reason on any parse failure, key
-        # mismatch, or low confidence — single discriminator.
+        # mismatch, or SimHash confidence below DEFAULT_CONFIDENCE_THRESHOLD
+        # (finalize_recalled's low_confidence path) — single discriminator.
         if result is None or "failure_reason" in result:
             reason = (result or {}).get("failure_reason", "probe returned None")
             return GateResult(
@@ -888,6 +1016,16 @@ def _gate_4_recall_check(
     :data:`GATE_4_MIN_REGISTRY_SIZE` keys, or when ``trial_adapter_dir`` has
     no files (NO_NEW_SESSIONS — no trial adapter exists).
 
+    ``live_registry_path`` (``key_metadata.json``,
+    ``paramem/server/consolidation.py:436-440``) supplies only the SAMPLE
+    POPULATION — the set of indexed-key names to draw the 20-key sample
+    from. It carries per-key bookkeeping, never a SimHash fingerprint, so
+    it cannot verify recall content. Verification uses the trial adapter's
+    own per-tier ``indexed_key_registry.json`` SimHash maps instead (see
+    :func:`_load_simhash_registry`) — full-replay training means those
+    files carry ground-truth fingerprints for the whole live key
+    population, not just newly-added keys.
+
     The ``"sampled_keys"`` field in ``metrics`` is the deciding sample list.
     The comparison report uses the same list so the same 20 keys appear in
     both the hard-gate result and the report.
@@ -901,7 +1039,8 @@ def _gate_4_recall_check(
     trial_adapter_dir:
         Directory containing the trial adapter files.
     live_registry_path:
-        Path to the current live ``registry.json``.
+        Path to the current live ``key_metadata.json`` — the sample
+        population source only (see class docstring).
     mount_state:
         Shared mount-state dict passed to mount/unmount helpers.
     recall_probe_batch_size:
@@ -946,7 +1085,19 @@ def _gate_4_recall_check(
             metrics=None,
         )
 
-    n_keys = len(registry_parsed)
+    # ACTUAL key count, not the top-level field count. registry_parsed is
+    # key_metadata.json (consolidation.py:436-440): {"cycle_count",
+    # "promoted_keys", "keys": {key: bookkeeping}} — len(registry_parsed) is
+    # always 3 (the field count), which is permanently < GATE_4_MIN_REGISTRY_SIZE
+    # and made this gate skip on every deployment. GATE_4_MIN_REGISTRY_SIZE is
+    # meant to gate on "does the live store have enough historical keys to make
+    # a cross-adapter recall check meaningful" — that is the count of entries
+    # under "keys" (or "active_keys" / flat dict-keys for other registry shapes),
+    # via the same population extraction _sample_registry_keys uses below so the
+    # two never disagree.
+    n_keys = (
+        len(_registry_key_population(registry_parsed)) if isinstance(registry_parsed, dict) else 0
+    )
     if n_keys < GATE_4_MIN_REGISTRY_SIZE:
         return GateResult(
             gate=4,
@@ -963,6 +1114,30 @@ def _gate_4_recall_check(
             name="live_registry_recall",
             status="skipped",
             reason="trial_adapter_dir is empty — no trial adapter (no_new_sessions case)",
+            metrics=None,
+        )
+
+    # --- Load the verification source: the TRIAL adapter's own SimHash fingerprints ---
+    # live_registry_path (key_metadata.json) supplies the SAMPLE POPULATION only —
+    # it carries per-key bookkeeping (paramem/memory/store.py::bookkeeping_for_key),
+    # never a SimHash fingerprint (see _load_simhash_registry docstring). Indexed-key
+    # training is full-replay (old ∪ new keys retrained together every cycle — see
+    # CLAUDE.md), so the trial adapter's freshly-written per-tier
+    # indexed_key_registry.json files carry ground-truth fingerprints for every
+    # currently active key, including ones unchanged by this cycle. Merge across
+    # all three tiers since the live sample can draw a key from any of them.
+    trial_simhash: dict[str, int] = {}
+    try:
+        for kind in _ADAPTER_KIND_SUBDIRS:
+            trial_simhash.update(
+                _load_simhash_registry(trial_adapter_dir / kind / "indexed_key_registry.json")
+            )
+    except ValueError as exc:
+        return GateResult(
+            gate=4,
+            name="live_registry_recall",
+            status="fail",
+            reason=f"failed to load trial adapter simhash registry: {exc}",
             metrics=None,
         )
 
@@ -998,11 +1173,11 @@ def _gate_4_recall_check(
             model,
             tokenizer,
             entries,
-            registry=registry_parsed,
+            registry=trial_simhash,
             batch_size=recall_probe_batch_size,
         ):
             if recalled is not None and "failure_reason" not in recalled:
-                conf = _verify_confidence(recalled, registry_parsed)
+                conf = _verify_confidence(recalled, trial_simhash)
                 if conf >= GATE_4_THRESHOLD:
                     passed += 1
         return keys, passed, seed_hex
