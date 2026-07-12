@@ -81,11 +81,16 @@ _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
             "paramem.graph.extractor",
             "_parse_extraction",
         ),
-        # test16_repair_sweep.py / test18_probe_batching.py — adapter-slot
-        # plumbing internals.  Promote to public or wrap via a load_adapter
-        # variant that returns the slot path.
+        # test16_repair_sweep.py / test18_probe_batching.py / test20_smallN_cold_gate.py
+        # — adapter-slot plumbing internals.  Promote to public or wrap via a
+        # load_adapter variant that returns the slot path.
         ("experiments/test16_repair_sweep.py", "paramem.models.loader", "_adapter_slot_for_load"),
         ("experiments/test18_probe_batching.py", "paramem.models.loader", "_adapter_slot_for_load"),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.models.loader",
+            "_adapter_slot_for_load",
+        ),
         # experiments/utils/early_stop.py — already a thin re-export of the
         # private early_stop state.  Either inline into the harness or promote
         # the underlying symbols.
@@ -295,6 +300,32 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ("experiments/test18_probe_batching.py", "paramem.training.trainer", "train_adapter"),
         ("experiments/test18_probe_batching.py", "paramem.utils.config", "AdapterConfig"),
         ("experiments/test18_probe_batching.py", "paramem.utils.config", "TrainingConfig"),
+        # test20_smallN_cold_gate.py
+        ("experiments/test20_smallN_cold_gate.py", "paramem.memory.entry", "build_registry"),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.memory.entry",
+            "format_entry_training",
+        ),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.models.loader",
+            "copy_adapter_weights",
+        ),
+        ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "create_adapter"),
+        ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "switch_adapter"),
+        ("experiments/test20_smallN_cold_gate.py", "paramem.models.loader", "unload_model"),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.server.config",
+            "load_server_config",
+        ),
+        (
+            "experiments/test20_smallN_cold_gate.py",
+            "paramem.training.recall_eval",
+            "evaluate_indexed_recall",
+        ),
+        ("experiments/test20_smallN_cold_gate.py", "paramem.training.trainer", "train_adapter"),
         # test_distillation_models.py / test_prompt_engineering.py
         (
             "experiments/test_distillation_models.py",
