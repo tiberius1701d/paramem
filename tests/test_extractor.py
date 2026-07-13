@@ -264,12 +264,12 @@ class TestStampSpeakerEntity:
         """A display-name entity (not a speaker id) must not receive speaker_id."""
         graph = self._make_graph(
             entities=[
-                Entity(name="Tobias Becker", entity_type="person"),
+                Entity(name="Jordan Becker", entity_type="person"),
                 Entity(name="speaker0", entity_type="person"),
             ]
         )
         result = _stamp_speaker_entity(graph, speaker_id="speaker0")
-        third_party = next(e for e in result.entities if e.name == "Tobias Becker")
+        third_party = next(e for e in result.entities if e.name == "Jordan Becker")
         assert third_party.speaker_id is None
         speaker_ent = next(e for e in result.entities if e.name == "speaker0")
         assert speaker_ent.speaker_id == "speaker0"
@@ -378,10 +378,10 @@ class TestStampSpeakerEntity:
         """Third-person document, full-name entity + relation subject match
         → rewritten to speaker0 and stamped."""
         graph = self._make_graph(
-            entities=[Entity(name="Tobias Preusser", entity_type="person")],
+            entities=[Entity(name="Alex Walker", entity_type="person")],
             relations=[
                 Relation(
-                    subject="Tobias Preusser",
+                    subject="Alex Walker",
                     predicate="leads",
                     object="the platform team",
                     relation_type="factual",
@@ -392,7 +392,7 @@ class TestStampSpeakerEntity:
         result = _stamp_speaker_entity(
             graph,
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="document",
         )
         assert len(result.entities) == 1
@@ -409,7 +409,7 @@ class TestStampSpeakerEntity:
                 Relation(
                     subject="the platform team",
                     predicate="led_by",
-                    object="Tobias Preusser",
+                    object="Alex Walker",
                     relation_type="factual",
                     speaker_id="speaker0",
                 )
@@ -418,7 +418,7 @@ class TestStampSpeakerEntity:
         result = _stamp_speaker_entity(
             graph,
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="document",
         )
         rel = result.relations[0]
@@ -428,10 +428,10 @@ class TestStampSpeakerEntity:
     def test_single_token_speaker_name_fails_closed(self):
         """Guard A: a single-token speaker_name never triggers the rewrite."""
         graph = self._make_graph(
-            entities=[Entity(name="Tobias", entity_type="person")],
+            entities=[Entity(name="Alex", entity_type="person")],
             relations=[
                 Relation(
-                    subject="Tobias",
+                    subject="Alex",
                     predicate="leads",
                     object="the team",
                     relation_type="factual",
@@ -442,19 +442,19 @@ class TestStampSpeakerEntity:
         result = _stamp_speaker_entity(
             graph,
             speaker_id="speaker0",
-            speaker_name="Tobias",
+            speaker_name="Alex",
             source_type="document",
         )
-        assert result.entities[0].name == "Tobias"
-        assert result.relations[0].subject == "Tobias"
+        assert result.entities[0].name == "Alex"
+        assert result.relations[0].subject == "Alex"
 
     def test_transcript_source_never_rewrites(self):
         """Guard B: an exact full-name match on a transcript source is left alone."""
         graph = self._make_graph(
-            entities=[Entity(name="Tobias Preusser", entity_type="person")],
+            entities=[Entity(name="Alex Walker", entity_type="person")],
             relations=[
                 Relation(
-                    subject="Tobias Preusser",
+                    subject="Alex Walker",
                     predicate="leads",
                     object="the team",
                     relation_type="factual",
@@ -465,19 +465,19 @@ class TestStampSpeakerEntity:
         result = _stamp_speaker_entity(
             graph,
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="transcript",
         )
-        assert result.entities[0].name == "Tobias Preusser"
-        assert result.relations[0].subject == "Tobias Preusser"
+        assert result.entities[0].name == "Alex Walker"
+        assert result.relations[0].subject == "Alex Walker"
 
     def test_first_name_only_not_rewritten(self):
         """A first-name-only entity does not match the speaker's full name."""
         graph = self._make_graph(
-            entities=[Entity(name="Tobias", entity_type="person")],
+            entities=[Entity(name="Alex", entity_type="person")],
             relations=[
                 Relation(
-                    subject="Tobias",
+                    subject="Alex",
                     predicate="leads",
                     object="the team",
                     relation_type="factual",
@@ -488,19 +488,19 @@ class TestStampSpeakerEntity:
         result = _stamp_speaker_entity(
             graph,
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="document",
         )
-        assert result.entities[0].name == "Tobias"
-        assert result.relations[0].subject == "Tobias"
+        assert result.entities[0].name == "Alex"
+        assert result.relations[0].subject == "Alex"
 
     def test_different_full_name_not_rewritten(self):
         """A different full name (same first name, different surname) is untouched."""
         graph = self._make_graph(
-            entities=[Entity(name="Tobias Müller", entity_type="person")],
+            entities=[Entity(name="Alex Müller", entity_type="person")],
             relations=[
                 Relation(
-                    subject="Tobias Müller",
+                    subject="Alex Müller",
                     predicate="supervised",
                     object="the thesis",
                     relation_type="factual",
@@ -511,34 +511,34 @@ class TestStampSpeakerEntity:
         result = _stamp_speaker_entity(
             graph,
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="document",
         )
-        assert result.entities[0].name == "Tobias Müller"
-        assert result.relations[0].subject == "Tobias Müller"
+        assert result.entities[0].name == "Alex Müller"
+        assert result.relations[0].subject == "Alex Müller"
 
     def test_superset_name_not_rewritten(self):
         """A superset name (organization sharing the speaker's name) is not collapsed."""
         graph = self._make_graph(
-            entities=[Entity(name="Tobias Preusser Foundation", entity_type="organization")],
+            entities=[Entity(name="Alex Walker Foundation", entity_type="organization")],
         )
         result = _stamp_speaker_entity(
             graph,
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="document",
         )
-        assert result.entities[0].name == "Tobias Preusser Foundation"
+        assert result.entities[0].name == "Alex Walker Foundation"
 
     def test_case_and_diacritic_insensitive_match(self):
         """canonical() folds case/diacritics/whitespace runs for the exact-match rewrite."""
         graph = self._make_graph(
-            entities=[Entity(name="tobías  preusser", entity_type="person")],
+            entities=[Entity(name="álex  walker", entity_type="person")],
         )
         result = _stamp_speaker_entity(
             graph,
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="document",
         )
         assert result.entities[0].name == "speaker0"
@@ -547,12 +547,12 @@ class TestStampSpeakerEntity:
         """A relation whose subject AND object are both the full name is DROPPED,
         not emitted as (speaker0, pred, speaker0)."""
         graph = self._make_graph(
-            entities=[Entity(name="Tobias Preusser", entity_type="person")],
+            entities=[Entity(name="Alex Walker", entity_type="person")],
             relations=[
                 Relation(
-                    subject="Tobias Preusser",
+                    subject="Alex Walker",
                     predicate="reports_to",
-                    object="Tobias Preusser",
+                    object="Alex Walker",
                     relation_type="factual",
                     speaker_id="speaker0",
                 )
@@ -561,7 +561,7 @@ class TestStampSpeakerEntity:
         result = _stamp_speaker_entity(
             graph,
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="document",
         )
         assert result.relations == []
@@ -571,7 +571,7 @@ class TestStampSpeakerEntity:
         stamping still fires."""
         graph = self._make_graph(
             entities=[
-                Entity(name="Tobias Preusser", entity_type="person"),
+                Entity(name="Alex Walker", entity_type="person"),
                 Entity(name="speaker0", entity_type="person"),
             ],
         )
@@ -581,7 +581,7 @@ class TestStampSpeakerEntity:
             speaker_name=None,
             source_type="document",
         )
-        third_party = next(e for e in result.entities if e.name == "Tobias Preusser")
+        third_party = next(e for e in result.entities if e.name == "Alex Walker")
         assert third_party.speaker_id is None
         speaker_ent = next(e for e in result.entities if e.name == "speaker0")
         assert speaker_ent.speaker_id == "speaker0"

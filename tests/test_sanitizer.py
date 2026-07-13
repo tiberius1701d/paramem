@@ -436,7 +436,7 @@ class TestM3SpeakerDisplayNameCoverage:
     referent even when it is not a registry subject.
 
     Under the id-as-subject refactor (step 8+) the registry holds ``speaker0``
-    as the subject rather than ``"Tobias"``.  inference.py::handle_chat now
+    as the subject rather than ``"Alex"``.  inference.py::handle_chat now
     explicitly adds the resolved ``speaker`` display name to ``known_entities``
     so the sanitizer still catches queries that mention the real name.
 
@@ -449,8 +449,8 @@ class TestM3SpeakerDisplayNameCoverage:
     def test_display_name_in_known_entities_flags_personal(self):
         """Querying the speaker by their display name is caught as personal."""
         findings = check_personal_content(
-            "What does Tobias do for work?",
-            known_entities={"tobias"},
+            "What does Alex do for work?",
+            known_entities={"alex"},
         )
         assert "personal_entity" in findings
 
@@ -461,7 +461,7 @@ class TestM3SpeakerDisplayNameCoverage:
         known_entities the sanitizer would let personal queries through.
         """
         findings = check_personal_content(
-            "What does Tobias do for work?",
+            "What does Alex do for work?",
             known_entities=set(),
         )
         assert "personal_entity" not in findings
@@ -513,9 +513,9 @@ class TestM3SpeakerDisplayNameCoverage:
             ),
         ):
             handle_chat(
-                text="What does Tobias do for work?",
+                text="What does Alex do for work?",
                 conversation_id="conv1",
-                speaker="Tobias",
+                speaker="Alex",
                 speaker_id="speaker0",
                 history=None,
                 model=mock_model,
@@ -526,7 +526,7 @@ class TestM3SpeakerDisplayNameCoverage:
 
         assert "known_entities" in captured
         assert captured["known_entities"] is not None
-        assert "tobias" in captured["known_entities"]
+        assert "alex" in captured["known_entities"]
 
     def test_handle_chat_anonymous_speaker_not_added_to_known_entities(self):
         """Anonymous display-name suppression: None speaker must not pollute known_entities.

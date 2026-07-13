@@ -325,8 +325,8 @@ class TestResolveSpeakerName:
 
     def test_known_named_speaker_returns_name(self, tmp_path, sample_embedding):
         store = SpeakerStore(tmp_path / "profiles.json")
-        sid = store.enroll("Tobias", sample_embedding)
-        assert store.resolve_speaker_name(sid) == "Tobias"
+        sid = store.enroll("Alex", sample_embedding)
+        assert store.resolve_speaker_name(sid) == "Alex"
 
     def test_unknown_speaker_id_returns_none(self, tmp_path):
         store = SpeakerStore(tmp_path / "profiles.json")
@@ -1101,7 +1101,7 @@ class TestSpeakerStoreMigrationV5ToV6:
             "last_greeted": {"Speaker0": "2026-01-01T00:00:00+00:00"},
             "speakers": {
                 "Speaker0": {
-                    "name": "Tobias",
+                    "name": "Alex",
                     "embeddings": [emb],
                     "preferred_language": "en",
                     "enroll_method": "self_introduced",
@@ -1125,7 +1125,7 @@ class TestSpeakerStoreMigrationV5ToV6:
             "last_greeted": {"speaker0": "2026-01-01T00:00:00+00:00"},
             "speakers": {
                 "speaker0": {
-                    "name": "Tobias",
+                    "name": "Alex",
                     "embeddings": [emb],
                     "preferred_language": "en",
                     "enroll_method": "self_introduced",
@@ -1137,7 +1137,7 @@ class TestSpeakerStoreMigrationV5ToV6:
         store = SpeakerStore(store_path)
 
         assert "speaker0" in store._profiles
-        assert store._profiles["speaker0"]["name"] == "Tobias"
+        assert store._profiles["speaker0"]["name"] == "Alex"
 
 
 # ---------------------------------------------------------------------------
@@ -1171,12 +1171,12 @@ class TestIngestSafetyNet:
         from paramem.graph.extractor import _normalize_extraction
 
         data = {
-            "entities": [{"name": "Tobias Becker", "entity_type": "person"}],
+            "entities": [{"name": "Jordan Becker", "entity_type": "person"}],
             "relations": [],
         }
         result = _normalize_extraction(data)
         # Display name must be preserved verbatim (only .strip() applied).
-        assert result["entities"][0]["name"] == "Tobias Becker"
+        assert result["entities"][0]["name"] == "Jordan Becker"
 
     def test_relation_subject_speaker0_lowercased(self):
         """Relation subject='Speaker0' is lowercased to 'speaker0'."""

@@ -351,16 +351,16 @@ class TestExtractionPathParity:
                 captured_procedural, procedural_graph
             ),
         )
-        body = "Tobias Preusser led the platform team."
+        body = "Alex Walker led the platform team."
         loop.extract_session(
             session_transcript=body,
             session_id="s001",
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="document",
         )
 
-        expected_cue = OWNERSHIP_CUE.format(name="Tobias Preusser", sid="speaker0")
+        expected_cue = OWNERSHIP_CUE.format(name="Alex Walker", sid="speaker0")
         assert captured_graph == [expected_cue + body]
         assert captured_procedural == [expected_cue + body]
 
@@ -397,7 +397,7 @@ class TestExtractionPathParity:
             session_transcript=body,
             session_id="s001",
             speaker_id="speaker0",
-            speaker_name="Tobias Preusser",
+            speaker_name="Alex Walker",
             source_type="transcript",
         )
 
@@ -411,10 +411,10 @@ class TestExtractionPathParity:
         session_graph = SessionGraph(
             session_id="s001",
             timestamp="2026-01-01T00:00:00Z",
-            entities=[Entity(name="Tobias Preusser", entity_type="person")],
+            entities=[Entity(name="Alex Walker", entity_type="person")],
             relations=[
                 Relation(
-                    subject="Tobias Preusser",
+                    subject="Alex Walker",
                     predicate="leads",
                     object="the team",
                     relation_type="factual",
@@ -432,7 +432,7 @@ class TestExtractionPathParity:
             extract_graph_spy=self._capture_transcript_spy(captured_graph, session_graph),
             extract_procedural_spy=self._capture_transcript_spy([], procedural_graph),
         )
-        body = "Tobias Preusser led the platform team."
+        body = "Alex Walker led the platform team."
         loop.extract_session(
             session_transcript=body,
             session_id="s001",
@@ -12243,8 +12243,8 @@ class TestResolveToNodeKeyP5:
 
         # canonical("speaker0") == "speaker0" (casefolded)
         assert resolve_to_node_key("speaker0", in_graph) == "speaker0"
-        # canonical("Tobias") == "tobias"
-        assert resolve_to_node_key("Tobias", in_graph) == "tobias"
+        # canonical("Alex") == "alex"
+        assert resolve_to_node_key("Alex", in_graph) == "alex"
 
     def test_coref_chain_follow(self):
         """With a coref_map, the resolved key is followed through the chain."""

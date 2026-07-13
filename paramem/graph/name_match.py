@@ -99,7 +99,7 @@ def is_speaker_id(s: str) -> bool:
     Returns:
         ``True`` iff *s* matches ``[Ss]peaker`` followed by one or more decimal
         digits and nothing else.  ``False`` for partial matches (``"Speaker"``,
-        ``"speaker"``, ``"tobias"``, ``"SpeakerX"``) and empty strings.
+        ``"speaker"``, ``"alex"``, ``"SpeakerX"``) and empty strings.
 
     Examples::
 
@@ -111,7 +111,7 @@ def is_speaker_id(s: str) -> bool:
         True
         >>> is_speaker_id("Speaker")
         False
-        >>> is_speaker_id("tobias")
+        >>> is_speaker_id("alex")
         False
     """
     if not s:

@@ -165,7 +165,7 @@ class TestIsSpeakerId:
         assert is_speaker_id("Speaker12") is True
 
     def test_plain_name_false(self):
-        assert is_speaker_id("tobias") is False
+        assert is_speaker_id("alex") is False
 
     def test_lowercase_word_speaker_false(self):
         """'speaker' without a digit suffix is not a speaker id."""
