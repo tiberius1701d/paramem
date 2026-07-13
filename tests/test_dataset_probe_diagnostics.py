@@ -184,6 +184,30 @@ class TestRawFactCountRegression:
         diag = _call_diag(_make_session(), graph)
         assert diag["extraction"]["raw_fact_count"] == 0
 
+    def test_predicate_placeholder_drops_counted_without_double_counting(self):
+        """F3 — the predicate-invariant drop list
+        (``predicate_placeholder_dropped_facts``, populated by BOTH the
+        anonymizer-stage filter and deanon-stage step 1 of
+        ``_apply_bindings``) is disjoint from
+        ``residual_dropped_facts`` (deanon-stage step 3) — both are
+        summed into ``raw_fact_count`` exactly once each, never
+        overlapping."""
+        graph = _make_graph(
+            {
+                "residual_dropped_facts": [{"text": "x"}],  # 1 — step-3 drop
+                "predicate_placeholder_dropped_facts": [
+                    {"text": "y"},
+                    {"text": "z"},
+                ],  # 2 — step-1 / anon-stage drops
+            }
+        )
+        episodic_rels = [{"q": "Q1", "a": "A1"}]
+        diag = _call_diag(_make_session(), graph, episodic_rels=episodic_rels)
+        # 1 surviving + 1 residual + 2 predicate-invariant = 4
+        assert diag["extraction"]["drops"]["residual_dropped_facts"] == 1
+        assert diag["extraction"]["drops"]["predicate_placeholder_dropped_facts"] == 2
+        assert diag["extraction"]["raw_fact_count"] == 4
+
 
 class TestEntityRelationDistributions:
     """Entity and relation type distributions are correctly aggregated."""

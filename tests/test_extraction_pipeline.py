@@ -819,6 +819,42 @@ class TestEnrichmentDelta:
         assert len(out) == 2  # 1 input + 1 valid add
         assert out[1]["subject"] == "X"
 
+    def test_add_entry_strips_non_fact_fields(self):
+        """F1 — an ``add`` entry carrying a non-fact key (``evidence``)
+        alongside the fact proper has that key stripped at the parse
+        boundary, so it never enters ``enriched_anon`` (and therefore
+        can never sink a valid fact at the residual sweep downstream).
+        The fact itself is kept, only the extra key is dropped."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        raw = (
+            '{"add": [{"subject": "Person_1", "predicate": "works_at",'
+            ' "object": "Org_1", "relation_type": "factual", "confidence": 0.9,'
+            ' "evidence": "Person_1 said they work at Org_1"}]}'
+        )
+        out, _, _, _ = _apply_enrichment_delta([], raw, None)
+        assert out is not None
+        assert len(out) == 1
+        assert "evidence" not in out[0]
+        assert out[0]["subject"] == "Person_1"
+        assert out[0]["object"] == "Org_1"
+
+    def test_modify_fields_strips_non_fact_fields(self):
+        """F1 companion — a ``modify`` entry's ``fields`` dict is
+        restricted the same way: ``relation_type``/``confidence``
+        updates apply normally, a stray ``evidence`` key does not."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        facts = [{"subject": "Alex", "predicate": "employed_by", "object": "Acme"}]
+        raw = (
+            '{"modify": [{"index": 0, "fields": {"predicate": "worked_for",'
+            ' "evidence": "she confirmed this"}}]}'
+        )
+        out, _, _, _ = _apply_enrichment_delta(facts, raw, None)
+        assert out is not None
+        assert out[0]["predicate"] == "worked_for"
+        assert "evidence" not in out[0]
+
     def test_malformed_envelope_returns_none(self):
         """Caller fail-opens — applier returns ``None`` for new_facts so
         ``_sota_pipeline`` keeps the pre-enrichment facts."""
@@ -1871,7 +1907,10 @@ class TestApplyBindings:
             },
         ]
         reverse = {"Person_1": "Alice", "Org_1": "Acme"}
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["subject"] == "Alice"
         assert kept[0]["object"] == "Acme"
@@ -1892,7 +1931,8 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice"}
         bindings = {"Event_1": "the agile transformation workshop"}
-        kept, dropped = _apply_bindings(facts, reverse, bindings)
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, bindings)
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["subject"] == "Alice"
         assert kept[0]["object"] == "the agile transformation workshop"
@@ -1913,7 +1953,10 @@ class TestApplyBindings:
             },
         ]
         reverse = {"Person_1": "Alice", "Org_1": "Acme"}
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["object"] == "Acme Hungary"
 
@@ -1942,7 +1985,10 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice"}
         # No binding for Event_1; no mapping for Person_99.
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        dropped = predicate_dropped + residual_dropped
         assert kept == []
         assert len(dropped) == 2
 
@@ -1961,7 +2007,10 @@ class TestApplyBindings:
             },
         ]
         reverse = {"Person_1": "Alice", "Person_2": "Bob"}
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["object"] == "Bob's cousin"
 
@@ -1981,7 +2030,8 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice", "Org_1": "Acme"}
         bindings = {"Event_1": "the workshop"}
-        kept, dropped = _apply_bindings(facts, reverse, bindings)
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, bindings)
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["subject"] == "Alice"
         assert kept[0]["object"] == "the workshop at Acme"
@@ -1989,7 +2039,9 @@ class TestApplyBindings:
     def test_empty_inputs_return_empty(self):
         from paramem.graph.extractor import _apply_bindings
 
-        kept, dropped = _apply_bindings([], {}, {})
+        kept, predicate_dropped, residual_dropped = _apply_bindings([], {}, {})
+
+        dropped = predicate_dropped + residual_dropped
         assert kept == []
         assert dropped == []
 
@@ -2008,7 +2060,7 @@ class TestApplyBindings:
             },
         ]
         reverse = {"Person_1": "Alice", "Person_2": "Bob"}
-        kept, _ = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, _, _ = _apply_bindings(facts, reverse, sota_bindings={})
         assert kept[0]["relation_type"] == "social"
         assert kept[0]["confidence"] == 0.7
         assert kept[0]["synthetic"] is False
@@ -2067,7 +2119,10 @@ class TestApplyBindings:
         # A fact whose subject is the real, load-bearing "speaker0" form
         # is untouched by substitution — no attribute value corrupts it.
         facts = [{"subject": "speaker0", "predicate": "lives_in", "object": "Germany"}]
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["subject"] == "speaker0"
 
@@ -2112,7 +2167,10 @@ class TestApplyBindings:
             assert v not in reverse.values()
 
         facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Germany"}]
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["subject"] == "Alex"
 
@@ -2134,7 +2192,8 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice"}
         sota_bindings = {"Event_1": "the quarterly retro"}
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings)
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, sota_bindings)
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["object"] == "the quarterly retro"
 
@@ -2154,7 +2213,8 @@ class TestApplyBindings:
         ]
         reverse = {"Person_1": "Alice"}
         sota_bindings = {"Event_1": "the quarterly retro"}
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings)
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, sota_bindings)
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["object"] == "the quarterly retro"
 
@@ -2175,7 +2235,10 @@ class TestApplyBindings:
             },
         ]
         reverse = {"Person_1": "Alex"}
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["object"] == "Alex"
 
@@ -2197,7 +2260,8 @@ class TestApplyBindings:
         ]
         sota_bindings = {"Role_1": "Senior Engineer at Org_1"}
         reverse = {"Person_1": "Alex", "Org_1": "Acme"}
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings)
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, sota_bindings)
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["object"] == "Senior Engineer at Acme"
 
@@ -2219,15 +2283,126 @@ class TestApplyBindings:
         ]
         reverse = {"Org_1": "Acme"}
         sota_bindings = {"Org_1": "Wrong Corp"}
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings)
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, reverse, sota_bindings)
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["subject"] == "Acme"
 
+    def test_predicate_placeholder_is_not_resolved_into_the_predicate(self):
+        """A placeholder glued into the predicate (``at_Org_1``) is
+        dropped by the predicate invariant BEFORE substitution runs — it
+        must never be "resolved" into a garbage predicate
+        (``at_Acme``). The predicate field is never a substitution
+        target, so the dropped fact's predicate is byte-identical to
+        the input; if the invariant ran AFTER substitution instead (or
+        were removed), a hypothetical predicate-substitution mistake
+        could turn this into ``at_Acme``, which contains no placeholder
+        token and would silently survive.
+
+        Pinned via the PARTITIONED return, not a recombined list: this
+        specific fact must land in ``predicate_dropped`` (step 1, the
+        pre-substitution copy — ``subject`` still ``Person_1``), NEVER
+        in ``residual_dropped`` (step 3, which would only see the
+        post-substitution copy with ``subject == "Alice"``). Deleting
+        the step-1 check makes the fact fall through to the residual
+        sweep instead — ``predicate_dropped`` goes empty and
+        ``residual_dropped`` gains a post-substitution copy — so both
+        assertions below fail together, not just one accidentally
+        redundant with the other. (Verified live: see task report.)"""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "at_Org_1",
+                "object": "engineer",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
+        ]
+        reverse = {"Person_1": "Alice", "Org_1": "Acme"}
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        assert kept == []
+        assert residual_dropped == []
+        assert len(predicate_dropped) == 1
+        assert predicate_dropped[0]["subject"] == "Person_1"
+        assert predicate_dropped[0]["predicate"] == "at_Org_1"
+        dropped = predicate_dropped + residual_dropped
+        assert not any(f.get("predicate") == "at_Acme" for f in kept + dropped)
+
+    def test_unresolved_token_in_any_field_dropped(self):
+        """A declared placeholder token glued into the OBJECT field
+        (``language_proficiency_Language_3`` — invisible to the
+        ``\\b``-anchored :data:`_PLACEHOLDER_TOKEN_RE`) still drops the
+        triple: the residual sweep tests every field against the
+        declared vocabulary, not just subject."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {
+                "subject": "Alice",
+                "predicate": "speaks",
+                "object": "language_proficiency_Language_3",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            },
+        ]
+        reverse = {"Language_3": "French"}
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        dropped = predicate_dropped + residual_dropped
+        assert kept == []
+        assert len(dropped) == 1
+
+    def test_non_fact_field_with_declared_token_does_not_shed_the_fact(self):
+        """F1 — a field outside :data:`_FACT_FIELDS` (e.g. an ``evidence``
+        key an LLM appended alongside the fact proper) that still
+        contains a declared placeholder token must NOT sink the whole
+        otherwise-valid fact: the residual sweep only tests the fields
+        that actually reach ``Relation`` (subject/predicate/object/
+        relation_type/confidence/symmetric). Before the fix, the sweep
+        iterated ``f.values()`` unconditionally and would have dropped
+        this fact over ``evidence`` alone."""
+        from paramem.graph.extractor import _apply_bindings
+
+        facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "works_at",
+                "object": "Org_1",
+                "relation_type": "factual",
+                "confidence": 0.9,
+                "evidence": "Person_1 said they work at Org_1",
+            },
+        ]
+        reverse = {"Person_1": "Alice", "Org_1": "Acme"}
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        assert predicate_dropped == []
+        assert residual_dropped == []
+        assert len(kept) == 1
+        assert kept[0]["subject"] == "Alice"
+        assert kept[0]["object"] == "Acme"
+        # The non-fact field is not a substitution target either — it
+        # still carries the unresolved token, proving the sweep
+        # genuinely ignored it rather than getting lucky on substitution.
+        assert "Person_1" in kept[0]["evidence"]
+
 
 class TestResidualSweepCatchesEmbeddedPlaceholders:
-    def test_strip_residual_placeholders_catches_bare_and_composite(self):
-        """Residual sweep drops facts with any placeholder-shaped token, bare or composite."""
-        from paramem.graph.extractor import _strip_residual_placeholders
+    def test_residual_sweep_catches_bare_and_composite(self):
+        """The residual sweep (step 3 of :func:`_apply_bindings`, the
+        SINGLE deanon exit gate — the standalone
+        ``_strip_residual_placeholders`` this test used to call directly
+        is retired) drops facts with any placeholder-shaped token, bare
+        or composite, via the fail-closed :data:`_PLACEHOLDER_TOKEN_RE`
+        backstop — even with an empty declared vocabulary (nothing in
+        ``reverse``/``sota_bindings`` here)."""
+        from paramem.graph.extractor import _apply_bindings
 
         facts = [
             {"subject": "Alice", "predicate": "knows", "object": "Bob"},  # clean
@@ -2235,8 +2410,9 @@ class TestResidualSweepCatchesEmbeddedPlaceholders:
             {"subject": "Alice", "predicate": "values", "object": "Person_2's Support"},  # embedded
             {"subject": "{Topic_1}", "predicate": "related_to", "object": "Bob"},  # braced
         ]
-        kept, dropped = _strip_residual_placeholders(facts)
-        assert len(dropped) == 3
+        kept, predicate_dropped, residual_dropped = _apply_bindings(facts, {}, {})
+        assert predicate_dropped == []
+        assert len(residual_dropped) == 3
         assert len(kept) == 1
         assert kept[0]["object"] == "Bob"
 
@@ -3069,37 +3245,43 @@ class TestEntityTypePreservation:
 
 
 class TestFallbackPlausibilityOnRawHelper:
-    """Direct tests of the _fallback_plausibility_on_raw helper: drops
-    residual placeholders and anon-failed facts.
+    """Direct tests of the _fallback_plausibility_on_raw helper: runs on
+    already-de-anonymized ``graph.relations`` (real names) and records
+    anon-failed facts.
     """
 
-    def test_helper_removes_residual_placeholders(self):
-        """Helper drops facts containing residual placeholder tokens."""
+    def test_helper_does_not_sweep_shape_like_real_names(self):
+        """F4 — the residual-placeholder sweep this helper used to run
+        (``_strip_residual_placeholders``) is retired: this path
+        operates on real-name ``graph.relations`` where no placeholder
+        vocabulary exists, so a real name that merely happens to be
+        shaped like a placeholder (``Boeing_747``) must survive — a
+        shape-only guard here could only ever produce false positives."""
         from paramem.graph.extractor import _fallback_plausibility_on_raw
 
         graph = _make_graph(
             [
-                ("Alex", "lives_in", "City_1"),  # placeholder not resolved
+                ("Alex", "owns", "Boeing_747"),  # shape-like real name, not a placeholder
                 ("Alex", "works_at", "Acme"),
             ],
             entities=[
                 Entity(name="Alex", entity_type="person"),
-                Entity(name="City_1", entity_type="place"),
+                Entity(name="Boeing_747", entity_type="concept"),
                 Entity(name="Acme", entity_type="organization"),
             ],
         )
         result = _fallback_plausibility_on_raw(
             graph,
-            "Alex works at Acme.",
+            "Alex owns a Boeing_747 and works at Acme.",
             None,
             None,
             speaker_id="speaker0",
             reason="test_residual",
         )
-        # City_1 is a placeholder token → the fact should be swept
         surviving = {r.object for r in result.relations}
-        assert "City_1" not in surviving
+        assert "Boeing_747" in surviving
         assert result.diagnostics.get("fallback_path") == "test_residual"
+        assert "residual_dropped_facts" not in result.diagnostics
 
     def test_helper_records_fallback_path(self):
         """Helper always records the reason in diagnostics."""
@@ -3800,7 +3982,10 @@ class TestBuildAnonymizationMapping:
         assert reverse["Person_4"] == "Alex"
 
         facts = [{"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"}]
-        kept, dropped = _apply_bindings(facts, reverse, sota_bindings={})
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            facts, reverse, sota_bindings={}
+        )
+        dropped = predicate_dropped + residual_dropped
         assert dropped == []
         assert kept[0]["subject"] == "Alex"
 
@@ -3912,8 +4097,8 @@ class TestCheckMappingTotality:
     at the prompt-pivot commit); this helper surfaces violations to
     ``logger`` and ``graph.diagnostics`` so prompt regressions are
     visible rather than silently shedding facts.  Orphan-placeholder
-    facts get dropped downstream by :func:`_strip_residual_placeholders`
-    — fail-closed.
+    facts get dropped downstream by :func:`_apply_bindings`'s residual
+    sweep — fail-closed.
     """
 
     @staticmethod
@@ -4073,7 +4258,10 @@ class TestCheckMappingTotality:
             extractor_logger.setLevel(prior_level)
         assert graph.diagnostics.get("sota_pending_orphans") == ["Org_9"]
         assert any("sota enrichment" in r.getMessage().lower() for r in caplog.records)
-        kept, dropped = _apply_bindings(anon_facts, reverse_mapping, sota_bindings)
+        kept, predicate_dropped, residual_dropped = _apply_bindings(
+            anon_facts, reverse_mapping, sota_bindings
+        )
+        dropped = predicate_dropped + residual_dropped
         assert kept == []
         assert len(dropped) == 1
 
@@ -4620,6 +4808,72 @@ class TestBindingTotalityRejection:
         subjects_objects = {(r.subject, r.object) for r in result.relations}
         assert ("Alex", "Springfield") in subjects_objects
 
+    def test_glued_placeholder_in_predicate_dropped_end_to_end(self):
+        """A predicate that glues a placeholder onto a static prefix
+        (``language_proficiency_Language_3``) is invisible to the
+        ``\\b``-anchored placeholder regex but must still be caught: the
+        exit gate's predicate invariant runs a literal substring test
+        over the declared token vocabulary, before substitution, so the
+        fact never even reaches SOTA and never reaches
+        ``graph.relations``."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "works_at", "Acme")],
+            entities=[Entity(name="Alex", entity_type="person")],
+        )
+        anon_facts_initial = [
+            {"subject": "Person_1", "predicate": "works_at", "object": "Acme"},
+            {
+                "subject": "Person_1",
+                "predicate": "language_proficiency_Language_3",
+                "object": "Advanced",
+            },
+        ]
+        # "French" -> "Language_3" is an LLM-hint mapping entry the
+        # deterministic builder merges in verbatim (never minted by
+        # graph.entities, which only covers Alex here) — this is what
+        # puts "Language_3" into the declared vocabulary.
+        mapping = {"Alex": "Person_1", "French": "Language_3"}
+        anon_transcript = "Person_1 works at Acme. Person_1 speaks French at an advanced level."
+        transcript = "Alex works at Acme. Alex speaks French at an advanced level."
+
+        sota_calls = []
+
+        def fake_sota(facts, *args, **kwargs):
+            sota_calls.append(list(facts))
+            return facts, None, {}, None, {}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(anon_facts_initial, mapping, anon_transcript, ""),
+            ),
+            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+        ):
+            result = _sota_pipeline(
+                graph,
+                transcript,
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
+
+        # The poisoned fact never even reaches SOTA.
+        assert all(
+            f.get("predicate") != "language_proficiency_Language_3"
+            for facts in sota_calls
+            for f in facts
+        )
+        # ...and never reaches the merged graph.
+        assert all(r.predicate != "language_proficiency_Language_3" for r in result.relations)
+        assert graph.diagnostics["predicate_placeholder_dropped"] == 1
+        # The unrelated fact survives normally.
+        subjects_objects = {(r.subject, r.object) for r in result.relations}
+        assert ("Alex", "Acme") in subjects_objects
+
     def test_skip_sota_path_deanonymizes_normally_core_unscoped(self):
         """T4b — ``observed=None`` on the ``_skip_sota`` path (SOTA never
         ran) means CORE UNSCOPED.  Reuses
@@ -4637,7 +4891,10 @@ class TestBindingTotalityRejection:
                 Entity(name="Millfield", entity_type="place"),
             ],
         )
-        anon_facts_initial = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        anon_facts_initial = [
+            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
+            {"subject": "Person_1", "predicate": "has_hobby", "object": "reading"},
+        ]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
         anon_transcript = "Person_1 lives in City_1."
         transcript = "Alex lives in Millfield. Alex's neighbor is Ghost."
@@ -4689,10 +4946,20 @@ class TestBindingTotalityRejection:
 
         assert sota_calls == [], "SOTA must be skipped on residual leak (_skip_sota=True)"
         assert graph.diagnostics.get("anonymize") == "leaked_repaired"
-        # The surviving, unrelated fact must deanonymize NORMALLY.
-        assert len(result.relations) == 1
-        assert result.relations[0].subject == "Alex"
-        assert result.relations[0].object == "Millfield"
+        # The surviving, unrelated facts must deanonymize NORMALLY — the
+        # `_skip_sota` path loses ZERO facts.  A mutation swapping the
+        # `observed=None` sentinel for `set()` would CORE-scope to
+        # nothing: both facts' subjects would stay literal, unresolved
+        # `Person_1` (itself a declared token), the residual sweep would
+        # drop them, and this would regress to 0.
+        assert len(result.relations) == 2
+        subjects_objects = {(r.subject, r.object) for r in result.relations}
+        assert ("Alex", "Millfield") in subjects_objects
+        assert ("Alex", "reading") in subjects_objects
+        # The new predicate-invariant/residual-sweep exit gate must not
+        # introduce any false-positive drop on this correctly-scoped path.
+        assert graph.diagnostics.get("predicate_placeholder_dropped", 0) == 0
+        assert not graph.diagnostics.get("residual_dropped_facts")
 
 
 class TestSpeakerAnchorPipeline:
@@ -4707,7 +4974,7 @@ class TestSpeakerAnchorPipeline:
     def test_speaker0_survives_end_to_end_not_swept(self):
         """T5a — ``speaker0`` survives extraction -> anonymize -> SOTA ->
         deanon -> graph VERBATIM, and is never swept by
-        ``_strip_residual_placeholders`` (it doesn't match the
+        :func:`_apply_bindings`'s residual sweep (it doesn't match the
         placeholder pattern at all — verified structurally, not
         assumed)."""
         from paramem.graph.extractor import _sota_pipeline

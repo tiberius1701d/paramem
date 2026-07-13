@@ -1845,11 +1845,13 @@ def _fallback_plausibility_on_raw(
     pipeline drops all relations.
 
     Steps (ported from scripts/dev/compare_extraction.py L722-795):
-    1. Serialize graph.relations to fact dicts.
-    2. Strip any residual placeholder tokens — records drops in diagnostics.
-    3. If non-empty, run local plausibility filter; keep raw on None return.
-    4. Rebuild Relations, canonicalize symmetric predicates, filter entities.
-    5. Record fallback_path in diagnostics.
+    1. Serialize graph.relations to fact dicts. These are already
+       real-name, un-anonymized ``graph.relations`` — no placeholder
+       vocabulary exists at this point (nothing was ever anonymized on
+       this path), so there is nothing to sweep here.
+    2. If non-empty, run local plausibility filter; keep raw on None return.
+    3. Rebuild Relations, canonicalize symmetric predicates, filter entities.
+    4. Record fallback_path in diagnostics.
 
     Args:
         speaker_id: Speaker store ID stamped onto every reconstructed
@@ -1871,15 +1873,6 @@ def _fallback_plausibility_on_raw(
         }
         for r in graph.relations
     ]
-
-    # Strip residual placeholders from raw facts (defensive).
-    raw_facts, res_dropped = _strip_residual_placeholders(raw_facts)
-    if res_dropped:
-        graph.diagnostics["residual_dropped_facts"] = res_dropped
-        logger.warning(
-            "_fallback_plausibility_on_raw: dropped %d fact(s) with residual placeholders",
-            len(res_dropped),
-        )
 
     # Local plausibility filter (uses real names).
     if raw_facts and model is not None and tokenizer is not None:
@@ -2139,8 +2132,9 @@ def _sota_pipeline(
     # (:func:`_apply_bindings`).  When the LLM violates that contract
     # (rare under the tightened shape-contract prompt), the orphan
     # placeholder cannot be substituted at deanon time and the affected
-    # fact is dropped at ``_strip_residual_placeholders``.  Surface the
-    # violation here so prompt regressions are visible in ``journalctl``
+    # fact is dropped by :func:`_apply_bindings`'s residual sweep (the
+    # single deanon exit gate).  Surface the violation here so prompt
+    # regressions are visible in ``journalctl``
     # and ``graph.diagnostics`` rather than silently shedding facts.  This
     # remains a per-fact shed, unlike the SOTA-enrichment stage's
     # equivalent check below, which REJECTS THE WHOLE DELTA instead (see
@@ -2174,6 +2168,41 @@ def _sota_pipeline(
         else f
         for f in anon_facts
     ]
+
+    # Predicate invariant — the SAME fail-closed check the deanon exit
+    # gate applies (:func:`_apply_bindings`), run here too so a
+    # placeholder glued into a predicate by the LOCAL anonymizer LLM
+    # (e.g. ``language_proficiency_Language_3``) never even reaches
+    # SOTA. Declared vocabulary at this pre-SOTA point is
+    # ``reverse_mapping`` alone — SOTA has not run yet, so there are no
+    # ``sota_bindings``. Non-dict entries pass through unchanged
+    # (mirrors the rebuild above).
+    _anon_declared = _declared_placeholder_tokens(reverse_mapping)
+    _anon_kept: list = []
+    _anon_predicate_dropped: list = []
+    for f in anon_facts:
+        if isinstance(f, dict) and _contains_declared_token(
+            str(f.get("predicate", "")), _anon_declared
+        ):
+            _anon_predicate_dropped.append(f)
+        else:
+            _anon_kept.append(f)
+    anon_facts = _anon_kept
+    if _anon_predicate_dropped:
+        # Same disjoint list the deanon-stage predicate invariant appends
+        # to below — one category, recorded across both stages.
+        graph.diagnostics["predicate_placeholder_dropped_facts"] = (
+            graph.diagnostics.get("predicate_placeholder_dropped_facts", [])
+            + _anon_predicate_dropped
+        )
+        graph.diagnostics["predicate_placeholder_dropped"] = graph.diagnostics.get(
+            "predicate_placeholder_dropped", 0
+        ) + len(_anon_predicate_dropped)
+        logger.warning(
+            "Anonymizer-stage predicate invariant: dropped %d fact(s) with a "
+            "placeholder glued into the predicate field (never forwarded to SOTA).",
+            len(_anon_predicate_dropped),
+        )
 
     # Forward-path privacy guard: verify no real name leaked past anonymization
     # before sending anything to the cloud. On leak, attempt deterministic
@@ -2570,15 +2599,33 @@ def _sota_pipeline(
     # that ``observed`` was computed from).
     with phase_trace("deanon") as t:
         deanon_input_count = len(enriched_anon)
-        deanon_facts, dropped_facts = _apply_bindings(
+        deanon_facts, predicate_dropped, residual_dropped = _apply_bindings(
             enriched_anon, reverse_mapping, sota_bindings, observed
         )
+        # Disjoint by construction (_apply_bindings partitions the two
+        # categories itself — no caller-side recomputation): predicate
+        # invariant drops (pre-substitution copy) accumulate into the
+        # SAME list the anonymizer-stage predicate filter above appends
+        # to; residual-sweep drops (post-substitution copy) are this
+        # stage's own list.
+        if predicate_dropped:
+            graph.diagnostics["predicate_placeholder_dropped_facts"] = (
+                graph.diagnostics.get("predicate_placeholder_dropped_facts", []) + predicate_dropped
+            )
+            graph.diagnostics["predicate_placeholder_dropped"] = graph.diagnostics.get(
+                "predicate_placeholder_dropped", 0
+            ) + len(predicate_dropped)
+        if residual_dropped:
+            graph.diagnostics["residual_dropped_facts"] = residual_dropped
+        dropped_facts = predicate_dropped + residual_dropped
         if dropped_facts:
-            graph.diagnostics["residual_dropped_facts"] = dropped_facts
             logger.warning(
-                "Dropped %d fact(s) with residual placeholders post-substitution "
-                "(missing SOTA binding or anonymizer leak).",
+                "Dropped %d fact(s) post-substitution (%d predicate-invariant, "
+                "%d residual placeholder sweep — missing SOTA binding or "
+                "anonymizer leak).",
                 len(dropped_facts),
+                len(predicate_dropped),
+                len(residual_dropped),
             )
         deanon_dropped = deanon_input_count - len(deanon_facts)
         if deanon_dropped:
@@ -3162,8 +3209,9 @@ def _check_mapping_totality(
     (``sota_bindings=sota_bindings, observed=<rendered tokens>,
     diagnostic_key="sota_pending_orphans", stage="sota_enrichment"``).
     For the anonymizer stage the caller only logs the violation — the
-    affected fact is dropped at :func:`_strip_residual_placeholders`,
-    the correct fail-closed semantic there.  For the SOTA-enrichment
+    affected fact is dropped by :func:`_apply_bindings`'s residual sweep
+    (the single deanon exit gate), the correct fail-closed semantic
+    there.  For the SOTA-enrichment
     stage the caller (:func:`_sota_pipeline`) instead REJECTS THE WHOLE
     DELTA on a non-empty verdict and falls back to the pre-enrichment
     local-extract facts — a single unbound placeholder no longer sheds
@@ -3426,6 +3474,57 @@ def _repair_anonymization_leaks(
 _PLACEHOLDER_TOKEN_RE = re.compile(r"\{(\w+_\d+)\}|\b([A-Z][A-Za-z]*_\d+)\b")
 
 
+def _declared_placeholder_tokens(
+    reverse: dict[str, str], sota_bindings: dict[str, str] | None = None
+) -> set[str]:
+    """The declared placeholder-token vocabulary for a deanon call.
+
+    Every key in ``reverse`` (the anonymizer's CORE map, ``placeholder ->
+    entity_name``) plus every key in ``sota_bindings`` (SOTA's own minted
+    placeholders) is a token this session's pipeline actually declared —
+    the ONE vocabulary the fail-closed predicate invariant and residual
+    sweep (:func:`_apply_bindings`) test membership against.
+
+    Deliberately NOT :data:`_PLACEHOLDER_TOKEN_RE`: that pattern's
+    ``\\b`` anchor misses a token glued onto a longer identifier
+    (``language_proficiency_Language_3`` does not match
+    ``\\bLanguage_3\\b``) — exactly the class of bug this
+    vocabulary-based check exists to catch. Token SHAPE is irrelevant
+    here (bare today, braced after a future format flip); only
+    DECLARED-ness — membership in one of the two mapping tables —
+    matters, so this helper survives that flip unchanged.
+    """
+    tokens: set[str] = {k for k in reverse if isinstance(k, str) and k}
+    if sota_bindings:
+        tokens.update(k for k in sota_bindings if isinstance(k, str) and k)
+    return tokens
+
+
+def _contains_declared_token(text: str, declared: set[str]) -> bool:
+    """True iff ``text`` contains any token in ``declared`` as a literal
+    substring, anywhere in the string — no regex, no word-boundary
+    anchor. This is what lets the check catch a token glued into a
+    longer identifier (``language_proficiency_Language_3``) that
+    :data:`_PLACEHOLDER_TOKEN_RE` misses.
+    """
+    return any(tok in text for tok in declared)
+
+
+# The fields of a fact dict that constitute a `Relation` — exactly the
+# keys read at the `Relation(**fact)`-equivalent construction site in
+# `_sota_pipeline` (subject/predicate/object/relation_type/confidence/
+# symmetric; `speaker_id` is stamped separately from the session, never
+# read off the fact). Any OTHER key on a fact dict (e.g. an `evidence`
+# field an LLM invents) never reaches `Relation` and therefore cannot
+# leak a placeholder anywhere observable — the residual sweep in
+# `_apply_bindings` only tests these fields, and the SOTA enrichment
+# delta boundary (`_parse_enrichment_delta`) strips any other key from
+# `add`/`modify` entries before they ever enter `enriched_anon`.
+_FACT_FIELDS: frozenset[str] = frozenset(
+    {"subject", "predicate", "object", "relation_type", "confidence", "symmetric"}
+)
+
+
 def _is_scalar_value(value: str) -> bool:
     """True iff ``value`` is a verbatim identifier rather than a content phrase.
 
@@ -3546,59 +3645,84 @@ def _apply_bindings(
     reverse: dict[str, str],
     sota_bindings: dict[str, str],
     observed: set[str] | None = None,
-) -> tuple[list[dict], list[dict]]:
-    """De-anonymize facts via state-machine substitution.
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """De-anonymize facts via state-machine substitution — the SINGLE
+    deanon exit gate, in three ordered steps:
 
-    Substitutes with :func:`_resolution_map` (``reverse``, ``sota_bindings``,
-    ``observed``) — the SAME legality domain :func:`_check_mapping_totality`
-    checks, rendered in both braced and bare form:
+    1. **Predicate invariant (BEFORE substitution).** A fact whose
+       ``predicate`` field contains ANY token from
+       :func:`_declared_placeholder_tokens` (``reverse`` keys union
+       ``sota_bindings`` keys), as a literal substring, is dropped
+       outright — no splitting, no repair. This runs first so a
+       poisoned predicate (``at_Org_1``) is never "resolved" into a
+       garbage predicate (``at_Acme``): the predicate field is never a
+       substitution target below, so checking it after substitution
+       would find nothing wrong with an already-corrupted predicate.
+    2. **Substitute** subject/object with :func:`_resolution_map`
+       (``reverse``, ``sota_bindings``, ``observed``) — the SAME
+       legality domain :func:`_check_mapping_totality` checks, rendered
+       in both braced and bare form:
 
-    * **Anonymizer reverse map** (``reverse`` arg) —
-      ``placeholder -> entity_name`` produced by
-      :func:`_build_anonymization_mapping`.  Earlier revisions inverted
-      the forward mapping here, which was lossy when PII attributes
-      folded onto the entity placeholder; the explicit reverse is now
-      produced alongside the forward map.
-    * **SOTA bindings** (``sota_bindings`` arg) — ``placeholder_name -> real_text``
-      that SOTA emitted alongside its enriched facts (new entities SOTA
-      minted, e.g. ``Event_1``).
-    * **``observed``** (trailing, defaulted ``None``) — ``None`` means
-      CORE UNSCOPED (every ``reverse`` entry is legal; this is what makes
-      the five pre-existing positional-only call sites in
-      ``test_extraction_pipeline.py`` keep passing unchanged as the
-      CORE-unscoped regression net).  A ``set`` means CORE SCOPED to it —
-      see :func:`_resolution_map`.  ``reverse`` wins on any key collision
-      in EITHER mode (CORE PRECEDENCE, T2f) — deterministic entity names
-      over SOTA-sourced values, never the reverse.
+       * **Anonymizer reverse map** (``reverse`` arg) —
+         ``placeholder -> entity_name`` produced by
+         :func:`_build_anonymization_mapping`.  Earlier revisions
+         inverted the forward mapping here, which was lossy when PII
+         attributes folded onto the entity placeholder; the explicit
+         reverse is now produced alongside the forward map.
+       * **SOTA bindings** (``sota_bindings`` arg) —
+         ``placeholder_name -> real_text`` that SOTA emitted alongside
+         its enriched facts (new entities SOTA minted, e.g.
+         ``Event_1``).
+       * **``observed``** (trailing, defaulted ``None``) — ``None``
+         means CORE UNSCOPED (every ``reverse`` entry is legal; this is
+         what makes the five pre-existing positional-only call sites in
+         ``test_extraction_pipeline.py`` keep passing unchanged as the
+         CORE-unscoped regression net).  A ``set`` means CORE SCOPED to
+         it — see :func:`_resolution_map`.  ``reverse`` wins on any key
+         collision in EITHER mode (CORE PRECEDENCE, T2f) — deterministic
+         entity names over SOTA-sourced values, never the reverse.
 
-    The union round-trips a placeholder regardless of which form (braced
-    or bare) it was actually emitted in: SOTA's contract asks for braced
-    minted placeholders and bare anonymizer placeholders, but models
-    don't always comply, so both maps are tried against both forms.
-    Braced literal substitution runs first (unambiguous, no
-    word-boundary needed), then word-boundary substitution over the same
-    map catches bare occurrences (``Person_2's cousin`` -> ``Alex's
-    cousin``) and resolves any bare placeholder nested inside a bound
-    value (``"Senior Engineer at Org_1"`` -> ``"Senior Engineer at
-    Acme"``).
+       The union round-trips a placeholder regardless of which form
+       (braced or bare) it was actually emitted in: SOTA's contract asks
+       for braced minted placeholders and bare anonymizer placeholders,
+       but models don't always comply, so both maps are tried against
+       both forms. Braced literal substitution runs first (unambiguous,
+       no word-boundary needed), then word-boundary substitution over
+       the same map catches bare occurrences (``Person_2's cousin`` ->
+       ``Alex's cousin``) and resolves any bare placeholder nested
+       inside a bound value (``"Senior Engineer at Org_1"`` ->
+       ``"Senior Engineer at Acme"``).
+    3. **Residual sweep, any FACT field (AFTER substitution).** Any
+       field in :data:`_FACT_FIELDS` (the fields that actually reach
+       ``Relation`` — an LLM-invented extra like ``evidence`` is never
+       swept, since it never reaches the graph either) still containing
+       a declared token (:func:`_contains_declared_token`) — or a
+       placeholder-shaped token per :data:`_PLACEHOLDER_TOKEN_RE`, kept
+       as the fail-closed backstop for an UNDECLARED orphan the
+       predicate/declared-token checks cannot see — is dropped. Causes,
+       direct-call context (this function invoked in isolation, e.g. by
+       its own unit tests):
+         a. SOTA introduced a braced placeholder but omitted its binding.
+         b. SOTA emitted a bare placeholder that was never in the
+            anonymizer mapping (anonymizer leak).
+         c. Composite strings where one of multiple placeholders
+            couldn't be resolved.
+       Inside the full pipeline (:func:`_sota_pipeline`), causes (a) and
+       (b) are now intercepted upstream by :func:`_check_mapping_totality`'s
+       SOTA-enrichment-stage rejection gate — a bad mint rejects the
+       WHOLE delta before it reaches this function, rather than shedding
+       just the one fact.  This sweep remains the fail-closed backstop
+       for cause (c) and for a genuine anonymizer-stage leak (R3).
 
-    Facts whose subject or object still contains a placeholder pattern
-    after substitution are dropped via the existing residual sweep.
-    Causes, direct-call context (this function invoked in isolation,
-    e.g. by its own unit tests):
-      1. SOTA introduced a braced placeholder but omitted its binding.
-      2. SOTA emitted a bare placeholder that was never in the anonymizer
-         mapping (anonymizer leak).
-      3. Composite strings where one of multiple placeholders couldn't be
-         resolved.
-    Inside the full pipeline (:func:`_sota_pipeline`), causes 1 and 2 are
-    now intercepted upstream by :func:`_check_mapping_totality`'s
-    SOTA-enrichment-stage rejection gate — a bad mint rejects the WHOLE
-    delta before it reaches this function, rather than shedding just the
-    one fact.  This sweep remains the fail-closed backstop for cause 3
-    and for a genuine anonymizer-stage leak (R3).
+    Non-dict entries in ``facts`` are silently skipped — never counted
+    in any returned list.
 
-    Returns ``(kept_facts, dropped_facts)``.
+    Returns ``(kept_facts, predicate_dropped, residual_dropped)`` — the
+    two drop categories are returned ALREADY partitioned (callers must
+    not recompute the split): ``predicate_dropped`` holds the exact
+    pre-substitution input dict for each fact step 1 removed;
+    ``residual_dropped`` holds the post-substitution copy for each fact
+    step 3 removed.
 
     Replaces the previous LLM-based deanon attempt that crashed on the
     largest chunk's prompt with ``device not ready`` (VRAM exhaustion on
@@ -3606,13 +3730,25 @@ def _apply_bindings(
     (``_extract_sota_bindings``) which produced bogus mappings under
     multi-token replace blocks (bug 5).
     """
+    declared = _declared_placeholder_tokens(reverse, sota_bindings)
+
+    # Step 1 — predicate invariant, BEFORE substitution.
+    pre_filtered: list[dict] = []
+    predicate_dropped: list[dict] = []
+    for f in facts:
+        if not isinstance(f, dict):
+            continue
+        if _contains_declared_token(str(f.get("predicate", "")), declared):
+            predicate_dropped.append(f)
+            continue
+        pre_filtered.append(f)
+
+    # Step 2 — substitute subject/object (unchanged semantics).
     resolve = _resolution_map(reverse, sota_bindings, observed)
     braced_map: dict[str, str] = {f"{{{k}}}": v for k, v in resolve.items()}
 
     substituted: list[dict] = []
-    for f in facts:
-        if not isinstance(f, dict):
-            continue
+    for f in pre_filtered:
         subj = str(f.get("subject", ""))
         obj = str(f.get("object", ""))
         # Pass 1: braced literal substring replace (unambiguous, no
@@ -3629,51 +3765,25 @@ def _apply_bindings(
         obj = _substitute_whole_words(obj, resolve)
         substituted.append({**f, "subject": subj, "object": obj})
 
-    # Residual sweep catches unresolved placeholders (missing binding, anon
-    # leak, etc.). Reuses existing tested helper.
-    return _strip_residual_placeholders(substituted)
-
-
-def _strip_residual_placeholders(
-    facts: list[dict],
-) -> tuple[list[dict], list[dict]]:
-    """Drop facts whose subject or object contains a residual placeholder token.
-
-    Runs post de-anonymization. Catches anything shaped like a placeholder —
-    either braced `{Prefix_N}` or bare `Prefix_N` with capitalised prefix.
-    No prefix enumeration; the pattern is type-agnostic. Stays the
-    fail-closed backstop for a genuine anonymizer-stage leak (R3) and any
-    residual case; covers:
-    1. (Retired as a reachable SOTA-enrichment cause.) A SOTA-invented
-       placeholder never in the mapping — this used to reach here, but
-       `_check_mapping_totality`'s SOTA-enrichment-stage rejection gate
-       (in `_sota_pipeline`) now catches it upstream: a bad mint rejects
-       the WHOLE delta and reverts to the pre-enrichment local-extract
-       facts before they ever reach this sweep. Kept as defense-in-depth
-       for any future direct caller of `_apply_bindings` that bypasses
-       the gate.
-    2. De-anonymization couldn't reverse-map a placeholder — a genuine
-       anonymizer-stage leak (mapping gap), still live and unaffected by
-       the rejection gate above.
-    3. Composite strings like `Person_2's Support` where the placeholder is
-       embedded in a longer phrase (substring search).
-
-    Returns `(kept_facts, dropped_facts)`. Each dropped fact is the exact
-    input object the caller can inspect for audit / diagnostics — no
-    `id()`-based reconstruction required.
-    """
+    # Step 3 — residual sweep, ANY FACT field (never a non-fact field an
+    # LLM invented — see `_FACT_FIELDS`), fail-closed. A fact is "clean"
+    # only if none of its fact fields carries a declared token or a
+    # placeholder-shaped token; either is grounds to drop the whole
+    # fact.
     kept: list[dict] = []
-    dropped: list[dict] = []
-    for f in facts:
-        if not isinstance(f, dict):
-            continue
-        s = str(f.get("subject", ""))
-        o = str(f.get("object", ""))
-        if _PLACEHOLDER_TOKEN_RE.search(s) or _PLACEHOLDER_TOKEN_RE.search(o):
-            dropped.append(f)
-            continue
-        kept.append(f)
-    return kept, dropped
+    residual_dropped: list[dict] = []
+    for f in substituted:
+        residual = any(
+            isinstance(v, str)
+            and (_PLACEHOLDER_TOKEN_RE.search(v) or _contains_declared_token(v, declared))
+            for v in (f.get(field) for field in _FACT_FIELDS)
+        )
+        if residual:
+            residual_dropped.append(f)
+        else:
+            kept.append(f)
+
+    return kept, predicate_dropped, residual_dropped
 
 
 def _normalize_anonymization_mapping(mapping: dict) -> tuple[dict, dict]:
@@ -4733,6 +4843,16 @@ def _parse_enrichment_delta(
     Indices outside ``[0, n_facts)`` in ``drop`` / ``modify`` are
     skipped with a warning rather than failing the whole parse — a
     single bad index shouldn't void an otherwise-valid delta.
+
+    Every ``add`` entry and every ``modify`` entry's ``fields`` dict is
+    restricted to :data:`_FACT_FIELDS` — the fields that actually reach
+    ``Relation``.  A key outside that set (e.g. an ``evidence`` field an
+    LLM invents) is stripped, not rejected: the fact itself (subject,
+    predicate, object, ...) still applies, only the non-fact key is
+    dropped, so it can never carry a residual placeholder into
+    ``enriched_anon``, debug snapshots, or diagnostics — nor can it make
+    the residual sweep in :func:`_apply_bindings` shed an otherwise-valid
+    fact over a field that was never going to reach the graph anyway.
     """
     if raw is None or not raw.strip():
         return None
@@ -4749,13 +4869,17 @@ def _parse_enrichment_delta(
         )
         return None
 
-    # add[] — every entry must be a dict; skip the rest.
+    # add[] — every entry must be a dict; skip the rest. Restricted to
+    # _FACT_FIELDS: any other key an LLM invents (e.g. "evidence") is
+    # stripped here, before the entry ever enters enriched_anon.
     add: list[dict] = []
+    unknown_fields_stripped = 0
     raw_add = parsed.get("add")
     if isinstance(raw_add, list):
         for entry in raw_add:
             if isinstance(entry, dict):
-                add.append(entry)
+                unknown_fields_stripped += sum(1 for k in entry if k not in _FACT_FIELDS)
+                add.append({k: v for k, v in entry.items() if k in _FACT_FIELDS})
     elif raw_add is not None:
         logger.warning(
             "enrichment delta: 'add' has non-list shape %s — ignored",
@@ -4764,6 +4888,8 @@ def _parse_enrichment_delta(
 
     # modify[] — each entry is {"index": <int>, "fields": {<partial>}};
     # tolerate either out-of-range indices or non-dict fields by skipping.
+    # ``fields`` is restricted to _FACT_FIELDS for the same reason as
+    # ``add`` above.
     modify: list[tuple[int, dict]] = []
     out_of_range_mod = 0
     raw_modify = parsed.get("modify")
@@ -4777,6 +4903,8 @@ def _parse_enrichment_delta(
             fields = entry.get("fields")
             if not isinstance(fields, dict):
                 continue
+            unknown_fields_stripped += sum(1 for k in fields if k not in _FACT_FIELDS)
+            fields = {k: v for k, v in fields.items() if k in _FACT_FIELDS}
             if 0 <= idx < n_facts:
                 modify.append((idx, fields))
             else:
@@ -4791,6 +4919,13 @@ def _parse_enrichment_delta(
             "enrichment delta: %d modify index(es) out of range [0, %d) — skipped",
             out_of_range_mod,
             n_facts,
+        )
+    if unknown_fields_stripped:
+        logger.warning(
+            "enrichment delta: stripped %d non-fact field(s) outside %s from "
+            "'add'/'modify' entries",
+            unknown_fields_stripped,
+            sorted(_FACT_FIELDS),
         )
 
     # drop[] — tolerates the same per-entry shapes as `_parse_drop_set`

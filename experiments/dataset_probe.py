@@ -333,9 +333,19 @@ def _build_session_diagnostics(
     # plausibility_dropped can be negative when SOTA enrichment adds more
     # facts than plausibility removes.  Split into actual drops (≥0) and
     # enrichment additions (≥0) so raw_fact_count stays sane.
+    #
+    # `residual_dropped_facts` (deanon-stage residual sweep, step 3 of
+    # `_apply_bindings`) and `predicate_placeholder_dropped_facts` (the
+    # predicate-invariant drops from BOTH the anonymizer-stage filter and
+    # deanon-stage step 1) are disjoint by construction — see
+    # `_apply_bindings`'s return contract — so summing both here cannot
+    # double-count the same dropped fact.
     plaus_raw = _as_count(diag.get("plausibility_dropped"))
     drops = {
         "residual_dropped_facts": _as_count(diag.get("residual_dropped_facts")),
+        "predicate_placeholder_dropped_facts": _as_count(
+            diag.get("predicate_placeholder_dropped_facts")
+        ),
         "plausibility_dropped": max(plaus_raw, 0),
         "mapping_ambiguous_dropped": _as_count(diag.get("mapping_ambiguous_dropped")),
         "residual_leaked_triples_dropped": _as_count(diag.get("residual_leaked_triples_dropped")),
@@ -935,6 +945,7 @@ def main() -> None:
                         "post_plausibility_count": 0,
                         "drops": {
                             "residual_dropped_facts": 0,
+                            "predicate_placeholder_dropped_facts": 0,
                             "plausibility_dropped": 0,
                             "mapping_ambiguous_dropped": 0,
                             "residual_leaked_triples_dropped": 0,

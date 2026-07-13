@@ -406,9 +406,9 @@ class TestPlausibilityPromptContract:
         The prior R4 ("Unresolved placeholder in real-name input") was
         tied to the constrained ``^(Person|City|Country|Org|Thing)_\\d+$``
         regex that became incoherent with the open-vocabulary anonymizer
-        pivot.  It was also structurally redundant with
-        ``_strip_residual_placeholders`` running inside ``_apply_bindings``
-        at the deanon stage, before plausibility.
+        pivot.  It was also structurally redundant with the residual
+        sweep inside ``_apply_bindings`` at the deanon stage, before
+        plausibility.
 
         The grounding refactor revised the remaining rules: lexical
         token lists became illustrative parentheticals, and a new R3

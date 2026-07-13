@@ -723,18 +723,8 @@ def _enrich_uniformly(
         needed. A PA never aborts; the pipeline always produces a final
         result, even if SOTA enrichment was unsafe or failed.
         """
-        from paramem.graph.extractor import (
-            _strip_residual_placeholders as _sweep,
-        )
-
         status["fallback_path"] = reason
         raw_facts = serialize_relations(extracted)
-        # Defense-in-depth: if the local extractor produced placeholder-like
-        # artifacts (very rare), drop them before plausibility.
-        raw_facts, sweep_dropped = _sweep(raw_facts)
-        if sweep_dropped:
-            status["residual_placeholders_dropped"] = len(sweep_dropped)
-            status["residual_dropped_facts"] = sweep_dropped
         status["facts_pre_plausibility"] = list(raw_facts)
         if not raw_facts or plausibility_judge == "off":
             status["plausibility"] = "off" if plausibility_judge == "off" else "skipped"
@@ -794,7 +784,6 @@ def _enrich_uniformly(
         _mapping_is_canonical,
         _normalize_anonymization_mapping,
         _repair_anonymization_leaks,
-        _strip_residual_placeholders,
     )
 
     mapping, norm_stats = _normalize_anonymization_mapping(mapping)
@@ -1002,21 +991,18 @@ def _enrich_uniformly(
             status,
         )
 
-    # Stage 3b: de-anonymize (final result path) + placeholder sweep.
-    deanon_facts_pre_sweep = _deanon_list(enriched_anon)
-    # Preserve the pre-sweep de-anonymized output for diagnostics. When the
+    # Stage 3b: de-anonymize (final result path).  The residual-placeholder
+    # sweep this stage used to run (`_strip_residual_placeholders`) is
+    # retired along with the function itself; the main pipeline's exit
+    # gate now lives entirely in `_apply_bindings`, which this comparison
+    # script does not call (it exercises its own pre-`_apply_bindings`
+    # `_deanon_list` implementation for the old-vs-new A/B comparison).
+    deanon_facts = _deanon_list(enriched_anon)
+    # Preserve the de-anonymized output for diagnostics. When the
     # all-dropped fallback later overwrites facts_pre/post_plausibility with
     # raw-extraction data, this field still shows what the primary pipeline
-    # actually produced before the residual sweep ran.
-    status["primary_deanon_facts"] = list(deanon_facts_pre_sweep)
-    deanon_facts, dropped_facts = _strip_residual_placeholders(deanon_facts_pre_sweep)
-    if dropped_facts:
-        status["residual_placeholders_dropped"] = len(dropped_facts)
-        status["residual_dropped_facts"] = dropped_facts
-        logger.warning(
-            "Dropped %d fact(s) with residual placeholder strings post-de-anon.",
-            len(dropped_facts),
-        )
+    # actually produced.
+    status["primary_deanon_facts"] = list(deanon_facts)
 
     # If no plausibility runs (any reason — off, stage mismatch, empty), the
     # snapshot keys reflect the de-anonymized post-enrichment state.
