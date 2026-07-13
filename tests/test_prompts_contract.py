@@ -289,6 +289,109 @@ class TestEnrichmentPromptContract:
         rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
         assert "Before returning" in rendered
 
+    # -- Speaker anchor (binding-totality plan, C9/P0) -----------------
+    #
+    # ``test_requires_grounding_of_new_placeholders`` above passed for
+    # months asserting only that the grounding RULE was stated, while
+    # three few-shots twenty lines below taught the exact opposite (a
+    # bare, unbound mint). The tests below assert on EXAMPLE CONTENT —
+    # not rule presence — so they cannot pass while the corpus
+    # contradicts itself the way that gap did.
+
+    def test_no_example_asserts_i_me_my_maps_to_person_1(self):
+        """STRUCTURAL — scans every blank-line-separated block in the
+        prompt, not a hardcoded phrase.  A block that talks about the
+        speaker (mentions 'speaker' in its descriptive text) but has no
+        'speaker0' anchor present must not use ``Person_1`` as the fact
+        subject — that is exactly how 'Person_1 (the speaker' and its
+        reworded cousin 'Person_1 — the speaker' both re-teach the
+        positional guess this plan retires.  A test that only checked
+        the literal substring passed for months while three few-shots
+        taught the opposite; this one cannot pass while any block does."""
+        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        blocks = re.split(r"\n\s*\n", tmpl)
+        for block in blocks:
+            if "speaker" not in block.lower():
+                continue
+            if "speaker0" in block:
+                # The anchor is present and doing the speaker-referring
+                # work in this block — Person_1, if it also appears, is
+                # not standing in for it.
+                continue
+            assert not re.search(r'"subject"\s*:\s*"\{?\{?Person_1\}?\}?"', block), (
+                "Block mentions 'speaker' but has no speaker0 anchor "
+                "while using Person_1 as a fact subject — this re-"
+                f"teaches Person_1 == the speaker: {block!r}"
+            )
+        assert '"my"' in tmpl and "speaker0" in tmpl, (
+            "Enrichment prompt must still teach first-person coreference, now grounded on speaker0."
+        )
+
+    def test_first_person_few_shots_resolve_to_speaker0(self):
+        """The 'my wife' / 'my sister's husband' / 'my father' coreference
+        few-shots must bind the speaker to 'speaker0' — not a Person_N —
+        in the delta they actually emit."""
+        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        for anchor in (
+            '"my wife is also a teacher"',
+            '"my sister\'s husband"',
+            '"my father is also an engineer"',
+        ):
+            idx = tmpl.index(anchor)
+            window = tmpl[idx : idx + 400]
+            assert '"subject":"speaker0"' in window or '"subject": "speaker0"' in window, (
+                f"First-person few-shot {anchor!r} must bind the speaker "
+                f"to 'speaker0', not a positionally-guessed Person_N: {window!r}"
+            )
+
+    def test_non_speaker_cast_as_person_1(self):
+        """At least one few-shot must show Person_1 naming someone OTHER
+        than the speaker, so the model cannot re-derive 'Person_1 = me'
+        positionally even without an explicit rule saying so."""
+        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        idx = tmpl.index('"we went there last summer"')
+        window = tmpl[idx : idx + 400]
+        assert "speaker0" in window, "Example must still ground the speaker as speaker0."
+        assert '"subject":"Person_1"' in window or '"subject": "Person_1"' in window, (
+            "Example must cast Person_1 as a THIRD PARTY (not the speaker) "
+            "so Person_1 cannot be re-derived as 'the speaker' positionally."
+        )
+
+    def test_every_positive_mint_has_a_binding(self):
+        """STRUCTURAL — scans EVERY blank-line-separated block in the
+        prompt for `{Prefix_N}` braced mints and requires a matching
+        `bindings` entry in the SAME block, rather than checking a
+        hardcoded list of anchors a human happened to think of.  A
+        newly-added few-shot with an unbound mint fails this test
+        automatically — the exact shape (bare unbound mint) that
+        produced the observed 5-in-1-out data loss: SOTA minting
+        Person_2/Person_3 with no binding at all.  NEGATIVE/WRONG blocks
+        are exempt — they deliberately demonstrate the unbound-mint
+        failure as the thing NOT to do."""
+        tmpl = _load_prompt("sota_enrichment.txt", required=True)
+        rendered = tmpl.format(transcript="x", facts_json="[]")
+        mint_re = re.compile(r"\{([A-Z][A-Za-z]*_\d+)\}")
+        blocks = re.split(r"\n\s*\n", rendered)
+        checked_any = False
+        for block in blocks:
+            if "WRONG" in block or block.lstrip().startswith("NEGATIVE"):
+                continue
+            if '"subject"' not in block:
+                # Not a fact-example block (e.g. the contract's own
+                # prose illustrating the braced-form syntax) — nothing
+                # to bind.
+                continue
+            for key in set(mint_re.findall(block)):
+                checked_any = True
+                assert f'"{key}"' in block and "bindings" in block, (
+                    f"Positive example block mints {{{key}}} without a "
+                    f"matching bindings entry in the same block: {block!r}"
+                )
+        assert checked_any, (
+            "No positive-example mints were found to check — the scan "
+            "regex or block split likely drifted from the prompt format."
+        )
+
 
 class TestPlausibilityPromptContract:
     def test_renders_without_format_errors(self):
@@ -515,6 +618,25 @@ class TestAnonymizationPrompt:
         # A simple check: no single { immediately followed by a letter (unrendered placeholder).
         stray = re.findall(r"(?<!\{)\{[a-z_]+\}", rendered)
         assert not stray, f"Stray unrendered placeholder(s) found in rendered prompt: {stray!r}"
+
+    def test_speaker_rule_present_and_no_example_maps_it(self):
+        """The prompt states speaker{N} is already anonymous and must
+        stay verbatim; NONE of the worked examples map a speaker{N}
+        token (the rule generalises — it isn't taught via an example
+        that could drift out of sync with the rule statement)."""
+        tmpl = _load_prompt("anonymization.txt", required=True)
+        lower = tmpl.lower()
+        assert "speaker" in lower and "verbatim" in lower, (
+            "anonymization.txt must state the speaker{N}-stays-verbatim rule."
+        )
+        examples_section = tmpl[tmpl.index("## Examples") :]
+        assert "speaker" not in examples_section.lower(), (
+            "No anonymization.txt example may map a speaker{N} token."
+        )
+        # Must still render cleanly with the new rule line present.
+        rendered = self._render(tmpl)
+        assert "{facts_json}" not in rendered
+        assert "{transcript}" not in rendered
 
 
 class TestEntityCorrectionPrompt:
@@ -792,14 +914,20 @@ class TestB2AnonymizerPrivacy:
     Under id-as-subject the session speaker entity is named ``speaker0``
     (not the display name).  The deterministic builder in
     ``_build_anonymization_mapping`` must still cover the display name
-    ("Tobias") so it cannot egress to SOTA verbatim in the anonymized
-    transcript.
+    ("Alex") so it cannot egress to SOTA verbatim in the anonymized
+    transcript — but the anchor itself (``speaker0``) is ALREADY
+    anonymous and must NEVER become a forward-map key (that would mean
+    minting a placeholder for something already anonymous — the
+    speaker-anchor bug the binding-totality plan retires).  A disclosed
+    display name folds onto the anchor (``speaker0``) directly, not onto
+    a fresh ``Person_N``.
 
     Two paths:
-    1. Named speaker (``speaker_name="Tobias"``): display name must be
-       covered under the speaker entity placeholder.
-    2. Anonymous speaker (``speaker_name=None``): ``speaker0`` is covered
-       by the entity-mint pass; no leak.
+    1. Named speaker (``speaker_name="Alex"``): display name must be
+       covered, folded onto the ``speaker0`` anchor.
+    2. Anonymous speaker (``speaker_name=None``): nothing needs scrubbing
+       — ``speaker0`` is never a forward-map key; the empty map is the
+       correct, safe result.
     """
 
     @staticmethod
@@ -822,8 +950,9 @@ class TestB2AnonymizerPrivacy:
         )
 
     def test_named_speaker_display_name_covered(self):
-        """When speaker entity is speaker0 and display name is 'Tobias',
-        the anonymizer must cover 'Tobias' under the speaker placeholder.
+        """When speaker entity is speaker0 and display name is 'Alex',
+        the anonymizer must fold 'Alex' onto the speaker0 anchor —
+        never mint a Person_N for either form.
         """
         from paramem.graph.extractor import _build_anonymization_mapping
 
@@ -832,22 +961,27 @@ class TestB2AnonymizerPrivacy:
             graph,
             {},
             pii_scope={"person"},
-            speaker_name="Tobias",
+            speaker_name="Alex",
         )
-        # speaker0 is covered by the entity-mint pass.
-        assert "speaker0" in forward, "speaker0 entity must be in forward mapping"
-        # Tobias must be covered by the speaker-name seeding branch.
-        assert "Tobias" in forward, (
-            "Display name 'Tobias' must be covered in the forward mapping; "
+        # speaker0 is already anonymous — it is NEVER a forward-map key
+        # (that would mean minting a placeholder for it).
+        assert "speaker0" not in forward, (
+            "speaker0 is already anonymous and must never be a forward-map "
+            "key — minting a placeholder for it is the speaker-anchor bug."
+        )
+        # Alex must still be covered by the speaker-name seeding branch.
+        assert "Alex" in forward, (
+            "Display name 'Alex' must be covered in the forward mapping; "
             "otherwise it can egress verbatim to SOTA."
         )
-        # Both map to the same placeholder (speaker entity reuse).
-        assert forward["speaker0"] == forward["Tobias"], (
-            "speaker0 and Tobias must share the same placeholder (speaker entity reuse)."
+        # Alex folds onto the anchor itself, not a minted placeholder.
+        assert forward["Alex"] == "speaker0", (
+            "The disclosed display name must fold onto the speaker0 "
+            "anchor directly, not onto a freshly-minted Person_N."
         )
 
     def test_named_speaker_anonymized_transcript_excludes_display_name(self):
-        """Transcript containing 'Tobias' verbatim is scrubbed when display name is seeded."""
+        """Transcript containing 'Alex' verbatim is scrubbed when display name is seeded."""
         from paramem.graph.extractor import _anonymize_transcript, _build_anonymization_mapping
 
         graph = self._make_graph("speaker0", "speaker0")
@@ -855,16 +989,16 @@ class TestB2AnonymizerPrivacy:
             graph,
             {},
             pii_scope={"person"},
-            speaker_name="Tobias",
+            speaker_name="Alex",
         )
-        raw_transcript = "[user] Hi, I'm Tobias and I work at Acme."
+        raw_transcript = "[user] Hi, I'm Alex and I work at Acme."
         anon = _anonymize_transcript(raw_transcript, forward)
-        assert "Tobias" not in anon, (
-            "Anonymized transcript must not contain the display name 'Tobias'."
-        )
+        assert "Alex" not in anon, "Anonymized transcript must not contain the display name 'Alex'."
 
     def test_anonymous_speaker_speaker0_covered_no_leak(self):
-        """Anonymous speaker (speaker_name=None): speaker0 entity is covered, no crash."""
+        """Anonymous speaker (speaker_name=None): nothing needs scrubbing —
+        speaker0 is never a forward-map key; no crash, empty map is safe.
+        """
         from paramem.graph.extractor import _build_anonymization_mapping
 
         graph = self._make_graph("speaker0", "speaker0")
@@ -874,9 +1008,9 @@ class TestB2AnonymizerPrivacy:
             pii_scope={"person"},
             speaker_name=None,
         )
-        # speaker0 covered by entity-mint pass.
-        assert "speaker0" in forward
-        # No crash; result is a valid mapping.
+        # speaker0 is already anonymous — never minted, never a forward key.
+        assert "speaker0" not in forward
+        # No crash; result is a valid (here, empty) mapping.
         assert isinstance(forward, dict)
 
 

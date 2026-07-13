@@ -9,6 +9,7 @@ Each placeholder is `<Prefix>_<N>` where:
 
 ## Rules
 
+- **`speaker{{N}}` (e.g. `speaker0`) is already anonymous — leave it VERBATIM.** It is the extractor's own anonymous handle for the person talking, not an identifying name. NEVER add a `speaker{{N}} → Person_N` entry to `mapping`, and never treat `speaker{{N}}` as a name to anonymize.
 - **Anonymize-or-not is decided by the rules below** (identifying names → anonymize; common nouns and descriptive phrases → leave verbatim). When in doubt, leave verbatim. Once you HAVE decided to replace a name with a placeholder, you MUST add the `real_name → placeholder` entry to `mapping` in the same response. A placeholder appearing in a fact without a corresponding mapping entry causes the fact to be silently dropped at downstream verification.
 - Mapping direction is `real_name → placeholder`: real name is the JSON KEY, placeholder is the JSON VALUE.
 - Use the SAME placeholder for every occurrence of a name across the facts.

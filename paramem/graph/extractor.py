@@ -1248,7 +1248,7 @@ def _parse_extraction(
         speaker_id: Speaker store ID (e.g. ``"speaker0"``).  Stamped onto
             every relation as provenance and used to identify the session
             speaker entity.  Required — callers must always supply a real id.
-        speaker_name: Display name of the speaker (e.g. ``"Tobias"``).  Used
+        speaker_name: Display name of the speaker (e.g. ``"Alex"``).  Used
             for document-source exact-full-name binding in
             :func:`_stamp_speaker_entity` (fires only when ``source_type ==
             "document"`` and the name is multi-token — see that function's
@@ -1314,7 +1314,7 @@ def _stamp_speaker_entity(
     Two responsibilities compose here, in order:
 
     1. **Exact-full-name rewrite (document sources only).** Third-person
-       documents (e.g. a CV: "Tobias Preusser led the team") describe the
+       documents (e.g. a CV: "Alex Walker led the team") describe the
        speaker by literal name rather than self-reference, so the model has
        no ``speaker{N}`` token to emit for the subject.  When both guards
        below hold, every entity/relation field that matches the speaker's
@@ -1327,7 +1327,7 @@ def _stamp_speaker_entity(
          ``len(canonical(speaker_name).split()) >= 2``. A single-token
          display name (``resolve_speaker_name`` routinely returns a bare
          first name) fails closed: no rewrite. This is what prevents a
-         first-person transcript mention like "My friend Tobias came over"
+         first-person transcript mention like "My friend Alex came over"
          from ever being eligible (paired with Guard B below, which excludes
          transcripts outright).
        * **Guard B (document sources only)** — fires only when
@@ -1364,7 +1364,7 @@ def _stamp_speaker_entity(
          appears (e.g. a third-party speaker), ``entity.speaker_id`` is set
          to ``ent.name`` (already lowercase via the ingest safety-net).
 
-    Non-speaker entities (display names like ``"Tobias Becker"``, places, orgs)
+    Non-speaker entities (display names like ``"Jordan Becker"``, places, orgs)
     are left untouched: ``is_speaker_id`` returns ``False`` for them, and the
     rewrite in (1) only fires under both guards.
 
@@ -1374,7 +1374,7 @@ def _stamp_speaker_entity(
         speaker_id: Authoritative speaker id (e.g. ``"speaker0"``).  Used as
             the authoritative-pin guard to detect wrong-digit model emissions,
             and as the rewrite target in (1).
-        speaker_name: Display name of the speaker (e.g. ``"Tobias Preusser"``),
+        speaker_name: Display name of the speaker (e.g. ``"Alex Walker"``),
             used ONLY as the exact-full-name rewrite target in (1). ``None``
             (default; e.g. an anonymous speaker) skips the rewrite — there is
             nothing to bind a third-person mention to.
@@ -2081,6 +2081,17 @@ def _sota_pipeline(
         pii_scope=pii_scope,
         speaker_name=speaker_name,
     )
+    # CORE-map diagnostic (C10).  The CORE map is never otherwise
+    # persisted — ``anonymize.parsed.mapping`` above is the LLM HINT map,
+    # recorded before this deterministic build runs, not CORE.  Keys and
+    # COUNTS only — never the real names: ``graph_snapshot.json`` (debug
+    # dumps under ``data/ha/debug/``) serializes ``graph.diagnostics``
+    # wholesale, and the placeholder keyset is non-identifying while the
+    # values are the PII.
+    graph.diagnostics["core_placeholders"] = {
+        "keys": sorted(reverse_mapping.keys()),
+        "count": len(reverse_mapping),
+    }
 
     # Phase — entity_correction.  Local model corrects misspelled real
     # place/organization/concept surfaces at two loci: the reverse map
@@ -2121,15 +2132,20 @@ def _sota_pipeline(
         # target) / phases[entity_correction].
         return graph
 
-    # Mapping-totality diagnostic.  The anonymization prompt requires
-    # every placeholder in any anonymized fact to appear as a key in
-    # ``reverse_mapping`` — the map deanon actually consumes
+    # Mapping-totality diagnostic — ANONYMIZER stage only (``observed=None``,
+    # ``sota_bindings=None`` — both defaulted).  The anonymization prompt
+    # requires every placeholder in any anonymized fact to appear as a key
+    # in ``reverse_mapping`` — the map deanon actually consumes
     # (:func:`_apply_bindings`).  When the LLM violates that contract
     # (rare under the tightened shape-contract prompt), the orphan
     # placeholder cannot be substituted at deanon time and the affected
     # fact is dropped at ``_strip_residual_placeholders``.  Surface the
     # violation here so prompt regressions are visible in ``journalctl``
-    # and ``graph.diagnostics`` rather than silently shedding facts.
+    # and ``graph.diagnostics`` rather than silently shedding facts.  This
+    # remains a per-fact shed, unlike the SOTA-enrichment stage's
+    # equivalent check below, which REJECTS THE WHOLE DELTA instead (see
+    # ``_check_mapping_totality``'s docstring and the ``sota_enrich``
+    # phase below).
     _check_mapping_totality(graph, anon_facts, reverse_mapping)
 
     # (Re-)build anonymized transcript AND facts from the ORIGINAL transcript
@@ -2262,6 +2278,16 @@ def _sota_pipeline(
     # enrichment prompt; emits enriched facts + new_entity_bindings +
     # updated_anon_transcript.  Skipped (outcome="skipped") when
     # _skip_sota=True (residual leak after repair with canonical mapping).
+    #
+    # ``observed`` is CORE's legality domain for this SOTA cycle (§2/§3 of
+    # the binding-totality plan) — declared here, beside ``sota_bindings``,
+    # BEFORE the block below, and assigned ONLY in the SOTA-ran (``else``)
+    # branch.  Left ``None`` on the ``_skip_sota`` branch: ``None`` means
+    # CORE UNSCOPED (:func:`_resolution_map`) — the semantics every
+    # non-SOTA deanon path needs.  An empty-set default here would scope
+    # CORE to nothing and drop every fact on the ``_skip_sota`` privacy
+    # path — the single most dangerous line in this function.
+    observed: set[str] | None = None
     updated_anon_transcript = None
     _sota_raw = None
     sota_bindings: dict[str, str] = {}
@@ -2283,6 +2309,20 @@ def _sota_pipeline(
                 len(anon_facts),
             )
         else:
+            # ``observed`` = every placeholder token SOTA is actually shown
+            # — the rendered facts_json (subject/predicate/object; a
+            # placeholder in a predicate is still visible to SOTA, T2g) and
+            # the anonymized transcript.  Mirrors the prompt render in
+            # :func:`_filter_with_sota` exactly (same ``anon_facts`` /
+            # ``anon_transcript`` values, same ``_render_indexed_facts`` +
+            # ``or "(not available)"`` fallback) so the two cannot drift.
+            observed = {
+                m[0] or m[1]
+                for m in _PLACEHOLDER_TOKEN_RE.findall(_render_indexed_facts(anon_facts))
+            } | {
+                m[0] or m[1]
+                for m in _PLACEHOLDER_TOKEN_RE.findall(anon_transcript or "(not available)")
+            }
             # Send anon facts and transcript to SOTA as the local anonymizer
             # produced them. The SOTA prompt's convention is "anonymizer
             # placeholders are bare; only new entities introduced by SOTA use
@@ -2335,17 +2375,74 @@ def _sota_pipeline(
                     "sota_enrich",
                     "cloud enrichment call failed or response unparseable",
                 )
-            t.set_parsed(
-                {
-                    "input_count": len(anon_facts),
-                    "output_count": len(enriched_anon),
-                    "new_bindings_count": len(sota_bindings or {}),
-                    "new_bindings": dict(sota_bindings) if sota_bindings else {},
-                    "updated_anon_transcript_len": len(updated_anon_transcript or ""),
-                }
+            # Binding-totality gate.  Compute the verdict against the SAME
+            # ``observed``-scoped legality domain :func:`_apply_bindings`
+            # will substitute with at deanon — a non-empty verdict means an
+            # orphan mint or a CORE/SOTA conflict, and the delta is REJECTED
+            # AS A WHOLE (not partially applied) so a bad mint can never
+            # shed the local facts its ``drop`` action replaced.
+            verdict = _check_mapping_totality(
+                graph,
+                enriched_anon,
+                reverse_mapping,
+                sota_bindings=sota_bindings,
+                observed=observed,
+                diagnostic_key="sota_pending_orphans",
+                stage="sota_enrichment",
             )
-            if not enriched_anon:
-                logger.info("SOTA enrichment removed all relations")
+            if verdict:
+                discarded_count = len(enriched_anon)
+                retained_count = len(anon_facts)
+                logger.error(
+                    "SOTA enrichment binding-totality breach: %d offending token(s) %s — "
+                    "rejecting the whole delta (%d enriched fact(s) discarded), falling "
+                    "back to %d local-extract fact(s).",
+                    len(verdict),
+                    verdict[:5],
+                    discarded_count,
+                    retained_count,
+                )
+                # The rejection: exactly three assignments.  ``anon_facts``
+                # (the local-extract facts) is what saves the data — the
+                # enrichment delta never touches it.  Deliberately NOT
+                # setting ``_skip_sota``: that flag is a PRIVACY predicate
+                # (the anonymized transcript may still leak real names —
+                # don't send it to a cloud judge) that is FALSE here — SOTA
+                # already ran, anonymization already succeeded.  A rejected
+                # delta must be indistinguishable downstream from a no-op
+                # delta; these three assignments achieve exactly that.
+                enriched_anon = anon_facts
+                sota_bindings = {}
+                updated_anon_transcript = None
+                graph.diagnostics["sota_enrichment_rejected"] = verdict
+                t.set_outcome("rejected", reason=f"binding-totality breach: {verdict[:5]}")
+                t.set_parsed(
+                    {
+                        "input_count": len(anon_facts),
+                        "output_count": len(enriched_anon),
+                        "new_bindings_count": 0,
+                        "new_bindings": {},
+                        "updated_anon_transcript_len": 0,
+                        "observed_count": len(observed),
+                        "mapped_count": len(_resolution_map(reverse_mapping, {}, observed)),
+                    }
+                )
+            else:
+                t.set_parsed(
+                    {
+                        "input_count": len(anon_facts),
+                        "output_count": len(enriched_anon),
+                        "new_bindings_count": len(sota_bindings or {}),
+                        "new_bindings": dict(sota_bindings) if sota_bindings else {},
+                        "updated_anon_transcript_len": len(updated_anon_transcript or ""),
+                        "observed_count": len(observed),
+                        "mapped_count": len(
+                            _resolution_map(reverse_mapping, sota_bindings, observed)
+                        ),
+                    }
+                )
+                if not enriched_anon:
+                    logger.info("SOTA enrichment removed all relations")
     if stop_phase == "sota_enrich":
         # Calibration short-circuit: SOTA enrichment block recorded,
         # downstream (anon_plausibility, deanon, deanon_plausibility) skipped.
@@ -2457,18 +2554,25 @@ def _sota_pipeline(
     # placeholders.  No LLM call; raw_output stays None.  Dropped facts
     # (those with residual unresolved placeholders) land in parsed for
     # calibration inspection.
+    #
+    # No totality check here (retired — was the ``sota_enrich`` phase's
+    # binding-totality check above, now the ONLY one, since it can ACT
+    # (reject the delta) where this site could only detect and log.
+    # Downstream of the pre-SOTA check at :func:`_build_anonymization_mapping`'s
+    # call site, orphans can only be REMOVED, never INTRODUCED: re-substitution
+    # only inserts values of the forward ``mapping``, every forward value has a
+    # paired ``reverse`` entry, repair returns both maps in tandem, and the
+    # residual-leak filter only drops facts.  ``observed`` is the SAME set
+    # computed in the ``sota_enrich`` phase above — ``None`` on the
+    # ``_skip_sota`` path (CORE unscoped) and, on the accept path, exactly
+    # what SOTA was shown for THIS ``enriched_anon`` (guaranteed superset,
+    # since every rejection-path fallback reuses the same ``anon_facts``
+    # that ``observed`` was computed from).
     with phase_trace("deanon") as t:
         deanon_input_count = len(enriched_anon)
-        if enriched_anon:
-            _check_mapping_totality(
-                graph,
-                enriched_anon,
-                reverse_mapping,
-                sota_bindings=sota_bindings,
-                diagnostic_key="sota_pending_orphans",
-                stage="sota_enrichment",
-            )
-        deanon_facts, dropped_facts = _apply_bindings(enriched_anon, reverse_mapping, sota_bindings)
+        deanon_facts, dropped_facts = _apply_bindings(
+            enriched_anon, reverse_mapping, sota_bindings, observed
+        )
         if dropped_facts:
             graph.diagnostics["residual_dropped_facts"] = dropped_facts
             logger.warning(
@@ -2749,12 +2853,26 @@ def _build_anonymization_mapping(
 
     This builder replaces that pattern with one deterministic walk:
 
-    1. **Mint placeholders for in-scope entity names.**  The graph
-       knows the canonical entity inventory; we don't need the LLM
-       to enumerate it.  Placeholder counter is per-prefix
-       (``Person_1, Person_2, …, Org_1, …``).
+    1. **Mint placeholders for in-scope entity names — except the
+       speaker.**  The graph knows the canonical entity inventory; we
+       don't need the LLM to enumerate it.  Placeholder counter is
+       per-prefix (``Person_1, Person_2, …, Org_1, …``).  The speaker
+       entity (``entity.speaker_id is not None``) is EXCLUDED from this
+       mint: ``speaker{N}`` is already an anonymized handle (CLAUDE.md's
+       "ONE lowercase ``speaker{N}`` everywhere") — minting a
+       ``Person_N`` for it would anonymize something already anonymous
+       and draw it into the session-dependent, positionally-allocated
+       ``Person_N`` counter.  When the entity's own ``name`` is a
+       disclosed display form (differs from ``entity.speaker_id``), that
+       name folds onto ``entity.speaker_id`` in the forward map instead
+       of onto a fresh placeholder — still scrubbed, just onto the
+       anchor.  ``reverse`` never gets an entry for the anchor: display
+       names are resolved at the fact-render boundary
+       (:func:`~paramem.server.speaker.resolve_speaker_name`), never
+       baked into graph edges.
     2. **Add PII attribute values under the parent entity's
-       placeholder.**  Reusing the placeholder is privacy-correct
+       placeholder** (the speaker's own ``speaker_id`` counts as its
+       "placeholder" here).  Reusing the placeholder is privacy-correct
        (SOTA only needs tokens scrubbed, not unique placeholders per
        attribute) and keeps the mapping canonical (no novel
        placeholder shapes).  These attribute values land in the
@@ -2765,16 +2883,31 @@ def _build_anonymization_mapping(
     3. **Speaker-name seeding** (legacy Bug A).  When the runtime
        knows the speaker's display name and that name isn't already
        in the mapping (e.g. anonymous-id session, full-name vs
-       first-name mismatch), reuse the speaker entity's placeholder
-       or — if no speaker entity is in scope — fall back to LLM's
-       exact or full-name match (``"Alex"`` or ``"Alex Rivera"`` →
-       reuse ``Person_1``) or mint a fresh ``Person_N``.
-    4. **Preserve LLM hints.**  Entries the LLM emitted that the
-       deterministic build does not cover (typically relation
-       participants the graph doesn't know about — e.g. ``Honda``
-       mentioned in a relation but not a graph entity) are merged
-       in.  When the LLM's entry conflicts with a deterministic one,
-       deterministic wins (we trust the graph).
+       first-name mismatch), reuse the speaker entity's anchor
+       (``entity.speaker_id``) or — if no speaker entity is in scope —
+       fall back to LLM's exact or full-name match (``"Alex"`` or
+       ``"Alex Rivera"`` → reuse ``Person_1``) or mint a fresh
+       ``Person_N``.  The no-speaker-entity fallback is unchanged by
+       the anchor (R7, out of scope): it can still mint a ``Person_N``
+       for the speaker's display name in the rare case the graph has no
+       speaker entity at all.
+    4. **Preserve LLM hints — except any keyed on or valued at the
+       speaker.**  Entries the LLM emitted that the deterministic build
+       does not cover (typically relation participants the graph
+       doesn't know about — e.g. ``Honda`` mentioned in a relation but
+       not a graph entity) are merged in.  When the LLM's entry
+       conflicts with a deterministic one, deterministic wins (we trust
+       the graph).  A key that is speaker-id-shaped
+       (:func:`~paramem.graph.name_match.is_speaker_id`) — e.g. a
+       hallucinated ``{"speaker0": "Person_1"}`` — is dropped outright
+       (forward *and* reverse), since treating the anchor itself as a
+       "real name" to be re-mapped would corrupt it in both directions.
+       A *value* that is speaker-id-shaped — e.g. ``{"RealName":
+       "speaker0"}``, an anonymizer hallucination scrubbing a real name
+       onto the anchor — keeps the forward scrub (harmless, and the
+       only thing standing between that real name and the cloud) but
+       drops the reverse write: a reverse entry keyed on ``speaker0``
+       would restore that real name onto every speaker-subject fact.
 
     The companion :func:`_check_mapping_totality` runs after this
     builder as a diagnostic for the orthogonal concern of LLM
@@ -2802,7 +2935,12 @@ def _build_anonymization_mapping(
         one-to-one ``{placeholder: entity_name}`` map consumed by the
         deanon path (:func:`deanonymize_text`, :func:`_apply_bindings`)
         — attribute values are deliberately absent so a folded
-        placeholder always restores to the entity name.
+        placeholder always restores to the entity name.  For the
+        speaker, "placeholder" in ``forward`` is the anchor
+        (``entity.speaker_id``, e.g. ``"speaker0"``) rather than a
+        minted value, and ``reverse`` carries NO entry for it at all —
+        the anchor is never a mint target and display names are never
+        restored into graph edges.
     """
     scope: frozenset[str] = _DEFAULT_PII_SCOPE if pii_scope is None else frozenset(pii_scope)
     type_to_prefix = anonymizer_type_to_prefix()
@@ -2822,6 +2960,25 @@ def _build_anonymization_mapping(
             continue
         if not entity.name:
             continue
+        if entity.speaker_id is not None:
+            # The speaker anchor — never mint a Person_N for it (see the
+            # module-level docstring, point 1).  entity.speaker_id itself
+            # (e.g. "speaker0") IS the anchor; entity.name may already be
+            # that same anonymous form, or a disclosed display name.
+            if speaker_entity_placeholder is None:
+                speaker_entity_placeholder = entity.speaker_id
+            if entity.name != entity.speaker_id:
+                mapping.setdefault(entity.name, entity.speaker_id)
+            # No reverse entry: the anchor is never a mint target, and
+            # display names are never restored into graph edges.
+            attrs = entity.attributes or {}
+            for attr_key, attr_value in attrs.items():
+                if attr_key not in _PII_ATTRIBUTE_KEYS:
+                    continue
+                if not isinstance(attr_value, str) or not attr_value.strip():
+                    continue
+                mapping.setdefault(attr_value, entity.speaker_id)
+            continue
         prefix = type_to_prefix.get(entity.entity_type, entity.entity_type.capitalize())
         if entity.name not in mapping:
             mapping[entity.name] = _next_placeholder(prefix)
@@ -2830,8 +2987,6 @@ def _build_anonymization_mapping(
         # first-seen entity wins if two distinct entities collide on the
         # same placeholder via an LLM hint downstream.
         reverse.setdefault(placeholder, entity.name)
-        if entity.speaker_id is not None and speaker_entity_placeholder is None:
-            speaker_entity_placeholder = placeholder
         attrs = entity.attributes or {}
         for attr_key, attr_value in attrs.items():
             if attr_key not in _PII_ATTRIBUTE_KEYS:
@@ -2848,13 +3003,12 @@ def _build_anonymization_mapping(
     # Speaker-name seeding: ensure the runtime-known speaker name is covered.
     if speaker_name and speaker_name not in mapping:
         if speaker_entity_placeholder is not None:
-            # Speaker is in graph.entities but under a different
-            # surface form (e.g. anonymous "speaker0" → display
-            # "Alex").  Reuse that placeholder so every form maps
-            # consistently.  ``reverse`` already points the placeholder
-            # at the canonical entity name from the entity-mint pass; do
-            # not overwrite — the entity name is the preferred display
-            # form for the deanon target.
+            # Speaker is in graph.entities.  ``speaker_entity_placeholder``
+            # is the anchor (entity.speaker_id, e.g. "speaker0"), never a
+            # minted Person_N — reuse it so the runtime-known display
+            # name folds onto the same anonymous handle as the entity's
+            # own name.  No reverse entry: the anchor never restores a
+            # display name into graph edges.
             mapping[speaker_name] = speaker_entity_placeholder
         else:
             # No speaker entity in scope — fall back to LLM hints
@@ -2892,13 +3046,86 @@ def _build_anonymization_mapping(
     # the reverse map.  The reverse write is NOT gated on the forward
     # write winning — anon_facts emitted under the LLM's (losing)
     # placeholder still need a reverse entry to deanonymize.
+    #
+    # A key that is speaker-id-shaped (``is_speaker_id``) — e.g. a
+    # hallucinated ``{"speaker0": "Person_1"}`` — is dropped outright
+    # (forward and reverse): the anchor itself is never a "real name"
+    # to be re-mapped.  A value that is speaker-id-shaped — e.g.
+    # ``{"RealName": "speaker0"}``, the LLM scrubbing a real name onto
+    # the anchor — keeps the forward scrub (still useful: it is what
+    # keeps that real name out of ``anon_transcript``) but drops ONLY
+    # the reverse write, which would otherwise restore the real name
+    # onto every ``speaker0``-subject fact at deanon.
     for k, v in llm_mapping.items():
         if not isinstance(k, str) or not isinstance(v, str):
             continue
+        if is_speaker_id(k):
+            continue
         mapping.setdefault(k, v)
+        if is_speaker_id(v):
+            continue
         reverse.setdefault(v, k)
 
     return mapping, reverse
+
+
+def _resolution_map(
+    reverse: dict[str, str],
+    sota_bindings: dict[str, str],
+    observed: set[str] | None,
+) -> dict[str, str]:
+    """The ONE legality/resolution map — built once, consumed by both
+    :func:`_check_mapping_totality` (as its legality domain) and
+    :func:`_apply_bindings` (as its substitution map).
+
+    ``observed`` is ``None`` -> **CORE UNSCOPED** (today's behaviour;
+    every non-SOTA deanon path, and the ``_skip_sota`` path where SOTA
+    never ran): every ``reverse`` entry is legal, ``sota_bindings`` is
+    merged in underneath it. An empty-set default here instead of ``None``
+    would scope CORE to nothing and drop every fact on those paths — see
+    the callers' ``observed: set[str] | None = None`` declarations.
+
+    ``observed`` is a ``set`` -> **CORE SCOPED** to it: a ``reverse``
+    entry resolves only when SOTA was actually shown its placeholder
+    (``key in observed`` — a token in the rendered facts SOTA saw, or in
+    the anonymized transcript). Every ``sota_bindings`` entry whose key
+    is NOT in ``observed`` is SOTA's own mint and resolves too. A key
+    present in both domains is a CONFLICT, caught upstream by
+    :func:`_check_mapping_totality` before an accepted delta ever reaches
+    this scoped branch — the map still reflects the tie-break if asked to
+    resolve one directly (unit-tested, T2f).
+
+    **CORE PRECEDENCE (named invariant, T2f) — CORE-LAST BY CONSTRUCTION.**
+    In both branches ``reverse`` entries are applied AFTER
+    ``sota_bindings``, so any key present in both resolves to CORE's
+    value. SOTA can never override or misresolve against the core map.
+    This is deliberate construction order, not an accident of dict-spread
+    — do not reorder the two ``.update()`` calls below.
+    """
+    resolved: dict[str, str] = {}
+    if observed is None:
+        resolved.update(
+            (k, v)
+            for k, v in sota_bindings.items()
+            if isinstance(k, str) and isinstance(v, str) and k and v
+        )
+        resolved.update(
+            (k, v)
+            for k, v in reverse.items()
+            if isinstance(k, str) and isinstance(v, str) and k and v
+        )
+    else:
+        resolved.update(
+            (k, v)
+            for k, v in sota_bindings.items()
+            if isinstance(k, str) and isinstance(v, str) and k and v and k not in observed
+        )
+        resolved.update(
+            (k, v)
+            for k, v in reverse.items()
+            if isinstance(k, str) and isinstance(v, str) and k and v and k in observed
+        )
+    return resolved
 
 
 def _check_mapping_totality(
@@ -2907,50 +3134,67 @@ def _check_mapping_totality(
     reverse_mapping: dict,
     *,
     sota_bindings: dict | None = None,
+    observed: set[str] | None = None,
     diagnostic_key: str = "totality_orphans",
     stage: str = "anonymizer",
-) -> None:
+) -> list[str]:
     """Diagnostic check: every placeholder in any anonymized fact must
-    resolve against ``reverse_mapping`` (plus ``sota_bindings`` when
-    given) — the union that :func:`_apply_bindings` actually consumes at
+    resolve against :func:`_resolution_map` (``reverse_mapping`` plus
+    ``sota_bindings``, scoped to ``observed`` — see that function) — the
+    SAME legality domain :func:`_apply_bindings` substitutes with at
     deanon time.  Checked against the reverse map — not the forward map —
     because a placeholder present only in the forward map's values still
     fails to translate at deanon time.  Surfaces violations to ``logger``
     and ``graph.diagnostics[diagnostic_key]`` so prompt regressions are
     visible rather than silently shedding facts.
 
+    Returns the sorted list of offending tokens (orphans, plus conflicts
+    when ``observed`` is given — see below); ``[]`` when the mapping is
+    total.  Two exits are intentionally explicit rather than falling
+    through to an implicit ``None`` — the empty-``anon_facts`` early
+    return and the empty-orphans path both ``return []`` so callers can
+    do a plain truthiness test on the result without a
+    falsy-``None``-vs-falsy-``[]`` trap.
+
     Generalised to cover two call sites: the pre-SOTA anonymizer check
-    (``sota_bindings=None``, default ``diagnostic_key``/``stage``) and a
-    post-SOTA check (``sota_bindings=sota_bindings,
-    diagnostic_key="sota_pending_orphans", stage="sota_enrichment"``) that
-    predicts SOTA's minted-placeholder drops before :func:`_apply_bindings`
-    sheds them.  Matches both braced (``{Event_1}``) and bare (``Event_1``)
-    placeholder forms via ``_PLACEHOLDER_TOKEN_RE`` — harmless for the
-    pre-SOTA call, whose facts only ever carry bare tokens.
+    (``sota_bindings=None``, ``observed=None``, default
+    ``diagnostic_key``/``stage``) and the post-SOTA check
+    (``sota_bindings=sota_bindings, observed=<rendered tokens>,
+    diagnostic_key="sota_pending_orphans", stage="sota_enrichment"``).
+    For the anonymizer stage the caller only logs the violation — the
+    affected fact is dropped at :func:`_strip_residual_placeholders`,
+    the correct fail-closed semantic there.  For the SOTA-enrichment
+    stage the caller (:func:`_sota_pipeline`) instead REJECTS THE WHOLE
+    DELTA on a non-empty verdict and falls back to the pre-enrichment
+    local-extract facts — a single unbound placeholder no longer sheds
+    just that one fact.  Matches both braced (``{Event_1}``) and bare
+    (``Event_1``) placeholder forms via ``_PLACEHOLDER_TOKEN_RE`` —
+    harmless for the pre-SOTA call, whose facts only ever carry bare
+    tokens.
 
-    When ``sota_bindings`` is given, also flags any KEY present in both
-    ``sota_bindings`` and ``reverse_mapping`` with a DIFFERING value —
-    the union's reverse-wins tie-break (:func:`_apply_bindings`) would
-    otherwise silently resolve a minted placeholder to the wrong real
-    name.  Recorded (sorted) to ``graph.diagnostics["sota_binding_collisions"]``.
-    Reverse-wins semantics are unchanged; this only makes the silent
-    wrong-resolution observable.
+    When ``sota_bindings`` is given and ``observed`` is a set, any
+    ``sota_bindings`` KEY that is also in ``observed`` is a CONFLICT
+    (SOTA referencing/rebinding something it was already shown as a core
+    reference) and is folded into the returned verdict.  When
+    ``observed`` is ``None`` (CORE unscoped — today's behaviour), the
+    conflict scan instead flags any KEY present in both ``sota_bindings``
+    and ``reverse_mapping`` with a DIFFERING value — informational only,
+    NOT folded into the verdict, since :func:`_resolution_map`'s
+    CORE-wins tie-break already resolves it safely.  Both are recorded
+    (sorted) to ``graph.diagnostics["sota_binding_collisions"]``.
 
-    Does not mutate inputs and does not change the data flow.  When the
-    contract is violated the orphan placeholder cannot be substituted
-    at deanon time and the affected fact will be dropped at
-    :func:`_strip_residual_placeholders` — the correct fail-closed
-    semantic.  The position-based ``_recover_missing_placeholder_mappings``
-    helper that previously patched these gaps was retired alongside the
-    open-vocabulary prompt rewrite: per-session prefix divergence is
-    harmless because cross-cycle entity merge happens on real names in
-    :class:`paramem.graph.merger.GraphMerger`, not on placeholder
-    vocabulary.
+    Does not mutate inputs and does not change the data flow.
     """
+    orphans: set[str] = set()
     if sota_bindings:
-        collisions = sorted(
-            k for k, v in sota_bindings.items() if k in reverse_mapping and reverse_mapping[k] != v
-        )
+        if observed is not None:
+            collisions = sorted(k for k in sota_bindings if k in observed)
+        else:
+            collisions = sorted(
+                k
+                for k, v in sota_bindings.items()
+                if k in reverse_mapping and reverse_mapping[k] != v
+            )
         if collisions:
             logger.warning(
                 "SOTA binding collision: %d placeholder(s) present in both "
@@ -2960,10 +3204,11 @@ def _check_mapping_totality(
                 collisions[:5],
             )
             graph.diagnostics["sota_binding_collisions"] = collisions
+            if observed is not None:
+                orphans |= set(collisions)
     if not anon_facts:
-        return
-    resolvable = set(reverse_mapping or {}) | set(sota_bindings or {})
-    orphans: set[str] = set()
+        return sorted(orphans) if orphans else []
+    resolvable = set(_resolution_map(reverse_mapping, sota_bindings or {}, observed))
     for f in anon_facts:
         if not isinstance(f, dict):
             continue
@@ -2984,15 +3229,25 @@ def _check_mapping_totality(
                 orphans.add(name)
     if orphans:
         ordered = sorted(orphans)
-        logger.warning(
-            "%s mapping-totality violation: %d orphan placeholder(s) "
-            "in anon_facts not resolvable: %s. Affected fact(s) will be "
-            "dropped at the residual placeholder sweep post-deanon.",
-            "SOTA enrichment binding-totality" if stage == "sota_enrichment" else "Anonymization",
-            len(ordered),
-            ordered[:5],
-        )
+        if stage == "sota_enrichment":
+            logger.warning(
+                "SOTA enrichment binding-totality violation: %d orphan/conflict "
+                "placeholder(s) in anon_facts not resolvable: %s. The enrichment "
+                "delta will be rejected; local-extract facts are kept instead.",
+                len(ordered),
+                ordered[:5],
+            )
+        else:
+            logger.warning(
+                "Anonymization mapping-totality violation: %d orphan placeholder(s) "
+                "in anon_facts not resolvable: %s. Affected fact(s) will be "
+                "dropped at the residual placeholder sweep post-deanon.",
+                len(ordered),
+                ordered[:5],
+            )
         graph.diagnostics[diagnostic_key] = ordered
+        return ordered
+    return []
 
 
 _TYPE_PREFIX_OVERRIDES = {
@@ -3290,11 +3545,13 @@ def _apply_bindings(
     facts: list[dict],
     reverse: dict[str, str],
     sota_bindings: dict[str, str],
+    observed: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """De-anonymize facts via state-machine substitution.
 
-    Merges the anonymizer reverse map and SOTA's bindings into ONE union
-    resolve map, rendered in both braced and bare form:
+    Substitutes with :func:`_resolution_map` (``reverse``, ``sota_bindings``,
+    ``observed``) — the SAME legality domain :func:`_check_mapping_totality`
+    checks, rendered in both braced and bare form:
 
     * **Anonymizer reverse map** (``reverse`` arg) —
       ``placeholder -> entity_name`` produced by
@@ -3305,27 +3562,41 @@ def _apply_bindings(
     * **SOTA bindings** (``sota_bindings`` arg) — ``placeholder_name -> real_text``
       that SOTA emitted alongside its enriched facts (new entities SOTA
       minted, e.g. ``Event_1``).
+    * **``observed``** (trailing, defaulted ``None``) — ``None`` means
+      CORE UNSCOPED (every ``reverse`` entry is legal; this is what makes
+      the five pre-existing positional-only call sites in
+      ``test_extraction_pipeline.py`` keep passing unchanged as the
+      CORE-unscoped regression net).  A ``set`` means CORE SCOPED to it —
+      see :func:`_resolution_map`.  ``reverse`` wins on any key collision
+      in EITHER mode (CORE PRECEDENCE, T2f) — deterministic entity names
+      over SOTA-sourced values, never the reverse.
 
-    ``reverse`` wins on key collision (deterministic, consistent with the
-    "deterministic wins" tie-break used elsewhere for the anonymizer
-    mapping).  The union round-trips a placeholder regardless of which
-    form (braced or bare) it was actually emitted in: SOTA's contract
-    asks for braced minted placeholders and bare anonymizer placeholders,
-    but models don't always comply, so both maps are tried against both
-    forms.  Braced literal substitution runs first (unambiguous, no
+    The union round-trips a placeholder regardless of which form (braced
+    or bare) it was actually emitted in: SOTA's contract asks for braced
+    minted placeholders and bare anonymizer placeholders, but models
+    don't always comply, so both maps are tried against both forms.
+    Braced literal substitution runs first (unambiguous, no
     word-boundary needed), then word-boundary substitution over the same
     map catches bare occurrences (``Person_2's cousin`` -> ``Alex's
     cousin``) and resolves any bare placeholder nested inside a bound
     value (``"Senior Engineer at Org_1"`` -> ``"Senior Engineer at
     Acme"``).
 
-    Facts whose subject or object still contains a placeholder pattern after
-    substitution are dropped via the existing residual sweep. Causes:
+    Facts whose subject or object still contains a placeholder pattern
+    after substitution are dropped via the existing residual sweep.
+    Causes, direct-call context (this function invoked in isolation,
+    e.g. by its own unit tests):
       1. SOTA introduced a braced placeholder but omitted its binding.
       2. SOTA emitted a bare placeholder that was never in the anonymizer
          mapping (anonymizer leak).
       3. Composite strings where one of multiple placeholders couldn't be
          resolved.
+    Inside the full pipeline (:func:`_sota_pipeline`), causes 1 and 2 are
+    now intercepted upstream by :func:`_check_mapping_totality`'s
+    SOTA-enrichment-stage rejection gate — a bad mint rejects the WHOLE
+    delta before it reaches this function, rather than shedding just the
+    one fact.  This sweep remains the fail-closed backstop for cause 3
+    and for a genuine anonymizer-stage leak (R3).
 
     Returns ``(kept_facts, dropped_facts)``.
 
@@ -3335,13 +3606,7 @@ def _apply_bindings(
     (``_extract_sota_bindings``) which produced bogus mappings under
     multi-token replace blocks (bug 5).
     """
-    # Union resolve map: reverse wins on collision (deterministic entity
-    # names over freshly-minted SOTA prefixes).
-    resolve: dict[str, str] = {
-        k: v
-        for k, v in {**sota_bindings, **reverse}.items()
-        if isinstance(k, str) and isinstance(v, str) and k and v
-    }
+    resolve = _resolution_map(reverse, sota_bindings, observed)
     braced_map: dict[str, str] = {f"{{{k}}}": v for k, v in resolve.items()}
 
     substituted: list[dict] = []
@@ -3376,9 +3641,20 @@ def _strip_residual_placeholders(
 
     Runs post de-anonymization. Catches anything shaped like a placeholder —
     either braced `{Prefix_N}` or bare `Prefix_N` with capitalised prefix.
-    No prefix enumeration; the pattern is type-agnostic. Covers:
-    1. SOTA invented a placeholder that was never in the mapping.
-    2. De-anonymization couldn't reverse-map a placeholder (mapping gap).
+    No prefix enumeration; the pattern is type-agnostic. Stays the
+    fail-closed backstop for a genuine anonymizer-stage leak (R3) and any
+    residual case; covers:
+    1. (Retired as a reachable SOTA-enrichment cause.) A SOTA-invented
+       placeholder never in the mapping — this used to reach here, but
+       `_check_mapping_totality`'s SOTA-enrichment-stage rejection gate
+       (in `_sota_pipeline`) now catches it upstream: a bad mint rejects
+       the WHOLE delta and reverts to the pre-enrichment local-extract
+       facts before they ever reach this sweep. Kept as defense-in-depth
+       for any future direct caller of `_apply_bindings` that bypasses
+       the gate.
+    2. De-anonymization couldn't reverse-map a placeholder — a genuine
+       anonymizer-stage leak (mapping gap), still live and unaffected by
+       the rejection gate above.
     3. Composite strings like `Person_2's Support` where the placeholder is
        embedded in a longer phrase (substring search).
 
@@ -3653,16 +3929,31 @@ def verify_anonymization_completeness(
     ``extra_pii_names``: names contributed by an independent NER pass
     (see :func:`extract_pii_names_with_ner`).  Carries ``{name: type}``
     and is filtered by ``pii_scope``.  Pass ``None`` to skip.
+
+    The speaker anchor (``speaker{N}``, :func:`is_speaker_id`) is
+    excluded from ``real_names`` at both the entity walk and the
+    relation-participant loop below (the latter re-adds by TYPE, so the
+    exclusion must apply there too) — it is already anonymous and is
+    NEVER anonymized further (see :func:`_build_anonymization_mapping`),
+    so it verbatim in ``anon_transcript``/``anon_facts`` is expected, not
+    a leak.  A genuinely disclosed real name (e.g. a document literally
+    naming the speaker) is unaffected: it is folded onto the anchor in
+    ``mapping`` by the builder and, if that scrub failed, its OWN
+    (non-anchor-shaped) surface form still triggers Case 1/2 below.
     """
     scope = _DEFAULT_PII_SCOPE if pii_scope is None else frozenset(pii_scope)
     if not scope:
         return []
     type_by_name = {e.name: e.entity_type for e in graph.entities}
-    real_names = {e.name for e in graph.entities if e.name and e.entity_type in scope}
+    real_names = {
+        e.name
+        for e in graph.entities
+        if e.name and e.entity_type in scope and not is_speaker_id(e.name)
+    }
     # Defensive: pick up in-scope names from relation participants too.
     for r in graph.relations:
         for n in (r.subject, r.object):
-            if n and type_by_name.get(n) in scope:
+            if n and type_by_name.get(n) in scope and not is_speaker_id(n):
                 real_names.add(n)
     # Add externally-sourced names filtered by scope.
     if extra_pii_names:

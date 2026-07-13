@@ -146,8 +146,13 @@ class PhaseRecord:
     outcome:
         ``"ok"`` (phase produced its output normally), ``"skipped"`` (a
         precondition didn't hold — e.g. SOTA missing API key),
-        ``"no_input"`` (phase had nothing to do), or ``"failed"`` (an
-        exception propagated through the scope; ``reason`` is set).
+        ``"no_input"`` (phase had nothing to do), ``"failed"`` (an
+        exception propagated through the scope; ``reason`` is set), or
+        ``"rejected"`` (the phase produced output but the caller rejected
+        it as a unit and fell back to a prior-stage input — e.g.
+        ``sota_enrich``'s binding-totality gate rejecting an enrichment
+        delta that references an orphan or CORE-conflicting placeholder;
+        ``reason`` is set). No consumer branches on the value.
     wall_clock_seconds:
         Time inside the ``with phase_trace(...)`` block, including all
         nested work.  Captured automatically by the context manager.
@@ -208,8 +213,8 @@ class _PhaseScope:
         self._parsed = parsed
 
     def set_outcome(self, outcome: str, *, reason: str | None = None) -> None:
-        """Set ``outcome`` (``ok``/``skipped``/``no_input``/``failed``)
-        with an optional one-line reason."""
+        """Set ``outcome`` (``ok``/``skipped``/``no_input``/``failed``/
+        ``rejected``) with an optional one-line reason."""
         self._outcome = outcome
         self._reason = reason
 

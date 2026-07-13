@@ -1,8 +1,10 @@
 """Session transcript buffering — accumulates conversation turns.
 
 Each conversation tracks speaker identity and conversation state.
-Speaker names are prefixed into transcript lines so the graph extractor
-attributes facts to the correct entity.
+Transcript lines use ``[user]``/``[assistant]`` markers, not inlined
+speaker names — speaker identity is bound via the ``{speaker_context}``
+slot the graph extractor injects separately (see
+:meth:`SessionBuffer._format_turns`).
 
 Every user turn stores a voice embedding fingerprint alongside the text.
 When a speaker enrolls, pending sessions are retroactively claimed by
