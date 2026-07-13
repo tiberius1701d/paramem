@@ -280,8 +280,9 @@ def anonymizer_prefix_to_type(path: str | None = None) -> dict[str, str]:
     """Return ``{prefix_lower: entity_type}`` — reverse map for de-anonymization.
 
     Keys are lowercased because callers (e.g.
-    :func:`~paramem.graph.placeholders.prefix_to_entity_type`) look up a
-    placeholder's prefix via ``.split("_")[0].lower()``.
+    :func:`~paramem.graph.placeholders.prefix_to_entity_type`, reached via
+    :func:`~paramem.graph.placeholders.placeholder_entity_type` for a full
+    placeholder token) look up a placeholder's prefix case-insensitively.
 
     Args:
         path: Optional override path for the schema YAML.

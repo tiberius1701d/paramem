@@ -26,9 +26,10 @@ from paramem.graph.placeholders import (
     _resolution_map,
     _substitute_whole_words,
     braced,
+    deanonymize_text,
     entity_type_to_prefix,
     mint_placeholder,
-    prefix_to_entity_type,
+    placeholder_entity_type,
 )
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Entity, SessionGraph
@@ -901,7 +902,7 @@ def extract_and_anonymize_for_cloud(
     3. Mechanical transcript fallback when the model omits
        ``anonymized_transcript`` (older prompt schema returns facts only).
     4. ``_normalize_anonymization_mapping`` — canonicalize direction.
-    5. ``verify_anonymization_completeness`` + ``_repair_anonymization_leaks``
+    5. ``check_anonymization_leaks`` + ``_repair_anonymization_leaks``
        — extend mapping for missed names, drop triples for hallucinated
        ones (canonical-mapping path only).
     6. Final completeness check; any residual leak → block.
@@ -1024,7 +1025,7 @@ def extract_and_anonymize_for_cloud(
     # which categories NER surfaces.
     extra_pii = extract_pii_names_with_ner(transcript, pii_scope=scope)
 
-    leaked = verify_anonymization_completeness(
+    leaked = check_anonymization_leaks(
         graph,
         mapping,
         anon_facts,
@@ -1049,7 +1050,7 @@ def extract_and_anonymize_for_cloud(
             leaked,
             extra_pii_types=extra_pii,
         )
-        leaked = verify_anonymization_completeness(
+        leaked = check_anonymization_leaks(
             graph,
             mapping,
             anon_facts,
@@ -1991,7 +1992,7 @@ def _sota_pipeline(
     # entries it produced for entities or attributes are overwritten by
     # the deterministic build (we trust the graph).
     mapping, reverse_mapping = _build_anonymization_mapping(
-        graph,
+        graph.entities,
         mapping,
         pii_scope=pii_scope,
         speaker_name=speaker_name,
@@ -2140,7 +2141,7 @@ def _sota_pipeline(
             if ner_check
             else None
         )
-        leaked = verify_anonymization_completeness(
+        leaked = check_anonymization_leaks(
             graph,
             mapping,
             anon_facts,
@@ -2172,7 +2173,7 @@ def _sota_pipeline(
                     repair_status["missed_fixed"],
                     repair_status["hallucinated_dropped"],
                 )
-                leaked = verify_anonymization_completeness(
+                leaked = check_anonymization_leaks(
                     graph,
                     mapping,
                     anon_facts,
@@ -2709,7 +2710,7 @@ def _sota_pipeline(
 
     # Rebuild entity list from surviving + new relations.
     # Every relation endpoint must have a corresponding Entity record.
-    # Entity type inference goes through :func:`prefix_to_entity_type`
+    # Entity type inference goes through :func:`placeholder_entity_type`
     # (open vocabulary): known prefixes (Person, Org, City, ...) use the
     # configured closed mapping; novel prefixes that SOTA introduces
     # (Project_1, Program_1, Paper_1, Certification_1, ...) derive the
@@ -2742,7 +2743,7 @@ def _sota_pipeline(
         entity_type = "concept"
         placeholder = name_to_placeholder.get(name)
         if placeholder:
-            entity_type = prefix_to_entity_type(placeholder.split("_")[0])
+            entity_type = placeholder_entity_type(placeholder)
         graph.entities.append(Entity(name=name, entity_type=entity_type))
 
     # Project scalar-object facts onto subject Entity.attributes (see
@@ -3017,7 +3018,7 @@ _SPACY_PII_LABELS = {
 # ``_DEFAULT_PII_SCOPE`` — imported from :mod:`paramem.graph.placeholders`
 # (also the default consumed by :func:`~paramem.graph.placeholders.
 # _build_anonymization_mapping`) — is the shared primitive-layer default
-# for ``verify_anonymization_completeness`` and
+# for ``check_anonymization_leaks`` and
 # ``extract_pii_names_with_ner`` below when no explicit ``pii_scope`` is
 # passed.  This is *not* the cloud-egress policy default — that is
 # :data:`_CLOUD_EGRESS_DEFAULT_SCOPE` below, narrower and configurable
@@ -3113,7 +3114,7 @@ def extract_pii_names_with_ner(
     return names
 
 
-def verify_anonymization_completeness(
+def check_anonymization_leaks(
     graph: SessionGraph,
     mapping: dict,
     anon_facts: list[dict],
@@ -3121,7 +3122,25 @@ def verify_anonymization_completeness(
     extra_pii_names: dict[str, str] | None = None,
     pii_scope: set[str] | frozenset[str] | None = None,
 ) -> list[str]:
-    """Forward-path privacy guard — scope-driven.
+    """Forward-path privacy guard — scope-driven, mechanical, NOT a
+    completeness proof.
+
+    Reconciles two pipeline-stage outputs: the typed entity list extraction
+    (stage 1) produced, against the mapping/facts/transcript anonymization
+    (stage 2) produced from it. It is a string-containment check — "did
+    stage 2 actually remove what stage 1 already named as in-scope?" — not
+    an independent inference over the raw content. It catches a real and
+    common class of failure (anonymizer omissions, parse failures,
+    substitution misses), but it CANNOT prove anonymization is complete:
+    establishing the ground-truth set of in-scope real names is itself the
+    classification problem being checked, and extraction and anonymization
+    are the SAME local model on two prompts (see :func:`_generate_extraction`
+    and :func:`anonymize_with_local_model`/its cloud-extractor sibling) — a
+    name extraction never typed as in-scope in the first place is invisible
+    to this function by construction, not merely by an implementation gap.
+    An entity the model misclassifies (e.g. a person typed as an
+    organization) egresses in the clear and neither this function nor
+    anything downstream can detect or undo it.
 
     Returns a list of real names that the anonymizer failed to handle properly.
     Empty list == safe. Non-empty list means callers MUST abort the SOTA call.
@@ -3722,6 +3741,7 @@ _SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT = _load_prompt(
 
 def _graph_enrich_with_sota(
     triples: list[dict],
+    entities: list[Entity],
     api_key: str,
     provider: str = "anthropic",
     filter_model: str = "claude-sonnet-4-6",
@@ -3729,6 +3749,7 @@ def _graph_enrich_with_sota(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
+    pii_scope: set[str] | frozenset[str] | None = None,
 ) -> tuple[list[dict], list[list[str]], str | None] | None:
     """SOTA graph-level enrichment pass over a pre-merged cumulative graph.
 
@@ -3737,32 +3758,115 @@ def _graph_enrich_with_sota(
     - New cross-session second-order relations not already in the graph.
     - ``same_as`` pairs identifying duplicate nodes under different surface forms.
 
+    Runs the SAME anonymize -> SOTA -> de-anonymize contract as the
+    session-tier :func:`_sota_pipeline`, via the SAME primitives in
+    :mod:`paramem.graph.placeholders` — this is the second (and, until now,
+    unprotected) call site of that contract. The CORE real-name ->
+    placeholder table is minted deterministically from ``entities`` via
+    :func:`~paramem.graph.placeholders._build_anonymization_mapping` with an
+    empty LLM hint (``llm_mapping={}``): there is no local anonymizer LLM
+    call on this path, only the deterministic entity walk. ``subject``,
+    ``object``, AND ``speaker_id`` fields of every triple are substituted
+    through that forward mapping before the prompt is built, so no bare
+    real name and no bare speaker id reaches the payload handed to
+    :func:`_sota_call`.
+
+    The production caller (:meth:`~paramem.training.consolidation.
+    ConsolidationLoop._run_graph_enrichment`) derives ``entities`` from a
+    per-chunk local-model anonymization pass rather than node attributes
+    (the fold graph carries no reliable entity types of its own — see that
+    method's docstring), and that local anonymizer prompt instructs the
+    model to leave ``speaker{N}`` ids verbatim and never mint a placeholder
+    for one. A speaker anchor therefore never appears in the production
+    ``entities`` list at all: it is never tokenised, and reaches the SOTA
+    payload bare by design — there is no mint/restore round trip for it in
+    practice. The function itself still honours ``Entity.speaker_id`` per
+    :func:`~paramem.graph.placeholders._build_anonymization_mapping`'s
+    general contract for any caller that DOES pass a speaker entity with
+    ``speaker_id`` unset (e.g. this module's own unit tests): such an
+    entity is minted like any other in-scope entity, and
+    :func:`~paramem.graph.placeholders._apply_bindings` (the exit gate,
+    below) restores it to the bare lowercase ``speaker{N}`` form the rest
+    of the pipeline requires.
+
+    After the SOTA call, the response's ``relations`` are de-anonymized via
+    :func:`~paramem.graph.placeholders._apply_bindings` (the single exit
+    gate: predicate invariant, then substitute, then residual sweep,
+    fail-closed) — returning real node names and bare ``speaker{N}`` ids,
+    exactly what :meth:`_run_graph_enrichment`'s existing consumption logic
+    (including the W1 speaker-pair guard) already expects. Any
+    ``bindings`` the response carries (SOTA-minted placeholders — normally
+    empty, since the prompt forbids inventing new nodes) are normalized via
+    :func:`~paramem.graph.placeholders._normalize_anonymization_mapping`
+    (placeholder on the key side) before being folded into that
+    substitution, mirroring the session tier. ``same_as`` pairs are
+    restored via the free-text primitive
+    :func:`~paramem.graph.placeholders.deanonymize_text` plus the same
+    fail-closed drop: a pair naming a token in neither table is dropped
+    rather than forwarded with a residual placeholder.
+
+    Under ``pii_scope={"person"}`` (the production default), only person
+    nodes — including speakers — are tokenised; org/place/thing nodes pass
+    through verbatim. Accepted consequence: person-level ``same_as``
+    coreference (e.g. ``["Yang Ming", "Mr. Yang"]``) can no longer be
+    detected by the cloud judge, since both surfaces collapse to opaque,
+    unrelated tokens before the model ever sees them — the name-surface
+    signal coreference depends on is gone for people. org/place/thing
+    ``same_as`` is unaffected (those surfaces stay verbatim under the
+    default scope).
+
     Loads ``sota_graph_enrichment.txt`` (required). The prompt uses a
     ``{triples_json}`` placeholder.
 
     Args:
-        triples: List of ``{"subject", "predicate", "object", "relation_type"}``
-            dicts representing the chunk subgraph.
+        triples: List of ``{"subject", "predicate", "object", "relation_type",
+            "speaker_id"}`` dicts representing the chunk subgraph, from
+            :func:`~paramem.training.consolidation.serialize_subgraph_triples`
+            (unchanged — anonymization happens on its output here, not
+            inside it).
+        entities: One :class:`~paramem.graph.schema.Entity` per real name
+            the caller's per-chunk local-model anonymization pass found,
+            typed via :func:`~paramem.graph.placeholders.placeholder_entity_type`
+            on the placeholder that pass minted (``speaker_id`` left unset
+            — see above).
         api_key: Provider API key.
         provider: SOTA provider name (e.g. ``"anthropic"``).
         filter_model: Model identifier for the provider.
         endpoint: Custom endpoint for OpenAI-compatible providers.
         max_tokens: Maximum tokens in the SOTA response.
         temperature: Sampling temperature (0.0 for deterministic output).
+        pii_scope: Entity-types in scope for anonymization (e.g.
+            ``{"person"}``). ``None`` falls back to
+            :func:`~paramem.graph.placeholders._build_anonymization_mapping`'s
+            primitive-layer default.
 
     Returns:
         ``(new_relations, same_as_pairs, raw_response)`` on success, or
         ``None`` when the SOTA call fails or the response cannot be parsed.
-        ``new_relations`` is a list of relation dicts; ``same_as_pairs`` is a
-        list of ``[canonical, variant]`` pairs.
+        ``new_relations`` is a list of relation dicts with real node names;
+        ``same_as_pairs`` is a list of ``[canonical, variant]`` pairs with
+        real node names / bare speaker ids.
 
     The prompt this function loads is external config — edit
     ``configs/prompts/sota_graph_enrichment.txt`` to tune; no code changes
     are needed.
     """
+    mapping, reverse_mapping = _build_anonymization_mapping(
+        entities, {}, pii_scope=pii_scope, speaker_name=None
+    )
+    anon_triples = [
+        {
+            **t,
+            "subject": _substitute_whole_words(str(t.get("subject", "")), mapping),
+            "object": _substitute_whole_words(str(t.get("object", "")), mapping),
+            "speaker_id": _substitute_whole_words(str(t.get("speaker_id", "")), mapping),
+        }
+        for t in triples
+    ]
+
     enrichment_prompt = _load_prompt("sota_graph_enrichment.txt", required=True)
     try:
-        prompt = enrichment_prompt.format(triples_json=json.dumps(triples, indent=2))
+        prompt = enrichment_prompt.format(triples_json=json.dumps(anon_triples, indent=2))
     except KeyError as exc:
         logger.warning("Graph enrichment prompt has unexpected placeholder: %s", exc)
         return None
@@ -3781,7 +3885,8 @@ def _graph_enrich_with_sota(
     if raw is None:
         return None
 
-    # Parse response: preferred schema {"relations": [...], "same_as": [...]}
+    # Parse response: preferred schema {"relations": [...], "same_as": [...],
+    # "bindings": {...}}; legacy bare-array (relations only).
     try:
         json_str = _extract_json_block(raw)
         parsed = json.loads(json_str)
@@ -3790,16 +3895,22 @@ def _graph_enrich_with_sota(
         return None
 
     if isinstance(parsed, list):
-        # Legacy bare-array: treat as relations, no same_as.
         logger.debug("Graph enrichment: bare-array response (no same_as)")
-        return parsed, [], raw
-
-    if not isinstance(parsed, dict):
+        new_relations: list = parsed
+        raw_same_as: list = []
+        raw_bindings: dict = {}
+    elif isinstance(parsed, dict):
+        new_relations = parsed.get("relations") or []
+        raw_same_as = parsed.get("same_as") or []
+        raw_bindings = parsed.get("bindings") or {}
+        if not isinstance(new_relations, list):
+            logger.warning("Graph enrichment: 'relations' is not a list, ignoring")
+            new_relations = []
+        if not isinstance(raw_bindings, dict):
+            raw_bindings = {}
+    else:
         logger.warning("Graph enrichment: unexpected response type %s", type(parsed).__name__)
         return None
-
-    new_relations: list[dict] = parsed.get("relations") or []
-    raw_same_as = parsed.get("same_as") or []
 
     # Validate same_as entries: must be 2-element lists/tuples of non-empty strings.
     same_as_pairs: list[list[str]] = []
@@ -3816,11 +3927,48 @@ def _graph_enrich_with_sota(
         else:
             logger.debug("Graph enrichment: malformed same_as entry skipped: %r", pair)
 
-    if not isinstance(new_relations, list):
-        logger.warning("Graph enrichment: 'relations' is not a list, ignoring")
-        new_relations = []
+    # De-anonymize — the SAME exit gate the session tier uses.  ``bindings``
+    # is normally empty (the prompt forbids inventing new nodes) but is
+    # still normalized/applied rather than skipped as a special case.
+    sota_bindings, _bindings_stats = _normalize_anonymization_mapping(
+        raw_bindings, placeholder_side="key"
+    )
 
-    return new_relations, same_as_pairs, raw
+    deanon_relations, predicate_dropped, residual_dropped = _apply_bindings(
+        new_relations, reverse_mapping, sota_bindings
+    )
+    if predicate_dropped or residual_dropped:
+        logger.warning(
+            "graph_enrichment: dropped %d relation(s) post-substitution "
+            "(%d predicate-invariant, %d residual placeholder sweep).",
+            len(predicate_dropped) + len(residual_dropped),
+            len(predicate_dropped),
+            len(residual_dropped),
+        )
+
+    # same_as pairs: free-text deanon plus the same fail-closed drop — a
+    # pair naming a token in neither table is dropped rather than forwarded
+    # with a residual placeholder.
+    resolve = _resolution_map(reverse_mapping, sota_bindings, None)
+    declared = _declared_placeholder_tokens(reverse_mapping, sota_bindings)
+    deanon_same_as: list[list[str]] = []
+    for canon, variant in same_as_pairs:
+        d_canon = deanonymize_text(canon, resolve)
+        d_variant = deanonymize_text(variant, resolve)
+        if (
+            PLACEHOLDER_TOKEN_RE.search(d_canon)
+            or PLACEHOLDER_TOKEN_RE.search(d_variant)
+            or _contains_declared_token(d_canon, declared)
+            or _contains_declared_token(d_variant, declared)
+        ):
+            logger.warning(
+                "graph_enrichment: dropping same_as pair with unresolved token: %r",
+                [canon, variant],
+            )
+            continue
+        deanon_same_as.append([d_canon, d_variant])
+
+    return deanon_relations, deanon_same_as, raw
 
 
 def _render_indexed_facts(facts: list[dict]) -> str:

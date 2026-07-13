@@ -23,6 +23,7 @@ from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeli
 from paramem.graph.extractor import (
     PROVIDER_KEY_ENV,
     _graph_enrich_with_sota,
+    anonymize_with_local_model,
     dedup_synonym_predicates,
 )
 from paramem.graph.merger import GraphMerger, min_nonempty
@@ -31,11 +32,12 @@ from paramem.graph.name_match import (
     is_speaker_id,
 )
 from paramem.graph.phase_trace import extraction_trace, phase_trace
+from paramem.graph.placeholders import placeholder_entity_type
 from paramem.graph.qa_generator import (
     partition_relations,
 )
 from paramem.graph.reconstruct import reconstruct_graph
-from paramem.graph.schema import Relation, SessionGraph
+from paramem.graph.schema import Entity, Relation, SessionGraph
 from paramem.graph.schema_config import fallback_relation_type, relation_types
 from paramem.memory.entry import (
     assign_keys,
@@ -45,7 +47,7 @@ from paramem.memory.entry import (
 )
 from paramem.models.loader import atomic_save_adapter, switch_adapter
 from paramem.server.fold_telemetry import record_fold_telemetry
-from paramem.server.vram_guard import safe_empty_cache
+from paramem.server.vram_guard import VramExhausted, safe_empty_cache
 from paramem.training.key_registry import KeyRegistry
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.training.trainer import TrainingHooks
@@ -2468,6 +2470,64 @@ class ConsolidationLoop:
         enrichment cannot see.  Folds in coreference resolution via
         ``same_as`` pairs emitted by the SOTA response.
 
+        Every cloud call this method makes runs through the SAME
+        anonymize -> SOTA -> de-anonymize contract as session-tier
+        extraction (:func:`~paramem.graph.extractor._sota_pipeline`), via
+        the shared primitives in :mod:`paramem.graph.placeholders`. The
+        cumulative fold graph carries no entity types (registry SPO
+        triples have none; the merger's fallback for an untyped relation
+        endpoint is ``entity_type="concept"``), so node attributes cannot
+        supply the per-chunk :class:`~paramem.graph.schema.Entity`
+        inventory the way session-tier extraction does. Instead, this
+        method runs :func:`~paramem.graph.extractor.anonymize_with_local_model`
+        (the SAME local-model anonymizer session-tier extraction uses) over
+        each chunk's triples first, and derives every real name's
+        ``entity_type`` from the placeholder that call minted for it
+        (:func:`~paramem.graph.placeholders.placeholder_entity_type`) —
+        the local model is the PRIMARY type source at this tier, not a
+        hint. That typed :class:`Entity` list and the ``pii_scope`` policy
+        (``ext_cfg.pii_scope``, sourced from ``sanitization.cloud_scope``)
+        are what feed :func:`~paramem.graph.extractor._graph_enrich_with_sota`,
+        which does the actual mint / SOTA-call / de-anonymize work (see its
+        docstring for the contract and the accepted person-level
+        ``same_as`` loss under the default ``{"person"}`` scope).
+        ``serialize_subgraph_triples`` stays a plain, un-anonymized
+        serializer — anonymization happens on its output, not inside it.
+        A local-anonymization parse failure fails the chunk closed (skips
+        the SOTA call for that chunk) rather than risk sending it unmasked
+        — mirroring :func:`~paramem.graph.extractor._sota_pipeline`'s own
+        fallback-to-local-only behaviour on the same failure mode.
+
+        Forward-path privacy: the local anonymizer's mapping keys are
+        real-name surfaces the LLM produced independently of the fold
+        graph's own (canonical, lowercase, separator-folded) node keys —
+        a re-cased, separator-varied, or diacritic-varied key (e.g. the
+        LLM emits ``"Yang Ming"`` for fold-graph node ``"yang ming"``)
+        would silently fail to substitute under a raw string comparison,
+        leaking the real name into the SOTA payload. This method
+        reconciles that mismatch itself, per chunk, before building
+        ``chunk_entities``: every ``_llm_mapping`` key is run through
+        :func:`~paramem.graph.name_match.canonical` and matched against
+        the (also-canonicalized) node keys of ``chunk_nodes``; on a match
+        the entry is re-keyed onto the actual node-key surface, and on no
+        match (or an ambiguous multiple-node match) it is dropped and
+        counted in ``mapping_rekey_dropped``. The shared
+        ``_substitute_whole_words`` primitive (:mod:`paramem.graph.
+        placeholders`) keeps EXACT matching everywhere else — canonical
+        folding there would let a mapped person name silently consume a
+        lowercase common-noun homograph in free transcript text, and
+        would defeat the fail-closed residual-token drop on the
+        deanonymize side (see that module's docstring). Separately, a local
+        mapping that comes back completely EMPTY, or every entry of which
+        is dropped by this reconciliation, while the chunk has real
+        (non-speaker) node names is a classification failure, not evidence
+        that nothing in the chunk is in scope — there is no way to tell
+        the two apart from here — so that chunk's SOTA call is skipped
+        (fail-closed) and counted in the returned ``privacy_skipped_chunks``.
+        This residual (an entity the local model misclassifies, e.g. types
+        as an organization) is owner-accepted and not otherwise engineered
+        around — see ``benchmarking.md``.
+
         The method mutates ``self.merger.graph`` in place: first applying
         ``same_as`` node contractions, then inserting new edges tagged with
         the provenance attribute ``edge_source="graph_enrichment"`` (stored
@@ -2483,6 +2543,7 @@ class ConsolidationLoop:
         ``last_seen``/``first_seen`` from bookkeeping.
 
         Early-return conditions (all return ``skipped=True``):
+        - No local model available (``self.model is None``).
         - Graph has fewer than 10 nodes (floor — too little signal).
         - ``extraction_noise_filter`` is empty (no SOTA provider configured).
         - Provider env-var is absent (API key not set).
@@ -2500,6 +2561,15 @@ class ConsolidationLoop:
                 - ``chunks`` (int): number of SOTA calls made.
                 - ``new_edges`` (int): edges added to the graph.
                 - ``same_as_merges`` (int): node contractions applied.
+                - ``privacy_skipped_chunks`` (int): chunks skipped because
+                  the local anonymizer identified zero entities for a
+                  chunk that had real (non-speaker) node names — see
+                  above.
+                - ``mapping_rekey_dropped`` (int): local-anonymizer mapping
+                  entries dropped because they named nothing (or an
+                  ambiguous multiple) in their chunk once reconciled
+                  against the chunk's actual node keys via ``canonical()``
+                  (F1b) — see the ``chunk_entities`` construction below.
                 - ``skipped`` (bool): ``True`` when enrichment was bypassed.
                 - ``skip_reason`` (str | None): reason token when skipped.
         """
@@ -2509,7 +2579,17 @@ class ConsolidationLoop:
 
         from paramem.memory.persistence import _IK_KEY_ATTR
 
-        _empty = {"chunks": 0, "new_edges": 0, "same_as_merges": 0}
+        _empty = {
+            "chunks": 0,
+            "new_edges": 0,
+            "same_as_merges": 0,
+            "privacy_skipped_chunks": 0,
+            "mapping_rekey_dropped": 0,
+        }
+
+        if self.model is None:
+            logger.info("graph_enrichment: no local model — skipping")
+            return {**_empty, "skipped": True, "skip_reason": "no_model"}
 
         graph = self.merger.graph
         node_count = graph.number_of_nodes()
@@ -2543,6 +2623,12 @@ class ConsolidationLoop:
 
         filter_model = ext_cfg.noise_filter_model
         endpoint = ext_cfg.noise_filter_endpoint or None
+        # Same cloud-egress PII scope as session-tier extraction
+        # (``sanitization.cloud_scope`` -> ``ExtractionConfig.pii_scope`` at
+        # bootstrap) — the anonymization contract below (§ the
+        # ``_graph_enrich_with_sota`` call) honours the same operator
+        # policy as every other cloud-egress path.
+        pii_scope = ext_cfg.pii_scope
         max_entities = max(1, self.graph_enrichment_max_entities_per_pass)
         hops = max(1, self.graph_enrichment_neighborhood_hops)
 
@@ -2582,6 +2668,8 @@ class ConsolidationLoop:
 
         total_merges = 0
         calls_made = 0
+        privacy_skipped_chunks = 0
+        mapping_rekey_dropped = 0
         seen_merge_keys: set[frozenset] = set()
         # Accumulates ik_keys from edges dropped by successful same_as contractions.
         # Keys are written to self.merger.removal_ledger after the loop completes
@@ -2609,18 +2697,191 @@ class ConsolidationLoop:
                         _chunk_first_seen, _edata.get("first_seen") or ""
                     )
                 triples = serialize_subgraph_triples(chunk_subgraph)
+                # The fold graph carries no entity types: registry SPO
+                # triples have none, and the merger's fallback for a
+                # relation endpoint that isn't already a known Entity is
+                # entity_type="concept" (GraphMerger._merge_relations).
+                # Node attributes are therefore NOT a usable type source at
+                # this tier — reading them here previously masked ONLY the
+                # speaker (the sole node synthesized with entity_type=
+                # "person") and sent every other real name to the cloud
+                # verbatim.
+                #
+                # The local model is the PRIMARY type source instead: run
+                # the SAME anonymize call the session tier uses
+                # (anonymize_with_local_model) over this chunk's triples,
+                # framed as a throwaway SessionGraph (transcript="" — there
+                # is no transcript at this tier), and derive each real
+                # name's entity_type from the placeholder the local model
+                # minted for it via placeholder_entity_type — the same
+                # primitive _sota_pipeline's own entity-rebuild loop uses
+                # to solve the identical problem (deriving a type from a
+                # placeholder). The anonymization prompt instructs
+                # the model to leave speaker{N} ids verbatim (never map
+                # them), so a speaker anchor never becomes a chunk_entities
+                # record here — it is already anonymous and reaches the
+                # SOTA payload bare by design (ONE-lowercase-speaker{N}
+                # invariant), with no mint/restore round trip needed.
+                _chunk_relations: list[Relation] = []
+                for _t in triples:
+                    _rt = _t.get("relation_type", _FALLBACK_RTYPE)
+                    if _rt not in _VALID_RTYPES:
+                        _rt = _FALLBACK_RTYPE
+                    _chunk_relations.append(
+                        Relation(
+                            subject=_t["subject"],
+                            predicate=_t["predicate"],
+                            object=_t["object"],
+                            relation_type=_rt,  # type: ignore[arg-type]
+                            speaker_id=_t.get("speaker_id", ""),
+                        )
+                    )
+                _chunk_session_graph = SessionGraph(
+                    session_id="__graph_enrichment__",
+                    timestamp="",
+                    entities=[],
+                    relations=_chunk_relations,
+                )
+                # anonymize_with_local_model calls model.generate() internally
+                # (CLAUDE.md: gradient checkpointing must be disabled around
+                # ANY model.generate() site — HF silently disables the KV
+                # cache when checkpointing is active).
+                self._disable_gradient_checkpointing()
+                try:
+                    _anon_facts, _llm_mapping, _anon_transcript, _anon_raw = (
+                        anonymize_with_local_model(
+                            _chunk_session_graph,
+                            self.model,
+                            self.tokenizer,
+                            transcript="",
+                            max_tokens=ext_cfg.max_tokens,
+                        )
+                    )
+                finally:
+                    self._enable_gradient_checkpointing()
+                if _anon_facts is None:
+                    # Mirrors the session tier's fail-closed behaviour:
+                    # _sota_pipeline falls back to LOCAL plausibility on
+                    # anonymization parse failure rather than ever sending
+                    # unmasked content to the cloud. This chunk has no
+                    # trustworthy type source at all when the local call
+                    # fails to parse — skip the SOTA call for this chunk
+                    # entirely rather than sending it unmasked.
+                    logger.warning(
+                        "graph_enrichment: local anonymization failed for chunk — "
+                        "skipping SOTA call (fail-closed)"
+                    )
+                    continue
+                # F1b — reconcile the local anonymizer's mapping onto the
+                # ACTUAL node-key surfaces before it feeds chunk_entities.
+                # The local model's mapping is keyed by whatever real-name
+                # surface it independently produced (e.g. "Yang Ming");
+                # the fold graph's own node keys are already canonicalized
+                # (e.g. "yang ming") — a raw comparison between the two
+                # silently misses every re-cased/separator-varied/
+                # diacritic-varied key, so _build_anonymization_mapping
+                # would mint a placeholder keyed on "Yang Ming" that never
+                # matches the "yang ming" text _substitute_whole_words
+                # compares against inside ``triples``' subject/object
+                # fields below — the real name would reach the SOTA
+                # payload unmasked even though the local model correctly
+                # classified it. Reconciling identity HERE, at this call
+                # site only, keeps the shared _substitute_whole_words
+                # primitive's matching exact everywhere else (no blast
+                # radius on the session tier, which never builds facts
+                # from pre-canonicalized node-key text).
+                _canon_to_node: dict[str, str] = {}
+                _ambiguous_canon: set[str] = set()
+                for _node_key in chunk_nodes:
+                    _c = canonical(str(_node_key))
+                    if _c in _canon_to_node and _canon_to_node[_c] != _node_key:
+                        # Two distinct node keys canonicalizing identically
+                        # is a real ambiguity — should not arise in practice
+                        # (node keys are already canonical by construction,
+                        # so canonical() is a no-op on them — see
+                        # name_match.canonical's idempotence), but fail
+                        # closed rather than silently pick one: drop BOTH
+                        # candidates from this chunk's reconciliation.
+                        _ambiguous_canon.add(_c)
+                    else:
+                        _canon_to_node[_c] = _node_key
+
+                chunk_entities: list[Entity] = []
+                _mapping_rekey_dropped_chunk = 0
+                for _real, _placeholder in (_llm_mapping or {}).items():
+                    if not isinstance(_real, str) or not isinstance(_placeholder, str):
+                        continue
+                    if is_speaker_id(_real):
+                        continue
+                    _c = canonical(_real)
+                    if _c in _ambiguous_canon or _c not in _canon_to_node:
+                        # The model named something that matches no (single,
+                        # unambiguous) node in THIS chunk — drop it rather
+                        # than mint a placeholder that would never be found
+                        # in the triples' subject/object text.
+                        _mapping_rekey_dropped_chunk += 1
+                        continue
+                    chunk_entities.append(
+                        Entity(
+                            name=_canon_to_node[_c],
+                            entity_type=placeholder_entity_type(_placeholder),
+                        )
+                    )
+                mapping_rekey_dropped += _mapping_rekey_dropped_chunk
+                if _mapping_rekey_dropped_chunk:
+                    logger.warning(
+                        "graph_enrichment: dropped %d local-anonymizer mapping "
+                        "entry(ies) naming nothing in this chunk (post-canonical "
+                        "reconciliation)",
+                        _mapping_rekey_dropped_chunk,
+                    )
+                # Forward-path privacy guard (leg 2 — the leg the F1b
+                # reconciliation above cannot fix, since it operates on a
+                # mapping that came back non-empty but wrong; this leg
+                # covers the mapping coming back EMPTY, or every entry
+                # dropped by reconciliation): a chunk with real
+                # (non-speaker) node names but zero surviving
+                # ``chunk_entities`` is a classification failure, not
+                # evidence that nothing in this chunk is in scope — there
+                # is no way to tell the two apart from here. Narrow by
+                # design: this does NOT attempt a totality check against
+                # every node (that would treat legitimate out-of-scope
+                # nodes, e.g. organizations, as leaks too) — it only fires
+                # when the local anonymizer named NOTHING usable at all for
+                # a chunk that has real content.
+                _chunk_nonspeaker_names = {
+                    str(_t.get(_field, "")) for _t in triples for _field in ("subject", "object")
+                }
+                _chunk_nonspeaker_names = {
+                    _n for _n in _chunk_nonspeaker_names if _n and not is_speaker_id(_n)
+                }
+                if _chunk_nonspeaker_names and not chunk_entities:
+                    privacy_skipped_chunks += 1
+                    logger.warning(
+                        "graph_enrichment: local anonymizer identified zero entities "
+                        "for a %d-triple chunk — skipping SOTA call (fail-closed)",
+                        len(triples),
+                    )
+                    continue
                 result = _graph_enrich_with_sota(
                     triples,
+                    chunk_entities,
                     api_key,
                     provider,
                     filter_model,
                     endpoint,
+                    pii_scope=pii_scope,
                 )
                 calls_made += 1
                 if result is None:
                     logger.warning("graph_enrichment: SOTA call returned None for chunk")
                     continue
                 new_rels, same_as_pairs, _raw = result
+            except VramExhausted:
+                # Not a chunk-level extraction failure — the caller (the
+                # per-cycle loop in app.py) must see this and retry rather
+                # than have it silently swallowed as a skipped chunk.
+                raise
             except Exception as exc:
                 logger.warning(
                     "graph_enrichment: exception during SOTA call — %s: %s",
@@ -2797,11 +3058,14 @@ class ConsolidationLoop:
         total_new = max(0, graph.number_of_edges() - _edges_before)
 
         logger.info(
-            "graph_enrichment: provider=%s chunks=%d new_edges=%d same_as_merges=%d",
+            "graph_enrichment: provider=%s chunks=%d new_edges=%d same_as_merges=%d "
+            "privacy_skipped_chunks=%d mapping_rekey_dropped=%d",
             provider,
             calls_made,
             total_new,
             total_merges,
+            privacy_skipped_chunks,
+            mapping_rekey_dropped,
         )
         # Write enrichment-collapsed ik_keys to the merger's removal ledger so the
         # drift classifier can route them to drift_intended_removal rather than
@@ -2816,6 +3080,8 @@ class ConsolidationLoop:
             "chunks": calls_made,
             "new_edges": total_new,
             "same_as_merges": total_merges,
+            "privacy_skipped_chunks": privacy_skipped_chunks,
+            "mapping_rekey_dropped": mapping_rekey_dropped,
             "skipped": False,
             "skip_reason": None,
         }

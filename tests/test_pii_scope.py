@@ -22,9 +22,9 @@ import pytest
 
 from paramem.graph.extractor import (
     _CLOUD_EGRESS_DEFAULT_SCOPE,
+    check_anonymization_leaks,
     extract_and_anonymize_for_cloud,
     extract_pii_names_with_ner,
-    verify_anonymization_completeness,
 )
 from paramem.graph.placeholders import _DEFAULT_PII_SCOPE
 from paramem.graph.schema import Entity, Relation, SessionGraph
@@ -130,14 +130,14 @@ def test_extract_pii_names_with_ner_empty_transcript_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# verify_anonymization_completeness — scope filter
+# check_anonymization_leaks — scope filter
 # ---------------------------------------------------------------------------
 
 
 def _make_mixed_graph():
     """SessionGraph with a person, a place, and an organization.
 
-    Used to verify that ``verify_anonymization_completeness`` flags
+    Used to verify that ``check_anonymization_leaks`` flags
     only in-scope categories as potential leaks.  All three entity
     types appear both as standalone entities and as relation
     participants so the defensive relation-walk in the verify
@@ -205,10 +205,8 @@ def _make_mixed_graph():
         ),
     ],
 )
-def test_verify_anonymization_completeness_scope_drives_real_names(
-    scope, anon_text, expected_leaked
-):
-    """``verify_anonymization_completeness`` only flags leaks whose type ∈ scope.
+def test_check_anonymization_leaks_scope_drives_real_names(scope, anon_text, expected_leaked):
+    """``check_anonymization_leaks`` only flags leaks whose type ∈ scope.
 
     Out-of-scope entities pass through unflagged — by design, so the
     operator's choice of ``cloud_scope`` controls which categories the
@@ -217,20 +215,20 @@ def test_verify_anonymization_completeness_scope_drives_real_names(
     graph = _make_mixed_graph()
     # Empty mapping → every in-scope name is missing from the mapping
     # AND appears verbatim in anon_text (Case 1 leak in the verify docstring).
-    leaked = verify_anonymization_completeness(
+    leaked = check_anonymization_leaks(
         graph, mapping={}, anon_facts=[], anon_transcript=anon_text, pii_scope=scope
     )
     assert set(leaked) == expected_leaked
 
 
-def test_verify_anonymization_completeness_empty_scope_returns_empty():
+def test_check_anonymization_leaks_empty_scope_returns_empty():
     """Empty scope short-circuits to no leaks: nothing's in scope to flag.
 
     Operator's "off" signal — must not invent leaks where there's no
     policy asking us to look.
     """
     graph = _make_mixed_graph()
-    leaked = verify_anonymization_completeness(
+    leaked = check_anonymization_leaks(
         graph,
         mapping={},
         anon_facts=[],
@@ -240,14 +238,14 @@ def test_verify_anonymization_completeness_empty_scope_returns_empty():
     assert leaked == []
 
 
-def test_verify_anonymization_completeness_default_scope_is_person_place():
+def test_check_anonymization_leaks_default_scope_is_person_place():
     """``pii_scope=None`` preserves the primitive default ``{person, place}``.
 
     Back-compat for callers that don't pass an explicit scope (e.g.
     legacy experiment scripts, the existing extraction-pipeline tests).
     """
     graph = _make_mixed_graph()
-    leaked = verify_anonymization_completeness(
+    leaked = check_anonymization_leaks(
         graph,
         mapping={},
         anon_facts=[],

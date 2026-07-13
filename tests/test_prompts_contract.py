@@ -897,18 +897,85 @@ class TestSpeakerDirectiveFile:
         assert "{speaker_name}" not in ctx
 
     def test_sota_graph_enrichment_contains_speaker_id_note(self):
-        """W1: sota_graph_enrichment.txt must instruct the model not to de-anonymize
-        Speaker{N} ids or propose same_as pairs between them.
+        """sota_graph_enrichment.txt must instruct the model that nodes IN
+        SCOPE for the operator's privacy policy are opaque placeholder
+        tokens, forbid de-anonymizing/renaming/inventing one, and forbid a
+        ``same_as`` pair between two ``speaker{N}`` identifiers.
+
+        Speaker endpoints are NEVER tokenised at either tier — same as the
+        session-tier anonymizer prompt, where the bare ``speaker{N}``
+        anchor is left untouched (it is already anonymous and carries no
+        identifying information; see ``consolidation.py``'s
+        ``_run_graph_enrichment`` docstring and ``SECURITY.md``). Nodes
+        outside the ``pii_scope`` (e.g. organizations under the default
+        ``{"person"}`` scope) also appear verbatim — the prompt must not
+        claim every ``subject``/``object`` is a token.
         """
         tmpl = _load_prompt("sota_graph_enrichment.txt", "")
         lower = tmpl.lower()
-        # The note must reference the system-id format.
+        # The note must reference speaker endpoints and the token/system framing.
         assert "speaker" in lower and ("identifier" in lower or "system" in lower), (
-            "sota_graph_enrichment.txt must note that Speaker{N} is a system id."
+            "sota_graph_enrichment.txt must note that speaker endpoints are "
+            "system-generated tokens."
+        )
+        assert "token" in lower, (
+            "sota_graph_enrichment.txt must describe node names as placeholder tokens."
         )
         assert "do not" in lower or "never" in lower, (
-            "sota_graph_enrichment.txt must forbid de-anonymizing or renaming Speaker{N} ids."
+            "sota_graph_enrichment.txt must forbid de-anonymizing, renaming, or inventing tokens."
         )
+
+    def test_sota_graph_enrichment_part1_examples_use_tokens_not_real_names(self):
+        """Part 1's worked examples must use placeholder tokens, not the
+        example real names the prompt used before this contract was wired
+        up (Alice/Bob/Acme/Stanford/Portland) — a live cloud call must
+        never see them, worked example or not. Scoped to Part 1's text
+        only — Part 2 (``same_as``) legitimately keeps real-name examples,
+        but they must be organization/place/thing names, not person names:
+        under the shipped ``{"person"}`` scope persons are always tokens
+        by the time this pass runs, so a person-name example there would
+        illustrate an unreachable task (F5). See
+        ``TestSpeakerDirectiveFile::test_sota_graph_enrichment_part2_examples_are_not_person_names``.
+        """
+        tmpl = _load_prompt("sota_graph_enrichment.txt", "")
+        part1 = tmpl.split("## Part 1")[1].split("## Part 2")[0]
+        for leaked_name in ("Alice", "Bob", "Acme", "Stanford", "Portland"):
+            assert leaked_name not in part1, (
+                f"sota_graph_enrichment.txt Part 1 must use placeholder tokens, "
+                f"not the real example name {leaked_name!r}."
+            )
+
+    def test_sota_graph_enrichment_part2_examples_are_not_person_names(self):
+        """Part 2's SAME_AS examples must be drawn from surfaces this pass
+        actually sees — organizations, places, things — never person
+        names, since under the shipped ``{"person"}`` scope persons are
+        always opaque tokens by the time this pass runs and never appear
+        as real-name surfaces. A person-name example there would coach
+        the model on a task it structurally cannot perform, while line 2
+        of the prompt simultaneously forbids guessing the identity behind
+        a token — a self-contradiction (F5).
+
+        Mutation: reintroduce a person-name SAME_AS example (e.g. ``"Yang
+        Ming"`` / ``"Mr. Yang"``) in Part 2 -> this test fails.
+        """
+        tmpl = _load_prompt("sota_graph_enrichment.txt", "")
+        part2 = tmpl.split("## Part 2")[1].split("## Input triples")[0]
+        for leaked_person_name in (
+            "Yang Ming",
+            "Mr. Yang",
+            "Robert Smith",
+            "Bob Smith",
+            "Alicia Smith",
+            "Zhang Min",
+            "Wang Min",
+            "Sara",
+            "Sarah",
+        ):
+            assert leaked_person_name not in part2, (
+                f"sota_graph_enrichment.txt Part 2 must not use the person-name "
+                f"example {leaked_person_name!r} — persons are always tokens "
+                f"under the shipped scope; use org/place/thing surfaces instead."
+            )
 
 
 class TestB2AnonymizerPrivacy:
@@ -961,7 +1028,7 @@ class TestB2AnonymizerPrivacy:
 
         graph = self._make_graph("speaker0", "speaker0")
         forward, _reverse = _build_anonymization_mapping(
-            graph,
+            graph.entities,
             {},
             pii_scope={"person"},
             speaker_name="Alex",
@@ -990,7 +1057,7 @@ class TestB2AnonymizerPrivacy:
 
         graph = self._make_graph("speaker0", "speaker0")
         forward, _reverse = _build_anonymization_mapping(
-            graph,
+            graph.entities,
             {},
             pii_scope={"person"},
             speaker_name="Alex",
@@ -1007,7 +1074,7 @@ class TestB2AnonymizerPrivacy:
 
         graph = self._make_graph("speaker0", "speaker0")
         forward, _reverse = _build_anonymization_mapping(
-            graph,
+            graph.entities,
             {},
             pii_scope={"person"},
             speaker_name=None,

@@ -1390,7 +1390,7 @@ class TestSOTANoiseFilter:
 
     def test_verify_anonymization_catches_leak(self):
         """Forward-path guard detects a real name leaking past anonymization."""
-        from paramem.graph.extractor import verify_anonymization_completeness
+        from paramem.graph.extractor import check_anonymization_leaks
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1403,13 +1403,13 @@ class TestSOTANoiseFilter:
         mapping = {"Alex": "Person_1"}
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Millfield"}]
         anon_transcript = "Person_1 moved to Millfield last year."
-        leaked = verify_anonymization_completeness(graph, mapping, anon_facts, anon_transcript)
+        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
         assert "Millfield" in leaked
         assert "Alex" not in leaked  # Alex was properly replaced
 
     def test_verify_anonymization_clean_mapping(self):
         """Guard returns empty list when anonymization is complete."""
-        from paramem.graph.extractor import verify_anonymization_completeness
+        from paramem.graph.extractor import check_anonymization_leaks
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1422,7 +1422,7 @@ class TestSOTANoiseFilter:
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         anon_transcript = "Person_1 moved to City_1 last year."
-        leaked = verify_anonymization_completeness(graph, mapping, anon_facts, anon_transcript)
+        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
         assert leaked == []
 
     def test_normalize_anonymization_mapping_inverts_placeholder_keys(self):
@@ -1672,7 +1672,7 @@ class TestSOTANoiseFilter:
 
     def test_verify_anonymization_catches_missing_mapping(self):
         """Guard catches silent de-anonymization failure (name replaced but mapping incomplete)."""
-        from paramem.graph.extractor import verify_anonymization_completeness
+        from paramem.graph.extractor import check_anonymization_leaks
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1688,13 +1688,13 @@ class TestSOTANoiseFilter:
         mapping = {"Millfield": "City_1"}
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         anon_transcript = "Person_1 moved to City_1."
-        problems = verify_anonymization_completeness(graph, mapping, anon_facts, anon_transcript)
+        problems = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
         assert "Alex" in problems
         assert "Millfield" not in problems  # properly mapped
 
     def test_verify_anonymization_case_insensitive(self):
         """Guard catches case-different leaks (Alex vs alex)."""
-        from paramem.graph.extractor import verify_anonymization_completeness
+        from paramem.graph.extractor import check_anonymization_leaks
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1707,7 +1707,7 @@ class TestSOTANoiseFilter:
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         anon_transcript = "the speaker alex moved to City_1."
-        leaked = verify_anonymization_completeness(graph, mapping, anon_facts, anon_transcript)
+        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
         assert "Alex" in leaked
 
     def test_pipeline_repairs_missed_leak_then_calls_sota(self):
@@ -2143,7 +2143,7 @@ class TestApplyBindings:
             )
         )
         forward, reverse = _build_anonymization_mapping(
-            graph, llm_mapping={}, pii_scope={"person"}, speaker_name="Alex"
+            graph.entities, llm_mapping={}, pii_scope={"person"}, speaker_name="Alex"
         )
         # PII attributes STILL scrubbed — folded onto the anchor, not a
         # minted placeholder (T5c is the PII-regression guard).
@@ -2199,7 +2199,7 @@ class TestApplyBindings:
             )
         )
         forward, reverse = _build_anonymization_mapping(
-            graph, llm_mapping={}, pii_scope={"person"}, speaker_name=None
+            graph.entities, llm_mapping={}, pii_scope={"person"}, speaker_name=None
         )
         # Forward fold is preserved (privacy contract).
         assert forward["Alex"] == "Person_1"
@@ -2921,7 +2921,7 @@ class TestResidualLeakDropsReferencingTriples:
     survived anonymization are dropped.
 
     The fact-level residual filter exists for the case where
-    ``verify_anonymization_completeness`` flags a leak that the
+    ``check_anonymization_leaks`` flags a leak that the
     deterministic builder did not pre-empt.  Under the consolidated
     architecture this can happen only when the leaked name is supplied
     externally — typically by ``extract_pii_names_with_ner`` over the
@@ -3652,7 +3652,7 @@ class TestExtractGraphNewKwargs:
     def test_verify_anonymization_false_skips_guard(self):
         """verify_anonymization=False skips the forward-path privacy guard.
 
-        The completeness verifier (verify_anonymization_completeness) must not
+        The forward-path leak check (check_anonymization_leaks) must not
         be called when the caller opts out of the guard.
         """
         from paramem.graph.extractor import _sota_pipeline
@@ -3688,7 +3688,7 @@ class TestExtractGraphNewKwargs:
                 return_value=(anon_facts, mapping, anon_transcript, ""),
             ),
             patch(
-                "paramem.graph.extractor.verify_anonymization_completeness",
+                "paramem.graph.extractor.check_anonymization_leaks",
                 side_effect=fake_verify,
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
@@ -3705,7 +3705,7 @@ class TestExtractGraphNewKwargs:
             )
 
         # With verify_anonymization=False the guard function must not be called
-        assert verifier_calls == [], "verify_anonymization_completeness must be skipped when False"
+        assert verifier_calls == [], "check_anonymization_leaks must be skipped when False"
         # SOTA must have been called (no guard blocked it)
         assert len(sota_calls) == 1
 
@@ -3915,14 +3915,8 @@ class TestBuildAnonymizationMapping:
     def _build_pair(entities, *, llm_mapping=None, pii_scope=None, speaker_name=None):
         from paramem.graph.placeholders import _build_anonymization_mapping
 
-        graph = SessionGraph(
-            session_id="s",
-            timestamp="2026-05-06T00:00:00Z",
-            entities=entities,
-            relations=[],
-        )
         return _build_anonymization_mapping(
-            graph,
+            entities,
             llm_mapping or {},
             pii_scope=pii_scope,
             speaker_name=speaker_name,
@@ -4310,7 +4304,7 @@ class TestBuildAnonymizationMapping:
         Locks the contract that the builder produces a complete enough
         mapping for verify to succeed.
         """
-        from paramem.graph.extractor import verify_anonymization_completeness
+        from paramem.graph.extractor import check_anonymization_leaks
         from paramem.graph.placeholders import _build_anonymization_mapping
 
         graph = _make_graph(
@@ -4321,14 +4315,14 @@ class TestBuildAnonymizationMapping:
             ],
         )
         mapping, _reverse = _build_anonymization_mapping(
-            graph,
+            graph.entities,
             {"Google": "Org_1"},  # LLM hint for the org.
             pii_scope={"person"},
             speaker_name="Alex",
         )
         anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Org_1"}]
         anon_transcript = "Person_1 works at Org_1."
-        leaked = verify_anonymization_completeness(graph, mapping, anon_facts, anon_transcript)
+        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
         assert leaked == [], f"verifier must report no leaks; got {leaked!r}"
 
 
@@ -5268,9 +5262,9 @@ class TestSpeakerAnchorPipeline:
         assert "sota_enrichment_rejected" not in result.diagnostics
 
     def test_verify_does_not_flag_speaker0_as_leak(self):
-        """T5b — ``verify_anonymization_completeness`` must NOT flag a
+        """T5b — ``check_anonymization_leaks`` must NOT flag a
         verbatim ``speaker0`` as a leak — it is already anonymous."""
-        from paramem.graph.extractor import verify_anonymization_completeness
+        from paramem.graph.extractor import check_anonymization_leaks
 
         graph = _make_graph(
             [("speaker0", "lives_in", "Millfield")],
@@ -5282,7 +5276,7 @@ class TestSpeakerAnchorPipeline:
         mapping = {"Millfield": "City_1"}
         anon_facts = [{"subject": "speaker0", "predicate": "lives_in", "object": "City_1"}]
         anon_transcript = "speaker0 lives in City_1."
-        leaked = verify_anonymization_completeness(graph, mapping, anon_facts, anon_transcript)
+        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
         assert leaked == [], f"speaker0 must never be flagged as a leak; got {leaked!r}"
 
     def test_anchor_independent_of_speaker_relation_presence(self):

@@ -210,8 +210,8 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  sota_enabled: false           # master gate for ALL SOTA (transcript pipeline + graph enrichment). false = ship default (off)
-  refinement_enrichment: "off"  # graph-stage SOTA enrichment pass. off|on. Requires sota_enabled:true to fire.
+  sota_enabled: false           # master gate for ALL SOTA (transcript pipeline + graph enrichment). false = ship default (off). NOT a benign toggle: enabling egresses knowledge-graph content (subjects/objects) to the configured cloud provider. Anonymization is best-effort, scoped by sanitization.cloud_scope, and depends on the LOCAL model's entity-type classification — a misclassified entity (e.g. a person typed as an organization) can leak a real name to the cloud with no downstream detection or repair. Keep false unless this risk is accepted.
+  refinement_enrichment: "off"  # graph-stage SOTA enrichment pass. off|on. Requires sota_enabled:true to fire. Same cloud-egress risk as sota_enabled above — this is the flag that actually triggers the graph-content SOTA call.
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
   recall_sanity_threshold: 1.0  # minimum recall fraction (0, 1] for all recall gates; 1.0 = sharp (all keys must be recalled)

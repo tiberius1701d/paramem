@@ -12290,6 +12290,49 @@ class TestW1SameAsGuard:
     for every distinct speaker pair).  The guard blocks both scenarios.
     """
 
+    @pytest.fixture(autouse=True)
+    def _stub_local_anonymize(self, monkeypatch):
+        """Stub ``anonymize_with_local_model`` for every test in this class.
+
+        ``_run_graph_enrichment`` now runs the local anonymizer (the SAME
+        primitive session-tier extraction uses) over each chunk BEFORE the
+        SOTA call, to derive real-name entity types the fold graph itself
+        cannot supply (see that method's docstring). ``_make_w1_loop``'s
+        model/tokenizer are ``MagicMock()``s, so a real call always fails to
+        parse (no JSON in a ``MagicMock``'s generated output), which would
+        fail every chunk closed (skip the SOTA call entirely) before the
+        mocked ``_graph_enrich_with_sota`` below is ever reached — masking
+        every test in this class behind a vacuous ``same_as_merges == 0``.
+
+        The stub lands on the SAFE side rather than the unsafe one: it
+        types every non-speaker name found in the chunk's relations as
+        ``"person"`` (masked). An EMPTY mapping (``{}``) is deliberately
+        NOT used here — ``_run_graph_enrichment``'s own fail-closed guard
+        (a local mapping that names zero entities for a chunk with real
+        content is treated as a classification failure) would otherwise
+        skip the SOTA call entirely for every test in this class before
+        the mocked ``_graph_enrich_with_sota`` is ever reached, the same
+        failure mode the docstring above already describes for a
+        MagicMock parse failure.
+        """
+        from paramem.graph.placeholders import entity_type_to_prefix
+
+        def _stub(session_graph, model, tokenizer, transcript="", **kwargs):
+            names = sorted(
+                {r.subject for r in session_graph.relations}
+                | {r.object for r in session_graph.relations}
+            )
+            mapping: dict[str, str] = {}
+            prefix = entity_type_to_prefix("person")
+            for i, name in enumerate(names, start=1):
+                mapping[name] = f"{prefix}_{i}"
+            return [], mapping, "", "stub-raw"
+
+        monkeypatch.setattr(
+            "paramem.training.consolidation.anonymize_with_local_model",
+            _stub,
+        )
+
     @staticmethod
     def _make_w1_loop(tmp_path):
         """Minimal ConsolidationLoop for W1 tests (≥10-node graph, real merger)."""

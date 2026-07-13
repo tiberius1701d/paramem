@@ -20,8 +20,10 @@ from paramem.graph.placeholders import (
     _normalize_anonymization_mapping,
     _substitute_whole_words,
     braced,
+    deanonymize_text,
     entity_type_to_prefix,
     mint_placeholder,
+    placeholder_entity_type,
     prefix_to_entity_type,
 )
 from paramem.graph.schema import Entity, SessionGraph
@@ -100,6 +102,40 @@ class TestPrefixToEntityType:
     def test_empty_prefix_falls_back_to_concept(self):
         assert prefix_to_entity_type("") == "concept"
         assert prefix_to_entity_type(None) == "concept"
+
+
+class TestPlaceholderEntityType:
+    """F5 — the ONE site deriving an entity type from a placeholder TOKEN
+    (brace-tolerant), collapsing the three previously-duplicated inline
+    ``prefix_to_entity_type(placeholder.split("_")[0])`` derivations in
+    ``consolidation.py``/``extractor.py``/``entity_correction.py``.
+    """
+
+    def test_bare_token_matches_prefix_to_entity_type(self):
+        assert placeholder_entity_type("Person_1") == "person"
+        assert placeholder_entity_type("Org_3") == "organization"
+        assert placeholder_entity_type("City_2") == "place"
+
+    def test_open_vocabulary_bare_token(self):
+        assert placeholder_entity_type("Project_1") == "project"
+
+    def test_braced_token_still_derives_correct_type(self):
+        """The braced format flip (bare ``Person_1`` -> braced
+        ``{Person_1}``) must not silently unmask a person.
+
+        Mutation: revert to ``prefix_to_entity_type(token.split("_")[0])``
+        without stripping braces first -> ``"{Person_1}".split("_")[0]`` is
+        ``"{Person"``, which is not in the closed vocabulary and passes
+        through open-vocabulary as its own (wrong) type ``"{person"`` —
+        this test fails (``"{person" != "person"``).
+        """
+        assert placeholder_entity_type("{Person_1}") == "person"
+        assert placeholder_entity_type("{Org_3}") == "organization"
+        assert placeholder_entity_type("{Project_1}") == "project"
+
+    def test_empty_or_none_falls_back_to_concept(self):
+        assert placeholder_entity_type("") == "concept"
+        assert placeholder_entity_type(None) == "concept"
 
 
 class TestNormalizeAndValidateTableBothDirections:
@@ -230,6 +266,52 @@ class TestSubstituteWholeWordsLongestFirst:
         assert out == "I visited City_1 yesterday."
 
 
+class TestSubstituteWholeWordsExactMatchRegression:
+    """F1 — matching in :func:`_substitute_whole_words` is exact (raw
+    ``==``), never routed through
+    :func:`~paramem.graph.name_match.canonical`. Canonical (case-/
+    separator-/diacritic-folded) matching would let a mapped person name
+    (e.g. ``"Bill"``) silently consume its lowercase common-noun homograph
+    (``"bill"``) in free transcript text, and would defeat the fail-closed
+    residual-token drop on the deanonymize side. The graph-tier local
+    anonymizer's mapping keys (which may differ in case/separators from
+    the fold graph's own canonical node text, e.g. ``"Yang Ming"`` vs.
+    ``"yang ming"``) are instead reconciled at their own call site — F1b,
+    pinned in
+    ``tests/test_graph_enrichment.py::TestGraphTierMappingReconciliation``
+    — not by loosening this shared primitive's matching.
+
+    Mutation: reintroduce ``canonical()`` matching in
+    ``_substitute_whole_words`` -> both tests below fail.
+    """
+
+    def test_anonymize_direction_does_not_eat_common_noun_homograph(self):
+        """ANONYMIZE direction (``_anonymize_transcript`` and friends): a
+        mapped person name (``Bill``) must not consume its lowercase
+        common-noun homograph (``the electricity bill``) — canonical
+        (case-insensitive) matching would fold ``"Bill"`` and ``"bill"``
+        onto the same identity and corrupt free-flowing transcript text
+        the cloud model reasons over.
+        """
+        mapping = {"Bill": "Person_1"}
+        text = "Bill said the electricity bill was late."
+        out = _substitute_whole_words(text, mapping)
+        assert out == "Person_1 said the electricity bill was late."
+
+    def test_deanon_direction_does_not_substitute_literal_lowercase_text(self):
+        """DEANON direction (:func:`deanonymize_text` / ``_apply_bindings``):
+        literal text a human wrote (``person 1``, ``Person 1``) must NOT
+        be substituted to the real name a DIFFERENT, exact-case, machine
+        -minted token (``Person_1``) stands for — canonical matching would
+        fold the human-written phrase onto the token's identity and, in
+        the full pipeline, consume it before the fail-closed residual-
+        token drop (b14a880) ever saw it.
+        """
+        reverse = {"Person_1": "Yang Ming"}
+        assert deanonymize_text("person 1 in the queue", reverse) == "person 1 in the queue"
+        assert deanonymize_text("Person 1 of 3 slides", reverse) == "Person 1 of 3 slides"
+
+
 class TestPlaceholderShapeRegex:
     """FIX 7.2 — re-homed from ``tests/test_schema_config.py`` (deleted
     there when ``anonymizer_placeholder_pattern()`` was retired in favour
@@ -296,7 +378,7 @@ class TestSpeakerAnchorReverseSkip:
             relations=[],
         )
         forward, reverse = _build_anonymization_mapping(
-            graph,
+            graph.entities,
             {"RealName": "speaker0"},  # hostile/hallucinated LLM hint
             pii_scope={"person"},
             speaker_name=None,

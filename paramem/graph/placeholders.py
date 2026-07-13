@@ -37,7 +37,7 @@ import re
 from collections.abc import Iterable
 
 from paramem.graph.name_match import is_speaker_id
-from paramem.graph.schema import SessionGraph
+from paramem.graph.schema import Entity, SessionGraph
 from paramem.graph.schema_config import anonymizer_prefix_to_type, anonymizer_type_to_prefix
 
 logger = logging.getLogger(__name__)
@@ -149,13 +149,26 @@ def _substitute_whole_words(
     occasionally emit ``null`` mapping entries.  Matching is
     case-sensitive — every call site's mapping keys are exact-case
     entity names or placeholder tokens.
+
+    Matching is EXACT — never case-, separator-, or diacritic-folded. Keys
+    here are literal surfaces: real names in the ANONYMIZE direction and
+    machine-minted placeholder tokens in the DEANONYMIZE direction. Folding
+    would let a mapped person name silently consume its lowercase
+    common-noun homograph (a person named "Bill" matching the electricity
+    "bill"), and would let literal placeholder text resolve against a real
+    name, defeating the fail-closed residual-token drop (b14a880) before it
+    ever sees the token. Identity reconciliation — matching a mapping key
+    to the fold graph's own canonical node-key text — is a separate step
+    performed by the one caller that needs it, before this function ever
+    sees the mapping — see :meth:`~paramem.training.consolidation.
+    ConsolidationLoop._run_graph_enrichment`.
     """
     if not mapping or not text:
         return text
-    normalized = {k: v for k, v in mapping.items() if isinstance(k, str)}
-    keys_sorted = sorted((k for k in normalized if k), key=len, reverse=True)
-    if not keys_sorted:
+    normalized = {k: v for k, v in mapping.items() if isinstance(k, str) and k}
+    if not normalized:
         return text
+    keys_sorted = sorted(normalized, key=len, reverse=True)
 
     parts: list[str] = []
     pos = 0
@@ -171,10 +184,10 @@ def _substitute_whole_words(
             end = pos + klen
             if end > n:
                 continue
+            if end < n and _is_word_char(text[end]):
+                continue
             slice_ = text[pos:end]
             if slice_ != key:
-                continue
-            if end < n and _is_word_char(text[end]):
                 continue
             replacement = normalized[key]
             if not isinstance(replacement, str):
@@ -253,6 +266,37 @@ def prefix_to_entity_type(prefix: str) -> str:
     """
     p = (prefix or "").strip().lower()
     return anonymizer_prefix_to_type().get(p) or p or "concept"
+
+
+def placeholder_entity_type(token: str) -> str:
+    """Convert a placeholder TOKEN (e.g. ``"Person_1"``) to its entity-type
+    label — brace-tolerant.
+
+    THE single site that derives an entity type from a placeholder TOKEN
+    (as opposed to an already-isolated prefix string, which
+    :func:`prefix_to_entity_type` handles). Strips a surrounding
+    ``{...}`` shape before splitting the prefix off the token, then
+    delegates to :func:`prefix_to_entity_type`.
+
+    Collapses three previously-duplicated inline
+    ``prefix_to_entity_type(placeholder.split("_")[0])`` derivations
+    (``paramem/training/consolidation.py``, ``paramem/graph/extractor.py``,
+    ``paramem/graph/entity_correction.py``). Token shape today is BARE
+    (``Person_1``); a braced form (``{Person_1}``) exists only for the
+    in-text detection net and SOTA's own brace-binding mint protocol (see
+    the module docstring). Bypassing the brace strip here would silently
+    mistype a braced token at a future format flip: ``"{Person_1}".split
+    ("_")[0]`` is ``"{Person"``, which is not in the closed vocabulary and
+    passes through open-vocabulary as its own (wrong) type ``"{person"`` —
+    never matching any ``pii_scope`` membership check and silently
+    unmasking the entity. Stripping braces first means this function
+    survives that flip unchanged.
+    """
+    t = (token or "").strip()
+    if len(t) >= 2 and t[0] == "{" and t[-1] == "}":
+        t = t[1:-1]
+    prefix = t.split("_", 1)[0] if "_" in t else t
+    return prefix_to_entity_type(prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +683,7 @@ _PII_ATTRIBUTE_KEYS: frozenset[str] = frozenset(
 )
 
 # Primitive-layer default scope for :func:`_build_anonymization_mapping`
-# and (via re-export) ``verify_anonymization_completeness`` /
+# and (via re-export) ``check_anonymization_leaks`` /
 # ``extract_pii_names_with_ner`` when no explicit ``pii_scope`` is
 # passed.  Preserves the historical hardcoded ``{person, place}`` scope
 # of these primitives so consolidation (``_sota_pipeline``) and any
@@ -654,7 +698,7 @@ _DEFAULT_PII_SCOPE: frozenset[str] = frozenset({"person", "place"})
 
 
 def _build_anonymization_mapping(
-    graph: SessionGraph,
+    entities: Iterable[Entity],
     llm_mapping: dict,
     *,
     pii_scope: set[str] | frozenset[str] | None,
@@ -738,8 +782,16 @@ def _build_anonymization_mapping(
     post-deanon, with the violation logged for monitoring.
 
     Args:
-        graph: The session graph carrying entities (with names and
-            attributes) and relations.
+        entities: The entity records to walk — ``graph.entities`` for the
+            session tier; for the graph tier (cumulative, post-merge
+            graph, which carries no entity types of its own) one
+            :class:`~paramem.graph.schema.Entity` per real name found by
+            the chunk's local-model anonymization pass, typed via
+            :func:`prefix_to_entity_type` on the placeholder that pass
+            minted (see :func:`~paramem.training.consolidation.
+            ConsolidationLoop._run_graph_enrichment`). This is the sole
+            input the function reads names/types/attributes from — it has
+            no other opinion about where entities come from.
         llm_mapping: Canonicalised ``{real_name: placeholder}`` mapping
             from :func:`_normalize_anonymization_mapping`.  Treated as
             a hint, not truth.
@@ -752,7 +804,7 @@ def _build_anonymization_mapping(
     Returns:
         ``(forward, reverse)`` — ``forward`` is the many-to-one
         ``{real_name | attr_value: placeholder}`` mapping that feeds
-        ``_anonymize_transcript`` and ``verify_anonymization_completeness``
+        ``_anonymize_transcript`` and ``check_anonymization_leaks``
         (both in :mod:`paramem.graph.extractor`).  ``reverse`` is the
         one-to-one ``{placeholder: entity_name}`` map consumed by the
         deanon path (:func:`deanonymize_text`, :func:`_apply_bindings`)
@@ -771,7 +823,7 @@ def _build_anonymization_mapping(
     # Mint placeholders for in-scope entities and fold in their PII
     # attribute values under the same placeholder.
     speaker_entity_placeholder: str | None = None
-    for entity in graph.entities:
+    for entity in entities:
         if entity.entity_type not in scope:
             continue
         if not entity.name:
@@ -832,7 +884,7 @@ def _build_anonymization_mapping(
     # Speaker-name seeding: ensure the runtime-known speaker name is covered.
     if speaker_name and speaker_name not in mapping:
         if speaker_entity_placeholder is not None:
-            # Speaker is in graph.entities.  ``speaker_entity_placeholder``
+            # Speaker is among the walked entities.  ``speaker_entity_placeholder``
             # is the anchor (entity.speaker_id, e.g. "speaker0"), never a
             # minted Person_N — reuse it so the runtime-known display
             # name folds onto the same anonymous handle as the entity's
@@ -867,7 +919,7 @@ def _build_anonymization_mapping(
                 reverse.setdefault(fresh, speaker_name)
 
     # Merge in LLM hints not already covered (typically relation-participant
-    # placeholders for entities absent from graph.entities).  Deterministic
+    # placeholders for entities absent from ``entities``).  Deterministic
     # entries win on conflict; LLM-only entries are added.  LLM-emitted
     # keys are entity-name-shaped (the anonymizer prompt operates on
     # relation participants, not attributes), so they are safe to enter

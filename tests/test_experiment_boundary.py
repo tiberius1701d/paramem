@@ -55,19 +55,6 @@ def _is_boundary_layer(py_file: Path) -> bool:
 # (b) rewriting the call site through a public path, or (c) explicit retire.
 _GRANDFATHERED_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
     {
-        # smoke_graph_enrichment.py — reaches into the SOTA enrichment helpers
-        # for direct probing.  Migrate to ExtractionPipeline once it exposes a
-        # debug surface.
-        (
-            "experiments/smoke_graph_enrichment.py",
-            "paramem.graph.extractor",
-            "_graph_enrich_with_sota",
-        ),
-        (
-            "experiments/smoke_graph_enrichment.py",
-            "paramem.training.consolidation",
-            "_safe_to_merge_surface",
-        ),
         # test11_adapter_extraction.py — calls the raw extractor internals.
         # CLAUDE.md says all extraction must go through ExtractionPipeline.run;
         # this experiment violates that.  Rewrite.
@@ -182,17 +169,6 @@ _GRANDFATHERED_PUBLIC_IMPORTS: frozenset[tuple[str, str, str]] = frozenset(
         ("experiments/quadruple_adapter.py", "paramem.training.trainer", "train_adapter"),
         ("experiments/quadruple_adapter.py", "paramem.utils.config", "AdapterConfig"),
         ("experiments/quadruple_adapter.py", "paramem.utils.config", "TrainingConfig"),
-        # smoke_graph_enrichment.py
-        (
-            "experiments/smoke_graph_enrichment.py",
-            "paramem.graph.extractor",
-            "PROVIDER_KEY_ENV",
-        ),
-        (
-            "experiments/smoke_graph_enrichment.py",
-            "paramem.training.consolidation",
-            "serialize_subgraph_triples",
-        ),
         # smoke_procedural_mlp.py
         ("experiments/smoke_procedural_mlp.py", "paramem.models.loader", "load_base_model"),
         ("experiments/smoke_procedural_mlp.py", "paramem.server.config", "ServerConfig"),

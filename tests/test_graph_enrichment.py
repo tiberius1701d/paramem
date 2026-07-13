@@ -9,6 +9,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import networkx as nx
+import pytest
 from peft import PeftModel
 
 from paramem.memory.persistence import _EDGE_SOURCE_ATTR
@@ -18,6 +19,43 @@ from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingCon
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _stub_local_anonymize(monkeypatch):
+    """Default stub for ``anonymize_with_local_model``.
+
+    ``_run_graph_enrichment`` now runs the local anonymizer (the SAME
+    primitive session-tier extraction uses) over each chunk BEFORE the SOTA
+    call, to derive real-name entity types the fold graph itself cannot
+    supply (see that method's docstring). ``_make_loop``'s model/tokenizer
+    are ``MagicMock()``s, so a real call always fails to parse (there is no
+    JSON in a ``MagicMock``'s generated output), which would fail every
+    chunk closed (skip the SOTA call entirely) before ``_graph_enrich_with_sota``
+    is ever reached — breaking every test below that mocks
+    ``_graph_enrich_with_sota`` to verify SOTA-response consumption.
+
+    The default therefore lands on the SAFE side rather than the unsafe
+    one: :func:`_stub_local_model_types` with an empty override dict, which
+    types every non-speaker name found in the chunk's relations as
+    ``"person"`` (masked). An EMPTY mapping (``{}``) is deliberately NOT the
+    default here — ``_run_graph_enrichment``'s own fail-closed guard (F1,
+    leg 2) treats "the local anonymizer named zero entities for a chunk
+    that has real content" as a classification failure and skips the SOTA
+    call entirely, so an empty-mapping default would silently skip privacy
+    behaviour in every test below that never overrides this fixture — the
+    opposite of what an autouse default should do. Tests that specifically
+    want to exercise the empty-mapping fail-closed path (or the
+    misclassification residual) override this fixture explicitly via
+    ``monkeypatch``/``patch`` within the test body. Tests in
+    ``TestGraphTierAnonymizationContract`` call ``_graph_enrich_with_sota``
+    directly (never through ``_run_graph_enrichment``) and are unaffected by
+    this fixture.
+    """
+    monkeypatch.setattr(
+        "paramem.training.consolidation.anonymize_with_local_model",
+        _stub_local_model_types({}),
+    )
 
 
 def _make_loop(tmp_path, **kwargs) -> ConsolidationLoop:
@@ -898,6 +936,156 @@ class TestNoProviderSkipsGracefully:
         call_spy.assert_not_called()
 
 
+class TestNoModelSkipsGracefully:
+    """F3 — self.model is None must early-return, mirroring
+    _run_graph_normalization's existing "no_model" guard rather than
+    crashing inside _disable_gradient_checkpointing.
+
+    Mutation: remove the ``self.model is None`` guard -> this test raises
+    an ``AttributeError``/``TypeError`` instead of returning a clean
+    ``skip_reason == "no_model"`` result.
+    """
+
+    def test_no_model_skip(self, tmp_path, monkeypatch):
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+        loop.model = None
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        call_spy = MagicMock()
+        with patch("paramem.training.consolidation._graph_enrich_with_sota", call_spy):
+            result = loop._run_graph_enrichment()
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == "no_model"
+        call_spy.assert_not_called()
+
+
+class TestVramExhaustedNotSwallowed:
+    """F3 — a VramExhausted mid-chunk must propagate to the caller (the
+    per-cycle loop retries), not be swallowed by the broad
+    ``except Exception`` as a skipped chunk.
+
+    Mutation: revert to a single ``except Exception`` with no
+    ``VramExhausted`` re-raise above it -> this test fails (no exception
+    propagates; the chunk is silently skipped instead).
+    """
+
+    def test_vram_exhausted_propagates(self, tmp_path, monkeypatch):
+        from paramem.server.vram_guard import VramExhausted
+
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+        def _raise_vram(*args, **kwargs):
+            raise VramExhausted("graph_enrichment_test")
+
+        with (
+            patch("paramem.training.consolidation._graph_enrich_with_sota", _raise_vram),
+            pytest.raises(VramExhausted),
+        ):
+            loop._run_graph_enrichment()
+
+
+class TestPrivacyFailClosedOnEmptyMapping:
+    """F1 (corrected), leg 2 — a local anonymizer mapping that comes back
+    completely EMPTY while the chunk has real (non-speaker) node names is
+    a classification failure, not evidence that nothing is in scope.
+    ``canonical()`` matching (tested directly in
+    ``tests/test_placeholders.py::TestSubstituteWholeWordsCanonicalMatching``)
+    cannot fix this leg — there is no key at all to canonicalize against.
+
+    Mutation: remove the ``_chunk_nonspeaker_names and not chunk_entities``
+    guard in ``_run_graph_enrichment`` -> the SOTA call fires with the
+    chunk's real names verbatim and ``privacy_skipped_chunks`` stays 0.
+    """
+
+    def test_empty_mapping_skips_sota_call_and_counts(self, tmp_path, monkeypatch):
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        # Deliberately override the (now-safe) autouse default with the
+        # unsafe empty-mapping stub — this test exists specifically to
+        # exercise that failure mode.
+        monkeypatch.setattr(
+            "paramem.training.consolidation.anonymize_with_local_model",
+            lambda *args, **kwargs: ([], {}, "", "stub-raw"),
+        )
+        call_spy = MagicMock()
+        with patch("paramem.training.consolidation._graph_enrich_with_sota", call_spy):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["privacy_skipped_chunks"] >= 1
+        assert result["new_edges"] == 0
+        assert result["same_as_merges"] == 0
+        call_spy.assert_not_called()
+
+    def test_all_speaker_chunk_is_not_falsely_skipped(self, tmp_path, monkeypatch):
+        """A chunk whose ONLY real content is speaker-to-speaker relations
+        legitimately has an empty (non-speaker) entity mapping — this must
+        NOT trip the fail-closed guard, since there was never any
+        non-speaker content to classify in the first place."""
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+
+        for sid in ("speaker0", "speaker1"):
+            graph.add_node(
+                sid,
+                entity_type="person",
+                speaker_id=sid,
+                attributes={"name": sid},
+                reinforcement_count=1,
+                sessions=["s000"],
+                first_seen="s000",
+                last_seen="s000",
+            )
+        # Pad past the 10-node floor with disconnected concept nodes so this
+        # chunk (built from the speaker-pair ego-graph) stays speaker-only.
+        for i in range(9):
+            graph.add_node(
+                f"filler{i}",
+                entity_type="concept",
+                attributes={},
+                reinforcement_count=0,
+                sessions=[],
+                first_seen="",
+                last_seen="",
+            )
+        graph.add_edge(
+            "speaker0",
+            "speaker1",
+            predicate="knows",
+            relation_type="social",
+            confidence=1.0,
+            speaker_id="speaker0",
+            source="extraction",
+            sessions=["s000"],
+        )
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr(
+            "paramem.training.consolidation.anonymize_with_local_model",
+            lambda *args, **kwargs: ([], {}, "", "stub-raw"),
+        )
+        canned_result = ([], [], "raw")
+        with patch(
+            "paramem.training.consolidation._graph_enrich_with_sota",
+            return_value=canned_result,
+        ) as call_spy:
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["privacy_skipped_chunks"] == 0
+        call_spy.assert_called()
+
+
 class TestGraphEnrichWithSotaUnit:
     """Unit tests for the extractor-level _graph_enrich_with_sota function."""
 
@@ -918,6 +1106,7 @@ class TestGraphEnrichWithSotaUnit:
                         "relation_type": "factual",
                     }
                 ],
+                entities=[],
                 api_key="test-key",
                 provider="anthropic",
                 filter_model="claude-sonnet-4-6",
@@ -941,6 +1130,7 @@ class TestGraphEnrichWithSotaUnit:
         with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
             result = _graph_enrich_with_sota(
                 [],
+                entities=[],
                 api_key="test-key",
                 provider="anthropic",
                 filter_model="claude-sonnet-4-6",
@@ -958,6 +1148,7 @@ class TestGraphEnrichWithSotaUnit:
         with patch("paramem.graph.extractor._sota_call", return_value=None):
             result = _graph_enrich_with_sota(
                 [],
+                entities=[],
                 api_key="test-key",
                 provider="anthropic",
                 filter_model="claude-sonnet-4-6",
@@ -972,6 +1163,7 @@ class TestGraphEnrichWithSotaUnit:
         with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
             result = _graph_enrich_with_sota(
                 [],
+                entities=[],
                 api_key="test-key",
                 provider="anthropic",
                 filter_model="claude-sonnet-4-6",
@@ -3169,4 +3361,852 @@ class TestSpeakerPredecessorInheritance:
         assert located_keys[0]["speaker_id"] == "", (
             f"Extraction concept-edge must keep speaker_id='' even when a unique "
             f"speaker predecessor exists; got {located_keys[0]['speaker_id']!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Graph-tier anonymization contract — the second call site of the
+# anonymize -> SOTA -> de-anonymize contract (paramem.graph.placeholders).
+# ---------------------------------------------------------------------------
+
+
+class TestGraphTierAnonymizationContract:
+    """paramem.graph.extractor._graph_enrich_with_sota now runs the SAME
+    anonymize -> SOTA -> de-anonymize contract as session-tier extraction
+    (_sota_pipeline), via the shared primitives in paramem.graph.placeholders.
+    """
+
+    def test_graph_enrichment_sends_no_real_names(self):
+        """No in-scope real name or bare speaker id reaches the payload
+        handed to _sota_call; every in-scope node and the speaker_id field
+        render as placeholder tokens.
+
+        Mutation: restore the pre-fix call (pass ``triples`` straight to
+        ``_sota_call`` with no anonymization step) -> real names and the
+        bare ``speaker0`` id appear in the captured payload -> this test
+        fails.
+        """
+        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.schema import Entity
+
+        triples = [
+            {
+                "subject": "alice",
+                "predicate": "colleague_of",
+                "object": "speaker0",
+                "relation_type": "social",
+                "speaker_id": "speaker0",
+            }
+        ]
+        entities = [
+            Entity(name="alice", entity_type="person"),
+            Entity(name="speaker0", entity_type="person"),
+        ]
+
+        captured: list[str] = []
+
+        def _capture(prompt, *args, **kwargs):
+            captured.append(prompt)
+            return '{"relations": [], "same_as": []}'
+
+        with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
+            result = _graph_enrich_with_sota(
+                triples,
+                entities,
+                api_key="test-key",
+                provider="anthropic",
+                filter_model="claude-sonnet-4-6",
+                pii_scope={"person"},
+            )
+
+        assert result is not None
+        assert captured, "Expected the SOTA call to be made"
+        payload = captured[0]
+        assert "alice" not in payload, f"Real name 'alice' leaked into payload: {payload}"
+        assert '"speaker0"' not in payload, f"Bare speaker id leaked into payload: {payload}"
+        assert "Person_1" in payload and "Person_2" in payload, (
+            f"Expected both in-scope nodes tokenised as Person_N; got: {payload}"
+        )
+
+    def test_graph_enrichment_round_trips_to_real_names(self):
+        """Relations SOTA returns (naming tokens) come back with real node
+        names and bare ``speaker{N}`` ids after ``_graph_enrich_with_sota``
+        returns.
+
+        Mutation: drop the deanon step (return ``new_relations``/
+        ``same_as_pairs`` straight from the parsed response, un-substituted)
+        -> placeholders reach the merger -> this test fails.
+        """
+        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.placeholders import _build_anonymization_mapping
+        from paramem.graph.schema import Entity
+
+        entities = [
+            Entity(name="alice", entity_type="person"),
+            Entity(name="speaker0", entity_type="person"),
+        ]
+        # Learn the exact tokens the CORE table mints (same primitive,
+        # same scope) so the canned SOTA response references them.
+        forward, _reverse = _build_anonymization_mapping(
+            entities, {}, pii_scope={"person"}, speaker_name=None
+        )
+        alice_token = forward["alice"]
+        speaker_token = forward["speaker0"]
+
+        canned_raw = (
+            '{{"relations": [{{"subject": "{s}", "predicate": "colleague_of", '
+            '"object": "{o}", "relation_type": "social", "confidence": 0.9, '
+            '"symmetric": true}}], "same_as": []}}'
+        ).format(s=alice_token, o=speaker_token)
+
+        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
+            result = _graph_enrich_with_sota(
+                [],
+                entities,
+                api_key="test-key",
+                provider="anthropic",
+                filter_model="claude-sonnet-4-6",
+                pii_scope={"person"},
+            )
+
+        assert result is not None
+        new_rels, same_as, _raw = result
+        assert len(new_rels) == 1
+        assert new_rels[0]["subject"] == "alice"
+        assert new_rels[0]["object"] == "speaker0"
+        assert same_as == []
+
+    def test_graph_enrichment_unresolved_token_dropped(self):
+        """A relation naming a token in neither the CORE table nor SOTA
+        bindings is DROPPED at the exit gate, not forwarded with a residual
+        placeholder.
+
+        Mutation: remove the exit gate (``_apply_bindings``) on this path
+        -> the unresolved token escapes into ``new_relations`` -> this test
+        fails.
+        """
+        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.schema import Entity
+
+        entities = [Entity(name="alice", entity_type="person")]
+        canned_raw = (
+            '{"relations": [{"subject": "Person_1", "predicate": "knows", '
+            '"object": "Person_99", "relation_type": "social", '
+            '"confidence": 0.9, "symmetric": false}], "same_as": []}'
+        )
+        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
+            result = _graph_enrich_with_sota(
+                [],
+                entities,
+                api_key="test-key",
+                provider="anthropic",
+                filter_model="claude-sonnet-4-6",
+                pii_scope={"person"},
+            )
+
+        assert result is not None
+        new_rels, _same_as, _raw = result
+        assert new_rels == [], (
+            f"Relation naming an unresolved token must be dropped; got {new_rels!r}"
+        )
+
+    def test_graph_enrichment_honours_pii_scope(self):
+        """``pii_scope`` determines which entity types get tokenised — it is
+        a real argument threaded through, not a hardcoded value.
+
+        Mutation: hardcode a scope inside ``_graph_enrich_with_sota``
+        (ignore the ``pii_scope`` argument) -> the second call's assertions
+        (org tokenised, person verbatim) fail.
+        """
+        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.schema import Entity
+
+        triples = [
+            {
+                "subject": "alice",
+                "predicate": "works_at",
+                "object": "acme",
+                "relation_type": "factual",
+                "speaker_id": "",
+            }
+        ]
+        entities = [
+            Entity(name="alice", entity_type="person"),
+            Entity(name="acme", entity_type="organization"),
+        ]
+
+        captured: list[str] = []
+
+        def _capture(prompt, *args, **kwargs):
+            captured.append(prompt)
+            return '{"relations": [], "same_as": []}'
+
+        with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
+            _graph_enrich_with_sota(
+                triples,
+                entities,
+                api_key="k",
+                provider="anthropic",
+                filter_model="claude-sonnet-4-6",
+                pii_scope={"person"},
+            )
+        person_scoped_payload = captured[-1]
+        assert "alice" not in person_scoped_payload
+        assert "acme" in person_scoped_payload
+
+        with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
+            _graph_enrich_with_sota(
+                triples,
+                entities,
+                api_key="k",
+                provider="anthropic",
+                filter_model="claude-sonnet-4-6",
+                pii_scope={"organization"},
+            )
+        org_scoped_payload = captured[-1]
+        assert "acme" not in org_scoped_payload
+        assert "alice" in org_scoped_payload
+
+    def test_graph_enrichment_same_as_deanonymized_before_speaker_guard(self):
+        """``same_as`` pairs must be real, bare ``speaker{N}`` ids by the
+        time they LEAVE ``_graph_enrich_with_sota`` — i.e. strictly before
+        ``ConsolidationLoop._run_graph_enrichment``'s W1 speaker-pair guard
+        (``is_speaker_id(keep) and is_speaker_id(drop)``, consolidation.py
+        ~:2659) ever sees them. ``is_speaker_id`` cannot recognise a
+        placeholder token (``Person_N``) as a speaker id, so if
+        deanonymization happened AFTER the guard (or not at all on the
+        ``same_as`` path), the guard would silently stop firing downstream
+        — this asserts the precondition the guard depends on directly at
+        the function boundary, rather than through a downstream side
+        effect (a merge attempt on a token that happens not to match any
+        real node would look safe for an unrelated reason).
+
+        Mutation: reorder so ``same_as`` pairs are returned still in token
+        form (e.g. return ``same_as_pairs`` instead of ``deanon_same_as``)
+        -> ``is_speaker_id`` on the returned pair is False -> this test
+        fails.
+        """
+        from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.name_match import is_speaker_id
+        from paramem.graph.placeholders import _build_anonymization_mapping
+        from paramem.graph.schema import Entity
+
+        entities = [
+            Entity(name="speaker0", entity_type="person"),
+            Entity(name="speaker1", entity_type="person"),
+        ]
+        forward, _reverse = _build_anonymization_mapping(
+            entities, {}, pii_scope={"person"}, speaker_name=None
+        )
+        token0, token1 = forward["speaker0"], forward["speaker1"]
+        canned_raw = '{{"relations": [], "same_as": [["{a}", "{b}"]]}}'.format(a=token0, b=token1)
+
+        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
+            result = _graph_enrich_with_sota(
+                [],
+                entities,
+                api_key="test-key",
+                provider="anthropic",
+                filter_model="claude-sonnet-4-6",
+                pii_scope={"person"},
+            )
+
+        assert result is not None
+        _new_rels, same_as, _raw = result
+        assert len(same_as) == 1
+        keep, drop = same_as[0]
+        assert is_speaker_id(keep) and is_speaker_id(drop), (
+            "same_as pair must be bare speaker ids by the time it leaves "
+            f"_graph_enrich_with_sota — the W1 guard depends on this; got {same_as[0]!r}"
+        )
+        assert {keep, drop} == {"speaker0", "speaker1"}
+
+    def test_graph_enrichment_full_pipeline_blocks_speaker_same_as_merge(
+        self, tmp_path, monkeypatch
+    ):
+        """Production-wiring confirmation: driving the same scenario through
+        the REAL ``ConsolidationLoop._run_graph_enrichment`` (only
+        ``_sota_call`` mocked; the local anonymizer stays on the module's
+        default autouse stub, which masks non-speaker names as ``person``
+        — speaker ids are never tokenised regardless, since the local
+        anonymizer prompt forbids mapping ``speaker{N}`` in the first
+        place) the two distinct speaker nodes are never contracted — the
+        W1 guard fires against the ``same_as`` pair ``_graph_enrich_with_sota``
+        returns, even though the SOTA payload carried the BARE speaker ids
+        verbatim (never opaque tokens: there is nothing to de-anonymize
+        here). This is defense-in-depth: the guard fires independently of
+        whatever the anonymizer did or didn't mask.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+        for sid in ("speaker0", "speaker1"):
+            graph.add_node(
+                sid,
+                entity_type="person",
+                speaker_id=sid,
+                attributes={"name": sid},
+                reinforcement_count=20,
+                sessions=["s100"],
+                first_seen="s100",
+                last_seen="s100",
+            )
+            graph.add_edge(
+                sid,
+                "acmecorp",
+                predicate="works at",
+                relation_type="factual",
+                confidence=1.0,
+                speaker_id=sid,
+                source="extraction",
+                sessions=["s100"],
+            )
+
+        node_count_before = graph.number_of_nodes()
+
+        def _sota_response(prompt, *args, **kwargs):
+            # speaker0/speaker1 are never in the local anonymizer's mapping
+            # (excluded by construction — see chunk_entities' is_speaker_id
+            # filter), so they reach the payload bare, not as opaque
+            # tokens — the model proposes a same_as pair on the bare ids
+            # directly, exactly as a real cloud model minus the W1
+            # code-level guard would.
+            assert '"speaker0"' in prompt and '"speaker1"' in prompt, (
+                f"Expected bare speaker ids in payload: {prompt}"
+            )
+            return '{"relations": [], "same_as": [["speaker0", "speaker1"]]}'
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch("paramem.graph.extractor._sota_call", side_effect=_sota_response):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["same_as_merges"] == 0, (
+            "W1 guard must block the speaker0/speaker1 same_as pair even "
+            "though the model saw the bare speaker ids directly; "
+            f"got same_as_merges={result['same_as_merges']}"
+        )
+        assert "speaker0" in graph.nodes
+        assert "speaker1" in graph.nodes
+        assert graph.number_of_nodes() == node_count_before
+
+
+def _populate_untyped_graph(graph: nx.MultiDiGraph, n_persons: int = 10) -> None:
+    """Mirror the merger's REAL fallback for the post-merge fold graph.
+
+    Registry-derived relation endpoints get ``entity_type="concept"`` from
+    ``GraphMerger`` (``paramem/graph/merger.py`` — no reliable type is ever
+    known for them), unlike ``_populate_graph`` above (used by the other
+    tests in this file) which sets accurate ``entity_type`` on every node
+    for test convenience — that is NOT what the production fold graph looks
+    like. These tests exist specifically to drive ``_run_graph_enrichment``
+    against a graph with no usable type signal, proving the type source is
+    now the local-model anonymization pass, not node attributes.
+    """
+    for i in range(n_persons):
+        name = f"person{i}"
+        graph.add_node(
+            name,
+            entity_type="concept",
+            attributes={"name": f"Person{i}"},
+            reinforcement_count=i + 1,
+            sessions=[f"s{i:03d}"],
+            first_seen=f"s{i:03d}",
+            last_seen=f"s{i:03d}",
+        )
+    org = "acmecorp"
+    graph.add_node(
+        org,
+        entity_type="concept",
+        attributes={"name": "AcmeCorp"},
+        reinforcement_count=n_persons,
+        sessions=["s000"],
+        first_seen="s000",
+        last_seen="s000",
+    )
+    for i in range(n_persons):
+        graph.add_edge(
+            f"person{i}",
+            org,
+            predicate="works at",
+            relation_type="factual",
+            confidence=1.0,
+            source="extraction",
+            sessions=["s000"],
+        )
+
+
+def _stub_local_model_types(type_by_name: dict[str, str]):
+    """Build a stand-in for ``anonymize_with_local_model`` typing real names
+    per ``type_by_name`` (default ``"person"`` for anything unlisted),
+    minting ``Prefix_N`` tokens in sorted-name order — simulating what the
+    LOCAL model's own anonymization pass would classify each real name as.
+    """
+    from paramem.graph.placeholders import entity_type_to_prefix
+
+    def _stub(session_graph, model, tokenizer, transcript="", **kwargs):
+        names = sorted(
+            {r.subject for r in session_graph.relations}
+            | {r.object for r in session_graph.relations}
+        )
+        mapping: dict[str, str] = {}
+        counters: dict[str, int] = {}
+        for name in names:
+            prefix = entity_type_to_prefix(type_by_name.get(name, "person"))
+            counters[prefix] = counters.get(prefix, 0) + 1
+            mapping[name] = f"{prefix}_{counters[prefix]}"
+        return [], mapping, "", "stub-raw"
+
+    return _stub
+
+
+class TestGraphTierLocalModelTypeDerivation:
+    """The cumulative fold graph carries no reliable entity types of its
+    own (production reality — see ``_run_graph_enrichment``'s docstring
+    and ``GraphMerger``'s ``entity_type="concept"`` fallback for endpoints
+    without a known Entity). These tests drive the REAL
+    ``ConsolidationLoop._run_graph_enrichment`` against a graph built with
+    that fallback (``_populate_untyped_graph`` — every node typed
+    ``"concept"``, unlike ``_populate_graph``'s test-convenience typing)
+    and a controlled local-model classification (``_stub_local_model_types``,
+    replacing this module's default empty-mapping ``_stub_local_anonymize``
+    fixture), proving that entity types now come from the local model's own
+    classification rather than from node attributes.
+    """
+
+    def test_graph_enrichment_masks_persons(self, tmp_path, monkeypatch):
+        """A real name the LOCAL model classifies as a person must not reach
+        the payload handed to ``_sota_call`` verbatim, even though the fold
+        graph node itself carries no usable ``entity_type``.
+
+        Mutation: revert ``_run_graph_enrichment`` to reading node
+        ``entity_type`` attributes (all ``"concept"`` here) instead of the
+        local model's mapping -> "person0" is never masked -> this test fails.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_untyped_graph(graph, n_persons=10)
+
+        captured: list[str] = []
+
+        def _capture(prompt, *args, **kwargs):
+            captured.append(prompt)
+            return '{"relations": [], "same_as": []}'
+
+        stub = _stub_local_model_types({"acmecorp": "organization"})
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch("paramem.training.consolidation.anonymize_with_local_model", side_effect=stub),
+            patch("paramem.graph.extractor._sota_call", side_effect=_capture),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert captured, "Expected the SOTA call to be made"
+        payload = captured[0]
+        assert "person0" not in payload, f"Real name 'person0' leaked into payload: {payload}"
+        assert "Person_" in payload, f"Expected person nodes tokenised as Person_N; got: {payload}"
+
+    def test_graph_enrichment_leaves_out_of_scope_verbatim(self, tmp_path, monkeypatch):
+        """Under scope ``{"person"}`` (the production default), a node the
+        LOCAL model classifies as an organization must appear VERBATIM in
+        the SOTA payload — this is what preserves ``same_as`` for non-person
+        entities.
+
+        Mutation: mask every entity regardless of type -> "acmecorp" is
+        also tokenised -> this test fails.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_untyped_graph(graph, n_persons=10)
+
+        captured: list[str] = []
+
+        def _capture(prompt, *args, **kwargs):
+            captured.append(prompt)
+            return '{"relations": [], "same_as": []}'
+
+        stub = _stub_local_model_types({"acmecorp": "organization"})
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch("paramem.training.consolidation.anonymize_with_local_model", side_effect=stub),
+            patch("paramem.graph.extractor._sota_call", side_effect=_capture),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert captured, "Expected the SOTA call to be made"
+        payload = captured[0]
+        # Check the DATA (triples_json), not the prompt's static examples —
+        # the template itself mentions "Org_1" as a generic illustration.
+        assert '"object": "acmecorp"' in payload, (
+            f"Out-of-scope org must pass through verbatim: {payload}"
+        )
+        assert '"object": "Org_1"' not in payload, (
+            f"Org must NOT be tokenised under person-only scope: {payload}"
+        )
+
+    def test_graph_enrichment_round_trips(self, tmp_path, monkeypatch):
+        """A new relation SOTA returns (naming the LOCAL model's own tokens)
+        comes back on the merged graph with REAL node names — the
+        production caller never sees a placeholder.
+
+        Mutation: skip the de-anonymize step for this call site -> the new
+        edge lands keyed by ``Person_N`` tokens instead of "person0"/
+        "person1" -> this test fails.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_untyped_graph(graph, n_persons=10)
+
+        stub = _stub_local_model_types({"acmecorp": "organization"})
+
+        def _sota_response(prompt, *args, **kwargs):
+            # Reference the SAME Person_N tokens the local-model stub just
+            # minted for person0/person1 (sorted-name order: person0 -> 1st).
+            return (
+                '{"relations": [{"subject": "Person_1", "predicate": "colleague_of", '
+                '"object": "Person_2", "relation_type": "social", "confidence": 0.9}], '
+                '"same_as": []}'
+            )
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch("paramem.training.consolidation.anonymize_with_local_model", side_effect=stub),
+            patch("paramem.graph.extractor._sota_call", side_effect=_sota_response),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["new_edges"] >= 1
+
+        found = False
+        for _, _, data in graph.out_edges("person0", data=True):
+            if (
+                data.get("predicate") == "colleague of"
+                and data.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
+            ):
+                found = True
+        assert found, "Expected the enriched edge on real node 'person0', not a placeholder"
+
+
+class TestGraphTierMappingReconciliation:
+    """F1b — the local anonymizer's mapping keys are reconciled onto the
+    ACTUAL node-key surfaces via ``canonical()`` inside
+    ``_run_graph_enrichment`` itself; the shared ``_substitute_whole_words``
+    primitive stays exact-match everywhere (see
+    ``tests/test_placeholders.py::TestSubstituteWholeWordsExactMatchRegression``
+    for why it must). The fold graph's node keys are already canonicalized
+    (``"yang ming"``), while the local model's mapping is keyed by
+    whatever real-name surface it independently produced (``"Yang
+    Ming"``) — a raw comparison between the two silently misses, so the
+    real name would reach the SOTA payload unmasked even though the model
+    correctly identified it.
+    """
+
+    @staticmethod
+    def _populate_two_node_chunk(graph: nx.MultiDiGraph, subject_key: str, object_key: str) -> None:
+        """A small chunk with exactly one real edge plus enough filler
+        nodes to clear the 10-node enrichment floor, all disconnected so
+        the ego-graph chunk built around the highest-reinforcement node
+        stays limited to ``{subject_key, object_key}`` plus filler.
+        """
+        graph.add_node(
+            subject_key,
+            entity_type="concept",
+            attributes={"name": subject_key},
+            reinforcement_count=10,
+            sessions=["s000"],
+            first_seen="s000",
+            last_seen="s000",
+        )
+        graph.add_node(
+            object_key,
+            entity_type="concept",
+            attributes={"name": object_key},
+            reinforcement_count=9,
+            sessions=["s000"],
+            first_seen="s000",
+            last_seen="s000",
+        )
+        graph.add_edge(
+            subject_key,
+            object_key,
+            predicate="works at",
+            relation_type="factual",
+            confidence=1.0,
+            source="extraction",
+            sessions=["s000"],
+        )
+        for i in range(8):
+            graph.add_node(
+                f"filler{i}",
+                entity_type="concept",
+                attributes={},
+                reinforcement_count=0,
+                sessions=[],
+                first_seen="",
+                last_seen="",
+            )
+
+    def test_recased_local_mapping_key_still_masks_the_node(self, tmp_path, monkeypatch):
+        """The node IS masked; no real name reaches the payload, even
+        though the local model's mapping key ("Yang Ming") does not
+        raw-string-match the graph's own node text ("yang ming").
+
+        Mutation: remove the F1b re-keying step in
+        ``_run_graph_enrichment`` -> the real node text ("yang ming")
+        reaches the SOTA payload verbatim -> this test fails.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        self._populate_two_node_chunk(graph, "yang ming", "acmecorp")
+
+        captured: list[str] = []
+
+        def _capture(prompt, *args, **kwargs):
+            captured.append(prompt)
+            return '{"relations": [], "same_as": []}'
+
+        monkeypatch.setattr(
+            "paramem.training.consolidation.anonymize_with_local_model",
+            lambda *args, **kwargs: ([], {"Yang Ming": "Person_1"}, "", "stub-raw"),
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert captured, "Expected the SOTA call to be made"
+        payload = captured[0]
+        assert "yang ming" not in payload.lower(), f"Real name leaked into payload: {payload}"
+        assert "Person_1" in payload, f"Expected the node masked as Person_1; got: {payload}"
+        assert result["mapping_rekey_dropped"] == 0
+
+    def test_mapping_key_naming_nothing_in_chunk_is_dropped_and_counted(
+        self, tmp_path, monkeypatch
+    ):
+        """A local-mapping entry whose (canonicalized) key matches no node
+        in this chunk names nothing here — it must be dropped rather than
+        minted as a phantom Entity, and the drop must be counted.
+
+        Mutation: skip the reconciliation and use the mapping as-is ->
+        ``mapping_rekey_dropped`` stays 0 and a phantom entity is minted
+        for a name absent from the chunk -> this test fails.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        _populate_untyped_graph(graph, n_persons=10)
+
+        monkeypatch.setattr(
+            "paramem.training.consolidation.anonymize_with_local_model",
+            lambda *args, **kwargs: ([], {"Someone Else": "Person_1"}, "", "stub-raw"),
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        call_spy = MagicMock()
+        with patch("paramem.training.consolidation._graph_enrich_with_sota", call_spy):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["mapping_rekey_dropped"] >= 1
+        # "Someone Else" names nothing in the chunk -- chunk_entities ends
+        # up empty, tripping the pre-existing empty-mapping fail-closed
+        # guard (leg 2), so no SOTA call fires at all.
+        call_spy.assert_not_called()
+        assert result["privacy_skipped_chunks"] >= 1
+
+    def test_ambiguous_canonical_node_keys_are_both_dropped(self, tmp_path, monkeypatch):
+        """Two distinct node keys that canonicalize identically are a real
+        ambiguity — this should not arise in production (node keys are
+        already canonical by construction, so ``canonical()`` is a no-op
+        on them), but the reconciliation must fail closed rather than
+        silently pick one: decision pinned here is DROP BOTH.
+        """
+        loop = _make_loop(tmp_path)
+        graph = loop.merger.graph
+        for key in ("Yang Ming", "yang ming"):
+            graph.add_node(
+                key,
+                entity_type="concept",
+                attributes={"name": key},
+                reinforcement_count=10,
+                sessions=["s000"],
+                first_seen="s000",
+                last_seen="s000",
+            )
+        graph.add_edge(
+            "Yang Ming",
+            "yang ming",
+            predicate="knows",
+            relation_type="social",
+            confidence=1.0,
+            source="extraction",
+            sessions=["s000"],
+        )
+        for i in range(8):
+            graph.add_node(
+                f"filler{i}",
+                entity_type="concept",
+                attributes={},
+                reinforcement_count=0,
+                sessions=[],
+                first_seen="",
+                last_seen="",
+            )
+
+        monkeypatch.setattr(
+            "paramem.training.consolidation.anonymize_with_local_model",
+            lambda *args, **kwargs: ([], {"Yang Ming": "Person_1"}, "", "stub-raw"),
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        call_spy = MagicMock()
+        with patch("paramem.training.consolidation._graph_enrich_with_sota", call_spy):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["mapping_rekey_dropped"] >= 1
+        call_spy.assert_not_called()
+
+
+class TestConsolidationLoopPiiScopeWiring:
+    """F8 — the real operator-facing wiring: ``sanitization.cloud_scope``
+    -> ``ConsolidationLoop(extraction_pii_scope=...)`` -> ``ExtractionConfig.
+    pii_scope`` -> ``_run_graph_enrichment``'s ``ext_cfg.pii_scope`` ->
+    ``_graph_enrich_with_sota``. ``_make_loop`` (used by every other test in
+    this file) never passes ``extraction_pii_scope``, so those tests
+    exercise the PRIMITIVE default (``{"person", "place"}`` — wider than
+    production) rather than the production-shipped ``{"person"}`` default
+    (``_CLOUD_EGRESS_DEFAULT_SCOPE`` / ``SanitizationConfig.cloud_scope``).
+    This is the only test in the suite that constructs the loop with an
+    explicit ``extraction_pii_scope`` and proves it actually reaches the
+    cloud payload — not a hardcoded scope inside the pass.
+
+    Mutation: hardcode ``pii_scope={"person", "place"}`` (or drop the
+    ``pii_scope=pii_scope`` kwarg) inside ``_run_graph_enrichment``'s call
+    to ``_graph_enrich_with_sota`` -> the "place" assertion below fails
+    (the place name is masked even though the configured scope excludes it).
+    """
+
+    def test_production_person_only_scope_reaches_sota_payload(self, tmp_path, monkeypatch):
+        loop = _make_loop(tmp_path, extraction_pii_scope={"person"})
+        graph = loop.merger.graph
+        _populate_untyped_graph(graph, n_persons=10)
+
+        captured: list[str] = []
+
+        def _capture(prompt, *args, **kwargs):
+            captured.append(prompt)
+            return '{"relations": [], "same_as": []}'
+
+        stub = _stub_local_model_types({"acmecorp": "place"})
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch("paramem.training.consolidation.anonymize_with_local_model", side_effect=stub),
+            patch("paramem.graph.extractor._sota_call", side_effect=_capture),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert captured, "Expected the SOTA call to be made"
+        payload = captured[0]
+        # Under the operator-configured {"person"} scope, a "place"-typed
+        # node is OUT of scope and must pass through verbatim.
+        assert '"object": "acmecorp"' in payload, (
+            f"place must pass through verbatim under {{'person'}} scope: {payload}"
+        )
+        assert "person0" not in payload, f"person must still be masked: {payload}"
+
+    def test_wider_operator_scope_masks_place_too(self, tmp_path, monkeypatch):
+        """Same graph, ``extraction_pii_scope={"person", "place"}`` — the
+        place node must now be masked, proving the scope is a real,
+        threaded parameter rather than a hardcoded ``{"person"}``."""
+        loop = _make_loop(tmp_path, extraction_pii_scope={"person", "place"})
+        graph = loop.merger.graph
+        _populate_untyped_graph(graph, n_persons=10)
+
+        captured: list[str] = []
+
+        def _capture(prompt, *args, **kwargs):
+            captured.append(prompt)
+            return '{"relations": [], "same_as": []}'
+
+        stub = _stub_local_model_types({"acmecorp": "place"})
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch("paramem.training.consolidation.anonymize_with_local_model", side_effect=stub),
+            patch("paramem.graph.extractor._sota_call", side_effect=_capture),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert captured, "Expected the SOTA call to be made"
+        payload = captured[0]
+        assert '"object": "acmecorp"' not in payload, (
+            f"place must be masked under {{'person', 'place'}} scope: {payload}"
+        )
+
+
+class TestGraphEnrichmentUsesSharedPrimitives:
+    """Structural guard mirroring ``tests/test_extraction_pipeline_guard.py``:
+    the graph-tier anonymization contract must route entirely through
+    ``paramem.graph.placeholders`` — no second mint/table-build/deanon
+    implementation may appear in ``paramem/training/consolidation.py``.
+    """
+
+    _PLACEHOLDER_PRIMITIVE_NAMES = frozenset(
+        {
+            "_build_anonymization_mapping",
+            "_apply_bindings",
+            "_normalize_anonymization_mapping",
+            "_resolution_map",
+            "mint_placeholder",
+            "deanonymize_text",
+            "_substitute_whole_words",
+            "_declared_placeholder_tokens",
+            "_contains_declared_token",
+        }
+    )
+
+    def test_no_duplicate_primitive_defined_in_consolidation(self):
+        """``consolidation.py`` must not define a function sharing a name
+        with a ``placeholders.py`` primitive — that would be a duplicate
+        mint/table/deanon implementation living outside the shared module.
+
+        Mutation: add a function named e.g. ``_apply_bindings`` (or any
+        other name in the set below) inside ``paramem/training/
+        consolidation.py`` -> this test fails.
+        """
+        import ast
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parent.parent
+        target = repo_root / "paramem" / "training" / "consolidation.py"
+        tree = ast.parse(target.read_text())
+
+        defined_names = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        collision = defined_names & self._PLACEHOLDER_PRIMITIVE_NAMES
+        assert not collision, (
+            "paramem/training/consolidation.py defines a function sharing a "
+            f"name with a placeholders.py primitive: {sorted(collision)} — "
+            "this is a duplicate mint/table/deanon implementation. Route "
+            "through paramem.graph.placeholders instead."
+        )
+
+    def test_consolidation_does_not_reimplement_placeholder_shape_regex(self):
+        """``consolidation.py`` must not hardcode its own placeholder-shape
+        pattern (PascalCase_N) — that regex lives ONLY in
+        ``paramem/graph/placeholders.py``.
+        """
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parent.parent
+        target = repo_root / "paramem" / "training" / "consolidation.py"
+        text = target.read_text()
+        assert "A-Z][A-Za-z]*_" not in text, (
+            "consolidation.py appears to hardcode the placeholder-shape "
+            "regex — this pattern must live only in paramem.graph.placeholders."
         )

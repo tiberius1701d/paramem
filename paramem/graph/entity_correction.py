@@ -33,7 +33,7 @@ import logging
 from collections import namedtuple
 
 from paramem.evaluation.recall import generate_answer
-from paramem.graph.placeholders import prefix_to_entity_type
+from paramem.graph.placeholders import placeholder_entity_type
 from paramem.graph.prompts import _load_prompt
 from paramem.models.loader import adapt_messages
 from paramem.server.vram_guard import vram_scope
@@ -196,7 +196,7 @@ def correct_entity_surfaces(
 
     Gathers correctable values from (a) ``reverse_mapping`` placeholder
     values (kind-eligible via :func:`~paramem.graph.placeholders.
-    prefix_to_entity_type` — open vocabulary, so a novel prefix's own
+    placeholder_entity_type` — open vocabulary, so a novel prefix's own
     name still passes through as its type) and (b)
     ``entities[*].attributes`` values (only when ``"attributes"`` is a
     member of ``correction_entity_types``), classifies each with the one
@@ -273,7 +273,7 @@ def correct_entity_surfaces(
     targets: list[_Target] = []
 
     for placeholder, surface in reverse_mapping.items():
-        entity_type = prefix_to_entity_type(placeholder.split("_")[0])
+        entity_type = placeholder_entity_type(placeholder)
         if entity_type not in correctable_kinds:
             continue
 
