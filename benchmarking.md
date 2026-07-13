@@ -2819,7 +2819,9 @@ fully isolated model loads — never switch adapters within a single model lifec
 
 ## 6-Model Extraction Comparison (2026-04-14)
 
-**Script:** `scripts/dev/compare_extraction.py`
+**Script:** a standalone dev comparison script (retired — superseded by
+the placeholder-contract refactor into `paramem/graph/placeholders.py`;
+the script had drifted from the production pipeline and was deleted).
 **Session set:** `data/ha/debug/extraction_eval_perltqa_top5` — 5 curated
 PerLTQA sessions (Bao Jun quantum, Cai Xiuying finance, Ruan Wenting sports,
 Ye Jie cultural psychology, Ye Jie community fitness).

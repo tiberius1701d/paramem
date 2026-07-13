@@ -14,7 +14,6 @@ expected; IDE autocomplete on ``entity.entity_type`` will degrade to
 from __future__ import annotations
 
 import logging
-import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -280,9 +279,9 @@ def format_predicate_examples(path: str | None = None, scope: str = "full") -> s
 def anonymizer_prefix_to_type(path: str | None = None) -> dict[str, str]:
     """Return ``{prefix_lower: entity_type}`` — reverse map for de-anonymization.
 
-    Keys are lowercased because ``anonymizer_placeholder_pattern`` is
-    case-insensitive and the SOTA path uses ``.split("_")[0].lower()``
-    before lookup.
+    Keys are lowercased because callers (e.g.
+    :func:`~paramem.graph.placeholders.prefix_to_entity_type`) look up a
+    placeholder's prefix via ``.split("_")[0].lower()``.
 
     Args:
         path: Optional override path for the schema YAML.
@@ -338,31 +337,3 @@ def format_replacement_rules(path: str | None = None) -> str:
         desc = entry["description"]
         lines.append(f"- {desc} \u2192 {prefix}_1, {prefix}_2, ...")
     return "\n".join(lines)
-
-
-_UNIVERSAL_PLACEHOLDER_RE = re.compile(r"^[A-Z][A-Za-z]*_\d+$")
-
-
-def anonymizer_placeholder_pattern() -> "re.Pattern[str]":
-    """Return the universal placeholder shape regex.
-
-    The shape contract is ``<Prefix>_<N>`` where:
-
-    * ``Prefix`` is a PascalCase noun naming the entity's type.  The
-      prefix vocabulary is **open**: ``Person`` / ``City`` / ``Org`` /
-      ``Thing`` are common and ship as illustrative examples in
-      ``configs/schema.yaml``, but the model is free to mint
-      type-appropriate prefixes (``University``, ``Project``, ``Paper``,
-      ``Language``, ``Currency``, ...) when none of the common ones fit.
-      Cross-cycle entity merge happens on real names in
-      :class:`paramem.graph.merger.GraphMerger`, not on placeholder
-      vocabulary, so per-session prefix divergence is harmless.
-    * ``N`` is a positive integer; uniqueness is enforced by callers
-      (the anonymizer prompt requires unique placeholders per real name,
-      and ``_mapping_is_canonical`` validates).
-
-    Returns:
-        A compiled ``re.Pattern`` matching the universal placeholder
-        shape ``^[A-Z][A-Za-z]*_\\d+$``.
-    """
-    return _UNIVERSAL_PLACEHOLDER_RE

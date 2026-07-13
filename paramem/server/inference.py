@@ -627,10 +627,8 @@ def _escalate_via_cloud_policy(
                 "cloud_mode=%s requires model/tokenizer for anonymization; blocking", cloud_mode
             )
             return None
-        from paramem.graph.extractor import (
-            deanonymize_text,
-            extract_and_anonymize_for_cloud,
-        )
+        from paramem.graph.extractor import extract_and_anonymize_for_cloud
+        from paramem.graph.placeholders import deanonymize_text
 
         # Anonymize ONLY the current-turn text.  History reaches the cloud
         # via the separate ``_sanitize_history`` channel inside

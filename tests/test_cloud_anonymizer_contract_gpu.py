@@ -171,10 +171,8 @@ def test_cloud_anonymizer_contract(loaded_model):
     personal markers must succeed.  No-personal-markers queries pass
     through with empty mapping and contribute neutrally to the rate.
     """
-    from paramem.graph.extractor import (
-        deanonymize_text,
-        extract_and_anonymize_for_cloud,
-    )
+    from paramem.graph.extractor import extract_and_anonymize_for_cloud
+    from paramem.graph.placeholders import deanonymize_text
 
     model, tokenizer = loaded_model
 
@@ -269,10 +267,8 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
     Operators picking the stricter posture (privacy over cloud-utility
     on places) need this guarantee to hold.
     """
-    from paramem.graph.extractor import (
-        deanonymize_text,
-        extract_and_anonymize_for_cloud,
-    )
+    from paramem.graph.extractor import extract_and_anonymize_for_cloud
+    from paramem.graph.placeholders import deanonymize_text
 
     model, tokenizer = loaded_model
 

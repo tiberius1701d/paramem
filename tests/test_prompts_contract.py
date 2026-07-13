@@ -19,6 +19,7 @@ from paramem.graph.extractor import (
     build_speaker_context,
     load_anonymization_prompt,
 )
+from paramem.graph.placeholders import PLACEHOLDER_TOKEN_RE
 from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
 from paramem.graph.schema_config import (
     format_entity_types,
@@ -370,7 +371,6 @@ class TestEnrichmentPromptContract:
         failure as the thing NOT to do."""
         tmpl = _load_prompt("sota_enrichment.txt", required=True)
         rendered = tmpl.format(transcript="x", facts_json="[]")
-        mint_re = re.compile(r"\{([A-Z][A-Za-z]*_\d+)\}")
         blocks = re.split(r"\n\s*\n", rendered)
         checked_any = False
         for block in blocks:
@@ -381,7 +381,10 @@ class TestEnrichmentPromptContract:
                 # prose illustrating the braced-form syntax) — nothing
                 # to bind.
                 continue
-            for key in set(mint_re.findall(block)):
+            # Braced mints only — a bare match here would be an existing
+            # anonymizer placeholder (Person_1), not a new SOTA mint.
+            mints = {m[0] for m in PLACEHOLDER_TOKEN_RE.findall(block) if m[0]}
+            for key in mints:
                 checked_any = True
                 assert f'"{key}"' in block and "bindings" in block, (
                     f"Positive example block mints {{{key}}} without a "
@@ -954,7 +957,7 @@ class TestB2AnonymizerPrivacy:
         the anonymizer must fold 'Alex' onto the speaker0 anchor —
         never mint a Person_N for either form.
         """
-        from paramem.graph.extractor import _build_anonymization_mapping
+        from paramem.graph.placeholders import _build_anonymization_mapping
 
         graph = self._make_graph("speaker0", "speaker0")
         forward, _reverse = _build_anonymization_mapping(
@@ -982,7 +985,8 @@ class TestB2AnonymizerPrivacy:
 
     def test_named_speaker_anonymized_transcript_excludes_display_name(self):
         """Transcript containing 'Alex' verbatim is scrubbed when display name is seeded."""
-        from paramem.graph.extractor import _anonymize_transcript, _build_anonymization_mapping
+        from paramem.graph.extractor import _anonymize_transcript
+        from paramem.graph.placeholders import _build_anonymization_mapping
 
         graph = self._make_graph("speaker0", "speaker0")
         forward, _reverse = _build_anonymization_mapping(
@@ -999,7 +1003,7 @@ class TestB2AnonymizerPrivacy:
         """Anonymous speaker (speaker_name=None): nothing needs scrubbing —
         speaker0 is never a forward-map key; no crash, empty map is safe.
         """
-        from paramem.graph.extractor import _build_anonymization_mapping
+        from paramem.graph.placeholders import _build_anonymization_mapping
 
         graph = self._make_graph("speaker0", "speaker0")
         forward, _reverse = _build_anonymization_mapping(

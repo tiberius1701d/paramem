@@ -778,6 +778,48 @@ class TestEnrichmentDelta:
         assert bindings == {"Event_1": "the agile transformation initiative"}
         assert "{Event_1}" in transcript
 
+    def test_inverted_binding_is_corrected_not_passed_through(self):
+        """An inverted binding (key = real text, value = placeholder —
+        the exact shape the SOTA bindings validator was previously
+        missing, per the placeholder-contract refactor) is corrected to
+        canonical ``{placeholder: real_text}`` direction rather than
+        passed straight into the substitution map. Confirmed by transcript
+        reconstruction: the real-text span is replaced by the placeholder,
+        which only happens when the binding resolves in the right direction."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        anon = "Person_1 works at Acme."
+        raw = '{"bindings": {"Acme": "Org_9"}}'
+        _, transcript, bindings, _ = _apply_enrichment_delta([], raw, anon)
+        assert bindings == {"Org_9": "Acme"}
+        assert "{Org_9}" in transcript
+        assert "Acme" not in transcript.replace("{Org_9}", "")
+
+    def test_binding_both_sides_shaped_ties_to_declared_side(self):
+        """A binding where BOTH sides happen to be placeholder-shaped
+        (e.g. a real-world name like `Person_2` or `GPT_4`) is not
+        ambiguous — the caller's declared `placeholder_side="key"` breaks
+        the tie, so the binding is kept as-is rather than the whole
+        delta losing the entry. Dropping here was a real regression:
+        the same case previously survived at HEAD."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        raw = '{"bindings": {"Org_9": "Person_2"}}'
+        _, _, bindings, counts = _apply_enrichment_delta([], raw, "text")
+        assert bindings == {"Org_9": "Person_2"}
+        assert counts["bindings_count"] == 1
+
+    def test_ambiguous_binding_neither_shaped_is_dropped(self):
+        """A binding where NEITHER side is placeholder-shaped is not a
+        real SOTA mint binding and is dropped rather than accepted
+        verbatim."""
+        from paramem.graph.extractor import _apply_enrichment_delta
+
+        raw = '{"bindings": {"my company": "Acme Corp"}}'
+        _, _, bindings, counts = _apply_enrichment_delta([], raw, "text")
+        assert bindings == {}
+        assert counts["bindings_count"] == 0
+
     def test_out_of_range_modify_skipped(self):
         """Modify index outside ``[0, n_facts)`` is dropped with a
         warning, not failed — single bad index shouldn't void the
@@ -1385,7 +1427,7 @@ class TestSOTANoiseFilter:
 
     def test_normalize_anonymization_mapping_inverts_placeholder_keys(self):
         """Mapping with placeholder keys is inverted to {real: placeholder} canonical."""
-        from paramem.graph.extractor import _normalize_anonymization_mapping
+        from paramem.graph.placeholders import _normalize_anonymization_mapping
 
         wrong_direction = {"Person_1": "Alex", "City_1": "Millfield"}
         normalized, stats = _normalize_anonymization_mapping(wrong_direction)
@@ -1394,7 +1436,7 @@ class TestSOTANoiseFilter:
 
     def test_normalize_anonymization_mapping_keeps_canonical(self):
         """Mapping already in {real: placeholder} canonical form passes through."""
-        from paramem.graph.extractor import _normalize_anonymization_mapping
+        from paramem.graph.placeholders import _normalize_anonymization_mapping
 
         canonical = {"Alex": "Person_1", "Millfield": "City_1"}
         normalized, stats = _normalize_anonymization_mapping(canonical)
@@ -1402,7 +1444,7 @@ class TestSOTANoiseFilter:
         assert stats == {"inverted": 0, "dropped": 0}
 
     def test_normalize_anonymization_mapping_empty(self):
-        from paramem.graph.extractor import _normalize_anonymization_mapping
+        from paramem.graph.placeholders import _normalize_anonymization_mapping
 
         normalized, stats = _normalize_anonymization_mapping({})
         assert normalized == {}
@@ -1417,7 +1459,7 @@ class TestSOTANoiseFilter:
         enforcing a fixed lexicon would just push the work into a
         position-based recovery helper (the pattern this rewrite is
         retiring)."""
-        from paramem.graph.extractor import _mapping_is_canonical
+        from paramem.graph.placeholders import _mapping_is_canonical
 
         assert _mapping_is_canonical({"Northcrest University": "University_1"}) is True
         assert _mapping_is_canonical({"Atlas Initiative": "Project_1"}) is True
@@ -1440,7 +1482,7 @@ class TestSOTANoiseFilter:
         check enforces it post-LLM so a duplicate-value mapping cannot
         slip through and silently collide two distinct entities into one
         identifier in the deanon round-trip."""
-        from paramem.graph.extractor import _mapping_is_canonical
+        from paramem.graph.placeholders import _mapping_is_canonical
 
         # Two persons mapped to the same placeholder.
         assert _mapping_is_canonical({"Alice": "Person_1", "Pat": "Person_1"}) is False
@@ -1453,7 +1495,7 @@ class TestSOTANoiseFilter:
     def test_mapping_is_canonical_malformed_shape_rejected(self):
         """Values that don't match the universal `<Prefix>_<N>` shape
         (lowercase prefix, missing index, etc.) are non-canonical."""
-        from paramem.graph.extractor import _mapping_is_canonical
+        from paramem.graph.placeholders import _mapping_is_canonical
 
         assert _mapping_is_canonical({"Alice": "person_1"}) is False  # lowercase
         assert _mapping_is_canonical({"Alice": "Person"}) is False  # missing _<N>
@@ -1581,28 +1623,29 @@ class TestSOTANoiseFilter:
             f"unknown-type repair must fall back to Entity_N, got {new_mapping['Foundry-X']!r}"
         )
 
-    def test_type_to_pascal_prefix_overrides_and_derivations(self):
-        """Pin the contract for ``_type_to_pascal_prefix``: historical
-        common types map via the override table; everything else is
-        PascalCase-joined; empty input falls back to ``Entity``."""
-        from paramem.graph.extractor import _type_to_pascal_prefix
+    def test_entity_type_to_prefix_closed_vocab_and_derivations(self):
+        """Pin the contract for ``entity_type_to_prefix``: closed-vocabulary
+        common types map via schema.yaml's ``anonymizer_type_to_prefix()``;
+        everything else is PascalCase-joined; empty input falls back to
+        ``Entity``."""
+        from paramem.graph.placeholders import entity_type_to_prefix
 
-        # Historical overrides — match anonymizer LLM conventions.
-        assert _type_to_pascal_prefix("person") == "Person"
-        assert _type_to_pascal_prefix("place") == "City"
-        assert _type_to_pascal_prefix("organization") == "Org"
-        assert _type_to_pascal_prefix("concept") == "Thing"
+        # Closed vocabulary — match anonymizer LLM conventions.
+        assert entity_type_to_prefix("person") == "Person"
+        assert entity_type_to_prefix("place") == "City"
+        assert entity_type_to_prefix("organization") == "Org"
+        assert entity_type_to_prefix("concept") == "Thing"
         # Open types — derived directly.
-        assert _type_to_pascal_prefix("product") == "Product"
-        assert _type_to_pascal_prefix("language") == "Language"
-        assert _type_to_pascal_prefix("event") == "Event"
+        assert entity_type_to_prefix("product") == "Product"
+        assert entity_type_to_prefix("language") == "Language"
+        assert entity_type_to_prefix("event") == "Event"
         # Multi-word labels collapse to PascalCase.
-        assert _type_to_pascal_prefix("work_of_art") == "WorkOfArt"
-        assert _type_to_pascal_prefix("self-driving") == "SelfDriving"
-        assert _type_to_pascal_prefix("law enforcement") == "LawEnforcement"
+        assert entity_type_to_prefix("work_of_art") == "WorkOfArt"
+        assert entity_type_to_prefix("self-driving") == "SelfDriving"
+        assert entity_type_to_prefix("law enforcement") == "LawEnforcement"
         # Empty / whitespace fall back to a generic recoverable shape.
-        assert _type_to_pascal_prefix("") == "Entity"
-        assert _type_to_pascal_prefix("   ") == "Entity"
+        assert entity_type_to_prefix("") == "Entity"
+        assert entity_type_to_prefix("   ") == "Entity"
 
     def test_clean_ner_span_strips_dialogue_tail(self):
         """NER span cleanup removes 'Name: Response' dialogue artifacts."""
@@ -1789,7 +1832,7 @@ class TestSOTANoiseFilter:
         normalization independently canonicalizes each, enabling the pipeline
         to proceed (SOTA call, de-anonymization) rather than aborting.
         """
-        from paramem.graph.extractor import _normalize_anonymization_mapping
+        from paramem.graph.placeholders import _normalize_anonymization_mapping
 
         mixed = {
             "Alex": "Person_1",  # canonical
@@ -1895,7 +1938,7 @@ class TestApplyBindings:
     def test_substitutes_anonymizer_placeholders(self):
         """Bare anonymizer placeholders (Person_1, Org_1) substitute via
         the reverse mapping."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -1918,7 +1961,7 @@ class TestApplyBindings:
     def test_substitutes_braced_sota_bindings(self):
         """SOTA-introduced braced placeholders ({Event_1}) substitute via
         explicit bindings without needing transcript reconstruction."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -1941,7 +1984,7 @@ class TestApplyBindings:
         """Bare placeholder embedded in literal text — `Org_1 Hungary`
         becomes `Acme Hungary` (the failure mode that bug 5 produced
         bogus bindings for under the old regex pipeline)."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -1965,7 +2008,7 @@ class TestApplyBindings:
         substitution get dropped (residual sweep). Causes: SOTA emitted a
         braced placeholder without including it in bindings, anonymizer
         leak, etc."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -1995,7 +2038,7 @@ class TestApplyBindings:
     def test_handles_apostrophes_at_word_boundary(self):
         """`Person_2's cousin` substitutes Person_2 cleanly without breaking
         on the apostrophe (existing _substitute_whole_words behaviour)."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2017,7 +2060,7 @@ class TestApplyBindings:
     def test_mixed_bare_and_braced_in_same_fact(self):
         """A single fact with both a bare anonymizer placeholder and a
         braced SOTA placeholder substitutes both."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2037,7 +2080,7 @@ class TestApplyBindings:
         assert kept[0]["object"] == "the workshop at Acme"
 
     def test_empty_inputs_return_empty(self):
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         kept, predicate_dropped, residual_dropped = _apply_bindings([], {}, {})
 
@@ -2047,7 +2090,7 @@ class TestApplyBindings:
 
     def test_preserves_other_fact_fields(self):
         """relation_type, confidence, and any extra fields pass through."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2079,7 +2122,7 @@ class TestApplyBindings:
         actually carries) round-trips through :func:`_apply_bindings`
         UNCHANGED, uncorrupted by any attribute value folded alongside it.
         """
-        from paramem.graph.extractor import _apply_bindings, _build_anonymization_mapping
+        from paramem.graph.placeholders import _apply_bindings, _build_anonymization_mapping
         from paramem.graph.schema import Entity, SessionGraph
 
         graph = SessionGraph(
@@ -2136,7 +2179,7 @@ class TestApplyBindings:
         folded.  This is the invariant the speaker-anchor regression
         vacated: without it, a placeholder like ``Person_1`` could
         deanonymize to a phone number instead of ``Alex``."""
-        from paramem.graph.extractor import _apply_bindings, _build_anonymization_mapping
+        from paramem.graph.placeholders import _apply_bindings, _build_anonymization_mapping
         from paramem.graph.schema import Entity, SessionGraph
 
         graph = SessionGraph(
@@ -2179,7 +2222,7 @@ class TestApplyBindings:
         prompt's contract) still round-trips via the union resolve map —
         today's two-channel design drops this because ``bare_map`` only
         ever contained ``reverse``."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2200,7 +2243,7 @@ class TestApplyBindings:
     def test_minted_placeholder_round_trips_braced_regression(self):
         """Braced-form minted placeholder still resolves (regression
         guard for the union unification)."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2223,7 +2266,7 @@ class TestApplyBindings:
         (contra the prompt's 'leave bare' contract) still resolves via
         the union — it is in ``reverse``, which is now tried in both
         the braced and bare pass."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2247,7 +2290,7 @@ class TestApplyBindings:
         (``"Senior Engineer at Org_1"``) resolves fully: braced pass
         expands ``{Role_1}`` to the value, bare pass then resolves the
         exposed ``Org_1`` from the SAME union map."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2270,7 +2313,7 @@ class TestApplyBindings:
         with differing values, ``reverse`` wins (deterministic entity
         name over a freshly-minted SOTA value) — the collision itself is
         surfaced by :func:`_check_mapping_totality`, not here."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2309,7 +2352,7 @@ class TestApplyBindings:
         ``residual_dropped`` gains a post-substitution copy — so both
         assertions below fail together, not just one accidentally
         redundant with the other. (Verified live: see task report.)"""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2338,7 +2381,7 @@ class TestApplyBindings:
         ``\\b``-anchored :data:`_PLACEHOLDER_TOKEN_RE`) still drops the
         triple: the residual sweep tests every field against the
         declared vocabulary, not just subject."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2366,7 +2409,7 @@ class TestApplyBindings:
         relation_type/confidence/symmetric). Before the fix, the sweep
         iterated ``f.values()`` unconditionally and would have dropped
         this fact over ``evidence`` alone."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {
@@ -2402,7 +2445,7 @@ class TestResidualSweepCatchesEmbeddedPlaceholders:
         or composite, via the fail-closed :data:`_PLACEHOLDER_TOKEN_RE`
         backstop — even with an empty declared vocabulary (nothing in
         ``reverse``/``sota_bindings`` here)."""
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         facts = [
             {"subject": "Alice", "predicate": "knows", "object": "Bob"},  # clean
@@ -2721,6 +2764,81 @@ class TestPlausibilityAnon:
         assert len(result.relations) == 1
         assert result.relations[0].predicate == "lives_in"
         assert result.diagnostics.get("plausibility") == "anon"
+
+    def test_anon_stage_plausibility_receives_post_enrichment_transcript(self):
+        """FIX 2: the anon-stage judge must see `updated_anon_transcript`
+        (post-enrichment — carrying SOTA's minted `{Paper_1}`-style
+        tokens), not the pre-enrichment `anon_transcript`.  A judge shown
+        the stale pre-enrichment transcript can never connect an
+        enrichment-only fact's placeholder to its real-text span in the
+        transcript, and drops a valid enrichment.
+
+        Mutation: revert the call site to pass `anon_transcript=anon_transcript`
+        -> this test fails.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "authored", "Attention Is All You Need")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+            ],
+        )
+        # Pre-enrichment: local extraction never saw the paper title, so
+        # neither the input facts nor the input transcript mention
+        # "Paper_1" — it is introduced by SOTA's enrichment delta below.
+        pre_enrichment_facts = [
+            {"subject": "Person_1", "predicate": "authored", "object": "a well-known paper"}
+        ]
+        enriched_anon_facts = [
+            {"subject": "Person_1", "predicate": "authored", "object": "Paper_1"}
+        ]
+        mapping = {"Alex": "Person_1"}
+        pre_enrichment_transcript = "Person_1 wrote a well-known paper."
+        post_enrichment_transcript = "Person_1 wrote {Paper_1} (Attention Is All You Need)."
+
+        plaus_calls = []
+
+        def fake_plaus(facts, api_key, **kwargs):
+            plaus_calls.append(kwargs.get("anon_transcript"))
+            return facts, "raw"
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(pre_enrichment_facts, mapping, pre_enrichment_transcript, ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(
+                    enriched_anon_facts,
+                    post_enrichment_transcript,
+                    {"Paper_1": "Attention Is All You Need"},
+                    None,
+                    {},
+                ),
+            ),
+            patch(
+                "paramem.graph.extractor._plausibility_filter_with_sota",
+                side_effect=fake_plaus,
+            ),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex wrote a well-known paper.",
+                None,
+                None,
+                speaker_id="speaker0",
+                plausibility_judge="claude",
+                plausibility_stage="anon",
+                correction_entity_types=set(),
+            )
+
+        assert len(plaus_calls) == 1
+        assert plaus_calls[0] == post_enrichment_transcript, (
+            f"anon-stage judge must see the post-enrichment transcript, got {plaus_calls[0]!r}"
+        )
 
 
 class TestPlausibilityDeanon:
@@ -3244,6 +3362,115 @@ class TestEntityTypePreservation:
         )
 
 
+class TestSotaMintedEntityTypeDerivation:
+    """The entity-rebuild loop (extractor.py, "Rebuild entity list from
+    surviving + new relations") must resolve a de-anonymized SOTA-minted
+    entity's REAL NAME back to its placeholder via the inverted
+    resolution map, not via ``reverse_mapping.get(name)`` — ``reverse_mapping``
+    is keyed by placeholder, so looking it up with a real name always
+    misses (dead code prior to the fix under test).
+    """
+
+    def test_sota_minted_entity_gets_prefix_derived_type(self):
+        """A SOTA-minted entity bound via ``bindings`` with a novel prefix
+        (``Paper_1``, absent from the closed anonymizer vocabulary) lands
+        in graph.entities typed by its prefix ("paper"), not "concept".
+
+        Mutation that must make this fail: restore the lookup to
+        ``reverse_mapping.get(name)`` (today's dead-code behaviour) —
+        ``reverse_mapping`` has no "Attention Is All You Need" key (it is
+        keyed by placeholder), so the entity falls back to "concept".
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "has_plans", "Alex")],  # placeholder relation; SOTA will override
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "has_plans", "object": "Person_1"}]
+        mapping = {"Alex": "Person_1"}
+        anon_transcript = "Person_1 has plans."
+        # SOTA mints a novel-prefix entity via a braced placeholder plus an
+        # explicit binding — the documented brace-binding protocol.
+        enriched_anon = [{"subject": "Person_1", "predicate": "authored", "object": "{Paper_1}"}]
+        sota_bindings = {"Paper_1": "Attention Is All You Need"}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(anon_facts, mapping, anon_transcript, ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(enriched_anon, None, sota_bindings, None, {}),
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex authored Attention Is All You Need.",
+                None,
+                None,
+                speaker_id="speaker0",
+                plausibility_judge="off",
+                correction_entity_types=set(),
+            )
+
+        entity_map = {e.name: e.entity_type for e in result.entities}
+        paper_type = entity_map.get("Attention Is All You Need")
+        assert paper_type == "paper", (
+            f"SOTA-minted novel-prefix entity must be typed 'paper', not {paper_type!r}"
+        )
+
+    def test_sota_minted_entity_known_prefix_uses_configured_type(self):
+        """A SOTA-minted entity with a KNOWN prefix (``Person_2``) still
+        maps through the schema's ``anonymizer_prefix_to_type()`` to
+        "person" — the closed-vocabulary branch of the same derivation.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "has_plans", "Alex")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "has_plans", "object": "Person_1"}]
+        mapping = {"Alex": "Person_1"}
+        anon_transcript = "Person_1 has plans."
+        enriched_anon = [{"subject": "Person_1", "predicate": "met", "object": "{Person_2}"}]
+        sota_bindings = {"Person_2": "Jordan Rivers"}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(anon_facts, mapping, anon_transcript, ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(enriched_anon, None, sota_bindings, None, {}),
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex met Jordan Rivers.",
+                None,
+                None,
+                speaker_id="speaker0",
+                plausibility_judge="off",
+                correction_entity_types=set(),
+            )
+
+        entity_map = {e.name: e.entity_type for e in result.entities}
+        jordan_type = entity_map.get("Jordan Rivers")
+        assert jordan_type == "person", (
+            f"SOTA-minted known-prefix entity must be typed 'person', not {jordan_type!r}"
+        )
+
+
 class TestFallbackPlausibilityOnRawHelper:
     """Direct tests of the _fallback_plausibility_on_raw helper: runs on
     already-de-anonymized ``graph.relations`` (real names) and records
@@ -3686,7 +3913,7 @@ class TestBuildAnonymizationMapping:
 
     @staticmethod
     def _build_pair(entities, *, llm_mapping=None, pii_scope=None, speaker_name=None):
-        from paramem.graph.extractor import _build_anonymization_mapping
+        from paramem.graph.placeholders import _build_anonymization_mapping
 
         graph = SessionGraph(
             session_id="s",
@@ -3966,8 +4193,14 @@ class TestBuildAnonymizationMapping:
         deanonymization end to end.  Uses a NON-speaker entity — this
         dual-numbering hazard no longer touches the speaker at all (R7),
         which is now excluded from the placeholder-mint counter entirely.
+
+        The entity-mint loop's FIX 1 collision scan excludes an
+        ``llm_mapping`` entry keyed on THIS SAME entity name — Alex's own
+        (disagreeing) hint is not a competing claimant, so the
+        deterministic mint still lands on ``Person_1`` here, preserving
+        the divergence this test exists to pin.
         """
-        from paramem.graph.extractor import _apply_bindings
+        from paramem.graph.placeholders import _apply_bindings
 
         forward, reverse = self._build_pair(
             [Entity(name="Alex", entity_type="person")],
@@ -4048,16 +4281,37 @@ class TestBuildAnonymizationMapping:
         assert "Globex" not in mapping
         assert "Volvo V70" not in mapping
 
+    def test_entity_mint_avoids_llm_hint_collision(self):
+        """FIX 1: the entity-mint loop must scan `llm_mapping` values too,
+        not just its own in-progress `mapping`.  Before the fix, an LLM
+        hint (`{"Kim": "Person_1"}`) merged in 74 lines later was
+        invisible to the entity loop's mint, so a graph entity ("Dana")
+        could mint the SAME `Person_1` token — collapsing two distinct
+        real names onto one placeholder and swapping their identities at
+        deanon time (every `Person_1` restores to "Dana", never "Kim").
+
+        Mutation: revert the mint call to scan `mapping.values()` alone
+        -> both names collapse onto `Person_1` and this test fails.
+        """
+        forward, reverse = self._build_pair(
+            [Entity(name="Dana", entity_type="person")],
+            llm_mapping={"Kim": "Person_1"},
+            pii_scope={"person"},
+        )
+        assert forward["Dana"] != forward["Kim"], (
+            f"Dana and Kim must not collapse onto the same placeholder: {forward!r}"
+        )
+        assert reverse[forward["Dana"]] == "Dana"
+        assert reverse[forward["Kim"]] == "Kim"
+
     def test_end_to_end_verifier_passes_after_build(self):
         """After the builder runs, the verifier finds no leaks for an
         anon_transcript and anon_facts that fully use the placeholders.
         Locks the contract that the builder produces a complete enough
         mapping for verify to succeed.
         """
-        from paramem.graph.extractor import (
-            _build_anonymization_mapping,
-            verify_anonymization_completeness,
-        )
+        from paramem.graph.extractor import verify_anonymization_completeness
+        from paramem.graph.placeholders import _build_anonymization_mapping
 
         graph = _make_graph(
             [("Alex", "works_at", "Google")],
@@ -4111,7 +4365,7 @@ class TestCheckMappingTotality:
     def test_total_mapping_records_no_orphans(self):
         """Every fact placeholder resolves via the reverse map → no
         diagnostic emitted."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4125,7 +4379,7 @@ class TestCheckMappingTotality:
         """A fact placeholder absent from ``reverse_mapping`` (the keys
         deanon actually looks up) is recorded as an orphan in
         ``graph.diagnostics`` for monitoring.  No mutation of inputs."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4141,7 +4395,7 @@ class TestCheckMappingTotality:
     def test_multiple_orphans_sorted(self):
         """Multiple orphans are deduplicated and sorted for stable
         diagnostic output."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4161,7 +4415,7 @@ class TestCheckMappingTotality:
     def test_embedded_placeholder_caught(self):
         """Placeholder embedded in a compound string still surfaces as
         an orphan when missing from ``reverse_mapping``."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4177,7 +4431,7 @@ class TestCheckMappingTotality:
 
     def test_empty_facts_short_circuits(self):
         """No facts → no diagnostic, regardless of reverse_mapping shape."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         _check_mapping_totality(graph, [], {})
@@ -4193,7 +4447,7 @@ class TestCheckMappingTotality:
         into the forward map's conflict-losing value but never reached
         the reverse map.
         """
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4211,7 +4465,7 @@ class TestCheckMappingTotality:
     def test_placeholder_present_in_reverse_keys_passes(self):
         """Once the placeholder is a key in the reverse map, the same
         fact passes with no orphan recorded."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4228,7 +4482,7 @@ class TestCheckMappingTotality:
         drops the fact."""
         import logging
 
-        from paramem.graph.extractor import _apply_bindings, _check_mapping_totality
+        from paramem.graph.placeholders import _apply_bindings, _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4240,10 +4494,10 @@ class TestCheckMappingTotality:
         # propagating to the root; attach the handler to the specific
         # logger directly (see test_skips_unrecognised_class_filenames pattern
         # in test_intent.py).
-        extractor_logger = logging.getLogger("paramem.graph.extractor")
-        prior_level = extractor_logger.level
-        extractor_logger.setLevel(logging.WARNING)
-        extractor_logger.addHandler(caplog.handler)
+        placeholders_logger = logging.getLogger("paramem.graph.placeholders")
+        prior_level = placeholders_logger.level
+        placeholders_logger.setLevel(logging.WARNING)
+        placeholders_logger.addHandler(caplog.handler)
         try:
             _check_mapping_totality(
                 graph,
@@ -4254,8 +4508,8 @@ class TestCheckMappingTotality:
                 stage="sota_enrichment",
             )
         finally:
-            extractor_logger.removeHandler(caplog.handler)
-            extractor_logger.setLevel(prior_level)
+            placeholders_logger.removeHandler(caplog.handler)
+            placeholders_logger.setLevel(prior_level)
         assert graph.diagnostics.get("sota_pending_orphans") == ["Org_9"]
         assert any("sota enrichment" in r.getMessage().lower() for r in caplog.records)
         kept, predicate_dropped, residual_dropped = _apply_bindings(
@@ -4269,7 +4523,7 @@ class TestCheckMappingTotality:
         """A binding value that itself contains an unresolved bare
         placeholder (``"... at Org_9"``) is predicted as an orphan even
         though no fact directly references ``Org_9``."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4295,7 +4549,7 @@ class TestCheckMappingTotality:
         otherwise silently resolve to the wrong real name."""
         import logging
 
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4307,10 +4561,10 @@ class TestCheckMappingTotality:
         # propagating to the root; attach the handler to the specific
         # logger directly (see test_skips_unrecognised_class_filenames pattern
         # in test_intent.py).
-        extractor_logger = logging.getLogger("paramem.graph.extractor")
-        prior_level = extractor_logger.level
-        extractor_logger.setLevel(logging.WARNING)
-        extractor_logger.addHandler(caplog.handler)
+        placeholders_logger = logging.getLogger("paramem.graph.placeholders")
+        prior_level = placeholders_logger.level
+        placeholders_logger.setLevel(logging.WARNING)
+        placeholders_logger.addHandler(caplog.handler)
         try:
             _check_mapping_totality(
                 graph,
@@ -4321,8 +4575,8 @@ class TestCheckMappingTotality:
                 stage="sota_enrichment",
             )
         finally:
-            extractor_logger.removeHandler(caplog.handler)
-            extractor_logger.setLevel(prior_level)
+            placeholders_logger.removeHandler(caplog.handler)
+            placeholders_logger.setLevel(prior_level)
         assert graph.diagnostics.get("sota_binding_collisions") == ["Org_1"]
         assert any("collision" in r.getMessage().lower() for r in caplog.records)
 
@@ -4331,7 +4585,7 @@ class TestCheckMappingTotality:
         earlier tests) keep passing unchanged — defaults preserve
         behaviour: ``sota_bindings=None`` skips the collision scan and
         the diagnostic key stays ``"totality_orphans"``."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4349,7 +4603,7 @@ class TestCheckMappingTotality:
         """C1 — the totality check returns ``[]`` (not ``None``) when the
         mapping is total — the explicit-return contract that makes a
         plain truthiness test safe for callers."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
@@ -4363,7 +4617,7 @@ class TestCheckMappingTotality:
         guard returns ``[]``, not the implicit ``None`` a bare ``return``
         would give — invisible to a caller that only writes ``if
         verdict:``."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         verdict = _check_mapping_totality(graph, [], {"Person_1": "Alex"})
@@ -4373,7 +4627,7 @@ class TestCheckMappingTotality:
     def test_returns_token_list_on_poisoned_delta(self):
         """The verdict IS the sorted offending-token list — not just a
         ``graph.diagnostics`` side effect."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [
@@ -4387,7 +4641,7 @@ class TestCheckMappingTotality:
         """When ``observed`` is a set, a ``sota_bindings`` key colliding
         with it is folded into the RETURNED verdict (not just the
         diagnostics) so the caller's plain truthiness gate rejects it."""
-        from paramem.graph.extractor import _check_mapping_totality
+        from paramem.graph.placeholders import _check_mapping_totality
 
         graph = self._graph()
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Berlin"}]
@@ -4419,7 +4673,7 @@ class TestResolutionMap:
     def test_core_wins_on_key_in_both_maps_unscoped(self):
         """observed=None (CORE unscoped): reverse wins on collision —
         today's behaviour, preserved."""
-        from paramem.graph.extractor import _resolution_map
+        from paramem.graph.placeholders import _resolution_map
 
         reverse = {"Org_1": "Acme"}
         sota_bindings = {"Org_1": "Wrong Corp"}
@@ -4431,7 +4685,7 @@ class TestResolutionMap:
         CORE — vacuous under normal scoped construction (the rejection
         gate would have already rejected this delta) but must hold if
         the map is asked to resolve one directly."""
-        from paramem.graph.extractor import _resolution_map
+        from paramem.graph.placeholders import _resolution_map
 
         reverse = {"Org_1": "Acme"}
         sota_bindings = {"Org_1": "Wrong Corp"}
@@ -4439,21 +4693,21 @@ class TestResolutionMap:
         assert resolved["Org_1"] == "Acme"
 
     def test_observed_none_is_core_unscoped_every_reverse_entry_legal(self):
-        from paramem.graph.extractor import _resolution_map
+        from paramem.graph.placeholders import _resolution_map
 
         reverse = {"Person_1": "Alex", "City_1": "Berlin"}
         resolved = _resolution_map(reverse, {}, observed=None)
         assert resolved == reverse
 
     def test_observed_scoped_excludes_reverse_entries_outside_observed(self):
-        from paramem.graph.extractor import _resolution_map
+        from paramem.graph.placeholders import _resolution_map
 
         reverse = {"Person_1": "Alex", "City_1": "Berlin"}
         resolved = _resolution_map(reverse, {}, observed={"Person_1"})
         assert resolved == {"Person_1": "Alex"}
 
     def test_sota_mint_outside_observed_is_included(self):
-        from paramem.graph.extractor import _resolution_map
+        from paramem.graph.placeholders import _resolution_map
 
         reverse = {"Person_1": "Alex"}
         sota_bindings = {"Event_1": "the workshop"}

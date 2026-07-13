@@ -130,10 +130,8 @@ def _run_one(
     speaker_name: str,
     pii_scope: set[str],
 ) -> tuple[str, dict, str]:
-    from paramem.graph.extractor import (
-        deanonymize_text,
-        extract_and_anonymize_for_cloud,
-    )
+    from paramem.graph.extractor import extract_and_anonymize_for_cloud
+    from paramem.graph.placeholders import deanonymize_text
 
     anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
         transcript,

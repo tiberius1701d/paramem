@@ -22,11 +22,11 @@ import pytest
 
 from paramem.graph.extractor import (
     _CLOUD_EGRESS_DEFAULT_SCOPE,
-    _DEFAULT_PII_SCOPE,
     extract_and_anonymize_for_cloud,
     extract_pii_names_with_ner,
     verify_anonymization_completeness,
 )
+from paramem.graph.placeholders import _DEFAULT_PII_SCOPE
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 # ---------------------------------------------------------------------------

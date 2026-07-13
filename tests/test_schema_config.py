@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from paramem.graph.schema_config import (
-    anonymizer_placeholder_pattern,
     anonymizer_prefix_to_type,
     anonymizer_type_to_prefix,
     entity_types,
@@ -394,71 +393,6 @@ class TestAnonymizerConfig:
         for line in format_replacement_rules().splitlines():
             assert "→" in line, f"Missing arrow in line: {line!r}"
             assert "_1" in line, f"Missing example token '_1' in line: {line!r}"
-
-    # ------------------------------------------------------------------ #
-    # anonymizer_placeholder_pattern                                      #
-    # ------------------------------------------------------------------ #
-
-    def test_pattern_matches_common_placeholders(self):
-        """The common-prefix placeholders all match the universal shape regex."""
-        pat = anonymizer_placeholder_pattern()
-        for token in ("Person_1", "City_42", "Country_3", "Org_10", "Thing_999"):
-            assert pat.match(token), f"Pattern should match {token!r}"
-
-    def test_pattern_matches_invented_prefixes(self):
-        """The prefix vocabulary is open — type-appropriate PascalCase prefixes
-        outside the common set must match.  Closes the regression that caused
-        the position-based `_recover_missing_placeholder_mappings` helper to
-        carry weight: when the LLM mints `University_1` / `Project_1` /
-        `Language_1`, the canonical check accepts it as well-formed instead
-        of forcing a constrained vocabulary."""
-        pat = anonymizer_placeholder_pattern()
-        for token in (
-            "University_1",
-            "Project_3",
-            "Paper_1",
-            "Language_2",
-            "Currency_1",
-            "Event_5",
-            "Role_1",
-            "Tool_99",
-        ):
-            assert pat.match(token), f"Pattern should match invented prefix {token!r}"
-
-    def test_pattern_requires_uppercase_first_letter(self):
-        """Pattern requires the prefix to start with an uppercase letter.
-        Lowercase-start is the most common LLM error mode and signals the
-        model ignored the shape contract — the canonical check should reject.
-        Mid-prefix uppercase (e.g. all-caps acronym-style ``URL_1``) is
-        accepted by the shape regex; the contract teaches PascalCase but
-        does not police every internal capitalisation pattern."""
-        pat = anonymizer_placeholder_pattern()
-        assert not pat.match("person_1"), "lowercase-start prefix must NOT match"
-        assert not pat.match("city_42"), "lowercase-start prefix must NOT match"
-
-    def test_pattern_does_not_match_real_names(self):
-        """Real names must not match the placeholder pattern."""
-        pat = anonymizer_placeholder_pattern()
-        for token in ("Alex", "Berlin", "Apple", ""):
-            assert not pat.match(token), f"Pattern should NOT match {token!r}"
-
-    def test_pattern_does_not_match_prefix_without_suffix(self):
-        """'Person' without '_<N>' suffix must not match."""
-        pat = anonymizer_placeholder_pattern()
-        assert not pat.match("Person"), "Pattern should NOT match bare 'Person'"
-        assert not pat.match("Person_"), "Pattern should NOT match 'Person_' (no digits)"
-        assert not pat.match("Person_abc"), "Pattern should NOT match 'Person_abc' (non-digit)"
-
-    def test_pattern_is_pattern_when_prefixes_nonempty(self):
-        """Default config — must return a compiled Pattern (not None)."""
-        import re
-
-        reset_cache()
-        result = anonymizer_placeholder_pattern()
-        assert isinstance(result, re.Pattern), (
-            f"anonymizer_placeholder_pattern must return re.Pattern when prefixes are configured, "
-            f"got {result!r}"
-        )
 
     # ------------------------------------------------------------------ #
     # Fallback behaviour                                                   #

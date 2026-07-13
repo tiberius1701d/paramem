@@ -33,8 +33,8 @@ import logging
 from collections import namedtuple
 
 from paramem.evaluation.recall import generate_answer
+from paramem.graph.placeholders import prefix_to_entity_type
 from paramem.graph.prompts import _load_prompt
-from paramem.graph.schema_config import anonymizer_prefix_to_type
 from paramem.models.loader import adapt_messages
 from paramem.server.vram_guard import vram_scope
 
@@ -195,7 +195,9 @@ def correct_entity_surfaces(
     """Correct misspelled real-world entity surfaces across two loci.
 
     Gathers correctable values from (a) ``reverse_mapping`` placeholder
-    values (kind-eligible via :func:`anonymizer_prefix_to_type`) and (b)
+    values (kind-eligible via :func:`~paramem.graph.placeholders.
+    prefix_to_entity_type` — open vocabulary, so a novel prefix's own
+    name still passes through as its type) and (b)
     ``entities[*].attributes`` values (only when ``"attributes"`` is a
     member of ``correction_entity_types``), classifies each with the one
     :func:`_verdict` primitive, and applies an accepted correction via the
@@ -214,7 +216,7 @@ def correct_entity_surfaces(
 
     Args:
         reverse_mapping: ``{placeholder: real_surface}`` produced by
-            :func:`paramem.graph.extractor._build_anonymization_mapping`.
+            :func:`paramem.graph.placeholders._build_anonymization_mapping`.
             Mutated in place for every applied placeholder-locus correction.
         entities: ``graph.entities`` — mutated in place (attribute values
             only) for every applied attribute-locus correction. Only read
@@ -270,10 +272,9 @@ def correct_entity_surfaces(
 
     targets: list[_Target] = []
 
-    prefix_to_type = anonymizer_prefix_to_type()
     for placeholder, surface in reverse_mapping.items():
-        entity_type = prefix_to_type.get(placeholder.split("_")[0].lower())
-        if entity_type is None or entity_type not in correctable_kinds:
+        entity_type = prefix_to_entity_type(placeholder.split("_")[0])
+        if entity_type not in correctable_kinds:
             continue
 
         def _write_placeholder(corrected: str, _ph: str = placeholder) -> None:

@@ -898,7 +898,7 @@ class TestCloudModePolicy:
                 return_value=("Person_1 query", {"Alex": "Person_1"}, {"Person_1": "Alex"}),
             ) as mock_anon,
             patch(
-                "paramem.graph.extractor.deanonymize_text",
+                "paramem.graph.placeholders.deanonymize_text",
                 return_value="Alex is a useful placeholder here.",
             ) as mock_deanon,
         ):
@@ -951,7 +951,7 @@ class TestCloudModePolicy:
                 return_value=("anon q", {"Berlin": "City_1"}, {"City_1": "Berlin"}),
             ),
             patch(
-                "paramem.graph.extractor.deanonymize_text",
+                "paramem.graph.placeholders.deanonymize_text",
                 return_value="<answer>",
             ),
         ):
