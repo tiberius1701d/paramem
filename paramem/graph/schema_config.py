@@ -317,24 +317,3 @@ def anonymizer_type_to_prefix(path: str | None = None) -> dict[str, str]:
         for entry in cfg["anonymizer"]["prefixes"]
         if entry.get("primary_for_type", False)
     }
-
-
-def format_replacement_rules(path: str | None = None) -> str:
-    """Return the bulleted Replace: block for the anonymization prompt.
-
-    One line per prefix:
-        ``- {description} → {Prefix}_1, {Prefix}_2, ...``
-
-    Args:
-        path: Optional override path for the schema YAML.
-
-    Returns:
-        Newline-joined bullet lines, one per configured prefix.
-    """
-    cfg = load_schema_config(path)
-    lines = []
-    for entry in cfg["anonymizer"]["prefixes"]:
-        prefix = entry["prefix"]
-        desc = entry["description"]
-        lines.append(f"- {desc} \u2192 {prefix}_1, {prefix}_2, ...")
-    return "\n".join(lines)

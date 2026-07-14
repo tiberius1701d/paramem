@@ -1476,21 +1476,35 @@ class TestSOTANoiseFilter:
             is True
         )
 
-    def test_mapping_is_canonical_uniqueness_violation(self):
-        """Two real names sharing a placeholder → not canonical.  The
-        anonymizer prompt's uniqueness rule is structural; the canonical
-        check enforces it post-LLM so a duplicate-value mapping cannot
-        slip through and silently collide two distinct entities into one
-        identifier in the deanon round-trip."""
-        from paramem.graph.placeholders import _mapping_is_canonical
+    def test_mapping_is_canonical_pii_attribute_fold_is_not_a_violation(self):
+        """Two entries collapsing onto the same placeholder is the NORMAL
+        shape of the CORE forward map, not a defect: an entity's PII
+        attribute values fold onto that entity's own placeholder
+        (``_build_anonymization_mapping``, ``placeholders.py:877``).
 
-        # Two persons mapped to the same placeholder.
-        assert _mapping_is_canonical({"Alice": "Person_1", "Pat": "Person_1"}) is False
-        # Same shape but with one entry valid → still false.
-        assert (
-            _mapping_is_canonical({"Alice": "Person_1", "Pat": "Person_1", "Berlin": "City_1"})
-            is False
+        Live regression this pins: an in-scope person carrying a single PII
+        attribute (phone, email, city, …) produced a many-to-one forward map
+        by design. A uniqueness clause treated that as non-canonical, so
+        cloud egress and the anonymizer-stage leak repair
+        (``extractor.py:1031``, ``:2147``) took the non-canonical branch on
+        every ordinary leak — repair never ran, cloud egress silently
+        blocked.
+
+        Mutation: restore the uniqueness clause
+        (``len(set(placeholder_entries)) == len(mapping)``) -> fails.
+        """
+        from paramem.graph.placeholders import _build_anonymization_mapping, _mapping_is_canonical
+        from paramem.graph.schema import Entity
+
+        entities = [
+            Entity(name="Alex", entity_type="person", attributes={"phone": "555-0100"}),
+        ]
+        fwd, rev = _build_anonymization_mapping(
+            entities, {}, pii_scope={"person"}, speaker_name=None
         )
+        assert fwd == {"Alex": "Person_1", "555-0100": "Person_1"}
+        assert _mapping_is_canonical(fwd) is True
+        assert rev == {"Person_1": "Alex"}
 
     def test_mapping_is_canonical_malformed_shape_rejected(self):
         """Values that don't match the universal `<Prefix>_<N>` shape
@@ -1646,29 +1660,6 @@ class TestSOTANoiseFilter:
         # Empty / whitespace fall back to a generic recoverable shape.
         assert entity_type_to_prefix("") == "Entity"
         assert entity_type_to_prefix("   ") == "Entity"
-
-    def test_clean_ner_span_strips_dialogue_tail(self):
-        """NER span cleanup removes 'Name: Response' dialogue artifacts."""
-        from paramem.graph.extractor import _clean_ner_span
-
-        assert _clean_ner_span("Li Ming: True") == "Li Ming"
-        assert _clean_ner_span("Li Yu: Indeed") == "Li Yu"
-        assert _clean_ner_span("Alex: Yes I agree") == "Alex"
-
-    def test_clean_ner_span_strips_possessive(self):
-        """NER span cleanup removes trailing possessive 's."""
-        from paramem.graph.extractor import _clean_ner_span
-
-        assert _clean_ner_span("Eugene Mekinen's") == "Eugene Mekinen"
-        assert _clean_ner_span("Alex\u2019s") == "Alex"
-
-    def test_clean_ner_span_keeps_clean(self):
-        """Names without dialogue tails or possessives pass through unchanged."""
-        from paramem.graph.extractor import _clean_ner_span
-
-        assert _clean_ner_span("Alex") == "Alex"
-        assert _clean_ner_span("Li Ming") == "Li Ming"
-        assert _clean_ner_span("New York City") == "New York City"
 
     def test_verify_anonymization_catches_missing_mapping(self):
         """Guard catches silent de-anonymization failure (name replaced but mapping incomplete)."""
@@ -5319,3 +5310,424 @@ class TestSpeakerAnchorPipeline:
         assert result.relations[0].subject == "Acme"
         assert result.relations[0].object == "Millfield"
         assert "sota_enrichment_rejected" not in result.diagnostics
+
+
+class TestCloudEgressSharedTableBuilder:
+    """``extract_and_anonymize_for_cloud`` builds its table with the SAME
+    primitive both SOTA tiers use (``_build_anonymization_mapping``).
+
+    It used to invert the local model's own map with a dict comprehension —
+    a second, divergent table construction on the privacy-critical path.
+    The inversion is lossy (an entity's PII attribute values fold onto the
+    entity's placeholder in the forward map, so inverting can restore a
+    phone number where the person's name belongs) and it minted nothing for
+    entities the model failed to name.
+    """
+
+    @staticmethod
+    def _graph():
+        return _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(
+                    name="Alex",
+                    entity_type="person",
+                    attributes={"phone": "555-0100"},
+                ),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+
+    def _run(self, llm_mapping, anon_facts, anon_transcript, **kwargs):
+        """Drive the real helper with the two LLM calls stubbed out."""
+        from paramem.graph.extractor import extract_and_anonymize_for_cloud
+
+        graph = self._graph()
+        with (
+            patch("paramem.graph.extractor.extract_graph", return_value=graph),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(anon_facts, llm_mapping, anon_transcript, ""),
+            ),
+        ):
+            return extract_and_anonymize_for_cloud(
+                "Alex lives in Millfield. Call 555-0100.",
+                MagicMock(),
+                MagicMock(),
+                speaker_id="speaker0",
+                pii_scope={"person", "place"},
+                **kwargs,
+            )
+
+    def test_cloud_egress_builds_the_table_via_the_shared_builder(self):
+        """The forward map folds an entity's PII ATTRIBUTE values onto that
+        entity's placeholder, and ``reverse`` still maps to ENTITY NAMES only.
+
+        The anonymizer prompt operates on relation participants, so the local
+        model's map never contains ``Entity.attributes`` values — the builder
+        is the only thing that puts them in the forward map (one placeholder
+        scrubs every surface form of the same person), and it deliberately
+        keeps them OUT of the reverse (a folded placeholder must restore the
+        name, never the phone number).
+
+        Mutation: restore the dict inversion (``reverse = {v: k for k, v in
+        mapping.items()}`` over the LLM's own map) -> the phone number is not
+        in the forward map at all, ``mapping["555-0100"]`` raises KeyError ->
+        this test fails.
+        """
+        anon_text, mapping, reverse = self._run(
+            llm_mapping={"Alex": "Person_1", "Millfield": "City_1"},
+            anon_facts=[{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}],
+            anon_transcript="Person_1 lives in City_1. Call 555-0100.",
+        )
+        assert anon_text
+        # Many-to-one BY CONSTRUCTION: the attribute value folds onto its
+        # entity's placeholder.
+        assert mapping["Alex"] == "Person_1"
+        assert mapping["555-0100"] == "Person_1"
+        # ... and the reverse carries entity names only.
+        assert reverse["Person_1"] == "Alex"
+        assert "555-0100" not in reverse.values()
+        assert set(reverse.values()) == {"Alex", "Millfield"}
+        # The folded attribute is actually scrubbed out of the payload.
+        assert "555-0100" not in anon_text
+
+    def test_cloud_egress_rebuilds_facts_and_transcript_from_the_full_map(self):
+        """Facts and transcript are rebuilt from the builder's COMPLETE map,
+        so an entity the local model never named is still scrubbed.
+
+        The builder mints for graph entities the LLM omitted; without the
+        rebuild those names stay bare in the model's own ``anon_facts`` /
+        transcript and ``check_anonymization_leaks`` blocks the call.
+
+        Mutation: skip the ``anon_facts`` / ``_anonymize_transcript``
+        rebuild -> "Millfield" survives bare in the facts -> the leak guard
+        fires and the helper returns the block sentinel -> this test fails.
+        """
+        anon_text, mapping, reverse = self._run(
+            # The local model named Alex but MISSED Millfield entirely.
+            llm_mapping={"Alex": "Person_1"},
+            anon_facts=[{"subject": "Person_1", "predicate": "lives_in", "object": "Millfield"}],
+            anon_transcript="Person_1 lives in Millfield. Call 555-0100.",
+        )
+        # Not the block sentinel.
+        assert anon_text != ""
+        assert "Millfield" not in anon_text
+        assert "555-0100" not in anon_text
+        # Millfield was minted by the BUILDER, not by the local model, and
+        # round-trips through both maps.
+        assert reverse[mapping["Millfield"]] == "Millfield"
+
+    def test_leak_on_pii_attribute_fold_mapping_reaches_repair_not_block(self):
+        """A leak-detected call whose forward map is the ordinary many-to-one
+        shape (an entity's PII attribute folded onto its own placeholder)
+        must take the REPAIR branch, never the block branch.
+
+        Live regression this pins (coordinator-reported): a uniqueness
+        clause in ``_mapping_is_canonical`` treated Alex's phone-attribute
+        fold as non-canonical, so ANY leak on this ordinary mapping shape
+        sent ``extract_and_anonymize_for_cloud`` down the non-canonical
+        branch -> the block sentinel ``("", {}, {})`` -> cloud escalation
+        silently died on every session with an in-scope person carrying
+        even one PII attribute.
+
+        The leak here is a real name ("Dana") extraction never named as an
+        entity -- bare in the transcript, absent from the mapping. NER
+        (mocked; no spaCy dependency) surfaces it, ``check_anonymization_leaks``
+        flags it, and -- because the mapping IS canonical post-fix -- repair
+        mints a placeholder for it and the call proceeds.
+
+        Mutation: restore the uniqueness clause in ``_mapping_is_canonical``
+        -> the canonical check on Alex's mapping (with the folded phone)
+        returns ``False`` -> the block sentinel is returned instead -> this
+        test fails.
+        """
+        from paramem.graph.extractor import extract_and_anonymize_for_cloud
+
+        graph = self._graph()
+        transcript = "Alex lives in Millfield. Call 555-0100. Dana was there too."
+        llm_mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        anon_transcript = "Person_1 lives in City_1. Call 555-0100. Dana was there too."
+
+        with (
+            patch("paramem.graph.extractor.extract_graph", return_value=graph),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(anon_facts, llm_mapping, anon_transcript, ""),
+            ),
+            patch(
+                "paramem.graph.extractor.extract_pii_names_with_ner",
+                return_value={"Dana": "person"},
+            ),
+        ):
+            anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
+                transcript,
+                MagicMock(),
+                MagicMock(),
+                speaker_id="speaker0",
+                pii_scope={"person", "place"},
+                ner_check=True,
+            )
+
+        # NOT the block sentinel -- repair ran and resolved the leak.
+        assert anon_text != ""
+        assert "Dana" not in anon_text
+        assert "555-0100" not in anon_text
+        # The PII-attribute fold survives repair untouched.
+        assert mapping["Alex"] == "Person_1"
+        assert mapping["555-0100"] == "Person_1"
+        # The leaked name was repaired in, and round-trips.
+        assert "Dana" in mapping
+        assert reverse[mapping["Dana"]] == "Dana"
+
+    def test_cloud_egress_does_not_call_ner_when_ner_check_is_false(self):
+        """THE acceptance test for the NER knob: the spaCy cross-check is
+        EXPERIMENTAL and OFF by default, at every call site.
+
+        Mutation: restore the unconditional
+        ``extract_pii_names_with_ner(transcript, pii_scope=scope)`` call ->
+        the spy fires under the default ``ner_check=False`` -> this test
+        fails.
+        """
+        with patch(
+            "paramem.graph.extractor.extract_pii_names_with_ner", return_value={}
+        ) as spy_ner:
+            self._run(
+                llm_mapping={"Alex": "Person_1", "Millfield": "City_1"},
+                anon_facts=[{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}],
+                anon_transcript="Person_1 lives in City_1.",
+            )
+        spy_ner.assert_not_called()
+
+    def test_cloud_egress_calls_ner_when_ner_check_is_true(self):
+        """The other half: it is an OPTION, not a deletion — switched on, it
+        runs, with the configured model name.
+
+        Mutation: drop the ``ner_check`` parameter (hardcode the call off)
+        -> the spy never fires -> this test fails.
+        """
+        with patch(
+            "paramem.graph.extractor.extract_pii_names_with_ner", return_value={}
+        ) as spy_ner:
+            self._run(
+                llm_mapping={"Alex": "Person_1", "Millfield": "City_1"},
+                anon_facts=[{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}],
+                anon_transcript="Person_1 lives in City_1.",
+                ner_check=True,
+                ner_model="en_core_web_sm",
+            )
+        spy_ner.assert_called_once()
+        assert spy_ner.call_args.args[1] == "en_core_web_sm"
+
+
+class TestNerRawSpans:
+    """spaCy spans are consumed exactly as spaCy produces them.
+
+    The three regex-shaped span fixers (``_clean_ner_span``,
+    ``_strip_ner_dialogue_tail``, ``_strip_ner_possessive``) are DELETED.
+    If the estimator's raw output is too dirty to be useful, that is the
+    measurement the experiment exists to surface — not something to patch
+    out of view behind a regex.
+    """
+
+    class _Ent:
+        def __init__(self, text: str, label: str) -> None:
+            self.text = text
+            self.label_ = label
+
+    class _Doc:
+        def __init__(self, ents) -> None:
+            self.ents = ents
+
+    def _stub_nlp(self, monkeypatch, ents):
+        """Seed the module's spaCy pipeline cache with a stub ``nlp``.
+
+        Seeding the cache means ``spacy.load`` is never reached; a bare
+        module object satisfies the ``import spacy`` line, so these tests
+        run without spaCy installed (it ships only in the ``ner`` extra).
+        """
+        import sys
+        import types
+
+        from paramem.graph import extractor
+
+        monkeypatch.setitem(sys.modules, "spacy", types.ModuleType("spacy"))
+        monkeypatch.setitem(
+            extractor._SPACY_MODELS, "stub_model", lambda text: self._Doc(list(ents))
+        )
+
+    def test_ner_returns_raw_spacy_spans(self, monkeypatch):
+        """A dirty span (dialogue tail) comes back VERBATIM.
+
+        Mutation: re-add ``_clean_ner_span`` at the span-consumption site ->
+        "Li Ming: True" is silently repaired to "Li Ming" -> this test fails.
+        """
+        from paramem.graph.extractor import extract_pii_names_with_ner
+
+        self._stub_nlp(
+            monkeypatch,
+            [self._Ent("Li Ming: True", "PERSON"), self._Ent("Alex's", "PERSON")],
+        )
+        result = extract_pii_names_with_ner("Li Ming: True", "stub_model", pii_scope={"person"})
+        assert set(result) == {"Li Ming: True", "Alex's"}
+
+    def test_ner_return_carries_the_pii_type(self, monkeypatch):
+        """The return stays ``{name: pii_type}`` — the type is load-bearing
+        on the repair path (without it ``Berlin`` repairs to ``Person_4``
+        instead of ``City_1``).
+
+        Mutation: collapse the return to a bare name set -> repair loses the
+        category -> this test fails.
+        """
+        from paramem.graph.extractor import extract_pii_names_with_ner
+
+        self._stub_nlp(
+            monkeypatch,
+            [self._Ent("Berlin", "GPE"), self._Ent("Alice", "PERSON")],
+        )
+        result = extract_pii_names_with_ner(
+            "Alice lives in Berlin", "stub_model", pii_scope={"person", "place"}
+        )
+        assert result == {"Berlin": "place", "Alice": "person"}
+
+
+class TestObservedDerivation:
+    """``observed`` — CORE's legality domain for a SOTA cycle — is derived
+    from the DECLARED token vocabulary intersected with the payload we
+    actually rendered, not scraped out of the payload with a shape regex.
+
+    A shape scrape reads whatever token-shaped text the payload happens to
+    carry (``Boeing_747``, ``GPT_4``) and is blind to the table that
+    declares what a token IS.
+    """
+
+    def test_observed_is_declared_tokens_present_in_the_rendered_payload(self):
+        """Mutation: restore the ``PLACEHOLDER_TOKEN_RE.findall`` scrape over
+        the facts + transcript -> the shape-like real name ``Boeing_747``
+        (copied verbatim out of the transcript) enters ``observed`` as if it
+        were a declared placeholder -> this test fails.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+                # Declared by the builder, but named in no fact and in no
+                # transcript span -> declared but NOT observed.
+                Entity(name="Dana", entity_type="person"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+
+        captured: list = []
+        from paramem.graph import extractor as _extractor
+
+        real_totality = _extractor._check_mapping_totality
+
+        def _spy(*args, **kwargs):
+            if "observed" in kwargs:
+                captured.append(kwargs["observed"])
+            return real_totality(*args, **kwargs)
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(anon_facts, mapping, "", ""),
+            ),
+            patch("paramem.graph.extractor._check_mapping_totality", side_effect=_spy),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(list(anon_facts), None, {}, None, {}),
+            ),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex lives in Millfield and flew on a Boeing_747",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
+
+        assert captured, "the sota_enrich totality check must run with an observed scope"
+        observed = captured[-1]
+        # Declared AND in the payload.
+        assert observed == {"Person_1", "City_1"}
+        # A shape-like real name copied out of the transcript is NOT a token.
+        assert "Boeing_747" not in observed
+        # A declared token absent from the payload is not observed either
+        # (Dana's minted placeholder).
+        assert observed <= {"Person_1", "City_1"}
+
+
+class TestFilterOpenaiCompatBoundaryErrors:
+    """``_filter_openai_compat`` must treat a malformed 200 response as the
+    SAME boundary condition its sibling ``_filter_anthropic`` already does
+    (broad catch, return ``None``) — not let it escape as an uncaught
+    exception.
+
+    Regression this pins: ``consolidation.py``'s graph-tier chunk loop was
+    narrowed from ``except Exception`` to ``except RuntimeError`` (the ONE
+    genuinely-failing runtime leg being the local ``generate()``'s CUDA
+    "device not ready" class). That premise is false for the OpenAI-
+    compatible provider: a 200 response with a non-JSON body raises
+    ``json.JSONDecodeError`` (a ``ValueError``) out of ``resp.json()``, and
+    an unexpected JSON shape (``choices`` is ``null``) raises ``TypeError``
+    out of the subscript chain. Neither is a ``RuntimeError``, so each would
+    escape the narrowed handler and kill the WHOLE fold over what should
+    cost one chunk.
+    """
+
+    @staticmethod
+    def _client_returning(mock_response):
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = mock_response
+        return mock_client
+
+    def test_openai_compat_malformed_json_returns_none(self):
+        """A 200 response whose body is not JSON at all (proxy error page,
+        captive-portal interstitial, truncated stream) must return ``None``,
+        not raise.
+
+        Mutation: drop ``ValueError`` from the caught tuple -> ``resp.json()``'s
+        ``json.JSONDecodeError`` escapes -> this test fails.
+        """
+        from paramem.graph.extractor import _filter_openai_compat
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.side_effect = json.JSONDecodeError("Expecting value", "<html>", 0)
+        mock_client = self._client_returning(mock_response)
+
+        with patch("httpx.Client", return_value=mock_client):
+            result = _filter_openai_compat(
+                "prompt", "test-key", "test-model", "groq", endpoint="https://example.test"
+            )
+        assert result is None
+
+    def test_openai_compat_unexpected_shape_returns_none(self):
+        """A 200 response whose JSON lacks the expected ``choices`` shape
+        (``choices`` is ``null``) must return ``None``, not raise.
+
+        Mutation: drop ``TypeError`` from the caught tuple -> subscripting
+        ``None[0]`` raises ``TypeError`` uncaught -> this test fails.
+        """
+        from paramem.graph.extractor import _filter_openai_compat
+
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json.return_value = {"choices": None}
+        mock_client = self._client_returning(mock_response)
+
+        with patch("httpx.Client", return_value=mock_client):
+            result = _filter_openai_compat(
+                "prompt", "test-key", "test-model", "groq", endpoint="https://example.test"
+            )
+        assert result is None

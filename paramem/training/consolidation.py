@@ -2882,9 +2882,20 @@ class ConsolidationLoop:
                 # per-cycle loop in app.py) must see this and retry rather
                 # than have it silently swallowed as a skipped chunk.
                 raise
-            except Exception as exc:
+            except RuntimeError as exc:
+                # Narrow by design.  The only genuinely-failing runtime leg in
+                # this chunk body is the local ``generate()`` inside
+                # ``anonymize_with_local_model`` (the CUDA "device not ready"
+                # class); OOM already arrives as ``VramExhausted`` above.  The
+                # cloud leg cannot raise — ``_sota_call`` and the response
+                # parse both return ``None`` on failure — so a broad
+                # ``except Exception`` here could only ever swallow a
+                # programming error (e.g. a KeyError from a malformed prompt
+                # template), silently disabling graph enrichment forever.
+                # Those must kill the fold.  Widen by NAME if a legitimate
+                # runtime condition surfaces; never back to ``Exception``.
                 logger.warning(
-                    "graph_enrichment: exception during SOTA call — %s: %s",
+                    "graph_enrichment: runtime error during chunk — %s: %s",
                     type(exc).__name__,
                     exc,
                 )

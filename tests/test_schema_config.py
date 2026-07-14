@@ -11,7 +11,6 @@ from paramem.graph.schema_config import (
     format_entity_types,
     format_predicate_examples,
     format_relation_types,
-    format_replacement_rules,
     load_schema_config,
     preferred_predicates,
     relation_types,
@@ -364,35 +363,6 @@ class TestAnonymizerConfig:
                 f"type_to_prefix returned prefix {prefix!r} for {etype!r} "
                 f"which is not in the configured prefix list: {sorted(all_prefixes)}"
             )
-
-    # ------------------------------------------------------------------ #
-    # format_replacement_rules                                            #
-    # ------------------------------------------------------------------ #
-
-    def test_format_replacement_rules_has_five_lines(self):
-        """One bullet line per configured prefix (5 prefixes → 5 lines)."""
-        result = format_replacement_rules()
-        lines = result.splitlines()
-        assert len(lines) == 5, (
-            f"Expected 5 lines in format_replacement_rules(), got {len(lines)}: {lines!r}"
-        )
-
-    def test_format_replacement_rules_each_line_starts_with_dash(self):
-        """Each line must be a bullet: '- <description> → <Prefix>_1, <Prefix>_2, ...'"""
-        for line in format_replacement_rules().splitlines():
-            assert line.startswith("- "), f"Line does not start with '- ': {line!r}"
-
-    def test_format_replacement_rules_contains_all_prefixes(self):
-        """All five prefix tokens must appear in the rendered rules."""
-        result = format_replacement_rules()
-        for prefix in ("Person", "City", "Country", "Org", "Thing"):
-            assert prefix in result, f"Prefix {prefix!r} missing from format_replacement_rules()"
-
-    def test_format_replacement_rules_each_line_contains_arrow_and_examples(self):
-        """Each line must contain the → arrow and at least one '_N' example."""
-        for line in format_replacement_rules().splitlines():
-            assert "→" in line, f"Missing arrow in line: {line!r}"
-            assert "_1" in line, f"Missing example token '_1' in line: {line!r}"
 
     # ------------------------------------------------------------------ #
     # Fallback behaviour                                                   #

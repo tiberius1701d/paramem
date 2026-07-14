@@ -4210,3 +4210,82 @@ class TestGraphEnrichmentUsesSharedPrimitives:
             "consolidation.py appears to hardcode the placeholder-shape "
             "regex — this pattern must live only in paramem.graph.placeholders."
         )
+
+
+class TestGraphEnrichmentFailureLoudness:
+    """The graph tier must FAIL LOUD on a programming error and skip
+    gracefully only on a genuine runtime condition.
+
+    Two swallows used to hide a malformed prompt template: an inner
+    ``except KeyError`` around ``enrichment_prompt.format(...)`` in
+    ``_graph_enrich_with_sota``, and a broad ``except Exception`` around the
+    whole chunk body in ``_run_graph_enrichment``.  Together they turned a
+    missed brace-doubling in ``sota_graph_enrichment.txt`` into a permanent,
+    SILENT outage of graph enrichment.  Both tests below are needed: each
+    pins one half, so an inert half-fix is caught.
+    """
+
+    def test_graph_enrichment_prompt_format_error_propagates(self, tmp_path, monkeypatch):
+        """A prompt template with an un-doubled literal brace raises
+        ``KeyError`` out of ``_run_graph_enrichment`` — it does not silently
+        disable enrichment.
+
+        Mutation: re-add EITHER the inner ``except KeyError`` in
+        ``_graph_enrich_with_sota`` OR the broad ``except Exception`` in
+        ``_run_graph_enrichment`` -> the KeyError is swallowed and the fold
+        "succeeds" with zero enrichment -> this test fails.
+        """
+        from paramem.graph.prompts import _load_prompt as _real_load_prompt
+
+        loop = _make_loop(tmp_path)
+        _populate_untyped_graph(loop.merger.graph)
+
+        def _bad_prompt(filename, *args, **kwargs):
+            if filename == "sota_graph_enrichment.txt":
+                # {oops} is a literal brace the author forgot to double.
+                return "Triples:\n{triples_json}\nSchema: {oops}"
+            return _real_load_prompt(filename, *args, **kwargs)
+
+        stub = _stub_local_model_types({})
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch("paramem.training.consolidation.anonymize_with_local_model", side_effect=stub),
+            patch("paramem.graph.extractor._load_prompt", side_effect=_bad_prompt),
+            patch(
+                "paramem.graph.extractor._sota_call",
+                side_effect=AssertionError("the cloud must never be called with a broken prompt"),
+            ),
+            pytest.raises(KeyError, match="oops"),
+        ):
+            loop._run_graph_enrichment()
+
+    def test_graph_enrichment_cuda_runtime_error_skips_the_chunk(self, tmp_path, monkeypatch):
+        """A ``RuntimeError`` from the local ``generate()`` (the CUDA
+        "device not ready" class) skips the chunk and lets the fold finish.
+
+        This is the ONE genuinely-failing runtime leg in the chunk body, and
+        it is the reason a handler exists at all.
+
+        Mutation: narrow the handler to nothing (delete the ``except
+        RuntimeError``) -> the RuntimeError kills the whole fold -> this
+        test fails.
+        """
+        loop = _make_loop(tmp_path)
+        _populate_untyped_graph(loop.merger.graph)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("CUDA error: device not ready")
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch("paramem.training.consolidation.anonymize_with_local_model", side_effect=_boom),
+            patch(
+                "paramem.graph.extractor._sota_call",
+                side_effect=AssertionError("the cloud must not be called for a failed chunk"),
+            ),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["chunks"] == 0, "no SOTA call may be made for a chunk that failed locally"
+        assert result["new_edges"] == 0

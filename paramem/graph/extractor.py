@@ -342,46 +342,6 @@ def _contains_whole_word(text: str, word: str, *, case_insensitive: bool = False
         return True
 
 
-_NER_APOSTROPHES = ("'", "’")
-
-
-def _strip_ner_dialogue_tail(text: str) -> str:
-    """Strip a ``:<whitespace><word-char>...$`` dialogue tail.
-
-    Mirrors ``re.sub(r":\\s*\\w+.*$", "", text)``: a colon followed by
-    optional whitespace, then a word character, then anything to end of
-    string is removed (along with the colon itself).  Returns ``text``
-    unchanged when no such suffix is present.
-    """
-    if ":" not in text:
-        return text
-    pos = 0
-    while True:
-        colon = text.find(":", pos)
-        if colon < 0:
-            return text
-        scan = colon + 1
-        while scan < len(text) and text[scan].isspace():
-            scan += 1
-        if scan < len(text) and _is_word_char(text[scan]):
-            return text[:colon]
-        pos = colon + 1
-
-
-def _strip_ner_possessive(text: str) -> str:
-    """Strip a trailing possessive (``'`` / ``'s`` / ``’`` / ``’s``).
-
-    Mirrors ``re.sub(r"['’]s?$", "", text)``.
-    """
-    if not text:
-        return text
-    if text.endswith("s") and len(text) > 1 and text[-2] in _NER_APOSTROPHES:
-        return text[:-2]
-    if text[-1] in _NER_APOSTROPHES:
-        return text[:-1]
-    return text
-
-
 # Prompt filename constants — one definition site for the single
 # extraction-prompt source of truth.  The transcript prompt-pair is
 # used for every source_type; document chunks land in the same
@@ -888,6 +848,8 @@ def extract_and_anonymize_for_cloud(
     speaker_name: str | None = None,
     prompts_dir: str | Path | None = None,
     pii_scope: set[str] | frozenset[str] | None = None,
+    ner_check: bool = False,
+    ner_model: str = "en_core_web_sm",
 ) -> tuple[str, dict[str, str], dict[str, str]]:
     """Local extract + local anonymize for cloud egress.
 
@@ -899,16 +861,24 @@ def extract_and_anonymize_for_cloud(
        produces a SessionGraph the anonymizer can anchor on.
     2. ``anonymize_with_local_model(graph, transcript=transcript)`` —
        model-based anonymization of facts + transcript.
-    3. Mechanical transcript fallback when the model omits
-       ``anonymized_transcript`` (older prompt schema returns facts only).
-    4. ``_normalize_anonymization_mapping`` — canonicalize direction.
+    3. ``_normalize_anonymization_mapping`` — canonicalize direction.
+    4. ``_build_anonymization_mapping`` — THE single table builder
+       (the same one both SOTA tiers use), with the local model's map as
+       its ``llm_mapping`` hint.  Facts and transcript are then rebuilt
+       from the resulting complete forward map.
     5. ``check_anonymization_leaks`` + ``_repair_anonymization_leaks``
        — extend mapping for missed names, drop triples for hallucinated
        ones (canonical-mapping path only).
     6. Final completeness check; any residual leak → block.
 
-    ``pii_scope`` controls which NER categories are anonymized; passes
-    through to NER and verify.  ``None`` → :data:`_CLOUD_EGRESS_DEFAULT_SCOPE`
+    ``ner_check`` / ``ner_model`` gate the EXPERIMENTAL spaCy PII
+    cross-check (:func:`extract_pii_names_with_ner`) — one knob
+    (``consolidation.extraction_ner_check``), off by default, shared with
+    the session tier.  The privacy control on this path is step 5's LLM
+    leak guard.
+
+    ``pii_scope`` controls which entity categories are anonymized; passes
+    through to the builder, NER and verify.  ``None`` → :data:`_CLOUD_EGRESS_DEFAULT_SCOPE`
     (``{"person"}``) — narrower than the primitive default because the
     cloud-utility tradeoff (Berlin restaurants, organisation-aware
     advice) bites here.  An empty scope short-circuits before any LLM
@@ -927,12 +897,17 @@ def extract_and_anonymize_for_cloud(
     Return shapes:
 
     * ``(anon_transcript, forward, reverse)`` — anonymization ran;
-      ``forward`` is the ``{real → placeholder}`` map produced by the
-      anonymizer LLM (one-to-one by contract — the prompt operates on
-      relation participants, not on attribute values, so no
-      placeholder fold), ``reverse`` is its inverse.  Caller
-      deanonymizes the cloud's response with :func:`~paramem.graph.placeholders.deanonymize_text`
-      using ``reverse``.
+      ``forward`` and ``reverse`` come from
+      :func:`~paramem.graph.placeholders._build_anonymization_mapping`.
+      ``forward`` is ``{real → placeholder}`` and is **many-to-one by
+      construction**: an entity's PII attribute values fold onto that
+      entity's placeholder, so one placeholder scrubs every surface form
+      of the same person.  ``reverse`` is therefore NOT a dict inversion
+      — it carries **entity names only**, so a folded placeholder can
+      never restore a phone number where the person's name belongs.
+      Caller deanonymizes the cloud's response with
+      :func:`~paramem.graph.placeholders.deanonymize_text` using
+      ``reverse``.
     * ``(transcript, {}, {})`` — operator opted out (``pii_scope=[]``)
       or the input had no in-scope content; caller forwards verbatim.
     * ``("", {}, {})`` — block.  Extraction error, anonymizer parse
@@ -1002,28 +977,47 @@ def extract_and_anonymize_for_cloud(
         return "", {}, {}
 
     mapping, _norm_stats = _normalize_anonymization_mapping(mapping)
-    if not anon_transcript:
-        # Older anonymization prompt returns only facts; rebuild the
-        # transcript mechanically from the mapping (same fallback
-        # `_sota_pipeline` uses).
-        anon_transcript = _anonymize_transcript(transcript, mapping)
 
-    # Build the reverse map alongside the forward.  ``anonymize_with_local_model``
-    # produces a one-to-one ``{real → placeholder}`` mapping (the anonymizer
-    # prompt operates on relation participants only, no attribute fold), so a
-    # straight dict inversion is information-preserving here.  Repairs below
-    # extend both maps in lockstep via :func:`_repair_anonymization_leaks`.
-    reverse: dict[str, str] = {
-        v: k for k, v in mapping.items() if isinstance(k, str) and isinstance(v, str) and k and v
-    }
+    # THE single table builder — the same one both SOTA tiers use.  The local
+    # model's (normalized) map is only a HINT: the builder walks the graph's
+    # own entity inventory, mints for entities the model never named, folds PII
+    # attribute values onto their entity's placeholder, and emits a ``reverse``
+    # that carries entity names only.  A straight inversion of the model's map
+    # was a second, divergent table construction on the privacy-critical path
+    # (and inverted attribute values onto tokens).  Repairs below extend both
+    # maps in lockstep via :func:`_repair_anonymization_leaks`.
+    mapping, reverse = _build_anonymization_mapping(
+        graph.entities, mapping, pii_scope=scope, speaker_name=speaker_name
+    )
 
-    # Defense-in-depth: NER cross-check catches PII that extraction missed
-    # (e.g. Mistral 7B emits relations referencing place names without
-    # tagging them as entities — those slip past the entity-scoped verify).
-    # Cloud egress is privacy-critical so we always enable NER cross-check;
-    # falls back to no-op if spaCy isn't installed.  ``pii_scope`` filters
-    # which categories NER surfaces.
-    extra_pii = extract_pii_names_with_ner(transcript, pii_scope=scope)
+    # Rebuild BOTH the transcript and the facts from the now-complete forward
+    # map (mirrors ``_sota_pipeline``).  Unconditional, not a fallback: the
+    # builder mints for entities the LLM never named, so those names are still
+    # BARE in the model's own ``anon_facts``/transcript and would trip
+    # ``check_anonymization_leaks`` on almost every call.  Idempotent when the
+    # model already produced clean output — placeholders are not mapping keys.
+    anon_transcript = _anonymize_transcript(transcript, mapping)
+    anon_facts = [
+        {
+            **f,
+            "subject": _substitute_whole_words(str(f.get("subject", "")), mapping),
+            "object": _substitute_whole_words(str(f.get("object", "")), mapping),
+        }
+        if isinstance(f, dict)
+        else f
+        for f in anon_facts
+    ]
+
+    # Optional spaCy NER cross-check — EXPERIMENTAL, off by default, gated by
+    # the SAME ``extraction_ner_check`` knob as the session tier (there is one
+    # knob, not one policy per call site).  It is a brittle estimator, not a
+    # shipped control: the defense on this path is the forward LLM leak guard
+    # below (``check_anonymization_leaks`` + repair).  Requires
+    # ``pip install paramem[ner]``; ``pii_scope`` filters which categories NER
+    # surfaces when it is switched on.
+    extra_pii = (
+        extract_pii_names_with_ner(transcript, ner_model, pii_scope=scope) if ner_check else None
+    )
 
     leaked = check_anonymization_leaks(
         graph,
@@ -2268,9 +2262,17 @@ def _sota_pipeline(
             # SAME render :func:`_filter_with_sota` uses for its prompt, so
             # the two cannot drift.
             _facts_text, _transcript_text = _sota_facing_payload(anon_facts, anon_transcript)
-            observed = {m[0] or m[1] for m in PLACEHOLDER_TOKEN_RE.findall(_facts_text)} | {
-                m[0] or m[1] for m in PLACEHOLDER_TOKEN_RE.findall(_transcript_text)
-            }
+            # Derive from the DECLARED vocabulary (the table we built) and the
+            # payload we actually rendered — a declared token is "observed" iff
+            # it literally occurs in that payload.  Substring membership, no
+            # regex: a shape scrape reads whatever token surface the text
+            # happens to carry, which is not necessarily the surface the table
+            # declares, and any divergence between the two silently scopes CORE
+            # to nothing (every token reads as an orphan → every delta
+            # rejected → SOTA enrichment dead, while the cycle still "succeeds"
+            # on local facts).
+            _declared = _declared_placeholder_tokens(reverse_mapping)
+            observed = {tok for tok in _declared if tok in _facts_text or tok in _transcript_text}
             # Send anon facts and transcript to SOTA as the local anonymizer
             # produced them. The SOTA prompt's convention is "anonymizer
             # placeholders are bare; only new entities introduced by SOTA use
@@ -3038,30 +3040,24 @@ _CLOUD_EGRESS_DEFAULT_SCOPE: frozenset[str] = frozenset({"person"})
 _SPACY_MODELS: dict[str, object] = {}
 
 
-def _clean_ner_span(text: str) -> str:
-    """Normalize a raw spaCy NER span — strip dialogue tails, possessives.
-
-    Dialogue-format transcripts often cause spaCy to extend PERSON spans
-    into the following response token (e.g. ``"Li Ming: True"`` — person
-    is ``"Li Ming"``, the rest is dialogue cruft that would inflate
-    false "missing mapping" flags).  ``_strip_ner_dialogue_tail`` and
-    ``_strip_ner_possessive`` apply the same shape as the previous
-    ``_NER_DIALOGUE_TAIL_RE`` / ``_NER_POSSESSIVE_RE`` patterns without
-    regex on user-content text.
-    """
-    cleaned = text.strip()
-    cleaned = _strip_ner_dialogue_tail(cleaned)
-    cleaned = _strip_ner_possessive(cleaned)
-    cleaned = cleaned.rstrip(":,.;!? ")
-    return cleaned.strip()
-
-
 def extract_pii_names_with_ner(
     transcript: str,
     spacy_model: str = "en_core_web_sm",
     pii_scope: set[str] | frozenset[str] | None = None,
 ) -> dict[str, str]:
-    """Independent PII detection via spaCy NER (optional defense-in-depth).
+    """Independent PII detection via spaCy NER — EXPERIMENTAL, off by default.
+
+    Not a shipped control.  Every call site is gated by the single
+    ``extraction_ner_check`` knob (default ``false``), and spaCy itself
+    ships only in the optional ``ner`` extra (``pip install paramem[ner]``).
+    The PII defense is the forward-path LLM leak guard
+    (:func:`check_anonymization_leaks` / ``verify_anonymization``); this
+    estimator exists so that guard can be compared against a second
+    opinion, not to stand in for it.
+
+    Spans are taken **as spaCy produces them**, whitespace-stripped and
+    nothing else — no span post-correction.  Dirty spans (dialogue tails,
+    possessives) are the measurement this experiment exists to surface.
 
     Returns a ``{name: pii_type}`` mapping over names whose internal
     type (per :data:`_SPACY_PII_LABELS`) is in ``pii_scope``.  When
@@ -3107,7 +3103,7 @@ def extract_pii_names_with_ner(
         pii_type = _SPACY_PII_LABELS.get(ent.label_)
         if pii_type is None or pii_type not in scope:
             continue
-        cleaned = _clean_ner_span(ent.text)
+        cleaned = ent.text.strip()
         if cleaned:
             # First spaCy span wins on collisions inside one transcript.
             names.setdefault(cleaned, pii_type)
@@ -3508,7 +3504,18 @@ def _filter_openai_compat(
             resp.raise_for_status()
             data = resp.json()
         return data["choices"][0]["message"]["content"]
-    except (httpx.HTTPError, httpx.RequestError, KeyError, IndexError) as e:
+    except (httpx.HTTPError, httpx.RequestError, KeyError, IndexError, ValueError, TypeError) as e:
+        # ValueError covers resp.json() raising json.JSONDecodeError on a
+        # 200 response with a non-JSON body (a proxy error page, a captive-
+        # portal interstitial, a truncated stream — real behind a VPN);
+        # json.JSONDecodeError is a ValueError subclass, so it is caught by
+        # name here rather than imported separately.  TypeError covers an
+        # unexpected JSON shape (e.g. "choices" is null).  Both are boundary
+        # conditions of an external API returning garbage, not programming
+        # errors — same failure contract as _filter_anthropic's broad catch,
+        # so callers (e.g. the graph-tier chunk loop in consolidation.py,
+        # narrowed to except RuntimeError) see a clean None instead of an
+        # escaping exception that kills the whole fold over one chunk.
         logger.warning("%s API call failed: %s", provider, e)
         return None
 
@@ -3865,11 +3872,11 @@ def _graph_enrich_with_sota(
     ]
 
     enrichment_prompt = _load_prompt("sota_graph_enrichment.txt", required=True)
-    try:
-        prompt = enrichment_prompt.format(triples_json=json.dumps(anon_triples, indent=2))
-    except KeyError as exc:
-        logger.warning("Graph enrichment prompt has unexpected placeholder: %s", exc)
-        return None
+    # No try/except: a KeyError here means the prompt template has an
+    # un-doubled literal brace (a template bug, not a runtime condition).
+    # Swallowing it turned a missed brace-doubling into a permanent,
+    # silent outage of graph enrichment — it must kill the fold loudly.
+    prompt = enrichment_prompt.format(triples_json=json.dumps(anon_triples, indent=2))
 
     raw = _sota_call(
         prompt,

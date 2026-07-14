@@ -1043,7 +1043,11 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     extraction_plausibility_judge: str = "auto"
     extraction_plausibility_stage: str = "deanon"  # "anon" | "deanon"
     extraction_verify_anonymization: bool = True  # forward-path privacy guard
-    extraction_ner_check: bool = False  # optional spaCy PII cross-check
+    # EXPERIMENTAL spaCy PII cross-check — off by default, gates EVERY NER call
+    # site (session tier + cloud egress).  Not a shipped control: brittle in
+    # practice, and the PII defense is extraction_verify_anonymization's LLM
+    # leak guard.  Requires `pip install paramem[ner]`.
+    extraction_ner_check: bool = False
     extraction_ner_model: str = "en_core_web_sm"  # spaCy model when ner_check=True
     # Anonymizer entity types eligible for local misspelling correction on
     # the reverse map (see paramem.graph.entity_correction). "person" is

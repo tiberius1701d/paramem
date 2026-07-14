@@ -387,7 +387,7 @@ def _normalize_anonymization_mapping(
 
 
 def _mapping_is_canonical(mapping: dict, *, placeholder_side: str = "value") -> bool:
-    """Validate the structural contract: shape, uniqueness, direction.
+    """Validate the structural contract: shape, direction.
 
     ``placeholder_side`` selects which side of the table must carry the
     placeholder shape — ``"value"`` (default) for the CORE table
@@ -402,28 +402,39 @@ def _mapping_is_canonical(mapping: dict, *, placeholder_side: str = "value") -> 
       exhaustive.
     * **Direction** — no entry on the OTHER side matches the placeholder
       shape (would be self-mapped).
-    * **Uniqueness** — no two entries collapse onto the same
-      ``placeholder_side`` entry. Trivially true when
-      ``placeholder_side="key"`` (dict keys are already unique) — the
-      check only has teeth for the CORE direction, where two distinct
-      real names colliding onto one placeholder would break the
-      deanonymization round-trip.
+
+    **Uniqueness is deliberately NOT a property of this table — do not
+    re-add it.** The CORE forward map is many-to-one BY CONSTRUCTION:
+    :func:`_build_anonymization_mapping` folds an entity's PII attribute
+    values onto that entity's own placeholder (``placeholders.py:877``),
+    so two entries legitimately collapsing onto the same
+    ``placeholder_side`` value is the normal, intended shape of the
+    table — not a defect to detect here. A former uniqueness clause
+    (``len(set(placeholder_entries)) == len(mapping)``) treated that
+    fold as non-canonical, sending every session with an in-scope
+    person carrying even one PII attribute (phone, email, city, …) down
+    the non-canonical branch at every leak-detected call site
+    (``extractor.py:1031``, ``:2147``) — repair never ran; cloud egress
+    silently blocked. It was also a no-op for the collision it claimed
+    to catch: two distinct entity NAMES colliding onto one placeholder
+    is already resolved by ``reverse.setdefault`` keeping only the
+    first (``placeholders.py:870``), so there is no duplicate left for
+    this function to find. Enforcing injectivity belongs at the
+    construction site (the LLM-hint merge), not here.
 
     Empty mapping is canonical (no entries to validate).
     """
     if not mapping:
         return True
     if placeholder_side == "key":
-        placeholder_entries = list(mapping.keys())
+        placeholder_entries = mapping.keys()
         other_entries = mapping.values()
     else:
-        placeholder_entries = list(mapping.values())
+        placeholder_entries = mapping.values()
         other_entries = mapping.keys()
     if not all(PLACEHOLDER_SHAPE_RE.match(str(v)) for v in placeholder_entries):
         return False
-    if any(PLACEHOLDER_SHAPE_RE.match(str(k)) for k in other_entries):
-        return False
-    return len(set(placeholder_entries)) == len(mapping)
+    return not any(PLACEHOLDER_SHAPE_RE.match(str(k)) for k in other_entries)
 
 
 # ---------------------------------------------------------------------------

@@ -298,7 +298,12 @@ consolidation:
   extraction_plausibility_stage: deanon         # "anon" | "deanon"
 
   extraction_verify_anonymization: true         # forward-path privacy guard (do not disable)
-  extraction_ner_check: false                   # optional spaCy PII cross-check
+  # EXPERIMENTAL spaCy PII cross-check — off by default, and off is the shipped
+  # posture.  It is a brittle estimator, not a control: the PII defense is the
+  # LLM leak guard above (extraction_verify_anonymization).  This knob gates
+  # EVERY NER call site (session tier + cloud egress).  Switching it on for a
+  # comparison run requires: pip install paramem[ner]
+  extraction_ner_check: false
   extraction_ner_model: en_core_web_sm          # spaCy model when ner_check=true
   # Local, privacy-preserving STT spelling repair (paramem/graph/entity_correction.py).
   # Runs entirely on-device on the anonymization *reverse map*: misheard real names

@@ -643,6 +643,10 @@ def _escalate_via_cloud_policy(
             speaker_id=speaker_id,
             speaker_name=speaker,
             pii_scope=set(config.sanitization.cloud_scope),
+            # The SAME knob the session tier uses — one experimental,
+            # off-by-default spaCy cross-check, not one policy per call site.
+            ner_check=config.consolidation.extraction_ner_check,
+            ner_model=config.consolidation.extraction_ner_model,
         )
         if not anon_text:
             # Per-query block: extraction error, anonymizer parse failure,
