@@ -170,6 +170,265 @@ class TestExtractionPrompt:
         assert "{speaker_name}" not in rendered
 
 
+def _extraction_prompt(model: str | None) -> str:
+    """Load the real (non-mocked) extraction.txt for a given model.
+
+    Passing ``_DEFAULT_PROMPT_DIR`` explicitly as ``prompts_dir`` is
+    required for per-model resolution: ``_load_prompt`` only searches
+    ``prompts_dir/<model>`` when ``prompts_dir`` is truthy (see
+    ``_load_prompt`` docstring) — omitting it silently falls back to the
+    shared base file even when ``model="qwen3-4b"`` is passed.
+    """
+    return _load_prompt(
+        "extraction.txt", required=True, model=model, prompts_dir=_DEFAULT_PROMPT_DIR
+    )
+
+
+def _positive_blocks(tmpl: str) -> list[str]:
+    return [b for b in re.split(r"\n\s*\n", tmpl) if b.lstrip().startswith("POSITIVE example")]
+
+
+def _negative_blocks(tmpl: str) -> list[str]:
+    return [b for b in re.split(r"\n\s*\n", tmpl) if b.lstrip().startswith("NEGATIVE example")]
+
+
+class TestExtractionPromptThirdPartySubjectContract:
+    """Contract tests for the third-party-subject fix.
+
+    Root cause (measured against real production data, data/ha/debug/):
+    the prompt taught the relation ``subject`` as a CONSTANT (``speaker0``)
+    rather than a variable — every one of six positive few-shots used
+    ``speaker0`` as the subject, and the one third-party example present
+    (a sister living in Frankfurt) explicitly re-rooted the third party's
+    fact onto ``speaker0`` via a compound predicate
+    (``sister_lives_in``). Only 2.9% of relations in a real 69-relation
+    sample had a non-speaker subject; production data shows glued
+    possessives like ``(speaker0, pet_ownership, "Pat's dog")`` and
+    outright misbindings like ``(speaker0, is, Priya)``.
+
+    These tests assert the STRUCTURE of the fix, not literal wording, so
+    the prompt prose can keep evolving without these tests going stale:
+    the positive set must not be uniformly speaker-subject, a
+    third-party-subject positive must exist, a discrimination negative
+    (wrong speaker0 binding vs. correct third-party binding for the same
+    fact) must exist, and the banned compound-possessive predicates must
+    not reappear. Both the shared prompt and the qwen3-4b per-model
+    override carried the identical defect, so both are checked.
+    """
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_positive_set_not_uniformly_speaker_subject(self, model):
+        """At least one POSITIVE block must use a subject other than
+        speaker0 for ALL of its relations — a uniformly speaker0-subject
+        positive set is exactly the defect that taught the model 'subject
+        is a constant'."""
+        tmpl = _extraction_prompt(model)
+        blocks = _positive_blocks(tmpl)
+        assert blocks, "No POSITIVE example blocks found — block-split regex or markers drifted."
+        subjects_per_block = [set(re.findall(r'"subject":\s*"([^"]+)"', b)) for b in blocks]
+        # Only consider blocks that actually contain relations (subjects non-empty).
+        relation_blocks = [subs for subs in subjects_per_block if subs]
+        assert relation_blocks, "No POSITIVE block contains a relation subject to check."
+        assert not all(subs <= {"speaker0"} for subs in relation_blocks), (
+            "Every POSITIVE example block uses only speaker0 as the relation "
+            "subject — the schema still teaches 'subject is a constant', not "
+            "a variable bound to whoever the fact is about."
+        )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_third_party_subject_positive_exists(self, model):
+        """At least one POSITIVE block must show a named third party (not
+        speaker0) surviving in the subject slot of a relation."""
+        tmpl = _extraction_prompt(model)
+        blocks = _positive_blocks(tmpl)
+        assert any(re.search(r'"subject":\s*"(?!speaker0")[A-Za-z][^"]*"', b) for b in blocks), (
+            "No POSITIVE example shows a non-speaker0 entity surviving in the subject slot."
+        )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_discrimination_negative_wrong_vs_correct_subject_exists(self, model):
+        """A NEGATIVE block must show the EXACT failure mode side by side:
+        a BAD output that re-roots a third party's action onto speaker0,
+        next to a CORRECT output that keeps the third party as subject for
+        the same fact. Every pre-fix negative was an extract-nothing
+        negative; the model had no exemplar of this discrimination."""
+        tmpl = _extraction_prompt(model)
+        blocks = _negative_blocks(tmpl)
+        found = False
+        for block in blocks:
+            if "BAD output" not in block or "CORRECT output" not in block:
+                continue
+            bad_part, _, correct_part = block.partition("CORRECT output")
+            bad_uses_speaker0_subject = re.search(r'"subject":\s*"speaker0"', bad_part)
+            correct_uses_third_party_subject = re.search(
+                r'"subject":\s*"(?!speaker0")[A-Za-z][^"]*"', correct_part
+            )
+            if bad_uses_speaker0_subject and correct_uses_third_party_subject:
+                found = True
+                break
+        assert found, (
+            "No NEGATIVE example discriminates a wrong (speaker0, ...) binding "
+            "from a correct third-party-subject binding for the same fact."
+        )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_no_compound_possessive_predicate_or_object_remains(self, model):
+        """The compound-predicate escape hatch (re-rooting a third party's
+        fact onto speaker0 by gluing their name into the predicate/object
+        as a possessive) must never appear as TAUGHT (POSITIVE or CORRECT)
+        behaviour. It IS allowed inside a BAD half of a NEGATIVE block —
+        the glued-possessive-object NEGATIVE example deliberately shows it
+        as the anti-pattern being taught against."""
+        tmpl = _extraction_prompt(model)
+        # The banned predicates may still be NAMED in rule prose as the
+        # anti-pattern to avoid; they must never appear as an actually
+        # emitted `"predicate"` value in a worked example.
+        for banned_predicate in ("sister_lives_in", "pet_ownership"):
+            assert f'"predicate": "{banned_predicate}"' not in tmpl, (
+                f"Banned compound-possessive predicate {banned_predicate!r} "
+                "is emitted as a predicate value in a worked example."
+            )
+        glued_object_re = re.compile(r'"object":\s*"[^"]*\'s [^"]*"')
+        # POSITIVE blocks must never contain a glued-possessive object.
+        for block in _positive_blocks(tmpl):
+            assert not glued_object_re.search(block), (
+                f"POSITIVE example teaches a glued-possessive object: {block!r}"
+            )
+        # NEGATIVE blocks: the glued form is allowed ONLY in the BAD half;
+        # the CORRECT half must never contain it.
+        for block in _negative_blocks(tmpl):
+            if "CORRECT output" not in block:
+                continue
+            _, _, correct_part = block.partition("CORRECT output")
+            assert not glued_object_re.search(correct_part), (
+                f"NEGATIVE example's CORRECT output still contains a "
+                f"glued-possessive object: {correct_part!r}"
+            )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_speaker_subject_binding_conditioned_on_self_reference(self, model):
+        """The rule prose must condition the speaker0-as-subject binding on
+        self-reference, not claim it applies to every fact."""
+        tmpl = _extraction_prompt(model)
+        prose = tmpl.split("POSITIVE example")[0]
+        assert re.search(r"self-reference|self-referen", prose, re.IGNORECASE), (
+            "Rule prose no longer conditions the speaker0 binding on self-reference."
+        )
+        assert "for every fact about the speaker" not in prose, (
+            "Rule prose still claims speaker0 is the subject for EVERY fact — "
+            "the self-reference conditioning regressed."
+        )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_assistant_turns_fact_source_rule_stated(self, model):
+        """The prompt must explicitly state that facts can come from
+        [assistant] turns and that the subject is whoever the sentence
+        names — not the speaker by default. Pre-fix, the prompt was
+        silent on assistant turns; that silence is the exact gap a
+        third-party fact stated only in an [assistant] reply fell through."""
+        tmpl = _extraction_prompt(model)
+        prose = tmpl.split("POSITIVE example")[0]
+        assert "[assistant]" in prose, (
+            "Rule prose does not explicitly mention [assistant] turns as a fact source."
+        )
+        assert re.search(r"never the speaker by default", prose, re.IGNORECASE), (
+            "Rule prose does not state that the subject defaults to whoever the "
+            "sentence names, not the speaker."
+        )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_no_generic_noun_subject_anywhere(self, model):
+        """Node identity is a graph-global string fold — ``canonical_id``
+        on ``entity.name`` (``paramem/graph/merger.py``) with NO owner or
+        speaker scoping (``canonical()`` in ``paramem/graph/name_match.py``
+        is a pure Unicode-NFC / casefold / diacritic fold). A generic role
+        noun (``sister``, ``dog``, ``kids``) placed in SUBJECT position
+        becomes ONE node shared across the entire household graph, so
+        facts about two different people's "sister" collide onto it —
+        a cross-speaker contamination class. Subject position is
+        therefore restricted to an IDENTIFIABLE entity: a proper
+        (capitalised) name, or a ``speaker{N}`` id. Generic nouns MAY
+        still appear as relation OBJECTS (e.g. ``(Pat, has_pet, dog)``) —
+        only the SUBJECT slot is restricted, since only the subject
+        accumulates outgoing facts across sessions/speakers. Scans every
+        relation subject in the whole prompt (not just positives) so a
+        stray generic-noun subject in a future example fails immediately.
+        """
+        tmpl = _extraction_prompt(model)
+        subjects = re.findall(r'"subject":\s*"([^"]+)"', tmpl)
+        assert subjects, "No relation subjects found in prompt — scan regex drifted."
+        allowed = re.compile(r"^(speaker\d+|[A-Z][A-Za-z]*(?: [A-Z][A-Za-z]*)*)$")
+        offenders = [s for s in subjects if not allowed.match(s)]
+        assert not offenders, (
+            f"Generic/common-noun or lowercase subject(s) found in relation "
+            f"subject position: {offenders!r} — only a speaker id or a "
+            "proper (capitalised) name may occupy the subject slot; a "
+            "generic role noun there is a graph-global node-identity "
+            "collision (see paramem/graph/merger.py canonical_id lookup)."
+        )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_glued_possessive_negative_exists(self, model):
+        """A NEGATIVE block must show the glued-possessive object as BAD
+        (a third party's name glued into the object string, e.g. "Theo's
+        orchids") next to a CORRECT output that splits the third party out
+        as its own subject entity, with the bare object surviving as a
+        separate relation. A live probe against a held-out name showed
+        this class SURVIVES on prose alone ("Yusuf's orchids" ->
+        (speaker0, cares_for, "Yusuf's orchids")) — a worked example is
+        required, mirroring the ``Pat's dog`` POSITIVE that already
+        teaches the correct split without ever pairing it against the
+        wrong form."""
+        tmpl = _extraction_prompt(model)
+        glued_object_re = re.compile(r'"object":\s*"[^"]*\'s [^"]*"')
+        found = False
+        for block in _negative_blocks(tmpl):
+            if "BAD output" not in block or "CORRECT output" not in block:
+                continue
+            bad_part, _, correct_part = block.partition("CORRECT output")
+            bad_has_glued_object = glued_object_re.search(bad_part)
+            correct_splits_subject = re.search(
+                r'"subject":\s*"(?!speaker0")[A-Za-z][^"]*"', correct_part
+            )
+            if bad_has_glued_object and correct_splits_subject:
+                found = True
+                break
+        assert found, (
+            "No NEGATIVE example demonstrates the glued-possessive-object "
+            "failure (BAD) next to the split-into-third-party-subject fix "
+            "(CORRECT)."
+        )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_unnamed_third_party_negative_exists(self, model):
+        """A NEGATIVE block must show an unnamed third party (a role noun
+        with no proper name) producing NO relation as CORRECT, next to a
+        BAD output that mangles the fact into a nonsense relation hung off
+        speaker0. A live probe showed this class produces semantic
+        garbage on prose alone ("My brother lives in Porto" ->
+        (speaker0, has_brother, Porto), a place under a has_brother
+        predicate) — a worked example is required."""
+        tmpl = _extraction_prompt(model)
+        found = False
+        for block in _negative_blocks(tmpl):
+            if "BAD output" not in block or "CORRECT output" not in block:
+                continue
+            bad_part, _, correct_part = block.partition("CORRECT output")
+            # BAD half mangles the fact onto speaker0; CORRECT half emits
+            # no relations at all (the structural signature of "an
+            # unnamed third party yields no relation").
+            bad_mangles_onto_speaker = re.search(r'"subject":\s*"speaker0"', bad_part)
+            correct_has_no_relations = '"relations": []' in correct_part
+            if bad_mangles_onto_speaker and correct_has_no_relations:
+                found = True
+                break
+        assert found, (
+            "No NEGATIVE example demonstrates the unnamed-third-party "
+            "failure (BAD: mangled onto speaker0) next to the "
+            "no-relation-extracted fix (CORRECT: empty relations)."
+        )
+
+
 class TestEnrichmentPromptContract:
     def test_renders_without_format_errors(self):
         """No stray single-brace placeholders that collide with .format()."""

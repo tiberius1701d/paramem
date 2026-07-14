@@ -1,6 +1,10 @@
-Extract PERSONAL FACTS about the speaker from this conversation transcript.{speaker_context}
+Extract personal facts from this conversation transcript — about the speaker AND about any other people named in it.{speaker_context}
 
-Use the speaker's system identifier from the directive above (e.g. `speaker0`) as the entity name and relation subject for every fact about the speaker. Never emit a display name, pronoun, or the literal string `{{SPEAKER_NAME}}` as the subject.
+Use the speaker's system identifier from the directive above (e.g. `speaker0`) as the subject ONLY for facts about the speaker themselves — signalled by self-reference (I / me / my) or their own display name. Never emit a display name, pronoun, or the literal string `{{SPEAKER_NAME}}` as the subject.
+
+A named third party (not the speaker) is a first-class entity: give them their own subject position, and never fold their action or possession onto the speaker or glue their name into a predicate/object as a possessive — see the worked NEGATIVE examples below for both mistakes. An unnamed person or thing (no name given) gets NO relation of its own: do not invent a subject for them and do not mangle their fact onto the speaker — see the worked NEGATIVE example below.
+
+Facts can come from ANY turn, including [assistant] turns. The subject is whoever the sentence names — never the speaker by default.
 
 
 POSITIVE example — speaker id is "speaker0" (display name "Alex"), transcript: "[user] Hi, I'm Alex Morgan. My email is alex.morgan@example.com and my phone is +1 555 123 4567. You can find me at linkedin.com/in/alex-morgan. I work at Brightfield Labs."
@@ -10,18 +14,14 @@ POSITIVE example — speaker id is "speaker0" (display name "Alex"), transcript:
  "summary": "speaker0 (Alex Morgan) works at Brightfield Labs."}}
 
 
-POSITIVE example — speaker id is "speaker0" (display name "Sam"), transcript: "[user] Sam Rivera | Senior Engineer | Berlin, Germany\n📱 +49 30 1234 5678 | 🖂 sam.rivera@example.com | LinkedIn: linkedin.com/in/sam-rivera\nI work at Brightfield Labs in the engineering department."
-{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{"last_name": "Rivera", "email": "sam.rivera@example.com", "phone": "+49 30 1234 5678", "linkedin": "linkedin.com/in/sam-rivera", "city": "Berlin", "country": "Germany"}}}},
- {{"name": "Brightfield Labs", "entity_type": "organization", "attributes": {{}}}}],
- "relations": [{{"subject": "speaker0", "predicate": "works_at", "object": "Brightfield Labs", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "speaker0 (Sam Rivera) works at Brightfield Labs in Berlin."}}
-
-
-POSITIVE example — speaker id is "speaker0", transcript: "[user] My sister lives in Frankford. [assistant] Frankfurt is about 200km from here."
+POSITIVE example — speaker id is "speaker0", transcript: "[user] My sister Nadia lives in Frankfurt. [assistant] Frankfurt is about 200km from here."
 {{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Nadia", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Frankfurt", "entity_type": "place", "attributes": {{}}}}],
- "relations": [{{"subject": "speaker0", "predicate": "sister_lives_in", "object": "Frankfurt", "relation_type": "social", "confidence": 1.0}}],
- "summary": "speaker0's sister lives in Frankfurt."}}
+ "relations": [
+   {{"subject": "speaker0", "predicate": "has_sibling", "object": "Nadia", "relation_type": "social", "confidence": 1.0}},
+   {{"subject": "Nadia", "predicate": "lives_in", "object": "Frankfurt", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0's sister Nadia lives in Frankfurt."}}
 
 
 POSITIVE example — speaker id is "speaker0", transcript: "[user] How often do I have to change my tires for my car? My car is a Volvo V70."
@@ -53,6 +53,19 @@ POSITIVE example — speaker id is "speaker0", transcript: "[user] Born and rais
  "summary": "speaker0 was born in Millfield and now lives in Westport."}}
 
 
+POSITIVE example — speaker id is "speaker0", transcript: "[user] Who's picking the kids up from school today? [assistant] Priya said she'd grab them after practice."
+{{"entities": [{{"name": "Priya", "entity_type": "person", "attributes": {{}}}}],
+ "relations": [{{"subject": "Priya", "predicate": "picks_up", "object": "kids", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Priya is picking the kids up from school today."}}
+
+
+POSITIVE example — speaker id is "speaker0", transcript: "[user] Add dog food to the shopping list, it's for Pat's dog. [assistant] Got it, adding dog food to the list."
+{{"entities": [{{"name": "Pat", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "dog", "entity_type": "concept", "attributes": {{"type": "pet"}}}}],
+ "relations": [{{"subject": "Pat", "predicate": "has_pet", "object": "dog", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Pat has a dog; speaker0 needs to buy dog food for it."}}
+
+
 NEGATIVE example — speaker id is "speaker0" (display name "Jordan"), transcript: "[user] My name is Jordan Wells and I live in Millbrook."
 BAD output (two entities for the same speaker, and using the display name as subject):
 {{"entities": [{{"name": "Jordan", "entity_type": "person", "attributes": {{}}}},
@@ -63,6 +76,39 @@ CORRECT output (single entity named by the speaker id, last name as attribute):
  {{"name": "Millbrook", "entity_type": "place", "attributes": {{}}}}],
  "relations": [{{"subject": "speaker0", "predicate": "lives_in", "object": "Millbrook", "relation_type": "factual", "confidence": 1.0}}],
  "summary": "speaker0 (Jordan Wells) lives in Millbrook."}}
+
+
+NEGATIVE example — speaker id is "speaker0", transcript: "[user] Sam picked the kids up from school today."
+BAD output (re-roots a third party's action onto the speaker — speaker0 did not do this):
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}}],
+ "relations": [{{"subject": "speaker0", "predicate": "picked_up", "object": "kids", "relation_type": "factual", "confidence": 1.0}}], ...}}
+CORRECT output (the third party keeps the subject slot):
+{{"entities": [{{"name": "Sam", "entity_type": "person", "attributes": {{}}}}],
+ "relations": [{{"subject": "Sam", "predicate": "picked_up", "object": "kids", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Sam picked the kids up from school today."}}
+
+
+NEGATIVE example — speaker id is "speaker0", transcript: "[user] I need to water Theo's orchids while he is away."
+BAD output (glues the third party's name into the object as a possessive — this is the class that also caused a PII leak, because the glued span becomes ONE placeholder and the name egresses to the cloud un-scrubbed):
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}}],
+ "relations": [{{"subject": "speaker0", "predicate": "cares_for", "object": "Theo's orchids", "relation_type": "factual", "confidence": 1.0}}], ...}}
+CORRECT output (the third party's name is split OUT of the object into its own subject entity; the speaker's own involvement, if any, becomes a separate relation against the bare object):
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Theo", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "orchids", "entity_type": "concept", "attributes": {{"type": "plant"}}}}],
+ "relations": [
+   {{"subject": "Theo", "predicate": "has_plant", "object": "orchids", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "cares_for", "object": "orchids", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "Theo has orchids; speaker0 is watering them while Theo is away."}}
+
+
+NEGATIVE example — speaker id is "speaker0", transcript: "[user] My brother lives in Rivermoor."
+BAD output (the brother has no name, so this invents a nonsense relation — the object is a place, not a brother — instead of leaving the fact unextracted):
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
+ {{"name": "Rivermoor", "entity_type": "place", "attributes": {{}}}}],
+ "relations": [{{"subject": "speaker0", "predicate": "has_brother", "object": "Rivermoor", "relation_type": "social", "confidence": 1.0}}], ...}}
+CORRECT output (an unnamed person yields NO relation at all — do not glue, do not promote, and do NOT mangle the fact into a relation about the speaker):
+{{"entities": [], "relations": [], "summary": "No personal facts found."}}
 
 
 NEGATIVE example — transcript: "[user] What's the weather in Tokyo? [assistant] Tokyo is 18°C and rainy."
