@@ -21,10 +21,9 @@
 # QUALITY CONSIDERATIONS (self-bias risk)
 # - If your extraction pipeline uses the SAME cloud model/provider that will
 #   answer inference queries, the LLM-judge stages (noise_filter,
-#   plausibility, ner_check, anonymization verify) become
-#   "model-as-judge-for-itself": the judge rates its own outputs, confirming
-#   its own biases and systematically over- or under-filtering certain
-#   fact classes. Expected quality degradation.
+#   plausibility) become "model-as-judge-for-itself": the judge rates its
+#   own outputs, confirming its own biases and systematically over- or
+#   under-filtering certain fact classes. Expected quality degradation.
 # - Mitigation: disable the LLM-judge stages (`extraction.*` toggles below)
 #   OR route them to a different provider than the inference agent.
 #
@@ -293,14 +292,6 @@ consolidation:
   extraction_plausibility_judge: auto
   extraction_plausibility_stage: deanon         # "anon" | "deanon"
 
-  extraction_verify_anonymization: true         # forward-path privacy guard (do not disable)
-  # EXPERIMENTAL spaCy PII cross-check — off by default, and off is the shipped
-  # posture.  It is a brittle estimator, not a control: the PII defense is the
-  # LLM leak guard above (extraction_verify_anonymization).  This knob gates
-  # EVERY NER call site (session tier + cloud egress).  Switching it on for a
-  # comparison run requires: pip install paramem[ner]
-  extraction_ner_check: false
-  extraction_ner_model: en_core_web_sm          # spaCy model when ner_check=true
   # Local, privacy-preserving STT spelling repair (paramem/graph/entity_correction.py).
   # Runs entirely on-device on the anonymization *reverse map*: misheard real names
   # (e.g. "Frankfrut" -> "Frankfurt") are fixed in place before de-anonymization, so
@@ -488,31 +479,39 @@ tools:
 #                                  blocked AND non-PERSONAL is anonymized
 #                                  per `cloud_scope`.
 #
-#   `cloud_scope` — list of NER categories anonymized when `cloud_mode` is
-#                   `anonymize` or `both`.  Default `[person]`: only person
-#                   names get redacted; place names, organizations, etc.
-#                   pass through verbatim so the cloud can answer questions
-#                   like "What's a good restaurant in Berlin?" sensibly.
-#                   Empty list `[]` disables anonymization entirely under
-#                   anonymizing modes (cloud sees the original text).
-#                   Operator owns the privacy/utility tradeoff; values are
-#                   passed through to NER without an allowlist check.
-#                   Supported categories (spaCy en_core_web_sm):
-#                     person       — PERSON
-#                     place        — GPE (countries, cities, states), LOC
-#                     organization — ORG
-#                     product      — PRODUCT
-#                     facility     — FAC
-#                     group        — NORP (nationalities, religious/political)
-#                     event        — EVENT
-#                     work         — WORK_OF_ART
-#                     law          — LAW
-#                     language     — LANGUAGE
-#                   Unrecognised values map to nothing (no error, but no effect).
+#   `cloud_scope` — MINT SELECTOR: list of entity-type categories that get a
+#                   placeholder minted (and are therefore substituted out of
+#                   the payload) when `cloud_mode` is `anonymize` or `both`.
+#                   Default `[person]`: only person names get redacted;
+#                   place names, organizations, etc. pass through verbatim so
+#                   the cloud can answer questions like "What's a good
+#                   restaurant in Berlin?" sensibly.  Empty list `[]`
+#                   disables anonymization entirely under anonymizing modes
+#                   (cloud sees the original text).  Operator owns the
+#                   privacy/utility tradeoff.  The entity-type vocabulary is
+#                   OPEN — person, place, organization, concept are the
+#                   closed subset in configs/schema.yaml, but the local
+#                   model is free to mint any other type (language,
+#                   activity, ...) — so there is no fixed set to validate
+#                   values against; only structure (a list of non-empty
+#                   strings) is checked at config load.  A misspelled entry
+#                   (e.g. "persons") is NOT rejected: it matches no entity's
+#                   type, mints nothing, and every entity of the type you
+#                   meant to scope egresses verbatim. Verify spelling against
+#                   a real run's `graph.diagnostics["core_placeholders"]`
+#                   rather than assuming silence means "in scope, nothing
+#                   found."
 #
-# Per-query safety: in any anonymizing mode, if the leak guard detects a real
-# name surviving anonymization, that single query falls back to block (config
-# stays put for the next query).
+# There is NO post-hoc leak check and no repair loop.  The anonymized
+# payload is built deterministically by the script from a table it mints
+# and owns, substituted exactly and case-sensitively — nothing verifies it
+# afterward.  Residual, stated plainly: (a) a real name that differs only in
+# CASE from its extracted surface egresses in the clear; (b) a name that
+# appears only as a fact's subject/object and was never itself surfaced as
+# an entity is covered only if the local model's mapping hint happened to
+# name it; (c) a name the local model TYPES as an out-of-scope category
+# (e.g. a person misclassified as an organization) egresses verbatim. See
+# SECURITY.md for the full accounting.
 #
 # HA path (HA conversation agent) is NOT affected by `cloud_mode`/`cloud_scope`.
 # HA receives cleartext, gated by intent classification. Hardening the HA hop
@@ -523,7 +522,7 @@ tools:
 sanitization:
   mode: block            # off | warn | block — PII detection layer
   cloud_mode: block      # block | anonymize | both — direct-SOTA egress policy (ship-safe default)
-  cloud_scope:           # NER categories anonymized when cloud_mode=anonymize|both ([] = off)
+  cloud_scope:           # entity types anonymized when cloud_mode=anonymize|both ([] = off)
     - person
 
 # ============================================================================

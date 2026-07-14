@@ -55,16 +55,13 @@ Phase                       Notes
 ``local_extract``           Mistral runs the extraction prompt.
 ``ha_validation``           Pure-Python location validation against HA
                             home context. ``raw_output=None``.
-``anonymize``               Mistral runs the anonymizer; emits mapping
-                            + anonymized facts + anonymized transcript.
+``anonymize``               Mistral runs the anonymizer; emits ONLY the
+                            real->placeholder mapping.  The script builds
+                            the anonymized facts + transcript from
+                            ``graph.relations`` and this mapping.
 ``entity_correction``       Mistral corrects misspelled real place /
                             organization / concept surfaces in the
                             reverse anonymization map (values only).
-``anonymize_verify``        Pure-Python residual-leak verifier.
-                            ``raw_output=None``.
-``anonymize_repair``        Pure-Python leak repair (extend mapping or
-                            drop facts).  Fires only when verify finds
-                            leaks.  ``raw_output=None``.
 ``sota_enrich``             SOTA cloud (Anthropic by default) runs the
                             enrichment prompt; emits enriched facts +
                             new_entity_bindings + updated_anon_transcript.
@@ -118,8 +115,6 @@ PHASE_NAMES: tuple[str, ...] = (
     "ha_validation",
     "anonymize",
     "entity_correction",
-    "anonymize_verify",
-    "anonymize_repair",
     "sota_enrich",
     "anon_plausibility",
     "deanon",

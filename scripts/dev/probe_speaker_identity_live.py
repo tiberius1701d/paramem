@@ -308,7 +308,6 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         extraction_ha_validation=False,
         extraction_noise_filter="off",
         extraction_plausibility_judge="off",
-        extraction_verify_anonymization=False,
     )
 
     results: dict = {}

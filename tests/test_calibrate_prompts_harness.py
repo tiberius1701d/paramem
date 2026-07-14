@@ -6,6 +6,12 @@ for-chunk loop and therefore never bound when chunks == [].
 
 Also covers the auth gap: _post_stage must attach the Authorization header
 and raise SystemExit with an actionable message on 401.
+
+``TestSeedFromEnrichLoading`` covers the ``--seed-from --stages enrich`` leak
+class: ``01_extract_chunk_N.json`` is written as a WRAPPER
+(``{"stage", "chunk_index", "candidate_runs": [...]}``), unlike ``02_``/``03_``
+which write the raw stage response directly — loading the wrapper as-is left
+``prior_extract`` with no usable ``"parsed"`` graph.
 """
 
 from __future__ import annotations
@@ -137,6 +143,60 @@ class TestNormalizeStageNoNameError:
         )
 
 
+class TestLoadChunksTurnMarking:
+    """_load_chunks must render ``text`` through the SAME production turn
+    renderer (``SessionBuffer._format_turns``), never a hand-rolled
+    marker — for every input shape (document AND transcript)."""
+
+    def test_txt_document_chunk_is_turn_marked(self, tmp_path: Path):
+        f = tmp_path / "notes.txt"
+        f.write_text("Alex works at Brightfield Labs.", encoding="utf-8")
+
+        chunks, source_type = calibrate_prompts._load_chunks(f, None)
+
+        assert source_type == "document"
+        assert len(chunks) >= 1
+        assert chunks[0]["text"].startswith("[user] "), (
+            f"Document chunk must be turn-marked: {chunks[0]['text']!r}"
+        )
+        assert "Alex works at Brightfield Labs." in chunks[0]["text"]
+
+    def test_jsonl_transcript_preserves_role_alternation(self, tmp_path: Path):
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            "\n".join(
+                [
+                    json.dumps({"role": "user", "text": "Hi there."}),
+                    json.dumps({"role": "assistant", "text": "Hello, how can I help?"}),
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        chunks, source_type = calibrate_prompts._load_chunks(f, None)
+
+        assert source_type == "transcript"
+        assert len(chunks) == 1
+        text = chunks[0]["text"]
+        assert text.startswith("[user] Hi there."), f"Got: {text!r}"
+        assert "[assistant] Hello, how can I help?" in text
+
+    def test_matches_sessionbuffer_format_turns_directly(self, tmp_path: Path):
+        """The rendered text is byte-identical to calling the renderer
+        directly — not a shape mimic (CLAUDE.md: no parallel renderer)."""
+        from paramem.server.session_buffer import SessionBuffer
+
+        f = tmp_path / "notes.txt"
+        f.write_text("Some document content.", encoding="utf-8")
+
+        chunks, _ = calibrate_prompts._load_chunks(f, None)
+
+        expected_lines, _ = SessionBuffer._format_turns(
+            [{"role": "user", "text": "Some document content."}]
+        )
+        assert chunks[0]["text"] == "\n".join(expected_lines)
+
+
 class TestPostStageAuth:
     """_post_stage must attach an Authorization header and handle 401 gracefully."""
 
@@ -182,3 +242,144 @@ class TestPostStageAuth:
         assert "PARAMEM_API_TOKEN" in message, (
             f"Expected 'PARAMEM_API_TOKEN' in SystemExit message, got: {message!r}"
         )
+
+
+class TestSeedFromEnrichLoading:
+    """``--seed-from --stages enrich`` reads prior-stage dumps off disk
+    instead of re-running ``extract``/``anonymize``.  All three regression
+    cases share one real input file + real prompts dir; only the seed
+    dump contents differ.
+    """
+
+    _REAL_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "configs" / "prompts"
+
+    @staticmethod
+    def _write_input(tmp_path: Path) -> Path:
+        input_path = tmp_path / "input.txt"
+        input_path.write_text("Alex works as an engineer at Acme Corp in Berlin.")
+        return input_path
+
+    @staticmethod
+    def _extract_wrapper_blob() -> dict:
+        """01_extract_chunk_0.json shape: a WRAPPER around candidate_runs."""
+        return {
+            "stage": "extract",
+            "chunk_index": 0,
+            "candidate_runs": [
+                {
+                    "seed": None,
+                    "parsed": {
+                        "session_id": "calib-chunk-0",
+                        "timestamp": "2026-07-14T00:00:00Z",
+                        "entities": [
+                            {"name": "Alex", "entity_type": "person", "speaker_id": "speaker0"},
+                            {"name": "Acme Corp", "entity_type": "organization"},
+                        ],
+                        "relations": [
+                            {
+                                "subject": "speaker0",
+                                "predicate": "works_at",
+                                "object": "Acme Corp",
+                                "relation_type": "factual",
+                                "confidence": 0.9,
+                                "speaker_id": "speaker0",
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+    def _run(
+        self, tmp_path: Path, *, anonymize_blob: dict, write_extract: bool = True
+    ) -> tuple[int, MagicMock]:
+        seed_from = tmp_path / "seed_from"
+        seed_from.mkdir()
+        if write_extract:
+            (seed_from / "01_extract_chunk_0.json").write_text(
+                json.dumps(self._extract_wrapper_blob())
+            )
+        (seed_from / "02_anonymize_chunk_0.json").write_text(json.dumps(anonymize_blob))
+
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        argv = [
+            "--input",
+            str(self._write_input(tmp_path)),
+            "--source-type",
+            "transcript",
+            "--chunk",
+            "0",
+            "--stages",
+            "enrich",
+            "--seed-from",
+            str(seed_from),
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        fake_run_enrich = MagicMock(
+            return_value={"stage": "enrich", "raw_output": "{}", "parsed": {}, "parse_error": None}
+        )
+        with patch.object(calibrate_prompts, "_run_enrich", fake_run_enrich):
+            rc = calibrate_prompts.main(argv)
+        return rc, fake_run_enrich
+
+    def test_extract_wrapper_is_unwrapped_into_a_populated_graph(self, tmp_path: Path):
+        """The seeded ``01_extract_chunk_0.json`` wrapper's real graph
+        (1 relation) must reach the enrich stage's fact-building step —
+        not collapse to an empty graph.
+
+        Mutation: revert to reading the wrapper blob directly as
+        ``prior_extract`` -> ``_run_enrich`` is called with ``facts=[]``
+        (or the call raises ``pydantic.ValidationError`` before it ever
+        happens) -> this test fails.
+        """
+        rc, fake_run_enrich = self._run(
+            tmp_path,
+            anonymize_blob={"parsed": {"mapping": {"Alex": "speaker0"}}},
+        )
+        assert rc == 0
+        fake_run_enrich.assert_called_once()
+        facts = fake_run_enrich.call_args.kwargs["facts"]
+        assert len(facts) == 1
+        assert facts[0]["subject"] == "speaker0"
+        assert facts[0]["object"] == "Acme Corp"
+
+    def test_missing_extract_dump_does_not_crash(self, tmp_path: Path):
+        """A seed dir with ``02_anonymize_chunk_0.json`` but no
+        ``01_extract_chunk_0.json`` must not crash — ``prior_extract``
+        stays ``None`` and the enrich stage is skipped for that chunk.
+
+        Mutation: drop the ``prior_extract is not None`` guard on the
+        enrich stage -> ``AttributeError: 'NoneType' object has no
+        attribute 'get'`` -> this test fails.
+        """
+        rc, fake_run_enrich = self._run(
+            tmp_path,
+            anonymize_blob={"parsed": {"mapping": {"Alex": "speaker0"}}},
+            write_extract=False,
+        )
+        assert rc == 0
+        fake_run_enrich.assert_not_called()
+
+    def test_none_mapping_parse_failure_aborts_without_a_cloud_call(self, tmp_path: Path):
+        """``anon_parsed.get("mapping")`` returning ``None`` (anonymizer
+        parse failure) must abort the chunk's enrich stage — no cloud
+        call — matching production's abort-on-``None`` in
+        ``_sota_pipeline``.
+
+        Mutation: revert to ``anon_parsed.get("mapping") or {}`` -> the
+        parse failure is silently treated as "found nothing" and
+        ``_run_enrich`` (the cloud call) is invoked anyway -> this test
+        fails.
+        """
+        rc, fake_run_enrich = self._run(
+            tmp_path,
+            anonymize_blob={"parsed": {}},  # no "mapping" key -> None
+        )
+        assert rc == 0
+        fake_run_enrich.assert_not_called()

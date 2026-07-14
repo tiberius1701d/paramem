@@ -1169,11 +1169,8 @@ class TestSOTANoiseFilter:
             patch("paramem.graph.extractor.generate_answer", return_value="not json"),
             patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
-            result, mapping, anon_transcript, _raw = anonymize_with_local_model(
-                graph, model, tokenizer
-            )
-        assert result is None
-        assert anon_transcript == ""
+            mapping, _raw = anonymize_with_local_model(graph, model, tokenizer)
+        assert mapping is None
 
     def test_pipeline_anonymize_failure_falls_back_to_raw_plausibility(self):
         """If anonymization fails, the pipeline falls back to raw (local) plausibility.
@@ -1195,7 +1192,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(None, {}, "", ""),
+                return_value=(None, ""),
             ),
             # Pass model=None/tokenizer=None → local_plausibility_filter skipped inside fallback
         ):
@@ -1236,14 +1233,13 @@ class TestSOTANoiseFilter:
                 Entity(name="Millfield", entity_type="place"),
             ],
         )
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -1282,7 +1278,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -1296,6 +1292,7 @@ class TestSOTANoiseFilter:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                pii_scope={"person", "place"},
             )
 
         # Both enriched relations survive and get de-anonymized
@@ -1330,7 +1327,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -1344,6 +1341,7 @@ class TestSOTANoiseFilter:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                pii_scope={"person", "place"},
             )
 
         # Composite strings must be de-anonymized, not dropped
@@ -1388,43 +1386,6 @@ class TestSOTANoiseFilter:
         assert result[0] == facts[0]  # input fact returned unchanged
         assert raw == drop_response
 
-    def test_verify_anonymization_catches_leak(self):
-        """Forward-path guard detects a real name leaking past anonymization."""
-        from paramem.graph.extractor import check_anonymization_leaks
-
-        graph = _make_graph(
-            [("Alex", "lives_in", "Millfield")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-        # Anonymizer forgot "Millfield" — mapping is incomplete ({real: placeholder})
-        mapping = {"Alex": "Person_1"}
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Millfield"}]
-        anon_transcript = "Person_1 moved to Millfield last year."
-        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
-        assert "Millfield" in leaked
-        assert "Alex" not in leaked  # Alex was properly replaced
-
-    def test_verify_anonymization_clean_mapping(self):
-        """Guard returns empty list when anonymization is complete."""
-        from paramem.graph.extractor import check_anonymization_leaks
-
-        graph = _make_graph(
-            [("Alex", "lives_in", "Millfield")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-        # {real: placeholder} — production direction.
-        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
-        anon_transcript = "Person_1 moved to City_1 last year."
-        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
-        assert leaked == []
-
     def test_normalize_anonymization_mapping_inverts_placeholder_keys(self):
         """Mapping with placeholder keys is inverted to {real: placeholder} canonical."""
         from paramem.graph.placeholders import _normalize_anonymization_mapping
@@ -1450,193 +1411,6 @@ class TestSOTANoiseFilter:
         assert normalized == {}
         assert stats == {"inverted": 0, "dropped": 0}
 
-    def test_mapping_is_canonical_invented_prefix_accepted(self):
-        """Open prefix vocabulary — `University_1`, `Project_1`, `Language_1`
-        are valid placeholders alongside the common `{Person, City, Org, ...}`
-        set.  Cross-cycle entity merge happens on real names in
-        :class:`paramem.graph.merger.GraphMerger`, not on placeholder
-        vocabulary, so per-session prefix divergence is harmless and
-        enforcing a fixed lexicon would just push the work into a
-        position-based recovery helper (the pattern this rewrite is
-        retiring)."""
-        from paramem.graph.placeholders import _mapping_is_canonical
-
-        assert _mapping_is_canonical({"Northcrest University": "University_1"}) is True
-        assert _mapping_is_canonical({"Atlas Initiative": "Project_1"}) is True
-        assert _mapping_is_canonical({"German": "Language_1"}) is True
-        # Mixed common + invented prefixes also valid.
-        assert (
-            _mapping_is_canonical(
-                {
-                    "Mira": "Person_1",
-                    "Northcrest University": "University_1",
-                    "Atlas Initiative": "Project_1",
-                }
-            )
-            is True
-        )
-
-    def test_mapping_is_canonical_pii_attribute_fold_is_not_a_violation(self):
-        """Two entries collapsing onto the same placeholder is the NORMAL
-        shape of the CORE forward map, not a defect: an entity's PII
-        attribute values fold onto that entity's own placeholder
-        (``_build_anonymization_mapping``, ``placeholders.py:877``).
-
-        Live regression this pins: an in-scope person carrying a single PII
-        attribute (phone, email, city, …) produced a many-to-one forward map
-        by design. A uniqueness clause treated that as non-canonical, so
-        cloud egress and the anonymizer-stage leak repair
-        (``extractor.py:1031``, ``:2147``) took the non-canonical branch on
-        every ordinary leak — repair never ran, cloud egress silently
-        blocked.
-
-        Mutation: restore the uniqueness clause
-        (``len(set(placeholder_entries)) == len(mapping)``) -> fails.
-        """
-        from paramem.graph.placeholders import _build_anonymization_mapping, _mapping_is_canonical
-        from paramem.graph.schema import Entity
-
-        entities = [
-            Entity(name="Alex", entity_type="person", attributes={"phone": "555-0100"}),
-        ]
-        fwd, rev = _build_anonymization_mapping(
-            entities, {}, pii_scope={"person"}, speaker_name=None
-        )
-        assert fwd == {"Alex": "Person_1", "555-0100": "Person_1"}
-        assert _mapping_is_canonical(fwd) is True
-        assert rev == {"Person_1": "Alex"}
-
-    def test_mapping_is_canonical_malformed_shape_rejected(self):
-        """Values that don't match the universal `<Prefix>_<N>` shape
-        (lowercase prefix, missing index, etc.) are non-canonical."""
-        from paramem.graph.placeholders import _mapping_is_canonical
-
-        assert _mapping_is_canonical({"Alice": "person_1"}) is False  # lowercase
-        assert _mapping_is_canonical({"Alice": "Person"}) is False  # missing _<N>
-        assert _mapping_is_canonical({"Alice": "Person_"}) is False  # empty index
-        assert _mapping_is_canonical({"Alice": "Person_abc"}) is False  # non-digit
-
-    def test_repair_anonymization_leaks_organization_type(self):
-        """_repair_anonymization_leaks allocates Org_N placeholder for organization entities.
-
-        Pins the broadened repair scope: organization entities are now covered by
-        anonymizer_type_to_prefix() via configs/schema.yaml (Org is primary_for_type).
-        A previously person/place-only repair path would leave "Google" unreplaced.
-        """
-        from paramem.graph.extractor import _repair_anonymization_leaks
-
-        graph = _make_graph(
-            [("Alex", "works_at", "Google")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Google", entity_type="organization"),
-            ],
-        )
-        mapping = {"Alex": "Person_1"}
-        reverse = {"Person_1": "Alex"}
-        anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Google"}]
-        anon_transcript = "Person_1 works at Google."
-        # "Google" is in the transcript → missed, not hallucinated.
-        leaked = ["Google"]
-        facts, new_mapping, new_reverse, _, status = _repair_anonymization_leaks(
-            graph,
-            mapping,
-            reverse,
-            anon_facts,
-            anon_transcript,
-            "Alex works at Google.",
-            leaked,
-        )
-        assert status["missed_fixed"] == 1, (
-            "organization entity present in transcript must be classified as missed and fixed"
-        )
-        assert "Google" in new_mapping, "extended mapping must contain the real name"
-        org_placeholder = new_mapping["Google"]
-        assert org_placeholder.startswith("Org_"), (
-            f"organization entity must get an Org_N placeholder, got {org_placeholder!r}"
-        )
-        # Reverse companion is mirrored.
-        assert new_reverse[org_placeholder] == "Google"
-        # The fact's object must be rewritten to the placeholder.
-        assert facts[0]["object"] == org_placeholder, (
-            f"anon_facts object must be rewritten to placeholder, got {facts[0]['object']!r}"
-        )
-
-    def test_repair_anonymization_leaks_open_type_falls_through(self):
-        """Repair allocates a fresh placeholder for any extractor type, not
-        only those with a configured ``primary_for_type`` flag.  Previously
-        types like ``"event"`` / ``"preference"`` had no configured prefix
-        and the leaked name was silently dropped (treated as hallucinated).
-        Under the open vocabulary the prefix is derived directly from the
-        type label (``event`` → ``Event``), and the leak gets repaired.
-        """
-        from paramem.graph.extractor import _repair_anonymization_leaks
-
-        graph = _make_graph(
-            [("Alex", "attended", "DefCon")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="DefCon", entity_type="event"),
-            ],
-        )
-        mapping = {"Alex": "Person_1"}
-        reverse = {"Person_1": "Alex"}
-        anon_facts = [{"subject": "Person_1", "predicate": "attended", "object": "DefCon"}]
-        anon_transcript = "Person_1 attended DefCon."
-        leaked = ["DefCon"]
-        facts, new_mapping, new_reverse, _, status = _repair_anonymization_leaks(
-            graph,
-            mapping,
-            reverse,
-            anon_facts,
-            anon_transcript,
-            "Alex attended DefCon.",
-            leaked,
-        )
-        assert status["missed_fixed"] == 1, (
-            "event entity present in transcript must be repaired, not dropped as hallucinated"
-        )
-        event_placeholder = new_mapping["DefCon"]
-        assert event_placeholder.startswith("Event_"), (
-            f"open-type repair must derive PascalCase prefix from the type label; "
-            f"got {event_placeholder!r}"
-        )
-        assert facts[0]["object"] == event_placeholder
-
-    def test_repair_anonymization_leaks_unknown_type_falls_back_to_entity(self):
-        """When neither extractor nor NER provides a type, repair falls back
-        to a generic ``Entity_N`` prefix rather than dropping the leak.
-        Closes the residual case where the previous person-default could
-        misclassify a city as a person."""
-        from paramem.graph.extractor import _repair_anonymization_leaks
-
-        graph = _make_graph(
-            [("Alex", "mentioned", "Foundry-X")],
-            # Note: the leaked name "Foundry-X" is NOT in graph.entities
-            # and no NER hint is provided, exercising the final fallback.
-            entities=[Entity(name="Alex", entity_type="person")],
-        )
-        mapping = {"Alex": "Person_1"}
-        reverse = {"Person_1": "Alex"}
-        anon_facts = [{"subject": "Person_1", "predicate": "mentioned", "object": "Foundry-X"}]
-        anon_transcript = "Person_1 mentioned Foundry-X."
-        leaked = ["Foundry-X"]
-        facts, new_mapping, _, _, status = _repair_anonymization_leaks(
-            graph,
-            mapping,
-            reverse,
-            anon_facts,
-            anon_transcript,
-            "Alex mentioned Foundry-X.",
-            leaked,
-        )
-        assert status["missed_fixed"] == 1
-        # Default fallback: when no type signal is available the prefix is
-        # "Entity" — generic but well-formed and recoverable.
-        assert new_mapping["Foundry-X"].startswith("Entity_"), (
-            f"unknown-type repair must fall back to Entity_N, got {new_mapping['Foundry-X']!r}"
-        )
-
     def test_entity_type_to_prefix_closed_vocab_and_derivations(self):
         """Pin the contract for ``entity_type_to_prefix``: closed-vocabulary
         common types map via schema.yaml's ``anonymizer_type_to_prefix()``;
@@ -1661,48 +1435,24 @@ class TestSOTANoiseFilter:
         assert entity_type_to_prefix("") == "Entity"
         assert entity_type_to_prefix("   ") == "Entity"
 
-    def test_verify_anonymization_catches_missing_mapping(self):
-        """Guard catches silent de-anonymization failure (name replaced but mapping incomplete)."""
-        from paramem.graph.extractor import check_anonymization_leaks
+    def test_pipeline_incomplete_llm_hint_still_scrubbed_before_sota(self):
+        """The LLM's anonymizer hint may be incomplete (misses "Millfield"
+        entirely) — the deterministic builder still mints a placeholder for
+        every in-scope ``graph.entities`` name regardless, so SOTA never
+        sees the real name and the final graph de-anonymizes correctly.
 
-        graph = _make_graph(
-            [("Alex", "lives_in", "Millfield")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-        # Anonymizer replaced "Alex" with "Person_1" everywhere — but forgot to
-        # include the mapping entry. Real name doesn't leak in output, but
-        # de-anonymization would silently emit "Person_1" as the final subject.
-        # {real: placeholder} — mapping has Millfield but is missing Alex.
-        mapping = {"Millfield": "City_1"}
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
-        anon_transcript = "Person_1 moved to City_1."
-        problems = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
-        assert "Alex" in problems
-        assert "Millfield" not in problems  # properly mapped
+        There is no repair step: the deterministic builder pre-empts the
+        gap before it can ever occur, rather than detecting and fixing a
+        leak after the fact.  Substitution is case-SENSITIVE and that is
+        load-bearing — case is the only signal separating a person named
+        ``Bill`` from the common noun ``bill``, so a case-insensitive
+        check could never distinguish a real leak from ordinary prose.
 
-    def test_verify_anonymization_case_insensitive(self):
-        """Guard catches case-different leaks (Alex vs alex)."""
-        from paramem.graph.extractor import check_anonymization_leaks
-
-        graph = _make_graph(
-            [("Alex", "lives_in", "Millfield")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-        # {real: placeholder} — complete mapping but transcript leaks "alex" (lowercase).
-        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
-        anon_transcript = "the speaker alex moved to City_1."
-        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
-        assert "Alex" in leaked
-
-    def test_pipeline_repairs_missed_leak_then_calls_sota(self):
-        """Leaked name present in transcript is auto-repaired; SOTA gets clean data."""
+        Explicit ``pii_scope={"person", "place"}`` — the production default
+        is ``{"person"}`` only, but this test's purpose is place
+        scrubbing specifically, so it opts a place into scope rather than
+        drift with the default.
+        """
         from paramem.graph.extractor import _sota_pipeline
 
         graph = _make_graph(
@@ -1712,9 +1462,7 @@ class TestSOTANoiseFilter:
                 Entity(name="Millfield", entity_type="place"),
             ],
         )
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Millfield"}]
         mapping = {"Alex": "Person_1"}
-        anon_transcript = "Person_1 lives in Millfield."
         filter_calls = []
 
         def fake_filter(facts, *args, **kwargs):
@@ -1725,7 +1473,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
         ):
@@ -1736,9 +1484,10 @@ class TestSOTANoiseFilter:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                pii_scope={"person", "place"},
             )
 
-        assert len(filter_calls) == 1, "SOTA was not called after repair"
+        assert len(filter_calls) == 1, "SOTA must be called once"
         # The call payload must not contain any real name.
         payload = filter_calls[0]
         assert all("Millfield" not in str(v) for f in payload for v in f.values())
@@ -1747,21 +1496,17 @@ class TestSOTANoiseFilter:
         assert result.relations[0].subject == "Alex"
         assert result.relations[0].object == "Millfield"
 
-    def test_deterministic_builder_preempts_hallucinated_leak_for_graph_entities(self):
-        """Under the consolidated deterministic mapping builder, the
-        hallucinated-leak repair path is **not reachable** for entities
-        that exist in ``graph.entities`` — the builder mints a
-        placeholder for every in-scope entity, so the LLM-supplied
-        ``Ghost`` token in ``anon_facts`` is substituted to
-        ``Person_2`` before the verifier runs.  No leak is detected,
-        repair never fires, SOTA is called with fully-scrubbed facts.
+    def test_deterministic_builder_preempts_incomplete_llm_hint_for_graph_entities(self):
+        """The deterministic mapping builder mints a placeholder for every
+        in-scope ``graph.entities`` name regardless of what the LLM's
+        anonymizer hint covers — the LLM-supplied mapping here is missing
+        ``Ghost`` entirely, but the builder substitutes it out before the
+        fact array is ever built, so SOTA is called with fully-scrubbed
+        facts.
 
-        This is the architecturally-correct outcome: the hallucinated-
-        leak repair path used to be a reactive safety net for
-        LLM-omitted mappings; the deterministic builder makes it
-        unnecessary for graph-resident names.  The repair path remains
-        live only for names supplied by NER (``extract_pii_names_with_ner``)
-        that are not in ``graph.entities`` — covered by a separate test.
+        There is no leak-detection/repair machinery: the deterministic
+        builder, not any post-hoc check, is what makes an incomplete LLM
+        hint harmless for any name present in ``graph.entities``.
         """
         from paramem.graph.extractor import _sota_pipeline
 
@@ -1772,9 +1517,7 @@ class TestSOTANoiseFilter:
                 Entity(name="Ghost", entity_type="person"),
             ],
         )
-        anon_facts = [{"subject": "Person_1", "predicate": "knows", "object": "Ghost"}]
         mapping = {"Alex": "Person_1"}
-        anon_transcript = "Person_1 mentioned something."
         filter_calls = []
 
         def fake_filter(facts, *args, **kwargs):
@@ -1785,7 +1528,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
         ):
@@ -1799,8 +1542,7 @@ class TestSOTANoiseFilter:
             )
 
         # SOTA WAS called — the deterministic builder substituted
-        # ``Ghost`` to its placeholder before verify ran, so no leak
-        # was detected and the repair path did not fire.
+        # ``Ghost`` to its placeholder while building the fact array.
         assert len(filter_calls) == 1, (
             "SOTA must be called once after deterministic-builder substitution"
         )
@@ -1889,7 +1631,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -1913,6 +1655,350 @@ class TestSOTANoiseFilter:
         assert len(correction_calls) == 1, "correct_entity_surfaces must be called exactly once"
         assert result.diagnostics["entity_corrections"] == canned_applied
         assert result.diagnostics["entity_correction_verdicts"] == canned_verdicts
+
+
+class TestAnonymizerMappingOnlyContract:
+    """The anonymizer LLM returns ONLY the mapping. No facts, no
+    transcript. The SCRIPT builds the anonymized fact array from
+    ``graph.relations``; the anonymizer cannot lose, reword, or drop a
+    fact because it never returns one.
+    """
+
+    def test_anonymizer_returns_mapping_only(self):
+        """``anonymize_with_local_model`` returns exactly ``(mapping, raw)``
+        — even when the model's raw response still smuggles fact-array
+        keys (a model that hasn't fully adopted the mapping-only contract).
+
+        Mutation: re-add a fact branch to the parser (e.g. return a third
+        element sourced from ``data["anonymized"]``/``data["anonymized_facts"]``)
+        -> the call returns more than ``(mapping, raw)`` -> this test fails.
+        """
+        from paramem.graph.extractor import anonymize_with_local_model
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        raw = json.dumps(
+            {
+                "mapping": {"Alex": "Person_1", "Millfield": "City_1"},
+                # A model that still emits fact-array keys — the parser
+                # must ignore them entirely, not merely deprioritize them.
+                "anonymized": [
+                    {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}
+                ],
+                "anonymized_facts": [
+                    {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}
+                ],
+                "anonymized_transcript": "Person_1 lives in City_1.",
+            }
+        )
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value=raw),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+        ):
+            result = anonymize_with_local_model(graph, model, tokenizer)
+
+        assert result == ({"Alex": "Person_1", "Millfield": "City_1"}, raw)
+
+    def test_facts_are_built_from_graph_relations_not_the_model(self):
+        """The SOTA-facing fact array must equal ``graph.relations`` —
+        same count, byte-identical predicates — even when the model's raw
+        response carries a SHORTER, REWORDED fact array alongside a valid
+        mapping.
+
+        Mutation: take the facts from the model's raw response instead of
+        building them from ``graph.relations`` -> the dropped/reworded
+        fact slips through -> fails.  The owner's rule, pinned.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [
+                ("Alex", "lives_in", "Millfield"),
+                ("Alex", "works_at", "Acme"),
+            ],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+                Entity(name="Acme", entity_type="organization"),
+            ],
+        )
+        # A model that has not fully adopted the mapping-only contract:
+        # it still emits an "anonymized" fact array, SHORTER than the
+        # real relation count (drops "works_at") and REWORDED
+        # ("lives_in" -> "resides_at").
+        raw = json.dumps(
+            {
+                "mapping": {"Alex": "Person_1", "Millfield": "City_1", "Acme": "Org_1"},
+                "anonymized": [
+                    {"subject": "Person_1", "predicate": "resides_at", "object": "City_1"},
+                ],
+            }
+        )
+
+        sota_calls: list[list[dict]] = []
+
+        def fake_sota(facts, *args, **kwargs):
+            sota_calls.append(list(facts))
+            return facts, None, {}, None, {}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch("paramem.graph.extractor.generate_answer", return_value=raw),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex lives in Millfield and works at Acme.",
+                MagicMock(),
+                MagicMock(),
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
+
+        assert len(sota_calls) == 1
+        anon_facts = sota_calls[0]
+        assert len(anon_facts) == len(graph.relations) == 2
+        predicates = {f["predicate"] for f in anon_facts}
+        assert predicates == {"lives_in", "works_at"}
+
+    def test_predicate_is_never_a_substitution_target(self):
+        """A relation whose ``predicate`` literally contains a real name
+        that IS a mapping key keeps that predicate VERBATIM — the
+        predicate is never a substitution target.
+
+        Mutation: substitute the predicate through the mapping too (e.g.
+        ``_substitute_whole_words(r.predicate, mapping)``) -> the
+        predicate gets scrubbed to ``"asked about Person_1"`` -> fails.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "asked about Alex", "Bob")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Bob", entity_type="person"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Bob": "Person_2"}
+
+        sota_calls: list[list[dict]] = []
+
+        def fake_sota(facts, *args, **kwargs):
+            sota_calls.append(list(facts))
+            return facts, None, {}, None, {}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(mapping, ""),
+            ),
+            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex asked about Alex and Bob.",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
+
+        assert len(sota_calls) == 1
+        assert sota_calls[0][0]["predicate"] == "asked about Alex"
+
+    def test_parse_failure_is_none_and_empty_mapping_is_not(self):
+        """``mapping is None`` (parse failure) and ``mapping == {}``
+        (the model found nothing to anonymize) are DISTINCT signals —
+        collapsing them lets either an empty-but-valid mapping take the
+        fail-closed branch, or a parse failure proceed unscrubbed.
+
+        Mutation: collapse the two signals (e.g. ``mapping or None``,
+        or gate on ``not mapping`` instead of ``mapping is None``) ->
+        this test fails.
+        """
+        from paramem.graph.extractor import anonymize_with_local_model
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value="not json"),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+        ):
+            parse_failure_mapping, _ = anonymize_with_local_model(graph, model, tokenizer)
+
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value='{"mapping": {}}'),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+        ):
+            empty_mapping, _ = anonymize_with_local_model(graph, model, tokenizer)
+
+        assert parse_failure_mapping is None
+        assert empty_mapping == {}
+        assert empty_mapping is not None
+
+
+class TestNoPostHocLeakGuardCaseSensitivity:
+    """There is no forward-path post-hoc check on the anonymized payload.
+    Substitution is case-SENSITIVE and that is load-bearing: case is the
+    only signal separating a person named ``Bill`` from the common noun
+    ``bill`` (an invoice), or ``Will``/``will``, ``Mark``/``mark``,
+    ``Rose``/``rose``. Any case-insensitive match over entity names cannot
+    tell a real leak from ordinary prose. Never introduce one.
+
+    Named for the bug this rule guards against.
+    """
+
+    def test_bill_the_person_scrubbed_electricity_bill_untouched(self):
+        """A person entity named ``Bill`` is scrubbed to its placeholder;
+        the common noun ``bill`` in "electricity bill" is left untouched
+        — and SOTA IS called (nothing skips or blocks the cycle over the
+        case collision).
+
+        Mutation: introduce any case-insensitive match over entity names
+        (e.g. a case-insensitive substring/whole-word check on the
+        anonymized payload, or make the substitution primitive
+        case-insensitive) -> "electricity bill" is misread as a leak of
+        ``Bill`` -> the cycle blocks/skips SOTA, or the object is wrongly
+        scrubbed -> this test fails.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Bill", "received", "electricity bill")],
+            entities=[Entity(name="Bill", entity_type="person")],
+        )
+        mapping = {"Bill": "Person_1"}
+        transcript = "Bill received the electricity bill yesterday."
+
+        sota_calls: list[list[dict]] = []
+
+        def fake_sota(facts, *args, **kwargs):
+            sota_calls.append(list(facts))
+            return facts, None, {}, None, {}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(mapping, ""),
+            ),
+            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
+        ):
+            result = _sota_pipeline(
+                graph,
+                transcript,
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+            )
+
+        # SOTA IS called — nothing blocks or skips the cycle.
+        assert len(sota_calls) == 1
+        sent = sota_calls[0][0]
+        # "Bill" (the person) IS scrubbed to its placeholder in the SOTA payload.
+        assert sent["subject"] == "Person_1"
+        # "bill" (the invoice, inside "electricity bill") is NOT scrubbed —
+        # case is the only signal telling the two apart.
+        assert sent["object"] == "electricity bill"
+        # Final graph de-anonymizes correctly.
+        assert len(result.relations) == 1
+        assert result.relations[0].subject == "Bill"
+        assert result.relations[0].object == "electricity bill"
+
+
+class TestDeanonStagePredicateInvariantEndToEnd:
+    """The anonymizer never returns facts, so a placeholder gluing into a
+    predicate at the anonymize stage is structurally impossible. The
+    ONLY stage a placeholder can still glue into a predicate is SOTA's
+    own returned delta. This pins the end-to-end behaviour of the
+    deanon-stage predicate invariant (:func:`_apply_bindings`): a fact
+    whose predicate carries a glued placeholder is dropped before it
+    reaches ``graph.relations``.
+    """
+
+    def test_sota_returned_glued_predicate_dropped_end_to_end(self):
+        """A fact in SOTA's *returned* delta whose predicate glues a
+        declared placeholder onto a static prefix
+        (``language_proficiency_Language_3``) never reaches
+        ``graph.relations``, and the drop is recorded in diagnostics.
+
+        Mutation: delete/narrow the deanon-stage predicate invariant in
+        ``_apply_bindings`` -> the poisoned fact reaches
+        ``graph.relations`` -> this test fails.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "works_at", "Acme")],
+            entities=[Entity(name="Alex", entity_type="person")],
+        )
+        # "French" -> "Language_3" is an LLM-hint mapping entry the
+        # deterministic builder merges in verbatim (never minted by
+        # graph.entities, which only covers Alex here) — this is what
+        # puts "Language_3" into the declared vocabulary SOTA's returned
+        # facts are checked against.
+        mapping = {"Alex": "Person_1", "French": "Language_3"}
+        transcript = "Alex works at Acme. Alex speaks French at an advanced level."
+
+        # SOTA's returned delta — NOT the anonymizer — carries the
+        # poisoned predicate.  `_check_mapping_totality` (the SOTA-stage
+        # binding-totality gate) scans subject/object only, so this fact
+        # sails through it untouched and reaches the deanon-stage
+        # predicate invariant, which is what this test pins.
+        enriched_anon = [
+            {
+                "subject": "Person_1",
+                "predicate": "language_proficiency_Language_3",
+                "object": "Advanced",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            },
+        ]
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(mapping, ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(enriched_anon, None, {}, None, {}),
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                transcript,
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                pii_scope={"person", "language"},
+            )
+
+        # The poisoned fact never reaches the merged graph.
+        assert all(r.predicate != "language_proficiency_Language_3" for r in result.relations)
+        assert graph.diagnostics["predicate_placeholder_dropped"] == 1
 
 
 class TestApplyBindings:
@@ -2720,7 +2806,6 @@ class TestPlausibilityAnon:
             {"subject": "Person_1", "predicate": "has_role", "object": "Speaker"},
         ]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        anon_transcript = "Person_1 lives in City_1."
 
         # Plausibility filter keeps only the lives_in fact
         kept_anon = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
@@ -2729,7 +2814,7 @@ class TestPlausibilityAnon:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -2749,6 +2834,7 @@ class TestPlausibilityAnon:
                 plausibility_judge="claude",
                 plausibility_stage="anon",
                 correction_entity_types=set(),
+                pii_scope={"person", "place"},
             )
 
         # Only the valid fact survives
@@ -2778,14 +2864,10 @@ class TestPlausibilityAnon:
         # Pre-enrichment: local extraction never saw the paper title, so
         # neither the input facts nor the input transcript mention
         # "Paper_1" — it is introduced by SOTA's enrichment delta below.
-        pre_enrichment_facts = [
-            {"subject": "Person_1", "predicate": "authored", "object": "a well-known paper"}
-        ]
         enriched_anon_facts = [
             {"subject": "Person_1", "predicate": "authored", "object": "Paper_1"}
         ]
         mapping = {"Alex": "Person_1"}
-        pre_enrichment_transcript = "Person_1 wrote a well-known paper."
         post_enrichment_transcript = "Person_1 wrote {Paper_1} (Attention Is All You Need)."
 
         plaus_calls = []
@@ -2798,7 +2880,7 @@ class TestPlausibilityAnon:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(pre_enrichment_facts, mapping, pre_enrichment_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -2856,7 +2938,6 @@ class TestPlausibilityDeanon:
             {"subject": "Person_1", "predicate": "has_name", "object": "Person_1"},
         ]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        anon_transcript = "Person_1 lives in City_1."
 
         # Local plausibility drops the tautology, keeps lives_in
         kept_deanon = [{"subject": "Alex", "predicate": "lives_in", "object": "Millfield"}]
@@ -2871,7 +2952,7 @@ class TestPlausibilityDeanon:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -2907,111 +2988,6 @@ class TestPlausibilityDeanon:
         assert result.diagnostics.get("plausibility") == "deanon"
 
 
-class TestResidualLeakDropsReferencingTriples:
-    """Residual-leak fact-level filter: triples referencing a PII name that
-    survived anonymization are dropped.
-
-    The fact-level residual filter exists for the case where
-    ``check_anonymization_leaks`` flags a leak that the
-    deterministic builder did not pre-empt.  Under the consolidated
-    architecture this can happen only when the leaked name is supplied
-    externally — typically by ``extract_pii_names_with_ner`` over the
-    transcript.  The test below mocks NER to surface ``Ghost`` as a
-    PII name not present in ``graph.entities``; the builder doesn't
-    mint for it, the verifier flags it, repair leaves the residual
-    intact, and the fact-level filter drops only the triples that
-    reference the leaked name.
-    """
-
-    def test_residual_leak_filters_fact_level(self):
-        from paramem.graph.extractor import _sota_pipeline
-
-        # Ghost is NOT in graph.entities — the deterministic builder
-        # therefore does not mint a placeholder for it.  NER (mocked
-        # below) surfaces it as PII.
-        graph = _make_graph(
-            [
-                ("Alex", "lives_in", "Millfield"),
-                ("Alex", "friend_of", "Ghost"),
-            ],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-        anon_facts_initial = [
-            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
-            {"subject": "Person_1", "predicate": "friend_of", "object": "Ghost"},
-        ]
-        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        anon_transcript = "Person_1 lives in City_1. Person_1 is friends with Ghost."
-        transcript = "Alex lives in Millfield. Alex is friends with Ghost."
-
-        sota_calls = []
-
-        def fake_sota(facts, *args, **kwargs):
-            sota_calls.append(list(facts))
-            return facts, None, {}, None, {}
-
-        def fake_repair(
-            graph,
-            mapping,
-            reverse,
-            anon_facts,
-            anon_transcript,
-            orig_transcript,
-            leaked,
-            **kwargs,
-        ):
-            # Repair runs but Ghost remains — residual leak.
-            return (
-                anon_facts,
-                mapping,
-                reverse,
-                anon_transcript,
-                {"missed_fixed": 0, "hallucinated_dropped": 0, "residual_dropped": 0},
-            )
-
-        with (
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-            patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts_initial, mapping, anon_transcript, ""),
-            ),
-            patch(
-                "paramem.graph.extractor._repair_anonymization_leaks",
-                side_effect=fake_repair,
-            ),
-            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
-            # NER surfaces Ghost — not in graph.entities — as person PII.
-            patch(
-                "paramem.graph.extractor.extract_pii_names_with_ner",
-                return_value={"Ghost": "person"},
-            ),
-        ):
-            result = _sota_pipeline(
-                graph,
-                transcript,
-                None,
-                None,
-                speaker_id="speaker0",
-                plausibility_judge="off",
-                ner_check=True,
-                correction_entity_types=set(),
-            )
-
-        # SOTA must NOT be called (_skip_sota=True after residual leak)
-        assert sota_calls == [], "SOTA must be skipped on residual leak"
-        # The lives_in triple does NOT reference "Ghost" → survives
-        surviving_predicates = {r.predicate for r in result.relations}
-        assert "lives_in" in surviving_predicates
-        # The friend_of triple references "Ghost" (lowercase match) → dropped
-        assert "friend_of" not in surviving_predicates
-        # Diagnostics
-        assert "residual_leaked_triples_dropped" in result.diagnostics
-        assert result.diagnostics["residual_leaked_triples_dropped"] >= 1
-
-
 class TestAnonFailureFallback:
     """When anonymization fails, _sota_pipeline runs raw (local) plausibility
     instead of returning the original facts.
@@ -3042,7 +3018,7 @@ class TestAnonFailureFallback:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(None, {}, "", ""),
+                return_value=(None, ""),
             ),
             patch(
                 "paramem.graph.extractor._fallback_plausibility_on_raw",
@@ -3087,14 +3063,13 @@ class TestSotaEnrichmentFailureRaises:
                 Entity(name="Millfield", entity_type="place"),
             ],
         )
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3166,7 +3141,7 @@ class TestAllDroppedSafetyNet:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "anon transcript", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3222,13 +3197,12 @@ class TestEntityTypePreservation:
             {"subject": "Person_1", "predicate": "listens_to", "object": "Thing_1"},
         ]
         mapping = {"Alex": "Person_1", "Frankfurt": "City_1", "Music": "Thing_1"}
-        anon_transcript = "Person_1 lives in City_1 and listens to Thing_1."
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3265,13 +3239,12 @@ class TestEntityTypePreservation:
         )
         anon_facts = [{"subject": "Person_1", "predicate": "born_in", "object": "Country_1"}]
         mapping = {"Alex": "Person_1", "Germany": "Country_1"}
-        anon_transcript = "Person_1 was born in Country_1."
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3318,9 +3291,7 @@ class TestEntityTypePreservation:
             ],
         )
         # Alex → Person_1 only; China is absent from the anonymization mapping
-        anon_facts = [{"subject": "Person_1", "predicate": "has_plans", "object": "Person_1"}]
         mapping = {"Alex": "Person_1"}
-        anon_transcript = "Person_1 has plans."
         # SOTA enrichment introduces China as a bare name with no placeholder equivalent
         enriched_anon = [{"subject": "Person_1", "predicate": "visited", "object": "China"}]
 
@@ -3328,7 +3299,7 @@ class TestEntityTypePreservation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3380,9 +3351,7 @@ class TestSotaMintedEntityTypeDerivation:
                 Entity(name="Alex", entity_type="person"),
             ],
         )
-        anon_facts = [{"subject": "Person_1", "predicate": "has_plans", "object": "Person_1"}]
         mapping = {"Alex": "Person_1"}
-        anon_transcript = "Person_1 has plans."
         # SOTA mints a novel-prefix entity via a braced placeholder plus an
         # explicit binding — the documented brace-binding protocol.
         enriched_anon = [{"subject": "Person_1", "predicate": "authored", "object": "{Paper_1}"}]
@@ -3392,7 +3361,7 @@ class TestSotaMintedEntityTypeDerivation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3428,9 +3397,7 @@ class TestSotaMintedEntityTypeDerivation:
                 Entity(name="Alex", entity_type="person"),
             ],
         )
-        anon_facts = [{"subject": "Person_1", "predicate": "has_plans", "object": "Person_1"}]
         mapping = {"Alex": "Person_1"}
-        anon_transcript = "Person_1 has plans."
         enriched_anon = [{"subject": "Person_1", "predicate": "met", "object": "{Person_2}"}]
         sota_bindings = {"Person_2": "Jordan Rivers"}
 
@@ -3438,7 +3405,7 @@ class TestSotaMintedEntityTypeDerivation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3524,14 +3491,13 @@ class TestFallbackPlausibilityOnRawHelper:
 
 
 class TestExtractGraphNewKwargs:
-    """extract_graph forwards privacy/plausibility kwargs (ner_check,
-    plausibility_judge, plausibility_stage, verify_anonymization) to
-    _sota_pipeline.
+    """extract_graph forwards plausibility kwargs (plausibility_judge,
+    plausibility_stage) to _sota_pipeline.
     """
 
-    def test_extract_graph_plumbs_ner_and_plausibility_kwargs(self):
-        """extract_graph forwards ner_check, ner_model, plausibility_judge,
-        plausibility_stage, verify_anonymization to _sota_pipeline."""
+    def test_extract_graph_plumbs_plausibility_kwargs(self):
+        """extract_graph forwards plausibility_judge, plausibility_stage to
+        _sota_pipeline."""
         from paramem.graph.extractor import extract_graph
 
         captured = {}
@@ -3601,18 +3567,12 @@ class TestExtractGraphNewKwargs:
                 speaker_id="speaker0",
                 sota_enabled=True,
                 noise_filter="anthropic",
-                ner_check=True,
-                ner_model="en_core_web_trf",
                 plausibility_judge="claude",
                 plausibility_stage="anon",
-                verify_anonymization=False,
             )
 
-        assert captured.get("ner_check") is True
-        assert captured.get("ner_model") == "en_core_web_trf"
         assert captured.get("plausibility_judge") == "claude"
         assert captured.get("plausibility_stage") == "anon"
-        assert captured.get("verify_anonymization") is False
 
     def test_extract_graph_default_temperature_zero(self):
         """extract_graph default temperature must be 0.0.
@@ -3640,66 +3600,6 @@ class TestExtractGraphNewKwargs:
         sig = inspect.signature(extract_graph)
         assert sig.parameters["max_tokens"].default == _DEFAULT_FILTER_MAX_TOKENS
 
-    def test_verify_anonymization_false_skips_guard(self):
-        """verify_anonymization=False skips the forward-path privacy guard.
-
-        The forward-path leak check (check_anonymization_leaks) must not
-        be called when the caller opts out of the guard.
-        """
-        from paramem.graph.extractor import _sota_pipeline
-
-        graph = _make_graph(
-            [("Alex", "lives_in", "Millfield")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-        # Mapping that would normally trigger a leak (Millfield not anonymized)
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Millfield"}]
-        mapping = {"Alex": "Person_1"}
-        anon_transcript = "Person_1 lives in Millfield."
-
-        verifier_calls = []
-
-        def fake_verify(*args, **kwargs):
-            verifier_calls.append(True)
-            return []  # report no leaks regardless
-
-        sota_calls = []
-
-        def fake_sota(facts, *args, **kwargs):
-            sota_calls.append(list(facts))
-            return facts, None, {}, None, {}
-
-        with (
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-            patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
-            ),
-            patch(
-                "paramem.graph.extractor.check_anonymization_leaks",
-                side_effect=fake_verify,
-            ),
-            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
-        ):
-            _sota_pipeline(
-                graph,
-                "Alex lives in Millfield.",
-                None,
-                None,
-                speaker_id="speaker0",
-                verify_anonymization=False,
-                plausibility_judge="off",
-                correction_entity_types=set(),
-            )
-
-        # With verify_anonymization=False the guard function must not be called
-        assert verifier_calls == [], "check_anonymization_leaks must be skipped when False"
-        # SOTA must have been called (no guard blocked it)
-        assert len(sota_calls) == 1
-
 
 class TestDiagnosticsKeys:
     """Diagnostics dict is populated with expected keys after a full pipeline run."""
@@ -3717,7 +3617,6 @@ class TestDiagnosticsKeys:
         )
         anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        anon_transcript = "Person_1 lives in City_1."
 
         def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
             return facts, ""  # keep all
@@ -3726,7 +3625,7 @@ class TestDiagnosticsKeys:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3771,7 +3670,7 @@ class TestDiagnosticsKeys:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "anon transcript", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3862,9 +3761,6 @@ class TestConsolidationScheduleConfigPrivacyGuard:
         # New fields must be present with defaults
         assert config.consolidation.extraction_plausibility_judge == "auto"
         assert config.consolidation.extraction_plausibility_stage == "deanon"
-        assert config.consolidation.extraction_verify_anonymization is True
-        assert config.consolidation.extraction_ner_check is False
-        assert config.consolidation.extraction_ner_model == "en_core_web_sm"
 
 
 # ---------------------------------------------------------------------------
@@ -4111,12 +4007,15 @@ class TestBuildAnonymizationMapping:
     def test_llm_only_entries_merged_in(self):
         """Relation participants the LLM placeholdered but the graph
         doesn't know about (e.g. ``Honda``) survive into the final
-        mapping via the LLM hint merge.
-        """
+        mapping via the LLM hint merge — PROVIDED the hint's own type is
+        itself in ``pii_scope`` (FIX 1: the merge is scope-gated, not just
+        speaker-id-gated — see ``TestLlmHintMergeScopedToPiiScope`` in
+        ``tests/test_placeholders.py`` for the out-of-scope-hint-dropped
+        counterpart)."""
         mapping = self._build(
             [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
             llm_mapping={"Honda": "Product_1"},
-            pii_scope={"person"},
+            pii_scope={"person", "product"},
         )
         # Alex is the speaker — folds onto the speaker0 anchor.
         assert mapping["Alex"] == "speaker0"
@@ -4249,8 +4148,10 @@ class TestBuildAnonymizationMapping:
 
     def test_default_pii_scope_when_none(self):
         """``pii_scope=None`` falls back to :data:`_DEFAULT_PII_SCOPE`
-        (``{"person", "place"}``), so persons and places are minted
-        but organizations and concepts are not.
+        (``{"person"}`` — the single mint-selector default, matching what
+        production ships at ``SanitizationConfig.cloud_scope``), so only
+        persons are minted; places, organizations, and concepts travel to
+        the cloud verbatim.
         """
         mapping = self._build(
             [
@@ -4262,7 +4163,7 @@ class TestBuildAnonymizationMapping:
             pii_scope=None,
         )
         assert "Alex" in mapping
-        assert "Berlin" in mapping
+        assert "Berlin" not in mapping
         assert "Globex" not in mapping
         assert "Volvo V70" not in mapping
 
@@ -4288,33 +4189,6 @@ class TestBuildAnonymizationMapping:
         )
         assert reverse[forward["Dana"]] == "Dana"
         assert reverse[forward["Kim"]] == "Kim"
-
-    def test_end_to_end_verifier_passes_after_build(self):
-        """After the builder runs, the verifier finds no leaks for an
-        anon_transcript and anon_facts that fully use the placeholders.
-        Locks the contract that the builder produces a complete enough
-        mapping for verify to succeed.
-        """
-        from paramem.graph.extractor import check_anonymization_leaks
-        from paramem.graph.placeholders import _build_anonymization_mapping
-
-        graph = _make_graph(
-            [("Alex", "works_at", "Google")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Google", entity_type="organization"),
-            ],
-        )
-        mapping, _reverse = _build_anonymization_mapping(
-            graph.entities,
-            {"Google": "Org_1"},  # LLM hint for the org.
-            pii_scope={"person"},
-            speaker_name="Alex",
-        )
-        anon_facts = [{"subject": "Person_1", "predicate": "works_at", "object": "Org_1"}]
-        anon_transcript = "Person_1 works at Org_1."
-        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
-        assert leaked == [], f"verifier must report no leaks; got {leaked!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -4789,7 +4663,7 @@ class TestBindingTotalityRejection:
                     patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
                     patch(
                         "paramem.graph.extractor.anonymize_with_local_model",
-                        return_value=(anon_facts, mapping, "", ""),
+                        return_value=(mapping, ""),
                     ),
                     patch(
                         "paramem.graph.extractor._filter_with_sota",
@@ -4849,7 +4723,7 @@ class TestBindingTotalityRejection:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -4891,7 +4765,7 @@ class TestBindingTotalityRejection:
                 patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
                 patch(
                     "paramem.graph.extractor.anonymize_with_local_model",
-                    return_value=(anon_facts, mapping, "", ""),
+                    return_value=(mapping, ""),
                 ),
                 patch(
                     "paramem.graph.extractor._filter_with_sota",
@@ -4905,6 +4779,7 @@ class TestBindingTotalityRejection:
                     None,
                     speaker_id="speaker0",
                     correction_entity_types=set(),
+                    pii_scope={"person", "place"},
                 )
         assert len(result.relations) == 2
         assert "sota_enrichment_rejected" not in result.diagnostics
@@ -4925,7 +4800,7 @@ class TestBindingTotalityRejection:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -4966,7 +4841,7 @@ class TestBindingTotalityRejection:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -4980,6 +4855,7 @@ class TestBindingTotalityRejection:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                pii_scope={"person", "place"},
             )
         assert "sota_enrichment_rejected" not in result.diagnostics
         subjects_objects = {(r.subject, r.object) for r in result.relations}
@@ -4991,21 +4867,32 @@ class TestBindingTotalityRejection:
         SOTA is actually shown), so a bare reference to it elsewhere is
         ACCEPTED.  Guards C4's rendered-payload requirement: a
         subject/object-only field scan would under-include ``observed``
-        and false-reject this."""
+        and false-reject this.
+
+        Explicit ``pii_scope={"person", "place"}`` — this test's fixture
+        relies on two place entities (Millfield, Springfield) being minted
+        as CORE placeholders; the production default narrowed to
+        ``{"person"}`` only, so the scope is opted in explicitly here to
+        preserve the test's actual purpose (the predicate-only-observed
+        guard, not the default scope value)."""
         from paramem.graph.extractor import _sota_pipeline
 
+        # Springfield -> City_2 is a REAL core placeholder (second place
+        # entity minted by the deterministic builder) but appears ONLY
+        # inside a compound PREDICATE string here, never as a
+        # subject/object anywhere in the local extract.  `predicate` is
+        # never a substitution target, so the graph relation's own
+        # predicate must already carry "City_2" verbatim for it to reach
+        # the SOTA-facing payload the script builds — the same text the
+        # old model-authored ``anon_facts`` stub carried.
         graph = _make_graph(
-            [("Alex", "lives_in", "Millfield")],
+            [("Alex", "moved from City_2 to", "Millfield")],
             entities=[
                 Entity(name="Alex", entity_type="person"),
                 Entity(name="Millfield", entity_type="place"),
                 Entity(name="Springfield", entity_type="place"),
             ],
         )
-        # Springfield -> City_2 is a REAL core placeholder (second place
-        # entity minted by the deterministic builder) but appears ONLY
-        # inside a compound PREDICATE string here, never as a
-        # subject/object anywhere in the local extract.
         anon_facts = [
             {"subject": "Person_1", "predicate": "moved from City_2 to", "object": "City_1"},
         ]
@@ -5025,7 +4912,7 @@ class TestBindingTotalityRejection:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, {}, "", ""),
+                return_value=({}, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -5039,166 +4926,20 @@ class TestBindingTotalityRejection:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                pii_scope={"person", "place"},
             )
         assert "sota_enrichment_rejected" not in result.diagnostics, (
             "City_2/Springfield appears only in a predicate but is still "
             "observed — a field-scan-only `observed` would false-reject."
         )
+        # `enriched_anon[0]` (the "moved from City_2 to" fact) is dropped by
+        # `_apply_bindings`'s deanon-stage predicate invariant — its own
+        # predicate contains a declared token — so it never reaches
+        # `result.relations`.  This assertion rides ENTIRELY on the
+        # second, SOTA-added fact ("recently_visited"); it is not
+        # evidence the first fact survived.
         subjects_objects = {(r.subject, r.object) for r in result.relations}
         assert ("Alex", "Springfield") in subjects_objects
-
-    def test_glued_placeholder_in_predicate_dropped_end_to_end(self):
-        """A predicate that glues a placeholder onto a static prefix
-        (``language_proficiency_Language_3``) is invisible to the
-        ``\\b``-anchored placeholder regex but must still be caught: the
-        exit gate's predicate invariant runs a literal substring test
-        over the declared token vocabulary, before substitution, so the
-        fact never even reaches SOTA and never reaches
-        ``graph.relations``."""
-        from paramem.graph.extractor import _sota_pipeline
-
-        graph = _make_graph(
-            [("Alex", "works_at", "Acme")],
-            entities=[Entity(name="Alex", entity_type="person")],
-        )
-        anon_facts_initial = [
-            {"subject": "Person_1", "predicate": "works_at", "object": "Acme"},
-            {
-                "subject": "Person_1",
-                "predicate": "language_proficiency_Language_3",
-                "object": "Advanced",
-            },
-        ]
-        # "French" -> "Language_3" is an LLM-hint mapping entry the
-        # deterministic builder merges in verbatim (never minted by
-        # graph.entities, which only covers Alex here) — this is what
-        # puts "Language_3" into the declared vocabulary.
-        mapping = {"Alex": "Person_1", "French": "Language_3"}
-        anon_transcript = "Person_1 works at Acme. Person_1 speaks French at an advanced level."
-        transcript = "Alex works at Acme. Alex speaks French at an advanced level."
-
-        sota_calls = []
-
-        def fake_sota(facts, *args, **kwargs):
-            sota_calls.append(list(facts))
-            return facts, None, {}, None, {}
-
-        with (
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-            patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts_initial, mapping, anon_transcript, ""),
-            ),
-            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
-        ):
-            result = _sota_pipeline(
-                graph,
-                transcript,
-                None,
-                None,
-                speaker_id="speaker0",
-                correction_entity_types=set(),
-            )
-
-        # The poisoned fact never even reaches SOTA.
-        assert all(
-            f.get("predicate") != "language_proficiency_Language_3"
-            for facts in sota_calls
-            for f in facts
-        )
-        # ...and never reaches the merged graph.
-        assert all(r.predicate != "language_proficiency_Language_3" for r in result.relations)
-        assert graph.diagnostics["predicate_placeholder_dropped"] == 1
-        # The unrelated fact survives normally.
-        subjects_objects = {(r.subject, r.object) for r in result.relations}
-        assert ("Alex", "Acme") in subjects_objects
-
-    def test_skip_sota_path_deanonymizes_normally_core_unscoped(self):
-        """T4b — ``observed=None`` on the ``_skip_sota`` path (SOTA never
-        ran) means CORE UNSCOPED.  Reuses
-        ``TestResidualLeakDropsReferencingTriples``'s fixture (residual
-        NER leak -> ``_skip_sota=True``) and asserts the surviving,
-        UNRELATED fact still deanonymizes normally.  An empty-set default
-        instead of ``None`` here is TOTAL DATA LOSS on this privacy path:
-        CORE would scope to nothing and every fact would drop."""
-        from paramem.graph.extractor import _sota_pipeline
-
-        graph = _make_graph(
-            [("Alex", "lives_in", "Millfield")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-        anon_facts_initial = [
-            {"subject": "Person_1", "predicate": "lives_in", "object": "City_1"},
-            {"subject": "Person_1", "predicate": "has_hobby", "object": "reading"},
-        ]
-        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        anon_transcript = "Person_1 lives in City_1."
-        transcript = "Alex lives in Millfield. Alex's neighbor is Ghost."
-
-        sota_calls = []
-
-        def fake_sota(facts, *args, **kwargs):
-            sota_calls.append(list(facts))
-            return facts, None, {}, None, {}
-
-        def fake_repair(
-            graph, mapping, reverse, anon_facts, anon_transcript, orig_transcript, leaked, **kwargs
-        ):
-            # Repair runs but "Ghost" remains — residual leak, canonical mapping.
-            return (
-                anon_facts,
-                mapping,
-                reverse,
-                anon_transcript,
-                {"missed_fixed": 0, "hallucinated_dropped": 0},
-            )
-
-        with (
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-            patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts_initial, mapping, anon_transcript, ""),
-            ),
-            patch(
-                "paramem.graph.extractor._repair_anonymization_leaks",
-                side_effect=fake_repair,
-            ),
-            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
-            patch(
-                "paramem.graph.extractor.extract_pii_names_with_ner",
-                return_value={"Ghost": "person"},
-            ),
-        ):
-            result = _sota_pipeline(
-                graph,
-                transcript,
-                None,
-                None,
-                speaker_id="speaker0",
-                plausibility_judge="off",
-                ner_check=True,
-                correction_entity_types=set(),
-            )
-
-        assert sota_calls == [], "SOTA must be skipped on residual leak (_skip_sota=True)"
-        assert graph.diagnostics.get("anonymize") == "leaked_repaired"
-        # The surviving, unrelated facts must deanonymize NORMALLY — the
-        # `_skip_sota` path loses ZERO facts.  A mutation swapping the
-        # `observed=None` sentinel for `set()` would CORE-scope to
-        # nothing: both facts' subjects would stay literal, unresolved
-        # `Person_1` (itself a declared token), the residual sweep would
-        # drop them, and this would regress to 0.
-        assert len(result.relations) == 2
-        subjects_objects = {(r.subject, r.object) for r in result.relations}
-        assert ("Alex", "Millfield") in subjects_objects
-        assert ("Alex", "reading") in subjects_objects
-        # The new predicate-invariant/residual-sweep exit gate must not
-        # introduce any false-positive drop on this correctly-scoped path.
-        assert graph.diagnostics.get("predicate_placeholder_dropped", 0) == 0
-        assert not graph.diagnostics.get("residual_dropped_facts")
 
 
 class TestSpeakerAnchorPipeline:
@@ -5215,7 +4956,14 @@ class TestSpeakerAnchorPipeline:
         deanon -> graph VERBATIM, and is never swept by
         :func:`_apply_bindings`'s residual sweep (it doesn't match the
         placeholder pattern at all — verified structurally, not
-        assumed)."""
+        assumed).
+
+        Explicit ``pii_scope={"person", "place"}`` — the fixture stubs
+        ``City_1`` as a CORE placeholder for the place entity Millfield;
+        the production default narrowed to ``{"person"}`` only, so the
+        scope is opted in explicitly here to preserve the test's actual
+        purpose (the speaker-anchor / residual-sweep guard, not the
+        default scope value)."""
         from paramem.graph.extractor import _sota_pipeline
 
         graph = _make_graph(
@@ -5231,7 +4979,7 @@ class TestSpeakerAnchorPipeline:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, {}, "", ""),
+                return_value=({}, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -5245,30 +4993,13 @@ class TestSpeakerAnchorPipeline:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                pii_scope={"person", "place"},
             )
         assert len(result.relations) == 1
         assert result.relations[0].subject == "speaker0"
         assert result.relations[0].object == "Millfield"
         assert "residual_dropped_facts" not in result.diagnostics
         assert "sota_enrichment_rejected" not in result.diagnostics
-
-    def test_verify_does_not_flag_speaker0_as_leak(self):
-        """T5b — ``check_anonymization_leaks`` must NOT flag a
-        verbatim ``speaker0`` as a leak — it is already anonymous."""
-        from paramem.graph.extractor import check_anonymization_leaks
-
-        graph = _make_graph(
-            [("speaker0", "lives_in", "Millfield")],
-            entities=[
-                Entity(name="speaker0", entity_type="person", speaker_id="speaker0"),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-        mapping = {"Millfield": "City_1"}
-        anon_facts = [{"subject": "speaker0", "predicate": "lives_in", "object": "City_1"}]
-        anon_transcript = "speaker0 lives in City_1."
-        leaked = check_anonymization_leaks(graph, mapping, anon_facts, anon_transcript)
-        assert leaked == [], f"speaker0 must never be flagged as a leak; got {leaked!r}"
 
     def test_anchor_independent_of_speaker_relation_presence(self):
         """T5d — the anchor holds even in a session with NO speaker
@@ -5291,7 +5022,7 @@ class TestSpeakerAnchorPipeline:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -5305,6 +5036,7 @@ class TestSpeakerAnchorPipeline:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                pii_scope={"person", "place", "organization"},
             )
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Acme"
@@ -5338,7 +5070,7 @@ class TestCloudEgressSharedTableBuilder:
             ],
         )
 
-    def _run(self, llm_mapping, anon_facts, anon_transcript, **kwargs):
+    def _run(self, llm_mapping, **kwargs):
         """Drive the real helper with the two LLM calls stubbed out."""
         from paramem.graph.extractor import extract_and_anonymize_for_cloud
 
@@ -5347,7 +5079,7 @@ class TestCloudEgressSharedTableBuilder:
             patch("paramem.graph.extractor.extract_graph", return_value=graph),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, llm_mapping, anon_transcript, ""),
+                return_value=(llm_mapping, ""),
             ),
         ):
             return extract_and_anonymize_for_cloud(
@@ -5377,8 +5109,6 @@ class TestCloudEgressSharedTableBuilder:
         """
         anon_text, mapping, reverse = self._run(
             llm_mapping={"Alex": "Person_1", "Millfield": "City_1"},
-            anon_facts=[{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}],
-            anon_transcript="Person_1 lives in City_1. Call 555-0100.",
         )
         assert anon_text
         # Many-to-one BY CONSTRUCTION: the attribute value folds onto its
@@ -5396,19 +5126,19 @@ class TestCloudEgressSharedTableBuilder:
         """Facts and transcript are rebuilt from the builder's COMPLETE map,
         so an entity the local model never named is still scrubbed.
 
-        The builder mints for graph entities the LLM omitted; without the
-        rebuild those names stay bare in the model's own ``anon_facts`` /
-        transcript and ``check_anonymization_leaks`` blocks the call.
+        The builder mints for graph entities the LLM omitted; the fact
+        array and transcript are BUILT from ``graph.relations`` and this
+        complete map (never from the model), so a name the LLM missed is
+        still scrubbed.
 
-        Mutation: skip the ``anon_facts`` / ``_anonymize_transcript``
-        rebuild -> "Millfield" survives bare in the facts -> the leak guard
-        fires and the helper returns the block sentinel -> this test fails.
+        Mutation: skip the ``_substitute_whole_words`` / ``_anonymize_transcript``
+        construction step -> "Millfield" survives bare in the facts -> the
+        leak guard fires and the helper returns the block sentinel -> this
+        test fails.
         """
         anon_text, mapping, reverse = self._run(
             # The local model named Alex but MISSED Millfield entirely.
             llm_mapping={"Alex": "Person_1"},
-            anon_facts=[{"subject": "Person_1", "predicate": "lives_in", "object": "Millfield"}],
-            anon_transcript="Person_1 lives in Millfield. Call 555-0100.",
         )
         # Not the block sentinel.
         assert anon_text != ""
@@ -5418,178 +5148,40 @@ class TestCloudEgressSharedTableBuilder:
         # round-trips through both maps.
         assert reverse[mapping["Millfield"]] == "Millfield"
 
-    def test_leak_on_pii_attribute_fold_mapping_reaches_repair_not_block(self):
-        """A leak-detected call whose forward map is the ordinary many-to-one
-        shape (an entity's PII attribute folded onto its own placeholder)
-        must take the REPAIR branch, never the block branch.
+    def test_mapping_none_is_blocked(self):
+        """§F4 — ``mapping is None`` (anonymizer parse failure) is the
+        ONLY empty-mapping leg that blocks the cloud call.
 
-        Live regression this pins (coordinator-reported): a uniqueness
-        clause in ``_mapping_is_canonical`` treated Alex's phone-attribute
-        fold as non-canonical, so ANY leak on this ordinary mapping shape
-        sent ``extract_and_anonymize_for_cloud`` down the non-canonical
-        branch -> the block sentinel ``("", {}, {})`` -> cloud escalation
-        silently died on every session with an in-scope person carrying
-        even one PII attribute.
-
-        The leak here is a real name ("Dana") extraction never named as an
-        entity -- bare in the transcript, absent from the mapping. NER
-        (mocked; no spaCy dependency) surfaces it, ``check_anonymization_leaks``
-        flags it, and -- because the mapping IS canonical post-fix -- repair
-        mints a placeholder for it and the call proceeds.
-
-        Mutation: restore the uniqueness clause in ``_mapping_is_canonical``
-        -> the canonical check on Alex's mapping (with the folded phone)
-        returns ``False`` -> the block sentinel is returned instead -> this
-        test fails.
+        Mutation: gate on ``not mapping`` (truthiness) instead of
+        ``mapping is None`` -> a legitimately empty ``{}`` mapping would
+        ALSO block (see the sibling test) -> this test alone would still
+        pass, which is why it must be read together with
+        ``test_mapping_empty_dict_proceeds_and_scrubs``.
         """
-        from paramem.graph.extractor import extract_and_anonymize_for_cloud
+        anon_text, mapping, reverse = self._run(llm_mapping=None)
+        assert (anon_text, mapping, reverse) == ("", {}, {})
 
-        graph = self._graph()
-        transcript = "Alex lives in Millfield. Call 555-0100. Dana was there too."
-        llm_mapping = {"Alex": "Person_1", "Millfield": "City_1"}
-        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
-        anon_transcript = "Person_1 lives in City_1. Call 555-0100. Dana was there too."
+    def test_mapping_empty_dict_proceeds_and_scrubs(self):
+        """§F4 — ``mapping == {}`` (the model found nothing to anonymize)
+        PROCEEDS: the deterministic builder mints from ``graph.entities``
+        and the payload is scrubbed and leak-guarded exactly as on the
+        ``_sota_pipeline`` sibling path, which already gates on
+        ``mapping is None`` (never on ``not mapping``).
 
-        with (
-            patch("paramem.graph.extractor.extract_graph", return_value=graph),
-            patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, llm_mapping, anon_transcript, ""),
-            ),
-            patch(
-                "paramem.graph.extractor.extract_pii_names_with_ner",
-                return_value={"Dana": "person"},
-            ),
-        ):
-            anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
-                transcript,
-                MagicMock(),
-                MagicMock(),
-                speaker_id="speaker0",
-                pii_scope={"person", "place"},
-                ner_check=True,
-            )
-
-        # NOT the block sentinel -- repair ran and resolved the leak.
-        assert anon_text != ""
-        assert "Dana" not in anon_text
-        assert "555-0100" not in anon_text
-        # The PII-attribute fold survives repair untouched.
-        assert mapping["Alex"] == "Person_1"
-        assert mapping["555-0100"] == "Person_1"
-        # The leaked name was repaired in, and round-trips.
-        assert "Dana" in mapping
-        assert reverse[mapping["Dana"]] == "Dana"
-
-    def test_cloud_egress_does_not_call_ner_when_ner_check_is_false(self):
-        """THE acceptance test for the NER knob: the spaCy cross-check is
-        EXPERIMENTAL and OFF by default, at every call site.
-
-        Mutation: restore the unconditional
-        ``extract_pii_names_with_ner(transcript, pii_scope=scope)`` call ->
-        the spy fires under the default ``ner_check=False`` -> this test
+        Mutation: gate on ``not mapping`` instead of ``mapping is None``
+        -> this legitimately empty mapping is treated as a parse failure
+        and the call blocks -> ``anon_text`` becomes ``""`` -> this test
         fails.
         """
-        with patch(
-            "paramem.graph.extractor.extract_pii_names_with_ner", return_value={}
-        ) as spy_ner:
-            self._run(
-                llm_mapping={"Alex": "Person_1", "Millfield": "City_1"},
-                anon_facts=[{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}],
-                anon_transcript="Person_1 lives in City_1.",
-            )
-        spy_ner.assert_not_called()
-
-    def test_cloud_egress_calls_ner_when_ner_check_is_true(self):
-        """The other half: it is an OPTION, not a deletion — switched on, it
-        runs, with the configured model name.
-
-        Mutation: drop the ``ner_check`` parameter (hardcode the call off)
-        -> the spy never fires -> this test fails.
-        """
-        with patch(
-            "paramem.graph.extractor.extract_pii_names_with_ner", return_value={}
-        ) as spy_ner:
-            self._run(
-                llm_mapping={"Alex": "Person_1", "Millfield": "City_1"},
-                anon_facts=[{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}],
-                anon_transcript="Person_1 lives in City_1.",
-                ner_check=True,
-                ner_model="en_core_web_sm",
-            )
-        spy_ner.assert_called_once()
-        assert spy_ner.call_args.args[1] == "en_core_web_sm"
-
-
-class TestNerRawSpans:
-    """spaCy spans are consumed exactly as spaCy produces them.
-
-    The three regex-shaped span fixers (``_clean_ner_span``,
-    ``_strip_ner_dialogue_tail``, ``_strip_ner_possessive``) are DELETED.
-    If the estimator's raw output is too dirty to be useful, that is the
-    measurement the experiment exists to surface — not something to patch
-    out of view behind a regex.
-    """
-
-    class _Ent:
-        def __init__(self, text: str, label: str) -> None:
-            self.text = text
-            self.label_ = label
-
-    class _Doc:
-        def __init__(self, ents) -> None:
-            self.ents = ents
-
-    def _stub_nlp(self, monkeypatch, ents):
-        """Seed the module's spaCy pipeline cache with a stub ``nlp``.
-
-        Seeding the cache means ``spacy.load`` is never reached; a bare
-        module object satisfies the ``import spacy`` line, so these tests
-        run without spaCy installed (it ships only in the ``ner`` extra).
-        """
-        import sys
-        import types
-
-        from paramem.graph import extractor
-
-        monkeypatch.setitem(sys.modules, "spacy", types.ModuleType("spacy"))
-        monkeypatch.setitem(
-            extractor._SPACY_MODELS, "stub_model", lambda text: self._Doc(list(ents))
-        )
-
-    def test_ner_returns_raw_spacy_spans(self, monkeypatch):
-        """A dirty span (dialogue tail) comes back VERBATIM.
-
-        Mutation: re-add ``_clean_ner_span`` at the span-consumption site ->
-        "Li Ming: True" is silently repaired to "Li Ming" -> this test fails.
-        """
-        from paramem.graph.extractor import extract_pii_names_with_ner
-
-        self._stub_nlp(
-            monkeypatch,
-            [self._Ent("Li Ming: True", "PERSON"), self._Ent("Alex's", "PERSON")],
-        )
-        result = extract_pii_names_with_ner("Li Ming: True", "stub_model", pii_scope={"person"})
-        assert set(result) == {"Li Ming: True", "Alex's"}
-
-    def test_ner_return_carries_the_pii_type(self, monkeypatch):
-        """The return stays ``{name: pii_type}`` — the type is load-bearing
-        on the repair path (without it ``Berlin`` repairs to ``Person_4``
-        instead of ``City_1``).
-
-        Mutation: collapse the return to a bare name set -> repair loses the
-        category -> this test fails.
-        """
-        from paramem.graph.extractor import extract_pii_names_with_ner
-
-        self._stub_nlp(
-            monkeypatch,
-            [self._Ent("Berlin", "GPE"), self._Ent("Alice", "PERSON")],
-        )
-        result = extract_pii_names_with_ner(
-            "Alice lives in Berlin", "stub_model", pii_scope={"person", "place"}
-        )
-        assert result == {"Berlin": "place", "Alice": "person"}
+        anon_text, mapping, reverse = self._run(llm_mapping={})
+        # Not the block sentinel — the builder minted from graph.entities
+        # even though the LLM's own mapping was empty.
+        assert anon_text != ""
+        assert "Alex" not in anon_text
+        assert "Millfield" not in anon_text
+        assert "555-0100" not in anon_text
+        assert "Alex" in mapping, "the deterministic builder must mint even when the LLM hint is {}"
+        assert set(reverse.values()) == {"Alex", "Millfield"}
 
 
 class TestObservedDerivation:
@@ -5637,7 +5229,7 @@ class TestObservedDerivation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, "", ""),
+                return_value=(mapping, ""),
             ),
             patch("paramem.graph.extractor._check_mapping_totality", side_effect=_spy),
             patch(
@@ -5652,6 +5244,7 @@ class TestObservedDerivation:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                pii_scope={"person", "place"},
             )
 
         assert captured, "the sota_enrich totality check must run with an observed scope"

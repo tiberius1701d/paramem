@@ -469,9 +469,6 @@ def test_server_yaml_extraction_flags_round_trip(tmp_path):
         "extraction_noise_filter_endpoint": "http://custom:8080/v1",
         "extraction_plausibility_judge": "off",
         "extraction_plausibility_stage": "anon",
-        "extraction_verify_anonymization": False,
-        "extraction_ner_check": True,
-        "extraction_ner_model": "xx_ent_wiki_sm",
     }
 
     defaults = ConsolidationScheduleConfig()
@@ -608,11 +605,8 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
         "extraction_noise_filter": "claude",
         "extraction_noise_filter_model": "claude-other",
         "extraction_noise_filter_endpoint": "http://custom:8080/v1",
-        "extraction_ner_check": True,
-        "extraction_ner_model": "xx_ent_wiki_sm",
         "extraction_plausibility_judge": "off",
         "extraction_plausibility_stage": "anon",
-        "extraction_verify_anonymization": False,
     }
 
     # Skip adapter wiring — we only care about flag storage on

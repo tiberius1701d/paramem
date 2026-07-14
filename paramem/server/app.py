@@ -1840,11 +1840,10 @@ def _cuda_liveness_canary() -> None:
     """Force the CUDA context to surface a latent sticky fault.
 
     Runs an UNGUARDED torch.cuda.synchronize() so a poisoned context raises
-    before the 'ready' log is emitted.  Unlike safe_empty_cache (vram_guard.py,
-    which swallows synchronize failures — DEFECT D documented in the plan),
-    this propagates the error so the lifespan fail-fast handler can act on it
-    BEFORE advertising server-ready.  No-op when CUDA is unavailable or no
-    model is loaded.
+    before the 'ready' log is emitted.  Unlike safe_empty_cache (vram_guard.py),
+    which swallows synchronize failures, this propagates the error so the
+    lifespan fail-fast handler can act on it BEFORE advertising server-ready.
+    No-op when CUDA is unavailable or no model is loaded.
     """
     if not torch.cuda.is_available() or _state.get("model") is None:
         return
@@ -13081,11 +13080,8 @@ def _run_extraction_phase(
                 noise_filter=config.consolidation.extraction_noise_filter,
                 noise_filter_model=config.consolidation.extraction_noise_filter_model,
                 noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint or None,
-                ner_check=config.consolidation.extraction_ner_check,
-                ner_model=config.consolidation.extraction_ner_model,
                 plausibility_judge=config.consolidation.extraction_plausibility_judge,
                 plausibility_stage=config.consolidation.extraction_plausibility_stage,
-                verify_anonymization=config.consolidation.extraction_verify_anonymization,
                 source_type=session.get("source_type", "transcript"),
                 event_time=session["started_at"],
             )
@@ -13703,11 +13699,8 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                         noise_filter_model=config.consolidation.extraction_noise_filter_model,
                         noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint
                         or None,
-                        ner_check=config.consolidation.extraction_ner_check,
-                        ner_model=config.consolidation.extraction_ner_model,
                         plausibility_judge=config.consolidation.extraction_plausibility_judge,
                         plausibility_stage=config.consolidation.extraction_plausibility_stage,
-                        verify_anonymization=config.consolidation.extraction_verify_anonymization,
                         source_type=session.get("source_type", "transcript"),
                         event_time=session["started_at"],
                     )

@@ -168,8 +168,11 @@ def create_consolidation_loop(
         # Same `cloud_scope` knob as inference-time cloud egress: the SOTA
         # enrichment cycle sends placeholders to the cloud just like the
         # cloud_anonymizer egress path, so the privacy policy must match.
-        # Empty list disables NER-scope filtering entirely (consolidation
-        # then uses the primitive default {person, place}).
+        # Empty list disables the mint selector entirely (an empty scope
+        # mints nothing, so nothing is substituted out — the operator's
+        # opt-out).  A non-empty list is a MINT SELECTOR: in-scope entity
+        # types get a placeholder minted and are substituted out;
+        # out-of-scope types travel to the cloud verbatim.
         extraction_pii_scope=set(config.sanitization.cloud_scope),
         extraction_correction_entity_types=set(
             config.consolidation.extraction_correction_entity_types
@@ -178,11 +181,8 @@ def create_consolidation_loop(
         extraction_noise_filter=config.consolidation.extraction_noise_filter,
         extraction_noise_filter_model=config.consolidation.extraction_noise_filter_model,
         extraction_noise_filter_endpoint=config.consolidation.extraction_noise_filter_endpoint,
-        extraction_ner_check=config.consolidation.extraction_ner_check,
-        extraction_ner_model=config.consolidation.extraction_ner_model,
         extraction_plausibility_judge=config.consolidation.extraction_plausibility_judge,
         extraction_plausibility_stage=config.consolidation.extraction_plausibility_stage,
-        extraction_verify_anonymization=config.consolidation.extraction_verify_anonymization,
         state_provider=state_provider,
         # Thermal fields live on ConsolidationScheduleConfig
         # (config.consolidation), NOT on ConsolidationConfig (which the loop

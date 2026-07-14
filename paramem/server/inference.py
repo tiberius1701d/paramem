@@ -595,10 +595,10 @@ def _escalate_via_cloud_policy(
     +-------------+----------------------+----------------------+
 
     Per-query safety: when an anonymizing path is selected and the local
-    anonymizer can't produce a clean mapping (leak guard tripped, model
-    failure, empty result), this call returns ``None`` so the caller falls
-    back without leaking text.  The config knob is unchanged for the next
-    query.
+    anonymizer fails to produce a mapping (model/extraction failure, parse
+    failure), this call returns ``None`` so the caller falls back without
+    sending anything to the cloud.  The config knob is unchanged for the
+    next query.
 
     ``model`` and ``tokenizer`` are required when ``cloud_mode`` selects
     anonymization; they're ignored in ``block`` mode.  Passing ``None``
@@ -643,15 +643,11 @@ def _escalate_via_cloud_policy(
             speaker_id=speaker_id,
             speaker_name=speaker,
             pii_scope=set(config.sanitization.cloud_scope),
-            # The SAME knob the session tier uses — one experimental,
-            # off-by-default spaCy cross-check, not one policy per call site.
-            ner_check=config.consolidation.extraction_ner_check,
-            ner_model=config.consolidation.extraction_ner_model,
         )
         if not anon_text:
             # Per-query block: extraction error, anonymizer parse failure,
-            # leak guard tripped, residual leak after repair, or empty
-            # mapping under non-empty scope.  Privacy-safe — cloud call
+            # or an operator-configured empty scope with no in-scope
+            # content.  Privacy-safe — cloud call
             # is suppressed.  Distinct from the ``(verbatim, {}, {})`` shape
             # returned when cloud_scope is empty (operator opt-out).
             return None

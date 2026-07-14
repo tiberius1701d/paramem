@@ -34,15 +34,18 @@ Outcome classification per query:
                        mapping is fine if the name also doesn't
                        appear in anon_text — the cloud sees nothing
                        to deanonymize either way.
-  leak_blocked       — anonymizer returned ('', {}) — the wrapper's
-                       repair-and-verify pipeline blocked the call.
-                       Privacy-safe (the cloud call doesn't happen),
-                       but counts as "anonymizer failed to deliver".
+  leak_blocked       — anonymizer returned ('', {}): the local model's
+                       mapping call came back empty (parse failure, or
+                       nothing in the configured scope), so the caller
+                       never sends anything to the cloud.  Privacy-safe
+                       (the cloud call doesn't happen), but counts as
+                       "anonymizer failed to deliver".
   privacy_leak       — mapping non-empty but at least one expected
                        name still appears in anon_text.  This is a
-                       hard failure: extraction + NER both missed
-                       the name and the cloud would receive it
-                       verbatim.
+                       hard failure: extraction missed the name
+                       entirely, or the local model classified it as
+                       an out-of-scope entity type, and the cloud
+                       would receive it verbatim.
   round_trip_failed  — mapping non-empty, no leak, but the response
                        fails to whitespace-equal the original after
                        deanon.  Indicates lossy whitespace handling
@@ -238,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         nargs="*",
         default=None,
         help=(
-            "NER categories to anonymize (e.g. --scope person place). "
+            "Entity categories to anonymize (e.g. --scope person place). "
             "Defaults to the production default in server.yaml.example "
             "(read from disk to stay in sync with the shipped config). "
             "Pass --scope with no values to disable anonymization."

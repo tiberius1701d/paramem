@@ -86,11 +86,8 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
             noise_filter="",
             noise_filter_model="",
             noise_filter_endpoint=None,
-            ner_check=False,
-            ner_model="en_core_web_sm",
             plausibility_judge="off",
             plausibility_stage="deanon",
-            verify_anonymization=False,
         ),
         prompts_dir=None,
     )

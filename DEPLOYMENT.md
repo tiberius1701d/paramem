@@ -357,6 +357,16 @@ options. A short map of the top-level sections:
 | `speaker` | pyannote thresholds, enrollment flow, embedding caps. |
 | `stt`, `tts` | Whisper model + Wyoming port; Piper/MMS voices per language. |
 
+Config loading is strict: an unknown key anywhere in `configs/server.yaml`
+raises `TypeError` at boot rather than being silently ignored. This means a
+config field removed in a later release (e.g. the `extraction_verify_anonymization`
+/ `extraction_ner_check` / `extraction_ner_model` consolidation knobs, retired
+in favour of the unified anonymization table and an off-by-default `ner`
+extra) will fail to boot an existing deployment's `configs/server.yaml` until
+the stale keys are deleted from it. When upgrading, diff your local
+`configs/server.yaml` against the current `configs/server.yaml.example` and
+remove any key the template no longer documents.
+
 The `process.restart` block controls the systemd restart policy baked into
 `~/.config/systemd/user/paramem-server.service.d/restart.conf` on each server
 start. Key knobs: `on_failure` (retry on crash vs. never), `max_attempts` /
@@ -983,6 +993,13 @@ The calibration endpoint is gated by
 `consolidation.calibrate_endpoint_enabled` in `configs/server.yaml`
 (default OFF — it loads the live model and would race against scheduled
 consolidation in production).
+
+`transcript` sent to any `/calibrate/*` endpoint MUST be the turn-marked
+production surface (`[user] <text>` / `[assistant] <text>`, rendered by
+`SessionBuffer._format_turns`) — every prompt's few-shots are calibrated
+on it, and a bare, unmarked transcript puts the model off-distribution
+(the endpoints reject unmarked input with HTTP 400). `calibrate_prompts.py`
+renders this automatically; a manual `curl` call must supply it explicitly.
 
 ### Editing checklist
 

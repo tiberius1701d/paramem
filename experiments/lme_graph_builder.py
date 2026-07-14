@@ -434,10 +434,8 @@ def main() -> None:
                     noise_filter=extraction_noise_filter,
                     noise_filter_model="claude-sonnet-4-6",
                     noise_filter_endpoint=None,
-                    ner_check=False,
                     plausibility_judge=plausibility_judge,
                     plausibility_stage="deanon",
-                    verify_anonymization=True,
                 )
             except Exception as exc:
                 logger.error(

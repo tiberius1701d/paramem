@@ -242,7 +242,7 @@ def parse_profile_to_triples(
 
     Uses pattern matching to extract (subject, predicate, object) triples
     from profile sentences. This is a lightweight parser for reconstruction
-    fidelity measurement — not a full NER/RE pipeline.
+    fidelity measurement — not a full entity/relation extraction pipeline.
 
     Handles common sentence patterns:
     - "{Subject} lives in {Object}."

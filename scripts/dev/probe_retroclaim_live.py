@@ -248,7 +248,6 @@ def run_gpu_phases(out_dir: Path) -> dict:
         extraction_ha_validation=False,
         extraction_noise_filter="off",
         extraction_plausibility_judge="off",
-        extraction_verify_anonymization=False,
     )
 
     results: dict = {"phase2": {}, "phase3": {}}

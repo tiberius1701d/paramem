@@ -1231,6 +1231,13 @@ class SessionBuffer:
         ``build_speaker_context``), not by inlining the speaker's name
         here.  ``speaker_id`` continues to track per-turn for downstream
         provenance.
+
+        Second caller: ``extract_and_anonymize_for_cloud`` (cloud-egress
+        chat escalation, ``paramem/graph/extractor.py``) calls this with a
+        single synthetic ``{"role": "user", "text": <bare chat text>}``
+        turn to put the model-facing copy of a bare chat sentence back
+        in-distribution for the extraction/anonymization few-shots, which
+        are calibrated exclusively on this marker surface.
         """
         formatted = []
         speaker_ids = []

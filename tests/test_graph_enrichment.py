@@ -1015,7 +1015,7 @@ class TestPrivacyFailClosedOnEmptyMapping:
         # exercise that failure mode.
         monkeypatch.setattr(
             "paramem.training.consolidation.anonymize_with_local_model",
-            lambda *args, **kwargs: ([], {}, "", "stub-raw"),
+            lambda *args, **kwargs: ({}, "stub-raw"),
         )
         call_spy = MagicMock()
         with patch("paramem.training.consolidation._graph_enrich_with_sota", call_spy):
@@ -1072,7 +1072,7 @@ class TestPrivacyFailClosedOnEmptyMapping:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         monkeypatch.setattr(
             "paramem.training.consolidation.anonymize_with_local_model",
-            lambda *args, **kwargs: ([], {}, "", "stub-raw"),
+            lambda *args, **kwargs: ({}, "stub-raw"),
         )
         canned_result = ([], [], "raw")
         with patch(
@@ -3755,7 +3755,7 @@ def _stub_local_model_types(type_by_name: dict[str, str]):
             prefix = entity_type_to_prefix(type_by_name.get(name, "person"))
             counters[prefix] = counters.get(prefix, 0) + 1
             mapping[name] = f"{prefix}_{counters[prefix]}"
-        return [], mapping, "", "stub-raw"
+        return mapping, "stub-raw"
 
     return _stub
 
@@ -3970,7 +3970,7 @@ class TestGraphTierMappingReconciliation:
 
         monkeypatch.setattr(
             "paramem.training.consolidation.anonymize_with_local_model",
-            lambda *args, **kwargs: ([], {"Yang Ming": "Person_1"}, "", "stub-raw"),
+            lambda *args, **kwargs: ({"Yang Ming": "Person_1"}, "stub-raw"),
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch("paramem.graph.extractor._sota_call", side_effect=_capture):
@@ -4000,7 +4000,7 @@ class TestGraphTierMappingReconciliation:
 
         monkeypatch.setattr(
             "paramem.training.consolidation.anonymize_with_local_model",
-            lambda *args, **kwargs: ([], {"Someone Else": "Person_1"}, "", "stub-raw"),
+            lambda *args, **kwargs: ({"Someone Else": "Person_1"}, "stub-raw"),
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
@@ -4056,7 +4056,7 @@ class TestGraphTierMappingReconciliation:
 
         monkeypatch.setattr(
             "paramem.training.consolidation.anonymize_with_local_model",
-            lambda *args, **kwargs: ([], {"Yang Ming": "Person_1"}, "", "stub-raw"),
+            lambda *args, **kwargs: ({"Yang Ming": "Person_1"}, "stub-raw"),
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         call_spy = MagicMock()
@@ -4074,12 +4074,12 @@ class TestConsolidationLoopPiiScopeWiring:
     pii_scope`` -> ``_run_graph_enrichment``'s ``ext_cfg.pii_scope`` ->
     ``_graph_enrich_with_sota``. ``_make_loop`` (used by every other test in
     this file) never passes ``extraction_pii_scope``, so those tests
-    exercise the PRIMITIVE default (``{"person", "place"}`` — wider than
-    production) rather than the production-shipped ``{"person"}`` default
-    (``_CLOUD_EGRESS_DEFAULT_SCOPE`` / ``SanitizationConfig.cloud_scope``).
-    This is the only test in the suite that constructs the loop with an
-    explicit ``extraction_pii_scope`` and proves it actually reaches the
-    cloud payload — not a hardcoded scope inside the pass.
+    exercise the SINGLE primitive default,
+    :data:`~paramem.graph.placeholders._DEFAULT_PII_SCOPE` (``{"person"}``)
+    — the same value production ships at ``SanitizationConfig.cloud_scope``.
+    This class is the only place in the suite that constructs the loop
+    with an EXPLICIT ``extraction_pii_scope`` and proves the value actually
+    reaches the cloud payload — not a hardcoded scope inside the pass.
 
     Mutation: hardcode ``pii_scope={"person", "place"}`` (or drop the
     ``pii_scope=pii_scope`` kwarg) inside ``_run_graph_enrichment``'s call
@@ -4288,4 +4288,40 @@ class TestGraphEnrichmentFailureLoudness:
 
         assert not result["skipped"]
         assert result["chunks"] == 0, "no SOTA call may be made for a chunk that failed locally"
+        assert result["new_edges"] == 0
+
+    def test_graph_tier_gates_on_mapping_not_facts(self, tmp_path, monkeypatch):
+        """The graph tier gates parse-failure on ``_llm_mapping is
+        None``, the sole ``anonymize_with_local_model`` return value now
+        that facts are gone.
+
+        Mutation: add back a 3rd-position facts-is-None gate on the
+        return tuple -> with a 2-tuple return there is no facts value
+        at that position -> either a ``TypeError`` unpacking the
+        stub's 2-tuple as if it were longer, or the gate silently never
+        fires -> this test fails either way.
+        """
+        loop = _make_loop(tmp_path)
+        _populate_untyped_graph(loop.merger.graph)
+
+        def _parse_failure(*args, **kwargs):
+            return None, "not json"
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with (
+            patch(
+                "paramem.training.consolidation.anonymize_with_local_model",
+                side_effect=_parse_failure,
+            ),
+            patch(
+                "paramem.graph.extractor._sota_call",
+                side_effect=AssertionError(
+                    "the cloud must not be called for a chunk with no local mapping"
+                ),
+            ),
+        ):
+            result = loop._run_graph_enrichment()
+
+        assert not result["skipped"]
+        assert result["chunks"] == 0, "no SOTA call may be made when the mapping is None"
         assert result["new_edges"] == 0

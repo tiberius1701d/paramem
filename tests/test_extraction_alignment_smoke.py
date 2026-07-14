@@ -62,7 +62,7 @@ _KNOWN_BAD_PREDICATES = {"listens_to", "has_role", "discussed_topic"}
 class TestAlignmentSmoke:
     """CPU-safe smoke test: all SOTA calls mocked, pipeline logic runs for real."""
 
-    def _build_smoke_graph(self) -> tuple[SessionGraph, list[dict], dict, str]:
+    def _build_smoke_graph(self) -> tuple[SessionGraph, list[dict], dict]:
         """Build a representative graph + anonymization mock return values."""
         graph = _make_graph_from_spec(
             relations=[
@@ -97,15 +97,11 @@ class TestAlignmentSmoke:
             "Music": "Thing_3",
             "Uptown Funk": "Thing_4",
         }
-        anon_transcript = (
-            "Person_1 is calling from City_1. Please turn on Thing_1 and play Thing_2 "
-            "from Org_1. Playing Thing_2 on Thing_1. Queuing Thing_4 on Thing_1."
-        )
-        return graph, anon_facts, mapping, anon_transcript
+        return graph, anon_facts, mapping
 
     def test_entity_types_not_stamped_person(self):
         """Non-person entities (Office Speaker, Music, HR3) must not be typed 'person'."""
-        graph, anon_facts, mapping, anon_transcript = self._build_smoke_graph()
+        graph, anon_facts, mapping = self._build_smoke_graph()
 
         # Plausibility filter drops the known-bad predicates
         def fake_plaus_filter(facts, transcript, model, tokenizer, **kwargs):
@@ -115,7 +111,7 @@ class TestAlignmentSmoke:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -155,7 +151,7 @@ class TestAlignmentSmoke:
 
     def test_plausibility_dropped_recorded(self):
         """plausibility_dropped is > 0 when the mock plausibility drops facts."""
-        graph, anon_facts, mapping, anon_transcript = self._build_smoke_graph()
+        graph, anon_facts, mapping = self._build_smoke_graph()
 
         def fake_plaus_filter(facts, transcript, model, tokenizer, **kwargs):
             # Drop 2 known-bad facts
@@ -165,7 +161,7 @@ class TestAlignmentSmoke:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -194,13 +190,13 @@ class TestAlignmentSmoke:
 
     def test_no_fallback_path_on_happy_path(self):
         """On the happy path (no failures), fallback_path must not be set."""
-        graph, anon_facts, mapping, anon_transcript = self._build_smoke_graph()
+        graph, anon_facts, mapping = self._build_smoke_graph()
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(anon_facts, mapping, anon_transcript, ""),
+                return_value=(mapping, ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",

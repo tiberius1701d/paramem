@@ -243,7 +243,6 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
         extraction_ha_validation=False,
         extraction_noise_filter="off",
         extraction_plausibility_judge="off",
-        extraction_verify_anonymization=False,
     )
 
     # Four cases layered from isolation to end-to-end:

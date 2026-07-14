@@ -203,14 +203,7 @@ class TestExtractionPathParity:
                 },
             ),
             (True, {"extraction_plausibility_stage": "anon"}),
-            (True, {"extraction_ner_check": True, "extraction_ner_model": "en_core_web_sm"}),
-            (
-                True,
-                {
-                    "extraction_ha_validation": False,
-                    "extraction_verify_anonymization": False,
-                },
-            ),
+            (True, {"extraction_ha_validation": False}),
         ],
     )
     def test_parity_kwargs_identical(
@@ -12326,7 +12319,7 @@ class TestW1SameAsGuard:
             prefix = entity_type_to_prefix("person")
             for i, name in enumerate(names, start=1):
                 mapping[name] = f"{prefix}_{i}"
-            return [], mapping, "", "stub-raw"
+            return mapping, "stub-raw"
 
         monkeypatch.setattr(
             "paramem.training.consolidation.anonymize_with_local_model",

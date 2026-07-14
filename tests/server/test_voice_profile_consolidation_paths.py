@@ -80,11 +80,8 @@ def _make_config(mode="train", tmp_path=None):
     cfg.consolidation.extraction_noise_filter = False
     cfg.consolidation.extraction_noise_filter_model = ""
     cfg.consolidation.extraction_noise_filter_endpoint = ""
-    cfg.consolidation.extraction_ner_check = False
-    cfg.consolidation.extraction_ner_model = ""
     cfg.consolidation.extraction_plausibility_judge = False
     cfg.consolidation.extraction_plausibility_stage = "post"
-    cfg.consolidation.extraction_verify_anonymization = False
     cfg.debug = False
     # Ground incident/run-status I/O in a real path when provided.
     if tmp_path is not None:

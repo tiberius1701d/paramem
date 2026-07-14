@@ -160,13 +160,6 @@ conda env create -f environment.yml
 conda activate paramem
 ```
 
-**Optional extra — `ner`.** `pip install -e ".[ner]"` adds spaCy plus the
-`en_core_web_sm` model for the **experimental, off-by-default** PII cross-check
-(`consolidation.extraction_ner_check: false`). It is a second opinion for
-comparison runs, not a shipped control — the PII defense on the default path is
-the LLM leak guard (`consolidation.extraction_verify_anonymization`, on by
-default). Leave it uninstalled unless you are running that comparison.
-
 ### Environment Variables
 
 Copy `.env.example` to `.env` and fill in the values for your deployment.

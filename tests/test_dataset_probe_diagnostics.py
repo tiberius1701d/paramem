@@ -169,13 +169,12 @@ class TestRawFactCountRegression:
                 "residual_dropped_facts": [{"text": "x"}, {"text": "y"}],  # 2
                 "plausibility_dropped": 5,  # 5
                 "mapping_ambiguous_dropped": 1,  # 1
-                "residual_leaked_triples_dropped": 0,  # 0
             }
         )
         # 3 surviving QA pairs (post_plausibility_count = 3)
         episodic_rels = [{"q": f"Q{i}", "a": f"A{i}"} for i in range(3)]
         diag = _call_diag(_make_session(), graph, episodic_rels=episodic_rels)
-        # Expected: 3 + 2 + 5 + 1 + 0 = 11
+        # Expected: 3 + 2 + 5 + 1 = 11
         assert diag["extraction"]["raw_fact_count"] == 11
 
     def test_raw_fact_count_all_zeros_no_qa(self):
@@ -185,13 +184,15 @@ class TestRawFactCountRegression:
         assert diag["extraction"]["raw_fact_count"] == 0
 
     def test_predicate_placeholder_drops_counted_without_double_counting(self):
-        """F3 — the predicate-invariant drop list
-        (``predicate_placeholder_dropped_facts``, populated by BOTH the
-        anonymizer-stage filter and deanon-stage step 1 of
-        ``_apply_bindings``) is disjoint from
+        """``predicate_placeholder_dropped_facts`` (populated by deanon-stage
+        step 1 of ``_apply_bindings``) is disjoint from
         ``residual_dropped_facts`` (deanon-stage step 3) — both are
         summed into ``raw_fact_count`` exactly once each, never
-        overlapping."""
+        overlapping. Anonymized facts are built by the script directly
+        from ``graph.relations``, so a placeholder can never glue into a
+        predicate at the anonymize stage; only SOTA's returned delta can
+        introduce that drop, which is why the writer lives at the
+        deanon stage."""
         graph = _make_graph(
             {
                 "residual_dropped_facts": [{"text": "x"}],  # 1 — step-3 drop

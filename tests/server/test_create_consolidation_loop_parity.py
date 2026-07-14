@@ -64,7 +64,6 @@ SCENARIOS = [
             "consolidation.extraction_ha_validation": False,
             "consolidation.extraction_noise_filter": "",
             "consolidation.extraction_plausibility_judge": "off",
-            "consolidation.extraction_verify_anonymization": False,
             "adapters.episodic.rank": 8,
             "adapters.episodic.alpha": 16,
             "adapters.episodic.learning_rate": 1e-4,
@@ -94,7 +93,6 @@ SCENARIOS = [
             "consolidation.extraction_noise_filter": "anthropic",
             "consolidation.extraction_noise_filter_model": "claude-sonnet-4-6",
             "consolidation.extraction_plausibility_judge": "off",
-            "consolidation.extraction_verify_anonymization": False,
             "consolidation.sota_enabled": True,
             "consolidation.graph_enrichment_neighborhood_hops": 1,
             "consolidation.graph_enrichment_max_entities_per_pass": 400,
@@ -207,16 +205,11 @@ def test_factory_threads_every_config_knob(
         captured["extraction_noise_filter_endpoint"]
         == cfg.consolidation.extraction_noise_filter_endpoint
     )
-    assert captured["extraction_ner_check"] == cfg.consolidation.extraction_ner_check
-    assert captured["extraction_ner_model"] == cfg.consolidation.extraction_ner_model
     assert (
         captured["extraction_plausibility_judge"] == cfg.consolidation.extraction_plausibility_judge
     )
     assert (
         captured["extraction_plausibility_stage"] == cfg.consolidation.extraction_plausibility_stage
-    )
-    assert captured["extraction_verify_anonymization"] == (
-        cfg.consolidation.extraction_verify_anonymization
     )
     assert captured["extraction_max_tokens"] == cfg.consolidation.extraction_max_tokens
     assert captured["extraction_pii_scope"] == set(cfg.sanitization.cloud_scope)

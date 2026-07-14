@@ -217,13 +217,11 @@ class TestSOTAFullFlow:
                 ),
             ],
         )
-        result, mapping, anon_transcript, raw = anonymize_with_local_model(graph, model, tokenizer)
+        mapping, raw = anonymize_with_local_model(graph, model, tokenizer)
         # Mistral may or may not produce valid anonymization
         # Just verify no crash and correct return types
-        if result is not None:
-            assert isinstance(result, list)
+        if mapping is not None:
             assert isinstance(mapping, dict)
-            assert isinstance(anon_transcript, str)
         assert isinstance(raw, str)
 
 
@@ -749,8 +747,8 @@ class TestRunExtractGraphHelper:
     def test_helper_runs_with_production_config(self, model_and_tokenizer, tmp_path):
         """Run ``loop.extraction.run`` with the exact flags from configs/server.yaml.
 
-        Mirrors production: noise_filter, plausibility_judge, verify_anonymization,
-        NER — all set to whatever ships in server.yaml today. Skips when
+        Mirrors production: noise_filter, plausibility_judge — all set
+        to whatever ships in server.yaml today. Skips when
         prerequisites for the configured stack are missing (e.g.
         ANTHROPIC_API_KEY for the cloud noise filter) rather than silently
         running a weaker configuration.
@@ -787,11 +785,8 @@ class TestRunExtractGraphHelper:
             extraction_noise_filter=cc.extraction_noise_filter,
             extraction_noise_filter_model=cc.extraction_noise_filter_model,
             extraction_noise_filter_endpoint=cc.extraction_noise_filter_endpoint or None,
-            extraction_ner_check=cc.extraction_ner_check,
-            extraction_ner_model=cc.extraction_ner_model,
             extraction_plausibility_judge=cc.extraction_plausibility_judge,
             extraction_plausibility_stage=cc.extraction_plausibility_stage,
-            extraction_verify_anonymization=cc.extraction_verify_anonymization,
         )
 
         graph = loop.extraction.run(

@@ -300,9 +300,10 @@ def anonymizer_prefix_to_type(path: str | None = None) -> dict[str, str]:
 def anonymizer_type_to_prefix(path: str | None = None) -> dict[str, str]:
     """Return ``{entity_type: prefix}`` for entries marked ``primary_for_type=True``.
 
-    Used by the repair path to pick a canonical placeholder when
-    re-anonymizing a leaked real name. Only types with a primary prefix
-    are eligible; others are treated as out-of-PII-scope.
+    Used by :func:`~paramem.graph.placeholders.entity_type_to_prefix` — the
+    closed-vocabulary lookup consulted first when minting a placeholder
+    prefix for an entity type. Only types with a primary prefix are
+    eligible; others fall through to the open-vocabulary PascalCase path.
 
     Args:
         path: Optional override path for the schema YAML.

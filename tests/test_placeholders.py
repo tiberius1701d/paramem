@@ -16,7 +16,6 @@ from paramem.graph.name_match import is_speaker_id
 from paramem.graph.placeholders import (
     PLACEHOLDER_SHAPE_RE,
     _build_anonymization_mapping,
-    _mapping_is_canonical,
     _normalize_anonymization_mapping,
     _substitute_whole_words,
     braced,
@@ -197,18 +196,6 @@ class TestNormalizeAndValidateTableBothDirections:
         assert mapping == {"Person_2": "Windows_11"}
         assert stats == {"inverted": 0, "dropped": 0}
 
-    def test_core_table_is_canonical_default_direction(self):
-        assert _mapping_is_canonical({"Alex": "Person_1"}) is True
-        assert _mapping_is_canonical({"Person_1": "Alex"}) is False
-
-    def test_bindings_table_is_canonical_key_direction(self):
-        assert _mapping_is_canonical({"Event_1": "the trip"}, placeholder_side="key") is True
-        assert _mapping_is_canonical({"the trip": "Event_1"}, placeholder_side="key") is False
-
-    def test_empty_table_is_canonical_either_direction(self):
-        assert _mapping_is_canonical({}) is True
-        assert _mapping_is_canonical({}, placeholder_side="key") is True
-
 
 class TestSubstituteWholeWordsLongestFirst:
     """FIX 7.1 — the longest-first hazard.  ``Person_10`` and ``Person_1``
@@ -388,3 +375,86 @@ class TestSpeakerAnchorReverseSkip:
         # The forward scrub is harmless and still useful (keeps "RealName"
         # out of anon_transcript) — only the reverse write is dangerous.
         assert forward.get("RealName") == "speaker0"
+
+
+class TestLlmHintMergeScopedToPiiScope:
+    """FIX 1 — the LLM-hint merge loop in ``_build_anonymization_mapping``
+    is gated on ``pii_scope`` via :func:`placeholder_entity_type`, not just
+    on ``is_speaker_id``.  Measured in production debug logs
+    (``data/ha/debug/**/graph_snapshot.json``): under ``cloud_scope:
+    ["person"]``, an ungated merge let the anonymizer's own out-of-scope
+    hints (``"Acme Corp" -> "Org_1"``) AND its common-noun
+    hallucinations (``"engineer" -> "Org_1"``, forbidden by the
+    anonymization prompt but emitted anyway) scrub ordinary vocabulary out
+    of the cloud payload regardless of the configured scope.
+    """
+
+    def test_out_of_scope_llm_hint_is_dropped(self):
+        """Mutation: remove the scope gate -> 'Acme Corp' enters
+        ``forward`` and is scrubbed from the transcript -> this test fails.
+        """
+        forward, reverse = _build_anonymization_mapping(
+            [],
+            {"Acme Corp": "Org_1"},
+            pii_scope={"person"},
+            speaker_name=None,
+        )
+        assert "Acme Corp" not in forward
+        assert "Org_1" not in reverse
+        text = "I work at Acme Corp in the automotive division."
+        out = _substitute_whole_words(text, forward)
+        assert out == text
+
+    def test_in_scope_llm_hint_is_kept(self):
+        """Mutation: gate on the wrong side (e.g. invert the ``not in
+        scope`` check) -> 'Kim' is dropped instead of kept -> this test
+        fails.
+        """
+        forward, reverse = _build_anonymization_mapping(
+            [],
+            {"Kim": "Person_1"},
+            pii_scope={"person"},
+            speaker_name=None,
+        )
+        assert forward.get("Kim") == "Person_1"
+        assert reverse.get("Person_1") == "Kim"
+        assert _substitute_whole_words("Kim called yesterday.", forward) == (
+            "Person_1 called yesterday."
+        )
+
+    def test_common_noun_hint_out_of_scope_is_not_redacted_from_the_transcript(self):
+        """The REAL measured case: the anonymization prompt forbids the
+        model from mapping common nouns, but it does it anyway
+        (``"engineer" -> "Org_1"``).  ``Org_1`` is out of the default
+        ``{"person"}`` scope, so the hint must not scrub the word out of
+        the transcript sent to the cloud.
+
+        Mutation: remove the scope gate -> the SOTA payload reads
+        'Org_1 with 10 years experience' instead of 'engineer with 10
+        years experience' -> this test fails.
+        """
+        forward, reverse = _build_anonymization_mapping(
+            [],
+            {"engineer": "Org_1"},
+            pii_scope={"person"},
+            speaker_name=None,
+        )
+        assert "engineer" not in forward
+        transcript = "She is an engineer with 10 years experience."
+        sota_payload = _substitute_whole_words(transcript, forward)
+        assert sota_payload == transcript
+
+    def test_speaker_id_hint_key_still_dropped(self):
+        """The speaker-id key guard predates the scope gate and must
+        still be checked first — a hallucinated ``{"speaker0":
+        "Person_1"}`` hint (observed in real logs) is dropped forward
+        AND reverse regardless of scope.
+        """
+        forward, reverse = _build_anonymization_mapping(
+            [],
+            {"speaker0": "Person_1"},
+            pii_scope={"person"},
+            speaker_name=None,
+        )
+        assert "speaker0" not in forward
+        assert "Person_1" not in reverse

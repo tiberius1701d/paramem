@@ -54,38 +54,55 @@ pytestmark = [
 
 
 # Empirical baseline calibrated on Mistral 7B Instruct v0.3 with the
-# repair pipeline + NER cross-check + default scope ``[person]`` + the
-# adapted (codebase-pattern-aligned) anonymization prompt.  Variance
-# recalibration on 2026-04-29 across 10 iterations × 5 fixtures (50
-# runs) showed 40/40 personal-marker success with zero flakes —
-# Mistral 7B at temperature=0.0 is fully deterministic on this fixture.
-# Threshold raised from 0.75 to 0.80 so the test trips on the very
-# first per-fixture regression (any 1/4 failure) without going to the
-# strict 0.9× empirical recommendation.  Re-run
-# scripts/dev/calibrate_cloud_anonymizer.py after any change to
-# extractor.py, NER scope, or the anonymization prompt.
+# default scope ``[person]`` + the adapted (codebase-pattern-aligned)
+# anonymization prompt.  Variance recalibration on 2026-04-29 across 10
+# iterations × 5 fixtures (50 runs) showed 40/40 personal-marker success
+# with zero flakes — Mistral 7B at temperature=0.0 is fully
+# deterministic on this fixture.  Threshold raised from 0.75 to 0.80 so
+# the test trips on the very first per-fixture regression (any 1/4
+# failure) without going to the strict 0.9× empirical recommendation.
+# Re-run scripts/dev/calibrate_cloud_anonymizer.py after any change to
+# extractor.py, the default scope, or the anonymization prompt.
 _MATCH_THRESHOLD = 0.80
 
 
 # Default scope under which the contract is asserted.  Mirrors the
 # production default in ``SanitizationConfig.cloud_scope``.  Only names
-# whose spaCy NER type maps into this set are required to be
+# whose LLM-classified entity type maps into this set are required to be
 # anonymized; out-of-scope categories (places, organizations, etc.)
 # pass through verbatim by design.
 _DEFAULT_SCOPE = {"person"}
 
 
 # Fixture transcripts: single-turn user queries — the production input
-# shape ``_handle_cloud_response`` passes to ``extract_and_anonymize_for_cloud``
-# (the cloud-egress entry point anonymizes only the current-turn text;
-# conversation history flows separately through ``_sanitize_history``).
-# Earlier multi-turn ``[user]/[assistant]`` fixtures here were testing
-# a code path the cloud-egress helper no longer receives in production.
+# shape ``_escalate_via_cloud_policy`` (paramem/server/inference.py:567)
+# passes to ``extract_and_anonymize_for_cloud`` (the cloud-egress entry
+# point anonymizes only the current-turn text; conversation history flows
+# separately through ``_sanitize_history``).  Earlier multi-turn
+# ``[user]/[assistant]`` fixtures here were testing a code path the
+# cloud-egress helper no longer receives in production.
 #
-# Each entry carries the user query, the speaker_name the chat handler
-# would have resolved via voice enrollment, and the names that appear
-# *in the query text* and MUST therefore be anonymized before the cloud
-# sees the query.
+# Each entry carries the user query, the speaker_name and speaker_id the
+# chat handler would have resolved via voice enrollment
+# (``app.py:3593`` threads ``_resolved.speaker_id`` into ``handle_chat``,
+# which threads it unchanged into ``_escalate_via_cloud_policy`` at
+# ``inference.py:643`` and on into ``extract_and_anonymize_for_cloud``),
+# and the names that appear *in the query text* and MUST therefore be
+# anonymized before the cloud sees the query.
+#
+# ``speaker_id`` is NOT optional here even though the helper's own
+# signature defaults it to ``None`` for text-only requests with no
+# resolved speaker: ``extract_and_anonymize_for_cloud`` threads it into
+# ``build_speaker_context`` (extractor.py:322), which formats it verbatim
+# into the extraction-prompt speaker directive
+# (configs/prompts/speaker_directive.txt) as "the current speaker's
+# system identifier is {speaker_id}".  Omitting it does not skip the
+# directive — the helper falls back to the literal sentinel
+# ``"cloud_egress"`` (extractor.py:920), which conflicts with the
+# extraction few-shots in configs/prompts/extraction.txt (every example
+# hardcodes the subject as ``"speaker0"``) and is not the shape any real
+# request produces.  Using the production-shaped ``"speaker0"`` here is
+# load-bearing for the contract, not decorative.
 #
 # ``speaker_name`` is metadata used by the extraction prompt to bind
 # first-person facts to a concrete subject.  It is NOT included in
@@ -96,15 +113,26 @@ _FIXTURE = [
     {
         "id": "single_person_self_claim",
         "speaker_name": "Anna",
+        "speaker_id": "speaker0",
         "transcript": "Should I follow up with Alex tomorrow about the project deadline?",
         "expected_names": ["Alex"],
     },
     {
         "id": "person_and_place",
         "speaker_name": "Anna",
-        "transcript": (
-            "What restaurants should I recommend to Alex when they move to Berlin next month?"
-        ),
+        "speaker_id": "speaker0",
+        # Declarative, not interrogative: "What restaurants should I
+        # recommend to Alex when they move to Berlin next month?" (the
+        # original fixture text) is an interrogative that local_extract
+        # yields ZERO relations for, so extract_and_anonymize_for_cloud
+        # fails closed at the zero-relations gate before the anonymizer
+        # ever runs (extractor.py:938-939) — the test named for the
+        # anonymizer never reached it. Verified live (2026-07-14,
+        # /calibrate/extract, temperature 0): this declarative produces
+        # relations carrying both a person name (Alex) and a place name
+        # (Berlin) — e.g. {"subject": "Alex", "predicate": "lives_in",
+        # "object": "Berlin"} — so the anonymizer actually runs on both.
+        "transcript": "Alex, my friend, moved to Berlin for a new job.",
         # Berlin is intentionally NOT in expected_names under the
         # default scope ``[person]`` — places pass through verbatim so
         # the cloud can recommend Berlin restaurants by name.  Only
@@ -114,18 +142,21 @@ _FIXTURE = [
     {
         "id": "two_people",
         "speaker_name": "Anna",
+        "speaker_id": "speaker0",
         "transcript": "Did Alex and Sam finalize the agenda for the workshop?",
         "expected_names": ["Alex", "Sam"],
     },
     {
         "id": "no_personal_markers",
         "speaker_name": "Anna",
+        "speaker_id": "speaker0",
         "transcript": "What is the speed of light in vacuum?",
         "expected_names": [],
     },
     {
         "id": "conversational_shape",
         "speaker_name": "Anna",
+        "speaker_id": "speaker0",
         "transcript": "Should I call the vet about Pat's dog being sick?",
         "expected_names": ["Pat"],
     },
@@ -191,6 +222,7 @@ def test_cloud_anonymizer_contract(loaded_model):
             transcript,
             model,
             tokenizer,
+            speaker_id=entry["speaker_id"],
             speaker_name=entry["speaker_name"],
             pii_scope=_DEFAULT_SCOPE,
         )
@@ -219,8 +251,7 @@ def test_cloud_anonymizer_contract(loaded_model):
         for name in expected_names:
             assert name not in anon_text, (
                 f"[{entry['id']}] Privacy breach: expected_name {name!r} "
-                f"present in anon_text {anon_text!r} "
-                f"(extraction or NER cross-check missed it)"
+                f"present in anon_text {anon_text!r} (extraction missed it)"
             )
 
         # Round-trip contract: deanonymize_text restores the original
@@ -279,6 +310,7 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
         transcript,
         model,
         tokenizer,
+        speaker_id=entry["speaker_id"],
         speaker_name=entry["speaker_name"],
         pii_scope={"person", "place"},
     )

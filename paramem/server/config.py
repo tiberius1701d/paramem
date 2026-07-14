@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from paramem.backup.types import FatalConfigError
+from paramem.graph.schema_config import entity_types
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
@@ -579,17 +580,36 @@ class SanitizationConfig:
         - ``both``      — strictest privacy posture.  PERSONAL blocked
           AND non-PERSONAL anonymized per ``cloud_scope``.
 
-    * ``cloud_scope`` — list of NER categories anonymized when
-      ``cloud_mode`` selects an anonymizing mode.  Defaults to
-      ``["person"]``: only person names are placeholdered; place,
-      organization, etc. pass through verbatim so the cloud can answer
-      questions like "What's a good restaurant in Berlin?" sensibly.
-      An empty list (``[]``) disables the anonymization branch
-      entirely under ``cloud_mode=anonymize|both`` — cloud sees the
-      original text unchanged.  Operator owns the privacy/utility
-      tradeoff; values are passed through to the NER filter without an
-      allowlist check, so any spaCy-supported category may be used
-      (see ``configs/server.yaml.example`` for the documented set).
+    * ``cloud_scope`` — list of entity-type categories anonymized when
+      ``cloud_mode`` selects an anonymizing mode.  This is the MINT
+      SELECTOR for ``_build_anonymization_mapping`` (via ``pii_scope``):
+      in-scope entity types get a placeholder minted and are substituted
+      out of the payload; out-of-scope types travel to the cloud
+      verbatim.  Defaults to ``["person"]``: only person names are
+      placeholdered; place, organization, etc. pass through verbatim so
+      the cloud can answer questions like "What's a good restaurant in
+      Berlin?" sensibly.  An empty list (``[]``) disables the
+      anonymization branch entirely under ``cloud_mode=anonymize|both``
+      — cloud sees the original text unchanged.  Operator owns the
+      privacy/utility tradeoff.  The entity-type vocabulary itself is
+      OPEN (:func:`~paramem.graph.placeholders.placeholder_entity_type`
+      derives a type from whatever prefix the model mints — ``person``,
+      ``place``, ``organization``, ``concept`` are the closed subset in
+      ``configs/schema.yaml``, but ``language``, ``activity``, or any
+      other PascalCase-prefixed type a model invents is equally legal),
+      so ``__post_init__`` below only REJECTS on STRUCTURE (a list of
+      non-empty strings) — there is no fixed vocabulary a value must
+      belong to.  It does, however, WARN (never raise, never drop the
+      value) when a value falls outside the closed built-in subset
+      returned by :func:`~paramem.graph.schema_config.entity_types`
+      (``person``, ``place``, ``organization``, ``event``, ``preference``,
+      ``concept``): the value is still honoured — it may be a legitimate
+      open-vocabulary type — but a misspelled entry (e.g. ``"persons"``)
+      now logs a WARNING at load time instead of failing silently.  It
+      still matches no entity's type and mints nothing, so double-check
+      spelling against a real placeholder dump
+      (``graph.diagnostics["core_placeholders"]``) rather than assuming
+      the warning's absence means "in scope, nothing found."
 
     HA path is independent of ``cloud_mode`` and ``cloud_scope``: HA
     receives cleartext gated by intent classification.  Hardening the
@@ -619,6 +639,18 @@ class SanitizationConfig:
                 f"Invalid sanitization cloud_scope '{self.cloud_scope}'. "
                 f"Must be a list of non-empty strings (may be empty list to disable)."
             )
+        known_types = set(entity_types())
+        for value in dict.fromkeys(self.cloud_scope):
+            if value not in known_types:
+                logger.warning(
+                    "sanitization.cloud_scope value '%s' is not one of the closed "
+                    "built-in entity types %s. Open-vocabulary types (e.g. 'tool', "
+                    "'language', 'activity') are legal and will be honoured as-is. "
+                    "If this is a typo, nothing of the intended type will be "
+                    "scrubbed before cloud egress.",
+                    value,
+                    sorted(known_types),
+                )
 
 
 _ABSTENTION_RESPONSE_FALLBACK = "I don't have that information stored yet."
@@ -1042,13 +1074,6 @@ class ConsolidationScheduleConfig(ConsolidationConfig):
     #     to the cloud and is rejected at server start.
     extraction_plausibility_judge: str = "auto"
     extraction_plausibility_stage: str = "deanon"  # "anon" | "deanon"
-    extraction_verify_anonymization: bool = True  # forward-path privacy guard
-    # EXPERIMENTAL spaCy PII cross-check — off by default, gates EVERY NER call
-    # site (session tier + cloud egress).  Not a shipped control: brittle in
-    # practice, and the PII defense is extraction_verify_anonymization's LLM
-    # leak guard.  Requires `pip install paramem[ner]`.
-    extraction_ner_check: bool = False
-    extraction_ner_model: str = "en_core_web_sm"  # spaCy model when ner_check=True
     # Anonymizer entity types eligible for local misspelling correction on
     # the reverse map (see paramem.graph.entity_correction). "person" is
     # excluded by default — private-name spelling is owned by the

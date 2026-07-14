@@ -141,8 +141,8 @@ if [[ -z "$server_pid" ]]; then
 
     # Distinguish "starting up" (service active, port not yet bound — model
     # loading in progress) from "not running" (service stopped/failed).  The
-    # bind happens only after Mistral 7B + adapters + spaCy NER + speaker
-    # store + TTS load all complete, typically 10-30s after process launch.
+    # bind happens only after Mistral 7B + adapters + speaker store + TTS
+    # load all complete, typically 10-30s after process launch.
     if [[ "$svc_state" == "active" ]]; then
         echo -e "  Status:   ${YELLOW}STARTING${RESET} (model loading; re-check in 10–30s)"
         echo -e "  Service:  ${svc_state}"

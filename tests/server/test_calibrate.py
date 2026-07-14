@@ -5,6 +5,9 @@ Coverage:
 - 503 when consolidation cycle is in flight (concurrency guard)
 - 503 when local model is not loaded (cloud-only mode)
 - 400 when prompt file is missing (no embedded fallback)
+- 400 when a ``transcript`` field is not turn-marked (``[user]``/
+  ``[assistant]`` — the production surface every prompt is calibrated
+  on; see ``_require_turn_marked_transcript``)
 
 The tests use a MagicMock-based fake state — they do NOT load the real
 Mistral model.  End-to-end live testing of the actual extraction logic is
@@ -33,7 +36,9 @@ from paramem.server.calibrate import (
     _effective_params,
     _Measurement,
     _preflight,
+    _production_turn_markers,
     _read_prompt,
+    _require_turn_marked_transcript,
     calibrate_anonymize,
     calibrate_extract,
     calibrate_name,
@@ -140,10 +145,59 @@ class TestReadPrompt:
             _read_prompt(None, "does_not_exist_12345.txt")
 
 
+class TestRequireTurnMarkedTranscript:
+    """Unit coverage for the shared turn-marking gate.
+
+    Every ``/calibrate/*`` endpoint that accepts a ``transcript`` field
+    routes through this check (see ``TestCalibrateExtract`` /
+    ``TestCalibrateProcedural`` / ``TestCalibrateAnonymize`` /
+    ``TestCalibratePlausibility`` below for the per-endpoint 400s).
+    """
+
+    def test_markers_derived_from_format_turns(self):
+        """Markers come from SessionBuffer._format_turns, not a hardcoded list.
+
+        Mutation guard: hardcode ``("[user]", "[assistant]")`` in
+        ``_production_turn_markers`` instead of calling
+        ``SessionBuffer._format_turns`` -> this test still passes (the
+        values happen to match today), but the point of this assertion is
+        cross-checked against the renderer directly rather than a literal,
+        so a future role-vocabulary or marker-shape change in
+        ``_format_turns`` is caught here instead of silently diverging.
+        """
+        from paramem.server.session_buffer import SessionBuffer
+
+        expected = []
+        for role in ("user", "assistant"):
+            lines, _ = SessionBuffer._format_turns([{"role": role, "text": "x"}])
+            marker, _sep, _rest = lines[0].partition(" ")
+            expected.append(marker)
+        assert _production_turn_markers() == tuple(expected)
+
+    def test_unmarked_transcript_raises_400(self):
+        with pytest.raises(HTTPException) as exc:
+            _require_turn_marked_transcript("Should I follow up with Alex tomorrow?")
+        assert exc.value.status_code == 400
+        assert "turn-marked" in exc.value.detail.lower()
+
+    def test_user_marked_transcript_passes(self):
+        # Should not raise.
+        _require_turn_marked_transcript("[user] Should I follow up with Alex tomorrow?")
+
+    def test_assistant_marked_transcript_passes(self):
+        # Should not raise.
+        _require_turn_marked_transcript("[assistant] Sure, I can help with that.")
+
+    def test_empty_transcript_raises_400(self):
+        with pytest.raises(HTTPException) as exc:
+            _require_turn_marked_transcript("")
+        assert exc.value.status_code == 400
+
+
 class TestCalibrateExtract:
     def test_disabled_404(self):
         req = CalibrateExtractRequest(
-            transcript="x",
+            transcript="[user] x",
             speaker_id="speaker0",
             source_type="document",
         )
@@ -155,7 +209,7 @@ class TestCalibrateExtract:
         state = _state_enabled()
         state["consolidating"] = True
         req = CalibrateExtractRequest(
-            transcript="x",
+            transcript="[user] x",
             speaker_id="speaker0",
             source_type="document",
         )
@@ -179,7 +233,7 @@ class TestCalibrateExtract:
         graph = SessionGraph(session_id="calib", timestamp="2026-01-01T00:00:00Z")
         state["consolidation_loop"].extraction.run.return_value = graph
         req = CalibrateExtractRequest(
-            transcript="hello there",
+            transcript="[user] hello there",
             speaker_id="speaker0",
             source_type="transcript",
         )
@@ -192,12 +246,52 @@ class TestCalibrateExtract:
         assert call.args[0] == result
         assert call.kwargs["session_id"] == req.session_id
 
+    def test_unmarked_transcript_raises_400(self):
+        """A bare, unmarked transcript is rejected before the pipeline runs.
+
+        Mutation: remove the ``_require_turn_marked_transcript`` call from
+        ``calibrate_extract`` -> this test fails (no 400 raised, or the
+        pipeline mock gets invoked on unmarked input).
+        """
+        state = _state_enabled()
+        req = CalibrateExtractRequest(
+            transcript="Should I follow up with Alex tomorrow?",
+            speaker_id="speaker0",
+            source_type="transcript",
+        )
+        with pytest.raises(HTTPException) as exc:
+            calibrate_extract(state, req)
+        assert exc.value.status_code == 400
+        assert "turn-marked" in exc.value.detail.lower()
+        assert not state["consolidation_loop"].extraction.run.called
+
+    def test_marked_transcript_reaches_pipeline(self):
+        """A turn-marked transcript clears the gate and reaches the pipeline.
+
+        Mutation: make the gate reject marked transcripts too (e.g. require
+        an exact-match on a different marker set) -> this test fails
+        because ``loop.extraction.run`` is never reached.
+        """
+        from paramem.graph.schema import SessionGraph
+
+        state = _state_enabled()
+        graph = SessionGraph(session_id="calib", timestamp="2026-01-01T00:00:00Z")
+        state["consolidation_loop"].extraction.run.return_value = graph
+        req = CalibrateExtractRequest(
+            transcript="[user] Should I follow up with Alex tomorrow?",
+            speaker_id="speaker0",
+            source_type="transcript",
+        )
+        result = calibrate_extract(state, req)
+        assert state["consolidation_loop"].extraction.run.called
+        assert result["stage"] == "extract"
+
 
 class TestCalibrateProceduralRequest:
     """Schema-level tests for CalibrateProceduralRequest (no GPU)."""
 
     def test_defaults(self):
-        req = CalibrateProceduralRequest(transcript="x", speaker_id="speaker0")
+        req = CalibrateProceduralRequest(transcript="[user] x", speaker_id="speaker0")
         assert req.source_type == "transcript"
         assert req.session_id == "calib"
         assert req.speaker_name is None
@@ -207,12 +301,14 @@ class TestCalibrateProceduralRequest:
 
     def test_source_type_pattern_rejects_bad_value(self):
         with pytest.raises(ValidationError):
-            CalibrateProceduralRequest(transcript="x", speaker_id="speaker0", source_type="voice")
+            CalibrateProceduralRequest(
+                transcript="[user] x", speaker_id="speaker0", source_type="voice"
+            )
 
 
 class TestCalibrateProcedural:
     def test_disabled_404(self):
-        req = CalibrateProceduralRequest(transcript="x", speaker_id="speaker0")
+        req = CalibrateProceduralRequest(transcript="[user] x", speaker_id="speaker0")
         with pytest.raises(HTTPException) as exc:
             calibrate_procedural(_state_disabled(), req)
         assert exc.value.status_code == 404
@@ -220,18 +316,47 @@ class TestCalibrateProcedural:
     def test_consolidating_503(self):
         state = _state_enabled()
         state["consolidating"] = True
-        req = CalibrateProceduralRequest(transcript="x", speaker_id="speaker0")
+        req = CalibrateProceduralRequest(transcript="[user] x", speaker_id="speaker0")
         with pytest.raises(HTTPException) as exc:
             calibrate_procedural(state, req)
         assert exc.value.status_code == 503
 
     def test_empty_speaker_id_400(self):
         state = _state_enabled()
-        req = CalibrateProceduralRequest(transcript="x", speaker_id="")
+        req = CalibrateProceduralRequest(transcript="[user] x", speaker_id="")
         with pytest.raises(HTTPException) as exc:
             calibrate_procedural(state, req)
         assert exc.value.status_code == 400
         assert "speaker_id" in exc.value.detail.lower()
+
+    def test_unmarked_transcript_raises_400(self):
+        """Mutation: remove the gate call from ``calibrate_procedural`` ->
+        this test fails (no 400, or the pipeline mock gets invoked)."""
+        state = _state_enabled()
+        req = CalibrateProceduralRequest(
+            transcript="My sister lives in Frankfurt.", speaker_id="speaker0"
+        )
+        with pytest.raises(HTTPException) as exc:
+            calibrate_procedural(state, req)
+        assert exc.value.status_code == 400
+        assert "turn-marked" in exc.value.detail.lower()
+        assert not state["consolidation_loop"].extraction.run_procedural.called
+
+    def test_marked_transcript_reaches_pipeline(self):
+        """Mutation: make the gate reject marked transcripts too -> this
+        test fails because ``loop.extraction.run_procedural`` is never
+        reached."""
+        from paramem.graph.schema import SessionGraph
+
+        state = _state_enabled()
+        graph = SessionGraph(session_id="calib", timestamp="2026-01-01T00:00:00Z")
+        state["consolidation_loop"].extraction.run_procedural.return_value = graph
+        req = CalibrateProceduralRequest(
+            transcript="[user] My sister lives in Frankfurt.", speaker_id="speaker0"
+        )
+        result = calibrate_procedural(state, req)
+        assert state["consolidation_loop"].extraction.run_procedural.called
+        assert result["stage"] == "procedural"
 
 
 class TestCalibrateAnonymize:
@@ -242,7 +367,7 @@ class TestCalibrateAnonymize:
         (prompts_dir / "anonymization.txt").write_text("x")
         req = CalibrateAnonymizeRequest(
             graph={"not": "a valid sessiongraph"},
-            transcript="x",
+            transcript="[user] x",
             prompts_dir=str(prompts_dir),
         )
         with pytest.raises(HTTPException) as exc:
@@ -252,7 +377,7 @@ class TestCalibrateAnonymize:
     def test_disabled_404(self):
         req = CalibrateAnonymizeRequest(
             graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="x",
+            transcript="[user] x",
         )
         with pytest.raises(HTTPException) as exc:
             calibrate_anonymize(_state_disabled(), req)
@@ -278,7 +403,7 @@ class TestCalibrateAnonymize:
 
         req = CalibrateAnonymizeRequest(
             graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="hello there",
+            transcript="[user] hello there",
             prompts_dir=str(prompts_dir),
             anonymization_prompt_filename="my_anon.txt",
         )
@@ -291,7 +416,7 @@ class TestCalibrateAnonymize:
 
         state["tokenizer"].apply_chat_template.side_effect = _capture_template
 
-        valid_json = '{"mapping": {}, "anonymized_facts": [], "anonymized_transcript": ""}'
+        valid_json = '{"mapping": {}}'
         with (
             _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
             _mock.patch("paramem.graph.extractor.generate_answer", return_value=valid_json),
@@ -318,12 +443,12 @@ class TestCalibrateAnonymize:
         state["model"] = _peft_model_mock()
         req = CalibrateAnonymizeRequest(
             graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
-            transcript="hello",
+            transcript="[user] hello",
         )
 
         with _mock.patch(
             "paramem.graph.extractor.anonymize_with_local_model",
-            return_value=([], {}, "", "raw"),
+            return_value=({}, "raw"),
         ) as helper:
             result = calibrate_anonymize(state, req)
 
@@ -333,10 +458,71 @@ class TestCalibrateAnonymize:
             "calibrate_anonymize must run the helper under base_model_inference"
         )
 
+    def test_calibrate_anonymize_returns_mapping_only(self):
+        """The ``parsed`` payload carries ONLY ``mapping`` — no
+        ``anonymized_facts`` / ``anonymized_transcript``: the model
+        returns a mapping, never facts.
+
+        Mutation: re-add ``anonymized_facts`` / ``anonymized_transcript`` to
+        ``parsed`` -> this test fails.
+        """
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        req = CalibrateAnonymizeRequest(
+            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
+            transcript="[user] hello",
+        )
+
+        with _mock.patch(
+            "paramem.graph.extractor.anonymize_with_local_model",
+            return_value=({"Alex": "Person_1"}, "raw"),
+        ):
+            result = calibrate_anonymize(state, req)
+
+        assert result["parsed"] == {"mapping": {"Alex": "Person_1"}}
+
+    def test_unmarked_transcript_raises_400(self):
+        """Mutation: remove the gate call from ``calibrate_anonymize`` ->
+        this test fails (no 400, or ``anonymize_with_local_model`` runs)."""
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        req = CalibrateAnonymizeRequest(
+            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
+            transcript="My friend Alex moved to Berlin.",
+        )
+        with (
+            _mock.patch("paramem.graph.extractor.anonymize_with_local_model") as helper,
+            pytest.raises(HTTPException) as exc,
+        ):
+            calibrate_anonymize(state, req)
+        assert exc.value.status_code == 400
+        assert "turn-marked" in exc.value.detail.lower()
+        assert not helper.called
+
+    def test_marked_transcript_reaches_model(self):
+        """Mutation: make the gate reject marked transcripts too -> this
+        test fails because ``anonymize_with_local_model`` is never called."""
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        req = CalibrateAnonymizeRequest(
+            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
+            transcript="[user] My friend Alex moved to Berlin.",
+        )
+        with _mock.patch(
+            "paramem.graph.extractor.anonymize_with_local_model",
+            return_value=({}, "raw"),
+        ) as helper:
+            result = calibrate_anonymize(state, req)
+        assert helper.called
+        assert result["stage"] == "anonymize"
+
 
 class TestCalibratePlausibility:
     def test_disabled_404(self):
-        req = CalibratePlausibilityRequest(facts=[], transcript="x")
+        req = CalibratePlausibilityRequest(facts=[], transcript="[user] x")
         with pytest.raises(HTTPException) as exc:
             calibrate_plausibility(_state_disabled(), req)
         assert exc.value.status_code == 404
@@ -361,7 +547,7 @@ class TestCalibratePlausibility:
 
         req = CalibratePlausibilityRequest(
             facts=[],
-            transcript="hello there",
+            transcript="[user] hello there",
             prompts_dir=str(prompts_dir),
             plausibility_prompt_filename="my_plaus.txt",
         )
@@ -397,7 +583,7 @@ class TestCalibratePlausibility:
 
         state = _state_enabled()
         state["model"] = _peft_model_mock()
-        req = CalibratePlausibilityRequest(facts=[], transcript="hello")
+        req = CalibratePlausibilityRequest(facts=[], transcript="[user] hello")
 
         with _mock.patch(
             "paramem.graph.extractor.local_plausibility_filter",
@@ -410,6 +596,37 @@ class TestCalibratePlausibility:
         assert state["model"].disable_adapter.called, (
             "calibrate_plausibility must run the helper under base_model_inference"
         )
+
+    def test_unmarked_transcript_raises_400(self):
+        """Mutation: remove the gate call from ``calibrate_plausibility`` ->
+        this test fails (no 400, or ``local_plausibility_filter`` runs)."""
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        req = CalibratePlausibilityRequest(facts=[], transcript="Should I call the vet?")
+        with (
+            _mock.patch("paramem.graph.extractor.local_plausibility_filter") as helper,
+            pytest.raises(HTTPException) as exc,
+        ):
+            calibrate_plausibility(state, req)
+        assert exc.value.status_code == 400
+        assert "turn-marked" in exc.value.detail.lower()
+        assert not helper.called
+
+    def test_marked_transcript_reaches_model(self):
+        """Mutation: make the gate reject marked transcripts too -> this
+        test fails because ``local_plausibility_filter`` is never called."""
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        req = CalibratePlausibilityRequest(facts=[], transcript="[user] Should I call the vet?")
+        with _mock.patch(
+            "paramem.graph.extractor.local_plausibility_filter",
+            return_value=([], "raw"),
+        ) as helper:
+            result = calibrate_plausibility(state, req)
+        assert helper.called
+        assert result["stage"] == "plausibility"
 
 
 class TestCalibrateNormalize:
@@ -619,7 +836,7 @@ class TestBuildCalibrateResponse:
             stage="anonymize",
             prompts=[{"role": "user", "path": "p.txt", "sha": "abc", "content": "hello"}],
             raw_output="some output",
-            parsed={"anonymized_facts": []},
+            parsed={"mapping": {}},
             input_prompt_text="hello",
             measurement=self._make_measurement(),
             params=CalibrateParams(),

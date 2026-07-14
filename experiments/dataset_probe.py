@@ -336,10 +336,11 @@ def _build_session_diagnostics(
     #
     # `residual_dropped_facts` (deanon-stage residual sweep, step 3 of
     # `_apply_bindings`) and `predicate_placeholder_dropped_facts` (the
-    # predicate-invariant drops from BOTH the anonymizer-stage filter and
-    # deanon-stage step 1) are disjoint by construction — see
-    # `_apply_bindings`'s return contract — so summing both here cannot
-    # double-count the same dropped fact.
+    # deanon-stage predicate-invariant drops, step 1 — the ONLY stage a
+    # placeholder can still glue into a predicate, since anonymized
+    # facts are script-built from `graph.relations`, never the model) are
+    # disjoint by construction — see `_apply_bindings`'s return contract —
+    # so summing both here cannot double-count the same dropped fact.
     plaus_raw = _as_count(diag.get("plausibility_dropped"))
     drops = {
         "residual_dropped_facts": _as_count(diag.get("residual_dropped_facts")),
@@ -348,7 +349,6 @@ def _build_session_diagnostics(
         ),
         "plausibility_dropped": max(plaus_raw, 0),
         "mapping_ambiguous_dropped": _as_count(diag.get("mapping_ambiguous_dropped")),
-        "residual_leaked_triples_dropped": _as_count(diag.get("residual_leaked_triples_dropped")),
     }
     enrichment_added = max(-plaus_raw, 0)
 
@@ -926,10 +926,8 @@ def main() -> None:
                     noise_filter=noise_filter,
                     noise_filter_model="claude-sonnet-4-6",
                     noise_filter_endpoint=None,
-                    ner_check=False,
                     plausibility_judge=plausibility_judge,
                     plausibility_stage="deanon",
-                    verify_anonymization=True,
                 )
             except Exception as exc:
                 logger.error("extract_session failed for %s: %s", session.session_id, exc)
@@ -948,7 +946,6 @@ def main() -> None:
                             "predicate_placeholder_dropped_facts": 0,
                             "plausibility_dropped": 0,
                             "mapping_ambiguous_dropped": 0,
-                            "residual_leaked_triples_dropped": 0,
                         },
                         "plausibility_judge_actual": None,
                         "fallback_path": None,

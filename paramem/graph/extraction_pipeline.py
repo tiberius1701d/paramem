@@ -16,7 +16,7 @@ Two public objects::
 
     @dataclass
     class ExtractionConfig:
-        # 15 tunables, sourced from configs/server.yaml::consolidation.extraction_*
+        # 12 tunables, sourced from configs/server.yaml::consolidation.extraction_*
 
     class ExtractionPipeline:
         def __init__(self, model, tokenizer, *, config, prompts_dir): ...
@@ -88,11 +88,8 @@ class ExtractionConfig:
     noise_filter_model: str = "claude-sonnet-4-6"
     noise_filter_endpoint: str | None = None
     sota_enabled: bool = False  # master gate for ALL SOTA; mirrors ConsolidationConfig.sota_enabled
-    ner_check: bool = False
-    ner_model: str = "en_core_web_sm"
     plausibility_judge: str = "auto"
     plausibility_stage: str = "deanon"
-    verify_anonymization: bool = True
     pii_scope: set[str] | frozenset[str] | None = None
     correction_entity_types: set[str] | frozenset[str] | None = None
 
@@ -123,7 +120,7 @@ class ExtractionPipeline:
     ----
     - ``model`` + ``tokenizer`` (set once at construction; assumed not
       to change for the lifetime of the pipeline).
-    - ``config: ExtractionConfig`` (the 15 tunables).
+    - ``config: ExtractionConfig`` (the 12 tunables).
     - ``prompts_dir`` (override for ``configs/prompts/``; ``None`` falls
       back to the project default).
 
@@ -242,11 +239,8 @@ class ExtractionPipeline:
             noise_filter_endpoint=pick("noise_filter_endpoint", cfg.noise_filter_endpoint),
             sota_enabled=pick("sota_enabled", cfg.sota_enabled),
             speaker_name=overrides.get("speaker_name"),
-            ner_check=pick("ner_check", cfg.ner_check),
-            ner_model=pick("ner_model", cfg.ner_model),
             plausibility_judge=pick("plausibility_judge", cfg.plausibility_judge),
             plausibility_stage=pick("plausibility_stage", cfg.plausibility_stage),
-            verify_anonymization=pick("verify_anonymization", cfg.verify_anonymization),
             pii_scope=pick("pii_scope", cfg.pii_scope),
             correction_entity_types=pick("correction_entity_types", cfg.correction_entity_types),
             speaker_id=_require_speaker_id(overrides),

@@ -22,7 +22,9 @@ Endpoints:
   every flag the production cycle applies is applied here too.  Returns
   the local-only graph (pre-anonymization).
 * ``POST /calibrate/anonymize`` — runs ``anonymize_with_local_model`` on
-  the caller-supplied SessionGraph + transcript.
+  the caller-supplied SessionGraph + transcript, returning ONLY the
+  ``real_name -> placeholder`` mapping the model identified — no facts,
+  no transcript.
 * ``POST /calibrate/plausibility`` — runs ``local_plausibility_filter``
   on the caller-supplied fact list + transcript.
 
@@ -55,6 +57,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from paramem.server.gpu_lock import gpu_lock_sync
+from paramem.server.session_buffer import SessionBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -484,6 +487,67 @@ def _preflight(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Turn-marking gate — every calibrate endpoint that accepts a ``transcript``
+# ---------------------------------------------------------------------------
+
+
+def _production_turn_markers() -> tuple[str, ...]:
+    """The exact ``[<role>]`` marker prefixes production transcripts begin
+    with, derived by calling the SAME renderer every producer uses —
+    :meth:`~paramem.server.session_buffer.SessionBuffer._format_turns`
+    (``/chat`` user + assistant turns, document ingest, and cloud-egress
+    anonymization all render through it; see that method's docstring).
+
+    ``"user"`` and ``"assistant"`` are the only two roles any production
+    caller ever passes to ``SessionBuffer.append`` /
+    ``append_document_chunk`` (both documented on those methods).  Calling
+    the real renderer for each — rather than hardcoding ``"[user]"`` /
+    ``"[assistant]"`` here — means this module carries no second copy of
+    the marker shape; if ``_format_turns`` ever changes its bracket
+    convention, this list changes with it automatically.
+    """
+    markers = []
+    for role in ("user", "assistant"):
+        lines, _ = SessionBuffer._format_turns([{"role": role, "text": "x"}])
+        marker, _sep, _rest = lines[0].partition(" ")
+        markers.append(marker)
+    return tuple(markers)
+
+
+def _require_turn_marked_transcript(transcript: str) -> None:
+    """Fail loud (HTTP 400) when ``transcript`` is not the production
+    turn-marked surface.
+
+    Every extraction/anonymization/plausibility prompt's few-shots
+    (``configs/prompts/extraction.txt``, ``anonymization.txt``, …) are
+    calibrated exclusively on the ``[user] <text>`` / ``[assistant]
+    <text>`` surface :meth:`SessionBuffer._format_turns` renders in
+    production (``/chat``, document ingest, cloud egress). A bare,
+    unmarked transcript puts the model off-distribution from every
+    example it was tuned on — this is exactly how the ``Pat's dog``
+    cloud-egress leak stayed invisible: the calibration endpoint that
+    exists to tune these prompts was itself feeding them a surface
+    production never sends.
+
+    This is a CHECK, not a repair: an unmarked transcript is an operator
+    error, so it is rejected with a message naming the expected surface —
+    never silently prepended, never guessed.
+    """
+    markers = _production_turn_markers()
+    if not transcript.startswith(markers):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"transcript must be turn-marked — it must start with one "
+                f"of {markers!r} (the same surface "
+                f"SessionBuffer._format_turns renders for production "
+                f"/chat, document ingest, and cloud egress; see "
+                f"DEPLOYMENT.md 'Calibration loop'). Got: {transcript[:80]!r}"
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Stage handlers — invoked from the registered FastAPI routes in app.py
 # ---------------------------------------------------------------------------
 
@@ -524,6 +588,7 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
     same flags.  Never calls ``extract_graph`` directly.
     """
     _preflight(state)
+    _require_turn_marked_transcript(req.transcript)
     loop = _ensure_calibration_loop(state)
 
     # Resolve prompt files for transparency: even though the actual read
@@ -641,6 +706,7 @@ def calibrate_procedural(state: dict, req: CalibrateProceduralRequest) -> dict[s
             status_code=400,
             detail="speaker_id is required for procedural extraction (no empty-string default).",
         )
+    _require_turn_marked_transcript(req.transcript)
     loop = _ensure_calibration_loop(state)
 
     # Resolve prompt files for transparency, mirroring calibrate_extract.
@@ -707,6 +773,7 @@ def calibrate_procedural(state: dict, req: CalibrateProceduralRequest) -> dict[s
 def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str, Any]:
     """Run the local anonymizer on an explicit graph + transcript."""
     _preflight(state)
+    _require_turn_marked_transcript(req.transcript)
     from paramem.graph.extractor import anonymize_with_local_model
     from paramem.graph.schema import SessionGraph
 
@@ -729,7 +796,7 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     with _measured_local_call() as m:
         with base_model_inference(model):
-            anon_facts, mapping, anon_transcript, raw_output = anonymize_with_local_model(
+            mapping, raw_output = anonymize_with_local_model(
                 graph,
                 model,
                 tokenizer,
@@ -740,11 +807,7 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
                 prompt_filename=filename,
             )
 
-    parsed: dict[str, Any] = {
-        "anonymized_facts": anon_facts,
-        "mapping": mapping,
-        "anonymized_transcript": anon_transcript,
-    }
+    parsed: dict[str, Any] = {"mapping": mapping}
 
     return _build_calibrate_response(
         stage="anonymize",
@@ -764,6 +827,7 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
 def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> dict[str, Any]:
     """Run the local plausibility filter on an explicit fact list."""
     _preflight(state)
+    _require_turn_marked_transcript(req.transcript)
     from paramem.graph.extractor import local_plausibility_filter
 
     model = state["model"]

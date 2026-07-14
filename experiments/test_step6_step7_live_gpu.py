@@ -92,7 +92,6 @@ def main() -> int:
     cfg.consolidation.extraction_ha_validation = False
     cfg.consolidation.extraction_noise_filter = ""
     cfg.consolidation.extraction_plausibility_judge = "off"
-    cfg.consolidation.extraction_verify_anonymization = False
 
     loop = create_consolidation_loop(
         model=model,

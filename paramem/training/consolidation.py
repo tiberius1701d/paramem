@@ -451,11 +451,8 @@ class ConsolidationLoop:
         extraction_noise_filter: str = "",
         extraction_noise_filter_model: str = "claude-sonnet-4-6",
         extraction_noise_filter_endpoint: str | None = None,
-        extraction_ner_check: bool = False,
-        extraction_ner_model: str = "en_core_web_sm",
         extraction_plausibility_judge: str = "auto",
         extraction_plausibility_stage: str = "deanon",
-        extraction_verify_anonymization: bool = True,
         extraction_pii_scope: set[str] | frozenset[str] | None = None,
         extraction_correction_entity_types: set[str] | frozenset[str] | None = None,
         graph_config: Optional[GraphConfig] = None,
@@ -529,9 +526,9 @@ class ConsolidationLoop:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Extraction pipeline — the single chokepoint for ``extract_graph`` /
-        # ``extract_procedural_graph``.  Owns the 15 SOTA-pipeline tunables
+        # ``extract_procedural_graph``.  Owns the 12 SOTA-pipeline tunables
         # (temperature, max_tokens, anonymizer / noise_filter / plausibility /
-        # NER flags, PII scope, etc.) sourced from the ``extraction_*``
+        # PII scope, etc.) sourced from the ``extraction_*``
         # ConsolidationLoop kwargs.  Every consolidation call site reaches the
         # extractors through ``self.extraction.run`` / ``run_procedural`` —
         # no direct ``extract_graph(...)`` calls in this module.
@@ -540,8 +537,10 @@ class ConsolidationLoop:
         # sourced at the bootstrap call site from
         # ``ServerConfig.sanitization.cloud_scope`` so consolidation honours
         # the same operator policy as inference-time cloud egress.  ``None``
-        # falls back to the primitive default in ``extractor.py``
-        # (``{person, place}``) for back-compat with experiment scripts.
+        # falls back to the one production default,
+        # ``_DEFAULT_PII_SCOPE = frozenset({"person"})`` in
+        # ``paramem/graph/placeholders.py``, for back-compat with
+        # experiment scripts.
         # BASE-MODEL HOLDER (loop.extraction.model): ExtractionPipeline stores
         # model on self.extraction.model; released via loop.release() →
         # self.extraction.model = None.
@@ -556,11 +555,8 @@ class ConsolidationLoop:
                 noise_filter=extraction_noise_filter,
                 noise_filter_model=extraction_noise_filter_model,
                 noise_filter_endpoint=extraction_noise_filter_endpoint,
-                ner_check=extraction_ner_check,
-                ner_model=extraction_ner_model,
                 plausibility_judge=extraction_plausibility_judge,
                 plausibility_stage=extraction_plausibility_stage,
-                verify_anonymization=extraction_verify_anonymization,
                 pii_scope=extraction_pii_scope,
                 correction_entity_types=extraction_correction_entity_types,
                 sota_enabled=sota_enabled,
@@ -1174,11 +1170,8 @@ class ConsolidationLoop:
         noise_filter: str | None = None,
         noise_filter_model: str | None = None,
         noise_filter_endpoint: str | None = None,
-        ner_check: bool | None = None,
-        ner_model: str | None = None,
         plausibility_judge: str | None = None,
         plausibility_stage: str | None = None,
-        verify_anonymization: bool | None = None,
         source_type: str = "transcript",
         event_time: str | None = None,
     ) -> tuple[list[dict], list[dict]]:
@@ -1242,11 +1235,8 @@ class ConsolidationLoop:
                 noise_filter_endpoint=noise_filter_endpoint,
                 speaker_name=speaker_name,
                 speaker_id=speaker_id,
-                ner_check=ner_check,
-                ner_model=ner_model,
                 plausibility_judge=plausibility_judge,
                 plausibility_stage=plausibility_stage,
-                verify_anonymization=verify_anonymization,
                 timestamp=event_time,
             )
 
@@ -2748,18 +2738,16 @@ class ConsolidationLoop:
                 # cache when checkpointing is active).
                 self._disable_gradient_checkpointing()
                 try:
-                    _anon_facts, _llm_mapping, _anon_transcript, _anon_raw = (
-                        anonymize_with_local_model(
-                            _chunk_session_graph,
-                            self.model,
-                            self.tokenizer,
-                            transcript="",
-                            max_tokens=ext_cfg.max_tokens,
-                        )
+                    _llm_mapping, _anon_raw = anonymize_with_local_model(
+                        _chunk_session_graph,
+                        self.model,
+                        self.tokenizer,
+                        transcript="",
+                        max_tokens=ext_cfg.max_tokens,
                     )
                 finally:
                     self._enable_gradient_checkpointing()
-                if _anon_facts is None:
+                if _llm_mapping is None:
                     # Mirrors the session tier's fail-closed behaviour:
                     # _sota_pipeline falls back to LOCAL plausibility on
                     # anonymization parse failure rather than ever sending

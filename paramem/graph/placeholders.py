@@ -37,7 +37,7 @@ import re
 from collections.abc import Iterable
 
 from paramem.graph.name_match import is_speaker_id
-from paramem.graph.schema import Entity, SessionGraph
+from paramem.graph.schema import Entity, Relation, SessionGraph
 from paramem.graph.schema_config import anonymizer_prefix_to_type, anonymizer_type_to_prefix
 
 logger = logging.getLogger(__name__)
@@ -55,9 +55,9 @@ logger = logging.getLogger(__name__)
 _BARE_PLACEHOLDER_SHAPE = r"[A-Z][A-Za-z]*_\d+"
 
 # Anchored full-string validator — used by table normalize/validate
-# (:func:`_normalize_anonymization_mapping`, :func:`_mapping_is_canonical`)
-# to classify whether a table ENTRY (not embedded in surrounding text) is
-# placeholder-shaped. Collapses the previous three-way split between
+# (:func:`_normalize_anonymization_mapping`) to classify whether a table
+# ENTRY (not embedded in surrounding text) is placeholder-shaped.
+# Collapses the previous three-way split between
 # schema_config's `_UNIVERSAL_PLACEHOLDER_RE` / `anonymizer_placeholder_pattern()`,
 # extractor's `_PLACEHOLDER_TOKEN_RE`, and a test-local `mint_re`.
 PLACEHOLDER_SHAPE_RE = re.compile(rf"^{_BARE_PLACEHOLDER_SHAPE}$")
@@ -92,13 +92,11 @@ def mint_placeholder(existing_values: Iterable[object], prefix: str) -> str:
     this function; every call site in this module passes the union of
     both sources.
 
-    THE only place a placeholder token string is built. Collapses three
-    previous implementations: the anonymizer's per-prefix counter
-    closure inside ``_build_anonymization_mapping`` (counted from 1,
-    blind to the table), that same function's already-scanning
-    speaker-name-fallback mint, and the leak-repair mint inside
-    ``_repair_anonymization_leaks`` (its own scanning closure,
-    duplicating this one).
+    THE only place a placeholder token string is built. Every mint in
+    this module — including :func:`_build_anonymization_mapping`'s
+    per-prefix and speaker-name-fallback mints — goes through this one
+    function; never re-implement a local counter or scanning closure
+    at a call site.
     """
     max_n = 0
     for v in existing_values:
@@ -203,6 +201,43 @@ def _substitute_whole_words(
             parts.append(text[pos:j])
             pos = j
     return "".join(parts)
+
+
+def _build_anon_facts(relations: Iterable[Relation], mapping: dict[str, str]) -> list[dict]:
+    """Build the anonymized fact array from ``relations`` and the forward
+    ``mapping`` — THE single construction the anonymizer's mapping-only
+    contract feeds.
+
+    One dict per relation: ``subject``/``object`` are substituted through
+    ``mapping`` via :func:`_substitute_whole_words`; ``predicate``,
+    ``relation_type``, and ``confidence`` are copied VERBATIM — the
+    predicate is NEVER a substitution target, so a placeholder cannot be
+    glued into it at this stage (the motivating bug,
+    ``language_proficiency_Language_3``, can still occur in SOTA's
+    *returned* facts, which is why the deanon-stage predicate invariant
+    in :func:`_apply_bindings` stays).  The output count is exactly
+    ``len(relations)`` by construction — a fact can never be lost,
+    reworded, or dropped by the anonymizer, because the anonymizer never
+    returns one.
+
+    Every caller that builds an anonymizer-facing fact array goes through
+    this ONE function: :func:`~paramem.graph.extractor._sota_pipeline`,
+    :func:`~paramem.graph.extractor.extract_and_anonymize_for_cloud`, and
+    ``scripts/dev/calibrate_prompts.py``'s client-side enrichment-stage
+    driver. ``mapping`` must already be the COMPLETE forward map (i.e.
+    :func:`_build_anonymization_mapping`'s output) — a partial/HINT-only
+    map here reproduces the exact leak this function exists to prevent.
+    """
+    return [
+        {
+            "subject": _substitute_whole_words(r.subject, mapping),
+            "predicate": r.predicate,
+            "object": _substitute_whole_words(r.object, mapping),
+            "relation_type": r.relation_type,
+            "confidence": r.confidence,
+        }
+        for r in relations
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -386,57 +421,6 @@ def _normalize_anonymization_mapping(
     return out, {"inverted": inverted, "dropped": dropped}
 
 
-def _mapping_is_canonical(mapping: dict, *, placeholder_side: str = "value") -> bool:
-    """Validate the structural contract: shape, direction.
-
-    ``placeholder_side`` selects which side of the table must carry the
-    placeholder shape — ``"value"`` (default) for the CORE table
-    (``{real_name: placeholder}``), ``"key"`` for SOTA ``bindings``
-    (``{placeholder: real_text}``).
-
-    Returns ``True`` iff:
-
-    * **Shape** — every entry on ``placeholder_side`` matches
-      :data:`PLACEHOLDER_SHAPE_RE`. The prefix vocabulary is open:
-      ``Person`` / ``City`` / ``Org`` / ``Thing`` are common but not
-      exhaustive.
-    * **Direction** — no entry on the OTHER side matches the placeholder
-      shape (would be self-mapped).
-
-    **Uniqueness is deliberately NOT a property of this table — do not
-    re-add it.** The CORE forward map is many-to-one BY CONSTRUCTION:
-    :func:`_build_anonymization_mapping` folds an entity's PII attribute
-    values onto that entity's own placeholder (``placeholders.py:877``),
-    so two entries legitimately collapsing onto the same
-    ``placeholder_side`` value is the normal, intended shape of the
-    table — not a defect to detect here. A former uniqueness clause
-    (``len(set(placeholder_entries)) == len(mapping)``) treated that
-    fold as non-canonical, sending every session with an in-scope
-    person carrying even one PII attribute (phone, email, city, …) down
-    the non-canonical branch at every leak-detected call site
-    (``extractor.py:1031``, ``:2147``) — repair never ran; cloud egress
-    silently blocked. It was also a no-op for the collision it claimed
-    to catch: two distinct entity NAMES colliding onto one placeholder
-    is already resolved by ``reverse.setdefault`` keeping only the
-    first (``placeholders.py:870``), so there is no duplicate left for
-    this function to find. Enforcing injectivity belongs at the
-    construction site (the LLM-hint merge), not here.
-
-    Empty mapping is canonical (no entries to validate).
-    """
-    if not mapping:
-        return True
-    if placeholder_side == "key":
-        placeholder_entries = mapping.keys()
-        other_entries = mapping.values()
-    else:
-        placeholder_entries = mapping.values()
-        other_entries = mapping.keys()
-    if not all(PLACEHOLDER_SHAPE_RE.match(str(v)) for v in placeholder_entries):
-        return False
-    return not any(PLACEHOLDER_SHAPE_RE.match(str(k)) for k in other_entries)
-
-
 # ---------------------------------------------------------------------------
 # Resolution map — core + secondary (SOTA) merge. CORE-LAST precedence and
 # the `observed is None` CORE-UNSCOPED sentinel are load-bearing invariants.
@@ -453,9 +437,11 @@ def _resolution_map(
     :func:`_apply_bindings` (as its substitution map).
 
     ``observed`` is ``None`` -> **CORE UNSCOPED** (today's behaviour;
-    every non-SOTA deanon path, and the ``_skip_sota`` path where SOTA
-    never ran): every ``reverse`` entry is legal, ``sota_bindings`` is
-    merged in underneath it. An empty-set default here instead of ``None``
+    every deanon call that has no SOTA-observed scope to pass — e.g. a
+    call outside the SOTA-enrichment cycle, or a unit test exercising
+    :func:`_apply_bindings`/:func:`_resolution_map` directly): every
+    ``reverse`` entry is legal, ``sota_bindings`` is merged in
+    underneath it. An empty-set default here instead of ``None``
     would scope CORE to nothing and drop every fact on those paths — see
     the callers' ``observed: set[str] | None = None`` declarations.
 
@@ -530,22 +516,20 @@ def _check_mapping_totality(
     do a plain truthiness test on the result without a
     falsy-``None``-vs-falsy-``[]`` trap.
 
-    Generalised to cover two call sites: the pre-SOTA anonymizer check
+    Only ONE production caller remains: the post-SOTA check
+    (:func:`~paramem.graph.extractor._sota_pipeline`, ``sota_bindings=
+    sota_bindings, observed=<rendered tokens>,
+    diagnostic_key="sota_pending_orphans", stage="sota_enrichment"``),
+    which REJECTS THE WHOLE DELTA on a non-empty verdict and falls back to
+    the pre-enrichment local-extract facts.  The anonymizer-stage shape
     (``sota_bindings=None``, ``observed=None``, default
-    ``diagnostic_key``/``stage``) and the post-SOTA check
-    (``sota_bindings=sota_bindings, observed=<rendered tokens>,
-    diagnostic_key="sota_pending_orphans", stage="sota_enrichment"``).
-    For the anonymizer stage the caller only logs the violation — the
-    affected fact is dropped by :func:`_apply_bindings`'s residual sweep
-    (the single deanon exit gate), the correct fail-closed semantic
-    there.  For the SOTA-enrichment
-    stage the caller (:func:`~paramem.graph.extractor._sota_pipeline`)
-    instead REJECTS THE WHOLE DELTA on a non-empty verdict and falls back
-    to the pre-enrichment local-extract facts — a single unbound
-    placeholder no longer sheds just that one fact.  Matches both braced
-    (``{Event_1}``) and bare (``Event_1``) placeholder forms via
-    :data:`PLACEHOLDER_TOKEN_RE` — harmless for the pre-SOTA call, whose
-    facts only ever carry bare tokens.
+    ``diagnostic_key``/``stage`` — kept as this function's default
+    parameters for direct/unit-test use) no longer has a production
+    caller: anonymized facts are built by the script directly from
+    ``graph.relations`` and the CORE map, so an orphan placeholder in a
+    local fact is now structurally impossible, not merely diagnosed and
+    logged.  Matches both braced (``{Event_1}``) and bare (``Event_1``)
+    placeholder forms via :data:`PLACEHOLDER_TOKEN_RE`.
 
     When ``sota_bindings`` is given and ``observed`` is a set, any
     ``sota_bindings`` KEY that is also in ``observed`` is a CONFLICT
@@ -693,19 +677,19 @@ _PII_ATTRIBUTE_KEYS: frozenset[str] = frozenset(
     }
 )
 
-# Primitive-layer default scope for :func:`_build_anonymization_mapping`
-# and (via re-export) ``check_anonymization_leaks`` /
-# ``extract_pii_names_with_ner`` when no explicit ``pii_scope`` is
-# passed.  Preserves the historical hardcoded ``{person, place}`` scope
-# of these primitives so consolidation (``_sota_pipeline``) and any
-# direct callers keep the prior leak-detection coverage.
+# THE single default for ``pii_scope``, and — post-guard-deletion —
+# ``pii_scope`` has exactly ONE consumer: :func:`_build_anonymization_mapping`.
 #
-# This is *not* the cloud-egress policy default — that is
-# ``_CLOUD_EGRESS_DEFAULT_SCOPE`` in :mod:`paramem.graph.extractor`,
-# narrower and configurable via ``SanitizationConfig.cloud_scope`` —
-# different concern, different default.  The primitive has no policy
-# opinion; the helper does.
-_DEFAULT_PII_SCOPE: frozenset[str] = frozenset({"person", "place"})
+# ``pii_scope`` has exactly one job: it decides which entity TYPES get a
+# placeholder minted by that function — and are therefore substituted
+# out of the payload — versus which travel to the cloud verbatim.
+# In-scope → blocked. Out-of-scope → emitted. Nothing else reads this
+# value; there is no separate verification concern for it to serve.
+#
+# ``{"person"}`` matches the value production actually ships
+# (``SanitizationConfig.cloud_scope``, default ``["person"]`` —
+# ``server/config.py``) — one constant, one policy, everywhere.
+_DEFAULT_PII_SCOPE: frozenset[str] = frozenset({"person"})
 
 
 def _build_anonymization_mapping(
@@ -717,15 +701,17 @@ def _build_anonymization_mapping(
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Single source of truth for the real → placeholder mapping.
 
-    The anonymizer LLM is good at producing **anon_facts** (canonical
-    predicates, compound-fact splits, dropping unsafe relations) but
-    historically untrustworthy at producing a **complete mapping**:
-    it routinely omits the bare first-name form when it has the full
-    name, never sees ``Entity.attributes`` at all (so PII embedded in
-    attributes leaks), and emits ambiguous pairs that have to be
-    canonicalized after the fact.  Three accreting "Bug X fix" helpers
-    (speaker-name seeding, attribute-extend, ambiguous-pair drop) used
-    to patch the LLM's output incrementally.
+    The anonymizer LLM returns ONLY a mapping — it never produces facts or
+    a transcript (measured: its fact array was a verbatim echo of its
+    input, with names swapped, in 0/22 divergent sessions before the
+    anonymizer stopped being asked for facts at all).  It is historically
+    untrustworthy at producing a **complete mapping**: it routinely omits
+    the bare first-name form when it has the full name, never sees
+    ``Entity.attributes`` at all (so PII embedded in attributes leaks),
+    and emits ambiguous pairs that have to be canonicalized after the
+    fact.  Three accreting "Bug X fix" helpers (speaker-name seeding,
+    attribute-extend, ambiguous-pair drop) used to patch the LLM's output
+    incrementally.
 
     This builder replaces that pattern with one deterministic walk:
 
@@ -768,11 +754,19 @@ def _build_anonymization_mapping(
        the anchor (R7, out of scope): it can still mint a ``Person_N``
        for the speaker's display name in the rare case the graph has no
        speaker entity at all.
-    4. **Preserve LLM hints — except any keyed on or valued at the
-       speaker.**  Entries the LLM emitted that the deterministic build
-       does not cover (typically relation participants the graph
+    4. **Preserve LLM hints — scoped, and except any keyed on or valued at
+       the speaker.**  Entries the LLM emitted that the deterministic
+       build does not cover (typically relation participants the graph
        doesn't know about — e.g. ``Honda`` mentioned in a relation but
-       not a graph entity) are merged in.  When the LLM's entry
+       not a graph entity) are merged in ONLY when the hint's own
+       placeholder types (:func:`placeholder_entity_type`) to a type in
+       ``pii_scope`` — the same authority the deterministic entity walk
+       above answers to.  An out-of-scope or common-noun hint (the
+       anonymization prompt forbids mapping common nouns, but the model
+       does it anyway) is dropped, not merged — merging it would scrub
+       ordinary vocabulary (``"engineer"``, ``"skiing"``) or an
+       out-of-scope entity type (an organization, a tool, a language) out
+       of the payload regardless of ``pii_scope``.  When the LLM's entry
        conflicts with a deterministic one, deterministic wins (we trust
        the graph).  A key that is speaker-id-shaped
        (:func:`~paramem.graph.name_match.is_speaker_id`) — e.g. a
@@ -786,11 +780,14 @@ def _build_anonymization_mapping(
        drops the reverse write: a reverse entry keyed on ``speaker0``
        would restore that real name onto every speaker-subject fact.
 
-    The companion :func:`_check_mapping_totality` runs after this
-    builder as a diagnostic for the orthogonal concern of LLM
-    placeholders that surface in ``anon_facts`` without any mapping
-    entry — those facts are dropped by the residual placeholder sweep
-    post-deanon, with the violation logged for monitoring.
+    Callers build the anonymized fact array directly from ``graph.relations``
+    and this builder's forward map (subject/object substituted, predicate
+    untouched) — never from the LLM's response, which carries no facts.  An
+    orphan placeholder in a LOCAL fact is therefore structurally impossible
+    at this stage, not merely diagnosed.  :func:`_check_mapping_totality`
+    still runs, unrelated to this builder, against SOTA's *returned*
+    enrichment delta (the one place a placeholder can still arrive
+    unresolved).
 
     Args:
         entities: The entity records to walk — ``graph.entities`` for the
@@ -807,16 +804,18 @@ def _build_anonymization_mapping(
             from :func:`_normalize_anonymization_mapping`.  Treated as
             a hint, not truth.
         pii_scope: Entity-types in scope for anonymization (e.g.
-            ``{"person", "place"}``).  Out-of-scope entities pass
-            through unscrubbed by design.
+            ``{"person"}`` — see :data:`_DEFAULT_PII_SCOPE`).  A mint
+            selector: in-scope entities get a placeholder minted and are
+            substituted out; out-of-scope entities travel to the cloud
+            verbatim, by design.
         speaker_name: Runtime-known display name of the session's
             speaker.  When set, this name is guaranteed to be covered.
 
     Returns:
         ``(forward, reverse)`` — ``forward`` is the many-to-one
         ``{real_name | attr_value: placeholder}`` mapping that feeds
-        ``_anonymize_transcript`` and ``check_anonymization_leaks``
-        (both in :mod:`paramem.graph.extractor`).  ``reverse`` is the
+        ``_anonymize_transcript`` and :func:`_build_anon_facts` (both in
+        :mod:`paramem.graph.extractor`).  ``reverse`` is the
         one-to-one ``{placeholder: entity_name}`` map consumed by the
         deanon path (:func:`deanonymize_text`, :func:`_apply_bindings`)
         — attribute values are deliberately absent so a folded
@@ -931,12 +930,18 @@ def _build_anonymization_mapping(
 
     # Merge in LLM hints not already covered (typically relation-participant
     # placeholders for entities absent from ``entities``).  Deterministic
-    # entries win on conflict; LLM-only entries are added.  LLM-emitted
-    # keys are entity-name-shaped (the anonymizer prompt operates on
-    # relation participants, not attributes), so they are safe to enter
-    # the reverse map.  The reverse write is NOT gated on the forward
-    # write winning — anon_facts emitted under the LLM's (losing)
-    # placeholder still need a reverse entry to deanonymize.
+    # entries win on conflict; LLM-only entries are added.  ``pii_scope`` is
+    # AUTHORITATIVE here, not just for the entity walk above: an LLM hint
+    # whose placeholder types to an out-of-scope entity type (via
+    # :func:`placeholder_entity_type`) is dropped, never merged.  Ungated,
+    # the LLM was measured minting placeholders for out-of-scope entity
+    # types (organizations, tools, languages) AND for plain common nouns
+    # the anonymization prompt explicitly forbids mapping (``"engineer"``,
+    # ``"skiing"``) — both classes reached the forward map and were
+    # scrubbed from the payload regardless of ``cloud_scope``.  Scoping the
+    # merge is the fix: a hint only survives when its own placeholder's
+    # type is in ``scope``, exactly the same test the deterministic walk
+    # above applies to graph entities.
     #
     # A key that is speaker-id-shaped (``is_speaker_id``) — e.g. a
     # hallucinated ``{"speaker0": "Person_1"}`` — is dropped outright
@@ -951,6 +956,16 @@ def _build_anonymization_mapping(
         if not isinstance(k, str) or not isinstance(v, str):
             continue
         if is_speaker_id(k):
+            continue
+        # The scope gate answers "does this hint's placeholder type belong
+        # in pii_scope" — a question that doesn't apply to a speaker-id
+        # VALUE at all (``placeholder_entity_type("speaker0")`` types to
+        # the literal string ``"speaker0"``, never a member of any real
+        # scope).  A speaker-id-shaped value is the anchor-scrub case
+        # documented below, not a scope-governed placeholder mint, so it
+        # bypasses the gate and is handled entirely by the
+        # ``is_speaker_id(v)`` branch that follows.
+        if not is_speaker_id(v) and placeholder_entity_type(v) not in scope:
             continue
         mapping.setdefault(k, v)
         if is_speaker_id(v):
@@ -1051,8 +1066,12 @@ def _apply_bindings(
        :func:`_check_mapping_totality`'s SOTA-enrichment-stage rejection
        gate — a bad mint rejects the WHOLE delta before it reaches this
        function, rather than shedding just the one fact.  This sweep
-       remains the fail-closed backstop for cause (c) and for a genuine
-       anonymizer-stage leak (R3).
+       remains the fail-closed backstop for cause (c). An anonymizer-stage
+       leak is not among the live causes any more: :func:`_build_anon_facts`
+       constructs the anon-stage fact array directly from ``graph.relations``
+       and the mapping, so an orphan placeholder in a LOCAL fact is
+       structurally impossible — the only source reaching this sweep is
+       SOTA's *returned* facts.
 
     Non-dict entries in ``facts`` are silently skipped — never counted
     in any returned list.

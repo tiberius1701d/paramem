@@ -67,6 +67,7 @@ from paramem.graph.document_chunker import (  # noqa: E402
     chunk_pdf_file,
     chunk_text_file,
 )
+from paramem.server.session_buffer import SessionBuffer  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Input loading
@@ -76,35 +77,52 @@ from paramem.graph.document_chunker import (  # noqa: E402
 def _load_chunks(path: Path, source_type_override: str | None) -> tuple[list[dict], str]:
     """Return ``(chunks, source_type)`` for ``path``.
 
-    Each chunk dict carries ``text`` and ``chunk_index``.  ``source_type`` is
-    auto-inferred from extension unless overridden.
+    Each chunk dict carries ``text`` and ``chunk_index``.  ``text`` is
+    rendered through :meth:`SessionBuffer._format_turns` — the SAME
+    turn-marking renderer every production producer uses (``/chat``,
+    document ingest, cloud egress) — so the transcript this tool POSTs to
+    ``/calibrate/*`` is the ``[user] <text>`` / ``[assistant] <text>``
+    surface the prompts' few-shots are actually calibrated on, not a
+    hand-rolled second renderer.  ``source_type`` is auto-inferred from
+    extension unless overridden.
     """
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         cs = chunk_pdf_file(path)
-        return (
-            [{"text": c.text, "chunk_index": c.chunk_index} for c in cs],
-            source_type_override or "document",
-        )
-    if suffix in (".md", ".markdown"):
+        chunks = [{"text": c.text, "chunk_index": c.chunk_index} for c in cs]
+        source_type = source_type_override or "document"
+    elif suffix in (".md", ".markdown"):
         cs = chunk_markdown_file(path)
-        return (
-            [{"text": c.text, "chunk_index": c.chunk_index} for c in cs],
-            source_type_override or "document",
-        )
-    if suffix == ".txt":
+        chunks = [{"text": c.text, "chunk_index": c.chunk_index} for c in cs]
+        source_type = source_type_override or "document"
+    elif suffix == ".txt":
         cs = chunk_text_file(path)
-        return (
-            [{"text": c.text, "chunk_index": c.chunk_index} for c in cs],
-            source_type_override or "document",
-        )
-    if suffix == ".jsonl":
-        # Multi-turn transcript: load and concatenate as a single chunk.
+        chunks = [{"text": c.text, "chunk_index": c.chunk_index} for c in cs]
+        source_type = source_type_override or "document"
+    elif suffix == ".jsonl":
+        # Multi-turn transcript: render every turn through the production
+        # renderer — preserves the real per-turn role alternation, unlike
+        # the previous bare-text concatenation (which lost role info and
+        # never emitted a marker at all).
         with path.open() as f:
             turns = [json.loads(line) for line in f if line.strip()]
-        text = "\n".join(t.get("text", "") for t in turns if t.get("text"))
-        return ([{"text": text, "chunk_index": 0}], source_type_override or "transcript")
-    raise SystemExit(f"Unsupported input extension: {suffix}")
+        lines, _ = SessionBuffer._format_turns(turns)
+        return (
+            [{"text": "\n".join(lines), "chunk_index": 0}],
+            source_type_override or "transcript",
+        )
+    else:
+        raise SystemExit(f"Unsupported input extension: {suffix}")
+
+    # Document-shaped inputs: production always ingests document chunks via
+    # ``SessionBuffer.append_document_chunk(..., "user", ...)``
+    # (paramem/server/app.py), so each chunk renders as a single
+    # ``[user] <chunk text>`` line — call the SAME renderer, not a shape
+    # mimic, so a future marker-format change here changes with it.
+    for c in chunks:
+        marked_lines, _ = SessionBuffer._format_turns([{"role": "user", "text": c["text"]}])
+        c["text"] = "\n".join(marked_lines)
+    return chunks, source_type
 
 
 # ---------------------------------------------------------------------------
@@ -654,9 +672,9 @@ def main(argv: list[str] | None = None) -> int:
             "Forwarded to /calibrate/extract — pipeline returns immediately "
             "after the named phase completes (saves compute when only early "
             "phases need inspection). Valid names: local_extract, "
-            "ha_validation, anonymize, anonymize_verify, "
-            "anonymize_repair, sota_enrich, anon_plausibility, deanon, "
-            "deanon_plausibility. Default: run full pipeline."
+            "ha_validation, anonymize, entity_correction, sota_enrich, "
+            "anon_plausibility, deanon, deanon_plausibility. Default: run "
+            "full pipeline."
         ),
     )
     parser.add_argument(
@@ -778,14 +796,24 @@ def main(argv: list[str] | None = None) -> int:
                 (f"03_enrich_chunk_{chunk_idx}.json", "enrich"),
             ]:
                 f = seed_from / fname
-                if f.exists():
-                    blob = json.loads(f.read_text())
-                    if slot == "extract":
-                        prior_extract = blob
-                    elif slot == "anonymize":
-                        prior_anonymize = blob
-                    elif slot == "enrich":
-                        prior_enrich = blob
+                if not f.exists():
+                    continue
+                blob = json.loads(f.read_text())
+                if slot == "extract":
+                    # 01_extract_chunk_N.json is written as a WRAPPER
+                    # ({"stage", "chunk_index", "candidate_runs": [...]}) —
+                    # unlike 02_/03_, which write the raw stage response
+                    # directly. `prior_extract` must carry the same
+                    # {"parsed", ...} shape a live "extract" stage leaves in
+                    # it (`prior_extract = extract_runs[0]` below), or
+                    # downstream `.get("parsed")` reads see nothing and the
+                    # "enrich" stage builds its payload from an EMPTY graph.
+                    runs = blob.get("candidate_runs") or []
+                    prior_extract = runs[0] if runs else None
+                elif slot == "anonymize":
+                    prior_anonymize = blob
+                elif slot == "enrich":
+                    prior_enrich = blob
 
         if "extract" in stages:
             extract_runs: list[dict] = []
@@ -878,15 +906,69 @@ def main(argv: list[str] | None = None) -> int:
             )
             prior_anonymize = anon
 
-        if "enrich" in stages and prior_anonymize is not None:
+        if "enrich" in stages and prior_extract is not None and prior_anonymize is not None:
+            # The anonymize stage returns ONLY the mapping — no facts,
+            # no transcript.  Build both here through the SAME production
+            # primitives `_sota_pipeline` uses — never a hand-rolled scrub:
+            #   1. `_build_anonymization_mapping` — the LLM's mapping is a
+            #      HINT only; the deterministic builder mints a placeholder
+            #      for every `graph.entities` name the LLM never named (a
+            #      chunk whose mapping covers "Alex" but misses "Millfield"
+            #      still gets "Millfield" scrubbed).  This is what actually
+            #      closes the leak class a post-hoc check would have caught.
+            #   2. `_build_anon_facts` — one fact per LOCAL relation,
+            #      subject/object substituted through the now-complete
+            #      forward map, predicate/relation_type/confidence VERBATIM.
+            # No post-hoc leak check: the payload is built from a table the
+            # script mints and owns via the same exact, case-sensitive
+            # primitive that built the table.  Substitution is
+            # case-SENSITIVE and that is load-bearing: case is the only
+            # signal separating a person named `Bill` from the common
+            # noun `bill`.  Any case-insensitive match over entity names
+            # cannot tell a real leak from ordinary prose — this script
+            # must not introduce one.
+            from paramem.graph.extractor import _anonymize_transcript
+            from paramem.graph.placeholders import (
+                _build_anon_facts,
+                _build_anonymization_mapping,
+                _normalize_anonymization_mapping,
+            )
+            from paramem.graph.schema import SessionGraph
+
             anon_parsed = prior_anonymize.get("parsed") or {}
+            # `mapping is None` means the anonymizer parse FAILED — matches
+            # production's abort-on-None (`extractor.py`'s `_sota_pipeline`:
+            # `if mapping is None:` falls back without ever calling the
+            # cloud).  `or {}` here would collapse that failure into "found
+            # nothing", building the SOTA payload from zero scrubbing
+            # instead of skipping the call — never a truthiness check on a
+            # mapping per CLAUDE.md.
+            raw_mapping = anon_parsed.get("mapping")
+            if raw_mapping is None:
+                print(
+                    f"Chunk {chunk_idx}: anonymizer mapping is None (parse "
+                    f"failure) — skipping enrich stage, no cloud call made."
+                )
+                continue
+            llm_mapping, _norm_stats = _normalize_anonymization_mapping(raw_mapping)
+            local_graph = SessionGraph.model_validate(prior_extract.get("parsed") or {})
+
+            mapping, _reverse = _build_anonymization_mapping(
+                local_graph.entities,
+                llm_mapping,
+                pii_scope=None,
+                speaker_name=args.speaker,
+            )
+            anon_transcript = _anonymize_transcript(chunk["text"], mapping)
+            anon_facts = _build_anon_facts(local_graph.relations, mapping)
+
             enrich_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['enrich']}"
             enrich_filename = (
                 enrich_calib if (prompts_dir / enrich_calib).exists() else _STAGE_FILENAME["enrich"]
             )
             enriched = _run_enrich(
-                facts=anon_parsed.get("anonymized_facts") or [],
-                transcript=anon_parsed.get("anonymized_transcript") or "",
+                facts=anon_facts,
+                transcript=anon_transcript,
                 prompts_dir=prompts_dir,
                 prompt_filename=enrich_filename,
                 sota_route=args.sota_route,
