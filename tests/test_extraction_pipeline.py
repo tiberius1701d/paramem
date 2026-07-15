@@ -3746,6 +3746,18 @@ class TestConsolidationScheduleConfigPrivacyGuard:
         assert cfg.extraction_plausibility_judge == "auto"
         assert cfg.extraction_plausibility_stage == "deanon"
 
+    def test_extraction_noise_filter_defaults_to_disabled(self):
+        """Privacy invariant: a config that omits ``extraction_noise_filter``
+        must NOT default to a cloud provider. ``""`` is the disabled
+        sentinel — a deployment whose YAML omits the key must not silently
+        send extraction-pipeline content to the cloud (see SECURITY.md's
+        stated default posture).
+        """
+        from paramem.server.config import ConsolidationScheduleConfig
+
+        cfg = ConsolidationScheduleConfig()
+        assert cfg.extraction_noise_filter == ""
+
     def test_minimal_yaml_loads_with_defaults(self, tmp_path):
         """Back-compat: minimal yaml without new keys loads with all new defaults.
 

@@ -464,7 +464,7 @@ def test_server_yaml_extraction_flags_round_trip(tmp_path):
     flipped = {
         "extraction_max_tokens": 4096,
         "extraction_ha_validation": False,
-        "extraction_noise_filter": "",
+        "extraction_noise_filter": "anthropic",
         "extraction_noise_filter_model": "claude-other",
         "extraction_noise_filter_endpoint": "http://custom:8080/v1",
         "extraction_plausibility_judge": "off",
