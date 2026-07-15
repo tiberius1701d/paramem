@@ -324,6 +324,32 @@ def compute_simhash(
     return fingerprint
 
 
+def entry_simhash(entry: dict) -> int:
+    """Compute the SimHash fingerprint for an entry from its OWN stored fields.
+
+    This is THE single primitive for turning an entry dict into a fingerprint.
+    Every mint/registration site must route through this function instead of
+    reconstructing a ``compute_simhash(key, subject, predicate, object)`` call
+    inline against some other representation of the fact (e.g. a graph node
+    key). :func:`verify_confidence` rebuilds its candidate fingerprint from
+    exactly these same entry fields (``entry.get("subject")`` /
+    ``entry.get("predicate")`` / ``entry.get("object")``) at recall time — so
+    hashing anything other than the entry's own ``subject``/``predicate``/
+    ``object`` desyncs the registered fingerprint from what recall verifies
+    against, silently corrupting the confidence score and — below
+    :data:`DEFAULT_CONFIDENCE_THRESHOLD` — dropping the fact.
+
+    Args:
+        entry: Dict containing at minimum ``key``, ``subject``, ``predicate``,
+            and ``object`` — the exact fields written into the store / used to
+            build the training example.
+
+    Returns:
+        The 64-bit SimHash fingerprint for this entry.
+    """
+    return compute_simhash(entry["key"], entry["subject"], entry["predicate"], entry["object"])
+
+
 def verify_confidence(
     recalled: dict,
     registry: dict[str, int] | dict[str, dict] | None = None,
@@ -382,10 +408,7 @@ def build_registry(entries: list[dict]) -> dict[str, int]:
     Returns:
         Dict mapping each key to its SimHash fingerprint.
     """
-    return {
-        p["key"]: compute_simhash(p["key"], p["subject"], p["predicate"], p["object"])
-        for p in entries
-    }
+    return {p["key"]: entry_simhash(p) for p in entries}
 
 
 # --- Probe ---

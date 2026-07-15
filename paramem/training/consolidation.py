@@ -42,7 +42,7 @@ from paramem.graph.schema_config import fallback_relation_type, relation_types
 from paramem.memory.entry import (
     assign_keys,
     build_registry,
-    compute_simhash,
+    entry_simhash,
     format_entry_training,
 )
 from paramem.models.loader import atomic_save_adapter, switch_adapter
@@ -4343,12 +4343,7 @@ class ConsolidationLoop:
                             adapter_name,
                             _key,
                             _entry,
-                            simhash=compute_simhash(
-                                _key,
-                                _entry["subject"],
-                                rec["predicate"],
-                                _entry["object"],
-                            ),
+                            simhash=entry_simhash(_entry),
                         )
                         self.store.set_bookkeeping(
                             _key,
@@ -5925,7 +5920,7 @@ class ConsolidationLoop:
                         tier,
                         minted_key,
                         entry,
-                        simhash=compute_simhash(minted_key, _t_subj, pred, _t_obj),
+                        simhash=entry_simhash(entry),
                     )
                     self.store.set_bookkeeping(
                         minted_key,

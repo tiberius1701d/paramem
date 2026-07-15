@@ -9532,6 +9532,127 @@ class TestHarvestKeylessEdgesSpeakerId:
 
 
 # ---------------------------------------------------------------------------
+# _build_all_edge_entries_into (fold path) — SimHash fingerprint must be
+# computed over the entry's OWN display surface, not the graph's
+# canonical()-folded node keys.
+# ---------------------------------------------------------------------------
+
+
+class TestMintedFingerprintMatchesEntryDisplaySurface:
+    """Regression: the fold-path fingerprint (store.put(..., simhash=...) at the
+    keyless-branch mint site) must hash the entry's stored subject/predicate/
+    object — exactly what MemoryStore._confidence_gate reconstructs at recall
+    time — not the graph's canonical() node keys (_t_subj / _t_obj).
+
+    canonical() folds separators (``-``/``_``) and diacritics, so any name
+    where canonical(name) != name (hyphenated or diacritic names) desyncs the
+    two representations.  Before the fix this drops the fact silently at
+    recall once the SimHash confidence falls below
+    entry.DEFAULT_CONFIDENCE_THRESHOLD.
+    """
+
+    def _make_loop(self, tmp_path):
+        """Minimal ConsolidationLoop stub with a real GraphMerger + a
+        replay-enabled MemoryStore — no GPU required."""
+        from peft import PeftModel
+
+        from paramem.graph.merger import GraphMerger
+        from paramem.memory.store import MemoryStore
+        from paramem.training.consolidation import ConsolidationLoop
+        from paramem.training.key_registry import KeyRegistry
+        from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
+
+        loop = object.__new__(ConsolidationLoop)
+        loop.model = MagicMock()
+        loop.model.__class__ = PeftModel
+        loop.tokenizer = MagicMock()
+        loop.config = ConsolidationConfig(min_tier_key_floor=0, tier_fast_start=False)
+        loop.training_config = TrainingConfig(num_epochs=1, gradient_checkpointing=False)
+        loop.episodic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.semantic_config = AdapterConfig(rank=4, alpha=8, target_modules=["q_proj"])
+        loop.procedural_config = None
+        loop.wandb_config = None
+        loop._thermal_policy = None
+        loop.output_dir = tmp_path
+        loop.store = MemoryStore(replay_enabled=True)
+        for tier in ("episodic", "semantic", "procedural"):
+            loop.store.load_registry(tier, KeyRegistry())
+        loop.promoted_keys = set()
+        loop.cycle_count = 1
+        loop._procedural_next_index = 0
+        loop._procedural_tentative_next_index = 0
+        loop._indexed_next_index = 0
+        loop._indexed_ep_interim = {}
+        loop._bg_trainer = None
+        loop.shutdown_requested = False
+        loop._early_stop_callback = None
+        loop.fingerprint_cache = None
+        loop._keep_prior_slots = 2
+        loop._debug_base = None
+        loop.save_cycle_snapshots = False
+        loop.snapshot_dir = None
+        loop.merger = GraphMerger()
+        return loop
+
+    def test_hyphenated_diacritic_name_recalls_above_confidence_threshold(self, tmp_path):
+        """subject/object with canonical() != display surface must still
+        recall at >= DEFAULT_CONFIDENCE_THRESHOLD after a fold-path mint."""
+        from paramem.graph.schema import Entity, Relation, SessionGraph
+        from paramem.memory.entry import DEFAULT_CONFIDENCE_THRESHOLD
+
+        loop = self._make_loop(tmp_path)
+
+        rel = Relation(
+            subject="Jean-Luc Picard",
+            predicate="lives in",
+            object="Saint-Étienne",
+            relation_type="factual",
+            speaker_id="",
+        )
+        session = SessionGraph(
+            session_id="s001",
+            timestamp="2026-01-01T00:00:00+00:00",
+            entities=[
+                Entity(name="Jean-Luc Picard", entity_type="person"),
+                Entity(name="Saint-Étienne", entity_type="place"),
+            ],
+            relations=[rel],
+        )
+        loop.merger.merge(session)
+
+        # Sanity: canonical() actually folds these names (otherwise the test
+        # would not exercise the divergence at all).
+        from paramem.graph.name_match import canonical
+
+        assert canonical("Jean-Luc Picard") != "Jean-Luc Picard"
+        assert canonical("Saint-Étienne") != "Saint-Étienne"
+
+        tier_keyed: dict = {"episodic": [], "procedural": []}
+        loop._build_all_edge_entries_into(tier_keyed)
+
+        minted = tier_keyed["episodic"] + tier_keyed["procedural"]
+        assert len(minted) == 1, f"Expected exactly 1 minted entry; got {minted}"
+        minted_key = minted[0]["key"]
+
+        # Entry stored verbatim (display surface), not the canonical node key.
+        stored = loop.store.get(minted_key)
+        assert stored is not None
+        assert stored["subject"] == "Jean-Luc Picard"
+        assert stored["object"] == "Saint-Étienne"
+
+        results = loop.store.probe({"episodic": [minted_key], "procedural": [minted_key]})
+        rendered = results.get(minted_key)
+        assert rendered is not None, (
+            "Fact was dropped at recall — the registered SimHash fingerprint "
+            "does not match the entry's own display surface."
+        )
+        assert rendered["confidence"] >= DEFAULT_CONFIDENCE_THRESHOLD, (
+            f"Confidence {rendered['confidence']} below threshold "
+            f"{DEFAULT_CONFIDENCE_THRESHOLD} — fingerprint desynced from entry."
+        )
+
+
+# ---------------------------------------------------------------------------
 # _build_all_edge_entries_into — unified edge→entry builder (keyed branch)
 # ---------------------------------------------------------------------------
 

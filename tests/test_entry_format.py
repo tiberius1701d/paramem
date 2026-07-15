@@ -11,12 +11,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from paramem.memory.entry import (
+    DEFAULT_CONFIDENCE_THRESHOLD,
     RECALL_TEMPLATE,
     SIMHASH_BITS,
     _build_response,
     assign_keys,
     build_registry,
     compute_simhash,
+    entry_simhash,
     format_entry_training,
     parse_recalled_entry,
     simhash_confidence,
@@ -243,6 +245,66 @@ class TestComputeSimhash:
     def test_empty_content(self):
         result = compute_simhash("graph1", "", "", "")
         assert isinstance(result, int)
+
+
+# --- entry_simhash ---
+
+
+class TestEntrySimhash:
+    """entry_simhash is THE single primitive every mint site must route
+    through — it must hash exactly the entry's own stored fields, matching
+    what verify_confidence reconstructs from a recalled/rendered entry."""
+
+    def test_matches_compute_simhash_on_same_fields(self):
+        entry = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
+        assert entry_simhash(entry) == compute_simhash("graph1", "Alice", "lives_in", "Berlin")
+
+    def test_matches_build_registry_for_same_entry(self):
+        entry = {"key": "graph1", "subject": "Alice", "predicate": "lives_in", "object": "Berlin"}
+        registry = build_registry([entry])
+        assert entry_simhash(entry) == registry["graph1"]
+
+    def test_recall_verifies_at_full_confidence_against_own_registration(self):
+        """The fingerprint entry_simhash registers for an entry must verify at
+        1.0 confidence when verify_confidence rebuilds the candidate from that
+        SAME entry — the exact contract the two consolidation mint sites rely
+        on (registered fingerprint == what recall reconstructs)."""
+        entry = {
+            "key": "graph1",
+            "subject": "Jean-Luc Picard",
+            "predicate": "lives in",
+            "object": "Saint-Étienne",
+        }
+        registry = {entry["key"]: entry_simhash(entry)}
+        assert verify_confidence(entry, registry) == 1.0
+
+    def test_diverges_from_hashing_a_different_surface_of_the_same_fact(self):
+        """Hashing a DIFFERENT representation of the same fact (e.g. the
+        canonical()-folded graph node key instead of the entry's own display
+        subject/object) must desync from what verify_confidence reconstructs
+        from the entry — this is the exact bug entry_simhash closes."""
+        from paramem.graph.name_match import canonical
+
+        entry = {
+            "key": "graph1",
+            "subject": "Jean-Luc Picard",
+            "predicate": "lives in",
+            "object": "Saint-Étienne",
+        }
+        wrong_fp = compute_simhash(
+            entry["key"],
+            canonical(entry["subject"]),
+            entry["predicate"],
+            canonical(entry["object"]),
+        )
+        registry = {entry["key"]: wrong_fp}
+        confidence = verify_confidence(entry, registry)
+        assert confidence < DEFAULT_CONFIDENCE_THRESHOLD, (
+            f"Expected the canonical-node-key fingerprint to desync below "
+            f"threshold; got confidence={confidence}"
+        )
+        # entry_simhash (the fix) does not reproduce the divergent fingerprint.
+        assert entry_simhash(entry) != wrong_fp
 
 
 # --- verify_confidence ---
