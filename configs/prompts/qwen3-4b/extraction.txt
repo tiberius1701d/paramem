@@ -146,33 +146,33 @@ NEGATIVE example — transcript: "[user] Page 4 of 12"
 Extract: NONE — page numbers are structural noise.
 
 
-POSITIVE example — speaker id is "speaker0" (display name "Jordan"), transcript: "[user] I'm Jordan Ellis. I led the Astra robotics platform at NovaTech, scaling the team from 8 to 60 engineers across 3 countries. We delivered 2 compute platforms to production. I also authored the paper 'Adaptive Control for Mobile Manipulators'."
-{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{"last_name": "Ellis"}}}},
- {{"name": "NovaTech", "entity_type": "organization", "attributes": {{}}}},
- {{"name": "Astra", "entity_type": "concept", "attributes": {{"domain": "robotics platform"}}}},
- {{"name": "Adaptive Control for Mobile Manipulators", "entity_type": "concept", "attributes": {{"type": "paper"}}}}],
+POSITIVE example — speaker id is "speaker0" (display name "Casey"), transcript: "[user] I'm Casey Bloom. I led the Riverside Youth Choir program at Harmony Arts Center, growing the choir from 15 to 100 singers across 4 countries. We performed 2 international tours. I also composed the piece 'Echoes of Dawn'."
+{{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{"last_name": "Bloom"}}}},
+ {{"name": "Harmony Arts Center", "entity_type": "organization", "attributes": {{}}}},
+ {{"name": "Riverside Youth Choir", "entity_type": "concept", "attributes": {{"domain": "choir program"}}}},
+ {{"name": "Echoes of Dawn", "entity_type": "concept", "attributes": {{"type": "composition"}}}}],
  "relations": [
-   {{"subject": "speaker0", "predicate": "works_at", "object": "NovaTech", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "speaker0", "predicate": "led", "object": "Astra", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "speaker0", "predicate": "scaled_team_to", "object": "60 engineers", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "speaker0", "predicate": "delivered", "object": "2 compute platforms", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "speaker0", "predicate": "authored", "object": "Adaptive Control for Mobile Manipulators", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "speaker0 (Jordan Ellis) led the Astra robotics platform at NovaTech, scaled the team to 60 engineers, delivered 2 compute platforms, and authored a paper on adaptive control."}}
+   {{"subject": "speaker0", "predicate": "works_at", "object": "Harmony Arts Center", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "led", "object": "Riverside Youth Choir", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "grew_choir_to", "object": "100 singers", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "performed", "object": "2 international tours", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "composed", "object": "Echoes of Dawn", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 (Casey Bloom) led the Riverside Youth Choir program at Harmony Arts Center, grew the choir to 100 singers, performed 2 international tours, and composed a piece titled 'Echoes of Dawn'."}}
 
 
-POSITIVE example — speaker id is "speaker0", transcript: "[user] I completed my PhD in computational neuroscience at Lakeview University in 2019. During my doctorate I published 4 papers on neural signal decoding, received the Lakeview Graduate Excellence Award, and co-founded the NeuroSig open-source library used by over 200 labs worldwide."
+POSITIVE example — speaker id is "speaker0", transcript: "[user] I completed my PhD in marine ecology at Bellwether University in 2015. During my doctorate I published 5 papers on coral reef restoration, received the Bellwether Graduate Fellowship, and co-founded the ReefWatch open-source monitoring toolkit used by over 150 research stations worldwide."
 {{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
- {{"name": "Lakeview University", "entity_type": "organization", "attributes": {{}}}},
- {{"name": "PhD in Computational Neuroscience", "entity_type": "concept", "attributes": {{"institution": "Lakeview University", "year": "2019"}}}},
- {{"name": "Lakeview Graduate Excellence Award", "entity_type": "concept", "attributes": {{"type": "award"}}}},
- {{"name": "NeuroSig", "entity_type": "concept", "attributes": {{"type": "open-source library"}}}}],
+ {{"name": "Bellwether University", "entity_type": "organization", "attributes": {{}}}},
+ {{"name": "PhD in Marine Ecology", "entity_type": "concept", "attributes": {{"institution": "Bellwether University", "year": "2015"}}}},
+ {{"name": "Bellwether Graduate Fellowship", "entity_type": "concept", "attributes": {{"type": "award"}}}},
+ {{"name": "ReefWatch", "entity_type": "concept", "attributes": {{"type": "open-source toolkit"}}}}],
  "relations": [
-   {{"subject": "speaker0", "predicate": "holds_degree", "object": "PhD in Computational Neuroscience", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "speaker0", "predicate": "studied_at", "object": "Lakeview University", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "speaker0", "predicate": "published", "object": "4 papers on neural signal decoding", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "speaker0", "predicate": "received_award", "object": "Lakeview Graduate Excellence Award", "relation_type": "factual", "confidence": 1.0}},
-   {{"subject": "speaker0", "predicate": "co_founded", "object": "NeuroSig", "relation_type": "factual", "confidence": 1.0}}],
- "summary": "speaker0 completed a PhD in computational neuroscience at Lakeview University in 2019, published 4 papers, won the Graduate Excellence Award, and co-founded the NeuroSig open-source library."}}
+   {{"subject": "speaker0", "predicate": "holds_degree", "object": "PhD in Marine Ecology", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "studied_at", "object": "Bellwether University", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "published", "object": "5 papers on coral reef restoration", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "received_award", "object": "Bellwether Graduate Fellowship", "relation_type": "factual", "confidence": 1.0}},
+   {{"subject": "speaker0", "predicate": "co_founded", "object": "ReefWatch", "relation_type": "factual", "confidence": 1.0}}],
+ "summary": "speaker0 completed a PhD in marine ecology at Bellwether University in 2015, published 5 papers, won the Graduate Fellowship, and co-founded the ReefWatch open-source toolkit."}}
 
 
 Transcript:

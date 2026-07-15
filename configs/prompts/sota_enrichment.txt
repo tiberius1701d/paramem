@@ -90,9 +90,9 @@ Few-shot — input: `[8] parent_of(P, Q)` AND `[9] birth_parent_of(P, Q)`
 
 Only emit a new fact when the transcript directly states it.
 
-Few-shot — transcript: "scaled team from 15 to 100+ engineers across 4 countries"
-→ add `scaled_team_from(P, "15 engineers")`, `scaled_team_to(P, "100+ engineers")`, `managed_teams_across(P, "4 countries")`.
-→ DO NOT add `interviewed/hired/mentored(P, "15 engineers")` — actions not stated.
+Few-shot — transcript: "grew the choir from 15 to 100+ singers across 4 countries"
+→ add `grew_choir_from(P, "15 singers")`, `grew_choir_to(P, "100+ singers")`, `runs_choirs_across(P, "4 countries")`.
+→ DO NOT add `auditioned/recruited/trained(P, "15 singers")` — actions not stated.
 → DO NOT broadcast `operates_in(P, Country_X)` for each of the 4 countries — the transcript names a count, not a list.
 
 Few-shot — same artefact named twice ("Indexed Key Retrieval paper", "the parametric memory system")
