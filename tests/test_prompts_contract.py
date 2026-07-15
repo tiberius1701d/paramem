@@ -428,6 +428,70 @@ class TestExtractionPromptThirdPartySubjectContract:
             "no-relation-extracted fix (CORRECT: empty relations)."
         )
 
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_named_relative_chain_example_exists(self, model):
+        """A POSITIVE block must show a named-relative CHAIN: an entity
+        that is BOTH the object of a speaker0-subject relation (the
+        relationship edge, e.g. speaker0 -> has_sibling -> Nadia) AND the
+        subject of another relation in the same block (the relative's own
+        fact, e.g. Nadia -> lives_in -> Frankfurt).
+
+        Root cause (measured): Mistral 7B collapsed a single-relative
+        clause ("my brother Nadeem lives in Porto") into ONE relation,
+        dropping either the kinship edge or the attribute — never
+        emitting both. Without a worked chain example, the model has no
+        exemplar of the two-relation decomposition the rule prose (below)
+        demands.
+        """
+        tmpl = _extraction_prompt(model)
+        triple_re = re.compile(
+            r'"subject":\s*"([^"]+)",\s*"predicate":\s*"([^"]+)",\s*"object":\s*"([^"]+)"'
+        )
+        found = False
+        for block in _positive_blocks(tmpl):
+            triples = triple_re.findall(block)
+            speaker_objects = {obj for subj, _pred, obj in triples if subj == "speaker0"}
+            if any(subj in speaker_objects for subj, _pred, _obj in triples):
+                found = True
+                break
+        assert found, (
+            "No POSITIVE example shows a named relative as BOTH the "
+            "object of a speaker0 relationship edge AND the subject of "
+            "their own fact — the chain structure teaching two-relation "
+            "decomposition is missing."
+        )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_named_relative_decomposition_rule_stated(self, model):
+        """The rule prose (outside the worked examples) must state that a
+        speaker's relationship-named clause ("my brother Nadeem") is TWO
+        separate facts — the relationship edge on the speaker AND the
+        person's own fact on their own node — and must forbid collapsing
+        or dropping either one.
+
+        Root cause (measured): Mistral 7B collapsed a single-relative
+        clause into one relation, dropping either the kinship edge or the
+        attribute. Asserted structurally (co-located stable tokens, not
+        the literal sentence) so the prose can keep evolving without this
+        test going stale.
+        """
+        tmpl = _extraction_prompt(model)
+        prose = tmpl.split("POSITIVE example")[0]
+        assert re.search(r"relationship edge", prose, re.IGNORECASE), (
+            "Rule prose no longer states the relationship-edge half of the "
+            "named-relative decomposition."
+        )
+        assert re.search(r"own (fact|node)", prose, re.IGNORECASE), (
+            "Rule prose no longer states the relative's-own-fact half of "
+            "the named-relative decomposition."
+        )
+        assert re.search(r"collapse", prose, re.IGNORECASE), (
+            "Rule prose no longer forbids collapsing the two relations into one."
+        )
+        assert re.search(r"drop", prose, re.IGNORECASE), (
+            "Rule prose no longer forbids dropping either relation."
+        )
+
 
 class TestEnrichmentPromptContract:
     def test_renders_without_format_errors(self):

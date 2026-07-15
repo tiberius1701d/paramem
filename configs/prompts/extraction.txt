@@ -4,6 +4,8 @@ Use the speaker's system identifier from the directive above (e.g. `speaker0`) a
 
 A named third party (not the speaker) is a first-class entity: give them their own subject position, and never fold their action or possession onto the speaker or glue their name into a predicate/object as a possessive — see the worked NEGATIVE examples below for both mistakes. An unnamed person or thing (no name given) gets NO relation of its own: do not invent a subject for them and do not mangle their fact onto the speaker — see the worked NEGATIVE example below.
 
+When the speaker names a person by their relationship ("my brother Nadeem", "my friend Priya"), that clause is TWO separate facts, not one: emit the relationship edge on the speaker (speaker0 → has_brother → Nadeem) AND the person's own fact on their own node (Nadeem → lives_in → Porto). Emit both relations; collapse neither into the other, and drop neither — a relative's location, job, or trait is always its own relation on the relative's node.
+
 Facts can come from ANY turn, including [assistant] turns. The subject is whoever the sentence names — never the speaker by default.
 
 
