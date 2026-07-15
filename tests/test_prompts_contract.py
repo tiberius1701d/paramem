@@ -493,6 +493,69 @@ class TestExtractionPromptThirdPartySubjectContract:
         )
 
 
+def _second_order_prompt(model: str | None) -> str:
+    """Load the real (non-mocked) extraction_second_order.txt for a given model.
+
+    Mirrors :func:`_extraction_prompt` — ``_DEFAULT_PROMPT_DIR`` must be
+    passed explicitly for per-model resolution to engage.
+    """
+    return _load_prompt(
+        "extraction_second_order.txt", required=True, model=model, prompts_dir=_DEFAULT_PROMPT_DIR
+    )
+
+
+class TestExtractionSecondOrderPromptContract:
+    """Contract tests for ``extraction_second_order.txt`` (the
+    ``second_order_extract`` phase — a second local-model pass that
+    extracts facts ABOUT the named entities ``local_extract`` surfaced,
+    recovering a named relative's own attribute when ``local_extract``
+    collapses a single-relative clause ("my brother Nadeem lives in
+    Porto") into one relation instead of two).
+
+    The second-order pass is ATTRIBUTE-ONLY: it must teach re-extraction
+    of the named person's own fact with them as subject, and must NOT
+    re-emit the speaker's kinship edge onto them — that edge is already
+    captured by ``local_extract``. A POSITIVE example that emits a
+    ``speaker0``-subject relation would double-teach ground the
+    second-order pass has no business touching. Asserted structurally
+    (subject-set membership), not literal wording, so the prompt prose can
+    keep evolving.
+    """
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_positive_example_subject_is_named_person(self, model):
+        """At least one POSITIVE block must emit a relation whose subject
+        is a named person, not speaker0."""
+        tmpl = _second_order_prompt(model)
+        blocks = _positive_blocks(tmpl)
+        assert blocks, "No POSITIVE example blocks found in extraction_second_order.txt."
+        found = False
+        for block in blocks:
+            subjects = set(re.findall(r'"subject":\s*"([^"]+)"', block))
+            if subjects and "speaker0" not in subjects:
+                found = True
+                break
+        assert found, (
+            "No POSITIVE example in extraction_second_order.txt emits a relation "
+            "whose subject is a named person (not speaker0)."
+        )
+
+    @pytest.mark.parametrize("model", [None, "qwen3-4b"], ids=["base", "qwen3-4b"])
+    def test_no_positive_example_emits_speaker0_subject(self, model):
+        """NO POSITIVE block may emit a speaker0-subject relation — the
+        second-order pass must not re-emit the kinship edge
+        ``local_extract`` already recorded."""
+        tmpl = _second_order_prompt(model)
+        blocks = _positive_blocks(tmpl)
+        assert blocks, "No POSITIVE example blocks found in extraction_second_order.txt."
+        for block in blocks:
+            subjects = set(re.findall(r'"subject":\s*"([^"]+)"', block))
+            assert "speaker0" not in subjects, (
+                "POSITIVE example re-emits a speaker0-subject relation — the "
+                f"second-order pass must not re-emit kinship edges: {block!r}"
+            )
+
+
 class TestEnrichmentPromptContract:
     def test_renders_without_format_errors(self):
         """No stray single-brace placeholders that collide with .format()."""

@@ -575,6 +575,111 @@ def extract_procedural_graph(
     return graph
 
 
+# Filename of the second-order extraction pass — it extracts facts ABOUT
+# the named entities local_extract (first-order) surfaced, recovering a
+# named relative's own attribute (location, job, trait) when Mistral 7B
+# collapses a single-relative clause ("my brother Nadeem lives in Porto")
+# into ONE relation instead of two. Reuses DEFAULT_SYSTEM_PROMPT_FILENAME —
+# no second-order-specific system prompt.
+DEFAULT_SECOND_ORDER_USER_PROMPT_FILENAME = "extraction_second_order.txt"
+
+
+def _run_local_extraction(
+    model,
+    tokenizer,
+    transcript: str,
+    session_id: str,
+    speaker_id: str,
+    temperature: float,
+    max_tokens: int,
+    prompts_dir: str | Path | None,
+    speaker_name: str | None,
+    system_prompt_filename: str,
+    user_prompt_filename: str,
+    model_alias: str | None,
+    seed: int | None,
+    timestamp: str | None,
+    source_type: str,
+    *,
+    phase_name: str,
+) -> SessionGraph:
+    """Shared generate→parse→summarise→trace primitive for a local-model
+    extraction phase.
+
+    This is the ONE shared implementation for BOTH local-model extraction
+    passes ``extract_graph`` runs — ``local_extract`` (first-order:
+    extracts from the raw transcript) and ``second_order_extract``
+    (second-order: re-extracts facts about the named non-speaker people
+    ``local_extract`` surfaced) — differing only by which prompt is loaded
+    (``user_prompt_filename``) and the ``phase_name`` recorded on the
+    trace. Must be called from inside an active
+    :func:`~paramem.graph.phase_trace.extraction_trace` scope (both call
+    sites are, via :func:`extract_graph`).
+
+    On parse failure, records ``outcome="failed"`` on the phase trace and
+    returns an empty :class:`SessionGraph` for ``session_id``/``timestamp``
+    — mirrors pre-carve-out ``local_extract`` behaviour. The caller decides
+    what an empty result means (``local_extract``'s caller returns
+    immediately; ``second_order_extract``'s caller has nothing to union).
+    """
+    with phase_trace(phase_name) as t:
+        raw_output = _generate_extraction(
+            model,
+            tokenizer,
+            transcript,
+            temperature,
+            max_tokens,
+            prompts_dir,
+            speaker_name,
+            speaker_id=speaker_id,
+            system_prompt_filename=system_prompt_filename,
+            user_prompt_filename=user_prompt_filename,
+            model_alias=model_alias,
+            seed=seed,
+        )
+        t.set_raw(raw_output)
+        logger.debug("Raw extraction output (%s): %s", phase_name, raw_output[:500])
+        try:
+            graph = _parse_extraction(
+                raw_output,
+                session_id,
+                speaker_id=speaker_id,
+                speaker_name=speaker_name,
+                timestamp=timestamp,
+                source_type=source_type,
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s parsing failed (%s), returning empty graph",
+                phase_name,
+                exc,
+            )
+            t.set_outcome("failed", reason=f"{type(exc).__name__}: {exc}")
+            t.set_parsed({"entity_count": 0, "relation_count": 0})
+            return SessionGraph(
+                session_id=session_id,
+                timestamp=timestamp or datetime.now(timezone.utc).isoformat(),
+            )
+        t.set_parsed(_summarise_graph(graph))
+    return graph
+
+
+def _has_named_non_speaker_person(graph: SessionGraph) -> bool:
+    """Gate for the ``second_order_extract`` phase: does the pass-1 graph
+    contain a named (proper-name) person entity other than a speaker id?
+
+    ``local_extract`` is speaker-centric, so a clause naming a non-speaker
+    person by relationship ("my brother Nadeem lives in Porto") tends to
+    keep only the speaker->person edge and drop that person's OWN fact
+    (measured on Mistral 7B). A surviving named non-speaker person entity
+    is exactly the set of people this failure mode can hit, and exactly
+    what ``second_order_extract`` re-extracts facts about — so it is the
+    gate: no such entity means nothing to recover, and the caller skips
+    the phase entirely (no LLM call, no phase_trace record).
+    """
+    return any(e.entity_type == "person" and not is_speaker_id(e.name) for e in graph.entities)
+
+
 def extract_graph(
     model,
     tokenizer,
@@ -609,8 +714,15 @@ def extract_graph(
 
     Multi-pass pipeline:
     1. Extract candidate triples from transcript
-    2. Validate with HA context — location ground truth (configurable)
-    3. SOTA pipeline (anonymize → enrich → plausibility → de-anonymize, configurable)
+    2. Second-order extraction: ``local_extract`` is speaker-centric, so a
+       clause naming a non-speaker person by relationship ("my brother
+       Nadeem lives in Porto") tends to keep only the speaker->person edge
+       and drop that person's OWN fact (measured on Mistral 7B). This pass
+       re-extracts facts ABOUT each named non-speaker person the first
+       pass surfaced and unions them in; predicate drift or redundant
+       re-emits are left to the existing merger dedup and normalization.
+    3. Validate with HA context — location ground truth (configurable)
+    4. SOTA pipeline (anonymize → enrich → plausibility → de-anonymize, configurable)
 
     All filters fail gracefully — extraction result is preserved on any failure.
 
@@ -704,46 +816,78 @@ def extract_graph(
             # debugging diffs prompt variants by comparing this raw_output,
             # before any downstream phase has had a chance to mutate the
             # result).
-            with phase_trace("local_extract") as t:
-                raw_output = _generate_extraction(
-                    model,
-                    tokenizer,
-                    transcript,
-                    temperature,
-                    max_tokens,
-                    prompts_dir,
-                    speaker_name,
-                    speaker_id=speaker_id,
-                    system_prompt_filename=system_prompt_filename,
-                    user_prompt_filename=user_prompt_filename,
-                    model_alias=model_alias,
-                    seed=seed,
-                )
-                t.set_raw(raw_output)
-                logger.debug("Raw extraction output: %s", raw_output[:500])
-                try:
-                    graph = _parse_extraction(
-                        raw_output,
-                        session_id,
-                        speaker_id=speaker_id,
-                        speaker_name=speaker_name,
-                        timestamp=timestamp,
-                        source_type=source_type,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Extraction parsing failed (%s), returning empty graph",
-                        exc,
-                    )
-                    t.set_outcome("failed", reason=f"{type(exc).__name__}: {exc}")
-                    t.set_parsed({"entity_count": 0, "relation_count": 0})
-                    return graph
-                t.set_parsed(_summarise_graph(graph))
+            graph = _run_local_extraction(
+                model,
+                tokenizer,
+                transcript,
+                session_id,
+                speaker_id,
+                temperature,
+                max_tokens,
+                prompts_dir,
+                speaker_name,
+                system_prompt_filename,
+                user_prompt_filename,
+                model_alias,
+                seed,
+                timestamp,
+                source_type,
+                phase_name="local_extract",
+            )
             if stop_phase == "local_extract":
                 return graph
 
             if not graph.relations:
                 return graph
+
+            # Second-order extraction: extracts facts ABOUT the named
+            # entities local_extract (first-order) surfaced, recovering a
+            # named relative's own attribute (location, job, trait) when
+            # local_extract collapsed a single-relative clause ("my brother
+            # Nadeem lives in Porto") into ONE relation instead of two
+            # (measured Mistral 7B failure mode). Unconditional except for
+            # the gate: nothing to recover when the pass-1 graph has no
+            # named non-speaker person, so the phase is skipped entirely
+            # (no LLM call, no phase_trace record) rather than firing on
+            # every session.
+            if _has_named_non_speaker_person(graph):
+                second_order_graph = _run_local_extraction(
+                    model,
+                    tokenizer,
+                    transcript,
+                    session_id,
+                    speaker_id,
+                    temperature,
+                    max_tokens,
+                    prompts_dir,
+                    speaker_name,
+                    system_prompt_filename,
+                    DEFAULT_SECOND_ORDER_USER_PROMPT_FILENAME,
+                    model_alias,
+                    seed,
+                    timestamp,
+                    source_type,
+                    phase_name="second_order_extract",
+                )
+                # Plain union: the second-order pass contributes recovered
+                # facts (recall) — it is not a dedup boundary.
+                # Predicate-surface drift for a fact both passes capture
+                # (e.g. "picked_up" vs "picks_up") is a PRE-EXISTING
+                # pipeline phenomenon (the same drift already happens
+                # across sessions) and is handled downstream exactly as
+                # cross-session drift is: triple-identity dedup at
+                # GraphMerger._upsert_relation Case 1 (paramem/graph/
+                # merger.py:580) and, when enabled,
+                # refinement_normalization's (subject, object)-grouped
+                # predicate-synonym fold. A redundant near-dup key is benign
+                # — not a wrong answer, at worst a redundant indexed key —
+                # so it is deliberately NOT special-cased here; filtering on
+                # (subject, object) identity would also destroy genuinely
+                # distinct same-(s,o) facts (e.g. born_in + lives_in).
+                graph.relations.extend(second_order_graph.relations)
+                graph.entities.extend(second_order_graph.entities)
+                if stop_phase == "second_order_extract":
+                    return graph
 
             # HA validation (pure-Python; no LLM call).
             if ha_validation and ha_context:

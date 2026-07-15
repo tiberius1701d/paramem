@@ -53,6 +53,15 @@ step runs (in firing order for the default configuration):
 Phase                       Notes
 ==========================  ===============================================
 ``local_extract``           Mistral runs the extraction prompt.
+``second_order_extract``    ``local_extract`` is speaker-centric, so a
+                            clause naming a non-speaker person by
+                            relationship tends to keep only the
+                            speaker->person edge and drop that person's
+                            OWN fact. This pass re-extracts facts ABOUT
+                            each named non-speaker person ``local_extract``
+                            surfaced. Gated on the pass-1 graph containing
+                            such an entity; skipped entirely (no record)
+                            otherwise.
 ``ha_validation``           Pure-Python location validation against HA
                             home context. ``raw_output=None``.
 ``anonymize``               Mistral runs the anonymizer; emits ONLY the
@@ -112,6 +121,7 @@ if TYPE_CHECKING:
 # simply do not fire — order in the trace reflects what actually ran.
 PHASE_NAMES: tuple[str, ...] = (
     "local_extract",
+    "second_order_extract",
     "ha_validation",
     "anonymize",
     "entity_correction",

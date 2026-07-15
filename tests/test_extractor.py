@@ -12,6 +12,7 @@ from paramem.graph.extractor import (
     extract_graph,
     extract_procedural_graph,
 )
+from paramem.graph.phase_trace import get_phases
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
@@ -648,6 +649,221 @@ class TestTimestampPropagation:
         after = datetime.now(timezone.utc)
         parsed = datetime.fromisoformat(graph.timestamp)
         assert before <= parsed <= after
+
+
+class TestSecondOrderExtractPhase:
+    """Unit tests for the ``second_order_extract`` phase — gate, union, and
+    ``stop_phase`` contract.
+
+    Mocks ``_generate_extraction`` (dispatched on the ``user_prompt_filename``
+    kwarg, which differs between ``local_extract`` and
+    ``second_order_extract``) so the tests run on CPU with no real model —
+    the surface under test is the gate/union/stop_phase plumbing, not
+    generation quality.
+    """
+
+    def _pass1_no_named_person(self) -> str:
+        """Pass-1 output with only the speaker + a place — no named
+        non-speaker person, so the gate must fail."""
+        return json.dumps(
+            {
+                "entities": [
+                    {"name": "speaker0", "entity_type": "person"},
+                    {"name": "Berlin", "entity_type": "place"},
+                ],
+                "relations": [
+                    {
+                        "subject": "speaker0",
+                        "predicate": "lives_in",
+                        "object": "Berlin",
+                        "relation_type": "factual",
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def _pass1_with_named_person(self) -> str:
+        """Pass-1 output collapsing 'my brother Nadeem lives in Porto' into
+        only the kinship edge — the measured Mistral 7B failure mode."""
+        return json.dumps(
+            {
+                "entities": [
+                    {"name": "speaker0", "entity_type": "person"},
+                    {"name": "Nadeem", "entity_type": "person"},
+                ],
+                "relations": [
+                    {
+                        "subject": "speaker0",
+                        "predicate": "has_brother",
+                        "object": "Nadeem",
+                        "relation_type": "social",
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def _second_order_output(self) -> str:
+        """Second-order-pass output recovering Nadeem's own attribute."""
+        return json.dumps(
+            {
+                "entities": [{"name": "Nadeem", "entity_type": "person"}],
+                "relations": [
+                    {
+                        "subject": "Nadeem",
+                        "predicate": "lives_in",
+                        "object": "Porto",
+                        "relation_type": "factual",
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def _pass1_sam_picked_up_kids(self) -> str:
+        """Pass-1 output already capturing Sam's fact in full — the
+        measured live regression fixture (real transcript: 'Sam picked
+        the kids up from school today')."""
+        return json.dumps(
+            {
+                "entities": [{"name": "Sam", "entity_type": "person"}],
+                "relations": [
+                    {
+                        "subject": "Sam",
+                        "predicate": "picked_up",
+                        "object": "kids",
+                        "relation_type": "factual",
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def _second_order_sam_picks_up_kids_drifted(self) -> str:
+        """Second-order-pass re-emit of the SAME fact with a drifted
+        predicate surface ('picks_up' vs pass-1's 'picked_up'). The plain
+        union keeps both; collapsing this near-dup is
+        refinement_normalization's job, not this union site's."""
+        return json.dumps(
+            {
+                "entities": [{"name": "Sam", "entity_type": "person"}],
+                "relations": [
+                    {
+                        "subject": "Sam",
+                        "predicate": "picks_up",
+                        "object": "kids",
+                        "relation_type": "factual",
+                        "confidence": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def _fake_generate(self, pass1_output: str, second_order_output: str):
+        def _inner(*args, **kwargs):
+            if kwargs.get("user_prompt_filename") == "extraction_second_order.txt":
+                return second_order_output
+            return pass1_output
+
+        return _inner
+
+    def test_gate_skips_when_no_named_non_speaker_person(self):
+        """No named non-speaker person in the pass-1 graph ->
+        second_order_extract never fires (no second _generate_extraction
+        call, no phase record)."""
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            side_effect=self._fake_generate(
+                self._pass1_no_named_person(), self._second_order_output()
+            ),
+        ) as mock_gen:
+            graph = extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="I live in Berlin.",
+                session_id="s001",
+                speaker_id="speaker0",
+            )
+        assert mock_gen.call_count == 1, (
+            "second_order_extract must not call _generate_extraction when its gate fails"
+        )
+        phase_names = [p.name for p in get_phases(graph)]
+        assert "second_order_extract" not in phase_names
+
+    def test_second_order_relations_unioned_when_named_person_present(self):
+        """Plain union: the second-order pass's recovered fact (Nadeem,
+        lives_in, Porto — the dropped-attribute case) survives alongside
+        the pass-1 kinship edge (speaker0, has_brother, Nadeem). The
+        second-order pass owns recall only; it is not a dedup boundary."""
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            side_effect=self._fake_generate(
+                self._pass1_with_named_person(), self._second_order_output()
+            ),
+        ):
+            graph = extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="My brother Nadeem lives in Porto.",
+                session_id="s001",
+                speaker_id="speaker0",
+            )
+        phase_names = [p.name for p in get_phases(graph)]
+        assert "second_order_extract" in phase_names
+        assert any(r.subject == "Nadeem" and r.object == "Porto" for r in graph.relations)
+        # Pass-1 kinship edge survives alongside the second-order relation.
+        assert any(r.subject == "speaker0" and r.object == "Nadeem" for r in graph.relations)
+
+    def test_second_order_union_is_plain_recall_preserving(self):
+        """Second-order re-emits a fact pass-1 already has, with a drifted
+        predicate surface ('picks_up' vs pass-1's 'picked_up' for the same
+        (Sam, kids) fact). The union is a plain extend — BOTH survive here;
+        collapsing same-fact predicate drift is refinement_normalization's
+        job (and GraphMerger exact-triple dedup for literal repeats),
+        tested elsewhere, not this union site's."""
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            side_effect=self._fake_generate(
+                self._pass1_sam_picked_up_kids(), self._second_order_sam_picks_up_kids_drifted()
+            ),
+        ):
+            graph = extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="Sam picked the kids up from school today.",
+                session_id="s001",
+                speaker_id="speaker0",
+            )
+        phase_names = [p.name for p in get_phases(graph)]
+        assert "second_order_extract" in phase_names, (
+            "gate must pass: Sam is a named non-speaker person"
+        )
+        sam_relations = {(r.predicate, r.object) for r in graph.relations if r.subject == "Sam"}
+        assert ("picked_up", "kids") in sam_relations
+        assert ("picks_up", "kids") in sam_relations
+
+    def test_stop_phase_second_order_extract_returns_after_union(self):
+        """stop_phase='second_order_extract' returns immediately after the
+        union, before ha_validation (or any later phase) fires."""
+        with patch(
+            "paramem.graph.extractor._generate_extraction",
+            side_effect=self._fake_generate(
+                self._pass1_with_named_person(), self._second_order_output()
+            ),
+        ):
+            graph = extract_graph(
+                model=None,
+                tokenizer=None,
+                transcript="My brother Nadeem lives in Porto.",
+                session_id="s001",
+                speaker_id="speaker0",
+                ha_context={"location_name": "", "zones": [], "areas": []},
+                stop_phase="second_order_extract",
+            )
+        phase_names = [p.name for p in get_phases(graph)]
+        assert phase_names == ["local_extract", "second_order_extract"]
+        assert any(r.subject == "Nadeem" and r.object == "Porto" for r in graph.relations)
 
 
 class TestExtractGraphTimestampPropagation:
