@@ -344,7 +344,7 @@ options. A short map of the top-level sections:
 | `debug` | Privacy mode — disables retention of transcripts on disk; session snapshots still write (envelope-encrypted under Security-ON, plaintext under Security-OFF) so mid-turn state survives graceful restarts. |
 | `paths` | Data, sessions, debug, prompts directories. |
 | `adapters` | Per-adapter `enabled` / `rank` / `alpha` / `learning_rate` / `target_modules`. |
-| `consolidation` | **`refresh_cadence` is the only scheduling knob** (default `"12h"`). Full-cycle period is derived: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Also gates the extraction pipeline stages (plausibility, anonymization, NER check) and the thermal-throttle quiet-hours policy (`quiet_hours_mode` = `always_on`/`always_off`/`auto` with `start`/`end`). |
+| `consolidation` | **`refresh_cadence` is the only scheduling knob** (default `"12h"`). Full-cycle period is derived: `refresh_cadence × max_interim_count` (default 12h × 7 = 84h). Also gates the extraction pipeline stages (plausibility, anonymization) and the thermal-throttle quiet-hours policy (`quiet_hours_mode` = `always_on`/`always_off`/`auto` with `start`/`end`). |
 | `agents` | SOTA cloud fallback (`sota` + `sota_providers`), HA conversation agent id. |
 | `tools.ha` | HA URL, token, language filter, entity allowlist, tool timeout. |
 | `sanitization` | PII gate for cloud egress (`off`/`warn`/`block`). The first-person check is encoder-based and multilingual when the intent encoder is loaded; falls back to an English token-set. See `personal_referent` below. |
@@ -361,11 +361,12 @@ Config loading is strict: an unknown key anywhere in `configs/server.yaml`
 raises `TypeError` at boot rather than being silently ignored. This means a
 config field removed in a later release (e.g. the `extraction_verify_anonymization`
 / `extraction_ner_check` / `extraction_ner_model` consolidation knobs, retired
-in favour of the unified anonymization table and an off-by-default `ner`
-extra) will fail to boot an existing deployment's `configs/server.yaml` until
-the stale keys are deleted from it. When upgrading, diff your local
-`configs/server.yaml` against the current `configs/server.yaml.example` and
-remove any key the template no longer documents.
+in favour of the unified anonymization table — spaCy NER is gone from the
+pipeline entirely, not an optional extra) will fail to boot an existing
+deployment's `configs/server.yaml` until the stale keys are deleted from it.
+When upgrading, diff your local `configs/server.yaml` against the current
+`configs/server.yaml.example` and remove any key the template no longer
+documents.
 
 The `process.restart` block controls the systemd restart policy baked into
 `~/.config/systemd/user/paramem-server.service.d/restart.conf` on each server
