@@ -14,9 +14,6 @@ import re
 from paramem.graph.extractor import load_extraction_prompts, load_procedural_prompt
 from paramem.graph.schema_config import (
     entity_types,
-    format_entity_types,
-    format_predicate_examples,
-    format_relation_types,
     relation_types,
     reset_cache,
 )
@@ -43,9 +40,6 @@ class TestExtractionPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
-            entity_types=format_entity_types(),
-            predicate_examples=format_predicate_examples(),
-            relation_types=format_relation_types(),
         )
         assert isinstance(rendered, str)
 
@@ -54,9 +48,6 @@ class TestExtractionPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
-            entity_types=format_entity_types(),
-            predicate_examples=format_predicate_examples(),
-            relation_types=format_relation_types(),
         )
         leftover = [
             m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
@@ -82,9 +73,6 @@ class TestExtractionPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
-            entity_types=format_entity_types(),
-            predicate_examples=format_predicate_examples(),
-            relation_types=format_relation_types(),
         )
         allowed = set(entity_types())
         used = set(re.findall(r'"entity_type":\s*"([^"]+)"', rendered))
@@ -105,9 +93,6 @@ class TestExtractionPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
-            entity_types=format_entity_types(),
-            predicate_examples=format_predicate_examples(),
-            relation_types=format_relation_types(),
         )
         allowed = set(relation_types())
         used = set(re.findall(r'"relation_type":\s*"([^"]+)"', rendered))
@@ -128,8 +113,6 @@ class TestProceduralPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
-            entity_types=format_entity_types(scope="procedural"),
-            predicate_examples=format_predicate_examples(scope="procedural"),
         )
         assert isinstance(rendered, str)
 
@@ -138,8 +121,6 @@ class TestProceduralPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
-            entity_types=format_entity_types(scope="procedural"),
-            predicate_examples=format_predicate_examples(scope="procedural"),
         )
         leftover = [
             m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
@@ -151,8 +132,6 @@ class TestProceduralPromptRender:
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
-            entity_types=format_entity_types(scope="procedural"),
-            predicate_examples=format_predicate_examples(scope="procedural"),
         )
         assert "person" in rendered
         assert "preference" in rendered

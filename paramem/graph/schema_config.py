@@ -1,7 +1,7 @@
 """Single source of truth for knowledge-graph taxonomy.
 
-Loads entity types, relation types, and preferred predicates from
-configs/schema.yaml. Import-time IO is cached via lru_cache; a YAML
+Loads entity types and relation types from configs/schema.yaml.
+Import-time IO is cached via lru_cache; a YAML
 parse error falls back to a hardcoded mirror with a logged error so a
 typo cannot brick ``from paramem.graph.schema import Entity`` for the
 whole package.
@@ -43,35 +43,6 @@ _HARDCODED_FALLBACK: dict = {
     "fallback_entity_type": "concept",
     "relation_types": ["factual", "temporal", "preference", "social"],
     "fallback_relation_type": "factual",
-    "preferred_predicates": [
-        {
-            "label": "Family/social",
-            "items": ["married_to", "parent_of", "child_of", "sibling_of", "has_pet"],
-        },
-        {
-            "label": "Location",
-            "items": ["lives_in", "lives_near", "born_in"],
-        },
-        {
-            "label": "Work/education",
-            "items": ["works_at", "studies_at", "manages"],
-        },
-        {
-            "label": "Preferences/habits",
-            "items": [
-                "prefers",
-                "likes",
-                "dislikes",
-                "drinks",
-                "eats",
-                "listens_to",
-                "uses",
-                "avoids",
-            ],
-        },
-    ],
-    "procedural_entity_types": ["person", "preference"],
-    "procedural_predicate_groups": ["Preferences/habits"],
     "anonymizer": {
         "prefixes": [
             {
@@ -127,7 +98,6 @@ def load_schema_config(path: str | None = None) -> dict:
             "fallback_entity_type",
             "relation_types",
             "fallback_relation_type",
-            "preferred_predicates",
             "anonymizer",
         }
     )
@@ -203,77 +173,6 @@ def fallback_relation_type(path: str | None = None) -> str:
         path: Optional override path for the schema YAML.
     """
     return load_schema_config(path)["fallback_relation_type"]
-
-
-def preferred_predicates(path: str | None = None) -> list[dict]:
-    """Return the list of preferred-predicate groups.
-
-    Each element is ``{"label": str, "items": list[str]}``.
-
-    Args:
-        path: Optional override path for the schema YAML.
-    """
-    return load_schema_config(path)["preferred_predicates"]
-
-
-def format_relation_types(path: str | None = None) -> str:
-    """Return a comma-separated string of relation type names for prompt injection.
-
-    Args:
-        path: Optional override path for the schema YAML.
-
-    Returns:
-        ``"factual, temporal, preference, social"`` (or whatever the YAML declares).
-    """
-    return ", ".join(relation_types(path))
-
-
-def format_entity_types(path: str | None = None, scope: str = "full") -> str:
-    """Return a comma-separated string of entity type names for prompt injection.
-
-    Args:
-        path: Optional override path for the schema YAML.
-        scope: ``"full"`` returns all entity types with fallback annotation;
-               ``"procedural"`` returns only the procedural subset.
-
-    Returns:
-        ``"person, place, organization, event, preference, concept (fallback — see rule below)"``
-        for ``scope="full"``; ``"person, preference"`` for ``scope="procedural"``.
-    """
-    cfg = load_schema_config(path)
-    if scope == "procedural":
-        types = list(cfg.get("procedural_entity_types", []))
-        return ", ".join(types)
-    # full scope
-    fb = cfg["fallback_entity_type"]
-    types = list(cfg["entity_types"].keys())
-    parts = []
-    for t in types:
-        if t == fb:
-            parts.append(f"{t} (fallback — see rule below)")
-        else:
-            parts.append(t)
-    return ", ".join(parts)
-
-
-def format_predicate_examples(path: str | None = None, scope: str = "full") -> str:
-    """Return multi-line predicate example bullets for prompt injection.
-
-    Args:
-        path: Optional override path for the schema YAML.
-        scope: ``"full"`` returns all groups; ``"procedural"`` filters to
-               groups listed in ``procedural_predicate_groups``.
-
-    Returns:
-        Newline-joined lines of the form ``"- Family/social: married_to, parent_of, ..."``.
-    """
-    cfg = load_schema_config(path)
-    groups = cfg["preferred_predicates"]
-    if scope == "procedural":
-        allowed = set(cfg.get("procedural_predicate_groups", []))
-        groups = [g for g in groups if g["label"] in allowed]
-    lines = [f"- {g['label']}: {', '.join(g['items'])}" for g in groups]
-    return "\n".join(lines)
 
 
 def anonymizer_prefix_to_type(path: str | None = None) -> dict[str, str]:

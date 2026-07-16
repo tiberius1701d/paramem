@@ -569,12 +569,16 @@ class GraphMerger:
 
         # E-2: symmetric direction canonicalization — collapse (A,P,B) / (B,P,A) into
         # a single direction so Case-1 reinforcement deduplicates them.
-        # Guard: when BOTH endpoints are speaker nodes (each has a speaker_id), keep
-        # both directions distinct (each mints its own key for per-speaker recall).
-        both_speakers = bool(self.graph.nodes.get(subject, {}).get("speaker_id")) and bool(
-            self.graph.nodes.get(obj, {}).get("speaker_id")
-        )
-        if relation.symmetric and subject > obj and not both_speakers:
+        # Guard: when ANY speaker endpoint is involved, keep the recorded direction
+        # (recall is always speaker-anchored, so demoting a speaker out of the
+        # subject slot is never correct — even for a lone speaker-owned edge like
+        # `speaker0 has_sibling nadia`). Uses the structural is_speaker_id token
+        # check rather than the node's speaker_id attribute: a speaker endpoint
+        # that arrives without a matching Entity is node-created with no
+        # speaker_id attribute (see merge(), ~line 329), so the attribute lookup
+        # has a hole the token check closes.
+        any_speaker = is_speaker_id(subject) or is_speaker_id(obj)
+        if relation.symmetric and subject > obj and not any_speaker:
             subject, obj = obj, subject
 
         # --- Case 1: Exact-duplicate reinforcement ---

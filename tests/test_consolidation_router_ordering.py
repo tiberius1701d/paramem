@@ -22,7 +22,7 @@ Patch targets for methods imported inside the consolidation body:
   build_registry     → paramem.training.consolidation.build_registry
   evaluate_indexed_recall → paramem.training.recall_eval.evaluate_indexed_recall
   unload_interim_adapters → paramem.memory.interim_adapter.unload_interim_adapters
-  partition_relations → paramem.graph.qa_generator.partition_relations
+  partition_relations → paramem.training.consolidation.partition_relations
   switch_adapter     → paramem.models.loader.switch_adapter
   copy_adapter_weights → paramem.models.loader.copy_adapter_weights
 """
@@ -54,7 +54,7 @@ _MOCK_PATCHES = [
     "paramem.memory.interim_adapter.unload_interim_adapters",
     "paramem.models.loader.switch_adapter",
     "paramem.models.loader.copy_adapter_weights",
-    "paramem.graph.qa_generator.partition_relations",
+    "paramem.training.consolidation.partition_relations",
 ]
 
 
@@ -384,7 +384,6 @@ class TestTrainingFlagBracketing:
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
@@ -510,8 +509,8 @@ class TestTrainingFlagBracketing:
         # partition_relations splits each triple into episodic vs procedural
         # buckets; consolidation then reads the registry to split episodic vs
         # semantic.  Patch the name bound in paramem.training.consolidation (the
-        # module-local import), NOT paramem.graph.qa_generator — the latter does
-        # not affect the call inside consolidate.  Route each
+        # module-local import) — patching paramem.graph.relation_prep.partition_relations
+        # would not affect the call inside consolidate.  Route each
         # triple to its registry tier so all three tiers train.
         _gpu_thread_lock.acquire()
         try:
@@ -803,7 +802,6 @@ class TestPerTierInferenceFallbackAdapter:
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
@@ -937,7 +935,6 @@ class TestCapacityCeilingRollback:
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
@@ -1014,7 +1011,6 @@ class TestCapacityCeilingRollback:
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
@@ -1117,7 +1113,6 @@ class TestAtomicFinalizeOrdering:
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
@@ -1232,7 +1227,6 @@ class TestAtomicFinalizeOrdering:
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],
@@ -1345,7 +1339,6 @@ class TestMainWeightsSavedBeforeInterimPurge:
         try:
             with (
                 patch("paramem.models.loader.create_adapter", side_effect=_create_noop),
-                patch("paramem.graph.qa_generator.partition_relations", return_value=([], [])),
                 patch(
                     "paramem.training.consolidation.format_entry_training",
                     return_value=[{"input_ids": [1], "labels": [1], "attention_mask": [1]}],

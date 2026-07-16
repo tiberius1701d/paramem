@@ -8,11 +8,7 @@ from paramem.graph.schema_config import (
     entity_types,
     fallback_entity_type,
     fallback_relation_type,
-    format_entity_types,
-    format_predicate_examples,
-    format_relation_types,
     load_schema_config,
-    preferred_predicates,
     relation_types,
     reset_cache,
 )
@@ -39,9 +35,6 @@ class TestLoadSchemaConfig:
             "fallback_entity_type": "SENTINEL_TYPE",
             "relation_types": ["SENTINEL_RELATION"],
             "fallback_relation_type": "SENTINEL_RELATION",
-            "preferred_predicates": [],
-            "procedural_entity_types": ["SENTINEL_TYPE"],
-            "procedural_predicate_groups": [],
         }
         monkeypatch.setattr(schema_config, "_HARDCODED_FALLBACK", sentinel)
         reset_cache()
@@ -60,9 +53,6 @@ class TestLoadSchemaConfig:
             "fallback_entity_type: thing\n"
             "relation_types: [factual]\n"
             "fallback_relation_type: factual\n"
-            "preferred_predicates: []\n"
-            "procedural_entity_types: [thing]\n"
-            "procedural_predicate_groups: []\n"
             "anonymizer:\n  prefixes: []\n"
         )
         second = load_schema_config(str(alt_yaml))
@@ -99,88 +89,6 @@ class TestRelationTypes:
 
     def test_fallback_in_relation_types(self):
         assert fallback_relation_type() in relation_types()
-
-
-class TestPreferredPredicates:
-    def test_returns_list_of_dicts(self):
-        reset_cache()
-        preds = preferred_predicates()
-        assert isinstance(preds, list)
-        assert len(preds) > 0
-
-    def test_each_group_has_label_and_nonempty_items(self):
-        for group in preferred_predicates():
-            assert "label" in group
-            assert "items" in group
-            assert isinstance(group["items"], list)
-            assert len(group["items"]) > 0
-
-
-class TestFormatEntityTypes:
-    def test_full_scope_contains_fallback_annotation(self):
-        reset_cache()
-        result = format_entity_types()
-        assert "(fallback — see rule below)" in result
-
-    def test_full_scope_contains_every_type(self):
-        reset_cache()
-        result = format_entity_types()
-        for t in entity_types():
-            assert t in result
-
-    def test_procedural_scope_contains_person_and_preference(self):
-        reset_cache()
-        result = format_entity_types(scope="procedural")
-        assert "person" in result
-        assert "preference" in result
-
-    def test_procedural_scope_excludes_organization(self):
-        reset_cache()
-        result = format_entity_types(scope="procedural")
-        assert "organization" not in result
-
-
-class TestFormatPredicateExamples:
-    def test_full_scope_contains_family_social_label(self):
-        reset_cache()
-        result = format_predicate_examples()
-        assert "Family/social:" in result
-
-    def test_full_scope_contains_married_to(self):
-        reset_cache()
-        result = format_predicate_examples()
-        assert "married_to" in result
-
-    def test_procedural_scope_contains_preferences_habits_label(self):
-        reset_cache()
-        result = format_predicate_examples(scope="procedural")
-        assert "Preferences/habits:" in result
-
-    def test_procedural_scope_excludes_married_to(self):
-        reset_cache()
-        result = format_predicate_examples(scope="procedural")
-        assert "married_to" not in result
-
-
-class TestFormatRelationTypes:
-    def test_returns_nonempty_string(self):
-        reset_cache()
-        result = format_relation_types()
-        assert isinstance(result, str)
-        assert result
-
-    def test_every_relation_type_appears(self):
-        """Every value from relation_types() must be present in format_relation_types()."""
-        reset_cache()
-        result = format_relation_types()
-        for rt in relation_types():
-            assert rt in result, f"Relation type {rt!r} missing from format_relation_types()"
-
-    def test_comma_separated(self):
-        reset_cache()
-        result = format_relation_types()
-        parts = [p.strip() for p in result.split(",")]
-        assert len(parts) == len(relation_types())
 
 
 class TestEmptyAndMalformedYaml:
@@ -223,9 +131,6 @@ class TestEmptyAndMalformedYaml:
             "fallback_entity_type": "SENTINEL_TYPE",
             "relation_types": ["SENTINEL_RELATION"],
             "fallback_relation_type": "SENTINEL_RELATION",
-            "preferred_predicates": [],
-            "procedural_entity_types": ["SENTINEL_TYPE"],
-            "procedural_predicate_groups": [],
         }
         monkeypatch.setattr(schema_config, "_HARDCODED_FALLBACK", sentinel)
         reset_cache()
@@ -251,9 +156,6 @@ class TestEmptyAndMalformedYaml:
             "fallback_entity_type": "SENTINEL_TYPE",
             "relation_types": ["SENTINEL_RELATION"],
             "fallback_relation_type": "SENTINEL_RELATION",
-            "preferred_predicates": [],
-            "procedural_entity_types": ["SENTINEL_TYPE"],
-            "procedural_predicate_groups": [],
         }
         monkeypatch.setattr(schema_config, "_HARDCODED_FALLBACK", sentinel)
         reset_cache()
@@ -381,7 +283,6 @@ class TestAnonymizerConfig:
             "fallback_entity_type: person\n"
             "relation_types: [factual]\n"
             "fallback_relation_type: factual\n"
-            "preferred_predicates: []\n"
         )
         cfg = load_schema_config(str(minimal))
         # Must have fallen back to hardcoded fallback which includes 'anonymizer'.

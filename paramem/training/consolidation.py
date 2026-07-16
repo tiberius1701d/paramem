@@ -33,10 +33,10 @@ from paramem.graph.name_match import (
 )
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.placeholders import placeholder_entity_type
-from paramem.graph.qa_generator import (
+from paramem.graph.reconstruct import reconstruct_graph
+from paramem.graph.relation_prep import (
     partition_relations,
 )
-from paramem.graph.reconstruct import reconstruct_graph
 from paramem.graph.schema import Entity, Relation, SessionGraph
 from paramem.graph.schema_config import fallback_relation_type, relation_types
 from paramem.memory.entry import (
@@ -1077,9 +1077,9 @@ class ConsolidationLoop:
     ) -> tuple[list[dict], list[dict]]:
         """Build entry relation dicts from a session graph — no model call.
 
-        Mirrors the partition-only half of ``generate_qa_from_graph`` but
-        produces relation dicts instead of relations.  The attribute surface
-        (``Entity.attributes``) is projected via
+        Projects relations and entity attributes into a unified relation-dict
+        set, then partitions it into episodic/procedural.  The attribute
+        surface (``Entity.attributes``) is projected via
         ``relation_prep._flatten_entity_attributes`` so scalar-PII keying
         (email/phone/linkedin) is not silently dropped.
 
@@ -1088,10 +1088,10 @@ class ConsolidationLoop:
             relation dicts suitable for ``assign_keys``.
 
         Note:
-            This method has no ``model.generate`` calls — the vram_scope
-            wrapping present on the QA-gen path can be omitted here, though a
-            trailing ``torch.cuda.empty_cache()`` at the call site is still
-            recommended for allocator hygiene on multi-session cycles.
+            This method has no ``model.generate`` calls, so no vram_scope
+            wrapping is needed here, though a trailing
+            ``torch.cuda.empty_cache()`` at the call site is still recommended
+            for allocator hygiene on multi-session cycles.
         """
         from paramem.graph import relation_prep
 

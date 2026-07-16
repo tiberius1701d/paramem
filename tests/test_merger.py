@@ -2694,40 +2694,175 @@ class TestMergerEdgeStamps:
         )
 
     def test_e2_symmetric_does_not_swap_speaker_speaker_pair(self):
-        """E-2 guard: both endpoints are speakers → no swap, both directions kept."""
+        """E-2 guard: both endpoints are speakers → no swap, both directions kept.
+
+        Uses real ``speaker{N}`` tokens (not contrived names) so the guard is
+        exercised through the structural ``is_speaker_id`` check the fix uses,
+        not merely a node-attribute lookup.
+        """
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation
 
         m = GraphMerger()
-        # Both nodes carry speaker_id.
-        m.graph.add_node("z_speaker", speaker_id="z_speaker")
-        m.graph.add_node("a_speaker", speaker_id="a_speaker")
+        # Both nodes carry speaker_id AND are valid speaker{N} tokens.
+        m.graph.add_node("speaker9", speaker_id="speaker9")
+        m.graph.add_node("speaker1", speaker_id="speaker1")
 
-        rel_z_a = Relation(
-            subject="z_speaker",
+        rel_9_1 = Relation(
+            subject="speaker9",
             predicate="colleague_of",
-            object="a_speaker",
+            object="speaker1",
             relation_type="social",
-            speaker_id="z_speaker",
+            speaker_id="speaker9",
             symmetric=True,
         )
-        rel_a_z = Relation(
-            subject="a_speaker",
+        rel_1_9 = Relation(
+            subject="speaker1",
             predicate="colleague_of",
-            object="z_speaker",
+            object="speaker9",
             relation_type="social",
-            speaker_id="a_speaker",
+            speaker_id="speaker1",
             symmetric=True,
         )
-        m._upsert_relation("z_speaker", "a_speaker", rel_z_a, "s1", "2026-01-01T00:00:00Z")
-        m._upsert_relation("a_speaker", "z_speaker", rel_a_z, "s2", "2026-01-01T00:00:00Z")
+        m._upsert_relation("speaker9", "speaker1", rel_9_1, "s1", "2026-01-01T00:00:00Z")
+        m._upsert_relation("speaker1", "speaker9", rel_1_9, "s2", "2026-01-01T00:00:00Z")
 
         # Speaker↔speaker: both directions must survive.
-        assert m.graph.has_edge("z_speaker", "a_speaker"), (
+        assert m.graph.has_edge("speaker9", "speaker1"), (
             "Speaker→speaker edge must survive (no E-2 swap for speaker pairs)"
         )
-        assert m.graph.has_edge("a_speaker", "z_speaker"), (
+        assert m.graph.has_edge("speaker1", "speaker9"), (
             "Speaker←speaker edge must survive (no E-2 swap for speaker pairs)"
+        )
+
+    def test_e2_symmetric_speaker_owned_sibling_not_flipped(self):
+        """Regression: a lone speaker-owned symmetric edge must NOT flip the
+        speaker out of the subject slot.  'speaker0' > 'nadia' lexicographically
+        and nadia carries no speaker_id, so the old both-speakers gate let this
+        swap through — breaking speaker-bound recall."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+
+        m = GraphMerger()
+        rel = Relation(
+            subject="speaker0",
+            predicate="has_sibling",
+            object="nadia",
+            relation_type="social",
+            speaker_id="speaker0",
+            symmetric=True,
+        )
+        m._upsert_relation("speaker0", "nadia", rel, "s1", "2026-01-01T00:00:00Z")
+
+        assert m.graph.has_edge("speaker0", "nadia"), (
+            "speaker0 must remain the subject — speaker-owned symmetric edges "
+            "must never flip the speaker out of the subject slot"
+        )
+        assert not m.graph.has_edge("nadia", "speaker0"), (
+            "Edge must not be recorded in the flipped (nadia, speaker0) direction"
+        )
+
+    def test_e2_symmetric_speaker_owned_married_to_not_flipped(self):
+        """Same regression as sibling, for a second symmetric predicate
+        ('speaker0' > 'person_1' lexicographically)."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+
+        m = GraphMerger()
+        rel = Relation(
+            subject="speaker0",
+            predicate="married_to",
+            object="person_1",
+            relation_type="social",
+            speaker_id="speaker0",
+            symmetric=True,
+        )
+        m._upsert_relation("speaker0", "person_1", rel, "s1", "2026-01-01T00:00:00Z")
+
+        assert m.graph.has_edge("speaker0", "person_1"), (
+            "speaker0 must remain the subject for married_to"
+        )
+        assert not m.graph.has_edge("person_1", "speaker0"), (
+            "Edge must not be recorded in the flipped (person_1, speaker0) direction"
+        )
+
+    def test_e2_symmetric_non_speaker_peers_still_collapse(self):
+        """Non-regression: two non-speaker peers on a symmetric relation must
+        still canonicalize to a single lexicographic-min direction so Case-1
+        reinforcement collapses both directions into one edge."""
+        from paramem.graph.merger import GraphMerger
+        from paramem.graph.schema import Relation
+
+        m = GraphMerger()
+        rel_nadia_bob = Relation(
+            subject="nadia",
+            predicate="friend_of",
+            object="bob",
+            relation_type="social",
+            speaker_id="",
+            symmetric=True,
+        )
+        rel_bob_nadia = Relation(
+            subject="bob",
+            predicate="friend_of",
+            object="nadia",
+            relation_type="social",
+            speaker_id="",
+            symmetric=True,
+        )
+        m._upsert_relation("nadia", "bob", rel_nadia_bob, "s1", "2026-01-01T00:00:00Z")
+        m._upsert_relation("bob", "nadia", rel_bob_nadia, "s2", "2026-01-01T00:00:00Z")
+
+        assert m.graph.has_edge("bob", "nadia"), (
+            "Both directions must canonicalize to the lexicographic-min subject 'bob'"
+        )
+        assert not m.graph.has_edge("nadia", "bob"), (
+            "Non-canonical direction must not survive as a separate edge"
+        )
+        edges = list(m.graph["bob"]["nadia"].values())
+        assert len(edges) == 1, (
+            f"Both directions must collapse into ONE edge via Case-1 "
+            f"reinforcement, got {len(edges)}"
+        )
+        assert edges[0].get("reinforcement_count") == 2, (
+            "Second insert must reinforce the collapsed edge, not create a "
+            f"duplicate; got reinforcement_count={edges[0].get('reinforcement_count')!r}"
+        )
+
+    def test_e2_symmetric_speaker_without_entity_still_protected(self):
+        """A speaker endpoint that arrives without a matching Entity is
+        node-created with no speaker_id attribute (merge(), ~line 329) — the
+        structural is_speaker_id token check must still protect it, closing
+        the hole a node-attribute lookup would leave open."""
+        merger = GraphMerger(similarity_threshold=85.0)
+        session = SessionGraph(
+            session_id="s_no_entity",
+            timestamp="2026-06-24T10:00:00Z",
+            entities=[],  # No Entity for speaker0 — forces the fallback path.
+            relations=[
+                Relation(
+                    subject="speaker0",
+                    predicate="has_sibling",
+                    object="amy",
+                    relation_type="social",
+                    speaker_id="speaker0",
+                    symmetric=True,
+                ),
+            ],
+        )
+        merger.merge(session)
+
+        # speaker0 has no speaker_id node attribute (no Entity was merged for it).
+        assert merger.graph.nodes["speaker0"].get("speaker_id") is None, (
+            "Precondition: speaker0 node must lack a speaker_id attribute here"
+        )
+        assert merger.graph.has_edge("speaker0", "amy"), (
+            "speaker0 must remain the subject even without a speaker_id node "
+            "attribute — protection must come from is_speaker_id, not the "
+            "node attribute"
+        )
+        assert not merger.graph.has_edge("amy", "speaker0"), (
+            "Edge must not be recorded in the flipped (amy, speaker0) direction"
         )
 
 

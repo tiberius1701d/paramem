@@ -179,7 +179,7 @@ class BundleManifest:
         ``registry_sha256`` (str),
         ``key_count`` (int | str),
         ``simhash_present`` (bool),
-        ``keyed_pairs_present`` (bool, always False — QA pairs are
+        ``keyed_pairs_present`` (bool, always False — keyed entries are
         transient and regenerated from the graph on every cycle).
     excluded : list[str]
         Human-readable list of artifact categories intentionally excluded

@@ -40,39 +40,28 @@ Before returning: every `{{Prefix_N}}` you wrote in `add`/`modify` MUST have a m
 ## Coreference resolution
 
 Few-shot — "my wife is also a teacher"
-→ add: `[{{"subject":"speaker0","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9}}, {{"subject":"{{Person_1}}","predicate":"profession","object":"teacher","relation_type":"factual","confidence":0.9}}]`
+→ add: `[{{"subject":"speaker0","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{{Person_1}}","predicate":"profession","object":"teacher","relation_type":"factual","confidence":0.9,"symmetric":false}}]`
 → bindings: `{{"Person_1": "my wife"}}`
 
 Few-shot — "we went there last summer" (context: speaker0 + Person_1 + Location_1 — `Person_1` here is already an anonymizer placeholder for a named third party, not something you mint)
-→ add: `[{{"subject":"speaker0","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9}}, {{"subject":"Person_1","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9}}]`.
+→ add: `[{{"subject":"speaker0","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9,"symmetric":false}}, {{"subject":"Person_1","predicate":"visited","object":"Location_1","relation_type":"factual","confidence":0.9,"symmetric":false}}]`.
 
 Few-shot — "my sister's husband"
-→ add: `[{{"subject":"speaker0","predicate":"sister_of","object":"{{Person_2}}","relation_type":"social","confidence":0.9}}, {{"subject":"{{Person_2}}","predicate":"married_to","object":"{{Person_3}}","relation_type":"social","confidence":0.9}}]`
+→ add: `[{{"subject":"speaker0","predicate":"sister_of","object":"{{Person_2}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"{{Person_2}}","predicate":"married_to","object":"{{Person_3}}","relation_type":"social","confidence":0.9,"symmetric":true}}]`
 → bindings: `{{"Person_2": "my sister", "Person_3": "my sister's husband"}}`
 
 Few-shot — "my father is also an engineer" (descriptor, no name given — a binding span may be a descriptor, not only a name)
-→ add: `[{{"subject":"speaker0","predicate":"child_of","object":"{{Person_4}}","relation_type":"social","confidence":0.9}}, {{"subject":"{{Person_4}}","predicate":"profession","object":"engineer","relation_type":"factual","confidence":0.9}}]`
+→ add: `[{{"subject":"speaker0","predicate":"child_of","object":"{{Person_4}}","relation_type":"social","confidence":0.9,"symmetric":false}}, {{"subject":"{{Person_4}}","predicate":"profession","object":"engineer","relation_type":"factual","confidence":0.9,"symmetric":false}}]`
 → bindings: `{{"Person_4": "my father"}}`
 
 
 ## Compound fact splitting
 
 Few-shot — input: `[3] {{"subject":"speaker0","predicate":"likes","object":"hiking and cooking"}}`
-→ drop: `[3]`, add: `[{{"subject":"speaker0","predicate":"likes","object":"hiking",...}}, {{"subject":"speaker0","predicate":"likes","object":"cooking",...}}]`.
+→ drop: `[3]`, add: `[{{"subject":"speaker0","predicate":"likes","object":"hiking",...,"symmetric":false}}, {{"subject":"speaker0","predicate":"likes","object":"cooking",...,"symmetric":false}}]`.
 
 Few-shot — input: `[5] {{"subject":"Person_1","predicate":"grew_up_in","object":"City_1 and studied in City_2"}}`
-→ drop: `[5]`, add: `[{{"subject":"Person_1","predicate":"grew_up_in","object":"City_1",...}}, {{"subject":"Person_1","predicate":"studied_in","object":"City_2",...}}]`.
-
-
-## Symmetric predicate canonicalization
-
-Symmetric predicates (one triple represents both directions; lexicographic-min subject wins): friend_of, friends_with, married_to, spouse_of, sibling_of, brother_of, sister_of, cousin_of (when reciprocal), colleague_of, coworker_of, neighbor_of, partner_of, related_to, met_with, knows (only if reciprocal), agrees_with, disagrees_with, attended_with, shares_interest_with.
-
-Few-shot — input: `[2] friend_of(A, B)` AND `[3] friend_of(B, A)`
-→ drop: `[3]`. Keep `[2]` (lexicographic-min subject).
-
-Few-shot — input: `[4] parent_of(A, B)` AND `[5] child_of(B, A)`
-→ no delta — asymmetric pair (also: manages/reports_to, taught/studied_under, likes/liked_by) — distinct semantics, keep both directions.
+→ drop: `[5]`, add: `[{{"subject":"Person_1","predicate":"grew_up_in","object":"City_1",...,"symmetric":false}}, {{"subject":"Person_1","predicate":"studied_at","object":"City_2",...,"symmetric":false}}]`.
 
 
 ## Predicate de-duplication
@@ -113,15 +102,17 @@ Few-shot — same artefact named twice ("Indexed Key Retrieval paper", "the para
 
 Return ONLY a single JSON object with these four optional keys:
 
-- `add` — array of new facts to append. Each fact: `{{"subject", "predicate", "object", "relation_type", "confidence"}}`. New entities appear as `{{Prefix_N}}`.
-- `modify` — array of partial updates against the indexed input facts. Each entry: `{{"index": <int>, "fields": {{<partial fact dict — only the keys you want to change>}}}}`.
+- `add` — array of new facts to append. Each fact: `{{"subject", "predicate", "object", "relation_type", "confidence", "symmetric"}}`. New entities appear as `{{Prefix_N}}`.
+- `modify` — array of partial updates against the indexed input facts. Each entry: `{{"index": <int>, "fields": {{<partial fact dict — only the keys you want to change>}}}}`. Include `"symmetric"` in `fields` when you are asserting or correcting it for an existing fact.
 - `drop` — array of zero-based integer indices to drop from the input facts.
 - `bindings` — dict mapping each NEW braced placeholder you used in `add` (key WITHOUT braces) to its exact transcript span. Empty `{{}}` if you minted no new entities.
+
+`symmetric`: `true` when the SAME predicate holds in both directions between subject and object by MEANING — swap subject and object and the sentence stays true (e.g. a marriage, a friendship, a sibling relationship). `false` for directional relations where the two endpoints are not interchangeable (e.g. parent/child, manages/reports_to, employer/employee, likes, profession, location facts). Judge from meaning; do not rely on a fixed predicate list.
 
 Confidence: 0.9 for coreference-resolved facts, 0.8 for inferred facts. Do not echo the input facts back. Do not echo the transcript back.
 
 Example clean input where you have nothing to do: `{{}}`
 Example with one synonym dedup: `{{"drop": [7]}}`
-Example with coreference resolution and a new entity: `{{"add": [{{"subject":"speaker0","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9}}, {{"subject":"speaker0","predicate":"led","object":"{{Event_1}}","relation_type":"factual","confidence":0.9}}], "bindings": {{"Person_1": "my wife", "Event_1": "the agile transformation initiative"}}}}`
+Example with coreference resolution and a new entity: `{{"add": [{{"subject":"speaker0","predicate":"married_to","object":"{{Person_1}}","relation_type":"social","confidence":0.9,"symmetric":true}}, {{"subject":"speaker0","predicate":"led","object":"{{Event_1}}","relation_type":"factual","confidence":0.9,"symmetric":false}}], "bindings": {{"Person_1": "my wife", "Event_1": "the agile transformation initiative"}}}}`
 
 Do NOT wrap the output in backticks, code fences, or any other prose.

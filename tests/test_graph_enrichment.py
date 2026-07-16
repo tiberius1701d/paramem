@@ -788,7 +788,7 @@ class TestPartitionRoutesEnrichedEdges:
 
     def test_social_edge_routes_to_episodic(self, tmp_path, monkeypatch):
         """Social relation_type → episodic bucket (not procedural)."""
-        from paramem.graph.qa_generator import partition_relations
+        from paramem.graph.relation_prep import partition_relations
 
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph

@@ -47,7 +47,6 @@ from paramem.evaluation.recall import generate_answer
 # --- graph ----------------------------------------------------------------
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 from paramem.graph.merger import GraphMerger
-from paramem.graph.qa_generator import generate_qa_from_relations
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 # --- memory ---------------------------------------------------------------
@@ -100,7 +99,6 @@ __all__ = [
     "ExtractionConfig",
     "ExtractionPipeline",
     "GraphMerger",
-    "generate_qa_from_relations",
     "Entity",
     "Relation",
     "SessionGraph",

@@ -21,11 +21,6 @@ from paramem.graph.extractor import (
 )
 from paramem.graph.placeholders import PLACEHOLDER_TOKEN_RE
 from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
-from paramem.graph.schema_config import (
-    format_entity_types,
-    format_predicate_examples,
-    format_relation_types,
-)
 
 
 class TestLoadPromptPerModelResolution:
@@ -131,9 +126,6 @@ class TestExtractionPrompt:
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context(None, None),
-            entity_types=format_entity_types(),
-            predicate_examples=format_predicate_examples(),
-            relation_types=format_relation_types(),
         )
         assert "{transcript}" not in rendered
         assert "{speaker_context}" not in rendered
@@ -146,9 +138,6 @@ class TestExtractionPrompt:
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context("speaker0", "Alex"),
-            entity_types=format_entity_types(),
-            predicate_examples=format_predicate_examples(),
-            relation_types=format_relation_types(),
         )
         # The directive must mention the speaker id as the required subject.
         assert "speaker0" in rendered
@@ -161,9 +150,6 @@ class TestExtractionPrompt:
         rendered = tmpl.format(
             transcript="[user] hello",
             speaker_context=build_speaker_context("speaker0", None),
-            entity_types=format_entity_types(),
-            predicate_examples=format_predicate_examples(),
-            relation_types=format_relation_types(),
         )
         assert "speaker0" in rendered
         assert "{speaker_id}" not in rendered
@@ -901,8 +887,6 @@ class TestProceduralPrompt:
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
             speaker_context=build_speaker_context(None, None),
-            entity_types=format_entity_types(scope="procedural"),
-            predicate_examples=format_predicate_examples(scope="procedural"),
         )
         assert "{transcript}" not in rendered
         assert "{speaker_context}" not in rendered
@@ -921,8 +905,6 @@ class TestProceduralPrompt:
         rendered = tmpl.format(
             transcript="[user] Play some jazz.",
             speaker_context=build_speaker_context("speaker0", "Alex"),
-            entity_types=format_entity_types(scope="procedural"),
-            predicate_examples=format_predicate_examples(scope="procedural"),
         )
         # The directive must mention the speaker id as the required subject.
         assert "speaker0" in rendered

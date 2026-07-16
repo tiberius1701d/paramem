@@ -208,16 +208,18 @@ def _retired(name: str, replacement: str):
 def distill_session(*args, **kwargs):
     _retired(
         "distill_session",
-        "paramem.graph.extraction_pipeline.ExtractionPipeline.run "
-        "(transcript → SessionGraph) + paramem.graph.qa_generator.generate_qa_from_relations",
+        "paramem.graph.extraction_pipeline.ExtractionPipeline.run (transcript → SessionGraph) "
+        "+ paramem.training.consolidation.ConsolidationLoop._entries_from_graph "
+        "(graph → keyed entries)",
     )
 
 
 def distill_qa_pairs(*args, **kwargs):
     _retired(
         "distill_qa_pairs",
-        "paramem.graph.qa_generator.generate_qa_from_relations "
-        "fed by the entry-format extraction pipeline",
+        "no direct replacement — the QA-pair stage is gone; keyed entries are built by "
+        "paramem.training.consolidation.ConsolidationLoop._entries_from_graph "
+        "+ paramem.memory.entry.format_entry_training",
     )
 
 

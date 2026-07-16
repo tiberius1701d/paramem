@@ -12,7 +12,7 @@ Required for both outputs:
 
 ## Part 1 — RELATIONS
 
-Symmetric predicates hold in both directions (colleague_of, friend_of, married_to, sibling_of, classmate_of, teammate_of, neighbor_of, knows, family_of, shares_interest_with, attended_with, ...) and must carry `"symmetric": true`. Directional predicates (mentored_by, manages, parent_of, works_at) carry `"symmetric": false`. For non-speaker symmetric pairs emit ONE direction only (the system canonicalizes direction). When the input triple's `speaker_id` is absent or empty, the speaker↔speaker exception below does not fire — emit a single direction (safe default).
+A relation is symmetric when the SAME predicate holds in both directions between subject and object by MEANING — swap subject and object and the sentence stays true (e.g. a colleague relationship, a marriage, a friendship). It must carry `"symmetric": true`. A directional predicate (mentored_by, manages, parent_of, works_at) — the endpoints are not interchangeable — carries `"symmetric": false`. Judge from meaning, not from a fixed predicate list. For non-speaker symmetric pairs emit ONE direction only (the system canonicalizes direction). When the input triple's `speaker_id` is absent or empty, the speaker↔speaker exception below does not fire — emit a single direction (safe default).
 
 EXCEPTION — when BOTH endpoints are speakers (each input triple carries a non-empty `speaker_id`), emit BOTH directions of a symmetric relation `(A,P,B)` AND `(B,P,A)`, each with `"symmetric": true`. For speaker↔non-speaker or non-speaker↔non-speaker symmetric relations, emit ONE direction.
 

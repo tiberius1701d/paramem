@@ -1,8 +1,8 @@
 """Format-neutral relation/entity preparation helpers.
 
 Partitions preference relations to the procedural adapter, and projects
-entity scalar attributes into relation triples.  No LLM.  Used by both
-``qa_generator.py`` (for human-readable fact text) and the indexed-key path.
+entity scalar attributes into relation triples.  No LLM.  Used by the
+indexed-key distillation path (``ConsolidationLoop._entries_from_graph``).
 """
 
 from typing import TYPE_CHECKING
@@ -73,11 +73,13 @@ def _flatten_entity_attributes(
 ) -> list[dict]:
     """Project ``Entity.attributes`` into the canonical relation-dict shape.
 
-    Internal projection used by :func:`generate_qa_from_graph`.  The graph's
-    knowledge lives in two surfaces — relations and entity attributes — and
-    both must reach the QA generator.  This helper converts the attribute
-    surface into the relation-dict shape, so the QA generator's input is the
-    union of "real" relations and "projected" attributes.
+    Internal projection used by
+    :meth:`paramem.training.consolidation.ConsolidationLoop._entries_from_graph`.
+    The graph's knowledge lives in two surfaces — relations and entity
+    attributes — and both must reach the indexed-key distillation stage.
+    This helper converts the attribute surface into the relation-dict shape,
+    so the distillation input is the union of "real" relations and
+    "projected" attributes.
 
     One projected relation is emitted per (entity, attribute_key) pair:
 

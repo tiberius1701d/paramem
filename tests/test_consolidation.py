@@ -45,7 +45,6 @@ class TestExtractionPathParity:
 
         from peft import PeftModel
 
-        from paramem.graph.qa_generator import generate_qa_from_relations as _real_qa
         from paramem.graph.schema import Entity, Relation, SessionGraph
         from paramem.training.consolidation import ConsolidationLoop
         from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
@@ -104,11 +103,6 @@ class TestExtractionPathParity:
             extract_procedural_spy
             if extract_procedural_spy is not None
             else _default_extract_procedural,
-        )
-        # Use template fallback (ignore passed model/tokenizer) for deterministic output.
-        monkeypatch.setattr(
-            "paramem.graph.qa_generator.generate_qa_from_relations",
-            lambda relations, model=None, tokenizer=None: _real_qa(relations),
         )
 
         # __class__ = PeftModel so _ensure_adapters' isinstance check

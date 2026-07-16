@@ -4,7 +4,7 @@ Use the speaker's system identifier from the directive above (e.g. `speaker0`) a
 
 A named third party (not the speaker) is a first-class entity: give them their own subject position, and never fold their action or possession onto the speaker or glue their name into a predicate/object as a possessive — see the worked NEGATIVE examples below for both mistakes. An unnamed person or thing (no name given) gets NO relation of its own: do not invent a subject for them and do not mangle their fact onto the speaker — see the worked NEGATIVE example below.
 
-When the speaker names a person by their relationship ("my brother Nadeem", "my friend Priya"), that clause is TWO separate facts, not one: emit the relationship edge on the speaker (speaker0 → has_brother → Nadeem) AND the person's own fact on their own node (Nadeem → lives_in → Porto). Emit both relations; collapse neither into the other, and drop neither — a relative's location, job, or trait is always its own relation on the relative's node.
+When the speaker names a person by their relationship ("my brother Nadeem", "my friend Priya"), that clause is TWO separate facts, not one: emit the relationship edge on the speaker (speaker0 → has_sibling → Nadeem) AND the person's own fact on their own node (Nadeem → lives_in → Porto). Emit both relations; collapse neither into the other, and drop neither — a relative's location, job, or trait is always its own relation on the relative's node.
 
 Facts can come from ANY turn, including [assistant] turns. The subject is whoever the sentence names — never the speaker by default.
 
@@ -83,10 +83,10 @@ CORRECT output (single entity named by the speaker id, last name as attribute):
 NEGATIVE example — speaker id is "speaker0", transcript: "[user] Sam picked the kids up from school today."
 BAD output (re-roots a third party's action onto the speaker — speaker0 did not do this):
 {{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}}],
- "relations": [{{"subject": "speaker0", "predicate": "picked_up", "object": "kids", "relation_type": "factual", "confidence": 1.0}}], ...}}
+ "relations": [{{"subject": "speaker0", "predicate": "picks_up", "object": "kids", "relation_type": "factual", "confidence": 1.0}}], ...}}
 CORRECT output (the third party keeps the subject slot):
 {{"entities": [{{"name": "Sam", "entity_type": "person", "attributes": {{}}}}],
- "relations": [{{"subject": "Sam", "predicate": "picked_up", "object": "kids", "relation_type": "factual", "confidence": 1.0}}],
+ "relations": [{{"subject": "Sam", "predicate": "picks_up", "object": "kids", "relation_type": "factual", "confidence": 1.0}}],
  "summary": "Sam picked the kids up from school today."}}
 
 
@@ -108,7 +108,7 @@ NEGATIVE example — speaker id is "speaker0", transcript: "[user] My brother li
 BAD output (the brother has no name, so this invents a nonsense relation — the object is a place, not a brother — instead of leaving the fact unextracted):
 {{"entities": [{{"name": "speaker0", "entity_type": "person", "attributes": {{}}}},
  {{"name": "Rivermoor", "entity_type": "place", "attributes": {{}}}}],
- "relations": [{{"subject": "speaker0", "predicate": "has_brother", "object": "Rivermoor", "relation_type": "social", "confidence": 1.0}}], ...}}
+ "relations": [{{"subject": "speaker0", "predicate": "has_sibling", "object": "Rivermoor", "relation_type": "social", "confidence": 1.0}}], ...}}
 CORRECT output (an unnamed person yields NO relation at all — do not glue, do not promote, and do NOT mangle the fact into a relation about the speaker):
 {{"entities": [], "relations": [], "summary": "No personal facts found."}}
 

@@ -1,8 +1,7 @@
 """Unit tests for scalar-attribute projection in the indexed-key distillation path.
 
-Mirrors tests/graph/test_scalar_attribute_projection.py but exercises the
-_entries_from_graph helper (in ConsolidationLoop) instead of
-generate_qa_from_graph.
+Exercises the _entries_from_graph helper (in ConsolidationLoop), the sole
+live path from a session graph into keyed entries.
 
 The key invariant:
   Entity.attributes (email, phone, linkedin) must survive into the keyed set.

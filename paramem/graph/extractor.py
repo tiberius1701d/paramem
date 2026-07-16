@@ -33,9 +33,6 @@ from paramem.graph.schema import Entity, SessionGraph
 from paramem.graph.schema_config import (
     fallback_entity_type,
     fallback_relation_type,
-    format_entity_types,
-    format_predicate_examples,
-    format_relation_types,
     relation_types,
 )
 from paramem.models.loader import adapt_messages, base_model_inference
@@ -513,8 +510,6 @@ def extract_procedural_graph(
             "content": prompt.format(
                 transcript=transcript,
                 speaker_context=speaker_context,
-                entity_types=format_entity_types(scope="procedural"),
-                predicate_examples=format_predicate_examples(scope="procedural"),
             ),
         },
     ]
@@ -1201,9 +1196,6 @@ def _generate_extraction(
     format_kwargs = dict(
         transcript=transcript,
         speaker_context=speaker_context,
-        entity_types=format_entity_types(),
-        predicate_examples=format_predicate_examples(),
-        relation_types=format_relation_types(),
     )
     messages = [
         {"role": "system", "content": system},
@@ -2482,7 +2474,7 @@ def _sota_pipeline(
     # which the QA generator's _flatten_entity_attributes mints into keyed
     # pairs.  The projection is applied after the entity rebuild step below
     # so the subject entity survives pruning.
-    scalar_facts, deanon_facts = _partition_scalar_facts(deanon_facts)
+    scalar_facts, deanon_facts = _partition_scalar_facts(deanon_facts, graph.entities)
     if scalar_facts:
         graph.diagnostics["scalar_facts_projected"] = len(scalar_facts)
 
@@ -2730,14 +2722,31 @@ def _is_scalar_value(value: str) -> bool:
     return False
 
 
-def _partition_scalar_facts(facts: list[dict]) -> tuple[list[dict], list[dict]]:
+def _partition_scalar_facts(
+    facts: list[dict], entities: list[Entity] | None = None
+) -> tuple[list[dict], list[dict]]:
     """Split facts by object-shape into ``(scalar, non_scalar)``.
 
     Scalars are projected onto ``Entity.attributes`` of the subject and
     flow through to plausibility and downstream filters without modification;
     non-scalars are treated as concept-level claims.  Facts already marked
     ``synthetic=True`` are passed through untouched.
+
+    ``entities`` is the graph's current entity list (local-extraction state,
+    read before this pipeline's own entity rebuild).  A fact's object is
+    forced to ``non_scalar`` whenever it already names an existing entity
+    node, regardless of what :func:`_is_scalar_value` would say — a
+    digit-bearing entity name (``speaker0``, ``speaker1``, a droid-style
+    person name like ``R2D2``) otherwise mis-triggers the version-tagged-
+    identifier heuristic and gets flattened into a string attribute instead
+    of staying a first-class edge. There is no dedicated "literal" entity
+    type in the schema (entity_type is open-vocabulary: person, place,
+    organization, event, preference, concept, or model-invented types), so
+    any existing node — not just ``person`` — qualifies: object-is-a-known-
+    entity-node is the gate; object shape is only consulted when no node
+    exists.
     """
+    entity_names = {e.name for e in (entities or [])}
     scalar: list[dict] = []
     non_scalar: list[dict] = []
     for f in facts:
@@ -2747,7 +2756,11 @@ def _partition_scalar_facts(facts: list[dict]) -> tuple[list[dict], list[dict]]:
         if f.get("synthetic") is True:
             non_scalar.append(f)
             continue
-        if _is_scalar_value(str(f.get("object", ""))):
+        obj = str(f.get("object", ""))
+        if obj in entity_names:
+            non_scalar.append(f)
+            continue
+        if _is_scalar_value(obj):
             scalar.append(f)
         else:
             non_scalar.append(f)

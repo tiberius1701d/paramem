@@ -965,8 +965,7 @@ enumerate alternatives:
 
 This split is the contract: closed-set fields are constrained by example
 exhaustiveness; open-set fields are filled by demonstration of shape. The
-attribute-projection step (`paramem/graph/relation_prep.py`; the legacy QA
-path in `paramem/graph/qa_generator.py` reaches the same helper) auto-prefixes
+attribute-projection step (`paramem/graph/relation_prep.py`) auto-prefixes
 attribute keys with `has_` so the prompt should emit bare keys (`email`, not
 `has_email`).
 

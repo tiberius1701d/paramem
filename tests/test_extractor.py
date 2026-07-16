@@ -8,6 +8,7 @@ import pytest
 from paramem.graph.extractor import (
     _extract_json_block,
     _normalize_extraction,
+    _partition_scalar_facts,
     _stamp_speaker_entity,
     extract_graph,
     extract_procedural_graph,
@@ -107,6 +108,87 @@ class TestExtractJsonBlock:
         result = _extract_json_block(text)
         parsed = json.loads(result)
         assert parsed[0]["subject"] == "Alex"
+
+
+class TestPartitionScalarFacts:
+    """Object-is-a-known-entity-node gates scalar folding, not object shape.
+
+    A digit-bearing entity name (``speaker1``, a droid-style person name
+    like ``R2D2``) matches ``_is_scalar_value``'s version-tagged-identifier
+    branch. Without the entity-node check, such a fact would be folded onto
+    ``Entity.attributes`` as a string, destroying the edge.
+    """
+
+    def test_has_sibling_speaker_object_stays_edge(self):
+        """has_sibling(speaker0, speaker1) — speaker1 is a known person node."""
+        facts = [
+            {
+                "subject": "speaker0",
+                "predicate": "has_sibling",
+                "object": "speaker1",
+                "relation_type": "social",
+                "confidence": 0.9,
+            }
+        ]
+        entities = [
+            Entity(name="speaker0", entity_type="person"),
+            Entity(name="speaker1", entity_type="person"),
+        ]
+        scalar, non_scalar = _partition_scalar_facts(facts, entities)
+        assert scalar == []
+        assert non_scalar == facts
+
+    def test_digit_bearing_person_name_stays_edge(self):
+        """A person named 'R2D2' must not be folded even though it looks
+        like a version-tagged identifier by shape alone."""
+        facts = [
+            {
+                "subject": "speaker0",
+                "predicate": "has_pet",
+                "object": "R2D2",
+                "relation_type": "social",
+                "confidence": 0.9,
+            }
+        ]
+        entities = [
+            Entity(name="speaker0", entity_type="person"),
+            Entity(name="R2D2", entity_type="person"),
+        ]
+        scalar, non_scalar = _partition_scalar_facts(facts, entities)
+        assert scalar == []
+        assert non_scalar == facts
+
+    def test_unknown_version_tagged_object_still_folds_to_scalar(self):
+        """Regression: a genuine scalar identifier with no matching entity
+        node still routes to scalar (existing behavior preserved)."""
+        facts = [
+            {
+                "subject": "speaker0",
+                "predicate": "uses",
+                "object": "ROS2",
+                "relation_type": "factual",
+                "confidence": 0.8,
+            }
+        ]
+        entities = [Entity(name="speaker0", entity_type="person")]
+        scalar, non_scalar = _partition_scalar_facts(facts, entities)
+        assert scalar == facts
+        assert non_scalar == []
+
+    def test_no_entities_arg_preserves_prior_behavior(self):
+        """``entities=None`` (default) — shape heuristic alone, unchanged."""
+        facts = [
+            {
+                "subject": "speaker0",
+                "predicate": "uses",
+                "object": "H100",
+                "relation_type": "factual",
+                "confidence": 0.8,
+            }
+        ]
+        scalar, non_scalar = _partition_scalar_facts(facts)
+        assert scalar == facts
+        assert non_scalar == []
 
 
 class TestSessionGraphFromJson:
