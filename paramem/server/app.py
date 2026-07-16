@@ -6101,6 +6101,14 @@ def _apply_config_live() -> dict:
          first, then signal the carve.  A ``paths.*`` mix is always
          manual-restart regardless of other fields.
 
+    3b. Reconciles the consolidation systemd timer against config B's
+        ``consolidation.refresh_cadence`` (:func:`paramem.server.systemd_timer.reconcile`),
+        unconditionally and independent of the R-PORT/R-PATHS carve outcome.
+        This is stateless: it re-reads the PRESENT cadence and acts on it —
+        it never diffs against config A's former cadence, so a cadence-only
+        edit applies live (drift clears) without a restart. Skipped only when
+        config B failed to load. Never raises — logged and swallowed like
+        the other systemd reconcile call sites (see ``lifespan``).
     4. Calls ``_live_reload_base_model(refresh_config_from_disk=True)`` for
        non-carve fields.
     5. On ``mode==local`` after the rebuild, calls
@@ -6234,6 +6242,34 @@ def _apply_config_live() -> dict:
             except Exception:
                 logger.exception(
                     "_apply_config_live: failed to load config B from disk for carve diff"
+                )
+
+        # ── scheduler reconcile: stateless re-read of the PRESENT cadence ──
+        # The systemd timer joins the live-apply mechanism like every other
+        # concern below: it re-reads consolidation.refresh_cadence straight
+        # from config B (the on-disk config being applied) and reconciles the
+        # timer to it. It never diffs against config A's former cadence — a
+        # cadence-only edit must apply live without a restart, so drift can
+        # clear on its own instead of only clearing via a restart that would
+        # then re-arm the very timer that fired the alert (self-prophecy).
+        # This runs even when the reload below carves off into a
+        # manual-restart path (R-PATHS / R-PORT) — the schedule is an
+        # independent concern from the base-model reload, and the operator
+        # still gets a live-applied cadence while the carve is pending a
+        # restart. TRIAL/migration semantics are preserved for free: this
+        # function (and therefore this reconcile) is only reached from
+        # accept/rollback, never from migration_confirm's disk-only candidate
+        # write, so a TRIAL candidate's cadence never arms the live timer.
+        if config_b is not None:
+            from paramem.server import systemd_timer
+
+            try:
+                sched_msg = systemd_timer.reconcile(config_b.consolidation.refresh_cadence or "")
+                logger.info("_apply_config_live: %s", sched_msg)
+            except Exception:
+                logger.exception(
+                    "_apply_config_live: failed to reconcile consolidation timer — "
+                    "continuing; cadence change may require a restart to apply"
                 )
 
         restart_required_reason: str | None = None

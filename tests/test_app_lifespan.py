@@ -9,7 +9,10 @@ All GPU/model calls are mocked — no hardware required.
 
 from __future__ import annotations
 
+import subprocess
 import time
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # ---------------------------------------------------------------------------
@@ -200,3 +203,197 @@ class TestSchedulerIdleDebounce:
             )
 
         assert result != "deferred_idle", f"No chat yet must not defer; got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# TestApplyConfigLiveSchedulerParticipation — _apply_config_live re-reads
+# consolidation.refresh_cadence from config B and reconciles the systemd
+# timer to it, so a cadence-only edit applies live and drift clears without
+# a restart. All systemctl calls are mocked (_run_systemctl) and unit files
+# are redirected into tmp_path — no test here can reach the live user
+# systemd session.
+# ---------------------------------------------------------------------------
+
+
+def _make_apply_live_config(
+    refresh_cadence: str = "12h",
+    stt_port: int = 10300,
+    tts_port: int = 10301,
+    sessions_path: str = "/data/sessions",
+    data_path: str = "/data",
+):
+    """Minimal mock ServerConfig for ``_apply_config_live`` scheduler tests.
+
+    Mirrors ``_make_config`` in ``tests/server/test_gpu_acquire.py`` (the
+    existing ``_apply_config_live`` test pattern), extended with
+    ``consolidation.refresh_cadence`` so the reconcile call under test has a
+    real schedule string to act on.
+    """
+    cfg = MagicMock()
+    cfg.stt.port = stt_port
+    cfg.tts.port = tts_port
+    cfg.paths.sessions = sessions_path
+    cfg.paths.data = data_path
+    cfg.source_path = None
+    cfg.consolidation.refresh_cadence = refresh_cadence
+    return cfg
+
+
+@contextmanager
+def _null_gpu_lock_sync(timeout=-1):
+    """No-op replacement for gpu_lock_sync — always succeeds immediately."""
+    yield
+
+
+def _mock_run_systemctl(*args, **kwargs):
+    return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+
+class TestApplyConfigLiveSchedulerParticipation:
+    def _install_timer_paths(self, tmp_path, monkeypatch):
+        from paramem.server import systemd_timer
+
+        monkeypatch.setattr(systemd_timer, "UNIT_DIR", tmp_path)
+        monkeypatch.setattr(systemd_timer, "TIMER_PATH", tmp_path / "paramem-consolidate.timer")
+        monkeypatch.setattr(systemd_timer, "SERVICE_PATH", tmp_path / "paramem-consolidate.service")
+        return systemd_timer
+
+    def test_cadence_change_applies_live_without_restart(self, tmp_path, monkeypatch):
+        """A cadence-only edit (config A '12h' -> config B '6h') is reconciled
+        into the systemd timer by _apply_config_live, with no restart
+        required — proving the scheduler is now a live-apply participant.
+        """
+        import paramem.server.app as app_module
+
+        systemd_timer = self._install_timer_paths(tmp_path, monkeypatch)
+
+        config_a = _make_apply_live_config(refresh_cadence="12h")
+        config_b = _make_apply_live_config(refresh_cadence="6h")
+
+        state_patch = {
+            "mode": "cloud-only",
+            "cloud_only_reason": "live_reload",
+            "config": config_a,
+            "config_path": "configs/server.yaml",
+            "consolidating": False,
+        }
+
+        with (
+            patch.dict(app_module._state, state_patch, clear=False),
+            patch("paramem.server.gpu_lock.gpu_lock_sync", _null_gpu_lock_sync),
+            patch(
+                "paramem.server.drift.compute_config_hash",
+                side_effect=["disk_hash_b", "mem_hash_a"],
+            ),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(app_module, "load_server_config", return_value=config_b),
+            patch.object(
+                systemd_timer, "_run_systemctl", side_effect=_mock_run_systemctl
+            ) as mock_systemctl,
+            patch.object(app_module, "_live_reload_base_model"),
+            patch.object(app_module, "_set_voice_pipeline_profile"),
+        ):
+            app_module._state["mode"] = "local"
+            result = app_module._apply_config_live()
+
+        assert result["restart_required_reason"] is None, (
+            f"Cadence-only change must not require a restart, got: {result}"
+        )
+        timer_text = (tmp_path / "paramem-consolidate.timer").read_text()
+        assert "OnCalendar=*-*-* 00,06,12,18:00:00" in timer_text, (
+            f"Timer unit was not reconciled to the '6h' cadence in config B: {timer_text!r}"
+        )
+        first_args = [c.args[0] for c in mock_systemctl.call_args_list]
+        assert "enable" in first_args, (
+            "systemd_timer.reconcile was not invoked from _apply_config_live "
+            f"(no enable call seen): {mock_systemctl.call_args_list}"
+        )
+
+    def test_cadence_off_disarms_timer_via_apply_config_live(self, tmp_path, monkeypatch):
+        """refresh_cadence='' in config B fully disarms the timer when applied
+        live — the off path stays absolute after wiring in the reconcile call.
+        """
+        import paramem.server.app as app_module
+
+        systemd_timer = self._install_timer_paths(tmp_path, monkeypatch)
+
+        # Pre-install an active timer (as if a prior '12h' cadence was live).
+        with patch.object(systemd_timer, "_run_systemctl", side_effect=_mock_run_systemctl):
+            systemd_timer.reconcile("every 12h")
+        assert (tmp_path / "paramem-consolidate.timer").exists()
+
+        config_a = _make_apply_live_config(refresh_cadence="12h")
+        config_b = _make_apply_live_config(refresh_cadence="")
+
+        state_patch = {
+            "mode": "cloud-only",
+            "cloud_only_reason": "live_reload",
+            "config": config_a,
+            "config_path": "configs/server.yaml",
+            "consolidating": False,
+        }
+
+        with (
+            patch.dict(app_module._state, state_patch, clear=False),
+            patch("paramem.server.gpu_lock.gpu_lock_sync", _null_gpu_lock_sync),
+            patch(
+                "paramem.server.drift.compute_config_hash",
+                side_effect=["disk_hash_b", "mem_hash_a"],
+            ),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(app_module, "load_server_config", return_value=config_b),
+            patch.object(systemd_timer, "_run_systemctl", side_effect=_mock_run_systemctl),
+            patch.object(app_module, "_live_reload_base_model"),
+            patch.object(app_module, "_set_voice_pipeline_profile"),
+        ):
+            app_module._state["mode"] = "local"
+            app_module._apply_config_live()
+
+        assert not (tmp_path / "paramem-consolidate.timer").exists(), (
+            "refresh_cadence='' must disarm (remove) the timer unit via _apply_config_live"
+        )
+        assert not (tmp_path / "paramem-consolidate.service").exists()
+
+    def test_no_config_b_skips_scheduler_reconcile(self, tmp_path, monkeypatch):
+        """When config B fails to load, the scheduler reconcile is skipped
+        (nothing to read) rather than acting on a stale/absent config."""
+        import paramem.server.app as app_module
+
+        systemd_timer = self._install_timer_paths(tmp_path, monkeypatch)
+
+        config_a = _make_apply_live_config(refresh_cadence="12h")
+
+        state_patch = {
+            "mode": "cloud-only",
+            "cloud_only_reason": "live_reload",
+            "config": config_a,
+            "config_path": "configs/server.yaml",
+            "consolidating": False,
+        }
+
+        def _failing_load(path, **kw):
+            raise ValueError("simulated parse failure")
+
+        with (
+            patch.dict(app_module._state, state_patch, clear=False),
+            patch("paramem.server.gpu_lock.gpu_lock_sync", _null_gpu_lock_sync),
+            patch(
+                "paramem.server.drift.compute_config_hash",
+                side_effect=["disk_hash_b", "mem_hash_a"],
+            ),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(app_module, "load_server_config", _failing_load),
+            patch.object(
+                systemd_timer, "_run_systemctl", side_effect=_mock_run_systemctl
+            ) as mock_systemctl,
+            patch.object(app_module, "_live_reload_base_model"),
+            patch.object(app_module, "_set_voice_pipeline_profile"),
+        ):
+            app_module._state["mode"] = "local"
+            app_module._apply_config_live()
+
+        assert mock_systemctl.call_args_list == [], (
+            "Scheduler reconcile must not run when config B failed to load: "
+            f"{mock_systemctl.call_args_list}"
+        )
+        assert not (tmp_path / "paramem-consolidate.timer").exists()

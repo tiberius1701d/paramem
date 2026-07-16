@@ -383,12 +383,27 @@ class TimerTarget:
 def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
     """Shared reconciliation core for both the consolidation and backup timers.
 
-    Parses *schedule*, renders/writes the unit pair, and enables the timer.
-    Never raises on systemd errors — logs and returns a notice so the caller
-    (server startup) still proceeds.
+    Parses *schedule*, renders/writes the unit pair, and — only when the
+    rendered unit content actually changed — (re)enables and restarts the
+    timer. Never raises on systemd errors — logs and returns a notice so the
+    caller (server startup, or ``_apply_config_live`` on a live cadence
+    change) still proceeds.
+
+    ``enable --now`` and ``restart`` are gated on ``svc_changed or
+    tmr_changed`` (the same flag that gates ``daemon-reload``), not called
+    unconditionally: when nothing changed, the previously-reconciled timer
+    is already enabled and running, so re-issuing ``enable --now`` on every
+    call would be a needless real ``systemctl`` write against the live user
+    session for no effect. Content-unchanged also covers first install
+    (``_write_if_changed`` reports a change when the unit files do not yet
+    exist), so a fresh machine still gets enabled.
 
     Returns a short human-readable description of the action taken, which
-    the caller logs.
+    the caller logs. The returned state ("updated" vs "already current") is
+    truthful by construction: it reports exactly ``svc_changed or
+    tmr_changed``, the same condition that gated every systemctl call in
+    this branch, so "already current" is never returned after an action was
+    actually taken.
     """
     spec = parse_schedule(schedule)
     if spec is None:
@@ -416,22 +431,22 @@ def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
         target.timer_path,
         render_timer_unit(spec, unit_name=target.timer_name, description=target.description),
     )
+    changed = svc_changed or tmr_changed
 
-    if svc_changed or tmr_changed:
+    if changed:
         _run_systemctl("daemon-reload")
 
-    enable = _run_systemctl("enable", "--now", f"{target.timer_name}.timer")
-    if enable.returncode != 0:
-        logger.warning(
-            "systemctl enable --now %s.timer failed: %s",
-            target.timer_name,
-            enable.stderr.strip(),
-        )
-        return f"{target.timer_name}: enable failed ({enable.stderr.strip()[:80]})"
+        enable = _run_systemctl("enable", "--now", f"{target.timer_name}.timer")
+        if enable.returncode != 0:
+            logger.warning(
+                "systemctl enable --now %s.timer failed: %s",
+                target.timer_name,
+                enable.stderr.strip(),
+            )
+            return f"{target.timer_name}: enable failed ({enable.stderr.strip()[:80]})"
 
-    # If unit already enabled, systemd won't restart it on daemon-reload —
-    # force a restart so the new OnCalendar takes effect.
-    if svc_changed or tmr_changed:
+        # If unit already enabled, systemd won't restart it on daemon-reload —
+        # force a restart so the new OnCalendar takes effect.
         _run_systemctl("restart", f"{target.timer_name}.timer")
 
     # Every non-off kind is OnCalendar + Persistent=true — catch-up always
@@ -440,7 +455,7 @@ def _reconcile_timer(target: TimerTarget, schedule: str) -> str:
         detail = f"calendar {spec.on_calendar} (with catch-up)"
     else:
         detail = f"daily at {spec.on_calendar} (with catch-up)"
-    state = "updated" if (svc_changed or tmr_changed) else "already current"
+    state = "updated" if changed else "already current"
     return f"{target.timer_name}: {state}, {detail}"
 
 
