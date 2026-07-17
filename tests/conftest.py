@@ -17,6 +17,7 @@
 # (this conftest re-exposes the device for those runs) or by being explicitly
 # selected via ``-m gpu``.
 import os
+import subprocess
 import sys
 
 
@@ -216,3 +217,45 @@ def _extraction_trace_scope():
 
     with extraction_trace():
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_systemd_timer_boundary(monkeypatch, tmp_path):
+    """Redirect every systemd unit write away from the operator's real timer dir.
+
+    ``_apply_config_live`` and the app lifespan (``paramem/server/app.py``)
+    reconcile the consolidation timer (:mod:`paramem.server.systemd_timer`)
+    and the backup timer (:mod:`paramem.backup.timer`) on every config apply.
+    A test that calls either path without mocking the systemd boundary would
+    write real ``paramem-consolidate.{timer,service}`` /
+    ``paramem-backup.{timer,service}`` units into
+    ``~/.config/systemd/user/`` and run a real ``systemctl enable --now``,
+    arming a timer the operator has ordered kept off — this has already
+    happened once from an unmocked test call site.
+
+    Both timers share one reconciliation core
+    (:func:`paramem.server.systemd_timer._reconcile_timer`), so redirecting
+    each module's ``UNIT_DIR``/``TIMER_PATH``/``SERVICE_PATH`` into
+    ``tmp_path`` and replacing the single ``_run_systemctl`` implementation
+    with an inert stub covers both, regardless of which test file reaches
+    ``reconcile()``.
+
+    Tests that deliberately exercise timer behaviour (e.g.
+    ``tests/test_systemd_timer_calendar.py``, ``tests/test_scheduler.py``,
+    ``tests/test_app_lifespan.py``) monkeypatch these same names themselves.
+    ``monkeypatch`` is function-scoped and shared with this fixture, so a
+    later ``monkeypatch.setattr`` call in the test body simply overrides the
+    defaults set here for the remainder of that test.
+    """
+    from paramem.backup import timer as backup_timer
+    from paramem.server import systemd_timer
+
+    def _inert_run_systemctl(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(systemd_timer, "_run_systemctl", _inert_run_systemctl)
+
+    for module in (systemd_timer, backup_timer):
+        monkeypatch.setattr(module, "UNIT_DIR", tmp_path)
+        monkeypatch.setattr(module, "TIMER_PATH", tmp_path / f"{module.TIMER_NAME}.timer")
+        monkeypatch.setattr(module, "SERVICE_PATH", tmp_path / f"{module.TIMER_NAME}.service")
