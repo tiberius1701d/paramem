@@ -24,7 +24,7 @@ from paramem.graph.extractor import (
     PROVIDER_KEY_ENV,
     _graph_enrich_with_sota,
     anonymize_with_local_model,
-    dedup_synonym_predicates,
+    normalize_predicates,
 )
 from paramem.graph.merger import GraphMerger, min_nonempty
 from paramem.graph.name_match import (
@@ -32,12 +32,11 @@ from paramem.graph.name_match import (
     is_speaker_id,
 )
 from paramem.graph.phase_trace import extraction_trace, phase_trace
-from paramem.graph.placeholders import placeholder_entity_type
 from paramem.graph.reconstruct import reconstruct_graph
 from paramem.graph.relation_prep import (
     partition_relations,
 )
-from paramem.graph.schema import Entity, Relation, SessionGraph
+from paramem.graph.schema import Relation, SessionGraph
 from paramem.graph.schema_config import fallback_relation_type, relation_types
 from paramem.memory.entry import (
     assign_keys,
@@ -453,7 +452,7 @@ class ConsolidationLoop:
         extraction_noise_filter_endpoint: str | None = None,
         extraction_plausibility_judge: str = "auto",
         extraction_plausibility_stage: str = "deanon",
-        extraction_pii_scope: set[str] | frozenset[str] | None = None,
+        extraction_scrub: set[str] | frozenset[str],
         extraction_correction_entity_types: set[str] | frozenset[str] | None = None,
         graph_config: Optional[GraphConfig] = None,
         sota_enabled: bool = False,
@@ -528,19 +527,20 @@ class ConsolidationLoop:
         # Extraction pipeline — the single chokepoint for ``extract_graph`` /
         # ``extract_procedural_graph``.  Owns the 12 SOTA-pipeline tunables
         # (temperature, max_tokens, anonymizer / noise_filter / plausibility /
-        # PII scope, etc.) sourced from the ``extraction_*``
+        # scrub categories, etc.) sourced from the ``extraction_*``
         # ConsolidationLoop kwargs.  Every consolidation call site reaches the
         # extractors through ``self.extraction.run`` / ``run_procedural`` —
         # no direct ``extract_graph(...)`` calls in this module.
         #
-        # Cloud egress PII anonymization scope (``extraction_pii_scope``) is
+        # Cloud egress PII anonymization scope (``extraction_scrub``) is
         # sourced at the bootstrap call site from
-        # ``ServerConfig.sanitization.cloud_scope`` so consolidation honours
-        # the same operator policy as inference-time cloud egress.  ``None``
-        # falls back to the one production default,
-        # ``_DEFAULT_PII_SCOPE = frozenset({"person"})`` in
-        # ``paramem/graph/placeholders.py``, for back-compat with
-        # experiment scripts.
+        # ``ServerConfig.sanitization.scrub`` so consolidation honours the
+        # same operator policy as inference-time cloud egress.  Required —
+        # no implicit default anywhere below the config layer (the model's
+        # anonymizer prompt is the sole scope authority; a graph-layer
+        # fallback constant would be a duplicated, out-of-layer privacy
+        # policy — see ``paramem/graph/placeholders.py``'s
+        # ``_build_anonymization_mapping`` docstring).
         # BASE-MODEL HOLDER (loop.extraction.model): ExtractionPipeline stores
         # model on self.extraction.model; released via loop.release() →
         # self.extraction.model = None.
@@ -557,7 +557,7 @@ class ConsolidationLoop:
                 noise_filter_endpoint=extraction_noise_filter_endpoint,
                 plausibility_judge=extraction_plausibility_judge,
                 plausibility_stage=extraction_plausibility_stage,
-                pii_scope=extraction_pii_scope,
+                scrub=extraction_scrub,
                 correction_entity_types=extraction_correction_entity_types,
                 sota_enabled=sota_enabled,
             ),
@@ -2464,28 +2464,27 @@ class ConsolidationLoop:
         anonymize -> SOTA -> de-anonymize contract as session-tier
         extraction (:func:`~paramem.graph.extractor._sota_pipeline`), via
         the shared primitives in :mod:`paramem.graph.placeholders`. The
-        cumulative fold graph carries no entity types (registry SPO
-        triples have none; the merger's fallback for an untyped relation
-        endpoint is ``entity_type="concept"``), so node attributes cannot
-        supply the per-chunk :class:`~paramem.graph.schema.Entity`
-        inventory the way session-tier extraction does. Instead, this
-        method runs :func:`~paramem.graph.extractor.anonymize_with_local_model`
+        cumulative fold graph carries no entity types of its own (registry
+        SPO triples have none; the merger's fallback for an untyped
+        relation endpoint is ``entity_type="concept"``), so this method
+        runs :func:`~paramem.graph.extractor.anonymize_with_local_model`
         (the SAME local-model anonymizer session-tier extraction uses) over
-        each chunk's triples first, and derives every real name's
-        ``entity_type`` from the placeholder that call minted for it
-        (:func:`~paramem.graph.placeholders.placeholder_entity_type`) —
-        the local model is the PRIMARY type source at this tier, not a
-        hint. That typed :class:`Entity` list and the ``pii_scope`` policy
-        (``ext_cfg.pii_scope``, sourced from ``sanitization.cloud_scope``)
-        are what feed :func:`~paramem.graph.extractor._graph_enrich_with_sota`,
-        which does the actual mint / SOTA-call / de-anonymize work (see its
-        docstring for the contract and the accepted person-level
-        ``same_as`` loss under the default ``{"person"}`` scope).
-        ``serialize_subgraph_triples`` stays a plain, un-anonymized
-        serializer — anonymization happens on its output, not inside it.
-        A local-anonymization parse failure fails the chunk closed (skips
-        the SOTA call for that chunk) rather than risk sending it unmasked
-        — mirroring :func:`~paramem.graph.extractor._sota_pipeline`'s own
+        each chunk's triples first. That call is where ``ext_cfg.scrub``
+        (sourced from ``sanitization.scrub``) is honoured — it is the SOLE
+        scope authority for THIS tier (no second detector): it decides
+        which real names the chunk's ``chunk_mapping`` even contains, and
+        its placeholders are threaded straight through — never re-derived
+        or re-minted. That mapping is what feeds
+        :func:`~paramem.graph.extractor._graph_enrich_with_sota`, which
+        applies no scope gate of its own — it substitutes every entry it
+        is handed (see its docstring for the contract and the accepted
+        person-level ``same_as`` loss under the default scope, which only
+        ever hands it person names). ``serialize_subgraph_triples`` stays a
+        plain, un-anonymized serializer — anonymization happens on its
+        output, not inside it. A local-anonymization parse failure fails
+        the chunk closed (skips the SOTA call for that chunk) rather than
+        risk sending it unmasked — mirroring
+        :func:`~paramem.graph.extractor._sota_pipeline`'s own
         fallback-to-local-only behaviour on the same failure mode.
 
         Forward-path privacy: the local anonymizer's mapping keys are
@@ -2496,27 +2495,34 @@ class ConsolidationLoop:
         would silently fail to substitute under a raw string comparison,
         leaking the real name into the SOTA payload. This method
         reconciles that mismatch itself, per chunk, before building
-        ``chunk_entities``: every ``_llm_mapping`` key is run through
+        ``chunk_mapping`` (identity reconciliation, not
+        classification): every ``_llm_mapping`` key is run through
         :func:`~paramem.graph.name_match.canonical` and matched against
         the (also-canonicalized) node keys of ``chunk_nodes``; on a match
-        the entry is re-keyed onto the actual node-key surface, and on no
-        match (or an ambiguous multiple-node match) it is dropped and
-        counted in ``mapping_rekey_dropped``. The shared
-        ``_substitute_whole_words`` primitive (:mod:`paramem.graph.
-        placeholders`) keeps EXACT matching everywhere else — canonical
-        folding there would let a mapped person name silently consume a
-        lowercase common-noun homograph in free transcript text, and
-        would defeat the fail-closed residual-token drop on the
-        deanonymize side (see that module's docstring). Separately, a local
-        mapping that comes back completely EMPTY, or every entry of which
-        is dropped by this reconciliation, while the chunk has real
-        (non-speaker) node names is a classification failure, not evidence
-        that nothing in the chunk is in scope — there is no way to tell
-        the two apart from here — so that chunk's SOTA call is skipped
-        (fail-closed) and counted in the returned ``privacy_skipped_chunks``.
-        This residual (an entity the local model misclassifies, e.g. types
-        as an organization) is owner-accepted and not otherwise engineered
-        around — see ``benchmarking.md``.
+        the entry is re-keyed onto the actual node-key surface with the
+        MODEL's own placeholder preserved verbatim, and on no match (or an
+        ambiguous multiple-node match) it is dropped and counted in
+        ``mapping_rekey_dropped``. The shared ``_substitute_whole_words``
+        primitive (:mod:`paramem.graph.placeholders`) keeps EXACT matching
+        everywhere else — canonical folding there would let a mapped
+        person name silently consume a lowercase common-noun homograph in
+        free transcript text, and would defeat the fail-closed
+        residual-token drop on the deanonymize side (see that module's
+        docstring). A local ``_llm_mapping`` that comes back completely
+        EMPTY is the anonymizer's own legitimate verdict that nothing in
+        the chunk is in scope against ``scrub`` — egress PROCEEDS on
+        that verdict, the same way
+        ``mapping == {}`` proceeds at the session tier
+        (:func:`~paramem.graph.extractor.extract_and_anonymize_for_cloud`).
+        Separately, when ``_llm_mapping`` DID name something but every
+        entry is dropped by this reconciliation, while the chunk has
+        real (non-speaker) node names, that residual is a
+        classification/identity-match failure, not a scope verdict — so
+        that chunk's SOTA call is skipped (fail-closed) and counted in
+        the returned ``privacy_skipped_chunks``. This residual (an
+        entity the local model named but reconciliation could not match
+        to a node) is owner-accepted and not otherwise engineered around
+        — see ``benchmarking.md``.
 
         The method mutates ``self.merger.graph`` in place: first applying
         ``same_as`` node contractions, then inserting new edges tagged with
@@ -2552,14 +2558,15 @@ class ConsolidationLoop:
                 - ``new_edges`` (int): edges added to the graph.
                 - ``same_as_merges`` (int): node contractions applied.
                 - ``privacy_skipped_chunks`` (int): chunks skipped because
-                  the local anonymizer identified zero entities for a
-                  chunk that had real (non-speaker) node names — see
-                  above.
+                  the local anonymizer NAMED entities but NONE survived
+                  reconciliation for a chunk that had real (non-speaker)
+                  node names — see above. A local mapping that came back
+                  EMPTY outright is not counted here; it proceeds.
                 - ``mapping_rekey_dropped`` (int): local-anonymizer mapping
                   entries dropped because they named nothing (or an
                   ambiguous multiple) in their chunk once reconciled
                   against the chunk's actual node keys via ``canonical()``
-                  (F1b) — see the ``chunk_entities`` construction below.
+                  — see the ``chunk_mapping`` construction below.
                 - ``skipped`` (bool): ``True`` when enrichment was bypassed.
                 - ``skip_reason`` (str | None): reason token when skipped.
         """
@@ -2613,12 +2620,12 @@ class ConsolidationLoop:
 
         filter_model = ext_cfg.noise_filter_model
         endpoint = ext_cfg.noise_filter_endpoint or None
-        # Same cloud-egress PII scope as session-tier extraction
-        # (``sanitization.cloud_scope`` -> ``ExtractionConfig.pii_scope`` at
-        # bootstrap) — the anonymization contract below (§ the
-        # ``_graph_enrich_with_sota`` call) honours the same operator
-        # policy as every other cloud-egress path.
-        pii_scope = ext_cfg.pii_scope
+        # Same cloud-egress scrub categories as session-tier extraction
+        # (``sanitization.scrub`` -> ``ExtractionConfig.scrub`` at
+        # bootstrap) — feeds the per-chunk ``anonymize_with_local_model``
+        # call below, which is the prompt-side scope authority at this
+        # tier (see the method docstring).
+        scrub = ext_cfg.scrub
         max_entities = max(1, self.graph_enrichment_max_entities_per_pass)
         hops = max(1, self.graph_enrichment_neighborhood_hops)
 
@@ -2687,30 +2694,28 @@ class ConsolidationLoop:
                         _chunk_first_seen, _edata.get("first_seen") or ""
                     )
                 triples = serialize_subgraph_triples(chunk_subgraph)
-                # The fold graph carries no entity types: registry SPO
-                # triples have none, and the merger's fallback for a
-                # relation endpoint that isn't already a known Entity is
-                # entity_type="concept" (GraphMerger._merge_relations).
-                # Node attributes are therefore NOT a usable type source at
+                # The fold graph carries no entity types of its own:
+                # registry SPO triples have none, and the merger's fallback
+                # for a relation endpoint that isn't already a known Entity
+                # is entity_type="concept" (GraphMerger._merge_relations).
+                # Node attributes are therefore NOT a usable scope source at
                 # this tier — reading them here previously masked ONLY the
                 # speaker (the sole node synthesized with entity_type=
                 # "person") and sent every other real name to the cloud
                 # verbatim.
                 #
-                # The local model is the PRIMARY type source instead: run
+                # The local model is the SOLE scope authority instead: run
                 # the SAME anonymize call the session tier uses
                 # (anonymize_with_local_model) over this chunk's triples,
                 # framed as a throwaway SessionGraph (transcript="" — there
-                # is no transcript at this tier), and derive each real
-                # name's entity_type from the placeholder the local model
-                # minted for it via placeholder_entity_type — the same
-                # primitive _sota_pipeline's own entity-rebuild loop uses
-                # to solve the identical problem (deriving a type from a
-                # placeholder). The anonymization prompt instructs
-                # the model to leave speaker{N} ids verbatim (never map
-                # them), so a speaker anchor never becomes a chunk_entities
-                # record here — it is already anonymous and reaches the
-                # SOTA payload bare by design (ONE-lowercase-speaker{N}
+                # is no transcript at this tier). Its ``mapping`` — real
+                # name -> the MODEL's own placeholder — is threaded straight
+                # through into ``chunk_mapping`` below, never re-derived or
+                # re-minted. The anonymization prompt instructs the model to
+                # leave speaker{N} ids verbatim (never map them), so a
+                # speaker anchor never becomes a ``chunk_mapping`` entry
+                # here — it is already anonymous and reaches the SOTA
+                # payload bare by design (ONE-lowercase-speaker{N}
                 # invariant), with no mint/restore round trip needed.
                 _chunk_relations: list[Relation] = []
                 for _t in triples:
@@ -2738,11 +2743,12 @@ class ConsolidationLoop:
                 # cache when checkpointing is active).
                 self._disable_gradient_checkpointing()
                 try:
-                    _llm_mapping, _anon_raw = anonymize_with_local_model(
+                    _llm_mapping, _llm_anon_transcript, _anon_raw = anonymize_with_local_model(
                         _chunk_session_graph,
                         self.model,
                         self.tokenizer,
                         transcript="",
+                        scrub=scrub,
                         max_tokens=ext_cfg.max_tokens,
                     )
                 finally:
@@ -2760,24 +2766,25 @@ class ConsolidationLoop:
                         "skipping SOTA call (fail-closed)"
                     )
                     continue
-                # F1b — reconcile the local anonymizer's mapping onto the
-                # ACTUAL node-key surfaces before it feeds chunk_entities.
+                # Reconcile the local anonymizer's mapping onto the
+                # ACTUAL node-key surfaces before it feeds chunk_mapping.
                 # The local model's mapping is keyed by whatever real-name
                 # surface it independently produced (e.g. "Yang Ming");
                 # the fold graph's own node keys are already canonicalized
                 # (e.g. "yang ming") — a raw comparison between the two
                 # silently misses every re-cased/separator-varied/
-                # diacritic-varied key, so _build_anonymization_mapping
-                # would mint a placeholder keyed on "Yang Ming" that never
-                # matches the "yang ming" text _substitute_whole_words
-                # compares against inside ``triples``' subject/object
-                # fields below — the real name would reach the SOTA
-                # payload unmasked even though the local model correctly
-                # classified it. Reconciling identity HERE, at this call
-                # site only, keeps the shared _substitute_whole_words
-                # primitive's matching exact everywhere else (no blast
-                # radius on the session tier, which never builds facts
-                # from pre-canonicalized node-key text).
+                # diacritic-varied key, so a ``chunk_mapping`` entry keyed
+                # on "Yang Ming" would never match the "yang ming" text
+                # _substitute_whole_words compares against inside
+                # ``triples``' subject/object fields below — the real name
+                # would reach the SOTA payload unmasked even though the
+                # local model correctly classified it. Reconciling identity
+                # HERE, at this call site only, keeps the shared
+                # _substitute_whole_words primitive's matching exact
+                # everywhere else (no blast radius on the session tier,
+                # which never builds facts from pre-canonicalized node-key
+                # text). The model's own placeholder is preserved verbatim
+                # through the rekey — never re-minted.
                 _canon_to_node: dict[str, str] = {}
                 _ambiguous_canon: set[str] = set()
                 for _node_key in chunk_nodes:
@@ -2794,7 +2801,7 @@ class ConsolidationLoop:
                     else:
                         _canon_to_node[_c] = _node_key
 
-                chunk_entities: list[Entity] = []
+                chunk_mapping: dict[str, str] = {}
                 _mapping_rekey_dropped_chunk = 0
                 for _real, _placeholder in (_llm_mapping or {}).items():
                     if not isinstance(_real, str) or not isinstance(_placeholder, str):
@@ -2805,16 +2812,13 @@ class ConsolidationLoop:
                     if _c in _ambiguous_canon or _c not in _canon_to_node:
                         # The model named something that matches no (single,
                         # unambiguous) node in THIS chunk — drop it rather
-                        # than mint a placeholder that would never be found
-                        # in the triples' subject/object text.
+                        # than carry a mapping entry that would never be
+                        # found in the triples' subject/object text.
                         _mapping_rekey_dropped_chunk += 1
                         continue
-                    chunk_entities.append(
-                        Entity(
-                            name=_canon_to_node[_c],
-                            entity_type=placeholder_entity_type(_placeholder),
-                        )
-                    )
+                    # Rekey onto the ACTUAL node-key surface; preserve the
+                    # MODEL's own placeholder verbatim — never re-mint.
+                    chunk_mapping[_canon_to_node[_c]] = _placeholder
                 mapping_rekey_dropped += _mapping_rekey_dropped_chunk
                 if _mapping_rekey_dropped_chunk:
                     logger.warning(
@@ -2823,42 +2827,49 @@ class ConsolidationLoop:
                         "reconciliation)",
                         _mapping_rekey_dropped_chunk,
                     )
-                # Forward-path privacy guard (leg 2 — the leg the F1b
-                # reconciliation above cannot fix, since it operates on a
-                # mapping that came back non-empty but wrong; this leg
-                # covers the mapping coming back EMPTY, or every entry
-                # dropped by reconciliation): a chunk with real
-                # (non-speaker) node names but zero surviving
-                # ``chunk_entities`` is a classification failure, not
-                # evidence that nothing in this chunk is in scope — there
-                # is no way to tell the two apart from here. Narrow by
-                # design: this does NOT attempt a totality check against
-                # every node (that would treat legitimate out-of-scope
-                # nodes, e.g. organizations, as leaks too) — it only fires
-                # when the local anonymizer named NOTHING usable at all for
-                # a chunk that has real content.
+                # Forward-path privacy guard (the case the identity
+                # reconciliation above cannot fix): ``_llm_mapping`` coming
+                # back EMPTY is the anonymizer's own legitimate verdict
+                # that nothing in the chunk is in scope against ``scrub``
+                # — a distinct case from every ``_llm_mapping`` entry
+                # being dropped by reconciliation above (a genuine
+                # identity-match failure, not a scope verdict). Egress
+                # PROCEEDS on the former (empty mapping == "ran, found
+                # nothing", trusted like the
+                # session-tier ``mapping is None`` check at
+                # ``_llm_mapping is None`` above already distinguishes
+                # true PARSE failure). This guard fires ONLY on the
+                # latter: a chunk with real (non-speaker) node names
+                # where ``_llm_mapping`` DID name something but zero of
+                # it survived reconciliation onto this chunk's actual
+                # node keys — that residual is a classification/identity
+                # failure, not evidence of out-of-scope content, so it
+                # still fails closed. Narrow by design: this does NOT
+                # attempt a totality check against every node (that would
+                # treat legitimate out-of-scope nodes, e.g. organizations,
+                # as leaks too).
                 _chunk_nonspeaker_names = {
                     str(_t.get(_field, "")) for _t in triples for _field in ("subject", "object")
                 }
                 _chunk_nonspeaker_names = {
                     _n for _n in _chunk_nonspeaker_names if _n and not is_speaker_id(_n)
                 }
-                if _chunk_nonspeaker_names and not chunk_entities:
+                if _llm_mapping and _chunk_nonspeaker_names and not chunk_mapping:
                     privacy_skipped_chunks += 1
                     logger.warning(
-                        "graph_enrichment: local anonymizer identified zero entities "
-                        "for a %d-triple chunk — skipping SOTA call (fail-closed)",
+                        "graph_enrichment: local anonymizer named entities but none "
+                        "survived reconciliation for a %d-triple chunk — skipping "
+                        "SOTA call (fail-closed)",
                         len(triples),
                     )
                     continue
                 result = _graph_enrich_with_sota(
                     triples,
-                    chunk_entities,
+                    chunk_mapping,
                     api_key,
                     provider,
                     filter_model,
                     endpoint,
-                    pii_scope=pii_scope,
                 )
                 calls_made += 1
                 if result is None:
@@ -2903,7 +2914,7 @@ class ConsolidationLoop:
                 keep, drop = pair[0], pair[1]
                 if keep == drop:
                     continue
-                # W1 guard: skip same_as pairs where BOTH surface strings are
+                # Guard: skip same_as pairs where BOTH surface strings are
                 # speaker ids.  Speaker identity is authoritative (voice/enrollment);
                 # it must never be coalesced by a surface-similarity heuristic.
                 # Two speaker-id surfaces are either the SAME speaker (already
@@ -3086,7 +3097,7 @@ class ConsolidationLoop:
         }
 
     def _run_graph_normalization(self) -> dict:
-        """Whole-graph normalization pass using :func:`dedup_synonym_predicates`.
+        """Whole-graph normalization pass using :func:`normalize_predicates`.
 
         Runs after the Materialize stage at refinement level ``light`` or higher,
         over the cumulative ``merger.graph``.  Collapses synonym predicates on the
@@ -3101,9 +3112,13 @@ class ConsolidationLoop:
           silently when credentials are absent; normalization still runs.
 
         The model receives the predicate list for each candidate group via the
-        ``{predicates_json}`` slot in ``graph_dedup_filter.txt`` and returns the
-        cluster schema ``{"clusters": [["predA", "predB"], ...]}``.  GC
-        disable/enable is handled inside :func:`dedup_synonym_predicates`.
+        ``{predicates_json}`` slot in ``predicate_normalization.txt`` and returns the
+        cluster schema ``{"clusters": [["predA", "predB"], ...]}``.  Both the
+        filter prompt and ``predicate_normalization_system.txt`` load through
+        :func:`_load_prompt` inside :func:`normalize_predicates` itself
+        (production fold passes no ``prompts_dir`` override, so the default
+        search path is used).  GC disable/enable is handled inside
+        :func:`normalize_predicates`.
 
         Survivor selection: within each cluster, the predicate with the highest
         ``reinforcement_count`` (summed across all edges for that predicate)
@@ -3122,7 +3137,7 @@ class ConsolidationLoop:
 
         1. Build ``_flat_relations`` and ``_so_groups`` from all predicate-bearing
            edges in ``merger.graph``.
-        2. Call :func:`dedup_synonym_predicates` with the resolved engine kwargs.
+        2. Call :func:`normalize_predicates` with the resolved engine kwargs.
         3. For each returned ``(can_s, can_o)`` cluster group: pick the MAX
            ``reinforcement_count`` edge as survivor; retire the rest.
 
@@ -3134,7 +3149,7 @@ class ConsolidationLoop:
 
         4. Single-predicate ``(s, o)`` facts are NEVER retired.
         5. Hallucinated predicates in model output are grounded inside
-           :func:`dedup_synonym_predicates` — no new edges are minted.
+           :func:`normalize_predicates` — no new edges are minted.
 
         Early-return conditions (all return ``skipped=True``):
 
@@ -3150,7 +3165,6 @@ class ConsolidationLoop:
                 - ``skipped`` (bool): ``True`` when the pass was bypassed.
                 - ``skip_reason`` (str | None): reason token when skipped.
         """
-        from paramem.graph.prompts import _load_prompt
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         _empty = {"groups_collapsed": 0, "edges_retired": 0, "chunks": 0}
@@ -3168,9 +3182,6 @@ class ConsolidationLoop:
                 node_count,
             )
             return {**_empty, "skipped": True, "skip_reason": "floor"}
-
-        # Load the filter prompt — fail loud if missing (misconfiguration, not transient).
-        filter_prompt = _load_prompt("graph_dedup_filter.txt", required=True)
 
         # Build flat relation list and per-(s,o) group index.
         # Each _info entry: {u, v, eid, edata, ik_key, can_s, can_o, can_pred}
@@ -3213,9 +3224,6 @@ class ConsolidationLoop:
                         "provider": provider,
                         "filter_model": ext_cfg.noise_filter_model,
                         "endpoint": ext_cfg.noise_filter_endpoint or None,
-                        "system_prompt": _load_prompt(
-                            "graph_dedup_filter_system.txt", required=True
-                        ),
                     }
                 }
                 logger.info("graph_normalization: engine=SOTA provider=%s", provider)
@@ -3224,11 +3232,9 @@ class ConsolidationLoop:
                     "graph_normalization: sota_enabled but no provider/api_key -- engine=local"
                 )
 
-        # Delegate model calls to dedup_synonym_predicates.
-        # GC disable/enable is handled inside dedup_synonym_predicates.
-        clusters_by_so, _dedup_diag = dedup_synonym_predicates(
-            _flat_relations, filter_prompt=filter_prompt, **engine_kwargs
-        )
+        # Delegate model calls to normalize_predicates.
+        # GC disable/enable is handled inside normalize_predicates.
+        clusters_by_so, _normalization_diag = normalize_predicates(_flat_relations, **engine_kwargs)
 
         total_edges_retired = 0
         total_groups_collapsed = 0
@@ -3246,7 +3252,7 @@ class ConsolidationLoop:
 
             for cluster in group_clusters:
                 # cluster is a list of canonical predicates confirmed as synonyms.
-                # At least 2 members guaranteed by dedup_synonym_predicates.
+                # At least 2 members guaranteed by normalize_predicates.
                 # Exclude predicates already retired by a prior cluster in this group
                 # (can arise when model returns overlapping clusters).
                 cluster_preds = [
@@ -3330,7 +3336,7 @@ class ConsolidationLoop:
             "graph_normalization: groups_collapsed=%d edges_retired=%d model_calls=%d",
             total_groups_collapsed,
             total_edges_retired,
-            _dedup_diag.get("model_calls", 0),
+            _normalization_diag.get("model_calls", 0),
         )
 
         _applied = {
@@ -3341,12 +3347,12 @@ class ConsolidationLoop:
             {"subject": s, "object": o, "clusters": cl} for (s, o), cl in clusters_by_so.items()
         ]
         self._debug_writer.on_normalization(
-            _dedup_diag.get("raw_outputs", []), _decisions, _applied
+            _normalization_diag.get("raw_outputs", []), _decisions, _applied
         )
 
         return {
             **_applied,
-            "chunks": _dedup_diag.get("model_calls", 0),
+            "chunks": _normalization_diag.get("model_calls", 0),
             "skipped": False,
             "skip_reason": None,
         }
@@ -6723,8 +6729,8 @@ class ConsolidationLoop:
 
         1. Optionally run the whole-graph local-model normalization pass via
            :meth:`_run_graph_normalization` (predicate alignment + entity merge +
-           semantic dedup).  Runs when ``normalize`` is ``True``.  Local model;
-           no cloud dependency.
+           predicate-synonym normalization).  Runs when ``normalize`` is ``True``.
+           Local model; no cloud dependency.
         2. Optionally run SOTA graph enrichment via :meth:`_run_graph_enrichment`
            (additive second-order discovery).  Runs when ``enrich`` is ``True``.
            Cloud dependency.
@@ -6757,7 +6763,8 @@ class ConsolidationLoop:
                 performed so ``merger.reinforcements`` will be empty too).  Does
                 NOT gate the independent ``adopt_reinforcements`` bump block.
             normalize: When ``True``, run :meth:`_run_graph_normalization`
-                (local-model predicate alignment + entity merge + dedup).
+                (local-model predicate alignment + entity merge +
+                predicate-synonym normalization).
                 Callers pass ``normalize=scope.normalize``.
                 Default ``False``.
             enrich: When ``True``, run :meth:`_run_graph_enrichment` (cloud-SOTA

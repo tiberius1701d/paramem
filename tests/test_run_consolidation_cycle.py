@@ -88,6 +88,7 @@ def _make_mock_loop(tmp_path: Path, *, adapter_names: list[str] | None = None):
             noise_filter_endpoint=None,
             plausibility_judge="off",
             plausibility_stage="deanon",
+            scrub={"person name"},
         ),
         prompts_dir=None,
     )
@@ -763,7 +764,7 @@ class TestSessionIdsProvenanceCarry:
     - rec["session_ids"] is present on the deferred-write record (sorted list of
       real contributing session ids, synthetic sentinels excluded).
     - rec["entry"] does NOT contain "session_ids" (the persisted dict schema
-      stays unchanged per owner decision D4).
+      stays unchanged).
     - speaker_id attribution is unchanged: the minted-key speaker_id comes from
       the subject node's speaker_id attribute (dcf4189 invariant), not from any
       session_ids field.
@@ -823,7 +824,7 @@ class TestSessionIdsProvenanceCarry:
     def test_entry_dict_does_not_contain_session_ids(self, tmp_path: Path) -> None:
         """rec['entry'] (the persisted dict passed to store.put) must NOT contain session_ids.
 
-        D4 owner decision: provenance is transient/RAM-only; the persisted
+        Provenance is transient/RAM-only; the persisted
         registry/bookkeeping schema stays unchanged.
         """
         loop = self._make_loop_with_sessions_in_graph(
@@ -837,7 +838,7 @@ class TestSessionIdsProvenanceCarry:
         entry = deferred_writes[0]["entry"]
         assert "session_ids" not in entry, (
             "session_ids must NOT appear in the persisted entry dict — "
-            "it is a transient rec-level field only (D4)"
+            "it is a transient rec-level field only"
         )
 
     def test_speaker_id_attribution_unchanged_by_session_ids(self, tmp_path: Path) -> None:
@@ -928,14 +929,14 @@ class TestRecallFailedSessionStaysPending:
       site at step 11b.
     - Assert result["recall_failed_session_ids"] and downstream behavior.
 
-    W4 / R2 caveat:
+    Conditional-assertion caveat:
     Under refinement_normalization="off", _pending_relations is None so the
     pending-session relations may not enter the merge graph and new episodic
     keys may not be minted.  The "off" arm asserts conditionally:
     if no new keys are minted, recall_failed_session_ids must be [] (the
-    bug cannot manifest there); the non-empty "off" case awaits the R2 GPU
-    probe.  Procedural is asserted under "off" regardless (always fact-dict
-    carrier).
+    bug cannot manifest there); the non-empty "off" case awaits further GPU
+    verification.  Procedural is asserted under "off" regardless (always
+    fact-dict carrier).
     """
 
     # Shared patch list for run_consolidation_cycle without model weights.
@@ -1046,9 +1047,7 @@ class TestRecallFailedSessionStaysPending:
         result = self._run_cycle(loop, mode="train")
 
         # The cycle must return recall_failed_session_ids with the contributing session.
-        assert "recall_failed_session_ids" in result, (
-            "result must carry recall_failed_session_ids (T8)"
-        )
+        assert "recall_failed_session_ids" in result, "result must carry recall_failed_session_ids"
         assert session_id in result["recall_failed_session_ids"], (
             f"session {session_id!r} must be in recall_failed_session_ids; "
             f"got {result['recall_failed_session_ids']}"
@@ -1079,16 +1078,16 @@ class TestRecallFailedSessionStaysPending:
         )
 
     def test_off_refinement_episodic_arm_conditional(self, tmp_path: Path) -> None:
-        """Under refinement_normalization='off', assert conditionally per W4/R2 caveat.
+        """Under refinement_normalization='off', assert conditionally per the caveat above.
 
         If no new episodic keys are minted (pending-sessions path absent under off),
         recall_failed_session_ids is [] — the bug cannot manifest; no assertion
         beyond that.  If keys ARE minted (not expected from static analysis, but
         defensive), we assert the failing key's session is collected.
 
-        NOTE: the R2 GPU probe must establish the "off"-config minting source
+        NOTE: a GPU probe must establish the "off"-config minting source
         before asserting the non-empty "off" case.  This conditional arm is
-        intentional — do not strengthen it without R2 results.
+        intentional — do not strengthen it without that GPU verification.
         """
         session_id = "real-session-off"
         loop = self._make_loop_with_session_edge(
@@ -1151,7 +1150,7 @@ class TestRecallFailedSessionStaysPending:
         assert buf._sessions[sid]["recall_retry_count"] == 3
 
     def test_bump_retry_and_release_skips_absent_ids(self, tmp_path: Path) -> None:
-        """R3 guard: ids absent from _sessions are silently skipped."""
+        """Guard: ids absent from _sessions are silently skipped."""
         from paramem.server.session_buffer import SessionBuffer
 
         buf = SessionBuffer(tmp_path, state_dir=tmp_path / "state", consolidation_retry_cap=3)
@@ -1347,7 +1346,7 @@ class TestRecallFailedSessionStaysPending:
         assert len(active) == 1, f"Exactly 1 key must be registered; got {active}"
 
     # ------------------------------------------------------------------
-    # Test 5 — procedural path: recall failure collects session id (T7)
+    # Test 5 — procedural path: recall failure collects session id
     # ------------------------------------------------------------------
 
     def test_procedural_recall_failure_populates_recall_failed_session_ids(

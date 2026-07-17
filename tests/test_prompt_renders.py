@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import re
 
-from paramem.graph.extractor import load_extraction_prompts, load_procedural_prompt
+from paramem.graph.extractor import (
+    load_anonymization_prompt,
+    load_extraction_prompts,
+    load_procedural_prompt,
+)
 from paramem.graph.schema_config import (
     entity_types,
     relation_types,
@@ -27,7 +31,12 @@ _LEFTOVER_PLACEHOLDER = re.compile(r"(?<!\{)\{[A-Za-z_]+\}(?!\})")
 # examples show the subject slot wrapped in template-variable syntax so the
 # model recognises it as a substitution target rather than a literal name.
 # It is produced by writing ``{{SPEAKER_NAME}}`` in the prompt source.
-_INTENTIONAL_LITERALS = {"{SPEAKER_NAME}"}
+#
+# `{N}` appears literally in anonymization.txt: it documents the
+# placeholder shape (`<Prefix>_<N>`) and the `speaker{N}` id pattern —
+# both produced by writing ``{{N}}`` in the prompt source, same mechanism
+# as `{SPEAKER_NAME}` above.
+_INTENTIONAL_LITERALS = {"{SPEAKER_NAME}", "{N}"}
 
 
 class TestExtractionPromptRender:
@@ -137,22 +146,52 @@ class TestProceduralPromptRender:
         assert "preference" in rendered
 
 
-class TestGraphDedupFilterPromptRender:
-    """The per-group predicate-dedup prompt is .format()-ed with predicates_json
-    at runtime (dedup_synonym_predicates).  Its JSON example literals MUST be
+class TestAnonymizationPromptRender:
+    """anonymization.txt renders with a rendered {scrub_categories} slot —
+    the config-driven ``sanitization.scrub`` scope authority."""
+
+    def _render(self):
+        tmpl = load_anonymization_prompt()
+        return tmpl.format(
+            scrub_categories="person name, email address, phone number",
+            facts_json="[]",
+            transcript="sample",
+        )
+
+    def test_renders_without_exception(self):
+        rendered = self._render()
+        assert isinstance(rendered, str)
+
+    def test_no_leftover_placeholders(self):
+        rendered = self._render()
+        leftover = [
+            m for m in _LEFTOVER_PLACEHOLDER.findall(rendered) if m not in _INTENTIONAL_LITERALS
+        ]
+        assert leftover == [], f"Leftover placeholders after render: {leftover}"
+
+    def test_scrub_categories_reach_rendered_output(self):
+        """A non-default scrub value must actually reach the prompt — the
+        guard against re-introducing a dead config knob."""
+        rendered = self._render()
+        assert "person name, email address, phone number" in rendered
+
+
+class TestPredicateNormalizationPromptRender:
+    """The per-group predicate-normalization prompt is .format()-ed with predicates_json
+    at runtime (normalize_predicates).  Its JSON example literals MUST be
     double-escaped ({{ }}) or .format() raises KeyError.  Only {predicates_json}
     is a format field."""
 
     def _load(self):
         from paramem.graph.prompts import _load_prompt
 
-        return _load_prompt("graph_dedup_filter.txt", "", None)
+        return _load_prompt("predicate_normalization.txt", "", None)
 
     def test_renders_without_exception(self):
         import json
 
         prompt = self._load()
-        assert prompt, "graph_dedup_filter.txt must exist and be non-empty"
+        assert prompt, "predicate_normalization.txt must exist and be non-empty"
         # Must not raise KeyError (brace-escape regression guard).
         rendered = prompt.format(predicates_json=json.dumps(["works_for", "employed_by"]))
         assert isinstance(rendered, str)

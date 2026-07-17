@@ -209,7 +209,7 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  sota_enabled: false           # master gate for ALL SOTA (transcript pipeline + graph enrichment). false = ship default (off). NOT a benign toggle: enabling egresses knowledge-graph content (subjects/objects) to the configured cloud provider. Anonymization is best-effort, scoped by sanitization.cloud_scope, and depends on the LOCAL model's entity-type classification — a misclassified entity (e.g. a person typed as an organization) can leak a real name to the cloud with no downstream detection or repair. Keep false unless this risk is accepted.
+  sota_enabled: false           # master gate for ALL SOTA (transcript pipeline + graph enrichment). false = ship default (off). NOT a benign toggle: enabling egresses knowledge-graph content (subjects/objects) to the configured cloud provider. Anonymization is best-effort, scoped by sanitization.scrub, and depends on the LOCAL model's classification of each value against that scope — a misclassified value can leak real PII to the cloud with no downstream detection or repair. Keep false unless this risk is accepted.
   refinement_enrichment: "off"  # graph-stage SOTA enrichment pass. off|on. Requires sota_enabled:true to fire. Same cloud-egress risk as sota_enabled above — this is the flag that actually triggers the graph-content SOTA call.
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (one model call per candidate (s,o) group). off|on.
   refinement_contradiction: "off"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. Applied at ingest, interim, and fold. off|on.
@@ -471,49 +471,54 @@ tools:
 #                                  non-PERSONAL sent verbatim. Phase 2 default,
 #                                  zero anonymizer cost, smallest cloud surface.
 #                     anonymize  : cloud-bound text is anonymized via the
-#                                  local LLM (categories chosen by `cloud_scope`),
+#                                  local LLM (categories chosen by `scrub`),
 #                                  sent to SOTA as placeholders, and
 #                                  de-anonymized on the way back. PERSONAL
 #                                  queries reach cloud as redacted text.
 #                     both       : strictest privacy posture — PERSONAL is
 #                                  blocked AND non-PERSONAL is anonymized
-#                                  per `cloud_scope`.
+#                                  per `scrub`.
 #
-#   `cloud_scope` — MINT SELECTOR: list of entity-type categories that get a
-#                   placeholder minted (and are therefore substituted out of
-#                   the payload) when `cloud_mode` is `anonymize` or `both`.
-#                   Default `[person]`: only person names get redacted;
-#                   place names, organizations, etc. pass through verbatim so
-#                   the cloud can answer questions like "What's a good
-#                   restaurant in Berlin?" sensibly.  Empty list `[]`
-#                   disables anonymization entirely under anonymizing modes
-#                   (cloud sees the original text).  Operator owns the
-#                   privacy/utility tradeoff.  The entity-type vocabulary is
-#                   OPEN — person, place, organization, concept are the
-#                   closed subset in configs/schema.yaml, but the local
-#                   model is free to mint any other type (language,
-#                   activity, ...) — so there is no fixed set to validate
-#                   values against; only structure (a list of non-empty
-#                   strings) is checked at config load.  A misspelled entry
-#                   (e.g. "persons") is NOT rejected: it matches no entity's
-#                   type, mints nothing, and every entity of the type you
-#                   meant to scope egresses verbatim. Verify spelling against
-#                   a real run's `graph.diagnostics["core_placeholders"]`
-#                   rather than assuming silence means "in scope, nothing
-#                   found."
+#   `scrub` — a flat list of PII-vocabulary HINTS (free text, e.g. "person
+#             name", "phone number") passed verbatim to the anonymizer
+#             prompt when `cloud_mode` is `anonymize` or `both`.  THE PROMPT
+#             IS THE SOLE SCOPE AUTHORITY: the local model decides, per
+#             value, whether it is an instance of one of these categories
+#             and mints/substitutes a placeholder for it — there is no
+#             code-side entity-type gate.  Default is a load-bearing set of
+#             name / phone / address / online-identity sub-terms (person
+#             name, full name, given name, family name, phone number,
+#             mobile number, landline number, email address, street
+#             address, postal address, profile URL, social media handle);
+#             place names, organizations, products, etc. are deliberately
+#             omitted so the cloud can still answer questions like "What's
+#             a good restaurant in Berlin?" sensibly.  Empty list `[]` disables
+#             anonymization entirely under anonymizing modes (cloud sees the
+#             original text) — this is the operator opt-out.  Operator owns
+#             the privacy/utility tradeoff.  Novel categories beyond the
+#             default core above (e.g. "date of birth", "passport number")
+#             are legal and honoured as-is — the anonymizer prompt, not this
+#             config, is what interprets them.  Vocabulary is free-form: only
+#             structure (a list of non-empty strings) is checked at config
+#             load, and a novel/misspelled term loads SILENTLY (no warning) —
+#             a code-side "known-good" vocabulary to validate or warn against
+#             would be the same closed list this design deletes everywhere
+#             else.  Verify a category actually scrubs against a real
+#             anonymizer run, not against config-load silence.
 #
-# There is NO post-hoc leak check and no repair loop.  The anonymized
-# payload is built deterministically by the script from a table it mints
-# and owns, substituted exactly and case-sensitively — nothing verifies it
-# afterward.  Residual, stated plainly: (a) a real name that differs only in
-# CASE from its extracted surface egresses in the clear; (b) a name that
-# appears only as a fact's subject/object and was never itself surfaced as
-# an entity is covered only if the local model's mapping hint happened to
-# name it; (c) a name the local model TYPES as an out-of-scope category
-# (e.g. a person misclassified as an organization) egresses verbatim. See
-# SECURITY.md for the full accounting.
+# There is no runtime check-and-abort that re-verifies the model's
+# classification — that would be brittle and second-guess the trusted
+# classifier.  The model authors BOTH the `mapping` and the rewritten
+# `anonymized_transcript` in one call; verification is an offline
+# calibration gate (recall + transcript fidelity) run before ship, not a
+# runtime check.  The only runtime fail-closed is boundary-error handling:
+# if the anonymizer call fails or returns no transcript, the original text
+# is never sent — the call is treated as blocked.  Residual, stated
+# plainly: a value the model fails to classify as in-scope egresses
+# verbatim with no downstream repair. See SECURITY.md for the full
+# accounting.
 #
-# HA path (HA conversation agent) is NOT affected by `cloud_mode`/`cloud_scope`.
+# HA path (HA conversation agent) is NOT affected by `cloud_mode`/`scrub`.
 # HA receives cleartext, gated by intent classification. Hardening the HA hop
 # is a planned follow-up package.
 #
@@ -522,8 +527,19 @@ tools:
 sanitization:
   mode: block            # off | warn | block — PII detection layer
   cloud_mode: block      # block | anonymize | both — direct-SOTA egress policy (ship-safe default)
-  cloud_scope:           # entity types anonymized when cloud_mode=anonymize|both ([] = off)
-    - person
+  scrub:                 # PII-vocabulary hints anonymized when cloud_mode=anonymize|both ([] = off)
+    - person name
+    - full name
+    - given name
+    - family name
+    - phone number
+    - mobile number
+    - landline number
+    - email address
+    - street address
+    - postal address
+    - profile URL
+    - social media handle
 
 # ============================================================================
 # ABSTENTION — LAST-RESORT CONFABULATION GUARD
@@ -713,9 +729,9 @@ text_lang_detection:
 #
 # enabled:       serve the static bundle and activate cookie-based auth.
 #                Disabled by default; enable after running the mobile-client
-#                build (a later slice).
+#                build (not yet implemented).
 # static_dir:    path to the compiled static bundle.  Empty → resolved to
-#                paramem/web/static by the static-mount slice.
+#                paramem/web/static once the static-mount path is implemented.
 # cookie_name:   session cookie name the SPA sets after login.
 # push_enabled:  enable Web Push notifications.  When true, a VAPID EC P-256
 #                keypair is auto-generated on first startup and persisted as

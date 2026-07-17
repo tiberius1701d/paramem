@@ -107,15 +107,29 @@ def test_cloud_mode_blocks_by_default(example_config):
     smallest cloud surface, no risk of an under-tuned anonymizer
     leaking PII on a fresh consumer's first query.  Operators who
     want cloud reasoning over personal context flip to ``anonymize``
-    and accept the configured ``cloud_scope`` policy.
+    and accept the configured ``scrub`` policy.
 
-    ``cloud_scope: [person]`` is shipped alongside so that any
-    operator who flips ``cloud_mode`` to an anonymizing mode inherits
-    the privacy/utility default (person names placeholdered, places /
-    organisations / etc. verbatim) without further configuration.
+    ``scrub`` ships a load-bearing set of name / phone / address /
+    online-identity sub-terms so any operator who flips ``cloud_mode``
+    to an anonymizing mode inherits the privacy/utility default (direct
+    contact identifiers placeholdered, places / organisations / etc.
+    verbatim) without further configuration.
     """
     assert example_config.sanitization.cloud_mode == "block"
-    assert example_config.sanitization.cloud_scope == ["person"]
+    assert example_config.sanitization.scrub == [
+        "person name",
+        "full name",
+        "given name",
+        "family name",
+        "phone number",
+        "mobile number",
+        "landline number",
+        "email address",
+        "street address",
+        "postal address",
+        "profile URL",
+        "social media handle",
+    ]
 
 
 def test_intent_classifier_enabled(example_config):

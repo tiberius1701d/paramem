@@ -143,7 +143,7 @@ class TestSystemPromptFilesPresent:
         "anonymization_system.txt",
         "sota_plausibility_system.txt",
         "sota_enrichment_system.txt",
-        "graph_dedup_filter_system.txt",
+        "predicate_normalization_system.txt",
         "sota_graph_enrichment_system.txt",
     )
 
@@ -162,8 +162,8 @@ class TestSystemPromptFilesPresent:
     def test_sota_enrichment_system_txt_exists(self):
         assert (_PROMPTS_DIR / "sota_enrichment_system.txt").exists()
 
-    def test_graph_dedup_filter_system_txt_exists(self):
-        assert (_PROMPTS_DIR / "graph_dedup_filter_system.txt").exists()
+    def test_predicate_normalization_system_txt_exists(self):
+        assert (_PROMPTS_DIR / "predicate_normalization_system.txt").exists()
 
     def test_sota_graph_enrichment_system_txt_exists(self):
         assert (_PROMPTS_DIR / "sota_graph_enrichment_system.txt").exists()
@@ -215,8 +215,8 @@ class TestSystemPromptGoldens:
             "plausibility filter handles removal. Output valid JSON only."
         )
 
-    def test_graph_dedup_filter_system_golden(self):
-        content = (_PROMPTS_DIR / "graph_dedup_filter_system.txt").read_text().strip()
+    def test_predicate_normalization_system_golden(self):
+        content = (_PROMPTS_DIR / "predicate_normalization_system.txt").read_text().strip()
         assert content == "You identify synonym predicate clusters. Output valid JSON only."
 
     def test_sota_graph_enrichment_system_golden(self):

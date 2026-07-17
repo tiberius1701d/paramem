@@ -212,7 +212,7 @@ def test_factory_threads_every_config_knob(
         captured["extraction_plausibility_stage"] == cfg.consolidation.extraction_plausibility_stage
     )
     assert captured["extraction_max_tokens"] == cfg.consolidation.extraction_max_tokens
-    assert captured["extraction_pii_scope"] == set(cfg.sanitization.cloud_scope)
+    assert captured["extraction_scrub"] == set(cfg.sanitization.scrub)
 
     # --- Misc knobs ---
     assert captured["prompts_dir"] == cfg.prompts_dir

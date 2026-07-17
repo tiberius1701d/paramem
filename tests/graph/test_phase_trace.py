@@ -12,9 +12,13 @@ Covers:
 - ordering: phases are appended in the order they fired
 - backward compat: graph.diagnostics flat keys are not disturbed
 - decoupling: trace survives graph rebinding inside the scope
+- prompt-recording contract: record_prompt appends to the active phase
+  scope, no-ops outside one, and round-trips through to_dict/get_phases/records
 """
 
 from __future__ import annotations
+
+import hashlib
 
 import pytest
 
@@ -24,6 +28,7 @@ from paramem.graph.phase_trace import (
     extraction_trace,
     get_phases,
     phase_trace,
+    record_prompt,
 )
 from paramem.graph.schema import SessionGraph
 
@@ -171,6 +176,180 @@ class TestPhaseRecordSerialization:
         d = r.to_dict()
         assert d["extra"] == {"k": "v"}
 
+    def test_to_dict_omits_prompts_when_empty(self):
+        r = PhaseRecord(name="local_extract")
+        d = r.to_dict()
+        assert "prompts" not in d
+
+    def test_to_dict_keeps_prompts_when_present(self):
+        entry = {"path": None, "sha": "abc123", "template": "hi"}
+        r = PhaseRecord(name="local_extract", prompts=[entry])
+        d = r.to_dict()
+        assert d["prompts"] == [entry]
+
+
+class TestRecordPrompt:
+    """record_prompt appends the loader's own resolution to the active
+    phase scope. See paramem/graph/prompts.py::_load_prompt for the
+    caller and tests/test_prompts_contract.py::TestLoadPromptPhaseTraceRecording
+    for the end-to-end regression pin against the real prompt loader."""
+
+    def test_record_prompt_appends_to_active_scope(self):
+        graph = _empty_graph()
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                record_prompt(path="/some/path.txt", content="hello world")
+            trace.attach_to(graph)
+        phases = get_phases(graph)
+        assert phases[0].prompts == [
+            {
+                "path": "/some/path.txt",
+                "sha": hashlib.sha256(b"hello world").hexdigest()[:12],
+                "template": "hello world",
+            }
+        ]
+
+    def test_multiple_prompts_in_one_phase_accumulate_in_order(self):
+        graph = _empty_graph()
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                record_prompt(path="/sys.txt", content="sys")
+                record_prompt(path="/user.txt", content="usr")
+            trace.attach_to(graph)
+        phases = get_phases(graph)
+        assert [p["path"] for p in phases[0].prompts] == ["/sys.txt", "/user.txt"]
+
+    def test_record_prompt_outside_active_scope_is_noop(self):
+        """No active phase_trace scope: record_prompt must no-op, never
+        raise. Two real production call paths run the prompt loader with
+        no phase scope open — ``anonymize_with_local_model`` reached from
+        ``extract_and_anonymize_for_cloud`` (the live chat egress,
+        extractor.py:1108) and from ``paramem.training.consolidation``
+        (consolidation.py:2739) — so this must never become a raise the
+        way phase_trace's own missing-scope case is."""
+        from paramem.graph.phase_trace import _ACTIVE_SCOPE
+
+        assert _ACTIVE_SCOPE.get() is None
+        record_prompt(path="/x.txt", content="anything")  # must not raise
+
+    def test_record_prompt_scoped_to_current_phase_only(self):
+        """A record_prompt call after a phase_trace block has exited must
+        not retroactively attach to the already-closed phase."""
+        graph = _empty_graph()
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                record_prompt(path="/a.txt", content="a")
+            # Scope has exited — this call is outside any active phase.
+            record_prompt(path="/b.txt", content="b")
+            trace.attach_to(graph)
+        phases = get_phases(graph)
+        assert len(phases) == 1
+        assert phases[0].prompts == [
+            {
+                "path": "/a.txt",
+                "sha": hashlib.sha256(b"a").hexdigest()[:12],
+                "template": "a",
+            }
+        ]
+
+    def test_get_phases_and_records_roundtrip_prompts(self):
+        graph = _empty_graph()
+        with extraction_trace() as trace:
+            with phase_trace("anonymize"):
+                record_prompt(path="/p.txt", content="tmpl")
+            trace.attach_to(graph)
+            in_process = trace.records
+        expected = [
+            {
+                "path": "/p.txt",
+                "sha": hashlib.sha256(b"tmpl").hexdigest()[:12],
+                "template": "tmpl",
+            }
+        ]
+        assert in_process[0].prompts == expected
+        phases = get_phases(graph)
+        assert phases[0].prompts == expected
+
+
+class TestActiveScopeResetDiscipline:
+    """Pins ``_ACTIVE_SCOPE``'s reset discipline in ``phase_trace``'s
+    ``finally: _ACTIVE_SCOPE.reset(token)``.
+
+    A future edit that swapped ``.reset(token)`` for ``.set(None)`` would
+    still make ``record_prompt`` no-op cleanly at the top level, so
+    nothing here would raise — but on NESTED ``phase_trace`` exit it
+    would clobber the OUTER scope with ``None`` instead of restoring it,
+    silently dropping any prompt the outer phase records afterward (or,
+    with a different bug shape, cross-attributing it to the wrong
+    phase). Nothing else in this test file would notice; these tests
+    exist specifically to catch that class of regression.
+    """
+
+    def test_exception_leaves_active_scope_restored_not_leaked(self):
+        from paramem.graph.phase_trace import _ACTIVE_SCOPE
+
+        assert _ACTIVE_SCOPE.get() is None
+        with extraction_trace():
+            with pytest.raises(RuntimeError, match="boom"):
+                with phase_trace("anonymize"):
+                    assert _ACTIVE_SCOPE.get() is not None
+                    raise RuntimeError("boom")
+            # The scope opened by the failed phase_trace must not leak
+            # past its own `with` block.
+            assert _ACTIVE_SCOPE.get() is None
+        assert _ACTIVE_SCOPE.get() is None
+
+    def test_nested_phase_trace_restores_outer_scope_not_none(self):
+        """Inner ``phase_trace`` exit must restore the OUTER scope object
+        — not ``None`` — so a ``record_prompt`` call made after the inner
+        block, but still inside the outer block, lands on the OUTER
+        phase's record rather than being silently dropped."""
+        graph = _empty_graph()
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                record_prompt(path="/outer-before.txt", content="outer-before")
+                with phase_trace("anonymize"):
+                    record_prompt(path="/inner.txt", content="inner")
+                # Inner scope has exited — this must land back on the
+                # OUTER ("local_extract") phase's scope, not be dropped.
+                record_prompt(path="/outer-after.txt", content="outer-after")
+            trace.attach_to(graph)
+
+        phases = get_phases(graph)
+        assert [p.name for p in phases] == ["anonymize", "local_extract"]
+        inner = next(p for p in phases if p.name == "anonymize")
+        outer = next(p for p in phases if p.name == "local_extract")
+        assert [pr["path"] for pr in inner.prompts] == ["/inner.txt"]
+        assert [pr["path"] for pr in outer.prompts] == [
+            "/outer-before.txt",
+            "/outer-after.txt",
+        ]
+
+    def test_nested_phase_trace_inner_raise_still_restores_outer_scope(self):
+        """An exception inside the INNER ``phase_trace`` must still
+        restore the OUTER scope on the way out (not ``None``) — the
+        outer block can keep recording after the inner phase fails."""
+        graph = _empty_graph()
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                record_prompt(path="/outer-before.txt", content="outer-before")
+                with pytest.raises(RuntimeError, match="boom"):
+                    with phase_trace("anonymize"):
+                        record_prompt(path="/inner.txt", content="inner")
+                        raise RuntimeError("boom")
+                record_prompt(path="/outer-after.txt", content="outer-after")
+            trace.attach_to(graph)
+
+        phases = get_phases(graph)
+        inner = next(p for p in phases if p.name == "anonymize")
+        outer = next(p for p in phases if p.name == "local_extract")
+        assert inner.outcome == "failed"
+        assert [pr["path"] for pr in inner.prompts] == ["/inner.txt"]
+        assert [pr["path"] for pr in outer.prompts] == [
+            "/outer-before.txt",
+            "/outer-after.txt",
+        ]
+
 
 class TestBackwardCompat:
     def test_phases_list_does_not_disturb_existing_flat_keys(self):
@@ -253,6 +432,7 @@ class TestExtractGraphStopPhase:
             validate=False,  # don't try the SOTA pipeline
             ha_validation=False,
             stop_phase="local_extract",
+            scrub={"person name"},
         )
 
         phase_names = [p["name"] for p in graph.diagnostics.get("phases", [])]
@@ -273,6 +453,7 @@ class TestExtractGraphStopPhase:
                 session_id="t",
                 speaker_id="speaker0",
                 stop_phase="anonymise",  # British spelling — should fail
+                scrub={"person name"},
             )
 
 

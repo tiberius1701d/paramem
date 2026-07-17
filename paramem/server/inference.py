@@ -642,14 +642,15 @@ def _escalate_via_cloud_policy(
             tokenizer,
             speaker_id=speaker_id,
             speaker_name=speaker,
-            pii_scope=set(config.sanitization.cloud_scope),
+            scrub=set(config.sanitization.scrub),
         )
         if not anon_text:
-            # Per-query block: extraction error, anonymizer parse failure,
-            # or an operator-configured empty scope with no in-scope
+            # Per-query block: extraction error, anonymizer parse failure or
+            # a missing/empty model-authored transcript (fail-closed),
+            # or an operator-configured empty scrub with no in-scope
             # content.  Privacy-safe — cloud call
             # is suppressed.  Distinct from the ``(verbatim, {}, {})`` shape
-            # returned when cloud_scope is empty (operator opt-out).
+            # returned when ``scrub`` is empty (operator opt-out).
             return None
         result = _escalate_to_sota(
             anon_text,

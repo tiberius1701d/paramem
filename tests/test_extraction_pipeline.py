@@ -660,7 +660,7 @@ class TestEnrichmentDelta:
         assert out[2]["predicate"] == "married_to"
 
     def test_modify_partial_field_update(self):
-        """Synonym dedup — replace ``employed_by`` with ``worked_for``
+        """Synonym normalization — replace ``employed_by`` with ``worked_for``
         on a single indexed fact."""
         from paramem.graph.extractor import _apply_enrichment_delta
 
@@ -979,6 +979,339 @@ class TestPipelineMaxTokensThreading:
         assert "max_tokens" in sig.parameters
 
 
+class TestPipelinePromptsDirThreading:
+    """A ``prompts_dir`` override passed to ``extract_graph`` must reach
+    every prompt load ``_sota_pipeline`` performs, not just the anonymizer
+    call ``extract_and_anonymize_for_cloud`` already wired.  Each stage is
+    exercised through ``_sota_pipeline`` itself (never by calling the
+    downstream helper directly) so the assertion covers the exact call
+    site that was silently dropping the override.
+    """
+
+    def test_anonymize_receives_prompts_dir(self, tmp_path):
+        """Stage 1 (anonymize): without this the pipeline silently loads the
+        shipped anonymization prompt while the caller believes its override
+        is in effect."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        captured = []
+
+        def fake_anonymize(*args, **kwargs):
+            captured.append(kwargs.get("prompts_dir"))
+            return mapping, "anonymized transcript", ""
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                side_effect=fake_anonymize,
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, {}, None, {}),
+            ),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                scrub={"person name"},
+                prompts_dir=tmp_path,
+            )
+
+        assert captured == [tmp_path], (
+            f"anonymize_with_local_model must receive the caller's prompts_dir, got {captured!r}"
+        )
+
+    def test_sota_enrich_receives_prompts_dir(self, tmp_path):
+        """Stage 2 (sota_enrich): ``_filter_with_sota`` had neither a
+        ``prompts_dir`` parameter nor a forwarded value — the override never
+        reached the enrichment prompt at all."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        captured = []
+
+        def fake_filter_with_sota(*args, **kwargs):
+            captured.append(kwargs.get("prompts_dir"))
+            return anon_facts, None, {}, None, {}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(mapping, "anonymized transcript", ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                side_effect=fake_filter_with_sota,
+            ),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                speaker_id="speaker0",
+                correction_entity_types=set(),
+                scrub={"person name"},
+                prompts_dir=tmp_path,
+            )
+
+        assert captured == [tmp_path], (
+            f"_filter_with_sota must receive the caller's prompts_dir, got {captured!r}"
+        )
+
+    def test_anon_plausibility_receives_prompts_dir(self, tmp_path):
+        """Stage 3a (anon_plausibility, SOTA judge): ``_plausibility_filter_with_sota``
+        had neither a ``prompts_dir`` parameter nor a forwarded value."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        captured = []
+
+        def fake_plaus(facts, api_key, **kwargs):
+            captured.append(kwargs.get("prompts_dir"))
+            return facts, "raw"
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(mapping, "anonymized transcript", ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, {}, None, {}),
+            ),
+            patch(
+                "paramem.graph.extractor._plausibility_filter_with_sota",
+                side_effect=fake_plaus,
+            ),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                speaker_id="speaker0",
+                plausibility_judge="claude",
+                plausibility_stage="anon",
+                correction_entity_types=set(),
+                scrub={"person name"},
+                prompts_dir=tmp_path,
+            )
+
+        assert captured == [tmp_path], (
+            f"_plausibility_filter_with_sota must receive the caller's prompts_dir, "
+            f"got {captured!r}"
+        )
+
+    def test_deanon_plausibility_receives_prompts_dir(self, tmp_path):
+        """Stage 3d (deanon_plausibility, local judge): ``local_plausibility_filter``
+        already accepted ``prompts_dir`` but the call site never passed it."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        captured = []
+
+        def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
+            captured.append(kwargs.get("prompts_dir"))
+            return facts, ""
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                return_value=(mapping, "anonymized transcript", ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, {}, None, {}),
+            ),
+            patch(
+                "paramem.graph.extractor.local_plausibility_filter",
+                side_effect=fake_local_plaus,
+            ),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                speaker_id="speaker0",
+                plausibility_judge="auto",
+                plausibility_stage="deanon",
+                correction_entity_types=set(),
+                scrub={"person name"},
+                prompts_dir=tmp_path,
+            )
+
+        assert captured == [tmp_path], (
+            f"local_plausibility_filter must receive the caller's prompts_dir, got {captured!r}"
+        )
+
+    def test_default_prompts_dir_is_none_at_anon_stage_call_sites(self):
+        """Parity check (plausibility_stage="anon"): when the caller does not
+        pass ``prompts_dir`` (production default), every downstream call
+        still receives ``None`` — byte-identical to pre-fix behaviour, never
+        a surprise override."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        captured = {}
+
+        def fake_anonymize(*args, **kwargs):
+            captured["anonymize"] = kwargs.get("prompts_dir")
+            return mapping, "anonymized transcript", ""
+
+        def fake_filter_with_sota(*args, **kwargs):
+            captured["sota_enrich"] = kwargs.get("prompts_dir")
+            return anon_facts, None, {}, None, {}
+
+        def fake_plaus(facts, api_key, **kwargs):
+            captured["anon_plausibility"] = kwargs.get("prompts_dir")
+            return facts, "raw"
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                side_effect=fake_anonymize,
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                side_effect=fake_filter_with_sota,
+            ),
+            patch(
+                "paramem.graph.extractor._plausibility_filter_with_sota",
+                side_effect=fake_plaus,
+            ),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                speaker_id="speaker0",
+                plausibility_judge="claude",
+                plausibility_stage="anon",
+                correction_entity_types=set(),
+                scrub={"person name"},
+            )
+
+        assert captured == {
+            "anonymize": None,
+            "sota_enrich": None,
+            "anon_plausibility": None,
+        }
+
+    def test_default_prompts_dir_is_none_at_deanon_stage_call_sites(self):
+        """Parity check (plausibility_stage="deanon"): same as above for the
+        local-judge deanon-plausibility call site."""
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        mapping = {"Alex": "Person_1", "Millfield": "City_1"}
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        captured = {}
+
+        def fake_anonymize(*args, **kwargs):
+            captured["anonymize"] = kwargs.get("prompts_dir")
+            return mapping, "anonymized transcript", ""
+
+        def fake_filter_with_sota(*args, **kwargs):
+            captured["sota_enrich"] = kwargs.get("prompts_dir")
+            return anon_facts, None, {}, None, {}
+
+        def fake_local_plaus(facts, transcript, model, tokenizer, **kwargs):
+            captured["deanon_plausibility"] = kwargs.get("prompts_dir")
+            return facts, ""
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.extractor.anonymize_with_local_model",
+                side_effect=fake_anonymize,
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                side_effect=fake_filter_with_sota,
+            ),
+            patch(
+                "paramem.graph.extractor.local_plausibility_filter",
+                side_effect=fake_local_plaus,
+            ),
+        ):
+            _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                MagicMock(),
+                MagicMock(),
+                speaker_id="speaker0",
+                plausibility_judge="auto",
+                plausibility_stage="deanon",
+                correction_entity_types=set(),
+                scrub={"person name"},
+            )
+
+        assert captured == {
+            "anonymize": None,
+            "sota_enrich": None,
+            "deanon_plausibility": None,
+        }
+
+
 class TestWaitForGpuReady:
     """Cover the WSL2 cloud-idle → local-LLM wake helper added after the
     May 2 production crash where a 62s SOTA cloud round-trip left the GPU
@@ -1143,6 +1476,7 @@ class TestSOTANoiseFilter:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
             # Should return original graph unchanged
             assert len(result.relations) == 1
@@ -1169,8 +1503,11 @@ class TestSOTANoiseFilter:
             patch("paramem.graph.extractor.generate_answer", return_value="not json"),
             patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
-            mapping, _raw = anonymize_with_local_model(graph, model, tokenizer)
+            mapping, anon_transcript, _raw = anonymize_with_local_model(
+                graph, model, tokenizer, scrub={"person name"}
+            )
         assert mapping is None
+        assert anon_transcript == ""
 
     def test_pipeline_anonymize_failure_falls_back_to_raw_plausibility(self):
         """If anonymization fails, the pipeline falls back to raw (local) plausibility.
@@ -1192,7 +1529,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(None, ""),
+                return_value=(None, "", ""),
             ),
             # Pass model=None/tokenizer=None → local_plausibility_filter skipped inside fallback
         ):
@@ -1205,6 +1542,7 @@ class TestSOTANoiseFilter:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
         # With plausibility_judge="off", fallback runs the residual-placeholder sweep only.
         # Both entities ARE in the transcript → relation survives.
@@ -1239,7 +1577,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -1254,6 +1592,7 @@ class TestSOTANoiseFilter:
                     None,
                     speaker_id="speaker0",
                     correction_entity_types=set(),
+                    scrub={"person name"},
                 )
         assert excinfo.value.phase == "sota_enrich"
 
@@ -1278,7 +1617,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -1292,7 +1631,7 @@ class TestSOTANoiseFilter:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
-                pii_scope={"person", "place"},
+                scrub={"person name", "physical address"},
             )
 
         # Both enriched relations survive and get de-anonymized
@@ -1327,7 +1666,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -1341,7 +1680,7 @@ class TestSOTANoiseFilter:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
-                pii_scope={"person", "place"},
+                scrub={"person name", "physical address"},
             )
 
         # Composite strings must be de-anonymized, not dropped
@@ -1435,128 +1774,6 @@ class TestSOTANoiseFilter:
         assert entity_type_to_prefix("") == "Entity"
         assert entity_type_to_prefix("   ") == "Entity"
 
-    def test_pipeline_incomplete_llm_hint_still_scrubbed_before_sota(self):
-        """The LLM's anonymizer hint may be incomplete (misses "Millfield"
-        entirely) — the deterministic builder still mints a placeholder for
-        every in-scope ``graph.entities`` name regardless, so SOTA never
-        sees the real name and the final graph de-anonymizes correctly.
-
-        There is no repair step: the deterministic builder pre-empts the
-        gap before it can ever occur, rather than detecting and fixing a
-        leak after the fact.  Substitution is case-SENSITIVE and that is
-        load-bearing — case is the only signal separating a person named
-        ``Bill`` from the common noun ``bill``, so a case-insensitive
-        check could never distinguish a real leak from ordinary prose.
-
-        Explicit ``pii_scope={"person", "place"}`` — the production default
-        is ``{"person"}`` only, but this test's purpose is place
-        scrubbing specifically, so it opts a place into scope rather than
-        drift with the default.
-        """
-        from paramem.graph.extractor import _sota_pipeline
-
-        graph = _make_graph(
-            [("Alex", "lives_in", "Millfield")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-        mapping = {"Alex": "Person_1"}
-        filter_calls = []
-
-        def fake_filter(facts, *args, **kwargs):
-            filter_calls.append(list(facts))
-            return facts, None, {}, None, {}
-
-        with (
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-            patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
-            ),
-            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
-        ):
-            result = _sota_pipeline(
-                graph,
-                "Alex lives in Millfield.",
-                None,
-                None,
-                speaker_id="speaker0",
-                correction_entity_types=set(),
-                pii_scope={"person", "place"},
-            )
-
-        assert len(filter_calls) == 1, "SOTA must be called once"
-        # The call payload must not contain any real name.
-        payload = filter_calls[0]
-        assert all("Millfield" not in str(v) for f in payload for v in f.values())
-        # Final graph is de-anonymized correctly.
-        assert len(result.relations) == 1
-        assert result.relations[0].subject == "Alex"
-        assert result.relations[0].object == "Millfield"
-
-    def test_deterministic_builder_preempts_incomplete_llm_hint_for_graph_entities(self):
-        """The deterministic mapping builder mints a placeholder for every
-        in-scope ``graph.entities`` name regardless of what the LLM's
-        anonymizer hint covers — the LLM-supplied mapping here is missing
-        ``Ghost`` entirely, but the builder substitutes it out before the
-        fact array is ever built, so SOTA is called with fully-scrubbed
-        facts.
-
-        There is no leak-detection/repair machinery: the deterministic
-        builder, not any post-hoc check, is what makes an incomplete LLM
-        hint harmless for any name present in ``graph.entities``.
-        """
-        from paramem.graph.extractor import _sota_pipeline
-
-        graph = _make_graph(
-            [("Alex", "knows", "Ghost")],
-            entities=[
-                Entity(name="Alex", entity_type="person"),
-                Entity(name="Ghost", entity_type="person"),
-            ],
-        )
-        mapping = {"Alex": "Person_1"}
-        filter_calls = []
-
-        def fake_filter(facts, *args, **kwargs):
-            filter_calls.append(list(facts))
-            return facts, None, {}, None, {}
-
-        with (
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-            patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
-            ),
-            patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_filter),
-        ):
-            _sota_pipeline(
-                graph,
-                "Alex mentioned something.",
-                None,
-                None,
-                speaker_id="speaker0",
-                correction_entity_types=set(),
-            )
-
-        # SOTA WAS called — the deterministic builder substituted
-        # ``Ghost`` to its placeholder while building the fact array.
-        assert len(filter_calls) == 1, (
-            "SOTA must be called once after deterministic-builder substitution"
-        )
-        sent_facts = filter_calls[0]
-        assert len(sent_facts) == 1
-        # ``Ghost`` must be substituted out of the object field.
-        assert sent_facts[0]["object"] != "Ghost", (
-            f"Ghost must be substituted before SOTA, got {sent_facts[0]['object']!r}"
-        )
-        obj = sent_facts[0]["object"]
-        assert obj.startswith("Person_"), (
-            f"object must be the deterministic Person_N placeholder, got {obj!r}"
-        )
-
     def test_pipeline_normalizes_mixed_direction_mapping_per_pair(self):
         """Mixed-direction mappings from the anonymizer are normalized per-pair.
 
@@ -1631,7 +1848,7 @@ class TestSOTANoiseFilter:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -1650,6 +1867,7 @@ class TestSOTANoiseFilter:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 correction_entity_types={"place"},
+                scrub={"person name"},
             )
 
         assert len(correction_calls) == 1, "correct_entity_surfaces must be called exactly once"
@@ -1658,20 +1876,23 @@ class TestSOTANoiseFilter:
 
 
 class TestAnonymizerMappingOnlyContract:
-    """The anonymizer LLM returns ONLY the mapping. No facts, no
-    transcript. The SCRIPT builds the anonymized fact array from
+    """The anonymizer LLM returns exactly TWO artifacts: the
+    ``mapping`` and its own ``anonymized_transcript`` rewrite. It never
+    returns FACTS. The SCRIPT builds the anonymized fact array from
     ``graph.relations``; the anonymizer cannot lose, reword, or drop a
     fact because it never returns one.
     """
 
-    def test_anonymizer_returns_mapping_only(self):
-        """``anonymize_with_local_model`` returns exactly ``(mapping, raw)``
-        — even when the model's raw response still smuggles fact-array
-        keys (a model that hasn't fully adopted the mapping-only contract).
+    def test_anonymizer_returns_mapping_and_transcript_only(self):
+        """``anonymize_with_local_model`` returns exactly ``(mapping,
+        anonymized_transcript, raw)`` — even when the model's raw
+        response still smuggles fact-array keys (a model that hasn't
+        fully adopted the mapping-only-for-FACTS contract).
 
-        Mutation: re-add a fact branch to the parser (e.g. return a third
-        element sourced from ``data["anonymized"]``/``data["anonymized_facts"]``)
-        -> the call returns more than ``(mapping, raw)`` -> this test fails.
+        Mutation: re-add a fact branch to the parser (e.g. source a
+        fourth element from ``data["anonymized"]``/``data["anonymized_facts"]``)
+        -> the call returns more than ``(mapping, anonymized_transcript,
+        raw)`` -> this test fails.
         """
         from paramem.graph.extractor import anonymize_with_local_model
 
@@ -1703,9 +1924,13 @@ class TestAnonymizerMappingOnlyContract:
             patch("paramem.graph.extractor.generate_answer", return_value=raw),
             patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
-            result = anonymize_with_local_model(graph, model, tokenizer)
+            result = anonymize_with_local_model(graph, model, tokenizer, scrub={"person name"})
 
-        assert result == ({"Alex": "Person_1", "Millfield": "City_1"}, raw)
+        assert result == (
+            {"Alex": "Person_1", "Millfield": "City_1"},
+            "Person_1 lives in City_1.",
+            raw,
+        )
 
     def test_facts_are_built_from_graph_relations_not_the_model(self):
         """The SOTA-facing fact array must equal ``graph.relations`` —
@@ -1740,6 +1965,7 @@ class TestAnonymizerMappingOnlyContract:
                 "anonymized": [
                     {"subject": "Person_1", "predicate": "resides_at", "object": "City_1"},
                 ],
+                "anonymized_transcript": "Person_1 resides_at City_1 and works at Org_1.",
             }
         )
 
@@ -1762,6 +1988,7 @@ class TestAnonymizerMappingOnlyContract:
                 MagicMock(),
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         assert len(sota_calls) == 1
@@ -1800,7 +2027,7 @@ class TestAnonymizerMappingOnlyContract:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
         ):
@@ -1811,6 +2038,7 @@ class TestAnonymizerMappingOnlyContract:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         assert len(sota_calls) == 1
@@ -1843,17 +2071,83 @@ class TestAnonymizerMappingOnlyContract:
             patch("paramem.graph.extractor.generate_answer", return_value="not json"),
             patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
-            parse_failure_mapping, _ = anonymize_with_local_model(graph, model, tokenizer)
+            parse_failure_mapping, _parse_failure_transcript, _ = anonymize_with_local_model(
+                graph, model, tokenizer, scrub={"person name"}
+            )
 
         with (
-            patch("paramem.graph.extractor.generate_answer", return_value='{"mapping": {}}'),
+            patch(
+                "paramem.graph.extractor.generate_answer",
+                return_value='{"mapping": {}, "anonymized_transcript": "nothing to scrub here"}',
+            ),
             patch("paramem.graph.extractor.adapt_messages", return_value=[]),
         ):
-            empty_mapping, _ = anonymize_with_local_model(graph, model, tokenizer)
+            empty_mapping, empty_mapping_transcript, _ = anonymize_with_local_model(
+                graph, model, tokenizer, scrub={"person name"}
+            )
 
         assert parse_failure_mapping is None
         assert empty_mapping == {}
+        assert empty_mapping_transcript == "nothing to scrub here"
         assert empty_mapping is not None
+
+
+class TestScrubCategoriesReachPrompt:
+    """The config -> prompt flow for ``scrub``.  ``scrub_categories``
+    is rendered as ``", ".join(sorted(scrub))`` into the anonymization
+    prompt's ``{scrub_categories}`` slot (``anonymize_with_local_model``).
+    No prior test drove a real, distinctive ``scrub`` set all the way
+    through to the rendered prompt string handed to the model — a
+    hardcoded/ignored ``scrub_categories`` slot would not be caught by any
+    existing test.
+
+    Mutation: hardcode ``scrub_categories`` to a fixed string (or drop the
+    ``sorted()`` call) -> this test fails.
+    """
+
+    def test_distinctive_scrub_set_appears_sorted_in_rendered_prompt(self):
+        from paramem.graph.extractor import anonymize_with_local_model
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        model = MagicMock()
+        tokenizer = MagicMock()
+        # Identity passthrough so the actual rendered prompt text (built
+        # from the real `scrub` set) survives into the string handed to
+        # `apply_chat_template`, instead of being discarded by a mocked
+        # no-op the way most other tests in this file do (they only care
+        # about the mapping/transcript result, not the prompt text).
+        tokenizer.apply_chat_template = MagicMock(
+            side_effect=lambda messages, **kwargs: messages[-1]["content"]
+        )
+        captured: dict[str, str] = {}
+
+        def _fake_generate_answer(_model, _tokenizer, prompt, **_kwargs):
+            captured["prompt"] = prompt
+            return json.dumps({"mapping": {}, "anonymized_transcript": "nothing to scrub here"})
+
+        with (
+            patch("paramem.graph.extractor.generate_answer", side_effect=_fake_generate_answer),
+            patch(
+                "paramem.graph.extractor.adapt_messages",
+                side_effect=lambda messages, tok: messages,
+            ),
+        ):
+            anonymize_with_local_model(
+                graph,
+                model,
+                tokenizer,
+                scrub={"custom_category_x", "another_y"},
+            )
+
+        assert "prompt" in captured, "generate_answer was never called with a prompt"
+        # sorted(["custom_category_x", "another_y"]) == ["another_y", "custom_category_x"]
+        assert "Categories to scrub: another_y, custom_category_x" in captured["prompt"]
 
 
 class TestNoPostHocLeakGuardCaseSensitivity:
@@ -1899,7 +2193,7 @@ class TestNoPostHocLeakGuardCaseSensitivity:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
         ):
@@ -1910,6 +2204,7 @@ class TestNoPostHocLeakGuardCaseSensitivity:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         # SOTA IS called — nothing blocks or skips the cycle.
@@ -1979,7 +2274,7 @@ class TestDeanonStagePredicateInvariantEndToEnd:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -1993,7 +2288,7 @@ class TestDeanonStagePredicateInvariantEndToEnd:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
-                pii_scope={"person", "language"},
+                scrub={"person name", "language"},
             )
 
         # The poisoned fact never reaches the merged graph.
@@ -2184,115 +2479,6 @@ class TestApplyBindings:
         assert kept[0]["relation_type"] == "social"
         assert kept[0]["confidence"] == 0.7
         assert kept[0]["synthetic"] is False
-
-    def test_pii_fold_does_not_corrupt_speaker_name(self):
-        """T5c — the speaker anchor (C9) PII-regression guard, not
-        optional.  When :func:`_build_anonymization_mapping` folds PII
-        attribute values (phone, email, …) belonging to the SPEAKER
-        entity, they fold onto the ``speaker0`` anchor — never a minted
-        ``Person_N`` (that would be the anonymize-something-already-
-        anonymous bug this plan retires).  The disclosed display name
-        ("Alex") also folds onto the anchor.  There is no reverse entry
-        for the anchor at all — display names/attribute values are never
-        restored into graph edges — so a fact whose subject is literally
-        ``speaker0`` (the load-bearing subject form every speaker fact
-        actually carries) round-trips through :func:`_apply_bindings`
-        UNCHANGED, uncorrupted by any attribute value folded alongside it.
-        """
-        from paramem.graph.placeholders import _apply_bindings, _build_anonymization_mapping
-        from paramem.graph.schema import Entity, SessionGraph
-
-        graph = SessionGraph(
-            session_id="s1",
-            speaker_id="speaker0",
-            timestamp="2026-05-09T13:00:00Z",
-        )
-        graph.entities.append(
-            Entity(
-                name="speaker0",
-                entity_type="person",
-                speaker_id="speaker0",
-                attributes={
-                    "last_name": "Walker",
-                    "email": "alex.walker@example.com",
-                    "phone": "+49 178 99 99 999",
-                },
-            )
-        )
-        forward, reverse = _build_anonymization_mapping(
-            graph.entities, llm_mapping={}, pii_scope={"person"}, speaker_name="Alex"
-        )
-        # PII attributes STILL scrubbed — folded onto the anchor, not a
-        # minted placeholder (T5c is the PII-regression guard).
-        assert forward["+49 178 99 99 999"] == "speaker0"
-        assert forward["Walker"] == "speaker0"
-        assert forward["alex.walker@example.com"] == "speaker0"
-        # The disclosed display name folds onto the anchor too.
-        assert forward["Alex"] == "speaker0"
-        # speaker0 itself is never a forward-map key (nothing to scrub).
-        assert "speaker0" not in forward
-        # No reverse entry for the anchor — nothing is ever restored onto
-        # graph edges; the phone/email values are absent from reverse.
-        assert "speaker0" not in reverse
-        assert reverse == {}
-
-        # A fact whose subject is the real, load-bearing "speaker0" form
-        # is untouched by substitution — no attribute value corrupts it.
-        facts = [{"subject": "speaker0", "predicate": "lives_in", "object": "Germany"}]
-        kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
-        )
-        dropped = predicate_dropped + residual_dropped
-        assert dropped == []
-        assert kept[0]["subject"] == "speaker0"
-
-    def test_pii_fold_does_not_corrupt_entity_name(self):
-        """F1 — non-speaker companion to
-        ``test_pii_fold_does_not_corrupt_speaker_name``.  For an ORDINARY
-        (non-speaker) entity, :func:`_build_anonymization_mapping` still
-        folds PII attribute values (phone, email, …) onto the entity's
-        minted placeholder in the forward map, but the reverse map must
-        restore the entity *name* — never the last attribute value
-        folded.  This is the invariant the speaker-anchor regression
-        vacated: without it, a placeholder like ``Person_1`` could
-        deanonymize to a phone number instead of ``Alex``."""
-        from paramem.graph.placeholders import _apply_bindings, _build_anonymization_mapping
-        from paramem.graph.schema import Entity, SessionGraph
-
-        graph = SessionGraph(
-            session_id="s1",
-            speaker_id="speaker0",
-            timestamp="2026-05-09T13:00:00Z",
-        )
-        graph.entities.append(
-            Entity(
-                name="Alex",
-                entity_type="person",
-                attributes={
-                    "last_name": "Walker",
-                    "email": "alex.walker@example.com",
-                    "phone": "+49 178 99 99 999",
-                },
-            )
-        )
-        forward, reverse = _build_anonymization_mapping(
-            graph.entities, llm_mapping={}, pii_scope={"person"}, speaker_name=None
-        )
-        # Forward fold is preserved (privacy contract).
-        assert forward["Alex"] == "Person_1"
-        assert forward["+49 178 99 99 999"] == "Person_1"
-        # Reverse must restore the entity name, never an attribute value.
-        assert reverse["Person_1"] == "Alex"
-        for v in ("Walker", "alex.walker@example.com", "+49 178 99 99 999"):
-            assert v not in reverse.values()
-
-        facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "Germany"}]
-        kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
-        )
-        dropped = predicate_dropped + residual_dropped
-        assert dropped == []
-        assert kept[0]["subject"] == "Alex"
 
     def test_minted_placeholder_round_trips_bare(self):
         """A SOTA-minted placeholder emitted BARE (not braced, contra the
@@ -2573,6 +2759,117 @@ class TestPlausibilityTupleReturn:
         assert raw is None
 
 
+class TestFilterWithSotaPromptsDir:
+    """``_filter_with_sota`` had neither a ``prompts_dir`` parameter nor a
+    forwarded value — the ``sota_enrichment.txt`` load never honoured a
+    calibration override at all."""
+
+    def test_prompts_dir_override_reaches_enrichment_prompt(self, tmp_path):
+        from paramem.graph.extractor import _filter_with_sota
+
+        sentinel = "SENTINEL-SOTA-ENRICH"
+        (tmp_path / "sota_enrichment.txt").write_text(
+            f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
+        )
+        captured_prompts = []
+
+        def fake_sota_call(prompt, *args, **kwargs):
+            captured_prompts.append(prompt)
+            return '{"add": [], "modify": [], "drop": [], "bindings": {}}'
+
+        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
+            _filter_with_sota(
+                [{"subject": "A", "predicate": "knows", "object": "B"}],
+                api_key="k",
+                provider="anthropic",
+                anon_transcript="A knows B.",
+                prompts_dir=tmp_path,
+            )
+
+        assert captured_prompts, "_sota_call was never invoked"
+        assert sentinel in captured_prompts[0], (
+            f"Enrichment call used the shipped prompt instead of the override: "
+            f"{captured_prompts[0]!r}"
+        )
+
+    def test_default_prompts_dir_uses_shipped_template(self):
+        """Parity check: omitting ``prompts_dir`` must keep loading the
+        production template — the new parameter is additive only."""
+        from paramem.graph.extractor import _filter_with_sota
+
+        captured_prompts = []
+
+        def fake_sota_call(prompt, *args, **kwargs):
+            captured_prompts.append(prompt)
+            return '{"add": [], "modify": [], "drop": [], "bindings": {}}'
+
+        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
+            _filter_with_sota(
+                [{"subject": "A", "predicate": "knows", "object": "B"}],
+                api_key="k",
+                provider="anthropic",
+                anon_transcript="A knows B.",
+            )
+
+        assert captured_prompts
+        assert "SENTINEL" not in captured_prompts[0]
+
+
+class TestPlausibilityFilterWithSotaPromptsDir:
+    """``_plausibility_filter_with_sota`` had the same gap: no ``prompts_dir``
+    parameter, no forwarding, ``sota_plausibility.txt`` loaded unconditionally."""
+
+    def test_prompts_dir_override_reaches_plausibility_prompt(self, tmp_path):
+        from paramem.graph.extractor import _plausibility_filter_with_sota
+
+        sentinel = "SENTINEL-SOTA-PLAUSIBILITY"
+        (tmp_path / "sota_plausibility.txt").write_text(
+            f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
+        )
+        captured_prompts = []
+
+        def fake_sota_call(prompt, *args, **kwargs):
+            captured_prompts.append(prompt)
+            return '{"drop": []}'
+
+        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
+            _plausibility_filter_with_sota(
+                [{"subject": "A", "predicate": "knows", "object": "B"}],
+                api_key="k",
+                provider="anthropic",
+                anon_transcript="A knows B.",
+                prompts_dir=tmp_path,
+            )
+
+        assert captured_prompts, "_sota_call was never invoked"
+        assert sentinel in captured_prompts[0], (
+            f"Plausibility call used the shipped prompt instead of the override: "
+            f"{captured_prompts[0]!r}"
+        )
+
+    def test_default_prompts_dir_uses_shipped_template(self):
+        """Parity check: omitting ``prompts_dir`` must keep loading the
+        production template — the new parameter is additive only."""
+        from paramem.graph.extractor import _plausibility_filter_with_sota
+
+        captured_prompts = []
+
+        def fake_sota_call(prompt, *args, **kwargs):
+            captured_prompts.append(prompt)
+            return '{"drop": []}'
+
+        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
+            _plausibility_filter_with_sota(
+                [{"subject": "A", "predicate": "knows", "object": "B"}],
+                api_key="k",
+                provider="anthropic",
+                anon_transcript="A knows B.",
+            )
+
+        assert captured_prompts
+        assert "SENTINEL" not in captured_prompts[0]
+
+
 class TestSpeakerContextInjection:
     def test_build_speaker_context_empty_when_no_id(self):
         """build_speaker_context returns empty string when speaker_id is absent."""
@@ -2814,7 +3111,7 @@ class TestPlausibilityAnon:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -2834,7 +3131,7 @@ class TestPlausibilityAnon:
                 plausibility_judge="claude",
                 plausibility_stage="anon",
                 correction_entity_types=set(),
-                pii_scope={"person", "place"},
+                scrub={"person name", "physical address"},
             )
 
         # Only the valid fact survives
@@ -2880,7 +3177,7 @@ class TestPlausibilityAnon:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -2906,6 +3203,7 @@ class TestPlausibilityAnon:
                 plausibility_judge="claude",
                 plausibility_stage="anon",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         assert len(plaus_calls) == 1
@@ -2952,7 +3250,7 @@ class TestPlausibilityDeanon:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -2972,6 +3270,7 @@ class TestPlausibilityDeanon:
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         # Plausibility ran and dropped the tautology
@@ -3018,7 +3317,7 @@ class TestAnonFailureFallback:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(None, ""),
+                return_value=(None, "", ""),
             ),
             patch(
                 "paramem.graph.extractor._fallback_plausibility_on_raw",
@@ -3032,6 +3331,7 @@ class TestAnonFailureFallback:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         assert fallback_calls == ["anon_failed"], (
@@ -3069,7 +3369,7 @@ class TestSotaEnrichmentFailureRaises:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3088,6 +3388,7 @@ class TestSotaEnrichmentFailureRaises:
                     None,
                     speaker_id="speaker0",
                     correction_entity_types=set(),
+                    scrub={"person name"},
                 )
             except ExtractionFailed as exc:
                 assert exc.phase == "sota_enrich"
@@ -3141,7 +3442,7 @@ class TestAllDroppedSafetyNet:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3165,6 +3466,7 @@ class TestAllDroppedSafetyNet:
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         assert "all_dropped" in fallback_calls, f"Expected all_dropped, got: {fallback_calls}"
@@ -3202,7 +3504,7 @@ class TestEntityTypePreservation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3217,6 +3519,7 @@ class TestEntityTypePreservation:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -3244,7 +3547,7 @@ class TestEntityTypePreservation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3259,6 +3562,7 @@ class TestEntityTypePreservation:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -3299,7 +3603,7 @@ class TestEntityTypePreservation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3314,6 +3618,7 @@ class TestEntityTypePreservation:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -3361,7 +3666,7 @@ class TestSotaMintedEntityTypeDerivation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3376,6 +3681,7 @@ class TestSotaMintedEntityTypeDerivation:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -3405,7 +3711,7 @@ class TestSotaMintedEntityTypeDerivation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3420,6 +3726,7 @@ class TestSotaMintedEntityTypeDerivation:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -3569,6 +3876,7 @@ class TestExtractGraphNewKwargs:
                 noise_filter="anthropic",
                 plausibility_judge="claude",
                 plausibility_stage="anon",
+                scrub={"person name"},
             )
 
         assert captured.get("plausibility_judge") == "claude"
@@ -3625,7 +3933,7 @@ class TestDiagnosticsKeys:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3645,6 +3953,7 @@ class TestDiagnosticsKeys:
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         assert "plausibility" in result.diagnostics, "diagnostics must contain 'plausibility'"
@@ -3670,7 +3979,7 @@ class TestDiagnosticsKeys:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -3685,6 +3994,7 @@ class TestDiagnosticsKeys:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         assert result.diagnostics.get("anonymize") == "ok"
@@ -3773,434 +4083,6 @@ class TestConsolidationScheduleConfigPrivacyGuard:
         # New fields must be present with defaults
         assert config.consolidation.extraction_plausibility_judge == "auto"
         assert config.consolidation.extraction_plausibility_stage == "deanon"
-
-
-# ---------------------------------------------------------------------------
-# Bug A — speaker bare-first-name seeding
-# ---------------------------------------------------------------------------
-
-
-class TestBuildAnonymizationMapping:
-    """Unit tests for the consolidated :func:`_build_anonymization_mapping`.
-
-    The builder is the single source of truth for ``real → placeholder``.
-    It folds the responsibilities of three earlier "Bug X fix" helpers
-    (``_ensure_speaker_name_in_mapping``,
-    ``_extend_mapping_with_pii_attributes``, ambiguous-pair drop) into
-    one deterministic walk over ``graph.entities``.
-
-    Coverage:
-    - Mints placeholders for in-scope entity names.
-    - Adds PII attribute values under the parent entity's placeholder.
-    - Speaker-name seeding when the runtime knows the display name and
-      it isn't covered by entities or LLM hints.
-    - Merges in LLM-only entries (relation participants the graph
-      doesn't know about) without overwriting deterministic ones.
-    - Out-of-scope entities are not minted.
-    - PII attributes on an out-of-scope entity are not minted.
-    """
-
-    @staticmethod
-    def _build(entities, *, llm_mapping=None, pii_scope=None, speaker_name=None):
-        forward, _reverse = TestBuildAnonymizationMapping._build_pair(
-            entities,
-            llm_mapping=llm_mapping,
-            pii_scope=pii_scope,
-            speaker_name=speaker_name,
-        )
-        return forward
-
-    @staticmethod
-    def _build_pair(entities, *, llm_mapping=None, pii_scope=None, speaker_name=None):
-        from paramem.graph.placeholders import _build_anonymization_mapping
-
-        return _build_anonymization_mapping(
-            entities,
-            llm_mapping or {},
-            pii_scope=pii_scope,
-            speaker_name=speaker_name,
-        )
-
-    def test_mints_placeholders_for_in_scope_entities(self):
-        mapping = self._build(
-            [
-                Entity(name="Alex", entity_type="person", speaker_id="speaker0"),
-                Entity(name="Berlin", entity_type="place"),
-                Entity(name="Globex", entity_type="organization"),
-            ],
-            pii_scope={"person", "place"},
-        )
-        # Alex is the speaker (speaker_id set) — folds onto the anchor
-        # "speaker0", NEVER a minted Person_N (the speaker-anchor fix).
-        assert mapping["Alex"] == "speaker0"
-        assert mapping["Berlin"] == "City_1"
-        # Organization is NOT in pii_scope → not minted by the builder.
-        assert "Globex" not in mapping
-
-    def test_pii_attributes_share_parent_placeholder(self):
-        forward, reverse = self._build_pair(
-            [
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    speaker_id="speaker0",
-                    attributes={
-                        "last_name": "Walker",
-                        "email": "alex.walker@example.com",
-                        "linkedin": "linkedin.com/in/alex-walker-fictional",
-                        "phone": "+49 30 12345678",
-                        "location": "Germany",
-                        # Non-PII attribute MUST NOT enter the mapping.
-                        "job_title": "Senior Engineer",
-                    },
-                )
-            ],
-            pii_scope={"person"},
-        )
-        # Alex is the speaker — folds onto the anchor "speaker0", not a
-        # minted Person_N.
-        assert forward["Alex"] == "speaker0"
-        # PII attributes share the SAME anchor in the FORWARD map (so the
-        # cloud-egress anonymizer scrubs every PII surface form to the
-        # same token) — folding still happens, just onto speaker0 instead
-        # of a fresh placeholder.
-        attr_values = (
-            "Walker",
-            "alex.walker@example.com",
-            "linkedin.com/in/alex-walker-fictional",
-            "+49 30 12345678",
-            "Germany",
-        )
-        for v in attr_values:
-            assert forward[v] == "speaker0"
-        # Non-PII attribute is not added.
-        assert "Senior Engineer" not in forward
-        # No reverse entry for the speaker at all — the anchor is never a
-        # mint target, and display names/attribute values are never
-        # restored into graph edges (resolved at the fact-render boundary
-        # instead).  With no non-speaker entity present, reverse is empty.
-        assert "speaker0" not in reverse
-        assert reverse == {}
-
-    def test_pii_attributes_share_parent_placeholder_non_speaker(self):
-        """F1 — non-speaker companion to
-        ``test_pii_attributes_share_parent_placeholder``.  Restores the
-        reverse-map assertions the speaker-anchor branch made vacuous: a
-        placeholder for an ORDINARY (non-speaker) entity must resolve
-        back to the entity's real name, and PII attribute values folded
-        into the forward map must never leak into ``reverse``."""
-        forward, reverse = self._build_pair(
-            [
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={
-                        "last_name": "Walker",
-                        "email": "alex.walker@example.com",
-                        "linkedin": "linkedin.com/in/alex-walker-fictional",
-                        "phone": "+49 30 12345678",
-                        "location": "Germany",
-                        # Non-PII attribute MUST NOT enter the mapping.
-                        "job_title": "Senior Engineer",
-                    },
-                )
-            ],
-            pii_scope={"person"},
-        )
-        # Parent placeholder.
-        assert forward["Alex"] == "Person_1"
-        # PII attributes share the parent placeholder in the FORWARD map
-        # (so the cloud-egress anonymizer scrubs every PII surface form
-        # to the same token).
-        attr_values = (
-            "Walker",
-            "alex.walker@example.com",
-            "linkedin.com/in/alex-walker-fictional",
-            "+49 30 12345678",
-            "Germany",
-        )
-        for v in attr_values:
-            assert forward[v] == "Person_1"
-        # Non-PII attribute is not added.
-        assert "Senior Engineer" not in forward
-        # Reverse map: only the entity name resolves Person_1 — attribute
-        # values are deliberately absent so SOTA-returned text never
-        # restores `Person_1` to a phone/email/etc.
-        assert reverse["Person_1"] == "Alex"
-        for v in attr_values:
-            assert v not in reverse.values()
-
-    def test_pii_attributes_on_out_of_scope_entity_not_minted(self):
-        mapping = self._build(
-            [
-                Entity(
-                    name="Globex",
-                    entity_type="organization",
-                    attributes={"city": "Springfield"},
-                )
-            ],
-            pii_scope={"person", "place"},
-        )
-        assert "Globex" not in mapping
-        # Springfield is on an out-of-scope entity — also not minted.
-        assert "Springfield" not in mapping
-
-    def test_speaker_name_already_in_entities_noop(self):
-        mapping = self._build(
-            [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
-            pii_scope={"person"},
-            speaker_name="Alex",
-        )
-        # Speaker name already covered by the entity walk (folded onto the
-        # speaker0 anchor); the seeding branch is a true no-op.
-        assert mapping == {"Alex": "speaker0"}
-
-    def test_speaker_name_reuses_speaker_entity_placeholder(self):
-        """Anonymous→disclosed: graph still has anonymous ``speaker0``
-        as the entity name but runtime knows the display name as
-        ``Alex``.  Both share the SAME anchor — ``speaker0`` itself,
-        never a minted ``Person_N``.  ``speaker0`` needs no forward-map
-        entry (nothing to scrub); ``Alex`` folds onto the anchor.
-        """
-        mapping = self._build(
-            [Entity(name="speaker0", entity_type="person", speaker_id="speaker0")],
-            pii_scope={"person"},
-            speaker_name="Alex",
-        )
-        assert "speaker0" not in mapping, (
-            "speaker0 is already anonymous — it must never be a forward-map key"
-        )
-        assert mapping["Alex"] == "speaker0", (
-            "speaker_name must fold onto the speaker0 anchor, not a minted placeholder"
-        )
-
-    def test_speaker_name_reuses_llm_full_name_placeholder(self):
-        """No speaker entity in scope; LLM seeded a full-name key
-        (``Alex Rivera``); seeding ``Alex`` reuses that placeholder
-        so both forms de-anonymize to the same person.
-        """
-        mapping = self._build(
-            entities=[],
-            llm_mapping={"Alex Rivera": "Person_1"},
-            pii_scope={"person"},
-            speaker_name="Alex",
-        )
-        assert mapping["Alex"] == "Person_1"
-        assert mapping["Alex Rivera"] == "Person_1"
-
-    def test_speaker_name_reuses_llm_exact_match_placeholder(self):
-        """No speaker entity in scope; LLM seeded a bare single-word key
-        that matches the speaker name exactly (``"Alex"`` → ``Person_1``,
-        not ``"Alex Rivera"``); seeding must reuse that placeholder
-        rather than minting a second one for the same speaker.  Without
-        the exact-match branch, only the multi-word ``startswith`` check
-        ran, missed the bare-name hint, and minted a fresh ``Person_2``
-        — splitting the speaker across two placeholders.
-        """
-        mapping = self._build(
-            entities=[],
-            llm_mapping={"Alex": "Person_1"},
-            pii_scope={"person"},
-            speaker_name="Alex",
-        )
-        assert mapping["Alex"] == "Person_1"
-
-    def test_speaker_name_mints_fresh_when_no_match(self):
-        mapping = self._build(
-            entities=[],
-            llm_mapping={"Alice": "Person_1"},  # unrelated full name
-            pii_scope={"person"},
-            speaker_name="Bob",
-        )
-        assert "Bob" in mapping
-        ph = mapping["Bob"]
-        assert ph.startswith("Person_") and ph != "Person_1"
-
-    def test_llm_only_entries_merged_in(self):
-        """Relation participants the LLM placeholdered but the graph
-        doesn't know about (e.g. ``Honda``) survive into the final
-        mapping via the LLM hint merge — PROVIDED the hint's own type is
-        itself in ``pii_scope`` (FIX 1: the merge is scope-gated, not just
-        speaker-id-gated — see ``TestLlmHintMergeScopedToPiiScope`` in
-        ``tests/test_placeholders.py`` for the out-of-scope-hint-dropped
-        counterpart)."""
-        mapping = self._build(
-            [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
-            llm_mapping={"Honda": "Product_1"},
-            pii_scope={"person", "product"},
-        )
-        # Alex is the speaker — folds onto the speaker0 anchor.
-        assert mapping["Alex"] == "speaker0"
-        assert mapping["Honda"] == "Product_1"
-
-    def test_llm_hint_keyed_on_speaker_id_dropped_outright(self):
-        """F7 — KEY case.  A hallucinated LLM hint keyed on the anchor
-        itself (``{"speaker0": "Person_1"}``) is dropped from BOTH maps:
-        treating ``speaker0`` as a "real name" to scrub would corrupt
-        the anchor in the forward map, and a reverse entry for it would
-        never be reachable anyway (the anchor has no reverse entry by
-        design)."""
-        forward, reverse = self._build_pair(
-            [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
-            llm_mapping={"speaker0": "Person_1"},
-            pii_scope={"person"},
-        )
-        assert "speaker0" not in forward
-        assert "Person_1" not in reverse
-
-    def test_llm_hint_valued_at_speaker_id_keeps_forward_scrub_only(self):
-        """F7 — VALUE case.  An anonymizer hallucination that scrubs a
-        real name onto the speaker anchor (``{"RealName": "speaker0"}``)
-        keeps the forward scrub — it is the only thing standing between
-        ``RealName`` and the cloud in ``anon_transcript`` — but must NOT
-        write a reverse entry keyed on ``speaker0``: that would restore
-        ``RealName`` onto every speaker-subject fact at deanon, leaking
-        it back into the graph."""
-        forward, reverse = self._build_pair(
-            [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
-            llm_mapping={"RealName": "speaker0"},
-            pii_scope={"person"},
-        )
-        assert forward["RealName"] == "speaker0"
-        assert "speaker0" not in reverse
-
-    def test_deterministic_wins_on_conflict(self):
-        """If the LLM mapped ``Alex → Person_2`` but Alex is the speaker
-        (deterministic build folds it onto the ``speaker0`` anchor), the
-        deterministic entry wins (we trust the graph) — the LLM's
-        Person_2 hint is discarded, not merged."""
-        mapping = self._build(
-            [Entity(name="Alex", entity_type="person", speaker_id="speaker0")],
-            llm_mapping={"Alex": "Person_2"},
-            pii_scope={"person"},
-        )
-        assert mapping["Alex"] == "speaker0"
-
-    def test_forward_conflict_still_records_both_reverse_entries(self):
-        """Regression for the incident where the LLM's mapping hint
-        disagrees with the deterministic mint for the same real name:
-        the LLM's own extraction pass placeholdered ``Alex`` as
-        ``Person_4`` while the deterministic entity walk minted
-        ``Person_1`` for the same (NON-speaker) entity.  The forward map
-        keeps the deterministic entry, but facts the LLM emitted still
-        carry ``Person_4`` — the reverse map must resolve BOTH
-        placeholders back to ``Alex``, not only the forward-map winner.
-        A fact carrying the LLM's placeholder must survive
-        deanonymization end to end.  Uses a NON-speaker entity — this
-        dual-numbering hazard no longer touches the speaker at all (R7),
-        which is now excluded from the placeholder-mint counter entirely.
-
-        The entity-mint loop's FIX 1 collision scan excludes an
-        ``llm_mapping`` entry keyed on THIS SAME entity name — Alex's own
-        (disagreeing) hint is not a competing claimant, so the
-        deterministic mint still lands on ``Person_1`` here, preserving
-        the divergence this test exists to pin.
-        """
-        from paramem.graph.placeholders import _apply_bindings
-
-        forward, reverse = self._build_pair(
-            [Entity(name="Alex", entity_type="person")],
-            llm_mapping={"Alex": "Person_4"},
-            pii_scope={"person"},
-        )
-        assert forward["Alex"] == "Person_1"
-        assert reverse["Person_1"] == "Alex"
-        # The LLM's disagreeing placeholder must ALSO resolve to Alex —
-        # this is the bug fix: the reverse write is no longer gated on
-        # the forward write winning.
-        assert reverse["Person_4"] == "Alex"
-
-        facts = [{"subject": "Person_4", "predicate": "lives_in", "object": "Berlin"}]
-        kept, predicate_dropped, residual_dropped = _apply_bindings(
-            facts, reverse, sota_bindings={}
-        )
-        dropped = predicate_dropped + residual_dropped
-        assert dropped == []
-        assert kept[0]["subject"] == "Alex"
-
-    def test_pii_value_already_keyed_by_llm_kept(self):
-        """If an attribute value was already a key in the LLM mapping
-        (LLM saw it in some relation), the deterministic (speaker-anchor)
-        entry wins because ``setdefault`` honours first-write semantics.
-        Test documents the precise rule: deterministic adds only when the
-        value isn't already mapped.
-        """
-        mapping = self._build(
-            [
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    speaker_id="speaker0",
-                    attributes={"last_name": "Walker"},
-                )
-            ],
-            # Builder runs FIRST and folds Walker → speaker0 (Alex is the
-            # speaker) from attributes; LLM hint Walker → Person_2 is
-            # then merged via setdefault and ignored.
-            llm_mapping={"Walker": "Person_2"},
-            pii_scope={"person"},
-        )
-        assert mapping["Walker"] == "speaker0"
-
-    def test_skips_empty_or_whitespace_attribute_values(self):
-        mapping = self._build(
-            [
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    speaker_id="speaker0",
-                    attributes={"last_name": "", "email": "   ", "phone": "+49 1"},
-                )
-            ],
-            pii_scope={"person"},
-        )
-        assert mapping["+49 1"] == "speaker0"
-        assert "" not in mapping
-        assert "   " not in mapping
-
-    def test_default_pii_scope_when_none(self):
-        """``pii_scope=None`` falls back to :data:`_DEFAULT_PII_SCOPE`
-        (``{"person"}`` — the single mint-selector default, matching what
-        production ships at ``SanitizationConfig.cloud_scope``), so only
-        persons are minted; places, organizations, and concepts travel to
-        the cloud verbatim.
-        """
-        mapping = self._build(
-            [
-                Entity(name="Alex", entity_type="person", speaker_id="speaker0"),
-                Entity(name="Berlin", entity_type="place"),
-                Entity(name="Globex", entity_type="organization"),
-                Entity(name="Volvo V70", entity_type="concept"),
-            ],
-            pii_scope=None,
-        )
-        assert "Alex" in mapping
-        assert "Berlin" not in mapping
-        assert "Globex" not in mapping
-        assert "Volvo V70" not in mapping
-
-    def test_entity_mint_avoids_llm_hint_collision(self):
-        """FIX 1: the entity-mint loop must scan `llm_mapping` values too,
-        not just its own in-progress `mapping`.  Before the fix, an LLM
-        hint (`{"Kim": "Person_1"}`) merged in 74 lines later was
-        invisible to the entity loop's mint, so a graph entity ("Dana")
-        could mint the SAME `Person_1` token — collapsing two distinct
-        real names onto one placeholder and swapping their identities at
-        deanon time (every `Person_1` restores to "Dana", never "Kim").
-
-        Mutation: revert the mint call to scan `mapping.values()` alone
-        -> both names collapse onto `Person_1` and this test fails.
-        """
-        forward, reverse = self._build_pair(
-            [Entity(name="Dana", entity_type="person")],
-            llm_mapping={"Kim": "Person_1"},
-            pii_scope={"person"},
-        )
-        assert forward["Dana"] != forward["Kim"], (
-            f"Dana and Kim must not collapse onto the same placeholder: {forward!r}"
-        )
-        assert reverse[forward["Dana"]] == "Dana"
-        assert reverse[forward["Kim"]] == "Kim"
 
 
 # ---------------------------------------------------------------------------
@@ -4468,10 +4350,10 @@ class TestCheckMappingTotality:
         assert "sota_binding_collisions" not in graph.diagnostics
         assert "sota_pending_orphans" not in graph.diagnostics
 
-    # -- T1 (C1) — explicit-return contract, verdict content --------
+    # -- Explicit-return contract, verdict content --------
 
     def test_returns_empty_list_not_none_on_clean_input(self):
-        """C1 — the totality check returns ``[]`` (not ``None``) when the
+        """The totality check returns ``[]`` (not ``None``) when the
         mapping is total — the explicit-return contract that makes a
         plain truthiness test safe for callers."""
         from paramem.graph.placeholders import _check_mapping_totality
@@ -4484,7 +4366,7 @@ class TestCheckMappingTotality:
         assert verdict is not None
 
     def test_returns_empty_list_not_none_on_empty_facts(self):
-        """C1's second explicit exit: the early ``if not anon_facts``
+        """The totality check's second explicit exit: the early ``if not anon_facts``
         guard returns ``[]``, not the implicit ``None`` a bare ``return``
         would give — invisible to a caller that only writes ``if
         verdict:``."""
@@ -4533,9 +4415,9 @@ class TestCheckMappingTotality:
 
 
 class TestResolutionMap:
-    """T2f — CORE PRECEDENCE (C8), pinned directly on :func:`_resolution_map`,
+    """CORE PRECEDENCE, pinned directly on :func:`_resolution_map`,
     independent of the rejection gate.  Backstops need their own test: do
-    not skip this because C3's rejection makes the collision unreachable
+    not skip this because the rejection gate makes the collision unreachable
     in the full pipeline — a future refactor flipping the ``.update()``
     order would otherwise silently let SOTA overwrite a real name with no
     test failing.
@@ -4587,17 +4469,20 @@ class TestResolutionMap:
 
 
 class TestBindingTotalityRejection:
-    """C1-C10 — reject invalid SOTA-enrichment deltas instead of applying
+    """Reject invalid SOTA-enrichment deltas instead of applying
     them partially, and fall back to the local-extract facts.  These are
-    the pipeline-level tests the binding-totality plan requires
-    (T2/T2b-g/T4b; plan v8 §7).
+    the pipeline-level tests the binding-totality contract requires.
 
-    FIXTURE MECHANICS (plan-verified): ``anon_transcript`` is NOT the
-    ``_filter_with_sota`` mock's 3rd tuple element — it is REBUILT at
-    ``extractor.py`` (``_anonymize_transcript(transcript, mapping)``)
-    from the ``transcript`` ARGUMENT through the forward ``mapping``.  To
-    control ``observed`` (§2), control the transcript TEXT and the
-    mapping KEYS, not the mock's tuple.
+    FIXTURE MECHANICS (post cloud-egress-PII redesign): ``anon_transcript``
+    is the MODEL's own rewrite — the 2nd element of the
+    ``anonymize_with_local_model`` mock's return tuple — never mechanically
+    rebuilt from ``transcript`` + ``mapping`` (the deleted
+    ``_anonymize_transcript`` forward-on-prose call).  ``observed`` is
+    derived from the DECLARED token vocabulary intersected with the
+    rendered payload (facts JSON + ``anon_transcript``), so a test
+    controlling what is "observed" controls the mocked
+    ``anonymize_with_local_model`` transcript string and/or the facts the
+    graph fixture carries — not a transcript-substitution side effect.
     """
 
     @staticmethod
@@ -4614,7 +4499,7 @@ class TestBindingTotalityRejection:
         return graph, anon_facts, mapping
 
     def test_poisoned_delta_rejected_local_facts_survive(self, caplog):
-        """T2 — the observed 5-in-1 collapse.  A poisoned delta that
+        """The observed 5-in-1 collapse.  A poisoned delta that
         drops the local fact and adds 5 facts over bare, unbound
         Person_2/Person_3 (``bindings={}``) must be REJECTED as a whole:
         the local-extract facts survive de-anonymized, no residual
@@ -4675,7 +4560,7 @@ class TestBindingTotalityRejection:
                     patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
                     patch(
                         "paramem.graph.extractor.anonymize_with_local_model",
-                        return_value=(mapping, ""),
+                        return_value=(mapping, "anonymized transcript", ""),
                     ),
                     patch(
                         "paramem.graph.extractor._filter_with_sota",
@@ -4689,6 +4574,7 @@ class TestBindingTotalityRejection:
                         None,
                         speaker_id="speaker0",
                         correction_entity_types=set(),
+                        scrub={"person name"},
                     )
         finally:
             extractor_logger.removeHandler(caplog.handler)
@@ -4712,7 +4598,7 @@ class TestBindingTotalityRejection:
         )
 
     def test_misattribution_orphan_rejected(self):
-        """T2b — the misattribution regression (headline).  A placeholder
+        """The misattribution regression (headline).  A placeholder
         NOT in ``observed`` (never shown to SOTA) that SOTA bare-mints is
         an ORPHAN → reject.  Pre-fix this would silently emit a
         fabricated fact bound for adapter weights; post-fix the local
@@ -4735,7 +4621,7 @@ class TestBindingTotalityRejection:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -4749,16 +4635,18 @@ class TestBindingTotalityRejection:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Alex"
         assert "sota_enrichment_rejected" in result.diagnostics
 
     def test_bare_observed_placeholder_as_new_subject_accepted(self):
-        """T2c — rule 1 must not regress.  A delta referencing a bare
+        """Rule 1 must not regress.  A delta referencing a bare
         OBSERVED placeholder (Person_1 — already shown to SOTA) as the
-        subject of a NEW triple, minting nothing, is ACCEPTED.  T2b and
-        T2c differ ONLY in observed-membership."""
+        subject of a NEW triple, minting nothing, is ACCEPTED.  This test
+        and ``test_misattribution_orphan_rejected`` differ ONLY in
+        observed-membership."""
         from paramem.graph.extractor import _sota_pipeline
         from paramem.graph.phase_trace import extraction_trace
 
@@ -4777,7 +4665,7 @@ class TestBindingTotalityRejection:
                 patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
                 patch(
                     "paramem.graph.extractor.anonymize_with_local_model",
-                    return_value=(mapping, ""),
+                    return_value=(mapping, "anonymized transcript", ""),
                 ),
                 patch(
                     "paramem.graph.extractor._filter_with_sota",
@@ -4791,7 +4679,7 @@ class TestBindingTotalityRejection:
                     None,
                     speaker_id="speaker0",
                     correction_entity_types=set(),
-                    pii_scope={"person", "place"},
+                    scrub={"person name", "physical address"},
                 )
         assert len(result.relations) == 2
         assert "sota_enrichment_rejected" not in result.diagnostics
@@ -4799,7 +4687,7 @@ class TestBindingTotalityRejection:
         assert phases["sota_enrich"].outcome == "ok"
 
     def test_binding_key_colliding_with_observed_rejected(self):
-        """T2d — conflict rejection.  A ``bindings`` key that is itself
+        """Conflict rejection.  A ``bindings`` key that is itself
         an OBSERVED token (Person_1 — already shown as a core reference)
         is a CONFLICT → rejected, even though it would resolve cleanly
         under the old flat-union design (reverse wins silently)."""
@@ -4812,7 +4700,7 @@ class TestBindingTotalityRejection:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -4826,6 +4714,7 @@ class TestBindingTotalityRejection:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
         assert "sota_enrichment_rejected" in result.diagnostics
         assert "Person_1" in result.diagnostics["sota_enrichment_rejected"]
@@ -4833,7 +4722,7 @@ class TestBindingTotalityRejection:
         assert result.relations[0].subject == "Alex"
 
     def test_mint_bound_to_descriptor_accepted(self):
-        """T2e — mint happy path.  SOTA mints a placeholder BOUND to a
+        """Mint happy path.  SOTA mints a placeholder BOUND to a
         descriptor span ("my father", ∉ observed) → ACCEPTED; the
         relation de-anonymizes to the bound text."""
         from paramem.graph.extractor import _sota_pipeline
@@ -4853,7 +4742,7 @@ class TestBindingTotalityRejection:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -4867,36 +4756,38 @@ class TestBindingTotalityRejection:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
-                pii_scope={"person", "place"},
+                scrub={"person name", "physical address"},
             )
         assert "sota_enrichment_rejected" not in result.diagnostics
         subjects_objects = {(r.subject, r.object) for r in result.relations}
         assert ("Alex", "my father") in subjects_objects
 
     def test_predicate_only_reference_still_observed_accepted(self):
-        """T2g — a placeholder appearing ONLY in a predicate is still
+        """A placeholder appearing ONLY in a predicate is still
         ∈ observed (the RENDERED payload, predicate included, is what
         SOTA is actually shown), so a bare reference to it elsewhere is
-        ACCEPTED.  Guards C4's rendered-payload requirement: a
+        ACCEPTED.  Guards the rendered-payload requirement: a
         subject/object-only field scan would under-include ``observed``
         and false-reject this.
 
-        Explicit ``pii_scope={"person", "place"}`` — this test's fixture
-        relies on two place entities (Millfield, Springfield) being minted
-        as CORE placeholders; the production default narrowed to
-        ``{"person"}`` only, so the scope is opted in explicitly here to
-        preserve the test's actual purpose (the predicate-only-observed
-        guard, not the default scope value)."""
+        Post cloud-egress-PII redesign: CORE placeholders come straight
+        from the model's own anonymizer mapping (there is no
+        code-side entity walk that mints for graph entities the model
+        didn't name).  So ``anonymize_with_local_model`` is mocked to
+        have already classified BOTH places (``Millfield`` -> ``City_1``,
+        ``Springfield`` -> ``City_2``) — the model decision this test's
+        fixture would need in production for either place to be a CORE
+        placeholder at all.
+        """
         from paramem.graph.extractor import _sota_pipeline
 
-        # Springfield -> City_2 is a REAL core placeholder (second place
-        # entity minted by the deterministic builder) but appears ONLY
-        # inside a compound PREDICATE string here, never as a
-        # subject/object anywhere in the local extract.  `predicate` is
-        # never a substitution target, so the graph relation's own
-        # predicate must already carry "City_2" verbatim for it to reach
-        # the SOTA-facing payload the script builds — the same text the
-        # old model-authored ``anon_facts`` stub carried.
+        # Springfield -> City_2 appears ONLY inside a compound PREDICATE
+        # string here, never as a subject/object anywhere in the local
+        # extract.  `predicate` is never a substitution target, so the
+        # graph relation's own predicate must already carry "City_2"
+        # verbatim for it to reach the SOTA-facing payload the script
+        # builds — the same text the old model-authored ``anon_facts``
+        # stub carried.
         graph = _make_graph(
             [("Alex", "moved from City_2 to", "Millfield")],
             entities=[
@@ -4920,11 +4811,12 @@ class TestBindingTotalityRejection:
                 "confidence": 0.9,
             },
         ]
+        mapping = {"Alex": "Person_1", "Millfield": "City_1", "Springfield": "City_2"}
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=({}, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -4938,7 +4830,7 @@ class TestBindingTotalityRejection:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
-                pii_scope={"person", "place"},
+                scrub={"person name", "physical address"},
             )
         assert "sota_enrichment_rejected" not in result.diagnostics, (
             "City_2/Springfield appears only in a predicate but is still "
@@ -4955,27 +4847,29 @@ class TestBindingTotalityRejection:
 
 
 class TestSpeakerAnchorPipeline:
-    """T5 — the speaker anchor (C9) through the pipeline.  T5c (a PII
-    attribute on the speaker STILL scrubbed) lives on
-    ``TestApplyBindings.test_pii_fold_does_not_corrupt_speaker_name`` —
-    the PII-regression guard is not optional, and that test already
-    covers it end to end against :func:`_build_anonymization_mapping` +
-    :func:`_apply_bindings`.
+    """The speaker anchor through the pipeline.  The PII-fold
+    regression guard (a PII attribute on the speaker still scrubbed onto
+    the anchor, never a minted ``Person_N``) is covered directly against
+    :func:`_build_anonymization_mapping` in
+    ``tests/test_placeholders.py::TestSpeakerAnchorReverseSkip`` — the
+    model's mapping is the sole scope authority post-redesign, so
+    there is no graph-entity/attribute fold left in this module to pin
+    end to end here.
     """
 
     def test_speaker0_survives_end_to_end_not_swept(self):
-        """T5a — ``speaker0`` survives extraction -> anonymize -> SOTA ->
+        """``speaker0`` survives extraction -> anonymize -> SOTA ->
         deanon -> graph VERBATIM, and is never swept by
         :func:`_apply_bindings`'s residual sweep (it doesn't match the
         placeholder pattern at all — verified structurally, not
         assumed).
 
-        Explicit ``pii_scope={"person", "place"}`` — the fixture stubs
-        ``City_1`` as a CORE placeholder for the place entity Millfield;
-        the production default narrowed to ``{"person"}`` only, so the
-        scope is opted in explicitly here to preserve the test's actual
-        purpose (the speaker-anchor / residual-sweep guard, not the
-        default scope value)."""
+        Post cloud-egress-PII redesign: CORE placeholders come straight
+        from the model's own anonymizer mapping (no code-side entity
+        walk), so the mock explicitly classifies ``Millfield`` ->
+        ``City_1`` — the model decision this test's fixture would need
+        in production.
+        """
         from paramem.graph.extractor import _sota_pipeline
 
         graph = _make_graph(
@@ -4987,11 +4881,12 @@ class TestSpeakerAnchorPipeline:
         )
         anon_facts = [{"subject": "speaker0", "predicate": "lives_in", "object": "City_1"}]
         enriched_anon = list(anon_facts)
+        mapping = {"Millfield": "City_1"}
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=({}, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -5005,7 +4900,7 @@ class TestSpeakerAnchorPipeline:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
-                pii_scope={"person", "place"},
+                scrub={"person name", "physical address"},
             )
         assert len(result.relations) == 1
         assert result.relations[0].subject == "speaker0"
@@ -5014,7 +4909,7 @@ class TestSpeakerAnchorPipeline:
         assert "sota_enrichment_rejected" not in result.diagnostics
 
     def test_anchor_independent_of_speaker_relation_presence(self):
-        """T5d — the anchor holds even in a session with NO speaker
+        """The anchor holds even in a session with NO speaker
         entity/relation at all (the protocol-constant case): the
         pipeline must not require a speaker fact to function correctly —
         nothing about the anonymizer/deanon machinery depends on the
@@ -5034,7 +4929,7 @@ class TestSpeakerAnchorPipeline:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -5048,152 +4943,12 @@ class TestSpeakerAnchorPipeline:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
-                pii_scope={"person", "place", "organization"},
+                scrub={"person name", "physical address", "organization"},
             )
         assert len(result.relations) == 1
         assert result.relations[0].subject == "Acme"
         assert result.relations[0].object == "Millfield"
         assert "sota_enrichment_rejected" not in result.diagnostics
-
-
-class TestCloudEgressSharedTableBuilder:
-    """``extract_and_anonymize_for_cloud`` builds its table with the SAME
-    primitive both SOTA tiers use (``_build_anonymization_mapping``).
-
-    It used to invert the local model's own map with a dict comprehension —
-    a second, divergent table construction on the privacy-critical path.
-    The inversion is lossy (an entity's PII attribute values fold onto the
-    entity's placeholder in the forward map, so inverting can restore a
-    phone number where the person's name belongs) and it minted nothing for
-    entities the model failed to name.
-    """
-
-    @staticmethod
-    def _graph():
-        return _make_graph(
-            [("Alex", "lives_in", "Millfield")],
-            entities=[
-                Entity(
-                    name="Alex",
-                    entity_type="person",
-                    attributes={"phone": "555-0100"},
-                ),
-                Entity(name="Millfield", entity_type="place"),
-            ],
-        )
-
-    def _run(self, llm_mapping, **kwargs):
-        """Drive the real helper with the two LLM calls stubbed out."""
-        from paramem.graph.extractor import extract_and_anonymize_for_cloud
-
-        graph = self._graph()
-        with (
-            patch("paramem.graph.extractor.extract_graph", return_value=graph),
-            patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(llm_mapping, ""),
-            ),
-        ):
-            return extract_and_anonymize_for_cloud(
-                "Alex lives in Millfield. Call 555-0100.",
-                MagicMock(),
-                MagicMock(),
-                speaker_id="speaker0",
-                pii_scope={"person", "place"},
-                **kwargs,
-            )
-
-    def test_cloud_egress_builds_the_table_via_the_shared_builder(self):
-        """The forward map folds an entity's PII ATTRIBUTE values onto that
-        entity's placeholder, and ``reverse`` still maps to ENTITY NAMES only.
-
-        The anonymizer prompt operates on relation participants, so the local
-        model's map never contains ``Entity.attributes`` values — the builder
-        is the only thing that puts them in the forward map (one placeholder
-        scrubs every surface form of the same person), and it deliberately
-        keeps them OUT of the reverse (a folded placeholder must restore the
-        name, never the phone number).
-
-        Mutation: restore the dict inversion (``reverse = {v: k for k, v in
-        mapping.items()}`` over the LLM's own map) -> the phone number is not
-        in the forward map at all, ``mapping["555-0100"]`` raises KeyError ->
-        this test fails.
-        """
-        anon_text, mapping, reverse = self._run(
-            llm_mapping={"Alex": "Person_1", "Millfield": "City_1"},
-        )
-        assert anon_text
-        # Many-to-one BY CONSTRUCTION: the attribute value folds onto its
-        # entity's placeholder.
-        assert mapping["Alex"] == "Person_1"
-        assert mapping["555-0100"] == "Person_1"
-        # ... and the reverse carries entity names only.
-        assert reverse["Person_1"] == "Alex"
-        assert "555-0100" not in reverse.values()
-        assert set(reverse.values()) == {"Alex", "Millfield"}
-        # The folded attribute is actually scrubbed out of the payload.
-        assert "555-0100" not in anon_text
-
-    def test_cloud_egress_rebuilds_facts_and_transcript_from_the_full_map(self):
-        """Facts and transcript are rebuilt from the builder's COMPLETE map,
-        so an entity the local model never named is still scrubbed.
-
-        The builder mints for graph entities the LLM omitted; the fact
-        array and transcript are BUILT from ``graph.relations`` and this
-        complete map (never from the model), so a name the LLM missed is
-        still scrubbed.
-
-        Mutation: skip the ``_substitute_whole_words`` / ``_anonymize_transcript``
-        construction step -> "Millfield" survives bare in the facts -> the
-        leak guard fires and the helper returns the block sentinel -> this
-        test fails.
-        """
-        anon_text, mapping, reverse = self._run(
-            # The local model named Alex but MISSED Millfield entirely.
-            llm_mapping={"Alex": "Person_1"},
-        )
-        # Not the block sentinel.
-        assert anon_text != ""
-        assert "Millfield" not in anon_text
-        assert "555-0100" not in anon_text
-        # Millfield was minted by the BUILDER, not by the local model, and
-        # round-trips through both maps.
-        assert reverse[mapping["Millfield"]] == "Millfield"
-
-    def test_mapping_none_is_blocked(self):
-        """§F4 — ``mapping is None`` (anonymizer parse failure) is the
-        ONLY empty-mapping leg that blocks the cloud call.
-
-        Mutation: gate on ``not mapping`` (truthiness) instead of
-        ``mapping is None`` -> a legitimately empty ``{}`` mapping would
-        ALSO block (see the sibling test) -> this test alone would still
-        pass, which is why it must be read together with
-        ``test_mapping_empty_dict_proceeds_and_scrubs``.
-        """
-        anon_text, mapping, reverse = self._run(llm_mapping=None)
-        assert (anon_text, mapping, reverse) == ("", {}, {})
-
-    def test_mapping_empty_dict_proceeds_and_scrubs(self):
-        """§F4 — ``mapping == {}`` (the model found nothing to anonymize)
-        PROCEEDS: the deterministic builder mints from ``graph.entities``
-        and the payload is scrubbed and leak-guarded exactly as on the
-        ``_sota_pipeline`` sibling path, which already gates on
-        ``mapping is None`` (never on ``not mapping``).
-
-        Mutation: gate on ``not mapping`` instead of ``mapping is None``
-        -> this legitimately empty mapping is treated as a parse failure
-        and the call blocks -> ``anon_text`` becomes ``""`` -> this test
-        fails.
-        """
-        anon_text, mapping, reverse = self._run(llm_mapping={})
-        # Not the block sentinel — the builder minted from graph.entities
-        # even though the LLM's own mapping was empty.
-        assert anon_text != ""
-        assert "Alex" not in anon_text
-        assert "Millfield" not in anon_text
-        assert "555-0100" not in anon_text
-        assert "Alex" in mapping, "the deterministic builder must mint even when the LLM hint is {}"
-        assert set(reverse.values()) == {"Alex", "Millfield"}
 
 
 class TestObservedDerivation:
@@ -5241,7 +4996,7 @@ class TestObservedDerivation:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch("paramem.graph.extractor._check_mapping_totality", side_effect=_spy),
             patch(
@@ -5256,7 +5011,7 @@ class TestObservedDerivation:
                 None,
                 speaker_id="speaker0",
                 correction_entity_types=set(),
-                pii_scope={"person", "place"},
+                scrub={"person name", "physical address"},
             )
 
         assert captured, "the sota_enrich totality check must run with an observed scope"

@@ -866,6 +866,7 @@ class TestSecondOrderExtractPhase:
                 transcript="I live in Berlin.",
                 session_id="s001",
                 speaker_id="speaker0",
+                scrub={"person name"},
             )
         assert mock_gen.call_count == 1, (
             "second_order_extract must not call _generate_extraction when its gate fails"
@@ -890,6 +891,7 @@ class TestSecondOrderExtractPhase:
                 transcript="My brother Nadeem lives in Porto.",
                 session_id="s001",
                 speaker_id="speaker0",
+                scrub={"person name"},
             )
         phase_names = [p.name for p in get_phases(graph)]
         assert "second_order_extract" in phase_names
@@ -916,6 +918,7 @@ class TestSecondOrderExtractPhase:
                 transcript="Sam picked the kids up from school today.",
                 session_id="s001",
                 speaker_id="speaker0",
+                scrub={"person name"},
             )
         phase_names = [p.name for p in get_phases(graph)]
         assert "second_order_extract" in phase_names, (
@@ -942,6 +945,7 @@ class TestSecondOrderExtractPhase:
                 speaker_id="speaker0",
                 ha_context={"location_name": "", "zones": [], "areas": []},
                 stop_phase="second_order_extract",
+                scrub={"person name"},
             )
         phase_names = [p.name for p in get_phases(graph)]
         assert phase_names == ["local_extract", "second_order_extract"]
@@ -995,6 +999,7 @@ class TestExtractGraphTimestampPropagation:
                 speaker_id="speaker0",
                 timestamp="2026-06-28T23:21:30+00:00",
                 stop_phase="local_extract",
+                scrub={"person name"},
             )
         assert graph.relations, "fake output must parse successfully, not fall back"
         assert graph.timestamp == "2026-06-28T23:21:30+00:00"
@@ -1015,6 +1020,7 @@ class TestExtractGraphTimestampPropagation:
                 session_id="s001",
                 speaker_id="speaker0",
                 stop_phase="local_extract",
+                scrub={"person name"},
             )
         after = datetime.now(timezone.utc)
         assert graph.relations, "fake output must parse successfully, not fall back"

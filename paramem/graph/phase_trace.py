@@ -43,6 +43,39 @@ Usage
 scope it raises :class:`RuntimeError` immediately rather than silently
 dropping records.
 
+Prompt provenance
+-----------------
+
+Every stage's prompt LOADER (:func:`paramem.graph.prompts._load_prompt`)
+calls :func:`record_prompt` right after it resolves a file, so
+``PhaseRecord.prompts`` holds exactly what the loader handed the stage —
+the same resolution the production run made, not a re-implementation of
+it.  Each entry is ``{"path", "sha", "template"}``:
+
+* ``template`` is the loader's raw output — the prompt TEMPLATE with
+  slots such as ``{transcript}`` still literal and unsubstituted, never
+  the rendered prompt.  A rendered prompt would embed the session
+  transcript (PII) in ``graph.diagnostics`` and therefore in
+  ``data/ha/debug/graph_snapshot.json``; the template never does.
+* ``path`` is the file actually resolved (which may be the shipped
+  default under ``_DEFAULT_PROMPT_DIR`` even when the caller requested
+  an operator-supplied ``prompts_dir`` — that fallback is exactly the
+  divergence this mechanism exists to make visible), or ``None`` when no
+  file was found anywhere and the caller's hardcoded default was used.
+* ``sha`` is the first 12 hex characters of the SHA-256 of ``template``.
+
+:func:`record_prompt` is a no-op when called with no active
+:func:`phase_trace` scope — unlike :func:`phase_trace` itself, which
+raises.  This is deliberate, not an inconsistency: ``_load_prompt`` is a
+shared loader that cannot know whether it is being called from inside a
+phase; two real production call paths run it with no phase scope open
+(``anonymize_with_local_model`` from ``extract_and_anonymize_for_cloud``,
+reached from the live chat egress, and from
+``paramem.training.consolidation``), so a raise there would break
+legitimate production behaviour. ``phase_trace``'s caller, by contrast,
+has explicitly declared a phase boundary — a lost record there is a
+contract breach the raise is meant to catch.
+
 Pipeline contract
 -----------------
 
@@ -77,9 +110,6 @@ Phase                       Notes
 ``anon_plausibility``       Optional SOTA judge at anonymized stage.
 ``deanon``                  Pure-Python dict substitution restoring real
                             names from placeholders.  ``raw_output=None``.
-``grounding_gate``          Pure-Python drop of facts whose entities
-                            don't appear in the original transcript.
-                            ``raw_output=None``.
 ``deanon_plausibility``     Local Mistral plausibility filter at
                             de-anonymized stage.
 ``merge_into_cumulative``   Pure-Python merge of the session graph into
@@ -96,6 +126,15 @@ Phase                       Notes
                             episodic relation set.  ``raw_output=None``.
 ``dedup_procedural``        Pure-Python triple-identity dedup of the
                             procedural relation set.  ``raw_output=None``.
+``normalize``               Synonym-predicate clustering over same-
+                            (subject, object) groups via
+                            ``normalize_predicates``; loads
+                            ``predicate_normalization.txt`` +
+                            ``predicate_normalization_system.txt``.
+``name_extract``            Local Mistral runs the name-extraction prompt
+                            on an explicit turn list (calibration/
+                            enrollment). Loads ``name_extraction.txt`` +
+                            ``name_extraction_system.txt``.
 ==========================  ===============================================
 
 Adding a new phase: extend :data:`PHASE_NAMES`, document it in the
@@ -105,6 +144,7 @@ table above, and wrap the new phase boundary with
 
 from __future__ import annotations
 
+import hashlib
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -128,12 +168,13 @@ PHASE_NAMES: tuple[str, ...] = (
     "sota_enrich",
     "anon_plausibility",
     "deanon",
-    "grounding_gate",
     "deanon_plausibility",
     "merge_into_cumulative",
     "procedural_extract",
     "dedup_episodic",
     "dedup_procedural",
+    "normalize",
+    "name_extract",
 )
 
 
@@ -164,11 +205,22 @@ class PhaseRecord:
     raw_output:
         Raw LLM/transformer text the phase generated, when applicable.
         ``None`` for pure-Python phases (HA validation, deanon,
-        grounding gate, etc.).
+        dedup, etc.).
     parsed:
         Phase-specific structured result.  Shape is per-phase but each
         phase's writer documents its keys (entity counts, mapping
         size, dropped-fact list, …).
+    prompts:
+        Prompt templates :func:`paramem.graph.prompts._load_prompt`
+        resolved for this phase, recorded via :func:`record_prompt` at
+        the loader's own chokepoint.  Each entry is
+        ``{"path", "sha", "template"}``.  ``template`` is the
+        loader's OUTPUT — the template with slots such as
+        ``{transcript}`` still UNSUBSTITUTED — never the rendered
+        prompt: rendering would put the session transcript (PII) into
+        ``graph.diagnostics`` and thus ``data/ha/debug/graph_snapshot.json``.
+        ``None`` when the phase loaded no prompt (pure-Python phases) or
+        the phase's loader calls happened outside any active phase scope.
     reason:
         Optional one-line explanation, set when ``outcome != "ok"``.
     extra:
@@ -181,6 +233,7 @@ class PhaseRecord:
     wall_clock_seconds: float = 0.0
     raw_output: str | None = None
     parsed: dict[str, Any] | None = None
+    prompts: list[dict[str, Any]] | None = None
     reason: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -189,6 +242,8 @@ class PhaseRecord:
         d = asdict(self)
         if not d["extra"]:
             d.pop("extra")
+        if not d["prompts"]:
+            d.pop("prompts")
         return d
 
 
@@ -199,12 +254,21 @@ class _PhaseScope:
     an immutable :class:`PhaseRecord` on exit.
     """
 
-    __slots__ = ("name", "_raw_output", "_parsed", "_outcome", "_reason", "_extra")
+    __slots__ = (
+        "name",
+        "_raw_output",
+        "_parsed",
+        "_prompts",
+        "_outcome",
+        "_reason",
+        "_extra",
+    )
 
     def __init__(self, name: str):
         self.name: str = name
         self._raw_output: str | None = None
         self._parsed: dict[str, Any] | None = None
+        self._prompts: list[dict[str, Any]] = []
         self._outcome: str = "ok"
         self._reason: str | None = None
         self._extra: dict[str, Any] = {}
@@ -254,6 +318,7 @@ class ExtractionTrace:
                     wall_clock_seconds=float(item.get("wall_clock_seconds") or 0.0),
                     raw_output=item.get("raw_output"),
                     parsed=item.get("parsed"),
+                    prompts=item.get("prompts"),
                     reason=item.get("reason"),
                     extra=item.get("extra") or {},
                 )
@@ -280,6 +345,13 @@ class ExtractionTrace:
 _ACTIVE_TRACE: ContextVar[ExtractionTrace | None] = ContextVar(
     "paramem_extraction_trace", default=None
 )
+
+# ContextVar holding the active :class:`_PhaseScope` instance.  Set and reset
+# by :func:`phase_trace` around its ``yield``; read by :func:`record_prompt`.
+# Default ``None`` means :func:`record_prompt` called with no phase open
+# NO-OPS rather than raising — see "Prompt provenance" in the module
+# docstring for why this differs from :func:`phase_trace`'s own contract.
+_ACTIVE_SCOPE: ContextVar[_PhaseScope | None] = ContextVar("paramem_phase_scope", default=None)
 
 
 @contextmanager
@@ -340,36 +412,97 @@ def phase_trace(name: str) -> Iterator[_PhaseScope]:
             f"paramem/graph/phase_trace.py before using it."
         )
     scope = _PhaseScope(name)
+    token = _ACTIVE_SCOPE.set(scope)
     t0 = time.perf_counter()
     try:
-        yield scope
-    except Exception as exc:
-        elapsed = time.perf_counter() - t0
-        trace._records.append(
-            PhaseRecord(
-                name=name,
-                outcome="failed",
-                wall_clock_seconds=round(elapsed, 4),
-                raw_output=scope._raw_output,
-                parsed=scope._parsed,
-                reason=f"{type(exc).__name__}: {exc}",
-                extra=dict(scope._extra),
-            ).to_dict()
-        )
-        raise
-    else:
-        elapsed = time.perf_counter() - t0
-        trace._records.append(
-            PhaseRecord(
-                name=name,
-                outcome=scope._outcome,
-                wall_clock_seconds=round(elapsed, 4),
-                raw_output=scope._raw_output,
-                parsed=scope._parsed,
-                reason=scope._reason,
-                extra=dict(scope._extra),
-            ).to_dict()
-        )
+        try:
+            yield scope
+        except Exception as exc:
+            elapsed = time.perf_counter() - t0
+            trace._records.append(
+                PhaseRecord(
+                    name=name,
+                    outcome="failed",
+                    wall_clock_seconds=round(elapsed, 4),
+                    raw_output=scope._raw_output,
+                    parsed=scope._parsed,
+                    prompts=list(scope._prompts) or None,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    extra=dict(scope._extra),
+                ).to_dict()
+            )
+            raise
+        else:
+            elapsed = time.perf_counter() - t0
+            trace._records.append(
+                PhaseRecord(
+                    name=name,
+                    outcome=scope._outcome,
+                    wall_clock_seconds=round(elapsed, 4),
+                    raw_output=scope._raw_output,
+                    parsed=scope._parsed,
+                    prompts=list(scope._prompts) or None,
+                    reason=scope._reason,
+                    extra=dict(scope._extra),
+                ).to_dict()
+            )
+    finally:
+        _ACTIVE_SCOPE.reset(token)
+
+
+def record_prompt(*, path: str | None, content: str) -> None:
+    """Record a loaded prompt template on the active :func:`phase_trace` scope.
+
+    Called from :func:`paramem.graph.prompts._load_prompt` right after it
+    resolves a file, so the recorded ``path``/``template`` are exactly
+    what the loader resolved and returned — never a re-implementation of
+    that resolution.
+
+    Args:
+        path: The resolved file path as a string, or ``None`` when no file
+            was found anywhere and the caller's hardcoded ``default`` was
+            used instead.
+        content: The exact text the loader is about to return — the
+            template with slots such as ``{transcript}`` still
+            UNSUBSTITUTED.  Never the rendered prompt (see the module
+            docstring's "Prompt provenance" section for why).
+
+    No-op when there is no active phase scope — unlike :func:`phase_trace`,
+    which raises in the analogous situation.  This is intentional, not an
+    oversight to "fix" into a raise:
+
+    * ``_load_prompt`` is called at MODULE IMPORT TIME to build
+      module-level prompt constants — e.g.
+      ``paramem.graph.extractor._SOTA_ENRICHMENT_SYSTEM_PROMPT``
+      (``extractor.py:2994``), ``_SOTA_PLAUSIBILITY_SYSTEM_PROMPT``
+      (``extractor.py:2995``), and
+      ``_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT`` (``extractor.py:3334``) —
+      long before any :func:`extraction_trace`/:func:`phase_trace` scope
+      can exist.  A raise here would break ``import
+      paramem.graph.extractor`` outright; this is the decisive reason a
+      raise is not an option, independent of any call-time scoping
+      question.
+    * Two real production call paths also run it with no phase scope
+      open at CALL time — ``anonymize_with_local_model`` from
+      ``extract_and_anonymize_for_cloud`` (reached from the live chat
+      egress, ``paramem/server/inference.py:639``,
+      ``extractor.py:1108``) and from
+      ``paramem.training.consolidation`` (``consolidation.py:2739``).
+
+    ``phase_trace``'s raise exists because ITS caller has explicitly
+    declared a phase boundary, so a lost record there is a contract
+    breach; ``record_prompt``'s caller has made no such declaration.
+    """
+    scope = _ACTIVE_SCOPE.get()
+    if scope is None:
+        return
+    scope._prompts.append(
+        {
+            "path": path,
+            "sha": hashlib.sha256(content.encode("utf-8")).hexdigest()[:12],
+            "template": content,
+        }
+    )
 
 
 def get_phases(graph: "SessionGraph") -> list[PhaseRecord]:
@@ -392,6 +525,7 @@ def get_phases(graph: "SessionGraph") -> list[PhaseRecord]:
                 wall_clock_seconds=float(item.get("wall_clock_seconds") or 0.0),
                 raw_output=item.get("raw_output"),
                 parsed=item.get("parsed"),
+                prompts=item.get("prompts"),
                 reason=item.get("reason"),
                 extra=item.get("extra") or {},
             )

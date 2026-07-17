@@ -22,15 +22,18 @@ Endpoints:
   every flag the production cycle applies is applied here too.  Returns
   the local-only graph (pre-anonymization).
 * ``POST /calibrate/anonymize`` — runs ``anonymize_with_local_model`` on
-  the caller-supplied SessionGraph + transcript, returning ONLY the
-  ``real_name -> placeholder`` mapping the model identified — no facts,
-  no transcript.
+  the caller-supplied SessionGraph + transcript, returning the model's
+  ``real_name -> placeholder`` mapping AND its own ``anonymized_transcript``
+  rewrite (the model is the sole scope authority) — no facts,
+  the anonymizer never authors those.  ``scrub`` is sourced from the
+  server's configured ``SanitizationConfig.scrub``, not a request field
+  (see :func:`calibrate_anonymize`).
 * ``POST /calibrate/plausibility`` — runs ``local_plausibility_filter``
   on the caller-supplied fact list + transcript.
 
 Returns a uniform shape:
 
-  prompt_path, prompt_sha, prompt_content, raw_output, parsed,
+  prompt_path, prompt_sha, prompt_template, raw_output, parsed,
   n_input_tokens, n_output_tokens, wall_clock_seconds, model,
   params_effective, vram_before, vram_after.
 
@@ -56,6 +59,8 @@ from typing import Any
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
+from paramem.graph.phase_trace import PhaseRecord, extraction_trace, phase_trace
+from paramem.graph.prompts import _DEFAULT_PROMPT_DIR
 from paramem.server.gpu_lock import gpu_lock_sync
 from paramem.server.session_buffer import SessionBuffer
 
@@ -159,7 +164,7 @@ class CalibratePlausibilityRequest(BaseModel):
 
 
 class CalibrateNormalizeRequest(BaseModel):
-    """Run the two-stage synonym-predicate dedup on an explicit relation list
+    """Run predicate normalization on an explicit relation list
     or a graph snapshot.
 
     Exactly one of ``relations`` or ``snapshot_path`` must be provided;
@@ -173,13 +178,13 @@ class CalibrateNormalizeRequest(BaseModel):
       flattened to ``{subject, predicate, object}`` dicts; edges missing a
       ``predicate`` key are skipped.
 
-    ``filter_prompt_filename`` defaults to ``graph_dedup_filter.txt``.
+    ``normalization_prompt_filename`` defaults to ``predicate_normalization.txt``.
     ``prompts_dir`` defaults to the project's ``configs/prompts/`` directory.
     """
 
     relations: list[dict] | None = None
     snapshot_path: str | None = None
-    filter_prompt_filename: str | None = None
+    normalization_prompt_filename: str | None = None
     prompts_dir: str | None = None
     params: CalibrateParams = Field(default_factory=CalibrateParams)
 
@@ -284,6 +289,44 @@ def _read_prompt(
     content = path.read_text(encoding="utf-8")
     sha = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
     return str(path), sha, content
+
+
+def _ensure_prompt_exists(prompts_dir: str | Path | None, filename: str) -> None:
+    """Guard-time existence check for an operator-overridable prompt file.
+
+    Runs from a handler's ``guard`` closure — BEFORE any model call — so a
+    typo'd ``prompts_dir``/filename override surfaces as HTTP 400 with zero
+    inference cost.
+
+    The no-``prompts_dir`` default anchors to
+    :data:`paramem.graph.prompts._DEFAULT_PROMPT_DIR` — the same
+    project-root-anchored directory :func:`~paramem.graph.prompts._load_prompt`
+    searches — so a no-override calibration call checks the real shipped
+    default regardless of the process's current working directory.
+
+    Beyond that anchor, resolution is STRICT (owner-approved semantics):
+    an operator-supplied ``prompts_dir`` is checked in isolation, with NO
+    silent fall-through to the project default — unlike ``_load_prompt``
+    itself, which searches ``[prompts_dir, _DEFAULT_PROMPT_DIR]`` and would
+    let a missing override silently resolve to the production prompt of
+    the same name. Provenance (path/sha/template) for a file that DOES
+    exist is no longer built here; it comes from the phase-trace records
+    :func:`_run_calibration` reads after ``dispatch`` runs (``_load_prompt``'s
+    own :func:`~paramem.graph.phase_trace.record_prompt` call).
+
+    This existence check overlaps the ``_read_prompt`` existence check
+    that still serves the extract/procedural/anonymize handlers; that
+    duplication resolves when ``_read_prompt`` is removed.
+    """
+    base = Path(prompts_dir) if prompts_dir is not None else _DEFAULT_PROMPT_DIR
+    path = base / filename
+    if not path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt file not found: {path}. "
+            f"Calibration requires the operator to specify a real prompt "
+            f"file; embedded fallbacks are not used.",
+        )
 
 
 def _count_tokens(tokenizer, text: str) -> int:
@@ -395,7 +438,7 @@ def _build_calibrate_response(
 
     Args:
         stage: Stage identifier string (``"extract"``, ``"anonymize"``, …).
-        prompts: List of prompt dicts with ``role``/``path``/``sha``/``content``.
+        prompts: List of prompt dicts with ``path``/``sha``/``template``.
         raw_output: The verbatim model string before post-processing.
         parsed: Stage-specific parsed result dict.
         input_prompt_text: The prompt text to count for ``n_input_tokens``.
@@ -548,6 +591,156 @@ def _require_turn_marked_transcript(transcript: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The shared calibration primitive
+# ---------------------------------------------------------------------------
+
+
+def _provenance_from_records(
+    records: list[PhaseRecord], phase: str
+) -> tuple[list[dict[str, Any]], str]:
+    """Derive a calibration response's prompt provenance from phase-trace records.
+
+    ``prompts``: every ``{path, sha, template}`` entry any record in
+    ``records`` captured, in firing order, DEDUPED by ``(path, sha)``
+    (first occurrence wins). A multi-phase run (e.g. ``local_extract`` +
+    ``second_order_extract``, both re-loading ``extraction_system.txt``)
+    would otherwise list the same system prompt twice.
+
+    ``input_prompt_text``: the ``template`` of the entry belonging to the
+    record named ``phase`` that is NOT a system prompt — selected
+    null-safely via ``not (p.get("path") or "").endswith("_system.txt")``.
+    Falls back to ``""`` when ``phase`` has no matching record, or that
+    record captured no non-system prompt (e.g. procedural extraction on
+    an empty transcript, or an opted-out anonymize call that never
+    reaches a model). A well-formed, empty-provenance response is
+    preferable to a crash on these legitimate no-model-call paths.
+
+    Args:
+        records: Typed phase records from ``ExtractionTrace.records``
+            (one :class:`ExtractionTrace` per :func:`_run_calibration` call).
+        phase: The :data:`~paramem.graph.phase_trace.PHASE_NAMES` phase
+            whose user-prompt template feeds ``n_input_tokens``.
+
+    Returns:
+        ``(prompts, input_prompt_text)``.
+    """
+    prompts: list[dict[str, Any]] = []
+    seen: set[tuple[Any, Any]] = set()
+    for record in records:
+        for p in record.prompts or []:
+            key = (p.get("path"), p.get("sha"))
+            if key in seen:
+                continue
+            seen.add(key)
+            prompts.append(p)
+
+    input_prompt_text = ""
+    for record in records:
+        if record.name != phase:
+            continue
+        entry = next(
+            (
+                p
+                for p in (record.prompts or [])
+                if not (p.get("path") or "").endswith("_system.txt")
+            ),
+            None,
+        )
+        if entry is not None:
+            input_prompt_text = entry.get("template") or ""
+        break
+    return prompts, input_prompt_text
+
+
+def _run_calibration(
+    *,
+    stage: str,
+    entry: str,
+    phase: str | None,
+    guard,
+    dispatch,
+    input_prompt_phase: str,
+    state: dict,
+    params: CalibrateParams,
+    supports_seed: bool,
+) -> dict[str, Any]:
+    """Shared execution + response-assembly primitive for every ``/calibrate/*`` handler.
+
+    Each handler shrinks to building a ``guard`` closure (raises HTTP 400
+    for any invalid input, BEFORE any model call) and a ``dispatch``
+    closure (runs the step, returns ``(raw_output, parsed)``), then calls
+    this function. Prompt provenance is read uniformly from the phase
+    trace — see :func:`_provenance_from_records` — never hand-built.
+
+    Execution order:
+
+    1. :func:`_preflight` — the shared 404/503 gates.
+    2. ``guard()`` — MUST run before any model call / before the trace
+       even opens, so a 400 costs zero inference.
+    3. ``with extraction_trace() as trace:`` — opens (or, if already
+       active, no-ops onto) the trace every :func:`~paramem.graph.prompts._load_prompt`
+       call records onto.
+    4. ``with _measured_local_call() as m:`` — GPU lock + timing/VRAM,
+       shared by every local stage.
+    5. ``entry == "standalone"``: wrap ``dispatch()`` in
+       ``with phase_trace(phase):`` so the step's own prompt loads land on
+       a named phase record. ``entry == "pipeline"``: call ``dispatch()``
+       bare — the pipeline (``extract_graph`` et al.) opens its own named
+       phases onto the same outer trace; nothing here would open a second,
+       redundant phase.
+
+    Args:
+        stage: Response ``"stage"`` label (``"plausibility"``, ``"normalize"``, …).
+        entry: ``"standalone"`` or ``"pipeline"`` — selects step 5 above.
+        phase: The :data:`~paramem.graph.phase_trace.PHASE_NAMES` phase to
+            open for a standalone step. ``None`` for a pipeline entry
+            (the pipeline names its own phases).
+        guard: Zero-arg callable raising :class:`~fastapi.HTTPException`
+            (400) for any invalid input. Called before the trace opens.
+        dispatch: Zero-arg callable that runs the step and returns
+            ``(raw_output, parsed)``.
+        input_prompt_phase: Which phase record's non-system prompt
+            template feeds ``n_input_tokens`` (see
+            :func:`_provenance_from_records`).
+        state: The live server state dict.
+        params: The request's :class:`CalibrateParams`.
+        supports_seed: ``True`` for local stages, ``False`` for SOTA
+            stages (forwarded to :func:`_build_calibrate_response`).
+
+    Returns:
+        The uniform calibration response dict.
+    """
+    _preflight(state)
+    guard()
+    with extraction_trace() as trace:
+        with _measured_local_call() as m:
+            if entry == "standalone":
+                with phase_trace(phase):
+                    raw_output, parsed = dispatch()
+            elif entry == "pipeline":
+                # The pipeline (extract_graph et al.) opens its own named
+                # phases onto this same outer trace via the
+                # extraction_trace() nesting no-op — nothing to wrap here.
+                raw_output, parsed = dispatch()
+            else:
+                raise ValueError(f"Unknown entry {entry!r}; expected 'standalone' or 'pipeline'.")
+    records = trace.records
+    prompts, input_prompt_text = _provenance_from_records(records, input_prompt_phase)
+    return _build_calibrate_response(
+        stage=stage,
+        prompts=prompts,
+        raw_output=raw_output,
+        parsed=parsed,
+        input_prompt_text=input_prompt_text,
+        measurement=m,
+        params=params,
+        state=state,
+        supports_seed=supports_seed,
+        phases=[r.to_dict() for r in records],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Stage handlers — invoked from the registered FastAPI routes in app.py
 # ---------------------------------------------------------------------------
 
@@ -653,16 +846,14 @@ def calibrate_extract(state: dict, req: CalibrateExtractRequest) -> dict[str, An
         stage="extract",
         prompts=[
             {
-                "role": "system",
                 "path": sys_prompt_path,
                 "sha": sys_prompt_sha,
-                "content": sys_prompt_content,
+                "template": sys_prompt_content,
             },
             {
-                "role": "user",
                 "path": user_prompt_path,
                 "sha": user_prompt_sha,
-                "content": user_prompt_content,
+                "template": user_prompt_content,
             },
         ],
         raw_output=raw_output,
@@ -747,16 +938,14 @@ def calibrate_procedural(state: dict, req: CalibrateProceduralRequest) -> dict[s
         stage="procedural",
         prompts=[
             {
-                "role": "system",
                 "path": sys_prompt_path,
                 "sha": sys_prompt_sha,
-                "content": sys_prompt_content,
+                "template": sys_prompt_content,
             },
             {
-                "role": "user",
                 "path": user_prompt_path,
                 "sha": user_prompt_sha,
-                "content": user_prompt_content,
+                "template": user_prompt_content,
             },
         ],
         raw_output=raw_output,
@@ -771,7 +960,38 @@ def calibrate_procedural(state: dict, req: CalibrateProceduralRequest) -> dict[s
 
 
 def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str, Any]:
-    """Run the local anonymizer on an explicit graph + transcript."""
+    """Run the local anonymizer on an explicit graph + transcript.
+
+    ``scrub`` — the operator's PII-vocabulary hint list, the sole scope
+    authority the model classifies against — is sourced from the
+    server's live ``SanitizationConfig.scrub``
+    (``state["config"].sanitization.scrub``), the SAME policy knob every
+    production call site reads (``ExtractionPipeline.kwargs``,
+    ``extract_and_anonymize_for_cloud``, ``_sota_pipeline``).  It is
+    deliberately NOT a request field: every other ``/calibrate/*``
+    request injects operator PROMPTS/PARAMS (filenames, seed,
+    temperature, ...), never privacy POLICY —
+    :class:`CalibrateExtractRequest` exposes no ``sota_enabled``- or
+    ``scrub``-equivalent override either.  A per-request override here
+    would let calibration silently anonymize against a scope the
+    operator never configured on a security-critical egress path.
+
+    Reports the model's two artifacts under the current
+    ``anonymize_with_local_model`` contract — ``mapping`` and
+    ``anonymized_transcript`` — via ``parsed``.  ``parsed["status"]``
+    reuses the same three-state vocabulary production diagnostics record
+    (``paramem.graph.extractor``'s ``graph.diagnostics["anonymize"]``):
+
+    * ``"opted_out"`` — ``scrub`` is empty (operator opt-out): no
+      model call is made; ``anonymized_transcript`` is the passed-in
+      ``req.transcript`` verbatim and ``mapping`` is ``{}``.
+    * ``"failed"`` — fail-closed: the model call returned a parse
+      failure OR a missing/empty ``anonymized_transcript``.  ``mapping``
+      is reported as ``{}`` and ``anonymized_transcript`` as ``""`` —
+      this endpoint never falls back to the real-name transcript to
+      manufacture an apparent success.
+    * ``"ok"`` — the model returned both artifacts.
+    """
     _preflight(state)
     _require_turn_marked_transcript(req.transcript)
     from paramem.graph.extractor import anonymize_with_local_model
@@ -779,6 +999,7 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
 
     model = state["model"]
     tokenizer = state["tokenizer"]
+    scrub = set(state["config"].sanitization.scrub)
 
     filename = req.anonymization_prompt_filename or "anonymization.txt"
     prompt_path, prompt_sha, prompt_content = _read_prompt(req.prompts_dir, filename)
@@ -795,24 +1016,47 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
 
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     with _measured_local_call() as m:
-        with base_model_inference(model):
-            mapping, raw_output = anonymize_with_local_model(
-                graph,
-                model,
-                tokenizer,
-                transcript=req.transcript,
-                max_tokens=max_tokens,
-                seed=req.params.seed,
-                prompts_dir=req.prompts_dir,
-                prompt_filename=filename,
+        if not scrub:
+            # Operator opt-out: no anonymizer call; the transcript
+            # egresses verbatim, sourced from the passed-in transcript —
+            # never a model artifact.
+            status, mapping, anonymized_transcript, raw_output = (
+                "opted_out",
+                {},
+                req.transcript,
+                "",
             )
+        else:
+            with base_model_inference(model):
+                mapping, anonymized_transcript, raw_output = anonymize_with_local_model(
+                    graph,
+                    model,
+                    tokenizer,
+                    transcript=req.transcript,
+                    scrub=scrub,
+                    max_tokens=max_tokens,
+                    seed=req.params.seed,
+                    prompts_dir=req.prompts_dir,
+                    prompt_filename=filename,
+                )
+            if mapping is None:
+                # Fail-closed: parse failure OR missing/empty
+                # anonymized_transcript.  Never fall back to the
+                # real-name transcript.
+                status, mapping, anonymized_transcript = "failed", {}, ""
+            else:
+                status = "ok"
 
-    parsed: dict[str, Any] = {"mapping": mapping}
+    parsed: dict[str, Any] = {
+        "status": status,
+        "mapping": mapping,
+        "anonymized_transcript": anonymized_transcript,
+    }
 
     return _build_calibrate_response(
         stage="anonymize",
         prompts=[
-            {"role": "user", "path": prompt_path, "sha": prompt_sha, "content": prompt_content},
+            {"path": prompt_path, "sha": prompt_sha, "template": prompt_content},
         ],
         raw_output=raw_output,
         parsed=parsed,
@@ -825,23 +1069,30 @@ def calibrate_anonymize(state: dict, req: CalibrateAnonymizeRequest) -> dict[str
 
 
 def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> dict[str, Any]:
-    """Run the local plausibility filter on an explicit fact list."""
-    _preflight(state)
-    _require_turn_marked_transcript(req.transcript)
+    """Run the local plausibility filter on an explicit fact list.
+
+    Thin wrapper around :func:`_run_calibration`: ``guard`` performs the
+    turn-marking + prompt-file checks (zero inference cost on failure);
+    ``dispatch`` runs :func:`~paramem.graph.extractor.local_plausibility_filter`
+    under ``base_model_inference`` (base weights, matching production).
+    Prompt provenance and ``n_input_tokens`` come from the
+    ``deanon_plausibility`` phase record :func:`_run_calibration` opens
+    around ``dispatch`` — never a hand-built ``prompts=[...]`` literal.
+    """
     from paramem.graph.extractor import local_plausibility_filter
-
-    model = state["model"]
-    tokenizer = state["tokenizer"]
-
-    filename = req.plausibility_prompt_filename or "sota_plausibility.txt"
-    prompt_path, prompt_sha, prompt_content = _read_prompt(req.prompts_dir, filename)
-
     from paramem.models.loader import base_model_inference
 
+    model = state.get("model")
+    tokenizer = state.get("tokenizer")
+    filename = req.plausibility_prompt_filename or "sota_plausibility.txt"
     max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
     temperature = req.params.temperature if req.params.temperature is not None else 0.0
 
-    with _measured_local_call() as m:
+    def guard() -> None:
+        _require_turn_marked_transcript(req.transcript)
+        _ensure_prompt_exists(req.prompts_dir, filename)
+
+    def dispatch() -> tuple[Any, dict]:
         with base_model_inference(model):
             kept, raw_output = local_plausibility_filter(
                 req.facts,
@@ -854,27 +1105,25 @@ def calibrate_plausibility(state: dict, req: CalibratePlausibilityRequest) -> di
                 prompts_dir=req.prompts_dir,
                 prompt_filename=filename,
             )
+        dropped = [f for f in req.facts if f not in (kept or [])]
+        parsed: dict[str, Any] = {
+            "kept_facts": kept or [],
+            "dropped_facts": dropped,
+            "input_count": len(req.facts),
+            "kept_count": len(kept or []),
+            "dropped_count": len(dropped),
+        }
+        return raw_output, parsed
 
-    dropped = [f for f in req.facts if f not in (kept or [])]
-    parsed: dict[str, Any] = {
-        "kept_facts": kept or [],
-        "dropped_facts": dropped,
-        "input_count": len(req.facts),
-        "kept_count": len(kept or []),
-        "dropped_count": len(dropped),
-    }
-
-    return _build_calibrate_response(
+    return _run_calibration(
         stage="plausibility",
-        prompts=[
-            {"role": "user", "path": prompt_path, "sha": prompt_sha, "content": prompt_content},
-        ],
-        raw_output=raw_output,
-        parsed=parsed,
-        input_prompt_text=prompt_content,
-        measurement=m,
-        params=req.params,
+        entry="standalone",
+        phase="deanon_plausibility",
+        guard=guard,
+        dispatch=dispatch,
+        input_prompt_phase="deanon_plausibility",
         state=state,
+        params=req.params,
         supports_seed=True,
     )
 
@@ -883,40 +1132,47 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
     """Run single-stage synonym-predicate clustering on an explicit relation list
     or a graph snapshot.
 
-    Routes through :func:`paramem.graph.extractor.dedup_synonym_predicates`
-    (the graph-layer primitive).  No merger/ledger state is modified — this is
-    a read-only probe.  A code survivor (first grounded cluster member) is
-    applied locally to produce ``surviving_relations`` for inspection.
+    Thin wrapper around :func:`_run_calibration`. ``guard`` performs, in
+    order: the mutually-exclusive ``relations``/``snapshot_path`` 400, the
+    prompt-file check, and — for the ``snapshot_path`` branch — the
+    NetworkX node-link load + flatten (with its own missing/unreadable-file
+    400s). The resolved relation list is stashed in a closure-local dict so
+    ``dispatch`` (called after ``guard``) can read it back.
 
-    The GPU lock and cuDNN deterministic flags are acquired here (not inside
-    the primitive) so production callers can apply their own locking policy.
+    Routes through :func:`paramem.graph.extractor.normalize_predicates`
+    (the graph-layer primitive).  No merger/ledger state is modified — this
+    is a read-only probe.  A code survivor (first grounded cluster member)
+    is applied locally to produce ``surviving_relations`` for inspection.
     """
-    _preflight(state)
-
-    # Validate mutually exclusive inputs.
-    has_relations = req.relations is not None
-    has_snapshot = req.snapshot_path is not None
-    if has_relations == has_snapshot:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Exactly one of 'relations' or 'snapshot_path' must be provided, "
-                "not both and not neither."
-            ),
-        )
-
-    from paramem.graph.extractor import dedup_synonym_predicates
+    from paramem.graph.extractor import normalize_predicates
     from paramem.graph.name_match import canonical as _can
+    from paramem.models.loader import base_model_inference
 
-    model = state["model"]
-    tokenizer = state["tokenizer"]
+    model = state.get("model")
+    tokenizer = state.get("tokenizer")
+    prompt_filename = req.normalization_prompt_filename or "predicate_normalization.txt"
+    max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
+    temperature = req.params.temperature if req.params.temperature is not None else 0.0
 
-    filter_filename = req.filter_prompt_filename or "graph_dedup_filter.txt"
-    filter_path, filter_sha, filter_content = _read_prompt(req.prompts_dir, filter_filename)
+    resolved: dict[str, list[dict]] = {}
 
-    if has_relations:
-        relations: list[dict] = req.relations  # type: ignore[assignment]
-    else:
+    def guard() -> None:
+        has_relations = req.relations is not None
+        has_snapshot = req.snapshot_path is not None
+        if has_relations == has_snapshot:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Exactly one of 'relations' or 'snapshot_path' must be provided, "
+                    "not both and not neither."
+                ),
+            )
+        _ensure_prompt_exists(req.prompts_dir, prompt_filename)
+
+        if has_relations:
+            resolved["relations"] = req.relations  # type: ignore[assignment]
+            return
+
         # Load from a NetworkX node-link snapshot.
         import json as _json
         from pathlib import Path as _Path
@@ -937,7 +1193,7 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
         # NetworkX node-link format: {"nodes": [...], "links": [...]} where
         # each link is {source, target, key, ...edge_data...}.
         links = snap.get("links", snap.get("edges", []))
-        relations = []
+        relations: list[dict] = []
         for link in links:
             if not isinstance(link, dict):
                 continue
@@ -951,70 +1207,62 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
                     "object": str(link.get("target", "")),
                 }
             )
+        resolved["relations"] = relations
 
-    max_tokens = req.params.max_tokens if req.params.max_tokens is not None else 8192
-    temperature = req.params.temperature if req.params.temperature is not None else 0.0
-
-    from paramem.models.loader import base_model_inference
-
-    with _measured_local_call() as m:
+    def dispatch() -> tuple[Any, dict]:
+        relations = resolved["relations"]
         with base_model_inference(model):
-            clusters_by_so, diag = dedup_synonym_predicates(
+            clusters_by_so, diag = normalize_predicates(
                 relations,
                 model=model,
                 tokenizer=tokenizer,
-                filter_prompt=filter_content,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 seed=req.params.seed,
+                prompts_dir=req.prompts_dir,
+                prompt_filename=prompt_filename,
             )
 
-    # Apply code survivor (first grounded cluster member) to produce
-    # surviving_relations for read-only inspection.
-    # NOTE: production uses MAX reinforcement_count as survivor, not first-in-cluster;
-    # surviving_relations illustrates which predicates cluster, not which would survive
-    # in production.
-    retire_set: dict[tuple[str, str], set[str]] = {}
-    for (can_s, can_o), group_clusters in clusters_by_so.items():
-        for cluster in group_clusters:
-            if len(cluster) >= 2:
-                for retired_pred in cluster[1:]:
-                    retire_set.setdefault((can_s, can_o), set()).add(retired_pred)
+        # Apply code survivor (first grounded cluster member) to produce
+        # surviving_relations for read-only inspection.
+        # NOTE: production uses MAX reinforcement_count as survivor, not
+        # first-in-cluster; surviving_relations illustrates which predicates
+        # cluster, not which would survive in production.
+        retire_set: dict[tuple[str, str], set[str]] = {}
+        for (can_s, can_o), group_clusters in clusters_by_so.items():
+            for cluster in group_clusters:
+                if len(cluster) >= 2:
+                    for retired_pred in cluster[1:]:
+                        retire_set.setdefault((can_s, can_o), set()).add(retired_pred)
 
-    surviving = [
-        rel
-        for rel in relations
-        if _can(str(rel.get("predicate", "")))
-        not in retire_set.get(
-            (_can(str(rel.get("subject", ""))), _can(str(rel.get("object", "")))), set()
-        )
-    ]
+        surviving = [
+            rel
+            for rel in relations
+            if _can(str(rel.get("predicate", "")))
+            not in retire_set.get(
+                (_can(str(rel.get("subject", ""))), _can(str(rel.get("object", "")))), set()
+            )
+        ]
 
-    raw_outputs = diag.pop("raw_outputs", [])
-    raw_output_str = "\n---\n".join(raw_outputs) if raw_outputs else ""
-    parsed: dict[str, Any] = {
-        "surviving_relations": surviving,
-        "input_count": len(relations),
-        "surviving_count": len(surviving),
-        **diag,
-    }
+        raw_outputs = diag.pop("raw_outputs", [])
+        raw_output_str = "\n---\n".join(raw_outputs) if raw_outputs else ""
+        parsed: dict[str, Any] = {
+            "surviving_relations": surviving,
+            "input_count": len(relations),
+            "surviving_count": len(surviving),
+            **diag,
+        }
+        return raw_output_str, parsed
 
-    return _build_calibrate_response(
+    return _run_calibration(
         stage="normalize",
-        prompts=[
-            {
-                "role": "filter",
-                "path": filter_path,
-                "sha": filter_sha,
-                "content": filter_content,
-            },
-        ],
-        raw_output=raw_output_str,
-        parsed=parsed,
-        input_prompt_text=filter_content,
-        measurement=m,
-        params=req.params,
+        entry="standalone",
+        phase="normalize",
+        guard=guard,
+        dispatch=dispatch,
+        input_prompt_phase="normalize",
         state=state,
+        params=req.params,
         supports_seed=True,
     )
 
@@ -1022,11 +1270,13 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
 def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
     """Run the name-extraction LLM on an explicit turn list.
 
-    Routes through :func:`paramem.graph.name_extraction.extract_name_via_llm`
-    (the same function the production enrollment path uses).  The
-    ``prompts_dir`` / filename fields let the calibration operator point at
-    scratch copies of the prompt files; the module re-reads from disk on
-    every call (no restart needed).
+    Thin wrapper around :func:`_run_calibration`. ``guard`` checks both
+    prompt files (system + user) exist before any model call; ``dispatch``
+    runs :func:`~paramem.graph.name_extraction.extract_name_via_llm` (the
+    same function the production enrollment path uses) under
+    ``base_model_inference``. Prompt provenance and ``n_input_tokens`` come
+    from the ``name_extract`` phase record :func:`_run_calibration` opens
+    around ``dispatch`` — never a hand-built ``prompts=[...]`` literal.
 
     ``user_turns_only`` mirrors the production default (``True``) — only
     user turns reach the model; set to ``False`` to include assistant turns
@@ -1039,20 +1289,16 @@ def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
     (``{"name": <str|None>}``), ``params_effective``, VRAM block, and
     wall-clock time.
     """
-    _preflight(state)
     from paramem.graph.name_extraction import extract_name_via_llm
+    from paramem.models.loader import base_model_inference
 
-    model = state["model"]
-    tokenizer = state["tokenizer"]
+    model = state.get("model")
+    tokenizer = state.get("tokenizer")
 
     # Resolve filenames with the same None-default + or-fallback convention
     # used by the other stages.
     sys_filename = req.name_system_prompt_filename or "name_extraction_system.txt"
     user_filename = req.name_prompt_filename or "name_extraction.txt"
-
-    # Surface the prompt files for provenance — same approach as other stages.
-    sys_path, sys_sha, sys_content = _read_prompt(req.prompts_dir, sys_filename)
-    user_path, user_sha, user_content = _read_prompt(req.prompts_dir, user_filename)
 
     inference_params = {
         "temperature": req.params.temperature,
@@ -1060,9 +1306,11 @@ def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
         "max_tokens": req.params.max_tokens,
     }
 
-    from paramem.models.loader import base_model_inference
+    def guard() -> None:
+        _ensure_prompt_exists(req.prompts_dir, sys_filename)
+        _ensure_prompt_exists(req.prompts_dir, user_filename)
 
-    with _measured_local_call() as m:
+    def dispatch() -> tuple[Any, dict]:
         with base_model_inference(model):
             extracted, raw_output = extract_name_via_llm(
                 req.turns,
@@ -1074,31 +1322,18 @@ def calibrate_name(state: dict, req: CalibrateNameRequest) -> dict[str, Any]:
                 user_turns_only=req.user_turns_only,
                 params=inference_params,
             )
+        parsed: dict[str, Any] = {"name": extracted}
+        return raw_output, parsed
 
-    parsed: dict[str, Any] = {"name": extracted}
-
-    return _build_calibrate_response(
+    return _run_calibration(
         stage="name",
-        prompts=[
-            {
-                "role": "system",
-                "path": sys_path,
-                "sha": sys_sha,
-                "content": sys_content,
-            },
-            {
-                "role": "user",
-                "path": user_path,
-                "sha": user_sha,
-                "content": user_content,
-            },
-        ],
-        raw_output=raw_output,
-        parsed=parsed,
-        input_prompt_text=user_content,
-        measurement=m,
-        params=req.params,
+        entry="standalone",
+        phase="name_extract",
+        guard=guard,
+        dispatch=dispatch,
+        input_prompt_phase="name_extract",
         state=state,
+        params=req.params,
         supports_seed=True,
     )
 

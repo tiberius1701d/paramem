@@ -15,15 +15,21 @@ fallback_entity_type: concept
 relation_types: [factual, temporal, preference, social]
 fallback_relation_type: factual
 
-# Anonymizer vocabulary — single source of truth for PII placeholder
-# prefixes shared by the anonymization prompt, the SOTA enrichment path,
-# and the de-anonymization/repair code.
+# Anonymizer vocabulary — single source of truth for placeholder-prefix
+# <-> entity-type resolution on the de-anonymization / repair path
+# (paramem.graph.placeholders.entity_type_to_prefix /
+# prefix_to_entity_type, via schema_config's anonymizer_type_to_prefix /
+# anonymizer_prefix_to_type). It is NOT rendered into any prompt —
+# anonymization.txt has exactly three format slots (scrub_categories,
+# facts_json, transcript) and the render call passes only those three;
+# the descriptions below are documentation for this file's readers, not
+# prompt content.
 #
 # prefix           — the literal token ("Person", "City", etc.)
 # entity_type      — the graph type that this prefix represents. Must be one
 #                    of entity_types above. Multiple prefixes may map to the
 #                    same entity_type (City → place, Country → place).
-# description      — human-readable label rendered into anonymization.txt
+# description      — human-readable label for this file's readers only.
 # primary_for_type — only one prefix per entity_type may set this.
 #                    Used by the repair path to pick a canonical prefix when
 #                    re-anonymizing a leaked real name.

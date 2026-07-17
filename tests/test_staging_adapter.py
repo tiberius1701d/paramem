@@ -466,6 +466,7 @@ class TestStaleInTrainingCleanup:
             semantic_adapter_config=AdapterConfig(),
             memory_store=_MS(replay_enabled=False),
             output_dir=tmp_path,
+            extraction_scrub={"person name"},
         )
         # _ensure_adapters runs in __init__; the stale dir should be gone
         assert not (tmp_path / "in_training").exists(), (

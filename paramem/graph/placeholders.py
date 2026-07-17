@@ -37,7 +37,7 @@ import re
 from collections.abc import Iterable
 
 from paramem.graph.name_match import is_speaker_id
-from paramem.graph.schema import Entity, Relation, SessionGraph
+from paramem.graph.schema import Relation, SessionGraph
 from paramem.graph.schema_config import anonymizer_prefix_to_type, anonymizer_type_to_prefix
 
 logger = logging.getLogger(__name__)
@@ -47,12 +47,18 @@ logger = logging.getLogger(__name__)
 # full-string validator and the unanchored in-text detector.
 # ---------------------------------------------------------------------------
 
-# PascalCase prefix + "_" + positive integer. The prefix vocabulary is
-# open: "Person" / "City" / "Org" / "Thing" are common (configured in
-# configs/schema.yaml) but any PascalCase noun is well-formed — a model
-# is free to mint "University_1" / "Project_1" / "Language_1" for a
-# type none of the common prefixes fit.
-_BARE_PLACEHOLDER_SHAPE = r"[A-Z][A-Za-z]*_\d+"
+# One-or-more PascalCase segments, underscore-joined, + "_" + positive
+# integer. The prefix vocabulary is open: "Person" / "City" / "Org" /
+# "Thing" are common (configured in configs/schema.yaml) but any
+# PascalCase noun is well-formed — a model is free to mint
+# "University_1" / "Project_1" / "Language_1" for a type none of the
+# common prefixes fit. The prefix itself may be MULTI-SEGMENT
+# (underscore-joined PascalCase words, e.g. "Home_Address_1",
+# "Car_Plate_1") — a model emits these for in-scope categories whose
+# natural label is itself multi-word. Only the FINAL "_\d+" is the
+# mandatory numeric suffix; "Foo_Bar" (no trailing digits) does not
+# match.
+_BARE_PLACEHOLDER_SHAPE = r"[A-Z][A-Za-z]*(?:_[A-Z][A-Za-z]*)*_\d+"
 
 # Anchored full-string validator — used by table normalize/validate
 # (:func:`_normalize_anonymization_mapping`) to classify whether a table
@@ -136,10 +142,16 @@ def _substitute_whole_words(
 ) -> str:
     """Replace whole-word occurrences of mapping keys with their values.
 
-    Mirrors the previous ``for k, v in mapping: text = re.sub(rf"\\b{re.escape(k)}\\b", v, text)``
-    pattern in a single token-walk pass.  Boundaries follow the ``\\b``
-    semantics: word-character/non-word-character transitions, where word-
-    character means ``c.isalnum() or c == "_"`` (Unicode-aware).
+    EDGE-AWARE boundaries: a match at ``pos`` requires a boundary on a
+    side only if the KEY's edge char on that side is a word char
+    (:func:`_is_word_char`).  A key whose first/last char is a
+    non-word char (e.g. ``"+49 151 2345"``) needs no boundary check on
+    that side and can therefore match starting or ending mid-run —
+    fixing the historical bug where a key starting with a non-word char
+    was never attempted because matches were only tried at word-char
+    positions.  A key that IS word-char-bounded on a side (``"Bill"``)
+    still requires a non-word (or string-edge) neighbour there, so
+    ``"Bill"`` matches standalone but never inside ``"Billing"``.
 
     Longest keys are tried first at each position so multi-word keys
     preempt single-word prefixes (``"Person_2"`` before ``"Person"``).
@@ -172,20 +184,17 @@ def _substitute_whole_words(
     pos = 0
     n = len(text)
     while pos < n:
-        if not _is_word_char(text[pos]):
-            parts.append(text[pos])
-            pos += 1
-            continue
         matched = False
         for key in keys_sorted:
             klen = len(key)
             end = pos + klen
             if end > n:
                 continue
-            if end < n and _is_word_char(text[end]):
+            if _is_word_char(key[0]) and pos > 0 and _is_word_char(text[pos - 1]):
                 continue
-            slice_ = text[pos:end]
-            if slice_ != key:
+            if _is_word_char(key[-1]) and end < n and _is_word_char(text[end]):
+                continue
+            if text[pos:end] != key:
                 continue
             replacement = normalized[key]
             if not isinstance(replacement, str):
@@ -195,18 +204,18 @@ def _substitute_whole_words(
             matched = True
             break
         if not matched:
-            j = pos + 1
-            while j < n and _is_word_char(text[j]):
-                j += 1
-            parts.append(text[pos:j])
-            pos = j
+            parts.append(text[pos])
+            pos += 1
     return "".join(parts)
 
 
 def _build_anon_facts(relations: Iterable[Relation], mapping: dict[str, str]) -> list[dict]:
     """Build the anonymized fact array from ``relations`` and the forward
-    ``mapping`` — THE single construction the anonymizer's mapping-only
-    contract feeds.
+    ``mapping`` — THE single construction that feeds off the
+    anonymizer's fact-free contract: the anonymizer LLM returns the
+    ``mapping`` and its own ``anonymized_transcript`` rewrite, but never
+    a fact array, so every anonymizer-facing fact array is built HERE,
+    mechanically, from ``relations``.
 
     One dict per relation: ``subject``/``object`` are substituted through
     ``mapping`` via :func:`_substitute_whole_words`; ``predicate``,
@@ -323,9 +332,11 @@ def placeholder_entity_type(token: str) -> str:
     mistype a braced token at a future format flip: ``"{Person_1}".split
     ("_")[0]`` is ``"{Person"``, which is not in the closed vocabulary and
     passes through open-vocabulary as its own (wrong) type ``"{person"`` —
-    never matching any ``pii_scope`` membership check and silently
-    unmasking the entity. Stripping braces first means this function
-    survives that flip unchanged.
+    corrupting every live consumer of the derived type: SOTA-minted-entity
+    type inference in :func:`~paramem.graph.extractor._sota_pipeline`
+    (``:2660``) and entity-surface correction in
+    :mod:`paramem.graph.entity_correction` (``:276``). Stripping braces
+    first means this function survives that flip unchanged.
     """
     t = (token or "").strip()
     if len(t) >= 2 and t[0] == "{" and t[-1] == "}":
@@ -453,9 +464,9 @@ def _resolution_map(
     present in both domains is a CONFLICT, caught upstream by
     :func:`_check_mapping_totality` before an accepted delta ever reaches
     this scoped branch — the map still reflects the tie-break if asked to
-    resolve one directly (unit-tested, T2f).
+    resolve one directly (unit-tested).
 
-    **CORE PRECEDENCE (named invariant, T2f) — CORE-LAST BY CONSTRUCTION.**
+    **CORE PRECEDENCE (named invariant) — CORE-LAST BY CONSTRUCTION.**
     In both branches ``reverse`` entries are applied AFTER
     ``sota_bindings``, so any key present in both resolves to CORE's
     value. SOTA can never override or misresolve against the core map.
@@ -655,322 +666,133 @@ def _contains_declared_token(text: str, declared: set[str]) -> bool:
 # Table construction — from entity records.
 # ---------------------------------------------------------------------------
 
-# PII-bearing attribute keys.  The local extractor projects these onto
-# ``Entity.attributes`` rather than as standalone entities or relations
-# — their values appear verbatim in the source transcript and must be
-# scrubbed before the anonymized transcript is sent to a SOTA cloud
-# provider.  Consumed by :func:`_build_anonymization_mapping`.
-#
-# The list is intentionally conservative: keys with a high prior of
-# carrying personally-identifying or location data.  Operators can
-# extend by adding entries here.
-_PII_ATTRIBUTE_KEYS: frozenset[str] = frozenset(
-    {
-        "last_name",
-        "first_name",
-        "email",
-        "phone",
-        "linkedin",
-        "city",
-        "country",
-        "location",
-    }
-)
 
-# THE single default for ``pii_scope``, and — post-guard-deletion —
-# ``pii_scope`` has exactly ONE consumer: :func:`_build_anonymization_mapping`.
-#
-# ``pii_scope`` has exactly one job: it decides which entity TYPES get a
-# placeholder minted by that function — and are therefore substituted
-# out of the payload — versus which travel to the cloud verbatim.
-# In-scope → blocked. Out-of-scope → emitted. Nothing else reads this
-# value; there is no separate verification concern for it to serve.
-#
-# ``{"person"}`` matches the value production actually ships
-# (``SanitizationConfig.cloud_scope``, default ``["person"]`` —
-# ``server/config.py``) — one constant, one policy, everywhere.
-_DEFAULT_PII_SCOPE: frozenset[str] = frozenset({"person"})
+def invert_forward_mapping(mapping: dict) -> dict[str, str]:
+    """Invert a forward ``{key: value}`` table to ``{value: key}``.
+
+    Skips any entry whose key or value is not a ``str``. When multiple
+    forward keys share the same value (a many-to-one forward map — e.g.
+    two real names the model scrubbed onto the same placeholder), the
+    FIRST key encountered in ``mapping``'s iteration order wins; later
+    duplicates are silently dropped via ``setdefault``.
+
+    THE only forward -> reverse inversion in this module. Previously two
+    call sites each inverted independently with OPPOSITE tie-breaks: the
+    session tier (:func:`_build_anonymization_mapping`) used first-wins
+    (``reverse.setdefault(v, k)``) while the graph tier
+    (:func:`~paramem.graph.extractor._graph_enrich_with_sota`) used
+    LAST-wins (a plain dict comprehension, where a later ``k`` for the
+    same ``v`` silently overwrites an earlier one) — so a many-to-one
+    forward map restored a DIFFERENT real name at each tier for the
+    identical placeholder. Both now call this one function.
+    """
+    out: dict[str, str] = {}
+    for k, v in mapping.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        out.setdefault(v, k)
+    return out
 
 
 def _build_anonymization_mapping(
-    entities: Iterable[Entity],
     llm_mapping: dict,
     *,
-    pii_scope: set[str] | frozenset[str] | None,
     speaker_name: str | None,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Single source of truth for the real → placeholder mapping.
+    """Assemble the real → placeholder mapping from the model's mapping.
 
-    The anonymizer LLM returns ONLY a mapping — it never produces facts or
-    a transcript (measured: its fact array was a verbatim echo of its
-    input, with names swapped, in 0/22 divergent sessions before the
-    anonymizer stopped being asked for facts at all).  It is historically
-    untrustworthy at producing a **complete mapping**: it routinely omits
-    the bare first-name form when it has the full name, never sees
-    ``Entity.attributes`` at all (so PII embedded in attributes leaks),
-    and emits ambiguous pairs that have to be canonicalized after the
-    fact.  Three accreting "Bug X fix" helpers (speaker-name seeding,
-    attribute-extend, ambiguous-pair drop) used to patch the LLM's output
-    incrementally.
+    The anonymizer LLM is the SOLE scope authority (it decides, against
+    the operator's ``scrub`` categories, which real values need a
+    placeholder — see :func:`~paramem.graph.extractor.
+    anonymize_with_local_model` and the module the prompt lives in,
+    ``configs/prompts/anonymization.txt``).  This builder does not
+    re-judge that decision, and does not re-derive it from any other
+    source (graph entities, entity types, a scope allowlist) — there is
+    no second detector on this path.  Its
+    job is exactly two things, both invariant maintenance rather than
+    classification:
 
-    This builder replaces that pattern with one deterministic walk:
-
-    1. **Mint placeholders for in-scope entity names — except the
-       speaker.**  The graph knows the canonical entity inventory; we
-       don't need the LLM to enumerate it.  Placeholder allocation is
-       per-prefix (``Person_1, Person_2, …, Org_1, …``) via
-       :func:`mint_placeholder`.  The speaker entity
-       (``entity.speaker_id is not None``) is EXCLUDED from this mint:
-       ``speaker{N}`` is already an anonymized handle (CLAUDE.md's
-       "ONE lowercase ``speaker{N}`` everywhere") — minting a
-       ``Person_N`` for it would anonymize something already anonymous
-       and draw it into the session-dependent, positionally-allocated
-       ``Person_N`` counter.  When the entity's own ``name`` is a
-       disclosed display form (differs from ``entity.speaker_id``), that
-       name folds onto ``entity.speaker_id`` in the forward map instead
-       of onto a fresh placeholder — still scrubbed, just onto the
-       anchor.  ``reverse`` never gets an entry for the anchor: display
-       names are resolved at the fact-render boundary
-       (:func:`~paramem.server.speaker.resolve_speaker_name`), never
-       baked into graph edges.
-    2. **Add PII attribute values under the parent entity's
-       placeholder** (the speaker's own ``speaker_id`` counts as its
-       "placeholder" here).  Reusing the placeholder is privacy-correct
-       (SOTA only needs tokens scrubbed, not unique placeholders per
-       attribute) and keeps the mapping canonical (no novel
-       placeholder shapes).  These attribute values land in the
-       *forward* map only — the reverse map records only the entity
-       name for each placeholder, so deanonymization can never
-       restore an attribute value (phone, email, …) where the entity
-       name belongs.
-    3. **Speaker-name seeding** (legacy Bug A).  When the runtime
-       knows the speaker's display name and that name isn't already
-       in the mapping (e.g. anonymous-id session, full-name vs
-       first-name mismatch), reuse the speaker entity's anchor
-       (``entity.speaker_id``) or — if no speaker entity is in scope —
-       fall back to LLM's exact or full-name match (``"Alex"`` or
-       ``"Alex Rivera"`` → reuse ``Person_1``) or mint a fresh
-       ``Person_N``.  The no-speaker-entity fallback is unchanged by
-       the anchor (R7, out of scope): it can still mint a ``Person_N``
-       for the speaker's display name in the rare case the graph has no
-       speaker entity at all.
-    4. **Preserve LLM hints — scoped, and except any keyed on or valued at
-       the speaker.**  Entries the LLM emitted that the deterministic
-       build does not cover (typically relation participants the graph
-       doesn't know about — e.g. ``Honda`` mentioned in a relation but
-       not a graph entity) are merged in ONLY when the hint's own
-       placeholder types (:func:`placeholder_entity_type`) to a type in
-       ``pii_scope`` — the same authority the deterministic entity walk
-       above answers to.  An out-of-scope or common-noun hint (the
-       anonymization prompt forbids mapping common nouns, but the model
-       does it anyway) is dropped, not merged — merging it would scrub
-       ordinary vocabulary (``"engineer"``, ``"skiing"``) or an
-       out-of-scope entity type (an organization, a tool, a language) out
-       of the payload regardless of ``pii_scope``.  When the LLM's entry
-       conflicts with a deterministic one, deterministic wins (we trust
-       the graph).  A key that is speaker-id-shaped
+    1. **Speaker-anchor invariants.**  ``speaker{N}`` is an anonymized
+       handle by construction (CLAUDE.md's "ONE lowercase ``speaker{N}``
+       everywhere"), never a real name to be re-mapped.  A ``llm_mapping``
+       KEY that is speaker-id-shaped
        (:func:`~paramem.graph.name_match.is_speaker_id`) — e.g. a
-       hallucinated ``{"speaker0": "Person_1"}`` — is dropped outright
-       (forward *and* reverse), since treating the anchor itself as a
-       "real name" to be re-mapped would corrupt it in both directions.
-       A *value* that is speaker-id-shaped — e.g. ``{"RealName":
-       "speaker0"}``, an anonymizer hallucination scrubbing a real name
-       onto the anchor — keeps the forward scrub (harmless, and the
-       only thing standing between that real name and the cloud) but
-       drops the reverse write: a reverse entry keyed on ``speaker0``
-       would restore that real name onto every speaker-subject fact.
+       hallucinated ``{"speaker0": "Person_1"}`` — is dropped outright,
+       forward AND reverse.  A ``llm_mapping`` VALUE that is
+       speaker-id-shaped — e.g. ``{"RealName": "speaker0"}``, the model
+       scrubbing a real name onto the anchor — keeps the forward scrub
+       (harmless, and the only thing standing between that real name and
+       the cloud) but drops the reverse write: a reverse entry keyed on
+       ``speaker0`` would restore that real name onto every
+       speaker-subject fact.
+    2. **Speaker-name seeding.**  When the runtime knows the speaker's
+       display name and the model's mapping doesn't already cover it
+       (the model never sees ``speaker_name`` as an explicit prompt
+       field — it can only have named it if the name happened to occur
+       in the transcript text it saw), reuse the model's own hint if it
+       named the speaker (exact or full-name match, e.g. ``"Alex"`` or
+       ``"Alex Rivera"`` → reuse ``Person_1``) or mint a fresh
+       ``Person_N`` via :func:`mint_placeholder`.
 
-    Callers build the anonymized fact array directly from ``graph.relations``
-    and this builder's forward map (subject/object substituted, predicate
-    untouched) — never from the LLM's response, which carries no facts.  An
-    orphan placeholder in a LOCAL fact is therefore structurally impossible
-    at this stage, not merely diagnosed.  :func:`_check_mapping_totality`
-    still runs, unrelated to this builder, against SOTA's *returned*
-    enrichment delta (the one place a placeholder can still arrive
-    unresolved).
+    Every other entry in ``llm_mapping`` is trusted and merged in
+    unconditionally — the model already decided it is in scope against
+    ``scrub``; this builder does not re-gate, walk, or float a
+    completeness floor under that decision.
+
+    Callers build the anonymized fact array directly from
+    ``graph.relations`` and this builder's forward map (subject/object
+    substituted, predicate untouched) — never from the LLM's response,
+    which carries no facts.
 
     Args:
-        entities: The entity records to walk — ``graph.entities`` for the
-            session tier; for the graph tier (cumulative, post-merge
-            graph, which carries no entity types of its own) one
-            :class:`~paramem.graph.schema.Entity` per real name found by
-            the chunk's local-model anonymization pass, typed via
-            :func:`prefix_to_entity_type` on the placeholder that pass
-            minted (see :func:`~paramem.training.consolidation.
-            ConsolidationLoop._run_graph_enrichment`). This is the sole
-            input the function reads names/types/attributes from — it has
-            no other opinion about where entities come from.
         llm_mapping: Canonicalised ``{real_name: placeholder}`` mapping
-            from :func:`_normalize_anonymization_mapping`.  Treated as
-            a hint, not truth.
-        pii_scope: Entity-types in scope for anonymization (e.g.
-            ``{"person"}`` — see :data:`_DEFAULT_PII_SCOPE`).  A mint
-            selector: in-scope entities get a placeholder minted and are
-            substituted out; out-of-scope entities travel to the cloud
-            verbatim, by design.
+            from :func:`_normalize_anonymization_mapping` — the model's
+            own ``scrub``-scoped decision, trusted as-is.
         speaker_name: Runtime-known display name of the session's
             speaker.  When set, this name is guaranteed to be covered.
 
     Returns:
-        ``(forward, reverse)`` — ``forward`` is the many-to-one
-        ``{real_name | attr_value: placeholder}`` mapping that feeds
-        ``_anonymize_transcript`` and :func:`_build_anon_facts` (both in
-        :mod:`paramem.graph.extractor`).  ``reverse`` is the
-        one-to-one ``{placeholder: entity_name}`` map consumed by the
-        deanon path (:func:`deanonymize_text`, :func:`_apply_bindings`)
-        — attribute values are deliberately absent so a folded
-        placeholder always restores to the entity name.  For the
-        speaker, "placeholder" in ``forward`` is the anchor
-        (``entity.speaker_id``, e.g. ``"speaker0"``) rather than a
-        minted value, and ``reverse`` carries NO entry for it at all —
-        the anchor is never a mint target and display names are never
-        restored into graph edges.
+        ``(forward, reverse)`` — ``forward`` is the ``{real_name:
+        placeholder}`` mapping that feeds :func:`_build_anon_facts` (in
+        :mod:`paramem.graph.extractor`).  ``reverse`` is the one-to-one
+        ``{placeholder: real_name}`` map consumed by the deanon path
+        (:func:`deanonymize_text`, :func:`_apply_bindings`) — built by
+        inverting ``forward`` via :func:`invert_forward_mapping`
+        (first-wins tie-break on a many-to-one forward map), after
+        dropping any entry whose VALUE is speaker-id-shaped (invariant 1
+        above).
     """
-    scope: frozenset[str] = _DEFAULT_PII_SCOPE if pii_scope is None else frozenset(pii_scope)
     mapping: dict[str, str] = {}
-    reverse: dict[str, str] = {}
 
-    # Mint placeholders for in-scope entities and fold in their PII
-    # attribute values under the same placeholder.
-    speaker_entity_placeholder: str | None = None
-    for entity in entities:
-        if entity.entity_type not in scope:
-            continue
-        if not entity.name:
-            continue
-        if entity.speaker_id is not None:
-            # The speaker anchor — never mint a Person_N for it (see the
-            # module-level docstring, point 1).  entity.speaker_id itself
-            # (e.g. "speaker0") IS the anchor; entity.name may already be
-            # that same anonymous form, or a disclosed display name.
-            if speaker_entity_placeholder is None:
-                speaker_entity_placeholder = entity.speaker_id
-            if entity.name != entity.speaker_id:
-                mapping.setdefault(entity.name, entity.speaker_id)
-            # No reverse entry: the anchor is never a mint target, and
-            # display names are never restored into graph edges.
-            attrs = entity.attributes or {}
-            for attr_key, attr_value in attrs.items():
-                if attr_key not in _PII_ATTRIBUTE_KEYS:
-                    continue
-                if not isinstance(attr_value, str) or not attr_value.strip():
-                    continue
-                mapping.setdefault(attr_value, entity.speaker_id)
-            continue
-        prefix = entity_type_to_prefix(entity.entity_type)
-        if entity.name not in mapping:
-            # Mint against the union of what is already allocated in
-            # `mapping` AND `llm_mapping` — a token the LLM already used
-            # for a DIFFERENT real name (merged into `mapping` only
-            # later, in the loop below) is otherwise invisible to the
-            # mint and two distinct real names can collide onto the
-            # same placeholder (FIX 1).  An `llm_mapping` entry keyed on
-            # THIS entity's own name is excluded from the scan — that is
-            # the LLM's (possibly disagreeing) hint for the SAME real
-            # name, not a competing claimant, and letting it block this
-            # mint would spuriously inflate the placeholder count and
-            # duplicate the reverse map every time the LLM hint happens
-            # to agree with the graph.
-            other_llm_values = (v for k, v in llm_mapping.items() if k != entity.name)
-            mapping[entity.name] = mint_placeholder([*mapping.values(), *other_llm_values], prefix)
-        placeholder = mapping[entity.name]
-        # Only entity names enter the reverse map.  ``setdefault`` so the
-        # first-seen entity wins if two distinct entities collide on the
-        # same placeholder via an LLM hint downstream.
-        reverse.setdefault(placeholder, entity.name)
-        attrs = entity.attributes or {}
-        for attr_key, attr_value in attrs.items():
-            if attr_key not in _PII_ATTRIBUTE_KEYS:
-                continue
-            if not isinstance(attr_value, str) or not attr_value.strip():
-                continue
-            mapping.setdefault(attr_value, placeholder)
-            # NOTE: deliberately not adding to ``reverse``.  Folding
-            # attribute values into the forward map is privacy-correct
-            # (one placeholder scrubs every PII surface form) but the
-            # reverse direction must restore the entity name, not an
-            # attribute value.
-
-    # Speaker-name seeding: ensure the runtime-known speaker name is covered.
-    if speaker_name and speaker_name not in mapping:
-        if speaker_entity_placeholder is not None:
-            # Speaker is among the walked entities.  ``speaker_entity_placeholder``
-            # is the anchor (entity.speaker_id, e.g. "speaker0"), never a
-            # minted Person_N — reuse it so the runtime-known display
-            # name folds onto the same anonymous handle as the entity's
-            # own name.  No reverse entry: the anchor never restores a
-            # display name into graph edges.
-            mapping[speaker_name] = speaker_entity_placeholder
-        else:
-            # No speaker entity in scope — fall back to LLM hints
-            # (exact or full-name match) or mint a fresh Person_N.
-            speaker_lower = speaker_name.lower()
-            reused: str | None = None
-            for key, placeholder in llm_mapping.items():
-                if not isinstance(key, str):
-                    continue
-                key_lower = key.lower()
-                if key_lower == speaker_lower or key_lower.startswith(speaker_lower + " "):
-                    reused = placeholder
-                    break
-            if reused is not None:
-                mapping[speaker_name] = reused
-                reverse.setdefault(reused, speaker_name)
-            else:
-                person_prefix = entity_type_to_prefix("person")
-                # Allocate Person_N taking BOTH the CORE mapping and
-                # llm_mapping values into account so we don't collide
-                # with an LLM-emitted Person_K.
-                merged_for_idx = dict(mapping)
-                for k, v in llm_mapping.items():
-                    merged_for_idx.setdefault(k, v)
-                fresh = mint_placeholder(merged_for_idx.values(), person_prefix)
-                mapping[speaker_name] = fresh
-                reverse.setdefault(fresh, speaker_name)
-
-    # Merge in LLM hints not already covered (typically relation-participant
-    # placeholders for entities absent from ``entities``).  Deterministic
-    # entries win on conflict; LLM-only entries are added.  ``pii_scope`` is
-    # AUTHORITATIVE here, not just for the entity walk above: an LLM hint
-    # whose placeholder types to an out-of-scope entity type (via
-    # :func:`placeholder_entity_type`) is dropped, never merged.  Ungated,
-    # the LLM was measured minting placeholders for out-of-scope entity
-    # types (organizations, tools, languages) AND for plain common nouns
-    # the anonymization prompt explicitly forbids mapping (``"engineer"``,
-    # ``"skiing"``) — both classes reached the forward map and were
-    # scrubbed from the payload regardless of ``cloud_scope``.  Scoping the
-    # merge is the fix: a hint only survives when its own placeholder's
-    # type is in ``scope``, exactly the same test the deterministic walk
-    # above applies to graph entities.
-    #
-    # A key that is speaker-id-shaped (``is_speaker_id``) — e.g. a
-    # hallucinated ``{"speaker0": "Person_1"}`` — is dropped outright
-    # (forward and reverse): the anchor itself is never a "real name"
-    # to be re-mapped.  A value that is speaker-id-shaped — e.g.
-    # ``{"RealName": "speaker0"}``, the LLM scrubbing a real name onto
-    # the anchor — keeps the forward scrub (still useful: it is what
-    # keeps that real name out of ``anon_transcript``) but drops ONLY
-    # the reverse write, which would otherwise restore the real name
-    # onto every ``speaker0``-subject fact at deanon.
     for k, v in llm_mapping.items():
         if not isinstance(k, str) or not isinstance(v, str):
             continue
         if is_speaker_id(k):
             continue
-        # The scope gate answers "does this hint's placeholder type belong
-        # in pii_scope" — a question that doesn't apply to a speaker-id
-        # VALUE at all (``placeholder_entity_type("speaker0")`` types to
-        # the literal string ``"speaker0"``, never a member of any real
-        # scope).  A speaker-id-shaped value is the anchor-scrub case
-        # documented below, not a scope-governed placeholder mint, so it
-        # bypasses the gate and is handled entirely by the
-        # ``is_speaker_id(v)`` branch that follows.
-        if not is_speaker_id(v) and placeholder_entity_type(v) not in scope:
-            continue
-        mapping.setdefault(k, v)
-        if is_speaker_id(v):
-            continue
-        reverse.setdefault(v, k)
+        mapping[k] = v
+
+    # Speaker-name seeding: ensure the runtime-known speaker name is
+    # covered, reusing the model's own hint when it named the speaker
+    # (exact or full-name match) and minting a fresh Person_N only when
+    # it did not.
+    if speaker_name and speaker_name not in mapping:
+        speaker_lower = speaker_name.lower()
+        reused: str | None = None
+        for key, placeholder in llm_mapping.items():
+            if not isinstance(key, str):
+                continue
+            key_lower = key.lower()
+            if key_lower == speaker_lower or key_lower.startswith(speaker_lower + " "):
+                reused = placeholder
+                break
+        if reused is not None:
+            mapping[speaker_name] = reused
+        else:
+            person_prefix = entity_type_to_prefix("person")
+            fresh = mint_placeholder(mapping.values(), person_prefix)
+            mapping[speaker_name] = fresh
+
+    reverse = invert_forward_mapping({k: v for k, v in mapping.items() if not is_speaker_id(v)})
 
     return mapping, reverse
 
@@ -1033,7 +855,7 @@ def _apply_bindings(
          ``test_extraction_pipeline.py`` keep passing unchanged as the
          CORE-unscoped regression net).  A ``set`` means CORE SCOPED to
          it — see :func:`_resolution_map`.  ``reverse`` wins on any key
-         collision in EITHER mode (CORE PRECEDENCE, T2f) — deterministic
+         collision in EITHER mode (CORE PRECEDENCE) — deterministic
          entity names over SOTA-sourced values, never the reverse.
 
        The union round-trips a placeholder regardless of which form
@@ -1150,9 +972,11 @@ def deanonymize_text(text: str, reverse: dict[str, str]) -> str:
 
     ``reverse`` is the ``{placeholder: real_name}`` map produced
     alongside the forward map by :func:`_build_anonymization_mapping`
-    (or by the dict-inversion in
-    :func:`~paramem.graph.extractor.extract_and_anonymize_for_cloud` for
-    LLM-emitted mappings, which are one-to-one by contract).  This
+    (used by both :func:`~paramem.graph.extractor.extract_and_anonymize_for_cloud`
+    and the session-tier :func:`~paramem.graph.extractor._sota_pipeline`),
+    or by the graph tier's own inversion in
+    :func:`~paramem.graph.extractor._graph_enrich_with_sota` — both now
+    go through the single :func:`invert_forward_mapping`.  This
     function never inverts a forward map itself — that inversion was
     lossy when the forward map folded PII attribute values onto the
     entity placeholder, and the asymmetry now lives in the producer.

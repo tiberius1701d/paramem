@@ -4,8 +4,9 @@ Anchored on runtime ground truth, not lexical patterns:
 
 * The speaker's **known entities** (the router's entity index plus the speaker
   store's enrolled names) are the source of truth for what counts as personal.
-  Detection reuses ``_anonymize_transcript`` from the extraction pipeline —
-  the same primitive that produces SOTA-safe transcripts.  Anonymization
+  Detection reuses :func:`~paramem.graph.placeholders._substitute_whole_words`
+  — the SAME edge-aware, case-sensitive substitution primitive the
+  cloud-egress anonymizer builds its forward map through.  Substitution
   replacing anything means the text contained a personal reference.
 * **First-person pronouns** plus an identified speaker count as personal
   even when no known entity is named (covers cold-start before the graph
@@ -25,7 +26,7 @@ Modes: ``off`` / ``warn`` / ``block``.
 
 import logging
 
-from paramem.graph.extractor import _anonymize_transcript
+from paramem.graph.placeholders import _substitute_whole_words
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +141,8 @@ def _query_paraphrases_entity(
     personal just because some indexed entity contains "system".
 
     Single-content-token entity names (e.g. ``"Alice"``) are already
-    fully covered by :func:`_anonymize_transcript`'s word-boundary
-    primitive in :func:`check_personal_content`, so this function
+    fully covered by :func:`~paramem.graph.placeholders._substitute_whole_words`'s
+    word-boundary primitive in :func:`check_personal_content`, so this function
     returns False for any entity whose content-token count is below
     ``min_overlap``.  Substring (not word-boundary) is the deliberate
     relaxation: it accepts "platforms" matching the entity token
@@ -165,16 +166,17 @@ def _query_paraphrases_entity(
 
 
 def _build_known_entity_mapping(known_entities: set[str] | None) -> dict[str, str]:
-    """Build a name → opaque-placeholder mapping for ``_anonymize_transcript``.
+    """Build a name → opaque-placeholder mapping for
+    :func:`~paramem.graph.placeholders._substitute_whole_words`.
 
     Placeholders are unique per known entity so the comparison
     ``anonymized != original`` reliably detects matches.  The actual
     placeholder strings are not surfaced — callers only see the
     ``personal_entity`` finding.
 
-    Empty input yields an empty dict; ``_anonymize_transcript`` is a no-op
-    on an empty mapping, which preserves back-compat for callers that
-    don't yet supply ``known_entities``.
+    Empty input yields an empty dict; ``_substitute_whole_words`` is a
+    no-op on an empty mapping, which preserves back-compat for callers
+    that don't yet supply ``known_entities``.
     """
     if not known_entities:
         return {}
@@ -233,9 +235,9 @@ def check_personal_content(
 
     * **Known-entity scrub** — the speaker's known entities (the router's
       entity index plus enrolled speaker names) are substituted via
-      :func:`paramem.graph.extractor._anonymize_transcript`.  Substitution
-      anywhere → personal.  Already language-agnostic (entity names are
-      surface forms).
+      :func:`~paramem.graph.placeholders._substitute_whole_words`.
+      Substitution anywhere → personal.  Already language-agnostic (entity
+      names are surface forms).
     * **Self-reference gate** — :func:`_is_about_speaker` decides whether
       the query refers to the speaker.  Production path uses the
       encoder-based classifier (``personal_referent_config`` provided +
@@ -258,10 +260,10 @@ def check_personal_content(
         # coverage so the real name is flagged even when it is no longer a
         # registry subject under id-as-subject extraction), but the user's
         # query is mixed-case.  Lowercase both sides and run
-        # _anonymize_transcript with the same word-boundary substitution
-        # the extraction path uses; the original text is preserved for
-        # the return value.
-        anonymized = _anonymize_transcript(text_lower, mapping)
+        # _substitute_whole_words with the same edge-aware, case-sensitive
+        # substitution the cloud-egress anonymizer uses; the original text
+        # is preserved for the return value.
+        anonymized = _substitute_whole_words(text_lower, mapping)
         if anonymized != text_lower:
             findings.append("personal_entity")
 

@@ -1,14 +1,18 @@
 """Shared prompt-loading utilities for the graph package.
 
 Dependency-light module: only imports from the standard library plus
-``paramem.utils.paths`` (itself stdlib-only) so that ``paramem.graph.merger``
-can import the loader without pulling in the heavyweight
-``paramem.graph.extractor`` transitive dependency chain (models.loader /
-vram_guard / evaluation.recall).
+``paramem.utils.paths`` (itself stdlib-only) and
+``paramem.graph.phase_trace`` (also dependency-light — stdlib-only at
+runtime; its only non-stdlib reference, ``SessionGraph``, is
+``TYPE_CHECKING``-guarded and never imported at runtime) so that
+``paramem.graph.merger`` can import the loader without pulling in the
+heavyweight ``paramem.graph.extractor`` transitive dependency chain
+(models.loader / vram_guard / evaluation.recall).
 """
 
 from pathlib import Path
 
+from paramem.graph.phase_trace import record_prompt
 from paramem.utils.paths import find_project_root
 
 _DEFAULT_PROMPT_DIR = (
@@ -168,6 +172,16 @@ def _load_prompt(
     ``{entity_types}`` are anti-patterns; long prose rules dilute the
     example signal.  Edit the prompt files directly to tune; no code
     changes are needed.
+
+    Every resolution — the found-file case AND the not-found-anywhere
+    fallback to *default* — is reported via
+    :func:`paramem.graph.phase_trace.record_prompt`, so a
+    :class:`~paramem.graph.phase_trace.PhaseRecord` for the calling phase
+    always reflects the path/content this function actually returned,
+    never a re-derivation of it.  ``record_prompt`` no-ops when no
+    :func:`~paramem.graph.phase_trace.phase_trace` scope is active (e.g.
+    the module-import-time calls that build module-level prompt
+    constants), so this call is always safe.
     """
     search_dirs: list[Path] = []
     if prompts_dir:
@@ -180,10 +194,13 @@ def _load_prompt(
     for d in search_dirs:
         path = d / filename
         if path.exists():
-            return path.read_text().strip()
+            content = path.read_text(encoding="utf-8").strip()
+            record_prompt(path=str(path), content=content)
+            return content
     if required:
         searched = ", ".join(str(d / filename) for d in search_dirs)
         raise FileNotFoundError(
             f"Required prompt file {filename!r} not found. Searched: {searched}"
         )
+    record_prompt(path=None, content=default)
     return default

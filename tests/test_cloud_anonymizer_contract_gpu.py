@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import pytest
 
+from paramem.server.config import _DEFAULT_SCRUB as _PRODUCTION_DEFAULT_SCRUB
+
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.skipif(
@@ -54,24 +56,37 @@ pytestmark = [
 
 
 # Empirical baseline calibrated on Mistral 7B Instruct v0.3 with the
-# default scope ``[person]`` + the adapted (codebase-pattern-aligned)
-# anonymization prompt.  Variance recalibration on 2026-04-29 across 10
-# iterations × 5 fixtures (50 runs) showed 40/40 personal-marker success
-# with zero flakes — Mistral 7B at temperature=0.0 is fully
-# deterministic on this fixture.  Threshold raised from 0.75 to 0.80 so
-# the test trips on the very first per-fixture regression (any 1/4
-# failure) without going to the strict 0.9× empirical recommendation.
+# production default scrub categories in effect at calibration time
+# (see ``_DEFAULT_SCRUB`` below — imported live from ``config.py`` so
+# this baseline always describes whatever the current default is) + the
+# two-artifact (mapping + anonymized_transcript) anonymization prompt.
+# Variance recalibration on 2026-04-29 (pre-redesign scope walk +
+# single-artifact prompt) across 10 iterations × 5 fixtures (50 runs)
+# showed 40/40 personal-marker success with zero flakes — Mistral 7B at
+# temperature=0.0 is fully deterministic on this fixture.  Threshold
+# raised from 0.75 to 0.80 so the test trips on the very first
+# per-fixture regression (any 1/4 failure) without going to the strict
+# 0.9× empirical recommendation.  NEEDS RECALIBRATION against the
+# redesigned prompt (model now also authors ``anonymized_transcript`` —
+# see FR-cal) AND against the 2026-07 scrub-vocabulary enrichment (5
+# terse labels -> 12 load-bearing terms) via
+# ``scripts/dev/calibrate_cloud_anonymizer.py`` before ship; the 0.80
+# threshold is carried forward as a conservative floor, not a
+# re-verified number.
 # Re-run scripts/dev/calibrate_cloud_anonymizer.py after any change to
 # extractor.py, the default scope, or the anonymization prompt.
 _MATCH_THRESHOLD = 0.80
 
 
-# Default scope under which the contract is asserted.  Mirrors the
-# production default in ``SanitizationConfig.cloud_scope``.  Only names
-# whose LLM-classified entity type maps into this set are required to be
-# anonymized; out-of-scope categories (places, organizations, etc.)
-# pass through verbatim by design.
-_DEFAULT_SCOPE = {"person"}
+# Default scrub categories under which the contract is asserted.
+# Imported directly from production (rather than duplicated as a
+# literal) so this test always tracks whatever ``SanitizationConfig``
+# actually ships — the prompt's sole scope authority (no code-side
+# entity-type gate): the model classifies real values against this
+# vocabulary and decides what to placeholder.  Categories NOT covered
+# (city, organization, product, ...) pass through verbatim by design so
+# the cloud can still reason about places and things sensibly.
+_DEFAULT_SCRUB = set(_PRODUCTION_DEFAULT_SCRUB)
 
 
 # Fixture transcripts: single-turn user queries — the production input
@@ -134,9 +149,11 @@ _FIXTURE = [
         # "object": "Berlin"} — so the anonymizer actually runs on both.
         "transcript": "Alex, my friend, moved to Berlin for a new job.",
         # Berlin is intentionally NOT in expected_names under the
-        # default scope ``[person]`` — places pass through verbatim so
-        # the cloud can recommend Berlin restaurants by name.  Only
-        # Alex (a person) must be anonymized.
+        # production default scrub categories (``_DEFAULT_SCRUB`` above —
+        # name/phone/address/online-identity sub-terms, no city/place
+        # category) — city names pass through verbatim so the cloud can
+        # recommend Berlin restaurants by name.  Only Alex (a person)
+        # must be anonymized.
         "expected_names": ["Alex"],
     },
     {
@@ -190,17 +207,22 @@ def test_cloud_anonymizer_contract(loaded_model):
     """Real-LLM contract: leak-guard correctness + round-trip integrity.
 
     Each query in the fixture is run through ``anonymize_outbound``.
-    Per-query contract (when mapping is non-empty):
+    Per-query contract (when the call is not a genuine block —
+    ``anon_text`` non-empty; ``mapping`` may legitimately be empty):
       1. No real name in mapping leaks into anon_text (forward leak guard).
          This is what ``anonymize_outbound`` already enforces — verified
          here on real LLM output.
-      2. Every expected name appears in ``mapping.keys()`` (coverage).
+      2. Every expected name appears in ``mapping.keys()`` (coverage) and
+         is absent from ``anon_text`` — an empty ``mapping`` proves this
+         the hard way: if ``expected_names`` are truly present in the
+         transcript, an unmodified ``anon_text`` trips the leak-guard
+         assertion below.
       3. ``deanonymize_inbound(anon_text, mapping)`` whitespace-equals the
          original query (round-trip).
 
     Aggregate contract: at least ``_MATCH_THRESHOLD`` of queries with
     personal markers must succeed.  No-personal-markers queries pass
-    through with empty mapping and contribute neutrally to the rate.
+    through (mapping may be empty) and contribute neutrally to the rate.
     """
     from paramem.graph.extractor import extract_and_anonymize_for_cloud
     from paramem.graph.placeholders import deanonymize_text
@@ -224,13 +246,19 @@ def test_cloud_anonymizer_contract(loaded_model):
             tokenizer,
             speaker_id=entry["speaker_id"],
             speaker_name=entry["speaker_name"],
-            pii_scope=_DEFAULT_SCOPE,
+            scrub=_DEFAULT_SCRUB,
         )
 
-        # Empty mapping is a privacy-safe block (leak guard tripped or
-        # model produced nothing usable).  Counts toward "blocks", does
-        # not count toward "successes" of personal-marker queries.
-        if not mapping:
+        # A genuinely blocked call is ``anon_text == ""`` (extraction
+        # failure, empty input, or the anonymizer's own parse failure —
+        # ``mapping is None``, fail-closed).  ``mapping == {}`` no longer
+        # means "block": it PROCEEDS —
+        # the anonymizer ran and found nothing in scope, trusted as a
+        # legitimate verdict rather than treated as a safe block.  That
+        # verdict is itself exercised by the leak-guard assertions below
+        # rather than skipped: if ``expected_names`` really are present
+        # in the transcript, an unscrubbed ``anon_text`` trips them.
+        if not anon_text:
             if expected_names:
                 blocks += 1
             continue
@@ -284,16 +312,17 @@ def test_cloud_anonymizer_contract(loaded_model):
 
 
 def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
-    """Wider-scope contract: under cloud_scope={person, place}, place
+    """Wider-scope contract: under ``scrub={person name, city}``, place
     names also get anonymized.
 
     The default-scope test above leaves place names verbatim by design
     (so the cloud can answer "Berlin restaurants?" sensibly).  This
     test differentiates: picks the ``person_and_place`` fixture entry —
-    the only one carrying both categories — and runs it under the
-    stricter scope ``{person, place}``.  Validates that the wider
-    scope path actually anonymizes places on real LLM output, not
-    just in unit tests with synthetic graphs.
+    the only one carrying both categories — and runs it under a wider
+    operator-configured scrub set.  Validates that a wider ``scrub``
+    actually reaches the model's own scope decision on real LLM output
+    (the prompt is the sole scope authority — there is no code-side
+    entity-type gate to unit-test with a synthetic graph instead).
 
     Operators picking the stricter posture (privacy over cloud-utility
     on places) need this guarantee to hold.
@@ -312,12 +341,18 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
         tokenizer,
         speaker_id=entry["speaker_id"],
         speaker_name=entry["speaker_name"],
-        pii_scope={"person", "place"},
+        scrub={"person name", "city"},
     )
 
     if not mapping:
+        # An empty mapping here is a compliance miss regardless of the
+        # proceed-on-empty decision (mapping == {} no longer means
+        # "block" — see extract_and_anonymize_for_cloud): this test
+        # specifically verifies the wider scrub set actually widens what
+        # the model classifies in scope, and it did not.
+        reason = "anon_text empty (block)" if not anon_text else "nothing anonymized"
         pytest.fail(
-            f"Strict scope produced empty mapping (block) on {entry['id']}; "
+            f"Strict scope produced empty mapping ({reason}) on {entry['id']}; "
             f"expected both Alex and Berlin to be anonymized."
         )
 
@@ -326,7 +361,7 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
     # into; a leak of either is a regression.
     for name in ("Alex", "Berlin"):
         assert name not in anon_text, (
-            f"[{entry['id']}, scope=person+place] Privacy breach: {name!r} "
+            f"[{entry['id']}, scrub=person_name+city] Privacy breach: {name!r} "
             f"present in anon_text {anon_text!r}"
         )
 
@@ -336,7 +371,7 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
     # cloud's response with placeholders the user sees.
     round_trip = deanonymize_text(anon_text, reverse)
     assert _normalise(round_trip) == _normalise(transcript), (
-        f"[{entry['id']}, scope=person+place] Round-trip mismatch:\n"
+        f"[{entry['id']}, scrub=person_name+city] Round-trip mismatch:\n"
         f"  original:   {transcript!r}\n"
         f"  round-trip: {round_trip!r}"
     )

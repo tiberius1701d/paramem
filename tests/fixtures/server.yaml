@@ -246,7 +246,7 @@ consolidation:
   retain_sessions: true        # archive transcripts after consolidation (false = delete)
   indexed_key_replay: true     # indexed key training mechanism
   decay_window: 10             # cycles before unreinforced keys decay
-  sota_enabled: true            # dev-test posture: exercise SOTA code paths (cloud calls fall through when API key unset). In a real deployment this egresses knowledge-graph content (subjects/objects) to the configured cloud provider; anonymization is best-effort, scoped by sanitization.cloud_scope, and a misclassified entity can leak a real name.
+  sota_enabled: true            # dev-test posture: exercise SOTA code paths (cloud calls fall through when API key unset). In a real deployment this egresses knowledge-graph content (subjects/objects) to the configured cloud provider; anonymization is best-effort, scoped by sanitization.scrub, and a misclassified value can leak real PII.
   refinement_enrichment: "on"   # graph-stage SOTA enrichment — on in tests; requires sota_enabled:true. This is the flag that actually triggers the graph-content SOTA call — same real-name-leak residual on misclassification.
   refinement_normalization: "on"  # full-fold predicate-synonym collapse (per-group cluster model call); local-7B precision ~0.89 accepted
   refinement_contradiction: "on"  # Case-2 recency-backed contradiction: freshest last_seen wins; empty/tied → coexist. off|on.
@@ -443,8 +443,9 @@ tools:
 #                     block      : PERSONAL queries dropped before SOTA;
 #                                  non-PERSONAL sent verbatim. Phase 2 default,
 #                                  zero anonymizer cost, smallest cloud surface.
-#                     anonymize  : ALL cloud-bound text is anonymized via the
-#                                  local LLM, sent to SOTA as placeholders, and
+#                     anonymize  : cloud-bound text is anonymized via the
+#                                  local LLM (categories chosen by `scrub`),
+#                                  sent to SOTA as placeholders, and
 #                                  de-anonymized on the way back. PERSONAL
 #                                  queries reach cloud as redacted text.
 #                     both       : strictest privacy posture — PERSONAL is
@@ -452,12 +453,14 @@ tools:
 #                                  Cloud only ever sees non-personal text, and
 #                                  even that is placeholder-substituted.
 #
-# There is NO post-hoc leak check and no repair loop.  The anonymized payload
-# is built deterministically by the script from a table it mints and owns,
-# substituted exactly and case-sensitively — nothing verifies it afterward.
-# `cloud_scope` is a MINT SELECTOR: in-scope entity types get a placeholder
-# and are substituted out; out-of-scope types travel to the cloud verbatim.
-# See SECURITY.md for the residual this leaves.
+# There is no runtime check-and-abort that re-verifies the model's
+# classification.  The model authors BOTH the `mapping` and the rewritten
+# `anonymized_transcript` in one call; verification is an offline
+# calibration gate (recall + transcript fidelity) run before ship, not a
+# runtime check.  `scrub` is a list of PII-vocabulary HINTS given verbatim
+# to the anonymizer prompt — THE PROMPT is the sole scope authority; there
+# is no code-side entity-type gate.  See SECURITY.md for the residual this
+# leaves.
 #
 # HA path (HA conversation agent) is NOT affected by `cloud_mode`. HA receives
 # cleartext, gated by intent classification. Hardening the HA hop is a planned
@@ -468,8 +471,13 @@ tools:
 sanitization:
   mode: block            # off | warn | block — PII detection layer
   cloud_mode: anonymize  # block | anonymize | both — direct-SOTA egress policy
-  cloud_scope:           # entity types anonymized when cloud_mode=anonymize|both ([] = off)
-    - person
+  scrub:                 # reduced person-only set (NOT the shipped default) — exercises both
+                         # the mask path (name terms) and the not-in-scope verbatim pass-through
+                         # path (phone/email/address, absent here) in the same test suite
+    - person name
+    - full name
+    - given name
+    - family name
 
 # ============================================================================
 # ABSTENTION — LAST-RESORT CONFABULATION GUARD

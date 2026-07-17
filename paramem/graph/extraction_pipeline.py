@@ -47,7 +47,7 @@ Enforced by ``tests/test_extraction_pipeline_guard.py`` (AST scan) and
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -90,7 +90,16 @@ class ExtractionConfig:
     sota_enabled: bool = False  # master gate for ALL SOTA; mirrors ConsolidationConfig.sota_enabled
     plausibility_judge: str = "auto"
     plausibility_stage: str = "deanon"
-    pii_scope: set[str] | frozenset[str] | None = None
+    # Required, no default (kw_only so it can sit after defaulted fields
+    # without violating dataclass field ordering) — the model's
+    # anonymizer prompt is the sole scope authority and the single
+    # declared default is ``SanitizationConfig.scrub``
+    # (``paramem/server/config.py``). A hidden fallback here would
+    # duplicate that policy in the graph layer and silently scrub against
+    # a value the operator never configured — see
+    # ``paramem.graph.placeholders._build_anonymization_mapping``'s
+    # docstring for the same reasoning applied one layer down.
+    scrub: set[str] | frozenset[str] = field(kw_only=True)
     correction_entity_types: set[str] | frozenset[str] | None = None
 
 
@@ -159,13 +168,13 @@ class ExtractionPipeline:
         model,
         tokenizer,
         *,
-        config: ExtractionConfig | None = None,
+        config: ExtractionConfig,
         prompts_dir: str | Path | None = None,
         model_name: str | None = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.config = config or ExtractionConfig()
+        self.config = config
         self.prompts_dir = prompts_dir
         # Model alias for per-file prompt resolution.  When set, the prompt
         # loader checks prompts_dir/<model_name>/<filename> before the shared
@@ -241,7 +250,7 @@ class ExtractionPipeline:
             speaker_name=overrides.get("speaker_name"),
             plausibility_judge=pick("plausibility_judge", cfg.plausibility_judge),
             plausibility_stage=pick("plausibility_stage", cfg.plausibility_stage),
-            pii_scope=pick("pii_scope", cfg.pii_scope),
+            scrub=pick("scrub", cfg.scrub),
             correction_entity_types=pick("correction_entity_types", cfg.correction_entity_types),
             speaker_id=_require_speaker_id(overrides),
             system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),

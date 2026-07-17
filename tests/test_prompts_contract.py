@@ -11,6 +11,7 @@ unit-test time.
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 import pytest
@@ -19,6 +20,7 @@ from paramem.graph.extractor import (
     build_speaker_context,
     load_anonymization_prompt,
 )
+from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.placeholders import PLACEHOLDER_TOKEN_RE
 from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
 
@@ -113,6 +115,123 @@ class TestLoadPromptPerModelResolution:
             "qwen3-4b must inherit the shared extraction_system.txt; "
             "a per-model override for this file should not exist."
         )
+
+
+class TestLoadPromptPhaseTraceRecording:
+    """``_load_prompt`` records its own resolution via
+    :func:`paramem.graph.phase_trace.record_prompt` right after it resolves
+    a file (see ``paramem/graph/prompts.py``).  This is the regression pin
+    for the divergence this step exists to close: a calibration run must
+    see the loader's OWN resolved path/content, never a re-implementation
+    of the search order.
+
+    That re-implementation is LIVE today, not historical:
+    ``paramem/server/calibrate.py::_read_prompt`` (``calibrate.py:259``)
+    still resolves ``path = Path(prompts_dir) / filename``
+    (``calibrate.py:276``), skipping the ``prompts_dir/<model>`` search
+    ``_load_prompt`` performs, and its return value still feeds the
+    top-level ``prompts`` field reported by 9 call sites across the
+    calibrate handlers (``calibrate.py:605, 608, 718, 721, 819, 895, 973,
+    1112, 1113``).  So ``_read_prompt`` reports a DIFFERENT prompt than
+    production loads whenever a per-model override exists — it does NOT
+    diverge on a merely-absent file (that case raises HTTP 400 at
+    ``calibrate.py:280-286`` rather than silently reporting anything).
+    Fixing ``_read_prompt`` itself is out of scope here (planned
+    separately, by hooking the calibrate handlers into the pipeline and
+    removing these calls) — this test class only pins that
+    ``_load_prompt``'s OWN chokepoint records truthfully, independent of
+    whether ``calibrate.py`` yet consumes that record."""
+
+    def test_silent_fallback_to_shipped_default_is_visible_in_record(self, tmp_path):
+        """The file is ABSENT from the operator-supplied ``prompts_dir``, so
+        ``_load_prompt`` silently falls through to ``_DEFAULT_PROMPT_DIR``.
+        That fallback must NOT be silent in the phase-trace record: the
+        recorded ``path`` is the SHIPPED file and ``sha`` is the shipped
+        text's sha — not the (nonexistent) operator-requested file."""
+        shipped_path = _DEFAULT_PROMPT_DIR / "sota_plausibility.txt"
+        shipped_content = shipped_path.read_text().strip()
+        expected_sha = hashlib.sha256(shipped_content.encode("utf-8")).hexdigest()[:12]
+
+        with extraction_trace() as trace:
+            with phase_trace("deanon_plausibility"):
+                _load_prompt("sota_plausibility.txt", prompts_dir=tmp_path)
+            record = trace.records[-1]
+
+        assert record.prompts == [
+            {
+                "path": str(shipped_path),
+                "sha": expected_sha,
+                "template": shipped_content,
+            }
+        ]
+
+    def test_variant_present_records_variant_path_and_sha(self, tmp_path):
+        """The positive counterpart: when the operator-supplied file DOES
+        exist, the record reflects the variant, not the shipped default.
+
+        The file is written WITH surrounding whitespace so this test only
+        passes if the recorded sha/template are taken over the POST-strip
+        text ``_load_prompt`` actually returns — a sha computed over an
+        unstripped re-read of the file would produce a different hash and
+        fail here.
+        """
+        (tmp_path / "sota_plausibility.txt").write_text("  variant text  \n")
+        expected_sha = hashlib.sha256(b"variant text").hexdigest()[:12]
+
+        with extraction_trace() as trace:
+            with phase_trace("deanon_plausibility"):
+                _load_prompt("sota_plausibility.txt", prompts_dir=tmp_path)
+            record = trace.records[-1]
+
+        assert record.prompts == [
+            {
+                "path": str(tmp_path / "sota_plausibility.txt"),
+                "sha": expected_sha,
+                "template": "variant text",
+            }
+        ]
+
+    def test_per_model_override_records_variant_path(self, tmp_path):
+        """Per-model precedence: prompts_dir/<model>/f.txt wins over
+        prompts_dir/f.txt, and the record says so."""
+        (tmp_path / "qwen3-4b").mkdir()
+        (tmp_path / "qwen3-4b" / "extraction.txt").write_text("qwen-specific")
+        (tmp_path / "extraction.txt").write_text("base")
+
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                _load_prompt("extraction.txt", prompts_dir=tmp_path, model="qwen3-4b")
+            record = trace.records[-1]
+
+        assert record.prompts == [
+            {
+                "path": str(tmp_path / "qwen3-4b" / "extraction.txt"),
+                "sha": hashlib.sha256(b"qwen-specific").hexdigest()[:12],
+                "template": "qwen-specific",
+            }
+        ]
+
+    def test_required_false_absent_everywhere_records_path_none_and_default(self, tmp_path):
+        """When no file exists anywhere and required=False, the record
+        reports the caller's hardcoded default with path=None — an
+        embedded default silently standing in for a prompt file is
+        precisely the dishonesty this mechanism exists to expose."""
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                _load_prompt(
+                    "definitely_not_a_real_prompt_file.txt",
+                    default="fallback-default",
+                    prompts_dir=tmp_path,
+                )
+            record = trace.records[-1]
+
+        assert record.prompts == [
+            {
+                "path": None,
+                "sha": hashlib.sha256(b"fallback-default").hexdigest()[:12],
+                "template": "fallback-default",
+            }
+        ]
 
 
 def _render(template: str, **values) -> str:
@@ -662,7 +781,7 @@ class TestEnrichmentPromptContract:
         rendered = tmpl.format(transcript="Person_1 said hi.", facts_json="[]")
         assert "Before returning" in rendered
 
-    # -- Speaker anchor (binding-totality plan, C9/P0) -----------------
+    # -- Speaker anchor -----------------
     #
     # ``test_requires_grounding_of_new_placeholders`` above passed for
     # months asserting only that the grounding RULE was stated, while
@@ -920,11 +1039,17 @@ class TestAnonymizationPrompt:
     earlier ``replacement_rules`` interpolation that listed the configured
     prefixes is gone — prefixes are illustrative-only inside the prompt
     body, and the model picks any type-appropriate PascalCase prefix.
+
+    Since the config-driven redesign (``sanitization.scrub``), the prompt
+    is the SOLE scope authority: it takes a ``{scrub_categories}`` slot and
+    returns TWO artifacts (``mapping`` AND ``anonymized_transcript``) — no
+    code-side entity-type gate narrows the model's output afterward.
     """
 
     def _render(self, tmpl: str) -> str:
         """Render the anonymization prompt with all expected kwargs."""
         return tmpl.format(
+            scrub_categories="person name, phone number",
             facts_json='[{"subject": "Person_1", "predicate": "lives_in", '
             '"object": "City_1", "relation_type": "factual", "confidence": 0.9}]',
             transcript="Person_1 lives in City_1.",
@@ -935,6 +1060,7 @@ class TestAnonymizationPrompt:
         rendered = self._render(_load_prompt("anonymization.txt", required=True))
         assert "{facts_json}" not in rendered
         assert "{transcript}" not in rendered
+        assert "{scrub_categories}" not in rendered
 
     def test_file_based_renders_without_format_errors(self):
         """File-based anonymization.txt must render with all expected kwargs without KeyError."""
@@ -942,6 +1068,7 @@ class TestAnonymizationPrompt:
         rendered = self._render(tmpl)
         assert "{facts_json}" not in rendered
         assert "{transcript}" not in rendered
+        assert "{scrub_categories}" not in rendered
 
     def test_shape_contract_present_in_default(self):
         """anonymization.txt must teach the four parts of the shape contract:
@@ -956,7 +1083,7 @@ class TestAnonymizationPrompt:
         # Totality clause.
         assert "totality" in rendered.lower() or "every placeholder" in rendered.lower()
         # Direction clause.
-        assert "real_name" in rendered or "real name" in rendered.lower()
+        assert "real_value" in rendered or "real value" in rendered.lower()
 
     def test_shape_contract_present_in_file_based(self):
         """The file-based prompt must teach the same four-part shape contract.
@@ -971,10 +1098,13 @@ class TestAnonymizationPrompt:
         assert "PascalCase" in rendered or "Prefix" in rendered
         assert "UNIQUE" in rendered or "unique" in rendered
         assert "totality" in rendered.lower() or "every placeholder" in rendered.lower()
-        assert "real_name" in rendered or "real name" in rendered.lower()
+        assert "real_value" in rendered or "real value" in rendered.lower()
         # Diverse-prefix examples present — illustrative breadth signals
-        # the model that prefixes outside the common set are valid.
-        assert "University" in rendered or "Project" in rendered or "Product" in rendered, (
+        # the model that prefixes outside the common {Person, City, Country,
+        # Org, Thing} set are valid.  The examples now draw on the
+        # contact-PII default (Phone/Email/Address/Profile), not
+        # organization/project surfaces (see the scope-inversion tests below).
+        assert "Phone" in rendered or "Email" in rendered, (
             "File-based prompt must show at least one type-appropriate prefix "
             "outside the common {Person, City, Country, Org, Thing} set so the "
             "model knows the prefix vocabulary is open."
@@ -1008,6 +1138,85 @@ class TestAnonymizationPrompt:
         rendered = self._render(tmpl)
         assert "{facts_json}" not in rendered
         assert "{transcript}" not in rendered
+
+    def test_scrub_categories_slot_present(self):
+        """The prompt must accept a {scrub_categories} slot and echo the
+        rendered value — the config-driven scope authority."""
+        tmpl = _load_prompt("anonymization.txt", required=True)
+        assert "{scrub_categories}" in tmpl, (
+            "anonymization.txt must declare a {scrub_categories} format slot."
+        )
+        rendered = tmpl.format(
+            scrub_categories="person name, phone number, some very unusual category",
+            facts_json="[]",
+            transcript="x",
+        )
+        assert "some very unusual category" in rendered, (
+            "A non-default scrub value must reach the rendered prompt verbatim — "
+            "the guard against a dead config knob."
+        )
+
+    def test_returns_two_artifacts_not_mapping_only(self):
+        """The output contract must ask for BOTH `mapping` and
+        `anonymized_transcript` — the prior 'mapping — nothing else' /
+        'do NOT rewrite the transcript' contract is retired."""
+        tmpl = _load_prompt("anonymization.txt", required=True)
+        assert "anonymized_transcript" in tmpl, (
+            "anonymization.txt must request the anonymized_transcript artifact."
+        )
+        assert "mapping" in tmpl
+        assert "do not rewrite" not in tmpl.lower() and "do not echo" not in tmpl.lower(), (
+            "anonymization.txt must not forbid rewriting the transcript — the model now authors it."
+        )
+        # The final output-contract line must not restrict the response to
+        # `mapping` alone.
+        tail = tmpl.strip().splitlines()[-1]
+        assert "mapping" in tail and "anonymized_transcript" in tail, (
+            f"Final instruction line must name both output keys, got: {tail!r}"
+        )
+
+    def test_city_org_product_are_not_positive_scrub_examples(self):
+        """Scope-inversion: the old
+        Berlin->City_1, Siemens->Org_1, iPhone 15 Pro->Product_1 POSITIVE
+        examples over-scrub now that the code-side entity-type gate is
+        gone — the prompt is the only scope boundary. None of them may
+        appear as a placeholder-mapping VALUE (i.e. actually scrubbed) in
+        the prompt body."""
+        tmpl = _load_prompt("anonymization.txt", required=True)
+        for forbidden in ("City_1", "Org_1", "Product_1"):
+            assert forbidden not in tmpl, (
+                f"anonymization.txt must not positively scrub-example {forbidden!r} — "
+                "city/org/product are out-of-scope by default and the prompt "
+                "is the sole scope authority (no code-side narrowing remains)."
+            )
+
+    def test_phone_and_email_positive_examples_present(self):
+        """Add phone/email POSITIVE examples now that
+        structured values (not just names) are scrubbed by the prompt."""
+        tmpl = _load_prompt("anonymization.txt", required=True)
+        examples_section = tmpl[tmpl.index("## Examples") :]
+        assert "Phone_1" in examples_section, (
+            "anonymization.txt must include a positive phone-number scrub example."
+        )
+        assert "Email_1" in examples_section, (
+            "anonymization.txt must include a positive email-address scrub example."
+        )
+
+    def test_fidelity_and_consistency_instruction_present(self):
+        """The prompt must instruct the model to rewrite the
+        transcript changing ONLY the listed PII, using the SAME
+        placeholders as `mapping` (fidelity + consistency)."""
+        tmpl = _load_prompt("anonymization.txt", required=True)
+        lower = tmpl.lower()
+        assert "anonymized_transcript" in lower
+        assert "same placeholder" in lower, (
+            "anonymization.txt must instruct placeholder consistency between "
+            "`mapping` and `anonymized_transcript`."
+        )
+        assert "changing only" in lower or "only the" in lower, (
+            "anonymization.txt must instruct that the transcript rewrite changes "
+            "only the in-scope PII, preserving everything else (fidelity)."
+        )
 
 
 class TestEntityCorrectionPrompt:
@@ -1275,9 +1484,11 @@ class TestSpeakerDirectiveFile:
         anchor is left untouched (it is already anonymous and carries no
         identifying information; see ``consolidation.py``'s
         ``_run_graph_enrichment`` docstring and ``SECURITY.md``). Nodes
-        outside the ``pii_scope`` (e.g. organizations under the default
-        ``{"person"}`` scope) also appear verbatim — the prompt must not
-        claim every ``subject``/``object`` is a token.
+        outside the operator's ``scrub`` categories (e.g. organizations,
+        which are not part of the default ``scrub`` — a load-bearing set
+        of name / phone / address / online-identity sub-terms) also
+        appear verbatim — the prompt must not claim every
+        ``subject``/``object`` is a token.
         """
         tmpl = _load_prompt("sota_graph_enrichment.txt", "")
         lower = tmpl.lower()
@@ -1344,113 +1555,6 @@ class TestSpeakerDirectiveFile:
                 f"example {leaked_person_name!r} — persons are always tokens "
                 f"under the shipped scope; use org/place/thing surfaces instead."
             )
-
-
-class TestB2AnonymizerPrivacy:
-    """B2 privacy regression tests for the SOTA-egress anonymizer.
-
-    Under id-as-subject the session speaker entity is named ``speaker0``
-    (not the display name).  The deterministic builder in
-    ``_build_anonymization_mapping`` must still cover the display name
-    ("Alex") so it cannot egress to SOTA verbatim in the anonymized
-    transcript — but the anchor itself (``speaker0``) is ALREADY
-    anonymous and must NEVER become a forward-map key (that would mean
-    minting a placeholder for something already anonymous — the
-    speaker-anchor bug the binding-totality plan retires).  A disclosed
-    display name folds onto the anchor (``speaker0``) directly, not onto
-    a fresh ``Person_N``.
-
-    Two paths:
-    1. Named speaker (``speaker_name="Alex"``): display name must be
-       covered, folded onto the ``speaker0`` anchor.
-    2. Anonymous speaker (``speaker_name=None``): nothing needs scrubbing
-       — ``speaker0`` is never a forward-map key; the empty map is the
-       correct, safe result.
-    """
-
-    @staticmethod
-    def _make_graph(entity_name: str, speaker_id_attr: str | None):
-        """Build a minimal SessionGraph with one person entity."""
-        from paramem.graph.schema import Entity, SessionGraph
-
-        entities = [
-            Entity(
-                name=entity_name,
-                entity_type="person",
-                speaker_id=speaker_id_attr,
-            )
-        ]
-        return SessionGraph(
-            session_id="b2_test",
-            timestamp="2026-06-24T00:00:00Z",
-            entities=entities,
-            relations=[],
-        )
-
-    def test_named_speaker_display_name_covered(self):
-        """When speaker entity is speaker0 and display name is 'Alex',
-        the anonymizer must fold 'Alex' onto the speaker0 anchor —
-        never mint a Person_N for either form.
-        """
-        from paramem.graph.placeholders import _build_anonymization_mapping
-
-        graph = self._make_graph("speaker0", "speaker0")
-        forward, _reverse = _build_anonymization_mapping(
-            graph.entities,
-            {},
-            pii_scope={"person"},
-            speaker_name="Alex",
-        )
-        # speaker0 is already anonymous — it is NEVER a forward-map key
-        # (that would mean minting a placeholder for it).
-        assert "speaker0" not in forward, (
-            "speaker0 is already anonymous and must never be a forward-map "
-            "key — minting a placeholder for it is the speaker-anchor bug."
-        )
-        # Alex must still be covered by the speaker-name seeding branch.
-        assert "Alex" in forward, (
-            "Display name 'Alex' must be covered in the forward mapping; "
-            "otherwise it can egress verbatim to SOTA."
-        )
-        # Alex folds onto the anchor itself, not a minted placeholder.
-        assert forward["Alex"] == "speaker0", (
-            "The disclosed display name must fold onto the speaker0 "
-            "anchor directly, not onto a freshly-minted Person_N."
-        )
-
-    def test_named_speaker_anonymized_transcript_excludes_display_name(self):
-        """Transcript containing 'Alex' verbatim is scrubbed when display name is seeded."""
-        from paramem.graph.extractor import _anonymize_transcript
-        from paramem.graph.placeholders import _build_anonymization_mapping
-
-        graph = self._make_graph("speaker0", "speaker0")
-        forward, _reverse = _build_anonymization_mapping(
-            graph.entities,
-            {},
-            pii_scope={"person"},
-            speaker_name="Alex",
-        )
-        raw_transcript = "[user] Hi, I'm Alex and I work at Acme."
-        anon = _anonymize_transcript(raw_transcript, forward)
-        assert "Alex" not in anon, "Anonymized transcript must not contain the display name 'Alex'."
-
-    def test_anonymous_speaker_speaker0_covered_no_leak(self):
-        """Anonymous speaker (speaker_name=None): nothing needs scrubbing —
-        speaker0 is never a forward-map key; no crash, empty map is safe.
-        """
-        from paramem.graph.placeholders import _build_anonymization_mapping
-
-        graph = self._make_graph("speaker0", "speaker0")
-        forward, _reverse = _build_anonymization_mapping(
-            graph.entities,
-            {},
-            pii_scope={"person"},
-            speaker_name=None,
-        )
-        # speaker0 is already anonymous — never minted, never a forward key.
-        assert "speaker0" not in forward
-        # No crash; result is a valid (here, empty) mapping.
-        assert isinstance(forward, dict)
 
 
 class TestNameExtractionPrompt:

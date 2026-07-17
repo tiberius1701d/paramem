@@ -217,11 +217,22 @@ class TestSOTAFullFlow:
                 ),
             ],
         )
-        mapping, raw = anonymize_with_local_model(graph, model, tokenizer)
+        from paramem.server.config import SanitizationConfig
+
+        mapping, anon_transcript, raw = anonymize_with_local_model(
+            graph,
+            model,
+            tokenizer,
+            # Same 5-category default the server config ships
+            # (SanitizationConfig.scrub) — required kwarg, no code-side
+            # default (the prompt is the sole scope authority).
+            scrub=set(SanitizationConfig().scrub),
+        )
         # Mistral may or may not produce valid anonymization
         # Just verify no crash and correct return types
         if mapping is not None:
             assert isinstance(mapping, dict)
+        assert isinstance(anon_transcript, str)
         assert isinstance(raw, str)
 
 
@@ -787,6 +798,10 @@ class TestRunExtractGraphHelper:
             extraction_noise_filter_endpoint=cc.extraction_noise_filter_endpoint or None,
             extraction_plausibility_judge=cc.extraction_plausibility_judge,
             extraction_plausibility_stage=cc.extraction_plausibility_stage,
+            # Same wiring as production (paramem/server/consolidation.py):
+            # the scrub knob lives on SanitizationConfig, not the
+            # consolidation schedule config.
+            extraction_scrub=set(server_config.sanitization.scrub),
         )
 
         graph = loop.extraction.run(
@@ -806,6 +821,7 @@ class TestBatchConsolidationE2E:
     def test_extract_session_and_train(self, model_and_tokenizer, tmp_path):
         """End-to-end: extract sessions → prepare → train."""
         from paramem.memory.store import MemoryStore
+        from paramem.server.config import SanitizationConfig
         from paramem.training.consolidation import ConsolidationLoop
         from paramem.utils.config import (
             AdapterConfig,
@@ -828,6 +844,12 @@ class TestBatchConsolidationE2E:
             memory_store=MemoryStore(replay_enabled=True),
             output_dir=tmp_path,
             save_cycle_snapshots=False,
+            # Required kwarg (no code-side default — the anonymizer
+            # prompt is the sole scope authority). No SOTA provider is
+            # configured here (extraction_noise_filter defaults to ""), so
+            # this never actually anonymizes — same 5-category default the
+            # server config ships (SanitizationConfig.scrub).
+            extraction_scrub=set(SanitizationConfig().scrub),
         )
 
         # Extract a session with personal facts

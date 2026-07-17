@@ -165,15 +165,15 @@ def create_consolidation_loop(
         sota_enabled=config.consolidation.sota_enabled,
         graph_enrichment_neighborhood_hops=config.consolidation.graph_enrichment_neighborhood_hops,
         graph_enrichment_max_entities_per_pass=config.consolidation.graph_enrichment_max_entities_per_pass,
-        # Same `cloud_scope` knob as inference-time cloud egress: the SOTA
+        # Same `scrub` knob as inference-time cloud egress: the SOTA
         # enrichment cycle sends placeholders to the cloud just like the
         # cloud_anonymizer egress path, so the privacy policy must match.
-        # Empty list disables the mint selector entirely (an empty scope
-        # mints nothing, so nothing is substituted out — the operator's
-        # opt-out).  A non-empty list is a MINT SELECTOR: in-scope entity
-        # types get a placeholder minted and are substituted out;
-        # out-of-scope types travel to the cloud verbatim.
-        extraction_pii_scope=set(config.sanitization.cloud_scope),
+        # The model's anonymizer prompt is the sole scope authority —
+        # this is a flat list of PII-vocabulary hints, not an entity-type
+        # selector.  Empty list disables anonymization entirely (the
+        # operator's opt-out): no anonymizer call, content egresses
+        # verbatim.
+        extraction_scrub=set(config.sanitization.scrub),
         extraction_correction_entity_types=set(
             config.consolidation.extraction_correction_entity_types
         ),

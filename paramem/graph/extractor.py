@@ -12,7 +12,6 @@ from paramem.graph.entity_correction import correct_entity_surfaces
 from paramem.graph.name_match import canonical, is_speaker_id
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.placeholders import (
-    _DEFAULT_PII_SCOPE,
     _FACT_FIELDS,
     PLACEHOLDER_TOKEN_RE,
     _apply_bindings,
@@ -26,6 +25,7 @@ from paramem.graph.placeholders import (
     _substitute_whole_words,
     braced,
     deanonymize_text,
+    invert_forward_mapping,
     placeholder_entity_type,
 )
 from paramem.graph.prompts import _load_prompt
@@ -695,7 +695,8 @@ def extract_graph(
     speaker_name: str | None = None,
     plausibility_judge: str = "auto",
     plausibility_stage: str = "deanon",
-    pii_scope: set[str] | frozenset[str] | None = None,
+    *,
+    scrub: set[str] | frozenset[str],
     correction_entity_types: set[str] | frozenset[str] | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
@@ -743,6 +744,11 @@ def extract_graph(
             or a SOTA provider name like "claude" for cloud judging at anon stage).
         plausibility_stage: When to run plausibility ("deanon"=after de-anon,
             "anon"=on anonymized data with SOTA judge).
+        scrub: PII-vocabulary hints (``SanitizationConfig.scrub``) forwarded
+            to the SOTA pipeline's local anonymizer call — the prompt is the
+            sole scope authority (see :func:`anonymize_with_local_model`).
+            Required — no implicit default; an empty ``set``/``frozenset``
+            is the operator opt-out.
         correction_entity_types: Scope-and-enable knob for the local
             entity-surface correction stage (see
             :func:`paramem.graph.entity_correction.correct_entity_surfaces`).
@@ -914,7 +920,7 @@ def extract_graph(
                     plausibility_stage=plausibility_stage,
                     speaker_name=speaker_name,
                     speaker_id=speaker_id,
-                    pii_scope=pii_scope,
+                    scrub=scrub,
                     correction_entity_types=correction_entity_types,
                     prompts_dir=prompts_dir,
                     model_alias=model_alias,
@@ -940,7 +946,7 @@ def extract_and_anonymize_for_cloud(
     speaker_id: str | None = None,
     speaker_name: str | None = None,
     prompts_dir: str | Path | None = None,
-    pii_scope: set[str] | frozenset[str] | None = None,
+    scrub: set[str] | frozenset[str],
 ) -> tuple[str, dict[str, str], dict[str, str]]:
     """Local extract + local anonymize for cloud egress.
 
@@ -955,57 +961,47 @@ def extract_and_anonymize_for_cloud(
        ``[assistant] <text>`` marker surface every extraction/
        anonymization few-shot is calibrated on) into
        ``model_facing_transcript``.  Only the two LLM calls below see the
-       turn-marked copy; the bare ``transcript`` is what gets substituted
-       in step 4 and returned to the caller — the marker exists solely to
-       keep the model in-distribution while the forward map is built. A
-       bare sentence was observed to glue a possessive into a single
-       anonymization token (``"Pat's dog"`` minted as one placeholder
-       instead of splitting ``"Pat"`` + ``"dog"``) because it is
-       off-distribution from every few-shot example.
+       turn-marked copy — the marker exists solely to keep the model
+       in-distribution while it authors the anonymized transcript (step
+       4). A bare sentence was observed to glue a possessive into a
+       single anonymization token (``"Pat's dog"`` minted as one
+       placeholder instead of splitting ``"Pat"`` + ``"dog"``) because it
+       is off-distribution from every few-shot example.
     1. ``extract_graph(validate=False)`` — local extraction only,
        produces a SessionGraph the anonymizer can anchor on.
-    2. ``anonymize_with_local_model(graph, transcript=model_facing_transcript)``
-       — model-based identification of the ``real_name -> placeholder``
-       mapping.  The model returns ONLY the mapping — no facts, no
-       transcript.
+    2. ``anonymize_with_local_model(graph, transcript=model_facing_transcript,
+       scrub=scrub)`` — the model is the SOLE scope authority: it
+       classifies which real values are in scope against ``scrub`` and
+       returns BOTH the ``real_name -> placeholder`` mapping AND its own
+       rewrite of the transcript with those values placeholdered
+       (``anonymized_transcript``).  Fail-closed: a parse failure or
+       a missing/empty ``anonymized_transcript`` yields ``mapping is
+       None``, and this helper never falls back to the original
+       real-name transcript on that signal.
     3. ``_normalize_anonymization_mapping`` — canonicalize direction.
-    4. ``_build_anonymization_mapping`` — THE single table builder
-       (the same one both SOTA tiers use), with the local model's map as
-       its ``llm_mapping`` hint.  The transcript is then BUILT (never taken
-       from the model) from the resulting complete forward map, applied to
-       the ORIGINAL bare ``transcript`` (not the turn-marked copy).  This
-       helper anonymizes a TRANSCRIPT for cloud egress — it never builds
-       or returns facts, so :func:`_build_anon_facts` (used by the two
-       SOTA tiers) does not apply here.
+    4. ``_build_anonymization_mapping`` — THE single table builder (the
+       same one both SOTA tiers use), assembled straight from the local
+       model's ``mapping`` (the SOLE scope decision) plus
+       ``speaker_name`` seeding — no code-side entity walk, no
+       completeness floor over the graph.  The returned TRANSCRIPT is the
+       model's own ``anonymized_transcript`` (step 2) — never mechanically
+       rebuilt from ``mapping`` — with the single synthetic ``[user] ``
+       marker (step 0) stripped back off, restoring the bare-text
+       contract this helper's one caller expects.  This helper
+       anonymizes a TRANSCRIPT for cloud egress — it never builds or
+       returns facts, so :func:`_build_anon_facts` (used by the two SOTA
+       tiers) does not apply here.
 
-    No post-hoc leak check: the payload is built by the script from a
-    table it mints and owns, substituted through the same exact,
-    case-sensitive primitive that built the table — there is nothing left
-    to verify.  The residual, honestly: (a) an entity whose real-name
-    surface in the transcript differs in CASE from its ``graph.entities``
-    surface egresses in the clear (substitution is exact and
-    case-sensitive by design — see the module docstring on why
-    case-insensitive matching is worse, not better); (b) an undeclared
-    relation participant (e.g. an object like ``Honda`` never typed as a
-    graph entity) is covered only if the anonymizer LLM's hint happened to
-    name it; (c) a name the local extractor typed as an out-of-scope
-    entity type never reaches the table at all.  None of these are new —
-    the deleted guard's own docstring already admitted (b) and (c) were
-    invisible to it by construction; it is gone because it added a
-    case-insensitive false-positive class on top, without closing (a)-(c).
-
-    ``pii_scope`` is a MINT SELECTOR — the only thing it does is decide
-    which entity types :func:`~paramem.graph.placeholders.
-    _build_anonymization_mapping` mints a placeholder for (and are
-    therefore substituted out of the payload) versus which travel to the
-    cloud verbatim.  ``None`` falls back to the single module-wide
-    default, :data:`~paramem.graph.placeholders._DEFAULT_PII_SCOPE`
-    (``{"person"}`` — the same value production ships at
-    ``SanitizationConfig.cloud_scope``; one constant, one policy,
-    everywhere).  An empty scope short-circuits before any LLM call: the
-    helper returns ``(transcript, {}, {})`` and the caller sends the
-    original text to the cloud verbatim — no anonymization, no
-    deanonymization needed.
+    ``scrub`` is the operator's PII-vocabulary hint list
+    (``SanitizationConfig.scrub``), rendered verbatim into the
+    anonymizer prompt's ``{scrub_categories}`` slot — the prompt is the
+    SOLE scope authority; there is no code-side entity-type gate.
+    Required — an omitted ``scrub`` would silently anonymize against a
+    hidden default on a security-critical egress path.  An EMPTY
+    ``scrub`` is the meaningful operator opt-out: it short-circuits
+    before any LLM call, and the helper returns ``(transcript, {}, {})``
+    — the caller sends the original text to the cloud verbatim, sourced
+    from the passed-in transcript, never a model artifact.
 
     ``speaker_id`` is the resolved speaker store ID, threaded to
     :func:`extract_graph` (which requires it) and stamped on the
@@ -1018,29 +1014,31 @@ def extract_and_anonymize_for_cloud(
     Return shapes:
 
     * ``(anon_transcript, forward, reverse)`` — anonymization ran;
+      ``anon_transcript`` is the MODEL's own rewrite (see step 4 above);
       ``forward`` and ``reverse`` come from
       :func:`~paramem.graph.placeholders._build_anonymization_mapping`.
-      ``forward`` is ``{real → placeholder}`` and is **many-to-one by
-      construction**: an entity's PII attribute values fold onto that
-      entity's placeholder, so one placeholder scrubs every surface form
-      of the same person.  ``reverse`` is therefore NOT a dict inversion
-      — it carries **entity names only**, so a folded placeholder can
-      never restore a phone number where the person's name belongs.
-      Caller deanonymizes the cloud's response with
+      ``forward`` is ``{real → placeholder}``; ``reverse`` is the
+      one-to-one ``{placeholder: entity_name}`` map.  Caller
+      deanonymizes the cloud's response with
       :func:`~paramem.graph.placeholders.deanonymize_text` using
       ``reverse``.
-    * ``(transcript, {}, {})`` — operator opted out (``pii_scope=[]``).
-      This is the ONLY verbatim-forward return; it never fires for any
-      other reason.
+    * ``(transcript, {}, {})`` — operator opted out (``scrub=set()``).
+      This is the ONLY verbatim-forward return sourced from the raw
+      input transcript; it never fires for any other reason.
+    * ``(anon_transcript, mapping, reverse)`` with ``mapping == {}`` —
+      the anonymizer ran and classified NOTHING in scope against
+      ``scrub`` (a legitimate verdict, not a failure). Egress PROCEEDS:
+      ``mapping``/``reverse`` may still be non-empty if speaker-name
+      seeding populated them.
     * ``("", {}, {})`` — block.  Every other early exit lands here:
       empty/whitespace-only input, local extraction raising, zero
       relations extracted (``not graph.relations``), the anonymizer
-      raising or returning ``mapping is None`` (parse failure), or the
-      built table/transcript coming back empty (``not anon_transcript or
-      not mapping``).  "The input had no in-scope content" is NOT
-      distinguished from a genuine failure at this level — both fail
-      closed and block the cloud call, they never forward the transcript
-      verbatim.
+      raising or returning ``mapping is None`` (parse failure OR a
+      missing/empty ``anonymized_transcript``), or the model's
+      rewritten transcript coming back empty (``not anon_transcript``).
+      "The input had no in-scope content" (an empty ``mapping``) is NOT
+      one of these — only ``mapping is None`` and an empty
+      ``anon_transcript`` fail closed and block the cloud call.
 
     The companion :func:`~paramem.graph.placeholders.deanonymize_text` is
     a no-op on an empty reverse map, so callers can apply it
@@ -1049,11 +1047,10 @@ def extract_and_anonymize_for_cloud(
     if not transcript or not transcript.strip():
         return "", {}, {}
 
-    scope = _DEFAULT_PII_SCOPE if pii_scope is None else frozenset(pii_scope)
-    # Empty scope = operator opt-out.  Skip the entire LLM-driven
+    # Empty scrub = operator opt-out.  Skip the entire LLM-driven
     # anonymization path and let the caller forward the transcript
     # verbatim.  Distinguished from ``("", {}, {})`` block by non-empty text.
-    if not scope:
+    if not scrub:
         return transcript, {}, {}
 
     # The local_extract and anonymization few-shots (configs/prompts/
@@ -1065,13 +1062,14 @@ def extract_and_anonymize_for_cloud(
     # A bare, unmarked sentence puts the model off-distribution from
     # every example it was tuned on and has been observed to glue a
     # possessive into a single anonymization token (e.g. "Pat's dog" ->
-    # one placeholder instead of "Pat" + "dog" separately). Only the
-    # MODEL-FACING copy is turn-marked; the transcript actually
-    # substituted and returned to the caller below stays the bare
-    # ``transcript`` the caller passed in — the marker exists solely to
-    # keep the model in-distribution while the forward map is built.
+    # one placeholder instead of "Pat" + "dog" separately).
     turn_marked_lines, _ = SessionBuffer._format_turns([{"role": "user", "text": transcript}])
     model_facing_transcript = "\n".join(turn_marked_lines)
+    # The single synthetic turn always renders as ``"<marker> " + transcript``
+    # (see ``_format_turns``) — derive the marker prefix mechanically rather
+    # than hardcoding the literal, so a future marker-format change (single
+    # source of truth: ``_format_turns``) cannot silently desync this strip.
+    _turn_marker_prefix = model_facing_transcript[: len(model_facing_transcript) - len(transcript)]
 
     # Both LLM calls below (extraction + anonymization) are structured
     # extraction and must run on the base weights, never the training-active
@@ -1102,6 +1100,7 @@ def extract_and_anonymize_for_cloud(
                 validate=False,
                 ha_validation=False,
                 noise_filter="",
+                scrub=scrub,
             )
         except Exception:
             logger.exception("Cloud egress: local extraction failed; treating as block")
@@ -1111,8 +1110,13 @@ def extract_and_anonymize_for_cloud(
             return "", {}, {}
 
         try:
-            mapping, _raw = anonymize_with_local_model(
-                graph, model, tokenizer, transcript=model_facing_transcript, prompts_dir=prompts_dir
+            mapping, model_anon_transcript, _raw = anonymize_with_local_model(
+                graph,
+                model,
+                tokenizer,
+                transcript=model_facing_transcript,
+                scrub=scrub,
+                prompts_dir=prompts_dir,
             )
         except Exception:
             logger.exception("Cloud egress: anonymization raised; treating as block")
@@ -1123,31 +1127,32 @@ def extract_and_anonymize_for_cloud(
 
     mapping, _norm_stats = _normalize_anonymization_mapping(mapping)
 
-    # THE single table builder — the same one both SOTA tiers use.  The local
-    # model's (normalized) map is only a HINT: the builder walks the graph's
-    # own entity inventory, mints for entities the model never named, folds PII
-    # attribute values onto their entity's placeholder, and emits a ``reverse``
-    # that carries entity names only.  A straight inversion of the model's map
-    # was a second, divergent table construction on the privacy-critical path
-    # (and inverted attribute values onto tokens).
-    mapping, reverse = _build_anonymization_mapping(
-        graph.entities, mapping, pii_scope=scope, speaker_name=speaker_name
-    )
+    # THE single table builder — the same one both SOTA tiers use.  The
+    # model's (normalized) mapping is the SOLE scope decision; the
+    # builder only maintains the speaker-anchor invariants and seeds the
+    # runtime-known speaker name — no entity walk, no completeness floor.
+    mapping, reverse = _build_anonymization_mapping(mapping, speaker_name=speaker_name)
 
-    # Build the transcript from ``graph.relations``' entity vocabulary and
-    # the now-complete forward map.  No post-hoc leak check: the transcript
-    # is built by the SCRIPT from a table it minted (``mapping``/``reverse``)
-    # via the SAME exact, case-sensitive primitive (``_substitute_whole_words``)
-    # that built the table — every real name in ``graph.entities`` under
-    # ``scope`` is already substituted out, so there is nothing left to
-    # verify.  (This helper returns a TRANSCRIPT, never facts — there is no
-    # ``_build_anon_facts`` call here; that primitive is for the two SOTA
-    # tiers, which return enriched facts.)
-    anon_transcript = _anonymize_transcript(transcript, mapping)
+    # The returned transcript is the MODEL's own rewrite — never
+    # mechanically rebuilt from ``mapping``.  Strip the single synthetic
+    # turn marker (step 0) back off so the bare-text contract this
+    # helper's one caller (conversational cloud-egress escalation) relies
+    # on is preserved; best-effort (the model is instructed to preserve
+    # everything outside the substitutions verbatim, including the
+    # marker, but a strip that finds nothing to strip is a no-op).
+    anon_transcript = model_anon_transcript
+    if _turn_marker_prefix and anon_transcript.startswith(_turn_marker_prefix):
+        anon_transcript = anon_transcript[len(_turn_marker_prefix) :]
 
-    if not anon_transcript or not mapping:
+    if not anon_transcript:
         return "", {}, {}
 
+    # An EMPTY (but non-None) ``mapping`` means the anonymizer ran and
+    # found nothing in scope against ``scrub`` — a legitimate verdict,
+    # not a failure. Egress PROCEEDS with
+    # ``mapping``/``reverse`` as-is (both possibly ``{}``, unless speaker-
+    # name seeding populated them); only ``mapping is None`` (checked
+    # above) fails closed.
     return anon_transcript, mapping, reverse
 
 
@@ -1481,7 +1486,7 @@ _JSON_ENVELOPE_KEYS = frozenset(
         "add",
         "modify",
         "bindings",
-        # Synonym-predicate dedup envelope (dedup_synonym_predicates):
+        # Predicate-normalization envelope (normalize_predicates):
         # single-stage output `{"clusters": [["predA", "predB"], ...]}`.
         "clusters",
     )
@@ -1937,7 +1942,8 @@ def _sota_pipeline(
     plausibility_judge: str = "auto",
     plausibility_stage: str = "deanon",
     speaker_name: str | None = None,
-    pii_scope: set[str] | frozenset[str] | None = None,
+    *,
+    scrub: set[str] | frozenset[str],
     correction_entity_types: set[str] | frozenset[str] | None = None,
     prompts_dir: str | Path | None = None,
     model_alias: str | None = None,
@@ -1948,13 +1954,26 @@ def _sota_pipeline(
 ) -> SessionGraph:
     """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
 
-    Stages:
-    1. Local anonymize    → the model returns ONLY the real→placeholder mapping; the
-       script builds the anonymized facts + transcript from ``graph.relations`` and
-       that mapping (subject/object substituted, predicate/relation_type/confidence
-       copied verbatim).  No post-hoc leak check: the script builds this payload
-       from a table it mints and owns, substituted through the same exact,
-       case-sensitive primitive that built it — there is nothing left to verify.
+    ``scrub`` (required — no implicit default) is the operator's
+    PII-vocabulary hint list, rendered into the anonymizer prompt's
+    ``{scrub_categories}`` slot — the model is the sole scope authority.
+    An EMPTY ``scrub`` is the operator opt-out: no anonymizer
+    call is made; the transcript egresses verbatim (sourced from the
+    passed-in ``transcript``, never a model artifact) and facts pass
+    through ``_build_anon_facts`` with an empty (identity) mapping.
+
+    Stages (non-empty ``scrub``):
+    1. Local anonymize    → the model is the SOLE scope authority: it
+       classifies real values against ``scrub`` and returns BOTH the
+       real→placeholder mapping AND its own rewrite of the transcript with
+       those values placeholdered (``anonymized_transcript``).  The
+       script still builds the anonymized FACT array deterministically from
+       ``graph.relations`` and the mapping (subject/object substituted,
+       predicate/relation_type/confidence copied verbatim) — facts are
+       never taken from the model's response.  Fail-closed: a parse
+       failure or missing/empty ``anonymized_transcript`` falls back to
+       local plausibility on the LOCAL-EXTRACT facts, never to the
+       original real-name transcript.
     1c. Local entity-surface correction (:func:`paramem.graph.entity_correction.
         correct_entity_surfaces`) — corrects misspelled real place/org/concept
         surfaces in the reverse map only; forward map + transcript are untouched.
@@ -2001,84 +2020,106 @@ def _sota_pipeline(
 
     original_count = len(graph.relations)
 
-    # Anonymization step.  Mistral runs the anonymizer prompt; it returns
-    # ONLY the real_name -> placeholder mapping — no facts, no transcript.
-    # The SCRIPT builds both from `graph.relations` and this mapping below
-    # (see the fact-construction block after `_build_anonymization_mapping`).
-    # Phase trace captures the raw model JSON so calibration can diff prompt
-    # variants on the anonymizer in isolation.
     _vram_snapshot(f"sota_pipeline_entry session={graph.session_id}")
-    with phase_trace("anonymize") as t:
-        mapping, anon_raw = anonymize_with_local_model(
-            graph, model, tokenizer, transcript=transcript, max_tokens=max_tokens, seed=seed
-        )
-        t.set_raw(anon_raw)
-        t.set_parsed(
-            {
-                "mapping": dict(mapping) if mapping else {},
-                "mapping_size": len(mapping) if mapping else 0,
-                "parse_ok": mapping is not None,
-            }
-        )
+    if not scrub:
+        # Operator opt-out: no anonymizer call; the transcript
+        # egresses verbatim, sourced from the passed-in transcript —
+        # never a model artifact.  Facts follow via the (empty-mapping,
+        # identity) ``_build_anon_facts`` call below.
+        mapping: dict[str, str] = {}
+        reverse_mapping: dict[str, str] = {}
+        anon_transcript = transcript
+        graph.diagnostics["anonymize"] = "opted_out"
+    else:
+        # Anonymization step.  The local model is the SOLE scope
+        # authority: it classifies real values against ``scrub``
+        # and returns BOTH the real_name -> placeholder mapping AND its
+        # own rewrite of the transcript with those values placeholdered.
+        # Phase trace captures the raw model JSON so calibration can diff
+        # prompt variants on the anonymizer in isolation.
+        with phase_trace("anonymize") as t:
+            mapping, model_anon_transcript, anon_raw = anonymize_with_local_model(
+                graph,
+                model,
+                tokenizer,
+                transcript=transcript,
+                scrub=scrub,
+                max_tokens=max_tokens,
+                seed=seed,
+                prompts_dir=prompts_dir,
+            )
+            t.set_raw(anon_raw)
+            t.set_parsed(
+                {
+                    "mapping": dict(mapping) if mapping else {},
+                    "mapping_size": len(mapping) if mapping else 0,
+                    "parse_ok": mapping is not None,
+                    "anonymized_transcript_len": len(model_anon_transcript or ""),
+                }
+            )
+            if mapping is None:
+                t.set_outcome(
+                    "failed",
+                    reason="anonymization parse failed or missing/empty anonymized_transcript",
+                )
+            elif not graph.relations:
+                t.set_outcome("no_input", reason="graph has 0 relations")
+        _vram_snapshot(f"after_anonymize session={graph.session_id}")
         if mapping is None:
-            t.set_outcome("failed", reason="anonymization parse failed")
-        elif not graph.relations:
-            t.set_outcome("no_input", reason="graph has 0 relations")
-    _vram_snapshot(f"after_anonymize session={graph.session_id}")
-    if mapping is None:
-        logger.warning("Anonymization failed — falling back to raw plausibility")
-        graph.diagnostics["anonymize"] = "failed"
-        return _fallback_plausibility_on_raw(
-            graph,
-            transcript,
-            model,
-            tokenizer,
-            "anon_failed",
-            speaker_name=speaker_name,
-            speaker_id=speaker_id,
-            max_tokens=max_tokens,
-            plausibility_max_tokens=plausibility_max_tokens,
-            seed=seed,
-        )
-    if stop_phase == "anonymize":
-        # Calibration short-circuit: anonymize completed; downstream
-        # phases (sota_enrich, anon_plausibility, deanon, …) are skipped.  graph.relations
-        # remains the local-extract output; the anonymize result lives in
-        # graph.diagnostics["phases"][anonymize].parsed.
-        return graph
-    # Canonicalize mapping direction before any downstream use.
-    mapping, norm_stats = _normalize_anonymization_mapping(mapping)
-    if norm_stats["dropped"]:
-        graph.diagnostics["mapping_ambiguous_dropped"] = norm_stats["dropped"]
+            # Fail-closed: parse failure OR a missing/empty
+            # anonymized_transcript.  Never fall back to raw plausibility
+            # on the ORIGINAL real-name transcript — fall back to local
+            # plausibility on the LOCAL-EXTRACT facts instead (no cloud
+            # egress at all).
+            logger.warning("Anonymization failed — falling back to raw plausibility")
+            graph.diagnostics["anonymize"] = "failed"
+            return _fallback_plausibility_on_raw(
+                graph,
+                transcript,
+                model,
+                tokenizer,
+                "anon_failed",
+                speaker_name=speaker_name,
+                speaker_id=speaker_id,
+                max_tokens=max_tokens,
+                plausibility_max_tokens=plausibility_max_tokens,
+                seed=seed,
+            )
+        if stop_phase == "anonymize":
+            # Calibration short-circuit: anonymize completed; downstream
+            # phases (sota_enrich, anon_plausibility, deanon, …) are skipped.  graph.relations
+            # remains the local-extract output; the anonymize result lives in
+            # graph.diagnostics["phases"][anonymize].parsed.
+            return graph
+        # Canonicalize mapping direction before any downstream use.
+        mapping, norm_stats = _normalize_anonymization_mapping(mapping)
+        if norm_stats["dropped"]:
+            graph.diagnostics["mapping_ambiguous_dropped"] = norm_stats["dropped"]
 
-    # Single source of truth for real → placeholder.  The deterministic
-    # builder walks ``graph.entities`` once and:
-    #   * mints placeholders for every in-scope entity name,
-    #   * adds PII attribute values (last_name, email, phone, …) under
-    #     the parent entity's placeholder,
-    #   * threads ``speaker_name`` so the runtime-known speaker is
-    #     always covered (even when the LLM emitted only the anonymous
-    #     ``Speaker_N`` form).
-    # The LLM-emitted mapping is treated as a HINT rather than truth:
-    # entries it produced for entities or attributes are overwritten by
-    # the deterministic build (we trust the graph).
-    mapping, reverse_mapping = _build_anonymization_mapping(
-        graph.entities,
-        mapping,
-        pii_scope=pii_scope,
-        speaker_name=speaker_name,
-    )
-    # CORE-map diagnostic (C10).  The CORE map is never otherwise
-    # persisted — ``anonymize.parsed.mapping`` above is the LLM HINT map,
-    # recorded before this deterministic build runs, not CORE.  Keys and
-    # COUNTS only — never the real names: ``graph_snapshot.json`` (debug
-    # dumps under ``data/ha/debug/``) serializes ``graph.diagnostics``
-    # wholesale, and the placeholder keyset is non-identifying while the
-    # values are the PII.
-    graph.diagnostics["core_placeholders"] = {
-        "keys": sorted(reverse_mapping.keys()),
-        "count": len(reverse_mapping),
-    }
+        # Single source of truth for real → placeholder.  The model's
+        # mapping is the SOLE scope decision (no second detector) —
+        # the builder only maintains the speaker-anchor invariants and
+        # seeds ``speaker_name`` so the runtime-known speaker is always
+        # covered.
+        mapping, reverse_mapping = _build_anonymization_mapping(
+            mapping,
+            speaker_name=speaker_name,
+        )
+        # CORE-map diagnostic.  The CORE map is never otherwise
+        # persisted — ``anonymize.parsed.mapping`` above is the LLM HINT map,
+        # recorded before this deterministic build runs, not CORE.  Keys and
+        # COUNTS only — never the real names: ``graph_snapshot.json`` (debug
+        # dumps under ``data/ha/debug/``) serializes ``graph.diagnostics``
+        # wholesale, and the placeholder keyset is non-identifying while the
+        # values are the PII.
+        graph.diagnostics["core_placeholders"] = {
+            "keys": sorted(reverse_mapping.keys()),
+            "count": len(reverse_mapping),
+        }
+        # The returned transcript is the MODEL's own rewrite — never
+        # mechanically rebuilt from ``mapping``.
+        anon_transcript = model_anon_transcript
+        graph.diagnostics["anonymize"] = "ok"
 
     # Phase — entity_correction.  Local model corrects misspelled real
     # place/organization/concept surfaces at two loci: the reverse map
@@ -2119,35 +2160,22 @@ def _sota_pipeline(
         # target) / phases[entity_correction].
         return graph
 
-    # Build the anonymized transcript AND the fact array from the ORIGINAL
-    # transcript and `graph.relations` using the now-complete mapping, via
-    # :func:`_build_anon_facts` (THE one construction, shared with
-    # `extract_and_anonymize_for_cloud` — not reimplemented).  Facts are
-    # never taken from the model's response — it returned only the
-    # mapping.  A fact can therefore never be lost, reworded, or dropped
-    # by the anonymizer, and a placeholder cannot be glued into a
-    # predicate at this stage — the motivating bug
+    # Build the fact array from `graph.relations` using the now-complete
+    # mapping, via :func:`_build_anon_facts` (THE one construction, shared
+    # with `extract_and_anonymize_for_cloud` — not reimplemented).  Facts
+    # are never taken from the model's response — the model's job
+    # is the TRANSCRIPT (``anon_transcript``, already built above); the
+    # fact array is always deterministic.  A fact can therefore never be
+    # lost, reworded, or dropped by the anonymizer, and a placeholder
+    # cannot be glued into a predicate at this stage — the motivating bug
     # (``language_proficiency_Language_3``) cannot occur here.  It can
     # still occur in SOTA's *returned* facts, which is why the
     # deanon-stage predicate invariant (:func:`_apply_bindings`) stays.
     # An orphan placeholder in a fact is likewise impossible: every
-    # placeholder a fact can carry comes from this same `mapping`.
-    anon_transcript = _anonymize_transcript(transcript, mapping)
+    # placeholder a fact can carry comes from this same `mapping`.  With
+    # an empty ``mapping`` (opt-out), substitution is a no-op and facts
+    # egress verbatim.
     anon_facts = _build_anon_facts(graph.relations, mapping)
-
-    # No forward-path leak check.  The SCRIPT builds this payload from a
-    # table it mints and owns (`_build_anonymization_mapping`), substituted
-    # through the SAME exact, case-SENSITIVE primitive
-    # (`_substitute_whole_words`) that built it — there is nothing left to
-    # verify, because nothing is guessing.  Substitution is case-SENSITIVE
-    # and that is load-bearing: case is the only signal separating `Bill`
-    # the person from `bill` the invoice, and `Will` the person from the
-    # verb `will`.  Any case-insensitive match over entity names cannot
-    # tell a real leak from ordinary prose.  Never introduce one.  See the
-    # deanon-stage guards below (`_apply_bindings`, `_check_mapping_totality`)
-    # for what DOES still need checking: SOTA's *returned* facts, which are
-    # a model rewriting content, not a table the script owns.
-    graph.diagnostics["anonymize"] = "ok"
 
     # Phase — sota_enrich.  Cloud (Anthropic by default) runs the
     # enrichment prompt; emits enriched facts + new_entity_bindings +
@@ -2155,7 +2183,7 @@ def _sota_pipeline(
     #
     # ``observed`` = every placeholder token SOTA is actually shown — the
     # rendered facts_json (subject/predicate/object; a placeholder in a
-    # predicate is still visible to SOTA, T2g) and the anonymized
+    # predicate is still visible to SOTA) and the anonymized
     # transcript.  This is CORE's legality domain for this SOTA cycle:
     # only tokens SOTA actually saw may be treated as legitimately bound.
     with phase_trace("sota_enrich") as t:
@@ -2175,8 +2203,8 @@ def _sota_pipeline(
         _declared = _declared_placeholder_tokens(reverse_mapping)
         observed = {tok for tok in _declared if tok in _facts_text or tok in _transcript_text}
         # Send anon facts and transcript to SOTA as the SCRIPT built them
-        # (the anonymizer LLM returns only the mapping; it never
-        # produces facts or a transcript). The SOTA prompt's convention
+        # (the anonymizer LLM returns the mapping and its own anonymized
+        # transcript, but it never produces facts). The SOTA prompt's convention
         # is "anonymizer placeholders are bare; only new entities
         # introduced by SOTA use braced form (`{Prefix_N}`)". SOTA also
         # returns explicit bindings for any braced placeholders it
@@ -2197,6 +2225,7 @@ def _sota_pipeline(
             anon_transcript,
             endpoint=endpoint,
             max_tokens=max_tokens,
+            prompts_dir=prompts_dir,
         )
         t.set_raw(_sota_raw or "")
         if _sota_info:
@@ -2326,6 +2355,7 @@ def _sota_pipeline(
                     endpoint=pv_info.get("endpoint"),
                     max_tokens=max_tokens,
                     temperature=_DEFAULT_FILTER_TEMPERATURE,
+                    prompts_dir=prompts_dir,
                 )
                 # Cloud round-trip can take 30–90s during which the WSL2 GPU
                 # goes idle and the next local CUDA op fails with
@@ -2507,6 +2537,7 @@ def _sota_pipeline(
                 max_tokens=plausibility_max_tokens,
                 temperature=_DEFAULT_FILTER_TEMPERATURE,
                 seed=seed,
+                prompts_dir=prompts_dir,
             )
             t.set_raw(plaus_raw)
             if filtered_deanon is not None:
@@ -2796,32 +2827,6 @@ def _project_scalar_facts_to_attributes(graph: SessionGraph, scalar_facts: list[
         ent.attributes[attr_key] = obj
 
 
-def _anonymize_transcript(transcript: str, mapping: dict) -> str:
-    """Apply entity name → placeholder mapping to a transcript.
-
-    Replaces all mapped entity names with their anonymized placeholders
-    so SOTA can see the conversation context without identifying info.
-    Word-boundary anchored — prevents "Li" from eating the "Li" prefix
-    of "Li Ming" or the "Li" substring of "Beijing".  Longer keys are
-    tried first internally so multi-word names preempt single-word
-    prefixes.
-
-    Defensive: local models occasionally emit ``null`` mapping entries
-    (non-string keys/values); :func:`_substitute_whole_words` skips
-    those rather than crashing.
-    """
-    if not mapping:
-        return transcript
-    invalid = [
-        (k, v)
-        for k, v in mapping.items()
-        if not isinstance(k, str) or not isinstance(v, str) or not k
-    ]
-    for k, v in invalid:
-        logger.warning("Skipping invalid anonymization entry: %r → %r", k, v)
-    return _substitute_whole_words(transcript, mapping)
-
-
 _DEFAULT_ANONYMIZER_MAX_TOKENS = 2048
 _DEFAULT_ANONYMIZER_TEMPERATURE = 0.0
 
@@ -2852,33 +2857,53 @@ def anonymize_with_local_model(
     graph: SessionGraph,
     model,
     tokenizer,
+    *,
+    scrub: set[str] | frozenset[str],
     transcript: str = "",
     max_tokens: int = _DEFAULT_ANONYMIZER_MAX_TOKENS,
     temperature: float = _DEFAULT_ANONYMIZER_TEMPERATURE,
     seed: int | None = None,
     prompts_dir: str | Path | None = None,
     prompt_filename: str = "anonymization.txt",
-) -> tuple[dict | None, str]:
-    """Identify the ``real_name -> placeholder`` mapping using the local model.
+) -> tuple[dict | None, str, str]:
+    """Identify the ``real_name -> placeholder`` mapping AND the
+    model-authored anonymized transcript using the local model.
 
-    Returns ``(mapping, raw_output)``.  The model is shown ``graph.relations``
-    (rendered as facts) and ``transcript`` as CONTEXT and decides which real
-    names must be anonymized, returning ONLY that mapping — no facts, no
-    transcript.  The SCRIPT, not the model, builds the anonymized fact array
-    and the anonymized transcript from ``graph.relations`` and this mapping
-    (see :func:`_sota_pipeline` / :func:`extract_and_anonymize_for_cloud`),
-    so a fact can never be lost, reworded, or dropped by the anonymizer, and
-    a placeholder can never be glued into a predicate at this stage.
+    Returns ``(mapping, anonymized_transcript, raw_output)``.  The model
+    is shown ``graph.relations`` (rendered as facts), ``transcript``, and
+    ``scrub`` (the operator's PII-vocabulary hints, rendered into the
+    prompt's ``{scrub_categories}`` slot) and is the SOLE scope authority
+    (no code-side entity-type gate): it decides which real values —
+    names AND structured values (phone, email, …), regardless of owning
+    entity type — are in scope, and returns BOTH the mapping AND its own
+    rewrite of ``transcript`` with those values placeholdered
+    (``anonymized_transcript``).  The SCRIPT still builds the anonymized
+    FACT array deterministically from ``graph.relations`` and ``mapping``
+    (see :func:`_sota_pipeline` / :func:`extract_and_anonymize_for_cloud`)
+    — facts are never taken from the model's response — so a fact can
+    never be lost, reworded, or dropped by the anonymizer, and a
+    placeholder can never be glued into a predicate at this stage.
 
-    ``mapping`` is ``None`` on PARSE FAILURE (the response was not a
-    well-formed ``{"mapping": {...}}`` envelope) and ``{}`` when the model
-    found nothing in scope to anonymize — callers MUST keep the two
-    distinguishable: ``None`` is fail-closed, ``{}`` is a legitimate empty
-    result.
+    ``mapping`` is ``None`` — the fail-closed signal — on PARSE
+    FAILURE (the response was not a well-formed ``{"mapping": {...},
+    "anonymized_transcript": "..."}`` envelope) OR when
+    ``anonymized_transcript`` is missing/empty/whitespace-only.  Callers
+    MUST never fall back to the original real-name transcript on this
+    signal.  ``mapping`` is ``{}`` (with a non-empty
+    ``anonymized_transcript``) when the model found nothing in scope to
+    anonymize — a legitimate empty result, distinguishable from
+    fail-closed.
 
-    The raw model output is the second element so the calibration phase
-    trace can record it without re-running the call.  An empty string is
-    returned only when the model did not produce a response at all.
+    The raw model output is the third element so the calibration phase
+    trace can record it without re-running the call.  ``anonymized_transcript``
+    is ``""`` whenever ``mapping`` is ``None`` (the two fail-closed
+    together).
+
+    ``scrub`` is required — no implicit default.  An omitting caller would
+    silently anonymize against a hidden default on a security-critical
+    egress path; the single declared default is
+    ``SanitizationConfig.scrub`` (``paramem/server/config.py``), which
+    every caller of this function threads down explicitly.
 
     ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the
     default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
@@ -2900,7 +2925,12 @@ def anonymize_with_local_model(
 
     anon_prompt = load_anonymization_prompt(prompts_dir=prompts_dir, filename=prompt_filename)
     anon_system = _load_prompt("anonymization_system.txt", prompts_dir=prompts_dir, required=True)
+    # Sorted so prompt rendering is deterministic regardless of the
+    # iteration order of the ``scrub`` set/frozenset the caller passed
+    # (Python set order is not stable across processes) — load-bearing at
+    # temperature=0.0, which is otherwise a strict determinism contract.
     prompt = anon_prompt.format(
+        scrub_categories=", ".join(sorted(scrub)),
         facts_json=json.dumps(facts, indent=2),
         transcript=transcript or "(no transcript provided)",
     )
@@ -2933,14 +2963,21 @@ def anonymize_with_local_model(
     try:
         json_str = _extract_json_block(raw)
         data = json.loads(json_str)
-        if isinstance(data, dict) and "mapping" in data:
-            normalized, _ = _normalize_anonymization_mapping(data["mapping"])
-            return normalized, raw
-        logger.warning("Anonymization returned unexpected format")
-        return None, raw
+        if not isinstance(data, dict) or "mapping" not in data:
+            logger.warning("Anonymization returned unexpected format")
+            return None, "", raw
+        anon_transcript = data.get("anonymized_transcript")
+        if not isinstance(anon_transcript, str) or not anon_transcript.strip():
+            # Fail-closed: a mapping with no accompanying transcript
+            # rewrite is not a safe egress artifact — never fall back to
+            # the original real-name transcript.
+            logger.warning("Anonymization returned missing/empty anonymized_transcript")
+            return None, "", raw
+        normalized, _ = _normalize_anonymization_mapping(data["mapping"])
+        return normalized, anon_transcript, raw
     except (json.JSONDecodeError, ValueError) as e:
         logger.warning("Anonymization parse failed: %s", e)
-        return None, raw
+        return None, "", raw
 
 
 # Public provider metadata — single source of truth, reused by the
@@ -3228,6 +3265,7 @@ def _filter_with_sota(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
+    prompts_dir: str | Path | None = None,
 ) -> tuple[list[dict] | None, str | None, dict[str, str], str | None, dict]:
     """SOTA enrichment pass — coreference + compound splitting + safe reification.
 
@@ -3263,8 +3301,12 @@ def _filter_with_sota(
     The prompt this function loads is external config — edit
     ``configs/prompts/sota_enrichment.txt`` to tune; no code changes are
     needed.
+
+    ``prompts_dir`` overrides the search directory (forwarded to
+    :func:`_load_prompt`) so a calibration override actually reaches the
+    model; it defaults to the production template.
     """
-    enrichment_prompt = _load_prompt("sota_enrichment.txt", required=True)
+    enrichment_prompt = _load_prompt("sota_enrichment.txt", prompts_dir=prompts_dir, required=True)
     facts_json, transcript_text = _sota_facing_payload(anon_facts, anon_transcript)
     prompt = enrichment_prompt.format(facts_json=facts_json, transcript=transcript_text)
     raw = _sota_call(
@@ -3307,7 +3349,7 @@ _SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT = _load_prompt(
 
 def _graph_enrich_with_sota(
     triples: list[dict],
-    entities: list[Entity],
+    mapping: dict[str, str],
     api_key: str,
     provider: str = "anthropic",
     filter_model: str = "claude-sonnet-4-6",
@@ -3315,7 +3357,6 @@ def _graph_enrich_with_sota(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
-    pii_scope: set[str] | frozenset[str] | None = None,
 ) -> tuple[list[dict], list[list[str]], str | None] | None:
     """SOTA graph-level enrichment pass over a pre-merged cumulative graph.
 
@@ -3326,41 +3367,35 @@ def _graph_enrich_with_sota(
 
     Runs the SAME anonymize -> SOTA -> de-anonymize contract as the
     session-tier :func:`_sota_pipeline`, via the SAME primitives in
-    :mod:`paramem.graph.placeholders` — this is the second (and, until now,
-    unprotected) call site of that contract. The CORE real-name ->
-    placeholder table is minted deterministically from ``entities`` via
-    :func:`~paramem.graph.placeholders._build_anonymization_mapping` with an
-    empty LLM hint (``llm_mapping={}``): there is no local anonymizer LLM
-    call on this path, only the deterministic entity walk. ``subject``,
+    :mod:`paramem.graph.placeholders` — this is the second call site of
+    that contract. ``mapping`` is the CORE real-name -> placeholder
+    forward table — the anonymizer model's own ``scrub``-scoped decision
+    (no second detector), already reconciled onto this chunk's node
+    keys by the caller — passed straight through, never re-derived
+    or re-walked here. ``reverse_mapping`` is its inversion. ``subject``,
     ``object``, AND ``speaker_id`` fields of every triple are substituted
-    through that forward mapping before the prompt is built, so no bare
-    real name and no bare speaker id reaches the payload handed to
-    :func:`_sota_call`.
+    through ``mapping`` before the prompt is built, so no real value the
+    model classified in scope reaches the payload handed to
+    :func:`_sota_call`. Scoping is entirely the model's decision, made at
+    the caller's ``anonymize_with_local_model(scrub=...)`` call (see
+    :meth:`~paramem.training.consolidation.ConsolidationLoop.
+    _run_graph_enrichment`) — this function applies no gate of its own.
 
-    The production caller (:meth:`~paramem.training.consolidation.
-    ConsolidationLoop._run_graph_enrichment`) derives ``entities`` from a
-    per-chunk local-model anonymization pass rather than node attributes
-    (the fold graph carries no reliable entity types of its own — see that
-    method's docstring), and that local anonymizer prompt instructs the
+    The production caller derives ``mapping`` from a per-chunk local-model
+    anonymization pass (the fold graph carries no reliable entity types of
+    its own — see that method's docstring), whose prompt instructs the
     model to leave ``speaker{N}`` ids verbatim and never mint a placeholder
-    for one. A speaker anchor therefore never appears in the production
-    ``entities`` list at all: it is never tokenised, and reaches the SOTA
-    payload bare by design — there is no mint/restore round trip for it in
-    practice. The function itself still honours ``Entity.speaker_id`` per
-    :func:`~paramem.graph.placeholders._build_anonymization_mapping`'s
-    general contract for any caller that DOES pass a speaker entity with
-    ``speaker_id`` unset (e.g. this module's own unit tests): such an
-    entity is minted like any other in-scope entity, and
-    :func:`~paramem.graph.placeholders._apply_bindings` (the exit gate,
-    below) restores it to the bare lowercase ``speaker{N}`` form the rest
-    of the pipeline requires.
+    for one. A speaker anchor therefore never appears as a ``mapping`` key
+    in practice: it reaches the SOTA payload bare by design, with no
+    mint/restore round trip needed.
 
     After the SOTA call, the response's ``relations`` are de-anonymized via
     :func:`~paramem.graph.placeholders._apply_bindings` (the single exit
     gate: predicate invariant, then substitute, then residual sweep,
     fail-closed) — returning real node names and bare ``speaker{N}`` ids,
     exactly what :meth:`_run_graph_enrichment`'s existing consumption logic
-    (including the W1 speaker-pair guard) already expects. Any
+    (including the speaker-pair guard that rejects a same_as pair where
+    both surfaces are speaker ids) already expects. Any
     ``bindings`` the response carries (SOTA-minted placeholders — normally
     empty, since the prompt forbids inventing new nodes) are normalized via
     :func:`~paramem.graph.placeholders._normalize_anonymization_mapping`
@@ -3371,15 +3406,16 @@ def _graph_enrich_with_sota(
     fail-closed drop: a pair naming a token in neither table is dropped
     rather than forwarded with a residual placeholder.
 
-    Under ``pii_scope={"person"}`` (the production default), only person
-    nodes — including speakers — are tokenised; org/place/thing nodes pass
-    through verbatim. Accepted consequence: person-level ``same_as``
-    coreference (e.g. ``["Yang Ming", "Mr. Yang"]``) can no longer be
-    detected by the cloud judge, since both surfaces collapse to opaque,
-    unrelated tokens before the model ever sees them — the name-surface
-    signal coreference depends on is gone for people. org/place/thing
-    ``same_as`` is unaffected (those surfaces stay verbatim under the
-    default scope).
+    Under the production default (``scrub`` includes ``"person name"``, so
+    the model's ``mapping`` is dominated by person nodes), person nodes —
+    including speakers — are tokenised; org/place/thing nodes the model
+    left out of ``mapping`` pass through verbatim. Accepted consequence:
+    person-level ``same_as`` coreference (e.g. ``["Yang Ming", "Mr.
+    Yang"]``) can no longer be detected by the cloud judge, since both
+    surfaces collapse to opaque, unrelated tokens before the model ever
+    sees them — the name-surface signal coreference depends on is gone for
+    people. org/place/thing ``same_as`` is unaffected (those surfaces stay
+    verbatim under the default ``scrub``).
 
     Loads ``sota_graph_enrichment.txt`` (required). The prompt uses a
     ``{triples_json}`` placeholder.
@@ -3390,21 +3426,17 @@ def _graph_enrich_with_sota(
             :func:`~paramem.training.consolidation.serialize_subgraph_triples`
             (unchanged — anonymization happens on its output here, not
             inside it).
-        entities: One :class:`~paramem.graph.schema.Entity` per real name
-            the caller's per-chunk local-model anonymization pass found,
-            typed via :func:`~paramem.graph.placeholders.placeholder_entity_type`
-            on the placeholder that pass minted (``speaker_id`` left unset
-            — see above).
+        mapping: ``{real_name: placeholder}`` — the anonymizer model's own
+            ``scrub``-scoped decision for this chunk, already reconciled
+            onto the chunk's node-key surfaces by the caller. Every
+            entry is trusted and substituted unconditionally — this
+            function applies no scope gate of its own.
         api_key: Provider API key.
         provider: SOTA provider name (e.g. ``"anthropic"``).
         filter_model: Model identifier for the provider.
         endpoint: Custom endpoint for OpenAI-compatible providers.
         max_tokens: Maximum tokens in the SOTA response.
         temperature: Sampling temperature (0.0 for deterministic output).
-        pii_scope: Entity-types in scope for anonymization (e.g.
-            ``{"person"}``). ``None`` falls back to
-            :func:`~paramem.graph.placeholders._build_anonymization_mapping`'s
-            primitive-layer default.
 
     Returns:
         ``(new_relations, same_as_pairs, raw_response)`` on success, or
@@ -3417,9 +3449,13 @@ def _graph_enrich_with_sota(
     ``configs/prompts/sota_graph_enrichment.txt`` to tune; no code changes
     are needed.
     """
-    mapping, reverse_mapping = _build_anonymization_mapping(
-        entities, {}, pii_scope=pii_scope, speaker_name=None
-    )
+    # ONE inversion, first-wins — see
+    # :func:`~paramem.graph.placeholders.invert_forward_mapping`. This
+    # site previously inverted with a plain dict comprehension (LAST-wins
+    # on a many-to-one forward map), which restored a DIFFERENT real name
+    # than the session tier's first-wins :func:`_build_anonymization_mapping`
+    # for the identical placeholder.
+    reverse_mapping = invert_forward_mapping(mapping)
     anon_triples = [
         {
             **t,
@@ -3931,6 +3967,7 @@ def _plausibility_filter_with_sota(
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
+    prompts_dir: str | Path | None = None,
 ) -> tuple[list[dict] | None, str | None]:
     """SOTA plausibility filter — drops invalid relations only.
 
@@ -3948,8 +3985,12 @@ def _plausibility_filter_with_sota(
 
     The prompt is external config — edit ``configs/prompts/sota_plausibility.txt``
     to tune; no code changes are needed.
+
+    ``prompts_dir`` overrides the search directory (forwarded to
+    :func:`_load_prompt`) so a calibration override actually reaches the
+    judge; it defaults to the production template.
     """
-    plaus_prompt = _load_prompt("sota_plausibility.txt", required=True)
+    plaus_prompt = _load_prompt("sota_plausibility.txt", prompts_dir=prompts_dir, required=True)
     facts_json, transcript_text = _sota_facing_payload(enriched_anon_facts, anon_transcript)
     prompt = plaus_prompt.format(facts_json=facts_json, transcript=transcript_text)
     raw = _sota_call(
@@ -4057,20 +4098,22 @@ def local_plausibility_filter(
 
 
 # ---------------------------------------------------------------------------
-# Synonym-predicate dedup primitive
+# Predicate-normalization primitive
 # ---------------------------------------------------------------------------
 
 
-def dedup_synonym_predicates(
+def normalize_predicates(
     relations: list[dict],
     *,
     model=None,
     tokenizer=None,
     sota: dict | None = None,
-    filter_prompt: str,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = 0.0,
     seed: int | None = None,
+    prompts_dir: str | Path | None = None,
+    prompt_filename: str = "predicate_normalization.txt",
+    system_filename: str = "predicate_normalization_system.txt",
 ) -> tuple[dict[tuple[str, str], list[list[str]]], dict]:
     """Backend-agnostic synonym-predicate clustering over same-(subject,object) groups.
 
@@ -4090,12 +4133,15 @@ def dedup_synonym_predicates(
       re-enabled in ``finally``.  Each call is wrapped in
       ``vram_scope("dedup")``.
     * ``sota`` dict → CLOUD: ``_sota_call`` receives the RAW rendered prompt
-      (no ``apply_chat_template``); a ``None`` return (network or parse
-      failure) yields empty clusters for that group — facts are never deleted
-      on failure.
+      (no ``apply_chat_template``) and the ``normalization_system_prompt``
+      prompt loaded here; a ``None`` return (network or parse failure) yields
+      empty clusters for that group — facts are never deleted on failure.
 
-    ``filter_prompt`` is the already-read prompt template string containing a
-    single ``{predicates_json}`` slot.
+    Both the normalization prompt (``prompt_filename``) and the system prompt
+    (``system_filename``) load through :func:`_load_prompt` — the single
+    production prompt-loading chokepoint — for BOTH branches, so a
+    calibration override or provenance record reaches either backend
+    identically.
 
     ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the default
     ``temperature=0.0`` (greedy decoding) it is a strict no-op.
@@ -4106,14 +4152,16 @@ def dedup_synonym_predicates(
         model: Local inference model.  Required when ``sota`` is ``None``.
         tokenizer: Local tokenizer.  Required when ``sota`` is ``None``.
         sota: Cloud backend configuration dict with keys ``api_key``,
-            ``provider``, ``filter_model``, ``endpoint``, ``system_prompt``.
-            When ``None`` the local branch is used.
-        filter_prompt: The already-read prompt template string.  Must contain
-            a single ``{predicates_json}`` slot.
+            ``provider``, ``filter_model``, ``endpoint``.  When ``None`` the
+            local branch is used.
         max_tokens: Maximum new tokens for each model call.
         temperature: Sampling temperature (0.0 = greedy).
         seed: RNG seed forwarded to :func:`generate_answer`.  No-op at
             ``temperature=0.0``.
+        prompts_dir: Overrides the search directory for both prompts
+            (forwarded to :func:`_load_prompt`).
+        prompt_filename: Overrides the filter-prompt template name.
+        system_filename: Overrides the system-prompt template name.
 
     Returns:
         clusters_by_so: ``dict[(canonical_s, canonical_o) -> list[list[str]]]``
@@ -4138,6 +4186,11 @@ def dedup_synonym_predicates(
             "raw_outputs": [],
             "discards": [],
         }
+
+    normalization_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
+    normalization_system_prompt = _load_prompt(
+        system_filename, prompts_dir=prompts_dir, required=True
+    )
 
     # --- Build canonical grouping -------------------------------------------
     groups: dict[tuple[str, str], list[dict]] = {}
@@ -4168,8 +4221,7 @@ def dedup_synonym_predicates(
         return clusters_by_so, diagnostics
 
     local_mode = sota is None
-    dedup_system = _load_prompt("graph_dedup_filter_system.txt", required=True)
-    # Predicate-dedup is structured extraction: the local path must run on the
+    # Predicate-normalization is structured extraction: the local path must run on the
     # base weights (adapter disabled) with the KV cache live (checkpointing off,
     # restored to entry state on exit).  The SOTA path uses the cloud model and
     # leaves the local model untouched.
@@ -4185,11 +4237,11 @@ def dedup_synonym_predicates(
                     pred_surface[can_pred] = str(rel.get("predicate", ""))
             preds_to_send = list(pred_surface.values())
 
-            rendered = filter_prompt.format(predicates_json=json.dumps(preds_to_send))
+            rendered = normalization_prompt.format(predicates_json=json.dumps(preds_to_send))
 
             if local_mode:
                 messages = [
-                    {"role": "system", "content": dedup_system},
+                    {"role": "system", "content": normalization_system_prompt},
                     {"role": "user", "content": rendered},
                 ]
                 formatted = tokenizer.apply_chat_template(
@@ -4215,7 +4267,7 @@ def dedup_synonym_predicates(
                     endpoint=sota["endpoint"],
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    system_prompt=sota["system_prompt"],
+                    system_prompt=normalization_system_prompt,
                 )
                 if raw is None:
                     diagnostics["raw_outputs"].append("")

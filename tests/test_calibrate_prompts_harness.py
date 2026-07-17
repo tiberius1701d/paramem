@@ -340,7 +340,12 @@ class TestSeedFromEnrichLoading:
         """
         rc, fake_run_enrich = self._run(
             tmp_path,
-            anonymize_blob={"parsed": {"mapping": {"Alex": "speaker0"}}},
+            anonymize_blob={
+                "parsed": {
+                    "mapping": {"Alex": "speaker0"},
+                    "anonymized_transcript": "[user] Person_1 works as an engineer.",
+                }
+            },
         )
         assert rc == 0
         fake_run_enrich.assert_called_once()
@@ -360,7 +365,12 @@ class TestSeedFromEnrichLoading:
         """
         rc, fake_run_enrich = self._run(
             tmp_path,
-            anonymize_blob={"parsed": {"mapping": {"Alex": "speaker0"}}},
+            anonymize_blob={
+                "parsed": {
+                    "mapping": {"Alex": "speaker0"},
+                    "anonymized_transcript": "[user] Person_1 works as an engineer.",
+                }
+            },
             write_extract=False,
         )
         assert rc == 0
@@ -369,7 +379,7 @@ class TestSeedFromEnrichLoading:
     def test_none_mapping_parse_failure_aborts_without_a_cloud_call(self, tmp_path: Path):
         """``anon_parsed.get("mapping")`` returning ``None`` (anonymizer
         parse failure) must abort the chunk's enrich stage — no cloud
-        call — matching production's abort-on-``None`` in
+        call — matching production's fail-closed abort-on-``None`` in
         ``_sota_pipeline``.
 
         Mutation: revert to ``anon_parsed.get("mapping") or {}`` -> the
@@ -380,6 +390,26 @@ class TestSeedFromEnrichLoading:
         rc, fake_run_enrich = self._run(
             tmp_path,
             anonymize_blob={"parsed": {}},  # no "mapping" key -> None
+        )
+        assert rc == 0
+        fake_run_enrich.assert_not_called()
+
+    def test_missing_anonymized_transcript_aborts_without_a_cloud_call(self, tmp_path: Path):
+        """A non-``None`` ``mapping`` with a missing/empty
+        ``anonymized_transcript`` is ALSO fail-closed — the model
+        never authored a safe transcript to send to the cloud, so the
+        chunk's enrich stage must abort with no cloud call, exactly like
+        the ``mapping is None`` case.
+
+        Mutation: gate only on ``raw_mapping is None`` (drop the
+        ``anonymized_transcript`` check) -> ``_run_enrich`` is invoked
+        anyway -> this test fails.
+        """
+        rc, fake_run_enrich = self._run(
+            tmp_path,
+            anonymize_blob={
+                "parsed": {"mapping": {"Alex": "speaker0"}}
+            },  # no anonymized_transcript
         )
         assert rc == 0
         fake_run_enrich.assert_not_called()

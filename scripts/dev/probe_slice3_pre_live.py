@@ -48,7 +48,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.test_harness import BENCHMARK_MODELS, setup_logging  # noqa: E402
+from paramem.memory.store import MemoryStore  # noqa: E402
 from paramem.models.loader import load_base_model  # noqa: E402
+from paramem.server.config import SanitizationConfig  # noqa: E402
 from paramem.server.speaker import SpeakerStore  # noqa: E402
 from paramem.training.consolidation import ConsolidationLoop  # noqa: E402
 from paramem.utils.config import (  # noqa: E402
@@ -236,13 +238,20 @@ def run_gpu_extraction_check(out_dir: Path) -> dict:
         episodic_adapter_config=_tier_cfg(),
         semantic_adapter_config=_tier_cfg(),
         procedural_adapter_config=_tier_cfg(),
+        # Required kwarg (no default on ConsolidationLoop.__init__) — this
+        # probe never persists to the store, so replay stays off.
+        memory_store=MemoryStore(replay_enabled=False),
         wandb_config=None,
         output_dir=out_dir,
         save_cycle_snapshots=False,
-        persist_graph=False,
         extraction_ha_validation=False,
         extraction_noise_filter="off",
         extraction_plausibility_judge="off",
+        # Same 5-category default the server config ships
+        # (SanitizationConfig.scrub) — no cloud egress happens in this
+        # probe (noise_filter="off"), but ConsolidationLoop's
+        # ExtractionPipeline requires a scrub value regardless.
+        extraction_scrub=set(SanitizationConfig().scrub),
     )
 
     # Four cases layered from isolation to end-to-end:

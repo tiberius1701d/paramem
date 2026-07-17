@@ -131,7 +131,7 @@ def _run_one(
     tokenizer,
     *,
     speaker_name: str,
-    pii_scope: set[str],
+    scrub: set[str],
 ) -> tuple[str, dict, str]:
     from paramem.graph.extractor import extract_and_anonymize_for_cloud
     from paramem.graph.placeholders import deanonymize_text
@@ -141,7 +141,7 @@ def _run_one(
         model,
         tokenizer,
         speaker_name=speaker_name,
-        pii_scope=pii_scope,
+        scrub=scrub,
     )
     if not mapping or not anon_text:
         return anon_text or "", mapping or {}, ""
@@ -241,10 +241,13 @@ def main(argv: list[str] | None = None) -> int:
         nargs="*",
         default=None,
         help=(
-            "Entity categories to anonymize (e.g. --scope person place). "
-            "Defaults to the production default in server.yaml.example "
-            "(read from disk to stay in sync with the shipped config). "
-            "Pass --scope with no values to disable anonymization."
+            "PII-vocabulary hints to scrub (e.g. --scope 'person name' "
+            "'phone number'); the model is the sole scope authority "
+            "against this list, so any free-form category is valid. "
+            "Defaults to the production default in "
+            "tests/fixtures/server.yaml's sanitization.scrub (read from "
+            "disk to stay in sync with the shipped config). Pass --scope "
+            "with no values to disable anonymization (operator opt-out)."
         ),
     )
     args = parser.parse_args(argv)
@@ -271,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Load the CI test fixture so the calibration target matches what
     # ``tests/test_cloud_anonymizer_contract_gpu.py`` runs against —
-    # same model (Mistral 7B), same default cloud_scope.  Loading
+    # same model (Mistral 7B), same default scrub.  Loading
     # ``configs/server.yaml.example`` instead would re-anchor the
     # calibration whenever the shipped template's ship-default drifts
     # (e.g. cloud_mode block ↔ anonymize) without changing what the
@@ -283,11 +286,11 @@ def main(argv: list[str] | None = None) -> int:
     model, tokenizer = load_base_model(model_cfg)
     print("  ready")
 
-    # Resolve the scope.  CLI override wins; otherwise inherit from the
-    # fixture so the calibration result reflects the contract test's
+    # Resolve the scrub scope.  CLI override wins; otherwise inherit from
+    # the fixture so the calibration result reflects the contract test's
     # default scope unless explicitly varied.
     if args.scope is None:
-        scope = set(server_cfg.sanitization.cloud_scope)
+        scope = set(server_cfg.sanitization.scrub)
     else:
         scope = set(args.scope)
     print(f"  scope: {sorted(scope) or '[]  (anonymization disabled)'}")
@@ -320,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                 model,
                 tokenizer,
                 speaker_name=entry["speaker_name"],
-                pii_scope=scope,
+                scrub=scope,
             )
             outcome = _classify(
                 expected_names=entry["expected_names"],

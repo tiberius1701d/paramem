@@ -1,6 +1,6 @@
 """Live-GPU probe — speaker-identity lowercase refactor + render-boundary resolution.
 
-Verifies that the speaker-identity refactor (P3/P4 — lowercase ``speaker{N}``
+Verifies that the speaker-identity refactor (lowercase ``speaker{N}``
 everywhere) and the render-boundary display-name substitution work end-to-end.
 
   Phase 1 (CPU) — identity + migration.
@@ -61,6 +61,7 @@ from paramem.graph.prompts import _load_speaker_directive_section  # noqa: E402
 from paramem.memory.entry import entry_fact_text  # noqa: E402
 from paramem.memory.store import MemoryStore  # noqa: E402
 from paramem.models.loader import load_base_model  # noqa: E402
+from paramem.server.config import SanitizationConfig  # noqa: E402
 from paramem.server.session_buffer import SessionBuffer  # noqa: E402
 from paramem.server.speaker import _PROFILE_VERSION, SpeakerStore  # noqa: E402
 from paramem.training.consolidation import ConsolidationLoop  # noqa: E402
@@ -308,6 +309,11 @@ def run_gpu_render_resolution(out_dir: Path) -> dict:
         extraction_ha_validation=False,
         extraction_noise_filter="off",
         extraction_plausibility_judge="off",
+        # Same 5-category default the server config ships
+        # (SanitizationConfig.scrub) — no cloud egress happens in this
+        # probe (noise_filter="off"), but ConsolidationLoop's
+        # ExtractionPipeline requires a scrub value regardless.
+        extraction_scrub=set(SanitizationConfig().scrub),
     )
 
     results: dict = {}

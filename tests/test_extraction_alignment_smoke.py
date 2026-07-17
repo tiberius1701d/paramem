@@ -111,7 +111,7 @@ class TestAlignmentSmoke:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -133,6 +133,7 @@ class TestAlignmentSmoke:
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         entity_map = {e.name: e.entity_type for e in result.entities}
@@ -161,7 +162,7 @@ class TestAlignmentSmoke:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -183,6 +184,7 @@ class TestAlignmentSmoke:
                 plausibility_judge="auto",
                 plausibility_stage="deanon",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         dropped = result.diagnostics.get("plausibility_dropped", 0)
@@ -196,7 +198,7 @@ class TestAlignmentSmoke:
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
                 "paramem.graph.extractor.anonymize_with_local_model",
-                return_value=(mapping, ""),
+                return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
@@ -211,6 +213,7 @@ class TestAlignmentSmoke:
                 speaker_id="speaker0",
                 plausibility_judge="off",
                 correction_entity_types=set(),
+                scrub={"person name"},
             )
 
         assert result.diagnostics.get("fallback_path") is None, (

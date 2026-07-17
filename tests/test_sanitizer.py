@@ -8,7 +8,7 @@ exists in the running system:
   subject/object fields plus the resolved speaker display name (M3 — plumbed
   directly from the ``speaker`` argument so the real name is covered even when
   it is no longer a registry subject under id-as-subject extraction).
-  Reuses the extraction pipeline's ``_anonymize_transcript`` primitive to
+  Reuses the placeholder module's ``_substitute_whole_words`` primitive to
   decide whether the query references any of them.
 * ``speaker_id`` + first-person pronouns from a fixed token set — covers
   cold-start before the graph has facts.
@@ -63,8 +63,8 @@ class TestPersonalEntityDetection:
         assert "first_person_personal" in findings
 
     def test_word_boundary_prevents_substring_false_positives(self):
-        # "Pat" must not match inside "patron" — _anonymize_transcript
-        # uses \b...\b boundaries.
+        # "Pat" must not match inside "patron" — _substitute_whole_words
+        # uses word-boundary matching.
         findings = check_personal_content(
             "Where is the nearest patron saint?",
             known_entities={"pat"},
@@ -424,97 +424,6 @@ class TestSanitizationConfigCloudMode:
 
         config = load_server_config("configs/server.yaml")
         assert config.sanitization.cloud_mode in {"block", "anonymize", "both"}
-
-
-# ---------------------------------------------------------------------------
-# SanitizationConfig — cloud_scope unknown-value WARN (not raise, not drop)
-# ---------------------------------------------------------------------------
-
-
-class TestSanitizationConfigCloudScopeUnknownValueWarns:
-    """``cloud_scope`` is open-vocabulary (see the class docstring above), so a
-    typo like ``"persons"`` must not be rejected — it might be a legitimate
-    open-vocabulary type.  But silently matching nothing is a footgun: it
-    scrubs zero entities of the intended type with no signal.  Owner ruling:
-    WARN at config load, keep the value, never raise.
-    """
-
-    def test_unknown_cloud_scope_value_warns_but_loads(self, caplog):
-        """A typo'd scope value ('persons') still loads and is preserved,
-        but a WARNING names it.
-
-        Mutation: remove the warning -> the typo is silent -> fails.
-        """
-        import logging
-
-        from paramem.server.config import SanitizationConfig
-
-        named = logging.getLogger("paramem.server.config")
-        orig_propagate = named.propagate
-        named.propagate = True
-        caplog.set_level(logging.WARNING, logger="paramem.server.config")
-        named.addHandler(caplog.handler)
-        try:
-            cfg = SanitizationConfig(cloud_scope=["persons"])
-        finally:
-            named.removeHandler(caplog.handler)
-            named.propagate = orig_propagate
-
-        assert cfg.cloud_scope == ["persons"]  # preserved, not dropped
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("persons" in r.getMessage() for r in warnings), (
-            f"Expected a WARNING naming 'persons'; got {[r.getMessage() for r in caplog.records]}"
-        )
-
-    def test_known_cloud_scope_value_does_not_warn(self, caplog):
-        """The ship default ('person') is in the closed built-in subset and
-        must not warn.
-
-        Mutation: warn unconditionally -> every normal boot logs a false
-        alarm -> fails.
-        """
-        import logging
-
-        from paramem.server.config import SanitizationConfig
-
-        named = logging.getLogger("paramem.server.config")
-        orig_propagate = named.propagate
-        named.propagate = True
-        caplog.set_level(logging.WARNING, logger="paramem.server.config")
-        named.addHandler(caplog.handler)
-        try:
-            cfg = SanitizationConfig(cloud_scope=["person"])
-        finally:
-            named.removeHandler(caplog.handler)
-            named.propagate = orig_propagate
-
-        assert cfg.cloud_scope == ["person"]
-        assert caplog.records == []
-
-    def test_open_vocabulary_value_is_not_rejected(self, caplog):
-        """A legal open-vocabulary type ('tool') is not raised on; a warning
-        for it is acceptable (it's outside the closed subset) but the config
-        must still load with both values preserved.
-
-        Mutation: raise on unknown -> a legal open-vocabulary config is
-        rejected -> fails.
-        """
-        import logging
-
-        from paramem.server.config import SanitizationConfig
-
-        named = logging.getLogger("paramem.server.config")
-        orig_propagate = named.propagate
-        named.propagate = True
-        caplog.set_level(logging.WARNING, logger="paramem.server.config")
-        named.addHandler(caplog.handler)
-        try:
-            cfg = SanitizationConfig(cloud_scope=["person", "tool"])
-        finally:
-            named.removeHandler(caplog.handler)
-            named.propagate = orig_propagate
-
-        assert cfg.cloud_scope == ["person", "tool"]
 
 
 # ---------------------------------------------------------------------------

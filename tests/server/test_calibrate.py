@@ -16,6 +16,7 @@ left to the existing integration suite + manual calibration runs.
 
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -46,12 +47,13 @@ from paramem.server.calibrate import (
     calibrate_plausibility,
     calibrate_procedural,
 )
+from paramem.server.config import SanitizationConfig
 
 
 def _state_disabled() -> dict:
     """Server state where calibrate is OFF (production default)."""
     consolidation_cfg = SimpleNamespace(calibrate_endpoint_enabled=False)
-    config = SimpleNamespace(consolidation=consolidation_cfg)
+    config = SimpleNamespace(consolidation=consolidation_cfg, sanitization=SanitizationConfig())
     return {
         "config": config,
         "consolidating": False,
@@ -62,7 +64,11 @@ def _state_disabled() -> dict:
 
 def _state_enabled() -> dict:
     consolidation_cfg = SimpleNamespace(calibrate_endpoint_enabled=True)
-    config = SimpleNamespace(consolidation=consolidation_cfg)
+    # SanitizationConfig() carries the production default ``scrub`` list
+    # (SanitizationConfig._DEFAULT_SCRUB) — calibrate_anonymize sources
+    # ``scrub`` from here, the same policy knob every production call
+    # site reads (see calibrate_anonymize's docstring).
+    config = SimpleNamespace(consolidation=consolidation_cfg, sanitization=SanitizationConfig())
     return {
         "config": config,
         "consolidating": False,
@@ -416,7 +422,7 @@ class TestCalibrateAnonymize:
 
         state["tokenizer"].apply_chat_template.side_effect = _capture_template
 
-        valid_json = '{"mapping": {}}'
+        valid_json = '{"mapping": {}, "anonymized_transcript": "[user] hello there"}'
         with (
             _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
             _mock.patch("paramem.graph.extractor.generate_answer", return_value=valid_json),
@@ -448,7 +454,7 @@ class TestCalibrateAnonymize:
 
         with _mock.patch(
             "paramem.graph.extractor.anonymize_with_local_model",
-            return_value=({}, "raw"),
+            return_value=({}, "[user] hello", "raw"),
         ) as helper:
             result = calibrate_anonymize(state, req)
 
@@ -458,12 +464,13 @@ class TestCalibrateAnonymize:
             "calibrate_anonymize must run the helper under base_model_inference"
         )
 
-    def test_calibrate_anonymize_returns_mapping_only(self):
-        """The ``parsed`` payload carries ONLY ``mapping`` — no
-        ``anonymized_facts`` / ``anonymized_transcript``: the model
-        returns a mapping, never facts.
+    def test_calibrate_anonymize_returns_mapping_and_transcript(self):
+        """The ``parsed`` payload carries the model's two artifacts —
+        ``mapping`` AND ``anonymized_transcript`` — plus a ``status``
+        (current 3-tuple ``anonymize_with_local_model`` contract; facts
+        are still never part of the anonymizer's response).
 
-        Mutation: re-add ``anonymized_facts`` / ``anonymized_transcript`` to
+        Mutation: drop ``anonymized_transcript`` or ``status`` from
         ``parsed`` -> this test fails.
         """
         import unittest.mock as _mock
@@ -476,11 +483,94 @@ class TestCalibrateAnonymize:
 
         with _mock.patch(
             "paramem.graph.extractor.anonymize_with_local_model",
-            return_value=({"Alex": "Person_1"}, "raw"),
+            return_value=({"Alex": "Person_1"}, "[user] Person_1 said hi", "raw"),
         ):
             result = calibrate_anonymize(state, req)
 
-        assert result["parsed"] == {"mapping": {"Alex": "Person_1"}}
+        assert result["parsed"] == {
+            "status": "ok",
+            "mapping": {"Alex": "Person_1"},
+            "anonymized_transcript": "[user] Person_1 said hi",
+        }
+
+    def test_fail_closed_when_mapping_is_none(self):
+        """Fail-closed: a parse failure (``mapping is None``) is
+        reported as ``status: "failed"`` with an empty mapping and an
+        empty ``anonymized_transcript`` — never a fallback to the
+        real-name transcript.
+        """
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        req = CalibrateAnonymizeRequest(
+            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
+            transcript="[user] My friend Alex moved to Berlin.",
+        )
+
+        with _mock.patch(
+            "paramem.graph.extractor.anonymize_with_local_model",
+            return_value=(None, "", "raw"),
+        ):
+            result = calibrate_anonymize(state, req)
+
+        assert result["parsed"] == {
+            "status": "failed",
+            "mapping": {},
+            "anonymized_transcript": "",
+        }
+
+    def test_empty_scrub_opts_out_without_model_call(self):
+        """An operator-configured empty ``scrub`` (operator opt-out) short-circuits
+        before any model call — the passed-in transcript egresses verbatim.
+
+        Mutation: call ``anonymize_with_local_model`` unconditionally ->
+        this test fails (``helper.called`` is True).
+        """
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        state["config"].sanitization.scrub = []
+        req = CalibrateAnonymizeRequest(
+            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
+            transcript="[user] My friend Alex moved to Berlin.",
+        )
+
+        with _mock.patch(
+            "paramem.graph.extractor.anonymize_with_local_model",
+        ) as helper:
+            result = calibrate_anonymize(state, req)
+
+        assert not helper.called
+        assert result["parsed"] == {
+            "status": "opted_out",
+            "mapping": {},
+            "anonymized_transcript": "[user] My friend Alex moved to Berlin.",
+        }
+
+    def test_scrub_sourced_from_config(self):
+        """``scrub`` reaches ``anonymize_with_local_model`` from
+        ``state["config"].sanitization.scrub`` — the same policy knob
+        every production call site reads — not a request field.
+
+        Mutation: hardcode a different scrub set or drop the ``scrub=``
+        kwarg -> this test fails.
+        """
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        state["config"].sanitization.scrub = ["person name", "phone number"]
+        req = CalibrateAnonymizeRequest(
+            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
+            transcript="[user] hello",
+        )
+
+        with _mock.patch(
+            "paramem.graph.extractor.anonymize_with_local_model",
+            return_value=({}, "[user] hello", "raw"),
+        ) as helper:
+            calibrate_anonymize(state, req)
+
+        assert helper.call_args.kwargs["scrub"] == {"person name", "phone number"}
 
     def test_unmarked_transcript_raises_400(self):
         """Mutation: remove the gate call from ``calibrate_anonymize`` ->
@@ -513,7 +603,7 @@ class TestCalibrateAnonymize:
         )
         with _mock.patch(
             "paramem.graph.extractor.anonymize_with_local_model",
-            return_value=({}, "raw"),
+            return_value=({}, "[user] My friend Person_1 moved to City_1.", "raw"),
         ) as helper:
             result = calibrate_anonymize(state, req)
         assert helper.called
@@ -572,6 +662,19 @@ class TestCalibratePlausibility:
         assert sentinel in user_content, (
             f"Model received default prompt instead of override: {user_content!r}"
         )
+
+        # Reported provenance is sourced from the real
+        # phase-trace record (populated by `_load_prompt`'s own
+        # `record_prompt` call inside `local_plausibility_filter`), not a
+        # hand-built `_read_prompt` literal — its sha must match a live
+        # `_load_prompt` computation of the same file.
+        from paramem.graph.prompts import _load_prompt
+
+        expected = _load_prompt("my_plaus.txt", prompts_dir=prompts_dir, required=True)
+        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
+        assert len(result["prompts"]) == 1
+        assert result["prompts"][0]["sha"] == expected_sha
+        assert result["prompts"][0]["template"] == expected
 
     def test_runs_on_base_weights(self):
         """calibrate_plausibility disables the active adapter around the model call.
@@ -687,7 +790,7 @@ class TestCalibrateNormalize:
 
         prompts_dir = tmp_path / "prompts"
         prompts_dir.mkdir()
-        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {predicates_json}")
+        (prompts_dir / "predicate_normalization.txt").write_text("filter {predicates_json}")
 
         state = _state_enabled()
         # One candidate group (Alex/Acme with works_for + employed_by) → one model call.
@@ -716,11 +819,26 @@ class TestCalibrateNormalize:
         # raw_output is a string (single-stage shape).
         assert isinstance(result["raw_output"], str)
 
+        # Reported provenance is sourced from the real
+        # phase-trace record (populated by `_load_prompt`'s own
+        # `record_prompt` call inside `normalize_predicates`), not a
+        # hand-built `_read_prompt` literal — its sha must match a live
+        # `_load_prompt` computation of the same file.
+        from paramem.graph.prompts import _load_prompt
+
+        expected = _load_prompt(
+            "predicate_normalization.txt", prompts_dir=prompts_dir, required=True
+        )
+        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
+        filter_entry = next(p for p in result["prompts"] if not p["path"].endswith("_system.txt"))
+        assert filter_entry["sha"] == expected_sha
+        assert filter_entry["template"] == expected
+
     def test_n_output_tokens_positive_for_nonempty_filter_output(self, tmp_path):
         """normalize n_output_tokens counts raw output tokens (not -1).
 
         Two relations on the SAME (subject, object) pair with DIFFERENT
-        predicates are required: dedup_synonym_predicates only calls
+        predicates are required: normalize_predicates only calls
         generate_answer when it finds at least one candidate group (≥2 distinct
         predicates on the same s/o pair).  A single relation produces no
         candidate group → early return with empty raw_outputs → n_output_tokens=-1.
@@ -730,7 +848,7 @@ class TestCalibrateNormalize:
 
         prompts_dir = tmp_path / "prompts"
         prompts_dir.mkdir()
-        (prompts_dir / "graph_dedup_filter.txt").write_text("filter {predicates_json}")
+        (prompts_dir / "predicate_normalization.txt").write_text("filter {predicates_json}")
 
         state = _state_enabled()
         # Tokenizer mock: _count_tokens calls tokenizer(text)["input_ids"]; the
@@ -834,7 +952,7 @@ class TestBuildCalibrateResponse:
         state = _state_enabled()
         result = _build_calibrate_response(
             stage="anonymize",
-            prompts=[{"role": "user", "path": "p.txt", "sha": "abc", "content": "hello"}],
+            prompts=[{"path": "p.txt", "sha": "abc", "template": "hello"}],
             raw_output="some output",
             parsed={"mapping": {}},
             input_prompt_text="hello",
@@ -946,14 +1064,22 @@ class TestExtractionPipelineKwargsSeed:
     def test_seed_forwarded(self):
         from unittest.mock import MagicMock
 
-        pipeline = ExtractionPipeline(MagicMock(), MagicMock())
+        from paramem.graph.extraction_pipeline import ExtractionConfig
+
+        pipeline = ExtractionPipeline(
+            MagicMock(), MagicMock(), config=ExtractionConfig(scrub=set())
+        )
         kwargs = pipeline.kwargs(seed=7, speaker_id="speaker0")
         assert kwargs["seed"] == 7
 
     def test_seed_none_by_default(self):
         from unittest.mock import MagicMock
 
-        pipeline = ExtractionPipeline(MagicMock(), MagicMock())
+        from paramem.graph.extraction_pipeline import ExtractionConfig
+
+        pipeline = ExtractionPipeline(
+            MagicMock(), MagicMock(), config=ExtractionConfig(scrub=set())
+        )
         kwargs = pipeline.kwargs(speaker_id="speaker0")
         assert kwargs["seed"] is None
 
@@ -1041,8 +1167,25 @@ class TestCalibrateName:
         assert "name" in result["parsed"]
         # Two prompt entries (system + user).
         assert len(result["prompts"]) == 2
-        roles = {p["role"] for p in result["prompts"]}
-        assert roles == {"system", "user"}
+
+        # Reported provenance is sourced from the real
+        # phase-trace record (populated by `_load_prompt`'s own
+        # `record_prompt` call inside `extract_name_via_llm`), not a
+        # hand-built `_read_prompt` literal — its sha must match a live
+        # `_load_prompt` computation of each file.
+        from paramem.graph.prompts import _load_prompt
+
+        expected_sys = _load_prompt(
+            "name_extraction_system.txt", prompts_dir=prompts_dir, required=True
+        )
+        expected_user = _load_prompt("name_extraction.txt", prompts_dir=prompts_dir, required=True)
+        expected_sys_sha = hashlib.sha256(expected_sys.encode("utf-8")).hexdigest()[:12]
+        expected_user_sha = hashlib.sha256(expected_user.encode("utf-8")).hexdigest()[:12]
+        sys_entry = next(p for p in result["prompts"] if p["path"].endswith("_system.txt"))
+        user_entry = next(p for p in result["prompts"] if not p["path"].endswith("_system.txt"))
+        assert sys_entry["sha"] == expected_sys_sha
+        assert user_entry["sha"] == expected_user_sha
+        assert result["parsed"]["name"] == "Alex"
 
     def test_filename_override_used_at_execution(self, tmp_path):
         """Filename override is what the model actually sees, not a display-only value.

@@ -9,7 +9,6 @@ from pathlib import Path
 import yaml
 
 from paramem.backup.types import FatalConfigError
-from paramem.graph.schema_config import entity_types
 from paramem.utils.config import (
     AdapterConfig,
     ConsolidationConfig,
@@ -557,6 +556,29 @@ class ToolsConfig:
     tool_timeout_seconds: float = 3.0
 
 
+#: Ship default for ``SanitizationConfig.scrub`` — a load-bearing set of
+#: PII-vocabulary hints (name / phone / address / online-identity sub-terms).
+#: This is the SINGLE declaration of the default and feeds ONLY the
+#: dataclass field default — it is not a validation vocabulary (see
+#: ``__post_init__``: structural checks only, no semantic warn; a closed
+#: code-side "canonical vocabulary" to warn against is the same closed-list
+#: artifact this design deletes everywhere else).
+_DEFAULT_SCRUB = [
+    "person name",
+    "full name",
+    "given name",
+    "family name",
+    "phone number",
+    "mobile number",
+    "landline number",
+    "email address",
+    "street address",
+    "postal address",
+    "profile URL",
+    "social media handle",
+]
+
+
 @dataclass
 class SanitizationConfig:
     """PII sanitization + cloud egress policy.
@@ -574,51 +596,48 @@ class SanitizationConfig:
           non-PERSONAL sent verbatim.  Smallest cloud surface, zero
           anonymizer cost.  Default.
         - ``anonymize`` — cloud-bound text is anonymized via the local
-          LLM (scope set by ``cloud_scope``), sent to SOTA as
+          LLM (categories set by ``scrub``), sent to SOTA as
           placeholders, and de-anonymized on return.  PERSONAL queries
           reach cloud as redacted text.
         - ``both``      — strictest privacy posture.  PERSONAL blocked
-          AND non-PERSONAL anonymized per ``cloud_scope``.
+          AND non-PERSONAL anonymized per ``scrub``.
 
-    * ``cloud_scope`` — list of entity-type categories anonymized when
-      ``cloud_mode`` selects an anonymizing mode.  This is the MINT
-      SELECTOR for ``_build_anonymization_mapping`` (via ``pii_scope``):
-      in-scope entity types get a placeholder minted and are substituted
-      out of the payload; out-of-scope types travel to the cloud
-      verbatim.  Defaults to ``["person"]``: only person names are
-      placeholdered; place, organization, etc. pass through verbatim so
-      the cloud can answer questions like "What's a good restaurant in
-      Berlin?" sensibly.  An empty list (``[]``) disables the
+    * ``scrub`` — a flat list of PII-vocabulary HINTS (e.g. ``"person
+      name"``, ``"phone number"``) anonymized when ``cloud_mode`` selects
+      an anonymizing mode.  **The prompt is the sole scope authority** —
+      the local LLM is given this list verbatim and decides, per value,
+      whether it is an instance of one of the listed categories; a value
+      it judges in-scope gets a placeholder minted and is substituted out
+      of the payload, regardless of the entity/attribute it happens to
+      live on.  There is no code-side entity-type gate downstream of this
+      config.  Defaults to a load-bearing set of name / phone / address /
+      online-identity sub-terms (e.g. ``"given name"``, ``"mobile
+      number"``, ``"street address"``, ``"social media handle"``):
+      direct contact identifiers are scrubbed while city, organization,
+      product, etc. are omitted so the cloud can still reason about
+      places and things sensibly (e.g. "What's a good restaurant in
+      Berlin?").  An empty list (``[]``) disables the
       anonymization branch entirely under ``cloud_mode=anonymize|both``
-      — cloud sees the original text unchanged.  Operator owns the
-      privacy/utility tradeoff.  The entity-type vocabulary itself is
-      OPEN (:func:`~paramem.graph.placeholders.placeholder_entity_type`
-      derives a type from whatever prefix the model mints — ``person``,
-      ``place``, ``organization``, ``concept`` are the closed subset in
-      ``configs/schema.yaml``, but ``language``, ``activity``, or any
-      other PascalCase-prefixed type a model invents is equally legal),
-      so ``__post_init__`` below only REJECTS on STRUCTURE (a list of
-      non-empty strings) — there is no fixed vocabulary a value must
-      belong to.  It does, however, WARN (never raise, never drop the
-      value) when a value falls outside the closed built-in subset
-      returned by :func:`~paramem.graph.schema_config.entity_types`
-      (``person``, ``place``, ``organization``, ``event``, ``preference``,
-      ``concept``): the value is still honoured — it may be a legitimate
-      open-vocabulary type — but a misspelled entry (e.g. ``"persons"``)
-      now logs a WARNING at load time instead of failing silently.  It
-      still matches no entity's type and mints nothing, so double-check
-      spelling against a real placeholder dump
-      (``graph.diagnostics["core_placeholders"]``) rather than assuming
-      the warning's absence means "in scope, nothing found."
+      — cloud sees the original text unchanged; this is the operator
+      opt-out.  Operator owns the privacy/utility tradeoff.  The
+      vocabulary is free-form — no closed set enforced or checked in
+      code, and NO semantic warn either: ``__post_init__`` below REJECTS
+      only on STRUCTURE (a list of non-empty strings) and never inspects
+      content.  A code-side "canonical vocabulary" to validate — or warn
+      — against would be the same closed list this design deletes
+      everywhere else, and it cannot discriminate a legitimate novel
+      category from a typo of a common one, so it isn't attempted.  See
+      ``configs/server.yaml.example`` for the documented canonical-core
+      guidance an operator edits against.
 
-    HA path is independent of ``cloud_mode`` and ``cloud_scope``: HA
+    HA path is independent of ``cloud_mode`` and ``scrub``: HA
     receives cleartext gated by intent classification.  Hardening the
     HA hop is a planned follow-up.
     """
 
     mode: str = "block"  # off, warn, block
     cloud_mode: str = "block"  # block, anonymize, both
-    cloud_scope: list[str] = field(default_factory=lambda: ["person"])
+    scrub: list[str] = field(default_factory=lambda: list(_DEFAULT_SCRUB))
 
     def __post_init__(self):
         valid_mode = {"off", "warn", "block"}
@@ -632,25 +651,13 @@ class SanitizationConfig:
                 f"Invalid sanitization cloud_mode '{self.cloud_mode}'. "
                 f"Must be one of: {valid_cloud_mode}"
             )
-        if not isinstance(self.cloud_scope, list) or not all(
-            isinstance(v, str) and v for v in self.cloud_scope
+        if not isinstance(self.scrub, list) or not all(
+            isinstance(v, str) and v for v in self.scrub
         ):
             raise ValueError(
-                f"Invalid sanitization cloud_scope '{self.cloud_scope}'. "
+                f"Invalid sanitization scrub '{self.scrub}'. "
                 f"Must be a list of non-empty strings (may be empty list to disable)."
             )
-        known_types = set(entity_types())
-        for value in dict.fromkeys(self.cloud_scope):
-            if value not in known_types:
-                logger.warning(
-                    "sanitization.cloud_scope value '%s' is not one of the closed "
-                    "built-in entity types %s. Open-vocabulary types (e.g. 'tool', "
-                    "'language', 'activity') are legal and will be honoured as-is. "
-                    "If this is a typo, nothing of the intended type will be "
-                    "scrubbed before cloud egress.",
-                    value,
-                    sorted(known_types),
-                )
 
 
 _ABSTENTION_RESPONSE_FALLBACK = "I don't have that information stored yet."
@@ -1533,11 +1540,11 @@ class MobilePwaConfig:
 
     ``enabled``: serve the static PWA bundle and activate cookie-based
     authentication for the mobile web client.  False by default so existing
-    API-key deployments are unaffected until the mobile slice is wired in.
+    API-key deployments are unaffected until the mobile client is wired in.
 
     ``static_dir``: filesystem path to the compiled static bundle.  Empty
-    string defers resolution to the mount point (``paramem/web/static``)
-    configured in a later slice.
+    string defers resolution to the mount point (``paramem/web/static``),
+    which is not yet implemented.
 
     ``cookie_name``: name of the cookie the middleware will accept if the
     client presents one.  The server does not issue this cookie; tokens are
@@ -1558,7 +1565,7 @@ class MobilePwaConfig:
     """
 
     enabled: bool = False
-    # Empty → paramem/web/static (resolved by the static-mount slice).
+    # Empty → paramem/web/static (not yet implemented).
     static_dir: str = ""
     cookie_name: str = "paramem_token"
     push_enabled: bool = False

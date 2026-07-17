@@ -567,7 +567,7 @@ _STAGE_FILENAME = {
     "anonymize": "anonymization.txt",
     "enrich": "sota_enrichment.txt",
     "plausibility": "sota_plausibility.txt",
-    "normalize_filter": "graph_dedup_filter.txt",
+    "normalize_filter": "predicate_normalization.txt",
     "name_user": "name_extraction.txt",
     "name_system": "name_extraction_system.txt",
 }
@@ -907,27 +907,24 @@ def main(argv: list[str] | None = None) -> int:
             prior_anonymize = anon
 
         if "enrich" in stages and prior_extract is not None and prior_anonymize is not None:
-            # The anonymize stage returns ONLY the mapping — no facts,
-            # no transcript.  Build both here through the SAME production
+            # The anonymize stage returns the model's two artifacts —
+            # `mapping` AND `anonymized_transcript` (the model authors the
+            # transcript rewrite in-context; it is the SOLE scope
+            # authority) — plus `status` (opted_out / failed / ok).
+            # Facts are still built here through the SAME production
             # primitives `_sota_pipeline` uses — never a hand-rolled scrub:
-            #   1. `_build_anonymization_mapping` — the LLM's mapping is a
-            #      HINT only; the deterministic builder mints a placeholder
-            #      for every `graph.entities` name the LLM never named (a
-            #      chunk whose mapping covers "Alex" but misses "Millfield"
-            #      still gets "Millfield" scrubbed).  This is what actually
-            #      closes the leak class a post-hoc check would have caught.
+            #   1. `_build_anonymization_mapping` — the model's mapping IS
+            #      the scope decision (no code-side entity walk, no
+            #      entity-type scope gate, no re-mint downstream of it);
+            #      this builder only maintains the speaker-anchor
+            #      invariants and seeds `speaker_name`.
             #   2. `_build_anon_facts` — one fact per LOCAL relation,
-            #      subject/object substituted through the now-complete
-            #      forward map, predicate/relation_type/confidence VERBATIM.
-            # No post-hoc leak check: the payload is built from a table the
-            # script mints and owns via the same exact, case-sensitive
-            # primitive that built the table.  Substitution is
-            # case-SENSITIVE and that is load-bearing: case is the only
-            # signal separating a person named `Bill` from the common
-            # noun `bill`.  Any case-insensitive match over entity names
-            # cannot tell a real leak from ordinary prose — this script
-            # must not introduce one.
-            from paramem.graph.extractor import _anonymize_transcript
+            #      subject/object substituted through the forward map,
+            #      predicate/relation_type/confidence VERBATIM.
+            # The anonymized TRANSCRIPT is taken directly from the model's
+            # own `anonymized_transcript` — never mechanically rebuilt via a
+            # code-side forward-on-prose substitution (deleted; the
+            # transcript is model-authored).
             from paramem.graph.placeholders import (
                 _build_anon_facts,
                 _build_anonymization_mapping,
@@ -936,30 +933,31 @@ def main(argv: list[str] | None = None) -> int:
             from paramem.graph.schema import SessionGraph
 
             anon_parsed = prior_anonymize.get("parsed") or {}
-            # `mapping is None` means the anonymizer parse FAILED — matches
-            # production's abort-on-None (`extractor.py`'s `_sota_pipeline`:
-            # `if mapping is None:` falls back without ever calling the
-            # cloud).  `or {}` here would collapse that failure into "found
+            # `mapping is None` OR a missing/empty `anonymized_transcript`
+            # is fail-closed — matches production's abort-on-None
+            # (`extractor.py`'s `_sota_pipeline`: `if mapping is None:`
+            # falls back without ever calling the cloud).  `or {}` on
+            # `mapping` here would collapse a parse failure into "found
             # nothing", building the SOTA payload from zero scrubbing
             # instead of skipping the call — never a truthiness check on a
             # mapping per CLAUDE.md.
             raw_mapping = anon_parsed.get("mapping")
-            if raw_mapping is None:
+            model_anon_transcript = anon_parsed.get("anonymized_transcript")
+            if raw_mapping is None or not model_anon_transcript:
                 print(
-                    f"Chunk {chunk_idx}: anonymizer mapping is None (parse "
-                    f"failure) — skipping enrich stage, no cloud call made."
+                    f"Chunk {chunk_idx}: anonymizer mapping is None or "
+                    f"anonymized_transcript missing/empty (fail-closed) "
+                    f"— skipping enrich stage, no cloud call made."
                 )
                 continue
             llm_mapping, _norm_stats = _normalize_anonymization_mapping(raw_mapping)
             local_graph = SessionGraph.model_validate(prior_extract.get("parsed") or {})
 
             mapping, _reverse = _build_anonymization_mapping(
-                local_graph.entities,
                 llm_mapping,
-                pii_scope=None,
                 speaker_name=args.speaker,
             )
-            anon_transcript = _anonymize_transcript(chunk["text"], mapping)
+            anon_transcript = model_anon_transcript
             anon_facts = _build_anon_facts(local_graph.relations, mapping)
 
             enrich_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['enrich']}"
@@ -1016,7 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
                 "normalize",
                 {
                     "snapshot_path": args.snapshot,
-                    "filter_prompt_filename": filter_override,
+                    "normalization_prompt_filename": filter_override,
                     "prompts_dir": args.prompts_dir,
                     "params": {k: v for k, v in params.items() if v is not None},
                 },

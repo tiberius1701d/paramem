@@ -120,6 +120,7 @@ class TestExtractionPathParity:
 
         from paramem.memory.store import MemoryStore as _MS
 
+        loop_kwargs.setdefault("extraction_scrub", {"person name"})
         return ConsolidationLoop(
             model=model,
             tokenizer=MagicMock(),
@@ -435,9 +436,13 @@ class TestExtractionPathParity:
         dict so extract_graph receives Guard B (guards the Edit 5 wiring)."""
         from unittest.mock import MagicMock
 
-        from paramem.graph.extraction_pipeline import ExtractionPipeline
+        from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 
-        pipeline = ExtractionPipeline(model=MagicMock(), tokenizer=MagicMock())
+        pipeline = ExtractionPipeline(
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            config=ExtractionConfig(scrub={"person name"}),
+        )
         result = pipeline.kwargs(source_type="document", speaker_id="speaker0")
         assert result["source_type"] == "document"
 
@@ -512,6 +517,7 @@ class TestInterimRefinementGate:
             memory_store=_MS(replay_enabled=False),
             procedural_adapter_config=None,
             output_dir=tmp_path,
+            extraction_scrub={"person name"},
         )
         return loop
 
@@ -1611,7 +1617,7 @@ class TestCreateConsolidationLoopFingerprintCacheWiring:
         cfg.debug = False
         cfg.debug_dir = None
         cfg.prompts_dir = None
-        cfg.sanitization.cloud_scope = ["person"]
+        cfg.sanitization.scrub = ["person name"]
         return cfg
 
     def test_state_provider_supplies_cache_to_loop(self, tmp_path, monkeypatch):
@@ -6264,7 +6270,7 @@ class TestDriftIntendedRemoval:
     def test_dedup_key_still_routes_through_collapsed_branch(self, tmp_path):
         """A duplicate-SPO key that is in BOTH _collapsed_set and removal_ledger
         must still be classified as drift_deduplicated (soft-staled) — the
-        _collapsed_set branch fires first (load-bearing for R4 / soft-stale).
+        _collapsed_set branch fires first (load-bearing for soft-stale classification).
 
         Regression guard: the new elif _dk in _ledger branch must NOT intercept
         dedup keys.
@@ -8078,7 +8084,7 @@ class TestTierFloor:
     # -------------------------------------------------------------------------
 
     def test_fast_start_fallback_trains_from_scratch_when_probe_fails(self, tmp_path):
-        """R5: when the pre-save probe returns below threshold for a fast-start tier,
+        """When the pre-save probe returns below threshold for a fast-start tier,
         the (b)→(a) fall-back fires: train_adapter IS called for that tier.
         """
         from unittest.mock import MagicMock, patch
@@ -12326,7 +12332,7 @@ class TestSynthSpeakerEntitiesB1Regression:
 
 
 # ---------------------------------------------------------------------------
-# W1 guard: resolve_to_node_key + same_as speaker-casing guard
+# Speaker-pair guard: resolve_to_node_key + same_as speaker-casing guard
 # ---------------------------------------------------------------------------
 
 
@@ -12387,7 +12393,7 @@ class TestResolveToNodeKeyP5:
 
 
 class TestW1SameAsGuard:
-    """W1 guard: any same_as pair where BOTH surfaces are speaker ids must be
+    """Speaker-pair guard: any same_as pair where BOTH surfaces are speaker ids must be
     skipped unconditionally.
 
     Speaker identity is authoritative (voice/enrollment) and must never be
@@ -12434,7 +12440,7 @@ class TestW1SameAsGuard:
             prefix = entity_type_to_prefix("person")
             for i, name in enumerate(names, start=1):
                 mapping[name] = f"{prefix}_{i}"
-            return mapping, "stub-raw"
+            return mapping, "stub-anon-transcript", "stub-raw"
 
         monkeypatch.setattr(
             "paramem.training.consolidation.anonymize_with_local_model",
@@ -12474,6 +12480,7 @@ class TestW1SameAsGuard:
             output_dir=tmp_path,
             extraction_noise_filter="anthropic",
             extraction_noise_filter_model="claude-sonnet-4-6",
+            extraction_scrub={"person name"},
         )
         loop._probe_passing_keys = lambda adapter_name, entries: {e["key"] for e in entries}
         for tier in ("episodic", "semantic", "procedural"):
@@ -12532,7 +12539,7 @@ class TestW1SameAsGuard:
         - "speaker0" still exists as a distinct node in the graph
         - no node was removed by a self-contraction
 
-        The W1 guard fires first (both surfaces are speaker ids); the
+        The guard fires first (both surfaces are speaker ids); the
         ``keep_canon == drop_canon`` post-resolution check is a secondary
         backstop for this specific case only.
         """
@@ -12551,7 +12558,7 @@ class TestW1SameAsGuard:
 
         assert not result["skipped"]
         assert result["same_as_merges"] == 0, (
-            "W1/post-resolution guard must prevent the speaker casing-variant pair "
+            "The speaker-pair/post-resolution guard must prevent the speaker casing-variant pair "
             "from counting as a merge; got same_as_merges="
             f"{result['same_as_merges']}"
         )
@@ -12569,9 +12576,9 @@ class TestW1SameAsGuard:
 
         Drives the real _run_graph_enrichment production path.  speaker0 and
         speaker1 are distinct enrollments; a SOTA same_as proposal must be
-        blocked by the generalized W1 guard (both surfaces are speaker ids).
+        blocked by the generalized speaker-pair guard (both surfaces are speaker ids).
 
-        This test is load-bearing: without the W1 guard,
+        This test is load-bearing: without the guard,
         ``_safe_to_merge_surface("speaker0", "speaker1")`` returns True (JW
         treats the digit as a typo, score ≈ 0.950) and the merger would
         contract speaker1 into speaker0 — catastrophic in a real 2-speaker
@@ -12608,25 +12615,25 @@ class TestW1SameAsGuard:
             result = loop._run_graph_enrichment()
 
         assert result["same_as_merges"] == 0, (
-            "W1 guard must block distinct speaker ids from merging; "
+            "The speaker-pair guard must block distinct speaker ids from merging; "
             f"got same_as_merges={result['same_as_merges']}"
         )
         # Both speaker nodes must remain distinct — no contraction occurred.
         assert "speaker0" in loop.merger.graph.nodes, (
-            "speaker0 must survive — W1 guard must block the speaker0/speaker1 merge"
+            "speaker0 must survive — the guard must block the speaker0/speaker1 merge"
         )
         assert "speaker1" in loop.merger.graph.nodes, (
-            "speaker1 must survive — W1 guard must block the speaker0/speaker1 merge"
+            "speaker1 must survive — the guard must block the speaker0/speaker1 merge"
         )
         assert loop.merger.graph.number_of_nodes() == node_count_before, (
-            "Graph node count must not change after a W1-guarded speaker same_as pair"
+            "Graph node count must not change after a guarded speaker same_as pair"
         )
 
     def test_non_speaker_pairs_are_not_guarded(self, tmp_path, monkeypatch):
-        """Non-speaker same_as pairs (e.g. name variants) must pass through W1.
+        """Non-speaker same_as pairs (e.g. name variants) must pass through the guard.
 
         Drives the real _run_graph_enrichment path.  A pair of ordinary non-speaker
-        names must NOT be intercepted by the W1 guard; they continue to the normal
+        names must NOT be intercepted by the speaker-pair guard; they continue to the normal
         resolution and surface-gate checks.
         """
         from unittest.mock import patch
@@ -12651,7 +12658,7 @@ class TestW1SameAsGuard:
         assert not is_speaker_id("alex")
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-        # Non-speaker pair: W1 must not fire; normal gates apply.
+        # Non-speaker pair: the guard must not fire; normal gates apply.
         # "Alexander"/"Alex" pass _safe_to_merge_surface (token subset), so the merge
         # is allowed and same_as_merges == 1.
         with patch(
@@ -12660,9 +12667,9 @@ class TestW1SameAsGuard:
         ):
             result = loop._run_graph_enrichment()
 
-        # Non-speaker pair was not guarded by W1 — the merge proceeded normally.
+        # Non-speaker pair was not guarded — the merge proceeded normally.
         assert result["same_as_merges"] >= 1, (
-            "Non-speaker same_as pair must not be blocked by the W1 guard; "
+            "Non-speaker same_as pair must not be blocked by the speaker-pair guard; "
             f"expected at least 1 merge, got {result['same_as_merges']}"
         )
 
@@ -13135,14 +13142,14 @@ class TestSubtractiveRemovalsHelperFold:
 
 
 # ---------------------------------------------------------------------------
-# _merge_registry_relations: C1 regression — timestamp="" prevents now() fabrication
+# _merge_registry_relations: regression guard — timestamp="" prevents now() fabrication
 # ---------------------------------------------------------------------------
 
 
 class TestMergeRegistryRelationsTimestamp:
     """_merge_registry_relations passes timestamp="" to the merger's SessionGraph.
 
-    C1 regression guard: before the fix, _merge_registry_relations always built the
+    Regression guard: before the fix, _merge_registry_relations always built the
     SessionGraph with timestamp=datetime.now(...), so a recon relation with
     last_seen="" resolved to incoming_ls = "" or now() = now() — making the legacy key
     appear as the unique freshest and wrongly retiring a genuinely-dated rival.
@@ -13693,11 +13700,11 @@ class TestRunGraphNormalizationApply:
         graph.add_node(obj, reinforcement_count=1, attributes={"name": obj})
         graph.add_edge(subj, obj, **attrs)
 
-    # Prompt stub: only {predicates_json} placeholder (matches dedup_synonym_predicates).
+    # Prompt stub: only {predicates_json} placeholder (matches normalize_predicates).
     _PROMPT_STUB = "dummy {predicates_json}"
 
     def _cluster_response(self, clusters: list[list[str]]) -> str:
-        """Encode a clusters-schema model response for dedup_synonym_predicates."""
+        """Encode a clusters-schema model response for normalize_predicates."""
         import json
 
         return json.dumps({"clusters": clusters})
@@ -13735,7 +13742,7 @@ class TestRunGraphNormalizationApply:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
@@ -13774,7 +13781,7 @@ class TestRunGraphNormalizationApply:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
@@ -13820,7 +13827,7 @@ class TestRunGraphNormalizationApply:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
@@ -13870,7 +13877,7 @@ class TestRunGraphNormalizationApply:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             loop._run_graph_normalization()
 
@@ -13914,7 +13921,7 @@ class TestRunGraphNormalizationApply:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             loop._run_graph_normalization()
 
@@ -13935,7 +13942,7 @@ class TestRunGraphNormalizationApply:
         """NDA-4: single-predicate (s,o) group is never a candidate — no model call.
 
         Graph: morgan -> germany with only 'born_in' (graph12).  The group has only
-        one predicate so it never reaches dedup_synonym_predicates as a candidate.
+        one predicate so it never reaches normalize_predicates as a candidate.
         After apply: graph12 survives, ledger empty.
         """
         from unittest.mock import patch
@@ -13953,7 +13960,7 @@ class TestRunGraphNormalizationApply:
                 "paramem.graph.extractor.generate_answer",
                 side_effect=Exception("should not be called"),
             ),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
@@ -13986,7 +13993,7 @@ class TestRunGraphNormalizationApply:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
@@ -14049,7 +14056,7 @@ class TestRunGraphNormalizationApply:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
@@ -14087,7 +14094,7 @@ class TestRunGraphNormalizationApply:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
@@ -14124,7 +14131,7 @@ class TestRunGraphNormalizationApply:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             result = loop._run_graph_normalization()
 
@@ -14147,13 +14154,13 @@ class TestRunGraphNormalizationSotaEngine:
     """_run_graph_normalization SOTA wiring and fail-loud tests.
 
     Tests:
-    - SOTA-1: sota_enabled=True + provider + api_key in env → dedup_synonym_predicates
+    - SOTA-1: sota_enabled=True + provider + api_key in env → normalize_predicates
               called with ``sota=`` kwarg, NOT ``model=``.
     - SOTA-2: sota_enabled=True + provider present but NO api_key in env → local
-              fallback: dedup_synonym_predicates called with ``model=`` kwarg.
+              fallback: normalize_predicates called with ``model=`` kwarg.
     - DBG-1: after retirement, on_normalization receives non-empty raw_outputs list
              and non-empty decisions list.
-    - FL-1:  FileNotFoundError raised when graph_dedup_filter.txt is missing
+    - FL-1:  FileNotFoundError raised when predicate_normalization.txt is missing
              (graph ≥ 10 nodes, model present).
     """
 
@@ -14262,10 +14269,10 @@ class TestRunGraphNormalizationSotaEngine:
         self._add_keyed_edge(graph, "morgan", "acme", "works_for", "g1", recurrence=1)
         self._add_keyed_edge(graph, "morgan", "acme", "employed_by", "g2", recurrence=2)
 
-        # Capture the kwargs that dedup_synonym_predicates receives.
+        # Capture the kwargs that normalize_predicates receives.
         captured: dict = {}
 
-        def _fake_dedup(relations, *, filter_prompt, **kwargs):
+        def _fake_dedup(relations, **kwargs):
             captured.update(kwargs)
             return {}, {
                 "raw_outputs": [],
@@ -14278,15 +14285,15 @@ class TestRunGraphNormalizationSotaEngine:
 
         with (
             patch(
-                "paramem.training.consolidation.dedup_synonym_predicates",
+                "paramem.training.consolidation.normalize_predicates",
                 side_effect=_fake_dedup,
             ),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             loop._run_graph_normalization()
 
         assert "sota" in captured, (
-            "dedup_synonym_predicates must receive sota= kwarg "
+            "normalize_predicates must receive sota= kwarg "
             "when sota_enabled=True and api_key present"
         )
         assert "model" not in captured, "model= must NOT be passed when SOTA engine is selected"
@@ -14306,7 +14313,7 @@ class TestRunGraphNormalizationSotaEngine:
 
         captured: dict = {}
 
-        def _fake_dedup(relations, *, filter_prompt, **kwargs):
+        def _fake_dedup(relations, **kwargs):
             captured.update(kwargs)
             return {}, {
                 "raw_outputs": [],
@@ -14319,15 +14326,15 @@ class TestRunGraphNormalizationSotaEngine:
 
         with (
             patch(
-                "paramem.training.consolidation.dedup_synonym_predicates",
+                "paramem.training.consolidation.normalize_predicates",
                 side_effect=_fake_dedup,
             ),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
             loop._run_graph_normalization()
 
         assert "model" in captured, (
-            "dedup_synonym_predicates must receive model= kwarg when api_key is absent"
+            "normalize_predicates must receive model= kwarg when api_key is absent"
         )
         assert "sota" not in captured, (
             "sota= must NOT be passed when api_key is absent (local fallback)"
@@ -14359,7 +14366,7 @@ class TestRunGraphNormalizationSotaEngine:
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_raw),
-            patch("paramem.graph.prompts._load_prompt", return_value=self._PROMPT_STUB),
+            patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
             patch.object(loop._debug_writer, "on_normalization", side_effect=_spy_on_normalization),
         ):
             loop._run_graph_normalization()
@@ -14370,21 +14377,29 @@ class TestRunGraphNormalizationSotaEngine:
         assert call["decisions"], "decisions must be non-empty when clusters were produced"
 
     def test_fail_loud_when_prompt_missing(self, tmp_path):
-        """FL-1: FileNotFoundError raised when graph_dedup_filter.txt is missing."""
+        """FL-1: FileNotFoundError raised when predicate_normalization.txt is missing.
+
+        The prompt load now happens inside ``normalize_predicates`` itself,
+        gated on ``relations`` being non-empty (it fires before the
+        candidate-group check) — so the graph needs at least one edge for the
+        load (and thus the raise) to happen at all.
+        """
         from unittest.mock import patch
 
         import pytest
 
         loop = self._make_loop(tmp_path, sota_enabled=False)
+        graph = loop.merger.graph
+        self._add_keyed_edge(graph, "morgan", "acme", "works_for", "g1", recurrence=1)
 
         with (
             patch(
-                "paramem.graph.prompts._load_prompt",
+                "paramem.graph.extractor._load_prompt",
                 side_effect=FileNotFoundError(
-                    "Required prompt file 'graph_dedup_filter.txt' not found. Searched: ..."
+                    "Required prompt file 'predicate_normalization.txt' not found. Searched: ..."
                 ),
             ),
-            pytest.raises(FileNotFoundError, match="graph_dedup_filter.txt"),
+            pytest.raises(FileNotFoundError, match="predicate_normalization.txt"),
         ):
             loop._run_graph_normalization()
 

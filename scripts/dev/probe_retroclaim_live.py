@@ -52,6 +52,7 @@ from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.test_harness import BENCHMARK_MODELS, setup_logging  # noqa: E402
 from paramem.memory.store import MemoryStore  # noqa: E402
 from paramem.models.loader import load_base_model  # noqa: E402
+from paramem.server.config import SanitizationConfig  # noqa: E402
 from paramem.server.session_buffer import SessionBuffer  # noqa: E402
 from paramem.server.speaker import SpeakerStore  # noqa: E402
 from paramem.training.consolidation import ConsolidationLoop  # noqa: E402
@@ -248,6 +249,11 @@ def run_gpu_phases(out_dir: Path) -> dict:
         extraction_ha_validation=False,
         extraction_noise_filter="off",
         extraction_plausibility_judge="off",
+        # Same 5-category default the server config ships
+        # (SanitizationConfig.scrub) — no cloud egress happens in this
+        # probe (noise_filter="off"), but ConsolidationLoop's
+        # ExtractionPipeline requires a scrub value regardless.
+        extraction_scrub=set(SanitizationConfig().scrub),
     )
 
     results: dict = {"phase2": {}, "phase3": {}}

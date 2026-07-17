@@ -1,4 +1,4 @@
-"""Tests for dedup_synonym_predicates (paramem/graph/extractor.py).
+"""Tests for normalize_predicates (paramem/graph/extractor.py).
 
 Uses a MagicMock model that returns canned JSON — no real GPU required.
 Verifies:
@@ -17,12 +17,14 @@ Verifies:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from paramem.graph.extractor import dedup_synonym_predicates
+from paramem.graph.extractor import normalize_predicates
+from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.prompts import _load_prompt
 
 
@@ -37,24 +39,20 @@ def _make_model_tokenizer(raw_outputs: list[str]):
     return model, tokenizer
 
 
-FILTER_PROMPT = "filter {predicates_json}"
-
-
 def _run(
     relations: list[dict],
     raw_outputs: list[str],
 ) -> tuple[dict, dict]:
-    """Run dedup_synonym_predicates with mocked generate_answer side-effects."""
+    """Run normalize_predicates with mocked generate_answer side-effects."""
     model, tokenizer = _make_model_tokenizer(raw_outputs)
     with patch(
         "paramem.graph.extractor.generate_answer",
         side_effect=raw_outputs,
     ):
-        return dedup_synonym_predicates(
+        return normalize_predicates(
             relations,
             model=model,
             tokenizer=tokenizer,
-            filter_prompt=FILTER_PROMPT,
         )
 
 
@@ -62,11 +60,10 @@ class TestEmptyInput:
     def test_empty_returns_empty_clusters(self):
         model = MagicMock()
         tokenizer = MagicMock()
-        clusters_by_so, diag = dedup_synonym_predicates(
+        clusters_by_so, diag = normalize_predicates(
             [],
             model=model,
             tokenizer=tokenizer,
-            filter_prompt=FILTER_PROMPT,
         )
         assert clusters_by_so == {}
         assert diag["groups_examined"] == 0
@@ -91,11 +88,10 @@ class TestSinglePredicateGroupPassthrough:
             "paramem.graph.extractor.generate_answer",
             side_effect=Exception("should not be called"),
         ):
-            clusters_by_so, diag = dedup_synonym_predicates(
+            clusters_by_so, diag = normalize_predicates(
                 relations,
                 model=model,
                 tokenizer=tokenizer,
-                filter_prompt=FILTER_PROMPT,
             )
         assert clusters_by_so == {}
         assert diag["candidate_groups"] == 0
@@ -139,11 +135,10 @@ class TestSynonymClusters:
             "paramem.graph.extractor.generate_answer",
             side_effect=Exception("should not be called"),
         ):
-            clusters_by_so, diag = dedup_synonym_predicates(
+            clusters_by_so, diag = normalize_predicates(
                 relations,
                 model=model,
                 tokenizer=tokenizer,
-                filter_prompt=FILTER_PROMPT,
             )
         assert clusters_by_so == {}
         assert diag["candidate_groups"] == 0
@@ -230,11 +225,10 @@ class TestGroundingGuard:
             side_effect=RuntimeError("GPU exploded"),
         ):
             with pytest.raises(RuntimeError, match="GPU exploded"):
-                dedup_synonym_predicates(
+                normalize_predicates(
                     relations,
                     model=model,
                     tokenizer=tokenizer,
-                    filter_prompt=FILTER_PROMPT,
                 )
         model.gradient_checkpointing_enable.assert_called_once()
 
@@ -245,17 +239,14 @@ class TestGroundingGuard:
 
 
 class TestSotaBranch:
-    """dedup_synonym_predicates SOTA path: _sota_call receives raw prompt,
+    """normalize_predicates SOTA path: _sota_call receives raw prompt,
     generate_answer/apply_chat_template are NOT used, None return is a no-op."""
-
-    _FILTER_PROMPT = "filter {predicates_json}"
 
     _SOTA_CFG = {
         "api_key": "sk-test",
         "provider": "anthropic",
         "filter_model": "claude-sonnet-4-6",
         "endpoint": None,
-        "system_prompt": _load_prompt("graph_dedup_filter_system.txt", required=True),
     }
 
     def test_sota_call_receives_raw_prompt(self):
@@ -270,10 +261,9 @@ class TestSotaBranch:
         ]
         cluster_raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
         with patch("paramem.graph.extractor._sota_call", return_value=cluster_raw) as mock_sota:
-            clusters_by_so, diag = dedup_synonym_predicates(
+            clusters_by_so, diag = normalize_predicates(
                 relations,
                 sota=self._SOTA_CFG,
-                filter_prompt=self._FILTER_PROMPT,
             )
 
         assert mock_sota.called, "_sota_call must be invoked on the SOTA path"
@@ -302,10 +292,9 @@ class TestSotaBranch:
             {"subject": "Jordan", "predicate": "employed_by", "object": "TechCo"},
         ]
         with patch("paramem.graph.extractor._sota_call", return_value=None):
-            clusters_by_so, diag = dedup_synonym_predicates(
+            clusters_by_so, diag = normalize_predicates(
                 relations,
                 sota=self._SOTA_CFG,
-                filter_prompt=self._FILTER_PROMPT,
             )
 
         assert clusters_by_so == {}, "None return must produce no clusters"
@@ -333,10 +322,52 @@ class TestSotaBranch:
             ),
         ):
             # Pass a tokenizer; the SOTA path must ignore it.
-            dedup_synonym_predicates(
+            normalize_predicates(
                 relations,
                 sota=self._SOTA_CFG,
-                filter_prompt=self._FILTER_PROMPT,
             )
 
         fake_tokenizer.apply_chat_template.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Prompt-loading chokepoint provenance
+# ---------------------------------------------------------------------------
+
+
+class TestPromptProvenance:
+    """normalize_predicates loads both prompts through the single
+    production loader ``_load_prompt`` — proven by the phase-trace
+    provenance record it emits when a phase scope is open."""
+
+    def test_filter_prompt_load_recorded_on_normalize_phase(self):
+        relations = [
+            {"subject": "Alex", "predicate": "works_for", "object": "Acme"},
+            {"subject": "Alex", "predicate": "employed_by", "object": "Acme"},
+        ]
+        raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
+        model = MagicMock()
+        model.gradient_checkpointing_disable = MagicMock()
+        model.gradient_checkpointing_enable = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="<formatted>")
+
+        with extraction_trace() as trace:
+            with phase_trace("normalize"):
+                with patch("paramem.graph.extractor.generate_answer", return_value=raw):
+                    normalize_predicates(
+                        relations,
+                        model=model,
+                        tokenizer=tokenizer,
+                    )
+
+        records = [r for r in trace.records if r.name == "normalize"]
+        assert len(records) == 1
+        prompts = records[0].prompts
+        assert prompts is not None
+        filter_records = [p for p in prompts if p["path"].endswith("predicate_normalization.txt")]
+        assert len(filter_records) == 1
+        expected_sha = hashlib.sha256(
+            _load_prompt("predicate_normalization.txt", required=True).encode("utf-8")
+        ).hexdigest()[:12]
+        assert filter_records[0]["sha"] == expected_sha

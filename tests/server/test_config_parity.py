@@ -141,6 +141,11 @@ _ALLOWED_VALUE_DIVERGENCE = frozenset(
         "tts.voices.tl.device",
         "debug",  # tests want full diagnostic artefacts
         "sanitization.cloud_mode",  # tests anonymize-and-send; example blocks
+        # Example ships the full load-bearing scrub default; fixture uses a
+        # reduced person-only set so tests cover both the mask path (name
+        # terms) and the not-in-scope verbatim pass-through path (phone/
+        # email/address absent from the fixture's scrub list).
+        "sanitization.scrub",
         # --- Sandbox-rooted paths: every path the fixture writes to must
         # live under tests/fixtures/sandbox/ so a test run can't clobber
         # production data. ------------------------------------------------

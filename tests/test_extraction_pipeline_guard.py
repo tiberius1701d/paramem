@@ -133,6 +133,7 @@ def _make_pipeline(model=None, tokenizer=None, **config_overrides):
     """
     from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 
+    config_overrides.setdefault("scrub", {"person name"})
     return ExtractionPipeline(
         model=model if model is not None else MagicMock(),
         tokenizer=tokenizer if tokenizer is not None else MagicMock(),
@@ -178,7 +179,7 @@ def test_kwargs_emits_model_alias():
     pipeline = ExtractionPipeline(
         model=MagicMock(),
         tokenizer=MagicMock(),
-        config=ExtractionConfig(),
+        config=ExtractionConfig(scrub={"person name"}),
         model_name="qwen3-4b",
     )
     kw = pipeline.kwargs(source_type="transcript", speaker_id="speaker0")
@@ -189,7 +190,7 @@ def test_kwargs_emits_model_alias():
     pipeline_base = ExtractionPipeline(
         model=MagicMock(),
         tokenizer=MagicMock(),
-        config=ExtractionConfig(),
+        config=ExtractionConfig(scrub={"person name"}),
     )
     kw_base = pipeline_base.kwargs(source_type="transcript", speaker_id="speaker0")
     assert kw_base["model_alias"] is None
@@ -607,6 +608,7 @@ def test_consolidation_loop_constructor_threads_extraction_flags(tmp_path):
         "extraction_noise_filter_endpoint": "http://custom:8080/v1",
         "extraction_plausibility_judge": "off",
         "extraction_plausibility_stage": "anon",
+        "extraction_scrub": {"email address"},
     }
 
     # Skip adapter wiring — we only care about flag storage on
@@ -673,6 +675,7 @@ def test_consolidation_loop_threads_model_name_to_extraction_pipeline(tmp_path):
         memory_store=_MS(replay_enabled=False),
         output_dir=tmp_path,
         model_name="qwen3-4b",
+        extraction_scrub={"person name"},
     )
 
     assert loop.extraction.model_name == "qwen3-4b", (
@@ -868,7 +871,7 @@ def test_kwargs_honors_prompts_dir_override():
     pipeline = ExtractionPipeline(
         model=MagicMock(),
         tokenizer=MagicMock(),
-        config=ExtractionConfig(),
+        config=ExtractionConfig(scrub={"person name"}),
         prompts_dir="configs/prompts",
     )
 
@@ -1001,6 +1004,7 @@ def _build_loop_with_session_dump(tmp_path, monkeypatch, *, fake_graph):
         output_dir=tmp_path,
         save_cycle_snapshots=True,
         snapshot_dir=tmp_path,
+        extraction_scrub={"person name"},
     )
     loop.cycle_count = 7
     return loop
@@ -1448,20 +1452,20 @@ def _find_function(module_rel: str, fn_name: str):
     raise AssertionError(f"{fn_name} not found in {module_rel}")
 
 
-def test_dedup_synonym_predicates_local_path_enters_base_model_inference():
-    """``dedup_synonym_predicates`` must run its local-model path on the base
+def test_normalize_predicates_local_path_enters_base_model_inference():
+    """``normalize_predicates`` must run its local-model path on the base
     weights via ``base_model_inference``.
 
-    Predicate-dedup is structured extraction: the local path must run with the
+    Predicate-normalization is structured extraction: the local path must run with the
     PA adapter disabled (it would otherwise bias synonym clustering) and with
     gradient checkpointing restored to its entry state.  The SOTA path uses the
     cloud model and is wrapped in ``nullcontext`` instead — the guard only
     asserts the primitive is present in the function, mirroring the app.py
     enrollment guard.
     """
-    target = _find_function("paramem/graph/extractor.py", "dedup_synonym_predicates")
+    target = _find_function("paramem/graph/extractor.py", "normalize_predicates")
     assert _function_calls_base_model_inference(target), (
-        "dedup_synonym_predicates must gate its local-model calls behind "
+        "normalize_predicates must gate its local-model calls behind "
         "`base_model_inference(model)` (conditional on local_mode) so predicate "
         "dedup runs on the base weights with the KV cache live."
     )
