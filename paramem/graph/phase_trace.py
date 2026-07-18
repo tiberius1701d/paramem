@@ -117,11 +117,12 @@ Phase                       Notes
                             from ``ConsolidationLoop.extract_session``.
                             ``raw_output=None``.
 ``procedural_extract``      Mistral runs the procedural extraction
-                            prompt.  Fires from
-                            ``ConsolidationLoop.extract_session`` (its
-                            own nested ``extract_graph`` trace records
-                            into the outer session trace via the
-                            nesting-no-op).
+                            prompt via the shared ``_run_local_extraction``
+                            primitive inside ``extract_procedural_graph``,
+                            which self-traces this phase — its own
+                            ``extraction_trace`` scope nest-no-ops onto
+                            whatever outer trace (session or calibration)
+                            is already active.
 ``dedup_episodic``          Pure-Python triple-identity dedup of the
                             episodic relation set.  ``raw_output=None``.
 ``dedup_procedural``        Pure-Python triple-identity dedup of the

@@ -2092,6 +2092,146 @@ class TestAnonymizerMappingOnlyContract:
         assert empty_mapping is not None
 
 
+class TestAnonymizerTranscriptArrayContract:
+    """``anonymized_transcript`` is a JSON array of turn strings per the
+    ``configs/prompts/anonymization.txt`` contract (one element per turn)
+    so a multi-turn rewrite can never contain a literal newline inside a
+    JSON string value — the illegal-JSON shape that caused a measured
+    fail-closed parse failure.  ``anonymize_with_local_model`` joins the
+    array with ``"\\n"``; a plain ``str`` is still accepted unchanged for
+    models that have not adopted the array contract.
+
+    Mutation: drop the ``list`` branch, or join with something other than
+    ``"\\n"``, or stop rejecting malformed arrays -> these tests fail.
+    """
+
+    @staticmethod
+    def _graph():
+        return _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+
+    def test_array_of_turn_strings_is_joined_with_newline(self):
+        from paramem.graph.extractor import anonymize_with_local_model
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        raw = json.dumps(
+            {
+                "mapping": {"Alex": "Person_1", "Millfield": "City_1"},
+                "anonymized_transcript": [
+                    "[user] My friend Person_1 lives in City_1.",
+                    "[assistant] Got it.",
+                    "[user] Anything else to add?",
+                ],
+            }
+        )
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value=raw),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+        ):
+            mapping, anon_transcript, _raw = anonymize_with_local_model(
+                self._graph(), model, tokenizer, scrub={"person name"}
+            )
+
+        assert mapping == {"Alex": "Person_1", "Millfield": "City_1"}
+        assert anon_transcript == (
+            "[user] My friend Person_1 lives in City_1.\n"
+            "[assistant] Got it.\n"
+            "[user] Anything else to add?"
+        )
+
+    def test_plain_string_transcript_still_accepted_unchanged(self):
+        from paramem.graph.extractor import anonymize_with_local_model
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        raw = json.dumps(
+            {
+                "mapping": {"Alex": "Person_1"},
+                "anonymized_transcript": "[user] Person_1 lives in Millfield.",
+            }
+        )
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value=raw),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+        ):
+            mapping, anon_transcript, _raw = anonymize_with_local_model(
+                self._graph(), model, tokenizer, scrub={"person name"}
+            )
+
+        assert mapping == {"Alex": "Person_1"}
+        assert anon_transcript == "[user] Person_1 lives in Millfield."
+
+    def test_empty_array_fails_closed(self):
+        from paramem.graph.extractor import anonymize_with_local_model
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        raw = json.dumps({"mapping": {"Alex": "Person_1"}, "anonymized_transcript": []})
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value=raw),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+        ):
+            mapping, anon_transcript, raw_output = anonymize_with_local_model(
+                self._graph(), model, tokenizer, scrub={"person name"}
+            )
+
+        assert mapping is None
+        assert anon_transcript == ""
+        assert raw_output == raw
+
+    def test_array_with_non_string_element_fails_closed(self):
+        from paramem.graph.extractor import anonymize_with_local_model
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        raw = json.dumps(
+            {
+                "mapping": {"Alex": "Person_1"},
+                "anonymized_transcript": ["[user] Person_1 lives in Millfield.", 42],
+            }
+        )
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value=raw),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+        ):
+            mapping, anon_transcript, raw_output = anonymize_with_local_model(
+                self._graph(), model, tokenizer, scrub={"person name"}
+            )
+
+        assert mapping is None
+        assert anon_transcript == ""
+        assert raw_output == raw
+
+    def test_missing_anonymized_transcript_key_fails_closed(self):
+        from paramem.graph.extractor import anonymize_with_local_model
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        raw = json.dumps({"mapping": {"Alex": "Person_1"}})
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value=raw),
+            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+        ):
+            mapping, anon_transcript, raw_output = anonymize_with_local_model(
+                self._graph(), model, tokenizer, scrub={"person name"}
+            )
+
+        assert mapping is None
+        assert anon_transcript == ""
+        assert raw_output == raw
+
+
 class TestScrubCategoriesReachPrompt:
     """The config -> prompt flow for ``scrub``.  ``scrub_categories``
     is rendered as ``", ".join(sorted(scrub))`` into the anonymization

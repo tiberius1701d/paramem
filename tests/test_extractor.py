@@ -96,6 +96,40 @@ class TestExtractJsonBlock:
         with pytest.raises(ValueError, match="(?i)envelope keys|no parseable JSON"):
             _extract_json_block(text)
 
+    def test_no_envelope_message_does_not_assert_truncation_when_complete(self):
+        """A response that ends on a closing brace (i.e. is NOT truncated)
+        but contains an unescaped control character inside a string value
+        must not be misdiagnosed as ``max_tokens`` truncation — the outer
+        ``raw_decode`` fails on the control character, only an inner
+        sub-object (no envelope keys) parses, and the response text itself
+        is complete."""
+        text = (
+            '{"mapping": {"Alice": "Person_1"}, "anonymized_transcript": '
+            '"[user] hi\n[assistant] there"}'
+        )
+        assert text.rstrip().endswith("}")
+        with pytest.raises(ValueError) as excinfo:
+            _extract_json_block(text)
+        message = str(excinfo.value)
+        assert "envelope keys" in message
+        assert "control character" in message
+        assert "truncated at max_tokens" not in message
+
+    def test_no_envelope_message_still_reports_truncation_when_incomplete(self):
+        """The truncation diagnosis is still surfaced when the response
+        text genuinely does not end on a closing brace/bracket: a
+        complete inner sub-object (no envelope keys) parses, but the
+        outer envelope never closes."""
+        text = (
+            '{"entities": [{"name": "Alex", "entity_type": "person", '
+            '"attributes": {}}, {"name": "Bob"'
+        )
+        assert not text.rstrip().endswith(("}", "]"))
+        with pytest.raises(ValueError) as excinfo:
+            _extract_json_block(text)
+        message = str(excinfo.value)
+        assert "truncated at max_tokens" in message
+
     def test_accepts_plausibility_empty_list(self):
         """Plausibility legitimately returns ``[]`` when all facts were
         filtered.  The parser must accept lists (even empty) as valid

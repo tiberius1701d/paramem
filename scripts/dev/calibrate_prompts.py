@@ -12,7 +12,7 @@ Stages:
 
 * ``extract``       — local Mistral.  POST /calibrate/extract
 * ``anonymize``     — local Mistral.  POST /calibrate/anonymize
-* ``enrich``        — Anthropic SOTA.  Client-side (no server endpoint).
+* ``enrich``        — SOTA cloud provider.  POST /calibrate/enrich
 * ``plausibility``  — local Mistral.  POST /calibrate/plausibility
 
 Usage::
@@ -44,13 +44,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
-import hashlib
 import json
-import os
-import shutil
-import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -145,7 +140,7 @@ def _calibration_variant_exists(
 
 
 # ---------------------------------------------------------------------------
-# Stage runners — local stages POST to the server, enrich runs locally
+# Stage runners — every stage POSTs to the server
 # ---------------------------------------------------------------------------
 
 
@@ -184,126 +179,6 @@ def _post_stage(
         )
     r.raise_for_status()
     return r.json()
-
-
-def _run_enrich(
-    *,
-    facts: list[dict],
-    transcript: str,
-    prompts_dir: Path,
-    prompt_filename: str,
-    sota_route: str,
-    sota_provider: str,
-    sota_model: str,
-    params: dict,
-) -> dict:
-    """Run the SOTA enrichment stage entirely client-side.
-
-    Reuses the production prompt template from ``prompts_dir`` so the
-    enrichment text the model sees is byte-identical to what production
-    would build.  Routes through ``cli`` (subprocess to ``claude
-    --print``) when available, else through the Anthropic SDK.
-    """
-    prompt_path = prompts_dir / prompt_filename
-    if not prompt_path.exists():
-        raise SystemExit(f"Enrichment prompt not found: {prompt_path}")
-    template = prompt_path.read_text(encoding="utf-8")
-    sha = hashlib.sha256(template.encode("utf-8")).hexdigest()[:12]
-
-    rendered = template.format(
-        facts_json=json.dumps(facts, indent=2),
-        transcript=transcript or "(not available)",
-    )
-
-    chosen_route = sota_route
-    if chosen_route == "auto":
-        chosen_route = "cli" if shutil.which("claude") else "api"
-
-    t0 = time.perf_counter()
-    raw_output: str | None = None
-    parse_error: str | None = None
-    seed_dropped = params.get("seed") is not None
-
-    if chosen_route == "cli":
-        instruction = (
-            "\n\n--- IMPORTANT: return ONLY the JSON envelope as specified. "
-            "No markdown fences, no preamble, no closing remarks. ---"
-        )
-        try:
-            res = subprocess.run(
-                ["claude", "--print", rendered + instruction],
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            if res.returncode != 0:
-                parse_error = f"claude CLI exited {res.returncode}: {res.stderr[:400]}"
-            else:
-                raw_output = res.stdout
-        except FileNotFoundError:
-            parse_error = "claude CLI not on PATH; pass --sota-route api"
-        except subprocess.TimeoutExpired:
-            parse_error = "claude CLI timed out after 600s"
-    elif chosen_route == "api":
-        from paramem.graph.extractor import (
-            _SOTA_ENRICHMENT_SYSTEM_PROMPT,
-            _filter_anthropic,
-        )
-
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise SystemExit(
-                "ANTHROPIC_API_KEY not set; pass --sota-route cli to use "
-                "the local Claude Code CLI instead."
-            )
-        raw_output = _filter_anthropic(
-            rendered,
-            api_key=api_key,
-            filter_model=sota_model,
-            system_prompt=_SOTA_ENRICHMENT_SYSTEM_PROMPT,
-            max_tokens=params.get("max_tokens") or 8192,
-            temperature=(
-                params.get("temperature") if params.get("temperature") is not None else 0.0
-            ),
-            top_p=params.get("top_p"),
-            top_k=params.get("top_k"),
-        )
-        if raw_output is None:
-            parse_error = "Anthropic call returned None (SDK or transport failure)"
-    else:
-        raise SystemExit(f"Unknown --sota-route value: {chosen_route}")
-
-    elapsed = time.perf_counter() - t0
-
-    parsed: dict | None = None
-    if raw_output and not parse_error:
-        try:
-            from paramem.graph.extractor import _extract_json_block
-
-            parsed = json.loads(_extract_json_block(raw_output))
-        except Exception as exc:  # noqa: BLE001
-            parse_error = f"JSON parse failed: {exc}"
-
-    return {
-        "stage": "enrich",
-        "prompts": [
-            {"role": "user", "path": str(prompt_path), "sha": sha, "content": template},
-        ],
-        "raw_output": raw_output or "",
-        "parsed": parsed or {},
-        "parse_error": parse_error,
-        "wall_clock_seconds": elapsed,
-        "model": sota_model,
-        "sota_route_effective": chosen_route,
-        "params_effective": {
-            "temperature": params.get("temperature"),
-            "top_p": params.get("top_p") if chosen_route == "api" else None,
-            "top_k": params.get("top_k") if chosen_route == "api" else None,
-            "seed": None,  # Anthropic accepts no seed
-            "max_tokens": params.get("max_tokens"),
-            "seed_dropped": seed_dropped,
-        },
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -646,14 +521,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--plausibility-max-tokens", type=int, default=None)
-    parser.add_argument(
-        "--sota-route",
-        choices=["auto", "cli", "api"],
-        default="auto",
-        help="auto: cli if `claude` on PATH else api",
-    )
-    parser.add_argument("--sota-provider", default="anthropic")
-    parser.add_argument("--sota-model", default="claude-sonnet-4-6")
     parser.add_argument("--chunk", type=int, default=None, help="run on this chunk index only")
     parser.add_argument(
         "--dump-dir",
@@ -961,18 +828,17 @@ def main(argv: list[str] | None = None) -> int:
             anon_facts = _build_anon_facts(local_graph.relations, mapping)
 
             enrich_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['enrich']}"
-            enrich_filename = (
-                enrich_calib if (prompts_dir / enrich_calib).exists() else _STAGE_FILENAME["enrich"]
-            )
-            enriched = _run_enrich(
-                facts=anon_facts,
-                transcript=anon_transcript,
-                prompts_dir=prompts_dir,
-                prompt_filename=enrich_filename,
-                sota_route=args.sota_route,
-                sota_provider=args.sota_provider,
-                sota_model=args.sota_model,
-                params=params_base,
+            enrich_override = enrich_calib if (prompts_dir / enrich_calib).exists() else None
+            enriched = _post_stage(
+                args.server,
+                "enrich",
+                {
+                    "facts": anon_facts,
+                    "transcript": anon_transcript,
+                    "prompts_dir": args.prompts_dir,
+                    "enrichment_prompt_filename": enrich_override,
+                    "params": {k: v for k, v in params_base.items() if v is not None},
+                },
             )
             (dump_dir / f"03_enrich_chunk_{chunk_idx}.json").write_text(
                 json.dumps(enriched, indent=2, default=str)

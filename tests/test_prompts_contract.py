@@ -121,26 +121,24 @@ class TestLoadPromptPhaseTraceRecording:
     """``_load_prompt`` records its own resolution via
     :func:`paramem.graph.phase_trace.record_prompt` right after it resolves
     a file (see ``paramem/graph/prompts.py``).  This is the regression pin
-    for the divergence this step exists to close: a calibration run must
-    see the loader's OWN resolved path/content, never a re-implementation
-    of the search order.
+    for a divergence that used to exist: a calibration run must see the
+    loader's OWN resolved path/content, never a re-implementation of the
+    search order.
 
-    That re-implementation is LIVE today, not historical:
-    ``paramem/server/calibrate.py::_read_prompt`` (``calibrate.py:259``)
-    still resolves ``path = Path(prompts_dir) / filename``
-    (``calibrate.py:276``), skipping the ``prompts_dir/<model>`` search
-    ``_load_prompt`` performs, and its return value still feeds the
-    top-level ``prompts`` field reported by 9 call sites across the
-    calibrate handlers (``calibrate.py:605, 608, 718, 721, 819, 895, 973,
-    1112, 1113``).  So ``_read_prompt`` reports a DIFFERENT prompt than
-    production loads whenever a per-model override exists — it does NOT
-    diverge on a merely-absent file (that case raises HTTP 400 at
-    ``calibrate.py:280-286`` rather than silently reporting anything).
-    Fixing ``_read_prompt`` itself is out of scope here (planned
-    separately, by hooking the calibrate handlers into the pipeline and
-    removing these calls) — this test class only pins that
-    ``_load_prompt``'s OWN chokepoint records truthfully, independent of
-    whether ``calibrate.py`` yet consumes that record."""
+    That re-implementation used to be live: ``paramem/server/calibrate.py``
+    carried a ``_read_prompt`` helper that resolved
+    ``path = Path(prompts_dir) / filename`` directly, skipping the
+    ``prompts_dir/<model>`` search ``_load_prompt`` performs, and fed its
+    own return value into the top-level ``prompts`` field reported by
+    several calibrate handlers — so it reported a DIFFERENT prompt than
+    production loaded whenever a per-model override existed.  Every
+    calibrate handler has since been hooked into the ``_run_calibration``
+    primitive, which reads prompt provenance from the phase trace
+    ``_load_prompt`` itself populates (see
+    :func:`paramem.server.calibrate._provenance_from_records`), and
+    ``_read_prompt`` has been removed.  This test class continues to pin
+    that ``_load_prompt``'s OWN chokepoint records truthfully — the
+    property every calibrate handler now depends on directly."""
 
     def test_silent_fallback_to_shipped_default_is_visible_in_record(self, tmp_path):
         """The file is ABSENT from the operator-supplied ``prompts_dir``, so

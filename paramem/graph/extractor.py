@@ -401,41 +401,6 @@ def load_extraction_prompts(
     return system, prompt
 
 
-def load_procedural_prompt(
-    prompts_dir: str | Path | None = None,
-    *,
-    system_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
-    user_filename: str = DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
-    model: str | None = None,
-) -> tuple[str, str]:
-    """Load procedural extraction prompts.
-
-    The prompts this function loads are external config — edit the files
-    under ``configs/prompts/`` to tune extraction behaviour; no code
-    changes are needed.
-
-    Args:
-        prompts_dir: Directory containing the prompt files.  Falls back to
-                     ``configs/prompts/`` in the project root.
-        system_filename: Filename of the system prompt.  Defaults to
-                         :data:`DEFAULT_SYSTEM_PROMPT_FILENAME`.  Used
-                         for every source type — see
-                         :func:`load_extraction_prompts`.
-        user_filename: Filename of the user-turn prompt template.
-                       Defaults to
-                       :data:`DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME`
-                       (``"extraction_procedural.txt"``).  Used for
-                       every source type.
-        model: Model alias (e.g. ``"qwen3-4b"``).  Per-file resolution —
-               see :func:`load_extraction_prompts` for the full search
-               order.  Only local-model extraction prompts are per-model.
-    """
-    pd = Path(prompts_dir) if prompts_dir else None
-    system = _load_prompt(system_filename, prompts_dir=pd, model=model, required=True)
-    prompt = _load_prompt(user_filename, prompts_dir=pd, model=model, required=True)
-    return system, prompt
-
-
 def extract_procedural_graph(
     model,
     tokenizer,
@@ -456,7 +421,22 @@ def extract_procedural_graph(
     """Extract preferences/habits from a session transcript.
 
     Separate extraction pass with a dedicated prompt targeting
-    behavioral patterns rather than factual knowledge.
+    behavioral patterns rather than factual knowledge. Runs through
+    :func:`_run_local_extraction` — the SAME shared generate→parse→trace
+    primitive :func:`extract_graph` uses for its ``local_extract`` and
+    ``second_order_extract`` phases — under its own
+    :func:`~paramem.graph.phase_trace.extraction_trace` scope, self-tracing
+    the ``procedural_extract`` phase. Callers no longer need to open a
+    phase trace around this call; nesting inside an outer
+    ``extraction_trace`` (e.g. the session-level trace opened by
+    consolidation) is a no-op, so the phase record lands wherever the
+    call happens to be nested.
+
+    Because parsing now goes through the shared primitive, this pass gets
+    the same improvements ``local_extract``/``second_order_extract``
+    already have: ``raw_output`` and prompt provenance on the phase
+    record, ``outcome="failed"`` recorded on parse error, and tolerance
+    for a bare-list model output shape.
 
     Args:
         timestamp: Session-start assertion time (ISO 8601), typically the
@@ -496,77 +476,27 @@ def extract_procedural_graph(
             document-only exact-full-name rewrite of third-person speaker
             mentions onto ``speaker_id``.
     """
-    system, prompt = load_procedural_prompt(
-        prompts_dir,
-        system_filename=system_prompt_filename,
-        user_filename=user_prompt_filename,
-        model=model_alias,
-    )
-    speaker_context = build_speaker_context(speaker_id, speaker_name)
-    messages = [
-        {"role": "system", "content": system},
-        {
-            "role": "user",
-            "content": prompt.format(
-                transcript=transcript,
-                speaker_context=speaker_context,
-            ),
-        },
-    ]
-    formatted = tokenizer.apply_chat_template(
-        adapt_messages(messages, tokenizer),
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    # vram_scope: procedural extraction is a separate generate per session
-    # that follows the main extraction + anonymization + plausibility chain.
-    # Empty cache before it runs so its prefill does not pile onto residual
-    # KV cache from the prior phases. Symmetric with the other wraps.
-    with vram_scope("procedural"):
-        raw_output = generate_answer(
+    with extraction_trace() as trace:
+        graph = _run_local_extraction(
             model,
             tokenizer,
-            formatted,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            seed=seed,
+            transcript,
+            session_id,
+            speaker_id,
+            temperature,
+            max_tokens,
+            prompts_dir,
+            speaker_name,
+            system_prompt_filename,
+            user_prompt_filename,
+            model_alias,
+            seed,
+            timestamp,
+            source_type,
+            phase_name="procedural_extract",
+            vram_label="procedural",
         )
-    logger.debug("Procedural extraction raw: %s", raw_output[:500])
-
-    try:
-        json_str = _extract_json_block(raw_output)
-        data = json.loads(json_str)
-        data["session_id"] = session_id
-        data["timestamp"] = timestamp or datetime.now(timezone.utc).isoformat()
-        data = _normalize_extraction(data)
-        # Stamp speaker_id onto every relation dict before schema validation.
-        # Relation.speaker_id is mandatory; the LLM output never includes it.
-        for rel_dict in data.get("relations", []):
-            rel_dict.setdefault("speaker_id", speaker_id)
-        graph = SessionGraph.model_validate(data)
-    except Exception as exc:
-        # Broad catch is intentional: malformed model output can produce any
-        # JSON/parse/schema error shape, and the recovery action is always the
-        # same — return an empty graph so the session is skipped cleanly.
-        logger.warning("Procedural extraction failed (%s), returning empty", exc)
-        return SessionGraph(
-            session_id=session_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
-    # _stamp_speaker_entity runs on an already-validated graph; it cannot fail
-    # on malformed model output and must not be swallowed by the parse guard.
-    if speaker_id:
-        graph = _stamp_speaker_entity(
-            graph, speaker_id=speaker_id, speaker_name=speaker_name, source_type=source_type
-        )
-
-    logger.info(
-        "Procedural extraction: %d entities, %d relations (session=%s)",
-        len(graph.entities),
-        len(graph.relations),
-        session_id,
-    )
+        trace.attach_to(graph)
     return graph
 
 
@@ -597,19 +527,22 @@ def _run_local_extraction(
     source_type: str,
     *,
     phase_name: str,
+    vram_label: str = "extract_main",
 ) -> SessionGraph:
     """Shared generate→parse→summarise→trace primitive for a local-model
     extraction phase.
 
-    This is the ONE shared implementation for BOTH local-model extraction
-    passes ``extract_graph`` runs — ``local_extract`` (first-order:
-    extracts from the raw transcript) and ``second_order_extract``
-    (second-order: re-extracts facts about the named non-speaker people
-    ``local_extract`` surfaced) — differing only by which prompt is loaded
-    (``user_prompt_filename``) and the ``phase_name`` recorded on the
-    trace. Must be called from inside an active
-    :func:`~paramem.graph.phase_trace.extraction_trace` scope (both call
-    sites are, via :func:`extract_graph`).
+    This is the ONE shared implementation for EVERY local-model extraction
+    pass — ``extract_graph``'s ``local_extract`` (first-order: extracts
+    from the raw transcript) and ``second_order_extract`` (second-order:
+    re-extracts facts about the named non-speaker people ``local_extract``
+    surfaced), plus ``extract_procedural_graph``'s ``procedural_extract``
+    (behavioral-pattern pass) — differing only by which prompt is loaded
+    (``user_prompt_filename``), the ``phase_name`` recorded on the trace,
+    and the ``vram_label`` used for the generate's VRAM scope. Must be
+    called from inside an active
+    :func:`~paramem.graph.phase_trace.extraction_trace` scope (all call
+    sites are — via :func:`extract_graph` or :func:`extract_procedural_graph`).
 
     On parse failure, records ``outcome="failed"`` on the phase trace and
     returns an empty :class:`SessionGraph` for ``session_id``/``timestamp``
@@ -631,6 +564,7 @@ def _run_local_extraction(
             user_prompt_filename=user_prompt_filename,
             model_alias=model_alias,
             seed=seed,
+            vram_label=vram_label,
         )
         t.set_raw(raw_output)
         logger.debug("Raw extraction output (%s): %s", phase_name, raw_output[:500])
@@ -1170,6 +1104,7 @@ def _generate_extraction(
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
     model_alias: str | None = None,
     seed: int | None = None,
+    vram_label: str = "extract_main",
 ) -> str:
     """Generate graph extraction output from the model. Called once.
 
@@ -1190,6 +1125,12 @@ def _generate_extraction(
 
     ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the
     default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
+
+    ``vram_label`` names the :func:`~paramem.server.vram_guard.vram_scope`
+    wrap around the generate call. Defaults to ``"extract_main"``
+    (``local_extract``/``second_order_extract``); callers with a distinct
+    VRAM-telemetry identity (e.g. ``extract_procedural_graph`` using
+    ``"procedural"``) override it.
     """
     system, prompt = load_extraction_prompts(
         prompts_dir,
@@ -1219,7 +1160,7 @@ def _generate_extraction(
     # ``past_key_values`` from this generate stay pinned and compound into
     # the next phase's allocation. Symmetric with the plausibility and
     # qa-gen wraps elsewhere in the chain.
-    with vram_scope("extract_main"):
+    with vram_scope(vram_label):
         return generate_answer(
             model,
             tokenizer,
@@ -1522,7 +1463,11 @@ def _extract_json_block(text: str) -> str:
 
     Error messages distinguish three fail modes:
     a. ``saw_decode_success_no_envelope=True`` → JSON parsed but no
-       envelope keys → likely outer-envelope truncation.
+       envelope keys → outer-envelope truncation if ``src`` does not end
+       on a closing brace/bracket, otherwise (response looks complete)
+       invalid JSON inside a string value — e.g. an unescaped control
+       character (illegal per RFC 8259) — is reported as the likely
+       cause instead.
     b. ``last_exc is not None`` → some ``{`` / ``[`` candidates existed
        but none parsed → likely all garbage / prose / corruption.
     c. No candidates at all → no JSON in the response.
@@ -1607,15 +1552,37 @@ def _extract_json_block(text: str) -> str:
         pos = end
 
     if saw_decode_success_no_envelope:
-        # Some JSON parsed cleanly but none had envelope keys — most
-        # likely the outer envelope was truncated at ``max_tokens`` and
-        # only inner sub-objects survived.
+        # Some JSON parsed cleanly but none had envelope keys.  Two
+        # distinct root causes land here and must not be conflated:
+        # (a) the outer envelope was truncated at ``max_tokens`` and
+        # only inner sub-objects survived — ``src`` will not end on a
+        # closing brace/bracket; (b) the response was complete (``src``
+        # DOES end on a closing brace/bracket) but the outer envelope
+        # still failed ``raw_decode`` for another reason — e.g. an
+        # unescaped control character inside a string value (illegal
+        # per RFC 8259) — and only an inner sub-object parsed cleanly.
+        # Asserting truncation unconditionally misdiagnoses (b).
+        truncated_looking = not src.rstrip().endswith(("}", "]"))
+        if truncated_looking:
+            likely_cause = f"outer envelope truncated at max_tokens (response length {src_len})"
+        else:
+            likely_cause = (
+                "response looks complete (ends on a closing brace/bracket) but the "
+                "outer envelope still failed to parse — check for an unescaped "
+                "control character or other invalid JSON inside a string value"
+            )
+        last_error_note = (
+            f" Last parse error before the accepted candidate: {last_exc.msg} "
+            f"(offset {last_offset})."
+            if last_exc is not None
+            else ""
+        )
         raise ValueError(
             "Parsed JSON values found in model output but none have "
             "envelope keys (entities/relations/facts/new_entity_bindings/"
-            "summary; non-empty list also accepted). Likely cause: outer "
-            f"envelope truncated at max_tokens (response length {src_len}). "
-            "Bump extraction_max_tokens or reduce input chunk size."
+            f"summary; non-empty list also accepted). Likely cause: {likely_cause}."
+            f"{last_error_note} Bump extraction_max_tokens or reduce input chunk "
+            "size if truncated."
         )
     if last_exc is not None:
         # Candidates existed but none parsed — could be prose-only output,
@@ -2001,7 +1968,7 @@ def _sota_pipeline(
     if key_env_name is None:
         logger.warning("Unsupported SOTA provider %r — skipping enrichment", provider)
         return graph
-    api_key = os.environ.get(key_env_name, "")
+    api_key = _resolve_sota_api_key(provider) or ""
     # Collect ALL config gaps before returning so a single warning surfaces
     # everything missing — avoids the "fix the key, then discover the endpoint
     # was also missing on the next run" loop.
@@ -2886,13 +2853,25 @@ def anonymize_with_local_model(
 
     ``mapping`` is ``None`` — the fail-closed signal — on PARSE
     FAILURE (the response was not a well-formed ``{"mapping": {...},
-    "anonymized_transcript": "..."}`` envelope) OR when
+    "anonymized_transcript": [...]}`` envelope) OR when
     ``anonymized_transcript`` is missing/empty/whitespace-only.  Callers
     MUST never fall back to the original real-name transcript on this
     signal.  ``mapping`` is ``{}`` (with a non-empty
     ``anonymized_transcript``) when the model found nothing in scope to
     anonymize — a legitimate empty result, distinguishable from
     fail-closed.
+
+    ``anonymized_transcript`` in the model's response is a JSON array of
+    turn strings (one element per turn) per the ``configs/prompts/
+    anonymization.txt`` contract — this keeps every turn on its own line
+    so a multi-turn rewrite can never contain a literal newline inside a
+    JSON string value (illegal per RFC 8259, the root cause of an
+    observed multi-turn parse failure).  The array is joined with
+    ``"\\n"`` back into a single transcript string before being returned.
+    A plain ``str`` value is also still accepted and returned unchanged,
+    since the model may emit the pre-contract shape; either way an empty
+    result, a non-list/non-str value, or a list containing a non-``str``
+    element is fail-closed.
 
     The raw model output is the third element so the calibration phase
     trace can record it without re-running the call.  ``anonymized_transcript``
@@ -2967,6 +2946,15 @@ def anonymize_with_local_model(
             logger.warning("Anonymization returned unexpected format")
             return None, "", raw
         anon_transcript = data.get("anonymized_transcript")
+        if isinstance(anon_transcript, list):
+            # Contract shape: one turn string per element (see
+            # configs/prompts/anonymization.txt) — join back into a
+            # single transcript.  Any non-str element makes the whole
+            # response untrustworthy, not just that element.
+            if not anon_transcript or not all(isinstance(t, str) for t in anon_transcript):
+                logger.warning("Anonymization returned a malformed anonymized_transcript array")
+                return None, "", raw
+            anon_transcript = "\n".join(anon_transcript)
         if not isinstance(anon_transcript, str) or not anon_transcript.strip():
             # Fail-closed: a mapping with no accompanying transcript
             # rewrite is not a safe egress artifact — never fall back to
@@ -3000,6 +2988,28 @@ PROVIDER_KEY_ENV = {
     "mistral": "MISTRAL_API_KEY",
     "ollama": "OLLAMA_API_KEY",
 }
+
+
+def _resolve_sota_api_key(provider: str) -> str | None:
+    """Resolve the API key for a SOTA provider from its configured env var.
+
+    Looks ``provider`` up in :data:`PROVIDER_KEY_ENV` for the env var name,
+    then reads that var from the environment.  Returns ``None`` when the
+    provider is not in the registry OR its env var is unset/empty — the
+    two cases are indistinguishable from this return value alone.
+    :func:`_sota_pipeline` still branches on
+    ``PROVIDER_KEY_ENV.get(provider) is None`` directly where it needs to
+    log a distinct "unsupported provider" warning; this helper only does
+    the env lookup, shared so the resolution logic is not duplicated at
+    each call site (:func:`_sota_pipeline`,
+    :func:`~paramem.server.calibrate.calibrate_enrich`).
+    """
+    import os
+
+    key_env_name = PROVIDER_KEY_ENV.get(provider)
+    if key_env_name is None:
+        return None
+    return os.environ.get(key_env_name) or None
 
 
 _SOTA_ENRICHMENT_SYSTEM_PROMPT = _load_prompt("sota_enrichment_system.txt", required=True)
@@ -3266,6 +3276,7 @@ def _filter_with_sota(
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
     prompts_dir: str | Path | None = None,
+    prompt_filename: str = "sota_enrichment.txt",
 ) -> tuple[list[dict] | None, str | None, dict[str, str], str | None, dict]:
     """SOTA enrichment pass — coreference + compound splitting + safe reification.
 
@@ -3304,9 +3315,13 @@ def _filter_with_sota(
 
     ``prompts_dir`` overrides the search directory (forwarded to
     :func:`_load_prompt`) so a calibration override actually reaches the
-    model; it defaults to the production template.
+    model; it defaults to the production template. ``prompt_filename``
+    overrides the file name within that directory (the production caller,
+    :func:`_sota_pipeline`, keeps the default); consistent with the
+    ``prompt_filename`` parameter on :func:`anonymize_with_local_model` and
+    :func:`local_plausibility_filter`.
     """
-    enrichment_prompt = _load_prompt("sota_enrichment.txt", prompts_dir=prompts_dir, required=True)
+    enrichment_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
     facts_json, transcript_text = _sota_facing_payload(anon_facts, anon_transcript)
     prompt = enrichment_prompt.format(facts_json=facts_json, transcript=transcript_text)
     raw = _sota_call(

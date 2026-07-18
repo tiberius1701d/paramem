@@ -12,9 +12,9 @@ from __future__ import annotations
 import re
 
 from paramem.graph.extractor import (
+    DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
     load_anonymization_prompt,
     load_extraction_prompts,
-    load_procedural_prompt,
 )
 from paramem.graph.schema_config import (
     entity_types,
@@ -118,7 +118,7 @@ class TestProceduralPromptRender:
         reset_cache()
 
     def test_renders_without_exception(self):
-        _, prompt = load_procedural_prompt()
+        _, prompt = load_extraction_prompts(user_filename=DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME)
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
@@ -126,7 +126,7 @@ class TestProceduralPromptRender:
         assert isinstance(rendered, str)
 
     def test_no_leftover_placeholders(self):
-        _, prompt = load_procedural_prompt()
+        _, prompt = load_extraction_prompts(user_filename=DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME)
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",
@@ -137,7 +137,7 @@ class TestProceduralPromptRender:
         assert leftover == [], f"Leftover placeholders after render: {leftover}"
 
     def test_procedural_entity_types_in_rendered_output(self):
-        _, prompt = load_procedural_prompt()
+        _, prompt = load_extraction_prompts(user_filename=DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME)
         rendered = prompt.format(
             transcript="sample",
             speaker_context="",

@@ -27,20 +27,20 @@ from pydantic import ValidationError
 from paramem.graph.extraction_pipeline import ExtractionPipeline
 from paramem.server.calibrate import (
     CalibrateAnonymizeRequest,
+    CalibrateEnrichRequest,
     CalibrateExtractRequest,
     CalibrateNameRequest,
     CalibrateNormalizeRequest,
     CalibrateParams,
     CalibratePlausibilityRequest,
     CalibrateProceduralRequest,
-    _build_calibrate_response,
     _effective_params,
-    _Measurement,
     _preflight,
     _production_turn_markers,
-    _read_prompt,
     _require_turn_marked_transcript,
+    _run_calibration,
     calibrate_anonymize,
+    calibrate_enrich,
     calibrate_extract,
     calibrate_name,
     calibrate_normalize,
@@ -127,28 +127,6 @@ class TestPreflight:
     def test_passes_when_enabled_idle_loaded(self):
         # Should not raise.
         _preflight(_state_enabled())
-
-
-class TestReadPrompt:
-    def test_missing_file_raises_400(self, tmp_path):
-        with pytest.raises(HTTPException) as exc:
-            _read_prompt(tmp_path, "does_not_exist.txt")
-        assert exc.value.status_code == 400
-        assert "prompt file not found" in exc.value.detail.lower()
-
-    def test_returns_path_sha_content(self, tmp_path):
-        f = tmp_path / "p.txt"
-        f.write_text("hello prompt", encoding="utf-8")
-        path, sha, content = _read_prompt(tmp_path, "p.txt")
-        assert path == str(f)
-        assert content == "hello prompt"
-        assert len(sha) == 12 and all(c in "0123456789abcdef" for c in sha)
-
-    def test_default_prompts_dir_when_none(self):
-        # When prompts_dir is None, the default is configs/prompts/.
-        # We exercise the path-construction branch only.
-        with pytest.raises(HTTPException):
-            _read_prompt(None, "does_not_exist_12345.txt")
 
 
 class TestRequireTurnMarkedTranscript:
@@ -292,6 +270,85 @@ class TestCalibrateExtract:
         assert state["consolidation_loop"].extraction.run.called
         assert result["stage"] == "extract"
 
+    def test_prompt_override_reaches_model(self, tmp_path):
+        """A prompts_dir + filename override actually drives the model call,
+        with a REAL ``ExtractionPipeline`` (not a mocked ``.run``).
+
+        Regression guard for the ``_run_calibration(entry="pipeline")``
+        conversion: provenance must come from the ``local_extract`` phase
+        record the pipeline itself opens (via ``_load_prompt``'s
+        ``record_prompt`` call) — never a hand-built ``prompts=[...]``
+        literal. Mirrors
+        ``TestCalibratePlausibility::test_prompt_override_reaches_model``.
+        ``stop_phase="local_extract"`` keeps the run cheap (no SOTA/second-
+        order passes).
+        """
+        import unittest.mock as _mock
+
+        from paramem.graph.extraction_pipeline import ExtractionConfig
+        from paramem.graph.prompts import _load_prompt
+
+        state = _state_enabled()
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        sentinel = "SENTINEL-EXTRACT-OVERRIDE"
+        (prompts_dir / "my_extract.txt").write_text(
+            f"{sentinel}\n{{speaker_context}}\ntranscript: {{transcript}}"
+        )
+        (prompts_dir / "my_extract_system.txt").write_text("SENTINEL-EXTRACT-SYSTEM")
+
+        pipeline = ExtractionPipeline(
+            state["model"], state["tokenizer"], config=ExtractionConfig(scrub=set())
+        )
+        loop = MagicMock()
+        loop.extraction = pipeline
+        loop.model = state["model"]
+        state["consolidation_loop"] = loop
+
+        captured: list[list[dict]] = []
+
+        def _capture_template(messages, **kw):
+            captured.append(messages)
+            return "formatted-prompt"
+
+        state["tokenizer"].apply_chat_template.side_effect = _capture_template
+
+        req = CalibrateExtractRequest(
+            transcript="[user] hello there",
+            speaker_id="speaker0",
+            source_type="transcript",
+            prompts_dir=str(prompts_dir),
+            extraction_prompt_filename="my_extract.txt",
+            extraction_system_prompt_filename="my_extract_system.txt",
+            stop_phase="local_extract",
+        )
+
+        with (
+            _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
+            _mock.patch(
+                "paramem.graph.extractor.generate_answer",
+                return_value='{"entities": [], "relations": []}',
+            ),
+        ):
+            result = calibrate_extract(state, req)
+
+        assert result["stage"] == "extract"
+        assert captured, "apply_chat_template was never called"
+        user_content = next(m["content"] for m in captured[0] if m["role"] == "user")
+        assert sentinel in user_content, (
+            f"Model received default prompt instead of override: {user_content!r}"
+        )
+
+        # Reported provenance comes from the real phase-trace record
+        # (populated by _load_prompt's own record_prompt call inside
+        # _generate_extraction), not a hand-built _read_prompt literal.
+        expected = _load_prompt("my_extract.txt", prompts_dir=prompts_dir, required=True)
+        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
+        shas = {p["sha"] for p in result["prompts"]}
+        templates = {p["template"] for p in result["prompts"]}
+        assert expected_sha in shas
+        assert expected in templates
+
 
 class TestCalibrateProceduralRequest:
     """Schema-level tests for CalibrateProceduralRequest (no GPU)."""
@@ -363,6 +420,88 @@ class TestCalibrateProcedural:
         result = calibrate_procedural(state, req)
         assert state["consolidation_loop"].extraction.run_procedural.called
         assert result["stage"] == "procedural"
+
+    def test_prompt_override_reaches_model(self, tmp_path):
+        """A prompts_dir + filename override actually drives the model call,
+        with a REAL ``ExtractionPipeline`` (not a mocked ``.run_procedural``).
+
+        Regression guard for the ``_run_calibration(entry="pipeline")``
+        conversion: procedural extraction now runs through the shared
+        ``_run_local_extraction`` primitive inside ``extract_procedural_graph``,
+        which self-traces the ``procedural_extract`` phase — proven here by
+        asserting ``result["phases"]`` carries that record.  Provenance
+        comes from the real phase-trace record (``_load_prompt``'s own
+        ``record_prompt`` call), never a hand-built ``prompts=[...]``
+        literal.
+        """
+        import unittest.mock as _mock
+
+        from paramem.graph.extraction_pipeline import ExtractionConfig
+        from paramem.graph.prompts import _load_prompt
+
+        state = _state_enabled()
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        sentinel = "SENTINEL-PROCEDURAL-OVERRIDE"
+        (prompts_dir / "my_procedural.txt").write_text(
+            f"{sentinel}\n{{speaker_context}}\ntranscript: {{transcript}}"
+        )
+        (prompts_dir / "my_procedural_system.txt").write_text("SENTINEL-PROCEDURAL-SYSTEM")
+
+        pipeline = ExtractionPipeline(
+            state["model"], state["tokenizer"], config=ExtractionConfig(scrub=set())
+        )
+        loop = MagicMock()
+        loop.extraction = pipeline
+        loop.model = state["model"]
+        state["consolidation_loop"] = loop
+
+        captured: list[list[dict]] = []
+
+        def _capture_template(messages, **kw):
+            captured.append(messages)
+            return "formatted-prompt"
+
+        state["tokenizer"].apply_chat_template.side_effect = _capture_template
+
+        req = CalibrateProceduralRequest(
+            transcript="[user] hello there",
+            speaker_id="speaker0",
+            source_type="transcript",
+            prompts_dir=str(prompts_dir),
+            procedural_prompt_filename="my_procedural.txt",
+            procedural_system_prompt_filename="my_procedural_system.txt",
+        )
+
+        with (
+            _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
+            _mock.patch(
+                "paramem.graph.extractor.generate_answer",
+                return_value='{"entities": [], "relations": []}',
+            ),
+        ):
+            result = calibrate_procedural(state, req)
+
+        assert result["stage"] == "procedural"
+        assert captured, "apply_chat_template was never called"
+        user_content = next(m["content"] for m in captured[0] if m["role"] == "user")
+        assert sentinel in user_content, (
+            f"Model received default prompt instead of override: {user_content!r}"
+        )
+
+        expected = _load_prompt("my_procedural.txt", prompts_dir=prompts_dir, required=True)
+        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
+        shas = {p["sha"] for p in result["prompts"]}
+        templates = {p["template"] for p in result["prompts"]}
+        assert result["prompts"], "procedural stage must surface prompt provenance"
+        assert expected_sha in shas
+        assert expected in templates
+
+        # Proves self-tracing: extract_procedural_graph opens its own
+        # extraction_trace() and records a "procedural_extract" phase that
+        # nest-no-ops onto _run_calibration's outer trace.
+        phase_names = {p.get("name") for p in result["phases"]}
+        assert "procedural_extract" in phase_names
 
 
 class TestCalibrateAnonymize:
@@ -732,6 +871,159 @@ class TestCalibratePlausibility:
         assert result["stage"] == "plausibility"
 
 
+class TestCalibrateEnrich:
+    """Tests for CalibrateEnrichRequest validation and calibrate_enrich.
+
+    Mirrors ``TestCalibratePlausibility`` — ``calibrate_enrich`` is the
+    same ``_run_calibration(entry="standalone")`` shape, wrapping
+    ``_filter_with_sota`` (the production ``sota_enrich`` stage) instead
+    of ``local_plausibility_filter``.  The SOTA provider config
+    (``extraction_noise_filter`` / ``_model`` / ``_endpoint``) is not on
+    the shared ``_state_enabled()`` fixture's ``consolidation``
+    ``SimpleNamespace`` by default, so each test sets the attributes it
+    needs directly (``SimpleNamespace`` accepts arbitrary attributes).
+    """
+
+    def test_disabled_404(self):
+        req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
+        with pytest.raises(HTTPException) as exc:
+            calibrate_enrich(_state_disabled(), req)
+        assert exc.value.status_code == 404
+
+    def test_unmarked_transcript_raises_400(self):
+        """Mutation: remove the gate call from ``calibrate_enrich`` ->
+        this test fails (no 400, or ``_filter_with_sota`` runs)."""
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        state["config"].consolidation.extraction_noise_filter = "anthropic"
+        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        req = CalibrateEnrichRequest(facts=[], transcript="Should I call the vet?")
+        with (
+            _mock.patch("paramem.graph.extractor._filter_with_sota") as helper,
+            pytest.raises(HTTPException) as exc,
+        ):
+            calibrate_enrich(state, req)
+        assert exc.value.status_code == 400
+        assert "turn-marked" in exc.value.detail.lower()
+        assert not helper.called
+
+    def test_provider_not_configured_400(self):
+        """Empty ``extraction_noise_filter`` (production default) -> 400,
+        no cloud call."""
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        state["config"].consolidation.extraction_noise_filter = ""
+        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
+        with (
+            _mock.patch("paramem.graph.extractor._filter_with_sota") as helper,
+            pytest.raises(HTTPException) as exc,
+        ):
+            calibrate_enrich(state, req)
+        assert exc.value.status_code == 400
+        assert "not configured" in exc.value.detail.lower()
+        assert not helper.called
+
+    def test_missing_api_key_400(self, monkeypatch: pytest.MonkeyPatch):
+        """Provider configured but its key env var is unset -> 400, no cloud call."""
+        import unittest.mock as _mock
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        state = _state_enabled()
+        state["config"].consolidation.extraction_noise_filter = "anthropic"
+        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        req = CalibrateEnrichRequest(facts=[], transcript="[user] x")
+        with (
+            _mock.patch("paramem.graph.extractor._filter_with_sota") as helper,
+            pytest.raises(HTTPException) as exc,
+        ):
+            calibrate_enrich(state, req)
+        assert exc.value.status_code == 400
+        assert "no api key" in exc.value.detail.lower()
+        assert not helper.called
+
+    def test_success(self, monkeypatch: pytest.MonkeyPatch):
+        """Provider configured + key present -> ``_filter_with_sota`` runs;
+        its returned facts surface at ``result["parsed"]["facts"]``."""
+        import unittest.mock as _mock
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        state = _state_enabled()
+        state["config"].consolidation.extraction_noise_filter = "anthropic"
+        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+        req = CalibrateEnrichRequest(
+            facts=[{"subject": "speaker0", "predicate": "likes", "object": "coffee"}],
+            transcript="[user] I like coffee.",
+        )
+        enriched_facts = [{"subject": "speaker0", "predicate": "likes", "object": "coffee"}]
+        with _mock.patch(
+            "paramem.graph.extractor._filter_with_sota",
+            return_value=(enriched_facts, "anon transcript", {}, "raw", {}),
+        ) as helper:
+            result = calibrate_enrich(state, req)
+        assert helper.called
+        assert result["stage"] == "enrich"
+        assert result["parsed"]["facts"] == enriched_facts
+
+    def test_prompt_override_reaches_model(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
+        """A prompts_dir + filename override actually drives the cloud call.
+
+        Mirrors ``TestCalibratePlausibility::test_prompt_override_reaches_model``.
+        Patches the leaf cloud call (``_filter_anthropic``), NOT
+        ``_filter_with_sota`` itself, so the real ``_load_prompt`` call
+        inside ``_filter_with_sota`` records onto the ``sota_enrich``
+        phase trace — provenance must come from that real record, not a
+        hand-built ``prompts=[...]`` literal.
+        """
+        import unittest.mock as _mock
+
+        from paramem.graph.prompts import _load_prompt
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        state = _state_enabled()
+        state["config"].consolidation.extraction_noise_filter = "anthropic"
+        state["config"].consolidation.extraction_noise_filter_model = "claude-sonnet-4-6"
+        state["config"].consolidation.extraction_noise_filter_endpoint = ""
+
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        sentinel = "SENTINEL-ENRICH-OVERRIDE"
+        (prompts_dir / "my_enrich.txt").write_text(
+            f"{sentinel}\nfacts: {{facts_json}}\ntranscript: {{transcript}}"
+        )
+
+        req = CalibrateEnrichRequest(
+            facts=[],
+            transcript="[user] hello there",
+            prompts_dir=str(prompts_dir),
+            enrichment_prompt_filename="my_enrich.txt",
+        )
+
+        with _mock.patch(
+            "paramem.graph.extractor._filter_anthropic",
+            return_value='{"add": [], "modify": [], "drop": [], "bindings": {}}',
+        ):
+            result = calibrate_enrich(state, req)
+
+        assert result["stage"] == "enrich"
+
+        # Reported provenance is sourced from the real phase-trace record
+        # (populated by `_load_prompt`'s own `record_prompt` call inside
+        # `_filter_with_sota`), not a hand-built `prompts=[...]` literal.
+        expected = _load_prompt("my_enrich.txt", prompts_dir=prompts_dir, required=True)
+        expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
+        shas = {p["sha"] for p in result["prompts"]}
+        templates = {p["template"] for p in result["prompts"]}
+        assert expected_sha in shas
+        assert expected in templates
+
+
 class TestCalibrateNormalize:
     """Tests for CalibrateNormalizeRequest validation and calibrate_normalize."""
 
@@ -919,11 +1211,18 @@ class TestEffectiveParamsSeed:
         assert result["seed"] is None
 
 
-class TestBuildCalibrateResponse:
-    """Verify _build_calibrate_response emits the expected uniform envelope.
+class TestRunCalibrationResponseEnvelope:
+    """Verify _run_calibration's inlined response assembly emits the
+    expected uniform envelope.
 
-    This proves the Seam-B factoring is behavior-preserving: the 9-key tail
-    matches what the five handlers previously assembled inline.
+    ``_build_calibrate_response`` (the former single-caller indirection)
+    has been folded directly into :func:`_run_calibration`; these tests
+    exercise the envelope through a trivial ``guard``/``dispatch`` pair
+    that returns a fixed ``(raw_output, parsed)`` so the assembly logic
+    is pinned independent of any one handler's real behavior.  This
+    proves the fold is behavior-preserving: the 11-key tail (plus
+    ``phases``) matches what the six handlers previously assembled via
+    the now-deleted ``_build_calibrate_response``.
     """
 
     _REQUIRED_KEYS = {
@@ -940,121 +1239,72 @@ class TestBuildCalibrateResponse:
         "vram_after",
     }
 
-    def _make_measurement(self, elapsed: float = 0.5) -> _Measurement:
-        m = _Measurement()
-        m.vram_before = {"alloc_mib": 100.0}
-        m.vram_after = {"alloc_mib": 110.0}
-        m.elapsed = elapsed
-        return m
+    def _run(
+        self,
+        *,
+        stage: str = "anonymize",
+        raw_output="some output",
+        parsed: dict | None = None,
+        params: CalibrateParams | None = None,
+        supports_seed: bool = True,
+        state: dict | None = None,
+    ) -> dict:
+        state = state if state is not None else _state_enabled()
+        params = params if params is not None else CalibrateParams()
+        parsed = parsed if parsed is not None else {}
+
+        def guard() -> None:
+            return None
+
+        def dispatch() -> tuple:
+            return raw_output, parsed
+
+        return _run_calibration(
+            stage=stage,
+            entry="standalone",
+            phase="anonymize",
+            guard=guard,
+            dispatch=dispatch,
+            input_prompt_phase="anonymize",
+            state=state,
+            params=params,
+            supports_seed=supports_seed,
+        )
 
     def test_all_required_keys_present(self):
         """All 11 uniform keys appear in the output."""
-        state = _state_enabled()
-        result = _build_calibrate_response(
-            stage="anonymize",
-            prompts=[{"path": "p.txt", "sha": "abc", "template": "hello"}],
-            raw_output="some output",
-            parsed={"mapping": {}},
-            input_prompt_text="hello",
-            measurement=self._make_measurement(),
-            params=CalibrateParams(),
-            state=state,
-        )
-        assert self._required_keys_present(result)
-
-    def _required_keys_present(self, result: dict) -> bool:
-        return self._REQUIRED_KEYS.issubset(result.keys())
+        result = self._run(raw_output="some output", parsed={"mapping": {}})
+        assert self._REQUIRED_KEYS.issubset(result.keys())
 
     def test_stage_field_matches_argument(self):
-        state = _state_enabled()
-        result = _build_calibrate_response(
-            stage="plausibility",
-            prompts=[],
-            raw_output="x",
-            parsed={},
-            input_prompt_text="x",
-            measurement=self._make_measurement(),
-            params=CalibrateParams(),
-            state=state,
-        )
+        result = self._run(stage="plausibility")
         assert result["stage"] == "plausibility"
 
-    def test_elapsed_propagated(self):
-        state = _state_enabled()
-        result = _build_calibrate_response(
-            stage="anonymize",
-            prompts=[],
-            raw_output="x",
-            parsed={},
-            input_prompt_text="x",
-            measurement=self._make_measurement(elapsed=1.23),
-            params=CalibrateParams(),
-            state=state,
-        )
-        assert result["wall_clock_seconds"] == pytest.approx(1.23)
+    def test_wall_clock_seconds_present_and_nonnegative(self):
+        result = self._run()
+        assert result["wall_clock_seconds"] >= 0
 
-    def test_vram_blocks_propagated(self):
-        state = _state_enabled()
-        m = self._make_measurement()
-        result = _build_calibrate_response(
-            stage="anonymize",
-            prompts=[],
-            raw_output="",
-            parsed={},
-            input_prompt_text="",
-            measurement=m,
-            params=CalibrateParams(),
-            state=state,
-        )
-        assert result["vram_before"] == m.vram_before
-        assert result["vram_after"] == m.vram_after
+    def test_vram_keys_present(self):
+        result = self._run()
+        assert "vram_before" in result
+        assert "vram_after" in result
 
     def test_n_output_tokens_minus1_for_empty_raw_output(self):
         """Empty raw_output → n_output_tokens == -1."""
-        state = _state_enabled()
-        result = _build_calibrate_response(
-            stage="anonymize",
-            prompts=[],
-            raw_output="",
-            parsed={},
-            input_prompt_text="",
-            measurement=self._make_measurement(),
-            params=CalibrateParams(),
-            state=state,
-        )
+        result = self._run(raw_output="")
         assert result["n_output_tokens"] == -1
 
-    def test_extra_kwargs_merged(self):
-        """Extra kwargs (e.g. phases=) are merged into the response."""
-        state = _state_enabled()
-        result = _build_calibrate_response(
-            stage="extract",
-            prompts=[],
-            raw_output="x",
-            parsed={},
-            input_prompt_text="x",
-            measurement=self._make_measurement(),
-            params=CalibrateParams(),
-            state=state,
-            phases=[{"name": "local_extract", "raw_output": "x"}],
-        )
+    def test_phases_present_from_trace(self):
+        """``phases`` is populated from the phase-trace records the
+        ``entry="standalone"`` scope opens around ``dispatch`` — no
+        caller passes it in directly."""
+        result = self._run()
         assert "phases" in result
-        assert result["phases"][0]["name"] == "local_extract"
+        assert any(p["name"] == "anonymize" for p in result["phases"])
 
     def test_supports_seed_false_nulls_seed(self):
         """supports_seed=False causes seed=null in params_effective."""
-        state = _state_enabled()
-        result = _build_calibrate_response(
-            stage="anonymize",
-            prompts=[],
-            raw_output="",
-            parsed={},
-            input_prompt_text="",
-            measurement=self._make_measurement(),
-            params=CalibrateParams(seed=99),
-            state=state,
-            supports_seed=False,
-        )
+        result = self._run(params=CalibrateParams(seed=99), supports_seed=False)
         assert result["params_effective"]["seed"] is None
 
 

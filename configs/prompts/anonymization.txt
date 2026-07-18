@@ -1,4 +1,4 @@
-Identify every value in the extracted personal facts and transcript that is an instance of one of the listed PII categories, decide a type-prefixed placeholder for each, and rewrite the transcript with those values replaced. Return BOTH a `real_value → placeholder` mapping AND the rewritten `anonymized_transcript` — no other keys.
+Identify every value in the extracted personal facts and transcript that is an instance of one of the listed PII categories, decide a type-prefixed placeholder for each, and rewrite the transcript with those values replaced. Return BOTH a `real_value → placeholder` mapping AND the rewritten `anonymized_transcript` as a JSON array of turn strings, one element per turn — no other keys.
 
 ## Scope
 
@@ -25,7 +25,7 @@ Each placeholder is `<Prefix>_<N>` where:
 - Use the SAME placeholder for every occurrence of a value across the facts, the transcript, and your `anonymized_transcript` output.
 - The facts and transcript below are the material to work from. Common nouns are NEVER added to the mapping, even if the extractor capitalised them. "Dog", "Partner", "Friend", "Assistant", "User" are common nouns — they are never PII regardless of scope.
 - Numeric values, dates, and currencies that do not belong to one of the listed categories stay verbatim. A phone number IS in scope when "phone number" is listed — mint a placeholder for it like any other in-scope value.
-- **`anonymized_transcript` is a faithful rewrite of the transcript, changing ONLY the values you placeholdered.** Wording, punctuation, and structure everywhere else must be identical to the original. Do not summarize, paraphrase, drop, or add content beyond the substitutions.
+- **`anonymized_transcript` is a JSON array of turn strings, one element per turn, in the same order as the input, each a faithful rewrite of that turn changing ONLY the values you placeholdered.** Keep every `[user]`/`[assistant]` marker with its turn. Wording, punctuation, and structure everywhere else must be identical to the original. Do not summarize, paraphrase, drop, merge turns, or add content beyond the substitutions.
 
 ## Examples
 
@@ -34,7 +34,7 @@ scrub categories: person name
 facts: [{{"subject": "Alice", "predicate": "lives_in", "object": "Berlin", "relation_type": "factual", "confidence": 1.0}}]
 Transcript: "[user] My friend Alice lives in Berlin. [assistant] Got it."
 Output:
-{{"mapping": {{"Alice": "Person_1"}}, "anonymized_transcript": "[user] My friend Person_1 lives in Berlin. [assistant] Got it."}}
+{{"mapping": {{"Alice": "Person_1"}}, "anonymized_transcript": ["[user] My friend Person_1 lives in Berlin. [assistant] Got it."]}}
 Note: "Berlin" fails the MEMBERSHIP question — "city" is not a listed category at all — not the instance question. It stays verbatim.
 
 POSITIVE — instance-ambiguous value in a listed category, placeholdered on doubt (instance doubt — resolves to placeholder):
@@ -42,7 +42,7 @@ scrub categories: physical address
 facts: [{{"subject": "Rowan", "predicate": "mentioned", "object": "Lindenstraße 44", "relation_type": "factual", "confidence": 1.0}}]
 Transcript: "[user] The label just said Lindenstraße 44, I couldn't tell if that was their home address or the name of the shop."
 Output:
-{{"mapping": {{"Lindenstraße 44": "Address_1"}}, "anonymized_transcript": "[user] The label just said Address_1, I couldn't tell if that was their home address or the name of the shop."}}
+{{"mapping": {{"Lindenstraße 44": "Address_1"}}, "anonymized_transcript": ["[user] The label just said Address_1, I couldn't tell if that was their home address or the name of the shop."]}}
 Note: "physical address" IS listed, and the value is address-SHAPED even though the transcript voices doubt about what it refers to — that is instance doubt, not membership doubt, so it resolves to a placeholder. ("Rowan" stays verbatim here since "person name" is not in this example's scrub list.)
 
 POSITIVE — phone number:
@@ -50,22 +50,30 @@ scrub categories: person name, phone number
 facts: [{{"subject": "Jordan", "predicate": "has_phone", "object": "+49 151 2345678", "relation_type": "factual", "confidence": 1.0}}]
 Transcript: "[user] Jordan's number is +49 151 2345678."
 Output:
-{{"mapping": {{"Jordan": "Person_1", "+49 151 2345678": "Phone_1"}}, "anonymized_transcript": "[user] Person_1's number is Phone_1."}}
+{{"mapping": {{"Jordan": "Person_1", "+49 151 2345678": "Phone_1"}}, "anonymized_transcript": ["[user] Person_1's number is Phone_1."]}}
 
 POSITIVE — name and email in the same pass:
 scrub categories: person name, email address
 facts: [{{"subject": "Dana", "predicate": "has_email", "object": "dana@example.com", "relation_type": "factual", "confidence": 1.0}}]
 Transcript: "[user] My colleague Dana's email is dana@example.com."
 Output:
-{{"mapping": {{"Dana": "Person_1", "dana@example.com": "Email_1"}}, "anonymized_transcript": "[user] My colleague Person_1's email is Email_1."}}
+{{"mapping": {{"Dana": "Person_1", "dana@example.com": "Email_1"}}, "anonymized_transcript": ["[user] My colleague Person_1's email is Email_1."]}}
 
 POSITIVE — common noun stays verbatim:
 scrub categories: person name
 facts: [{{"subject": "Pat", "predicate": "noticed", "object": "Dog", "relation_type": "factual", "confidence": 1.0}}]
 Transcript: "[user] My partner Pat noticed our dog was sick last week."
 Output:
-{{"mapping": {{"Pat": "Person_1"}}, "anonymized_transcript": "[user] My partner Person_1 noticed our dog was sick last week."}}
+{{"mapping": {{"Pat": "Person_1"}}, "anonymized_transcript": ["[user] My partner Person_1 noticed our dog was sick last week."]}}
 Note: "Dog" appears in the fact, but the transcript context ("our dog") makes clear it is a common noun, and it is not one of the listed categories either way. Pat is anonymized; "Dog" does NOT appear in the mapping.
+
+POSITIVE — multi-turn transcript, one array element per turn:
+scrub categories: person name
+facts: [{{"subject": "Riley", "predicate": "works_with", "object": "Sam", "relation_type": "factual", "confidence": 1.0}}]
+Transcript: "[user] My colleague Riley mentioned Sam is joining the project. [assistant] Got it, I'll remember that. [user] Sam starts on Monday."
+Output:
+{{"mapping": {{"Riley": "Person_1", "Sam": "Person_2"}}, "anonymized_transcript": ["[user] My colleague Person_1 mentioned Person_2 is joining the project.", "[assistant] Got it, I'll remember that.", "[user] Person_2 starts on Monday."]}}
+Note: the transcript has three turns, so `anonymized_transcript` has three array elements in the same order, each carrying its own `[user]`/`[assistant]` marker. Turns are never merged into one element or split across extra ones.
 
 NEGATIVE — out-of-scope category over-scrubbed:
 scrub categories: person name
@@ -73,7 +81,7 @@ facts: [{{"subject": "Charlie", "predicate": "works_at", "object": "Siemens", "r
 Transcript: "[user] I work at Siemens in the R&D group."
 WRONG: minting a placeholder for "Siemens" and substituting it into `anonymized_transcript`.
 "Siemens" is an organization, not one of the listed categories — placeholdering it over-scrubs. The same applies to products, cities, or any other category you were not told to scrub.
-RIGHT: {{"mapping": {{"Charlie": "Person_1"}}, "anonymized_transcript": "[user] I work at Siemens in the R&D group."}}
+RIGHT: {{"mapping": {{"Charlie": "Person_1"}}, "anonymized_transcript": ["[user] I work at Siemens in the R&D group."]}}
 
 NEGATIVE — mapping direction reversed:
 WRONG: {{"mapping": {{"Person_1": "Alice"}}}}
@@ -84,9 +92,9 @@ NEGATIVE — incomplete mapping (a decided-on value omitted):
 scrub categories: person name, phone number
 facts: [{{"subject": "Honda", "predicate": "has_phone", "object": "+1 555 0100", "relation_type": "factual", "confidence": 1.0}}]
 Transcript: "[user] Their sales line is +1 555 0100, and my number is +1 555 0199."
-WRONG: {{"mapping": {{"+1 555 0100": "Phone_1"}}, "anonymized_transcript": "[user] Their sales line is Phone_1, and my number is +1 555 0199."}}
+WRONG: {{"mapping": {{"+1 555 0100": "Phone_1"}}, "anonymized_transcript": ["[user] Their sales line is Phone_1, and my number is +1 555 0199."]}}
 "+1 555 0199" is also an in-scope phone number — deciding to anonymize the first number but leaving the second unmapped is incomplete. Every value you decide to anonymize gets an entry, not just some of them.
-RIGHT: {{"mapping": {{"+1 555 0100": "Phone_1", "+1 555 0199": "Phone_2"}}, "anonymized_transcript": "[user] Their sales line is Phone_1, and my number is Phone_2."}}
+RIGHT: {{"mapping": {{"+1 555 0100": "Phone_1", "+1 555 0199": "Phone_2"}}, "anonymized_transcript": ["[user] Their sales line is Phone_1, and my number is Phone_2."]}}
 
 NEGATIVE — duplicate placeholder for two distinct values (uniqueness violation):
 WRONG: {{"mapping": {{"Alice": "Person_1", "Pat": "Person_1"}}}}
@@ -98,14 +106,14 @@ Every mapping KEY must be a real value copied verbatim from the input facts or t
 
 NEGATIVE — transcript rewritten beyond the substitutions:
 Given a transcript "[user] My friend Alice lives in Berlin, she's great." with only "person name" in scope:
-WRONG: {{"mapping": {{"Alice": "Person_1"}}, "anonymized_transcript": "[user] My friend Person_1 lives in Berlin."}}
+WRONG: {{"mapping": {{"Alice": "Person_1"}}, "anonymized_transcript": ["[user] My friend Person_1 lives in Berlin."]}}
 Dropping "she's great." is not a substitution — it is content loss. `anonymized_transcript` must preserve everything except the listed substitutions.
-RIGHT: {{"mapping": {{"Alice": "Person_1"}}, "anonymized_transcript": "[user] My friend Person_1 lives in Berlin, she's great."}}
+RIGHT: {{"mapping": {{"Alice": "Person_1"}}, "anonymized_transcript": ["[user] My friend Person_1 lives in Berlin, she's great."]}}
 
 Facts (decide which values below need anonymizing):
 {facts_json}
 
-Conversation transcript (rewrite it into `anonymized_transcript`, changing only the in-scope values):
+Conversation transcript (rewrite it into `anonymized_transcript` as an array of one string per turn, changing only the in-scope values):
 {transcript}
 
-Return JSON only with exactly the keys `mapping` and `anonymized_transcript`. No prose, no markdown, no extra keys.
+Return JSON only with exactly the keys `mapping` and `anonymized_transcript` (a JSON array of turn strings). No prose, no markdown, no extra keys.

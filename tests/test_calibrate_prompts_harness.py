@@ -321,12 +321,12 @@ class TestSeedFromEnrichLoading:
             "--baseline",
             "none",
         ]
-        fake_run_enrich = MagicMock(
+        fake_post_stage = MagicMock(
             return_value={"stage": "enrich", "raw_output": "{}", "parsed": {}, "parse_error": None}
         )
-        with patch.object(calibrate_prompts, "_run_enrich", fake_run_enrich):
+        with patch.object(calibrate_prompts, "_post_stage", fake_post_stage):
             rc = calibrate_prompts.main(argv)
-        return rc, fake_run_enrich
+        return rc, fake_post_stage
 
     def test_extract_wrapper_is_unwrapped_into_a_populated_graph(self, tmp_path: Path):
         """The seeded ``01_extract_chunk_0.json`` wrapper's real graph
@@ -334,11 +334,11 @@ class TestSeedFromEnrichLoading:
         not collapse to an empty graph.
 
         Mutation: revert to reading the wrapper blob directly as
-        ``prior_extract`` -> ``_run_enrich`` is called with ``facts=[]``
-        (or the call raises ``pydantic.ValidationError`` before it ever
-        happens) -> this test fails.
+        ``prior_extract`` -> ``/calibrate/enrich`` is posted with
+        ``facts=[]`` (or the call raises ``pydantic.ValidationError``
+        before it ever happens) -> this test fails.
         """
-        rc, fake_run_enrich = self._run(
+        rc, fake_post_stage = self._run(
             tmp_path,
             anonymize_blob={
                 "parsed": {
@@ -348,8 +348,11 @@ class TestSeedFromEnrichLoading:
             },
         )
         assert rc == 0
-        fake_run_enrich.assert_called_once()
-        facts = fake_run_enrich.call_args.kwargs["facts"]
+        fake_post_stage.assert_called_once()
+        args, _kwargs = fake_post_stage.call_args
+        assert args[1] == "enrich"
+        payload = args[2]
+        facts = payload["facts"]
         assert len(facts) == 1
         assert facts[0]["subject"] == "speaker0"
         assert facts[0]["object"] == "Acme Corp"
@@ -363,7 +366,7 @@ class TestSeedFromEnrichLoading:
         enrich stage -> ``AttributeError: 'NoneType' object has no
         attribute 'get'`` -> this test fails.
         """
-        rc, fake_run_enrich = self._run(
+        rc, fake_post_stage = self._run(
             tmp_path,
             anonymize_blob={
                 "parsed": {
@@ -374,7 +377,7 @@ class TestSeedFromEnrichLoading:
             write_extract=False,
         )
         assert rc == 0
-        fake_run_enrich.assert_not_called()
+        fake_post_stage.assert_not_called()
 
     def test_none_mapping_parse_failure_aborts_without_a_cloud_call(self, tmp_path: Path):
         """``anon_parsed.get("mapping")`` returning ``None`` (anonymizer
@@ -384,15 +387,15 @@ class TestSeedFromEnrichLoading:
 
         Mutation: revert to ``anon_parsed.get("mapping") or {}`` -> the
         parse failure is silently treated as "found nothing" and
-        ``_run_enrich`` (the cloud call) is invoked anyway -> this test
-        fails.
+        ``/calibrate/enrich`` (the cloud call) is posted to anyway ->
+        this test fails.
         """
-        rc, fake_run_enrich = self._run(
+        rc, fake_post_stage = self._run(
             tmp_path,
             anonymize_blob={"parsed": {}},  # no "mapping" key -> None
         )
         assert rc == 0
-        fake_run_enrich.assert_not_called()
+        fake_post_stage.assert_not_called()
 
     def test_missing_anonymized_transcript_aborts_without_a_cloud_call(self, tmp_path: Path):
         """A non-``None`` ``mapping`` with a missing/empty
@@ -402,14 +405,14 @@ class TestSeedFromEnrichLoading:
         the ``mapping is None`` case.
 
         Mutation: gate only on ``raw_mapping is None`` (drop the
-        ``anonymized_transcript`` check) -> ``_run_enrich`` is invoked
-        anyway -> this test fails.
+        ``anonymized_transcript`` check) -> ``/calibrate/enrich`` is
+        posted to anyway -> this test fails.
         """
-        rc, fake_run_enrich = self._run(
+        rc, fake_post_stage = self._run(
             tmp_path,
             anonymize_blob={
                 "parsed": {"mapping": {"Alex": "speaker0"}}
             },  # no anonymized_transcript
         )
         assert rc == 0
-        fake_run_enrich.assert_not_called()
+        fake_post_stage.assert_not_called()

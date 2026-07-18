@@ -1275,18 +1275,20 @@ class ConsolidationLoop:
             )
 
             # --- PROCEDURAL: separate extraction pass ---
+            # extract_procedural_graph self-traces the "procedural_extract"
+            # phase (nest-no-ops onto this outer extraction_trace scope) via
+            # the shared _run_local_extraction primitive, so no wrapper is
+            # needed here.
             proc_graph: SessionGraph | None = None
             if self.procedural_config is not None:
-                with phase_trace("procedural_extract") as t:
-                    proc_graph = self.extraction.run_procedural(
-                        extraction_input,
-                        session_id,
-                        speaker_name=speaker_name,
-                        source_type=source_type,
-                        speaker_id=speaker_id,
-                        timestamp=event_time,
-                    )
-                    t.add("relation_count", len(proc_graph.relations))
+                proc_graph = self.extraction.run_procedural(
+                    extraction_input,
+                    session_id,
+                    speaker_name=speaker_name,
+                    source_type=source_type,
+                    speaker_id=speaker_id,
+                    timestamp=event_time,
+                )
                 procedural_rels.extend(
                     {
                         "subject": r.subject,
