@@ -10,6 +10,9 @@ heavyweight ``paramem.graph.extractor`` transitive dependency chain
 (models.loader / vram_guard / evaluation.recall).
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from paramem.graph.phase_trace import record_prompt
@@ -23,6 +26,47 @@ _DEFAULT_PROMPT_DIR = (
 
 _SPEAKER_DIRECTIVE_FILE = "speaker_directive.txt"
 _SPEAKER_DIRECTIVE_SENTINEL = "==="
+
+# ContextVar holding an active calibration prompt-override mapping
+# (``{basename: content}``), consulted as the first act of ``_load_prompt``.
+# ``None`` (the default) means no override is active — every caller's
+# normal ``prompts_dir``/``model`` resolution is unaffected.  Scoped via
+# :func:`prompt_overrides` so an override never outlives the ``with`` block
+# that requested it, regardless of how deeply nested the prompt-loading
+# call site is (no threading through every layer's parameter list).
+_PROMPT_OVERRIDES: ContextVar[dict[str, str] | None] = ContextVar(
+    "paramem_prompt_overrides", default=None
+)
+
+
+@contextmanager
+def prompt_overrides(mapping: dict[str, str]) -> Iterator[None]:
+    """Substitute prompt content for the duration of the block.
+
+    Every :func:`_load_prompt` call made anywhere inside the ``with`` body
+    — no matter how deeply nested the caller — checks ``mapping`` for its
+    ``filename`` FIRST, before any ``prompts_dir``/``model`` search.  A
+    match short-circuits straight to the override's content; no match falls
+    through to the normal resolution unchanged.
+
+    Args:
+        mapping: ``{basename: content}`` — e.g.
+            ``{"sota_enrichment_system.txt": "<calibration variant>"}``.
+            ``content`` is used verbatim, exactly as if it had been read
+            from a file (slots such as ``{transcript}`` remain literal).
+
+    Nesting: an inner ``prompt_overrides`` call fully replaces the outer
+    mapping for its duration (no merge) and the outer mapping is restored
+    on exit, via the same token-based ``ContextVar.reset`` discipline
+    :func:`~paramem.graph.phase_trace.phase_trace` uses for
+    ``_ACTIVE_SCOPE``.
+    """
+    token = _PROMPT_OVERRIDES.set(mapping)
+    try:
+        yield
+    finally:
+        _PROMPT_OVERRIDES.reset(token)
+
 
 # Load-bearing prompt files. Absent, ``_load_prompt`` silently returns the empty
 # default (``required=False``), so the extraction pipeline degrades quietly
@@ -81,6 +125,14 @@ def _load_speaker_directive_section(section_name: str) -> str:
       ``inference.py`` as the fallback label when a ``speaker{N}`` token
       has no display name (e.g. anonymous or unknown profile).
 
+    The file is read via :func:`_load_prompt` (``required=True``) rather
+    than a bare ``Path.read_text()`` — this is the SAME chokepoint every
+    other prompt in the extraction pipeline resolves through, so the file
+    is overridable via :func:`prompt_overrides` (a calibration probe can
+    substitute the whole file's content) and its resolution is recorded
+    via :func:`~paramem.graph.phase_trace.record_prompt` like any other
+    prompt load.  Section parsing below is unchanged — only the read.
+
     Args:
         section_name: Name of the section to load (e.g.
             ``"EXTRACTION-DIRECTIVE"``).  The sentinel format is
@@ -91,11 +143,10 @@ def _load_speaker_directive_section(section_name: str) -> str:
 
     Raises:
         FileNotFoundError: When ``speaker_directive.txt`` is absent from
-            ``configs/prompts/`` and no fallback is registered.
+            ``configs/prompts/`` and no override or fallback is registered.
         KeyError: When the requested section is not found in the file.
     """
-    path = _DEFAULT_PROMPT_DIR / _SPEAKER_DIRECTIVE_FILE
-    raw = path.read_text()
+    raw = _load_prompt(_SPEAKER_DIRECTIVE_FILE, required=True)
     sections: dict[str, str] = {}
     current_name: str | None = None
     current_lines: list[str] = []
@@ -173,16 +224,32 @@ def _load_prompt(
     example signal.  Edit the prompt files directly to tune; no code
     changes are needed.
 
-    Every resolution — the found-file case AND the not-found-anywhere
-    fallback to *default* — is reported via
+    Before any of the above, an active :func:`prompt_overrides` mapping is
+    consulted for ``filename``.  A match short-circuits straight to the
+    override's content — ``prompts_dir``/``model`` resolution never runs —
+    and is reported via :func:`~paramem.graph.phase_trace.record_prompt`
+    with a synthetic ``<override:{filename}>`` path so provenance clearly
+    marks it as substituted rather than resolved from disk.  ``required``
+    is satisfied by an override the same as by a found file — the
+    "missing" case only fires when no override matched AND the normal
+    search exhausted every directory.
+
+    Every resolution — the override case, the found-file case, AND the
+    not-found-anywhere fallback to *default* — is reported via
     :func:`paramem.graph.phase_trace.record_prompt`, so a
     :class:`~paramem.graph.phase_trace.PhaseRecord` for the calling phase
     always reflects the path/content this function actually returned,
     never a re-derivation of it.  ``record_prompt`` no-ops when no
     :func:`~paramem.graph.phase_trace.phase_trace` scope is active (e.g.
-    the module-import-time calls that build module-level prompt
-    constants), so this call is always safe.
+    a caller invoked at module import time, before any phase scope can
+    exist), so this call is always safe.
     """
+    override = _PROMPT_OVERRIDES.get()
+    if override is not None and filename in override:
+        content = override[filename]
+        record_prompt(path=f"<override:{filename}>", content=content)
+        return content
+
     search_dirs: list[Path] = []
     if prompts_dir:
         base = Path(prompts_dir)

@@ -110,7 +110,7 @@ class TestAlignmentSmoke:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -161,7 +161,7 @@ class TestAlignmentSmoke:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -197,7 +197,7 @@ class TestAlignmentSmoke:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(

@@ -108,7 +108,7 @@ def _make_speaker_store(
         return (known_ids or {}).get(sid)
 
     store.get_name.side_effect = _get_name
-    # resolve_speaker_name (P3) is now called by _resolve_speaker for the
+    # resolve_speaker_name is now called by _resolve_speaker for the
     # auth-speaker-id path.  Wire it to the same lookup so tests that
     # construct stores via this helper work regardless of which internal
     # method is invoked.

@@ -13,7 +13,7 @@ from paramem.graph.extractor import (
     extract_graph,
     extract_procedural_graph,
 )
-from paramem.graph.phase_trace import get_phases
+from paramem.graph.phase_trace import get_phases, stop_at
 from paramem.graph.schema import Entity, Relation, SessionGraph
 
 
@@ -769,12 +769,12 @@ class TestTimestampPropagation:
 
 class TestSecondOrderExtractPhase:
     """Unit tests for the ``second_order_extract`` phase — gate, union, and
-    ``stop_phase`` contract.
+    ``stop_at`` contract.
 
     Mocks ``_generate_extraction`` (dispatched on the ``user_prompt_filename``
     kwarg, which differs between ``local_extract`` and
     ``second_order_extract``) so the tests run on CPU with no real model —
-    the surface under test is the gate/union/stop_phase plumbing, not
+    the surface under test is the gate/union/``stop_at`` plumbing, not
     generation quality.
     """
 
@@ -963,24 +963,24 @@ class TestSecondOrderExtractPhase:
         assert ("picks_up", "kids") in sam_relations
 
     def test_stop_phase_second_order_extract_returns_after_union(self):
-        """stop_phase='second_order_extract' returns immediately after the
-        union, before ha_validation (or any later phase) fires."""
+        """``stop_at("second_order_extract")`` returns immediately after
+        the union, before ha_validation (or any later phase) fires."""
         with patch(
             "paramem.graph.extractor._generate_extraction",
             side_effect=self._fake_generate(
                 self._pass1_with_named_person(), self._second_order_output()
             ),
         ):
-            graph = extract_graph(
-                model=None,
-                tokenizer=None,
-                transcript="My brother Nadeem lives in Porto.",
-                session_id="s001",
-                speaker_id="speaker0",
-                ha_context={"location_name": "", "zones": [], "areas": []},
-                stop_phase="second_order_extract",
-                scrub={"person name"},
-            )
+            with stop_at("second_order_extract"):
+                graph = extract_graph(
+                    model=None,
+                    tokenizer=None,
+                    transcript="My brother Nadeem lives in Porto.",
+                    session_id="s001",
+                    speaker_id="speaker0",
+                    ha_context={"location_name": "", "zones": [], "areas": []},
+                    scrub={"person name"},
+                )
         phase_names = [p.name for p in get_phases(graph)]
         assert phase_names == ["local_extract", "second_order_extract"]
         assert any(r.subject == "Nadeem" and r.object == "Porto" for r in graph.relations)
@@ -994,9 +994,9 @@ class TestExtractGraphTimestampPropagation:
     Mocks ``_generate_extraction`` (the sole LLM call before parsing) with
     valid, parseable extraction JSON containing at least one entity and one
     relation, so ``_parse_extraction`` succeeds rather than falling back to
-    the empty-graph exception handler. ``stop_phase="local_extract"``
-    returns immediately after parsing succeeds, isolating the surface under
-    test (timestamp plumbing) from the unrelated STT/HA/SOTA phases.
+    the empty-graph exception handler. ``stop_at("local_extract")`` returns
+    immediately after parsing succeeds, isolating the surface under test
+    (timestamp plumbing) from the unrelated STT/HA/SOTA phases.
     """
 
     def _fake_raw_output(self) -> str:
@@ -1025,16 +1025,16 @@ class TestExtractGraphTimestampPropagation:
             "paramem.graph.extractor._generate_extraction",
             return_value=self._fake_raw_output(),
         ):
-            graph = extract_graph(
-                model=None,
-                tokenizer=None,
-                transcript="I like tea.",
-                session_id="s001",
-                speaker_id="speaker0",
-                timestamp="2026-06-28T23:21:30+00:00",
-                stop_phase="local_extract",
-                scrub={"person name"},
-            )
+            with stop_at("local_extract"):
+                graph = extract_graph(
+                    model=None,
+                    tokenizer=None,
+                    transcript="I like tea.",
+                    session_id="s001",
+                    speaker_id="speaker0",
+                    timestamp="2026-06-28T23:21:30+00:00",
+                    scrub={"person name"},
+                )
         assert graph.relations, "fake output must parse successfully, not fall back"
         assert graph.timestamp == "2026-06-28T23:21:30+00:00"
 
@@ -1047,15 +1047,15 @@ class TestExtractGraphTimestampPropagation:
             "paramem.graph.extractor._generate_extraction",
             return_value=self._fake_raw_output(),
         ):
-            graph = extract_graph(
-                model=None,
-                tokenizer=None,
-                transcript="I like tea.",
-                session_id="s001",
-                speaker_id="speaker0",
-                stop_phase="local_extract",
-                scrub={"person name"},
-            )
+            with stop_at("local_extract"):
+                graph = extract_graph(
+                    model=None,
+                    tokenizer=None,
+                    transcript="I like tea.",
+                    session_id="s001",
+                    speaker_id="speaker0",
+                    scrub={"person name"},
+                )
         after = datetime.now(timezone.utc)
         assert graph.relations, "fake output must parse successfully, not fall back"
         parsed = datetime.fromisoformat(graph.timestamp)

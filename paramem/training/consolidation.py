@@ -7,7 +7,6 @@ episodic and semantic adapters.
 
 import hashlib
 import logging
-import os
 import random
 import secrets
 from dataclasses import dataclass
@@ -20,17 +19,8 @@ import torch
 from torch.utils.data import Dataset
 
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
-from paramem.graph.extractor import (
-    PROVIDER_KEY_ENV,
-    _graph_enrich_with_sota,
-    anonymize_with_local_model,
-    normalize_predicates,
-)
-from paramem.graph.merger import GraphMerger, min_nonempty
-from paramem.graph.name_match import (
-    canonical,
-    is_speaker_id,
-)
+from paramem.graph.merger import GraphMerger
+from paramem.graph.name_match import canonical
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.reconstruct import reconstruct_graph
 from paramem.graph.relation_prep import (
@@ -46,7 +36,8 @@ from paramem.memory.entry import (
 )
 from paramem.models.loader import atomic_save_adapter, switch_adapter
 from paramem.server.fold_telemetry import record_fold_telemetry
-from paramem.server.vram_guard import VramExhausted, safe_empty_cache
+from paramem.server.vram_guard import safe_empty_cache
+from paramem.training import graph_tier
 from paramem.training.key_registry import KeyRegistry
 from paramem.training.thermal_throttle import ThermalPolicy
 from paramem.training.trainer import TrainingHooks
@@ -67,7 +58,7 @@ _VALID_RTYPES: frozenset[str] = frozenset(relation_types())
 _FALLBACK_RTYPE: str = fallback_relation_type()
 
 # Synthetic session-id sentinels used by the three fold/re-merge paths that
-# call _merge_registry_relations or GraphMerger.merge with a pseudo-id rather
+# call GraphMerger.merge_relations or GraphMerger.merge with a pseudo-id rather
 # than a real session identifier.  The harvest filter in
 # _build_all_edge_entries_into subtracts these from edge["sessions"] so that
 # the deferred-write record carries ONLY real contributing session ids — synthetic
@@ -91,65 +82,6 @@ _SYNTHETIC_SESSION_IDS: frozenset[str] = frozenset(
 OWNERSHIP_CUE = (
     "[Document provided by {name} ({sid}). Statements describing {name} are facts about {sid}.]\n\n"
 )
-
-
-def resolve_to_node_key(
-    name: str,
-    in_graph: "Callable[[str], bool]",
-    coref_map: "dict[str, str] | None" = None,
-) -> str:
-    """Resolve a surface name to the actual node key used in the graph.
-
-    Collapses the two formerly-duplicated nested resolvers
-    (``_resolve_node_key`` / ``_resolve_name``) into one module-level
-    function so the resolution logic lives in exactly one place.
-
-    Resolution order:
-
-    1. **Membership shortcut** — if ``in_graph(name)`` is ``True``, the name
-       IS already a valid node key; return it unchanged.  This handles ordinary
-       non-speaker node keys (node-key model A: the key IS the canonical form)
-       without an extra ``canonical()`` call.  Note: with casefolded speaker
-       keys, verbatim speaker ids (``"Speaker0"``) are NOT in
-       the graph (the key is ``"speaker0"``), so they fall through to step 2.
-    2. **Canonical fallback** — ``canonical(name)`` (casefolds, diacritic-folds,
-       separator-normalizes).  This resolves speaker ids to their casefolded node
-       keys (``"Speaker0"`` → ``"speaker0"``) and ordinary display-surface names
-       to their canonical keys.
-    3. **Coref-chain follow** (optional) — if ``coref_map`` is provided, follow
-       the drop→keep chain on the resolved key.  Cycle-guarded via a ``seen``
-       set so a malformed coref loop does not block.
-
-    The stale rationale "verbatim-first because speaker nodes are keyed
-    VERBATIM" no longer applies: speaker node keys are now casefolded, so the
-    membership shortcut is only useful for ordinary node keys.
-
-    Args:
-        name: Surface name or node key to resolve.
-        in_graph: Callable that returns ``True`` when its argument is a live
-            node key in the graph (typically ``graph.__contains__`` or
-            ``lambda n: n in graph``).
-        coref_map: Optional mapping from dropped node key to kept node key,
-            built during the same_as contraction pass.  When provided, the
-            resolved key is followed through the chain (cycle-guarded).
-
-    Returns:
-        The resolved node key as a string.  May not be present in the graph
-        if neither the input nor its canonical form is a live node.
-    """
-    # Step 1: membership shortcut (node already keyed canonically).
-    if in_graph(name):
-        return name
-    # Step 2: canonical fallback (casefolds speaker ids, normalizes surfaces).
-    resolved = canonical(name)
-    if coref_map is None:
-        return resolved
-    # Step 3: follow the drop→keep coref chain (cycle-guarded).
-    seen: set[str] = set()
-    while resolved in coref_map and resolved not in seen:
-        seen.add(resolved)
-        resolved = coref_map[resolved]
-    return resolved
 
 
 def _fingerprint_entries(entries: "list[dict]") -> str:
@@ -2376,7 +2308,8 @@ class ConsolidationLoop:
 
         **Always-stale reasons (both scopes):**
         - ``"predicate_synonym_collapse"`` — synonym-predicate collapse from the
-          whole-graph normalization pass (:meth:`_run_graph_normalization`).
+          whole-graph normalization pass
+          (:meth:`~paramem.training.graph_tier.GraphTierRefiner.run_normalization`).
         - ``"semantic_dedup"`` — near-duplicate triple collapse from the normalization
           pass.
         - ``"entity_merge"`` — edge incident to a same_as variant node (normalization
@@ -2454,910 +2387,23 @@ class ConsolidationLoop:
 
         return soft_stale_by_tier
 
-    def _run_graph_enrichment(self) -> dict:
-        """Post-merge graph-level SOTA enrichment pass (Task #10).
+    def _current_extraction_config(self) -> "ExtractionConfig":
+        """Resolve the live :class:`ExtractionConfig` off the extraction pipeline.
 
-        Runs at full consolidation over the cumulative ``merger.graph`` to
-        capture cross-transcript second-order relations that per-transcript
-        enrichment cannot see.  Folds in coreference resolution via
-        ``same_as`` pairs emitted by the SOTA response.
+        Handed to the graph tier (:class:`~paramem.training.graph_tier.GraphTierRefiner`
+        and :func:`~paramem.training.graph_enrich.run_graph_enrichment`) as a
+        bound method rather than a resolved value, so the read happens only on
+        the paths that actually consume the config — all of which sit past
+        those passes' ``no_model``/``floor`` skips.
 
-        Every cloud call this method makes runs through the SAME
-        anonymize -> SOTA -> de-anonymize contract as session-tier
-        extraction (:func:`~paramem.graph.extractor._sota_pipeline`), via
-        the shared primitives in :mod:`paramem.graph.placeholders`. The
-        cumulative fold graph carries no entity types of its own (registry
-        SPO triples have none; the merger's fallback for an untyped
-        relation endpoint is ``entity_type="concept"``), so this method
-        runs :func:`~paramem.graph.extractor.anonymize_with_local_model`
-        (the SAME local-model anonymizer session-tier extraction uses) over
-        each chunk's triples first. That call is where ``ext_cfg.scrub``
-        (sourced from ``sanitization.scrub``) is honoured — it is the SOLE
-        scope authority for THIS tier (no second detector): it decides
-        which real names the chunk's ``chunk_mapping`` even contains, and
-        its placeholders are threaded straight through — never re-derived
-        or re-minted. That mapping is what feeds
-        :func:`~paramem.graph.extractor._graph_enrich_with_sota`, which
-        applies no scope gate of its own — it substitutes every entry it
-        is handed (see its docstring for the contract and the accepted
-        person-level ``same_as`` loss under the default scope, which only
-        ever hands it person names). ``serialize_subgraph_triples`` stays a
-        plain, un-anonymized serializer — anonymization happens on its
-        output, not inside it. A local-anonymization parse failure fails
-        the chunk closed (skips the SOTA call for that chunk) rather than
-        risk sending it unmasked — mirroring
-        :func:`~paramem.graph.extractor._sota_pipeline`'s own
-        fallback-to-local-only behaviour on the same failure mode.
-
-        Forward-path privacy: the local anonymizer's mapping keys are
-        real-name surfaces the LLM produced independently of the fold
-        graph's own (canonical, lowercase, separator-folded) node keys —
-        a re-cased, separator-varied, or diacritic-varied key (e.g. the
-        LLM emits ``"Yang Ming"`` for fold-graph node ``"yang ming"``)
-        would silently fail to substitute under a raw string comparison,
-        leaking the real name into the SOTA payload. This method
-        reconciles that mismatch itself, per chunk, before building
-        ``chunk_mapping`` (identity reconciliation, not
-        classification): every ``_llm_mapping`` key is run through
-        :func:`~paramem.graph.name_match.canonical` and matched against
-        the (also-canonicalized) node keys of ``chunk_nodes``; on a match
-        the entry is re-keyed onto the actual node-key surface with the
-        MODEL's own placeholder preserved verbatim, and on no match (or an
-        ambiguous multiple-node match) it is dropped and counted in
-        ``mapping_rekey_dropped``. The shared ``_substitute_whole_words``
-        primitive (:mod:`paramem.graph.placeholders`) keeps EXACT matching
-        everywhere else — canonical folding there would let a mapped
-        person name silently consume a lowercase common-noun homograph in
-        free transcript text, and would defeat the fail-closed
-        residual-token drop on the deanonymize side (see that module's
-        docstring). A local ``_llm_mapping`` that comes back completely
-        EMPTY is the anonymizer's own legitimate verdict that nothing in
-        the chunk is in scope against ``scrub`` — egress PROCEEDS on
-        that verdict, the same way
-        ``mapping == {}`` proceeds at the session tier
-        (:func:`~paramem.graph.extractor.extract_and_anonymize_for_cloud`).
-        Separately, when ``_llm_mapping`` DID name something but every
-        entry is dropped by this reconciliation, while the chunk has
-        real (non-speaker) node names, that residual is a
-        classification/identity-match failure, not a scope verdict — so
-        that chunk's SOTA call is skipped (fail-closed) and counted in
-        the returned ``privacy_skipped_chunks``. This residual (an
-        entity the local model named but reconciliation could not match
-        to a node) is owner-accepted and not otherwise engineered around
-        — see ``benchmarking.md``.
-
-        The method mutates ``self.merger.graph`` in place: first applying
-        ``same_as`` node contractions, then inserting new edges tagged with
-        the provenance attribute ``edge_source="graph_enrichment"`` (stored
-        under :data:`paramem.memory.persistence._EDGE_SOURCE_ATTR`, not the
-        NetworkX-reserved ``"source"`` field, so the tag survives persist).
-
-        Each enrichment edge is a second-order fact derived from its chunk's
-        source edges, so it inherits their assertion window: ``last_seen`` is
-        the max (most recent) and ``first_seen`` the earliest non-empty
-        (:func:`~paramem.graph.merger.min_nonempty`) across the chunk
-        subgraph's edges, computed before same_as contraction mutates the
-        graph.  This mirrors :meth:`_build_registry_true_relations` stamping
-        ``last_seen``/``first_seen`` from bookkeeping.
-
-        Early-return conditions (all return ``skipped=True``):
-        - No local model available (``self.model is None``).
-        - Graph has fewer than 10 nodes (floor — too little signal).
-        - ``extraction_noise_filter`` is empty (no SOTA provider configured).
-        - Provider env-var is absent (API key not set).
-
-        Chunking strategy:
-        Entities are ranked by ``reinforcement_count`` descending.  For each
-        focal entity an N-hop ego-graph is built (``radius=neighborhood_hops``).
-        Chunks are deduplicated by node frozenset so overlapping ego-graphs do
-        not re-send the same payload.  The number of chunks is capped at
-        ``ceil(total_nodes / max_entities_per_pass)`` to prevent O(N) SOTA
-        calls on large graphs.
-
-        Returns:
-            Diagnostics dict with keys:
-                - ``chunks`` (int): number of SOTA calls made.
-                - ``new_edges`` (int): edges added to the graph.
-                - ``same_as_merges`` (int): node contractions applied.
-                - ``privacy_skipped_chunks`` (int): chunks skipped because
-                  the local anonymizer NAMED entities but NONE survived
-                  reconciliation for a chunk that had real (non-speaker)
-                  node names — see above. A local mapping that came back
-                  EMPTY outright is not counted here; it proceeds.
-                - ``mapping_rekey_dropped`` (int): local-anonymizer mapping
-                  entries dropped because they named nothing (or an
-                  ambiguous multiple) in their chunk once reconciled
-                  against the chunk's actual node keys via ``canonical()``
-                  — see the ``chunk_mapping`` construction below.
-                - ``skipped`` (bool): ``True`` when enrichment was bypassed.
-                - ``skip_reason`` (str | None): reason token when skipped.
+        This method touches ``self.extraction``, which :meth:`release` nulls
+        alongside ``self.model``.  It is therefore only safe to CALL when the
+        base model is live, and the tier's guards are what guarantee that: a
+        released loop skips on ``model is None`` and never gets here.  Passing
+        ``self.extraction.config`` eagerly instead would evaluate the read
+        before any of those guards could run.
         """
-        import math
-
-        import networkx as nx
-
-        from paramem.memory.persistence import _IK_KEY_ATTR
-
-        _empty = {
-            "chunks": 0,
-            "new_edges": 0,
-            "same_as_merges": 0,
-            "privacy_skipped_chunks": 0,
-            "mapping_rekey_dropped": 0,
-        }
-
-        if self.model is None:
-            logger.info("graph_enrichment: no local model — skipping")
-            return {**_empty, "skipped": True, "skip_reason": "no_model"}
-
-        graph = self.merger.graph
-        node_count = graph.number_of_nodes()
-
-        if node_count < 10:
-            logger.info(
-                "graph_enrichment: graph too small (%d nodes < 10 floor) — skipping",
-                node_count,
-            )
-            return {**_empty, "skipped": True, "skip_reason": "floor"}
-
-        # Graph-tier SOTA enrichment shares the operator-configured provider
-        # with session-tier extraction (anonymize → noise-filter → plausibility
-        # chain).  Reading from ``self.extraction.config`` keeps both tiers
-        # pointing at the same model + endpoint without an extra knob.
-        ext_cfg = self.extraction.config
-        provider = ext_cfg.noise_filter
-        if not provider:
-            logger.info("graph_enrichment: no SOTA provider configured — skipping")
-            return {**_empty, "skipped": True, "skip_reason": "no_provider"}
-
-        key_env = PROVIDER_KEY_ENV.get(provider, "")
-        api_key = os.environ.get(key_env, "") if key_env else ""
-        if not api_key:
-            logger.warning(
-                "graph_enrichment: provider=%r env_var=%r not set — skipping",
-                provider,
-                key_env,
-            )
-            return {**_empty, "skipped": True, "skip_reason": "no_api_key"}
-
-        filter_model = ext_cfg.noise_filter_model
-        endpoint = ext_cfg.noise_filter_endpoint or None
-        # Same cloud-egress scrub categories as session-tier extraction
-        # (``sanitization.scrub`` -> ``ExtractionConfig.scrub`` at
-        # bootstrap) — feeds the per-chunk ``anonymize_with_local_model``
-        # call below, which is the prompt-side scope authority at this
-        # tier (see the method docstring).
-        scrub = ext_cfg.scrub
-        max_entities = max(1, self.graph_enrichment_max_entities_per_pass)
-        hops = max(1, self.graph_enrichment_neighborhood_hops)
-
-        # Rank nodes by reinforcement descending.
-        nodes_by_recurrence = sorted(
-            graph.nodes(data=True),
-            key=lambda nd: nd[1].get("reinforcement_count", 0),
-            reverse=True,
-        )
-
-        # Build deduplicated chunks from N-hop ego-graphs.
-        undirected = graph.to_undirected(as_view=True)
-        seen_chunks: set[frozenset] = set()
-        chunks: list[list[str]] = []
-        chunk_cap = max(1, math.ceil(node_count / max_entities))
-
-        for focal, _ in nodes_by_recurrence:
-            if len(chunks) >= chunk_cap:
-                break
-            if focal not in undirected:
-                continue
-            ego = nx.ego_graph(undirected, focal, radius=hops)
-            nodes = list(ego.nodes)
-            if len(nodes) > max_entities:
-                # Trim: keep focal + top-(cap-1) neighbours by degree.
-                neighbours = sorted(
-                    (n for n in nodes if n != focal),
-                    key=lambda n: undirected.degree(n),
-                    reverse=True,
-                )
-                nodes = [focal] + neighbours[: max_entities - 1]
-            key = frozenset(nodes)
-            if key in seen_chunks:
-                continue
-            seen_chunks.add(key)
-            chunks.append(nodes)
-
-        total_merges = 0
-        calls_made = 0
-        privacy_skipped_chunks = 0
-        mapping_rekey_dropped = 0
-        seen_merge_keys: set[frozenset] = set()
-        # Accumulates ik_keys from edges dropped by successful same_as contractions.
-        # Keys are written to self.merger.removal_ledger after the loop completes
-        # so the classifier can distinguish intended enrichment-driven removals from
-        # genuine reconstruction failures.
-        _collapsed_ik: dict[str, str] = {}  # ik_key → keep node
-        # SF-2: accumulate Relation objects across all chunks; edge-count delta
-        # computed after _merge_registry_relations so merger deduplication is counted.
-        enrichment_relations: list[Relation] = []
-        _edges_before = graph.number_of_edges()
-
-        for chunk_nodes in chunks:
-            try:
-                chunk_subgraph = graph.subgraph(chunk_nodes)
-                # Enrichment edges are second-order facts derived from this
-                # chunk's source edges, so they inherit the chunk's assertion
-                # window rather than landing untimed.  Computed from the
-                # subgraph view BEFORE any same_as contraction below mutates
-                # ``graph`` (contraction would change what the view sees).
-                _chunk_last_seen = ""
-                _chunk_first_seen = ""
-                for _u, _v, _edata in chunk_subgraph.edges(data=True):
-                    _chunk_last_seen = max(_chunk_last_seen, _edata.get("last_seen") or "")
-                    _chunk_first_seen = min_nonempty(
-                        _chunk_first_seen, _edata.get("first_seen") or ""
-                    )
-                triples = serialize_subgraph_triples(chunk_subgraph)
-                # The fold graph carries no entity types of its own:
-                # registry SPO triples have none, and the merger's fallback
-                # for a relation endpoint that isn't already a known Entity
-                # is entity_type="concept" (GraphMerger._merge_relations).
-                # Node attributes are therefore NOT a usable scope source at
-                # this tier — reading them here previously masked ONLY the
-                # speaker (the sole node synthesized with entity_type=
-                # "person") and sent every other real name to the cloud
-                # verbatim.
-                #
-                # The local model is the SOLE scope authority instead: run
-                # the SAME anonymize call the session tier uses
-                # (anonymize_with_local_model) over this chunk's triples,
-                # framed as a throwaway SessionGraph (transcript="" — there
-                # is no transcript at this tier). Its ``mapping`` — real
-                # name -> the MODEL's own placeholder — is threaded straight
-                # through into ``chunk_mapping`` below, never re-derived or
-                # re-minted. The anonymization prompt instructs the model to
-                # leave speaker{N} ids verbatim (never map them), so a
-                # speaker anchor never becomes a ``chunk_mapping`` entry
-                # here — it is already anonymous and reaches the SOTA
-                # payload bare by design (ONE-lowercase-speaker{N}
-                # invariant), with no mint/restore round trip needed.
-                _chunk_relations: list[Relation] = []
-                for _t in triples:
-                    _rt = _t.get("relation_type", _FALLBACK_RTYPE)
-                    if _rt not in _VALID_RTYPES:
-                        _rt = _FALLBACK_RTYPE
-                    _chunk_relations.append(
-                        Relation(
-                            subject=_t["subject"],
-                            predicate=_t["predicate"],
-                            object=_t["object"],
-                            relation_type=_rt,  # type: ignore[arg-type]
-                            speaker_id=_t.get("speaker_id", ""),
-                        )
-                    )
-                _chunk_session_graph = SessionGraph(
-                    session_id="__graph_enrichment__",
-                    timestamp="",
-                    entities=[],
-                    relations=_chunk_relations,
-                )
-                # anonymize_with_local_model calls model.generate() internally
-                # (CLAUDE.md: gradient checkpointing must be disabled around
-                # ANY model.generate() site — HF silently disables the KV
-                # cache when checkpointing is active).
-                self._disable_gradient_checkpointing()
-                try:
-                    _llm_mapping, _llm_anon_transcript, _anon_raw = anonymize_with_local_model(
-                        _chunk_session_graph,
-                        self.model,
-                        self.tokenizer,
-                        transcript="",
-                        scrub=scrub,
-                        max_tokens=ext_cfg.max_tokens,
-                    )
-                finally:
-                    self._enable_gradient_checkpointing()
-                if _llm_mapping is None:
-                    # Mirrors the session tier's fail-closed behaviour:
-                    # _sota_pipeline falls back to LOCAL plausibility on
-                    # anonymization parse failure rather than ever sending
-                    # unmasked content to the cloud. This chunk has no
-                    # trustworthy type source at all when the local call
-                    # fails to parse — skip the SOTA call for this chunk
-                    # entirely rather than sending it unmasked.
-                    logger.warning(
-                        "graph_enrichment: local anonymization failed for chunk — "
-                        "skipping SOTA call (fail-closed)"
-                    )
-                    continue
-                # Reconcile the local anonymizer's mapping onto the
-                # ACTUAL node-key surfaces before it feeds chunk_mapping.
-                # The local model's mapping is keyed by whatever real-name
-                # surface it independently produced (e.g. "Yang Ming");
-                # the fold graph's own node keys are already canonicalized
-                # (e.g. "yang ming") — a raw comparison between the two
-                # silently misses every re-cased/separator-varied/
-                # diacritic-varied key, so a ``chunk_mapping`` entry keyed
-                # on "Yang Ming" would never match the "yang ming" text
-                # _substitute_whole_words compares against inside
-                # ``triples``' subject/object fields below — the real name
-                # would reach the SOTA payload unmasked even though the
-                # local model correctly classified it. Reconciling identity
-                # HERE, at this call site only, keeps the shared
-                # _substitute_whole_words primitive's matching exact
-                # everywhere else (no blast radius on the session tier,
-                # which never builds facts from pre-canonicalized node-key
-                # text). The model's own placeholder is preserved verbatim
-                # through the rekey — never re-minted.
-                _canon_to_node: dict[str, str] = {}
-                _ambiguous_canon: set[str] = set()
-                for _node_key in chunk_nodes:
-                    _c = canonical(str(_node_key))
-                    if _c in _canon_to_node and _canon_to_node[_c] != _node_key:
-                        # Two distinct node keys canonicalizing identically
-                        # is a real ambiguity — should not arise in practice
-                        # (node keys are already canonical by construction,
-                        # so canonical() is a no-op on them — see
-                        # name_match.canonical's idempotence), but fail
-                        # closed rather than silently pick one: drop BOTH
-                        # candidates from this chunk's reconciliation.
-                        _ambiguous_canon.add(_c)
-                    else:
-                        _canon_to_node[_c] = _node_key
-
-                chunk_mapping: dict[str, str] = {}
-                _mapping_rekey_dropped_chunk = 0
-                for _real, _placeholder in (_llm_mapping or {}).items():
-                    if not isinstance(_real, str) or not isinstance(_placeholder, str):
-                        continue
-                    if is_speaker_id(_real):
-                        continue
-                    _c = canonical(_real)
-                    if _c in _ambiguous_canon or _c not in _canon_to_node:
-                        # The model named something that matches no (single,
-                        # unambiguous) node in THIS chunk — drop it rather
-                        # than carry a mapping entry that would never be
-                        # found in the triples' subject/object text.
-                        _mapping_rekey_dropped_chunk += 1
-                        continue
-                    # Rekey onto the ACTUAL node-key surface; preserve the
-                    # MODEL's own placeholder verbatim — never re-mint.
-                    chunk_mapping[_canon_to_node[_c]] = _placeholder
-                mapping_rekey_dropped += _mapping_rekey_dropped_chunk
-                if _mapping_rekey_dropped_chunk:
-                    logger.warning(
-                        "graph_enrichment: dropped %d local-anonymizer mapping "
-                        "entry(ies) naming nothing in this chunk (post-canonical "
-                        "reconciliation)",
-                        _mapping_rekey_dropped_chunk,
-                    )
-                # Forward-path privacy guard (the case the identity
-                # reconciliation above cannot fix): ``_llm_mapping`` coming
-                # back EMPTY is the anonymizer's own legitimate verdict
-                # that nothing in the chunk is in scope against ``scrub``
-                # — a distinct case from every ``_llm_mapping`` entry
-                # being dropped by reconciliation above (a genuine
-                # identity-match failure, not a scope verdict). Egress
-                # PROCEEDS on the former (empty mapping == "ran, found
-                # nothing", trusted like the
-                # session-tier ``mapping is None`` check at
-                # ``_llm_mapping is None`` above already distinguishes
-                # true PARSE failure). This guard fires ONLY on the
-                # latter: a chunk with real (non-speaker) node names
-                # where ``_llm_mapping`` DID name something but zero of
-                # it survived reconciliation onto this chunk's actual
-                # node keys — that residual is a classification/identity
-                # failure, not evidence of out-of-scope content, so it
-                # still fails closed. Narrow by design: this does NOT
-                # attempt a totality check against every node (that would
-                # treat legitimate out-of-scope nodes, e.g. organizations,
-                # as leaks too).
-                _chunk_nonspeaker_names = {
-                    str(_t.get(_field, "")) for _t in triples for _field in ("subject", "object")
-                }
-                _chunk_nonspeaker_names = {
-                    _n for _n in _chunk_nonspeaker_names if _n and not is_speaker_id(_n)
-                }
-                if _llm_mapping and _chunk_nonspeaker_names and not chunk_mapping:
-                    privacy_skipped_chunks += 1
-                    logger.warning(
-                        "graph_enrichment: local anonymizer named entities but none "
-                        "survived reconciliation for a %d-triple chunk — skipping "
-                        "SOTA call (fail-closed)",
-                        len(triples),
-                    )
-                    continue
-                result = _graph_enrich_with_sota(
-                    triples,
-                    chunk_mapping,
-                    api_key,
-                    provider,
-                    filter_model,
-                    endpoint,
-                )
-                calls_made += 1
-                if result is None:
-                    logger.warning("graph_enrichment: SOTA call returned None for chunk")
-                    continue
-                new_rels, same_as_pairs, _raw = result
-            except VramExhausted:
-                # Not a chunk-level extraction failure — the caller (the
-                # per-cycle loop in app.py) must see this and retry rather
-                # than have it silently swallowed as a skipped chunk.
-                raise
-            except RuntimeError as exc:
-                # Narrow by design.  The only genuinely-failing runtime leg in
-                # this chunk body is the local ``generate()`` inside
-                # ``anonymize_with_local_model`` (the CUDA "device not ready"
-                # class); OOM already arrives as ``VramExhausted`` above.  The
-                # cloud leg cannot raise — ``_sota_call`` and the response
-                # parse both return ``None`` on failure — so a broad
-                # ``except Exception`` here could only ever swallow a
-                # programming error (e.g. a KeyError from a malformed prompt
-                # template), silently disabling graph enrichment forever.
-                # Those must kill the fold.  Widen by NAME if a legitimate
-                # runtime condition surfaces; never back to ``Exception``.
-                logger.warning(
-                    "graph_enrichment: runtime error during chunk — %s: %s",
-                    type(exc).__name__,
-                    exc,
-                )
-                continue
-
-            # Apply same_as contractions FIRST so subsequent edge inserts
-            # reference canonical nodes. Gate on:
-            #   1. Both endpoints exist in the live graph.
-            #   2. Unordered-pair dedup across the whole enrichment pass.
-            #   3. Surface-form safety gate (token-subset + Jaro-Winkler).
-            coref_map: dict[str, str] = {}
-
-            # _in_graph closure passed to resolve_to_node_key.
-            _in_graph = graph.__contains__
-
-            for pair in same_as_pairs:
-                keep, drop = pair[0], pair[1]
-                if keep == drop:
-                    continue
-                # Guard: skip same_as pairs where BOTH surface strings are
-                # speaker ids.  Speaker identity is authoritative (voice/enrollment);
-                # it must never be coalesced by a surface-similarity heuristic.
-                # Two speaker-id surfaces are either the SAME speaker (already
-                # unified by canonical node-keying, so no merge needed) or
-                # DIFFERENT speakers (must never merge — Jaro-Winkler treats the
-                # distinguishing digit as a typo and would incorrectly merge
-                # speaker0/speaker1).  Skip unconditionally: the pair is always
-                # either redundant or catastrophically wrong.
-                # Note: the ``keep_canon == drop_canon`` post-resolution check
-                # handles the casing-only case (Speaker0/speaker0), but does NOT
-                # catch distinct speaker ids (speaker0 ≠ speaker1) — this guard
-                # is load-bearing for the distinct-speaker scenario.
-                if is_speaker_id(keep) and is_speaker_id(drop):
-                    logger.debug(
-                        "graph_enrichment: same_as skip — both surfaces are speaker ids %r / %r",
-                        keep,
-                        drop,
-                    )
-                    continue
-                # Resolve to actual node keys via resolve_to_node_key
-                # (membership shortcut then canonical).  Keep _safe_to_merge_surface
-                # on the ORIGINAL SURFACE strings (fuzzy layer-2 check; done
-                # before resolution).
-                keep_canon = resolve_to_node_key(keep, _in_graph)
-                drop_canon = resolve_to_node_key(drop, _in_graph)
-                if keep_canon == drop_canon:
-                    continue
-                if keep_canon not in graph or drop_canon not in graph:
-                    logger.debug(
-                        "graph_enrichment: same_as skip — keep=%r drop=%r not both in graph",
-                        keep_canon,
-                        drop_canon,
-                    )
-                    continue
-                merge_key = frozenset({keep_canon, drop_canon})
-                if merge_key in seen_merge_keys:
-                    logger.debug(
-                        "graph_enrichment: same_as dedup — %r / %r already seen",
-                        keep_canon,
-                        drop_canon,
-                    )
-                    continue
-                seen_merge_keys.add(merge_key)
-                if not _safe_to_merge_surface(keep, drop):
-                    logger.info(
-                        "graph_enrichment: same_as rejected by surface gate — %r / %r",
-                        keep,
-                        drop,
-                    )
-                    continue
-                # Collect ik_keys from edges in both directions that will become
-                # self-loops (and be dropped by self_loops=False) on success.
-                # Use inner-dict .values() iteration — MultiDiGraph get_edge_data
-                # returns {edge_id: data_dict}; do NOT treat the outer dict as data.
-                _pending: dict[str, str] = {}
-                for _u, _v in [(keep_canon, drop_canon), (drop_canon, keep_canon)]:
-                    for _edata in (graph.get_edge_data(_u, _v) or {}).values():
-                        _ik = _edata.get(_IK_KEY_ATTR)
-                        if _ik:
-                            _pending[_ik] = keep_canon
-                try:
-                    nx.contracted_nodes(graph, keep_canon, drop_canon, self_loops=False, copy=False)
-                    total_merges += 1
-                    # Success — absorb pending keys into the accumulator.
-                    _collapsed_ik.update(_pending)
-                    coref_map[drop_canon] = keep_canon
-                    logger.debug("graph_enrichment: contracted %r → %r", drop_canon, keep_canon)
-                except Exception as exc:
-                    logger.warning(
-                        "graph_enrichment: same_as contraction failed %r → %r: %s",
-                        drop_canon,
-                        keep_canon,
-                        exc,
-                    )
-
-            # Build Relation objects from SOTA-emitted new_rels for this chunk.
-            # BLOCKER-1 endpoint surface rule: speaker endpoints pass their canonical
-            # key (the speaker_id), non-speaker endpoints pass the display surface.
-            fallback_rtype = "factual"
-            valid_rtypes = {"factual", "temporal", "preference", "social"}
-            for rel in new_rels:
-                if not isinstance(rel, dict):
-                    continue
-                # Remap endpoints through this chunk's coref map so edges
-                # referencing a to-be-dropped node still land on the canonical.
-                # resolve_to_node_key(membership shortcut → canonical → coref chain).
-                subj_canon = resolve_to_node_key(rel.get("subject", ""), _in_graph, coref_map)
-                raw_pred = rel.get("predicate", "")
-                obj_canon = resolve_to_node_key(rel.get("object", ""), _in_graph, coref_map)
-                rtype = rel.get("relation_type", fallback_rtype)
-                if rtype not in valid_rtypes:
-                    rtype = fallback_rtype
-                if not (subj_canon and raw_pred and obj_canon):
-                    continue
-
-                # Choose endpoint surface string per endpoint.
-                # Speaker endpoint (node carries speaker_id attribute): pass the node
-                # key (lowercase canonical speaker{N} id) so _synth_speaker_entities
-                # can emit the correct Entity from the canonical key.
-                # Non-speaker endpoint: pass the display surface from node attributes.
-                def _endpoint_str(canon: str) -> str:
-                    _n = graph.nodes.get(canon, {})
-                    if _n.get("speaker_id"):
-                        return canon
-                    return _n.get("attributes", {}).get("name", canon)
-
-                subj_endpoint = _endpoint_str(subj_canon)
-                obj_endpoint = _endpoint_str(obj_canon)
-
-                if not (subj_endpoint and obj_endpoint and subj_endpoint != obj_endpoint):
-                    continue
-
-                try:
-                    confidence = float(rel.get("confidence", 0.8))
-                except (TypeError, ValueError):
-                    confidence = 0.8
-                # Safety net for the prompt-level 0.7 rule: discard low-confidence
-                # enriched edges even if the model ignored its own instruction.
-                if confidence < 0.7:
-                    continue
-
-                # B-3: derive speaker_id from the subject node's speaker_id attribute.
-                _subj_sid = graph.nodes.get(subj_canon, {}).get("speaker_id", "")
-
-                enrichment_relations.append(
-                    Relation(
-                        subject=subj_endpoint,
-                        predicate=raw_pred,
-                        object=obj_endpoint,
-                        relation_type=rtype,  # type: ignore[arg-type]
-                        confidence=confidence,
-                        speaker_id=_subj_sid,
-                        symmetric=bool(rel.get("symmetric")),
-                        edge_source="graph_enrichment",
-                        last_seen=_chunk_last_seen,
-                        first_seen=_chunk_first_seen,
-                    )
-                )
-
-        # Route all accumulated enrichment relations through the merger so they
-        # receive full Case-1/Case-3 treatment (dedup, edge-source stamp, speaker_id).
-        if enrichment_relations:
-            self._merge_registry_relations(
-                enrichment_relations,
-                session_id="__graph_enrichment__",
-                log_label="enrichment relations",
-                resolve_contradictions=False,
-            )
-
-        # SF-2: edge-count delta (merger may absorb some via Case-1).
-        total_new = max(0, graph.number_of_edges() - _edges_before)
-
-        logger.info(
-            "graph_enrichment: provider=%s chunks=%d new_edges=%d same_as_merges=%d "
-            "privacy_skipped_chunks=%d mapping_rekey_dropped=%d",
-            provider,
-            calls_made,
-            total_new,
-            total_merges,
-            privacy_skipped_chunks,
-            mapping_rekey_dropped,
-        )
-        # Write enrichment-collapsed ik_keys to the merger's removal ledger so the
-        # drift classifier can route them to drift_intended_removal rather than
-        # drift_genuine_loss.  Only keys from SUCCESSFUL contractions are written
-        # (failures were discarded from _pending before _collapsed_ik was updated).
-        for _ik, _keep in _collapsed_ik.items():
-            self.merger.removal_ledger[_ik] = {
-                "reason": "enrichment_same_as",
-                "merged_into": _keep,
-            }
-        return {
-            "chunks": calls_made,
-            "new_edges": total_new,
-            "same_as_merges": total_merges,
-            "privacy_skipped_chunks": privacy_skipped_chunks,
-            "mapping_rekey_dropped": mapping_rekey_dropped,
-            "skipped": False,
-            "skip_reason": None,
-        }
-
-    def _run_graph_normalization(self) -> dict:
-        """Whole-graph normalization pass using :func:`normalize_predicates`.
-
-        Runs after the Materialize stage at refinement level ``light`` or higher,
-        over the cumulative ``merger.graph``.  Collapses synonym predicates on the
-        same ``(subject, object)`` pair.  One model call per candidate group.
-
-        Engine selection (resolved once before the primitive call):
-
-        * **Local** (default): ``model`` + ``tokenizer`` from ``self``.
-        * **SOTA**: when ``config.sota_enabled`` is ``True`` AND
-          ``extraction.config.noise_filter`` is set AND the corresponding
-          ``PROVIDER_KEY_ENV`` variable is non-empty.  Falls back to local
-          silently when credentials are absent; normalization still runs.
-
-        The model receives the predicate list for each candidate group via the
-        ``{predicates_json}`` slot in ``predicate_normalization.txt`` and returns the
-        cluster schema ``{"clusters": [["predA", "predB"], ...]}``.  Both the
-        filter prompt and ``predicate_normalization_system.txt`` load through
-        :func:`_load_prompt` inside :func:`normalize_predicates` itself
-        (production fold passes no ``prompts_dir`` override, so the default
-        search path is used).  GC disable/enable is handled inside
-        :func:`normalize_predicates`.
-
-        Survivor selection: within each cluster, the predicate with the highest
-        ``reinforcement_count`` (summed across all edges for that predicate)
-        survives.  Tie broken by max ``last_seen``; remaining ties by cluster
-        iteration order.
-
-        Overlapping clusters (same predicate in two clusters — a model
-        hallucination) are handled by ``_retired_in_so_group`` tracking per
-        ``(s, o)`` group: a predicate retired by cluster N is excluded from
-        cluster N+1's candidate list, and ``graph.remove_edge`` is called
-        fail-loud (no try/except) since the tracking guarantees each edge is
-        retired at most once.
-
-        Applied changes — same-(subject, object) collapse only (subtractive,
-        grounded in input):
-
-        1. Build ``_flat_relations`` and ``_so_groups`` from all predicate-bearing
-           edges in ``merger.graph``.
-        2. Call :func:`normalize_predicates` with the resolved engine kwargs.
-        3. For each returned ``(can_s, can_o)`` cluster group: pick the MAX
-           ``reinforcement_count`` edge as survivor; retire the rest.
-
-           a. Union ``sessions``, sum ``reinforcement_count``, max ``confidence``,
-              max ``last_seen`` of all retired edges onto the survivor BEFORE removal.
-           b. Write ``removal_ledger[ik_key] = {"reason": "predicate_synonym_collapse",
-              "merged_into": <survivor_pred>}`` for each retired keyed edge.
-           c. Remove retired edges from the graph.
-
-        4. Single-predicate ``(s, o)`` facts are NEVER retired.
-        5. Hallucinated predicates in model output are grounded inside
-           :func:`normalize_predicates` — no new edges are minted.
-
-        Early-return conditions (all return ``skipped=True``):
-
-        - No local model available (``self.model is None``).
-        - Graph has fewer than 10 nodes (too little signal).
-        - Prompt file missing: raises ``FileNotFoundError`` (fail-loud).
-
-        Returns:
-            Diagnostics dict with keys:
-                - ``groups_collapsed`` (int): ``(s, o)`` groups with >=1 retirement.
-                - ``edges_retired`` (int): total edges removed across all groups.
-                - ``chunks`` (int): total model calls made.
-                - ``skipped`` (bool): ``True`` when the pass was bypassed.
-                - ``skip_reason`` (str | None): reason token when skipped.
-        """
-        from paramem.memory.persistence import _IK_KEY_ATTR
-
-        _empty = {"groups_collapsed": 0, "edges_retired": 0, "chunks": 0}
-
-        if self.model is None:
-            logger.info("graph_normalization: no local model — skipping")
-            return {**_empty, "skipped": True, "skip_reason": "no_model"}
-
-        graph = self.merger.graph
-        node_count = graph.number_of_nodes()
-
-        if node_count < 10:
-            logger.info(
-                "graph_normalization: graph too small (%d nodes < 10 floor) — skipping",
-                node_count,
-            )
-            return {**_empty, "skipped": True, "skip_reason": "floor"}
-
-        # Build flat relation list and per-(s,o) group index.
-        # Each _info entry: {u, v, eid, edata, ik_key, can_s, can_o, can_pred}
-        _flat_relations: list[dict] = []
-        _so_groups: dict[tuple, dict[str, list[dict]]] = {}
-
-        for _u, _v, _eid, _edata in graph.edges(keys=True, data=True):
-            _pred = _edata.get("predicate", "")
-            if not _pred:
-                continue
-            _ik = _edata.get(_IK_KEY_ATTR) or None
-            _can_s = canonical(_u)
-            _can_o = canonical(_v)
-            _can_pred = canonical(_pred)
-            _info = {
-                "u": _u,
-                "v": _v,
-                "eid": _eid,
-                "edata": _edata,
-                "ik_key": _ik,
-                "can_s": _can_s,
-                "can_o": _can_o,
-                "can_pred": _can_pred,
-            }
-            _flat_relations.append({"subject": _u, "predicate": _pred, "object": _v})
-            _so_groups.setdefault((_can_s, _can_o), {}).setdefault(_can_pred, []).append(_info)
-
-        # Resolve which backend to use: SOTA when sota_enabled + provider + api_key
-        # are all present; fall back to local silently when credentials are absent
-        # (local model is always present; normalization still runs on the knob).
-        engine_kwargs: dict = {"model": self.model, "tokenizer": self.tokenizer}
-        if self.config.sota_enabled:
-            ext_cfg = self.extraction.config
-            provider = ext_cfg.noise_filter
-            api_key = os.environ.get(PROVIDER_KEY_ENV.get(provider, ""), "") if provider else ""
-            if provider and api_key:
-                engine_kwargs = {
-                    "sota": {
-                        "api_key": api_key,
-                        "provider": provider,
-                        "filter_model": ext_cfg.noise_filter_model,
-                        "endpoint": ext_cfg.noise_filter_endpoint or None,
-                    }
-                }
-                logger.info("graph_normalization: engine=SOTA provider=%s", provider)
-            else:
-                logger.info(
-                    "graph_normalization: sota_enabled but no provider/api_key -- engine=local"
-                )
-
-        # Delegate model calls to normalize_predicates.
-        # GC disable/enable is handled inside normalize_predicates.
-        clusters_by_so, _normalization_diag = normalize_predicates(_flat_relations, **engine_kwargs)
-
-        total_edges_retired = 0
-        total_groups_collapsed = 0
-
-        for so_key, group_clusters in clusters_by_so.items():
-            pred_map = _so_groups.get(so_key)
-            if not pred_map:
-                continue
-
-            # Track predicates already retired in this (s,o) group so that
-            # overlapping clusters (model hallucination: same predicate in two
-            # clusters) do not attempt a second remove_edge on an already-absent
-            # edge, which would be an undetectable bug if silenced by try/except.
-            _retired_in_so_group: set[str] = set()
-
-            for cluster in group_clusters:
-                # cluster is a list of canonical predicates confirmed as synonyms.
-                # At least 2 members guaranteed by normalize_predicates.
-                # Exclude predicates already retired by a prior cluster in this group
-                # (can arise when model returns overlapping clusters).
-                cluster_preds = [
-                    cp for cp in cluster if cp in pred_map and cp not in _retired_in_so_group
-                ]
-                if len(cluster_preds) < 2:
-                    continue
-
-                # Survivor selection: MAX reinforcement_count (summed across all edges
-                # for that predicate); tie-broken by MAX last_seen (ISO string max).
-                def _pred_sort_key(cp: str) -> tuple:
-                    edges = pred_map[cp]
-                    rec = sum(e["edata"].get("reinforcement_count", 1) for e in edges)
-                    ls = max((e["edata"].get("last_seen", "") for e in edges), default="")
-                    return (rec, ls)
-
-                _survivor_pred = max(cluster_preds, key=_pred_sort_key)
-                _survivor_edges = pred_map[_survivor_pred]
-                _survivor_edata = _survivor_edges[0]["edata"]
-
-                # Union provenance from retired edges onto survivor BEFORE removal.
-                _surv_sessions: list[str] = list(_survivor_edata.get("sessions", []))
-                _surv_recurrence: int = _survivor_edata.get("reinforcement_count", 1)
-                _surv_confidence: float = _survivor_edata.get("confidence", 0.0)
-                _surv_last_seen: str = _survivor_edata.get("last_seen", "")
-                _surv_first_seen: str = _survivor_edata.get("first_seen", "")
-
-                _retired_preds = [cp for cp in cluster_preds if cp != _survivor_pred]
-                for _ret_pred in _retired_preds:
-                    for _ret_info in pred_map[_ret_pred]:
-                        for _sid in _ret_info["edata"].get("sessions", []):
-                            if _sid not in _surv_sessions:
-                                _surv_sessions.append(_sid)
-                        _surv_recurrence += _ret_info["edata"].get("reinforcement_count", 1)
-                        _surv_confidence = max(
-                            _surv_confidence, _ret_info["edata"].get("confidence", 0.0)
-                        )
-                        _surv_last_seen = max(
-                            _surv_last_seen, _ret_info["edata"].get("last_seen", "")
-                        )
-                        _surv_first_seen = min_nonempty(
-                            _surv_first_seen, _ret_info["edata"].get("first_seen", "")
-                        )
-
-                _survivor_edata["sessions"] = _surv_sessions
-                _survivor_edata["reinforcement_count"] = _surv_recurrence
-                _survivor_edata["confidence"] = _surv_confidence
-                _survivor_edata["last_seen"] = _surv_last_seen
-                _survivor_edata["first_seen"] = _surv_first_seen
-
-                # Retire each non-survivor edge.
-                group_retired = 0
-                for _ret_pred in _retired_preds:
-                    for _ret_info in pred_map[_ret_pred]:
-                        _ret_ik = _ret_info["ik_key"]
-                        if _ret_ik:
-                            self.merger.removal_ledger[_ret_ik] = {
-                                "reason": "predicate_synonym_collapse",
-                                "merged_into": _survivor_pred,
-                            }
-                        # Fail-loud: the (u, v, eid) triple was built from
-                        # graph.edges(keys=True) and each predicate is retired at most
-                        # once (guaranteed by _retired_in_so_group tracking above),
-                        # so remove_edge must always succeed.
-                        graph.remove_edge(_ret_info["u"], _ret_info["v"], _ret_info["eid"])
-                        logger.info(
-                            "graph_normalization: retired (%r, %r, %r) -> survivor=%r",
-                            _ret_info["u"],
-                            _ret_info["v"],
-                            _ret_pred,
-                            _survivor_pred,
-                        )
-                        group_retired += 1
-
-                _retired_in_so_group.update(_retired_preds)
-                if group_retired:
-                    total_groups_collapsed += 1
-                    total_edges_retired += group_retired
-
-        logger.info(
-            "graph_normalization: groups_collapsed=%d edges_retired=%d model_calls=%d",
-            total_groups_collapsed,
-            total_edges_retired,
-            _normalization_diag.get("model_calls", 0),
-        )
-
-        _applied = {
-            "groups_collapsed": total_groups_collapsed,
-            "edges_retired": total_edges_retired,
-        }
-        _decisions = [
-            {"subject": s, "object": o, "clusters": cl} for (s, o), cl in clusters_by_so.items()
-        ]
-        self._debug_writer.on_normalization(
-            _normalization_diag.get("raw_outputs", []), _decisions, _applied
-        )
-
-        return {
-            **_applied,
-            "chunks": _normalization_diag.get("model_calls", 0),
-            "skipped": False,
-            "skip_reason": None,
-        }
+        return self.extraction.config
 
     def _collect_disk_fold_relations(self, adapter_dir: "Path") -> "DiskFoldInput":
         """Load all :class:`Relation` objects from the canonical graph and interim slots.
@@ -3487,7 +2533,7 @@ class ConsolidationLoop:
                 - ``last_seen`` from the edge ``"last_seen"`` attribute (empty
                   string when absent).  Propagating the real ingest-time stamp
                   ensures pending relations carry genuine recency through the
-                  ``_merge_registry_relations`` call so a newer pending fact can
+                  ``merger.merge_relations`` call so a newer pending fact can
                   supersede a strictly-older dated registry-true rival.  Without
                   this field the captured relation would have ``last_seen=""``
                   (undated) and lose outright to the dated registry-true rival —
@@ -5806,10 +4852,10 @@ class ConsolidationLoop:
 
                 # Resolve endpoint surface from node attributes["name"].
                 # For speaker subjects: _endpoint_str returns the node key (lowercase
-                # speaker{N}); _synth_speaker_entities emits Entity(name=speaker_id)
-                # which refreshes attributes["name"] to the lowercase speaker_id during
-                # _merge_registry_relations.  So _subj_display yields the lowercase
-                # speaker_id for speaker subjects.
+                # speaker{N}); paramem.graph.merger._synth_speaker_entities emits
+                # Entity(name=speaker_id) which refreshes attributes["name"] to the
+                # lowercase speaker_id during GraphMerger.merge_relations.  So
+                # _subj_display yields the lowercase speaker_id for speaker subjects.
                 # For non-speaker subjects this yields the stored display name.
                 _subj_display = (
                     self.merger.graph.nodes[_t_subj].get("attributes", {}).get("name") or _t_subj
@@ -6211,159 +5257,6 @@ class ConsolidationLoop:
             )
         return relations
 
-    def _synth_speaker_entities(self, relations: "list[Relation]") -> "list":
-        """Synthesise :class:`~paramem.graph.schema.Entity` objects for speaker-attributed subjects.
-
-        For each :class:`Relation` in *relations* whose ``speaker_id`` is non-empty
-        and whose ``subject == speaker_id`` (plain equality — both are lowercase
-        ``speaker{N}`` under the lowercase-uniform design), emit one
-        :class:`~paramem.graph.schema.Entity` with ``entity_type="person"`` and
-        the matching ``speaker_id``.  Deduplicates by ``speaker_id`` so exactly
-        one entity is produced per unique speaker.
-
-        Non-speaker subjects (``speaker_id == ""`` OR ``subject != speaker_id``)
-        are skipped; their nodes retain no ``speaker_id`` attribute, which resolves
-        to ``""`` in the keyed-walk (the correct default for non-person nodes).
-
-        Used by :meth:`_merge_registry_relations` so that
-        :meth:`~paramem.graph.merger.GraphMerger._upsert_entity` stamps
-        ``speaker_id`` onto the subject node before the edge walk in
-        :meth:`_build_all_edge_entries_into` reads it.  Without the entity the
-        node would lack ``speaker_id``, causing minted keys to fall back to
-        ``speaker_id=""`` (dcf4189 regression).
-
-        Args:
-            relations: The list of :class:`Relation` objects from which speaker
-                entities are derived.  Both the recon path and the extra-relations
-                (pending-session) path pass their respective relation lists here.
-
-        Returns:
-            A :class:`list` of :class:`~paramem.graph.schema.Entity` objects, one
-            per unique speaker subject found in *relations*.  May be empty when no
-            relation carries a non-empty ``speaker_id`` whose subject equals the
-            speaker ID.
-        """
-        from paramem.graph.schema import Entity as _Entity
-
-        _seen_speaker_ids: set[str] = set()
-        entities: list[_Entity] = []
-        for _r in relations:
-            if _r.speaker_id and _r.speaker_id not in _seen_speaker_ids:
-                # Both subject and speaker_id are lowercase speaker{N} — plain ==
-                # is sufficient.  Non-speaker subjects are skipped.
-                if _r.subject == _r.speaker_id:
-                    entities.append(
-                        _Entity(
-                            # Use _r.subject (== _r.speaker_id) as the entity name.
-                            # This refreshes attributes["name"] to the lowercase
-                            # speaker_id on the existing speaker node.
-                            name=_r.subject,
-                            entity_type="person",
-                            speaker_id=_r.speaker_id,
-                        )
-                    )
-                    _seen_speaker_ids.add(_r.speaker_id)
-        return entities
-
-    def _merge_registry_relations(
-        self,
-        relations: "list[Relation]",
-        *,
-        session_id: str,
-        log_label: str,
-        timestamp: str = "",
-        resolve_contradictions: bool = False,
-        credit_adopt_reinforcement: bool = False,
-    ) -> None:
-        """Build a synthetic :class:`SessionGraph` from *relations* and merge it.
-
-        This is the single shared builder for turning a ``list[Relation]`` into an
-        entitied, merged :class:`SessionGraph`.  All three merge paths route through
-        here: the recon path (``session_id="__full_consolidation_recon__"``), the
-        extra-relations (pending-session) path
-        (``session_id="__interim_pending_sessions__"``), and the simulate full-fold
-        path (``session_id="__simulate_consolidation_merge__"``).  There is exactly
-        ONE place that constructs a ``SessionGraph``.
-
-        The entity list is synthesised from *relations* via
-        :meth:`_synth_speaker_entities`, which stamps ``speaker_id`` onto speaker
-        subject nodes.  This ensures the edge walk in
-        :meth:`_build_all_edge_entries_into` reads the correct ``speaker_id`` from
-        each node (dcf4189 invariant).  Before this unification the recon path used
-        ``entities=[]``, causing reconstructed person nodes to be stored as
-        ``entity_type="concept"`` with no ``speaker_id``; graph-enrichment then
-        rooted facts at unattributed nodes.  The simulate path had the same latent
-        bug: relations with ``speaker_id`` set produced person nodes that became
-        concepts with no ``speaker_id`` because ``entities=[]`` was passed directly.
-
-        The gradient-checkpointing guard fires when ``resolve_contradictions`` is
-        True and a model is present — the contradiction path calls
-        ``model.generate()``.  Simulate callers may omit the model entirely.
-
-        Returns early without side effects when *relations* is empty.
-
-        Args:
-            relations: The :class:`Relation` objects to merge.  May be the
-                registry-true recon set, the pending extra-relations set, or the
-                simulate fold's collected interim-slot relations.
-            session_id: Synthetic session identifier passed to
-                :class:`~paramem.graph.schema.SessionGraph`.  Used only for
-                logging/debugging.
-            log_label: Human-readable label for the count log line, e.g.
-                ``"reconstructed triples"`` or ``"extra (pending-session) relations"``.
-            timestamp: The session timestamp passed to :class:`SessionGraph`.
-                Default ``""`` (empty string) for all HISTORICAL callers
-                (recon/registry-true/simulate-disk/enrichment), which ensures the
-                merger's ``relation.last_seen or timestamp`` fallback yields ``""``
-                for legacy relations instead of fabricating a NOW recency value.
-                A legacy ``""`` relation coexists with its rivals only when every
-                rival is also undated; a genuinely dated rival always outranks it
-                (dated wins over undated) and the legacy relation is retired.
-                Pass ``datetime.now()`` only for
-                genuinely FRESH sessions where an empty ``last_seen`` should resolve
-                to the current wall-clock time.  Currently all callers are historical
-                and omit this parameter (receive the ``""`` default).
-            resolve_contradictions: Forwarded to
-                :meth:`~paramem.graph.merger.GraphMerger.merge`.  Default
-                ``False`` (no cardinality resolution).  Set ``True`` when the config
-                ``refinement_contradiction == "on"``.
-            credit_adopt_reinforcement: Forwarded to
-                :meth:`~paramem.graph.merger.GraphMerger.merge`.  Default
-                ``False`` for every caller (recon, extra-relations, simulate,
-                enrichment).  Set ``True`` ONLY by the interim recital-dedup
-                merge call, so a recited fact's Case-1-adopt onto a main-tier
-                key is credited to that key's reinforcement.
-        """
-        if not relations:
-            return
-        entities = self._synth_speaker_entities(relations)
-        _session = SessionGraph(
-            session_id=session_id,
-            timestamp=timestamp,
-            entities=entities,
-            relations=relations,
-        )
-        # The gradient-checkpointing guard fires when resolve_contradictions is
-        # True and a model is present — the contradiction path calls model.generate().
-        _has_model = getattr(self, "model", None) is not None
-        _needs_guard = _has_model and resolve_contradictions
-        if _needs_guard:
-            self._disable_gradient_checkpointing()
-        try:
-            self.merger.merge(
-                _session,
-                resolve_contradictions=resolve_contradictions,
-                credit_adopt_reinforcement=credit_adopt_reinforcement,
-            )
-        finally:
-            if _needs_guard:
-                self._enable_gradient_checkpointing()
-        logger.info(
-            "_materialize_consolidation_graph: re-merged %d %s into keying graph",
-            len(relations),
-            log_label,
-        )
-
     def _materialize_consolidation_graph(
         self,
         *,
@@ -6435,8 +5328,10 @@ class ConsolidationLoop:
         never run cardinality resolution over main-tier facts.
 
         **Speaker-ID note (unified path):** Both the recon path and the
-        ``extra_relations`` path call :meth:`_merge_registry_relations`, which
-        invokes :meth:`_synth_speaker_entities` to produce a synthetic
+        ``extra_relations`` path call
+        :meth:`~paramem.graph.merger.GraphMerger.merge_relations`, which
+        invokes the module-level ``_synth_speaker_entities`` helper in
+        :mod:`paramem.graph.merger` to produce a synthetic
         :class:`~paramem.graph.schema.Entity` (``entity_type="person"``) for each
         speaker-attributed subject.
         :meth:`~paramem.graph.merger.GraphMerger._upsert_entity` stamps
@@ -6497,8 +5392,9 @@ class ConsolidationLoop:
                 caller always passes the caller-scoped subset (session-touched
                 main-tier keys; possibly empty).  Ignored when ``source="disk"``.
             resolve_contradictions_recon: Forwarded to
-                :meth:`_merge_registry_relations` for the registry-true recon
-                merge.  Driven by ``config.refinement_contradiction == "on"``.
+                :meth:`~paramem.graph.merger.GraphMerger.merge_relations` for
+                the registry-true recon merge.  Driven by
+                ``config.refinement_contradiction == "on"``.
                 At fold, ``timestamp=""`` is passed to the merger so legacy
                 relations (``last_seen=""``) never fabricate a NOW recency value.
                 A legacy relation coexists with its rivals only when every rival
@@ -6506,8 +5402,8 @@ class ConsolidationLoop:
                 (dated wins over undated) and the legacy relation is retired.
                 Ignored when ``source="disk"`` (no recon merge performed).
             resolve_contradictions_extra: Forwarded to
-                :meth:`_merge_registry_relations` for the ``extra_relations``
-                (pending-session) merge.  Driven by
+                :meth:`~paramem.graph.merger.GraphMerger.merge_relations` for
+                the ``extra_relations`` (pending-session) merge.  Driven by
                 ``config.refinement_contradiction == "on"``.
                 Ignored when ``extra_relations`` is empty.
 
@@ -6548,12 +5444,25 @@ class ConsolidationLoop:
             # relation coexists only when every rival is also undated, and is
             # retired when a genuinely dated rival outranks it (dated wins over
             # undated) — simulate==train invariant holds.
-            self._merge_registry_relations(
-                extra_relations or [],
-                session_id="__simulate_consolidation_merge__",
-                log_label="disk relations (simulate full fold)",
-                resolve_contradictions=(self.config.refinement_contradiction == "on"),
+            # The gradient-checkpointing guard fires when resolve_contradictions
+            # is True and a model is present — the contradiction path calls
+            # model.generate().
+            _disk_resolve_contradictions = self.config.refinement_contradiction == "on"
+            _disk_needs_guard = (
+                getattr(self, "model", None) is not None and _disk_resolve_contradictions
             )
+            if _disk_needs_guard:
+                self._disable_gradient_checkpointing()
+            try:
+                self.merger.merge_relations(
+                    extra_relations or [],
+                    session_id="__simulate_consolidation_merge__",
+                    log_label="disk relations (simulate full fold)",
+                    resolve_contradictions=_disk_resolve_contradictions,
+                )
+            finally:
+                if _disk_needs_guard:
+                    self._enable_gradient_checkpointing()
             self._debug_writer.on_fold_graph(self.merger, label="merged")
             return set(), []
 
@@ -6655,7 +5564,7 @@ class ConsolidationLoop:
 
         recon_relations: list[Relation] = self._build_registry_true_relations(keys=keys)
 
-        # Merge registry-true reconstructed relations.  _merge_registry_relations
+        # Merge registry-true reconstructed relations.  merger.merge_relations
         # synthesises speaker entities from the relation list (same logic as the
         # extra-relations path below) so reconstructed person nodes receive
         # entity_type="person" + speaker_id from bookkeeping.  Before unification
@@ -6665,12 +5574,23 @@ class ConsolidationLoop:
         # NOW recency value; a legacy key coexists only when every rival is also
         # undated, and is retired when a genuinely dated rival outranks it (dated
         # wins over undated).
-        self._merge_registry_relations(
-            recon_relations,
-            session_id="__full_consolidation_recon__",
-            log_label="reconstructed triples",
-            resolve_contradictions=resolve_contradictions_recon,
+        # The gradient-checkpointing guard fires when resolve_contradictions is
+        # True and a model is present — the contradiction path calls model.generate().
+        _recon_needs_guard = (
+            getattr(self, "model", None) is not None and resolve_contradictions_recon
         )
+        if _recon_needs_guard:
+            self._disable_gradient_checkpointing()
+        try:
+            self.merger.merge_relations(
+                recon_relations,
+                session_id="__full_consolidation_recon__",
+                log_label="reconstructed triples",
+                resolve_contradictions=resolve_contradictions_recon,
+            )
+        finally:
+            if _recon_needs_guard:
+                self._enable_gradient_checkpointing()
 
         # --- Re-merge extra_relations (interim mini-fold pending-session content) ---
         # INVARIANT: extra_relations participate in MERGE / Case-1-adopt ONLY.
@@ -6679,12 +5599,21 @@ class ConsolidationLoop:
         # passes None; interim passes the pending-session relations from merger.graph).
         # resolve_contradictions_extra: driven by config.refinement_contradiction.
         # At fold extra_relations=None so this merge is a no-op.
-        self._merge_registry_relations(
-            extra_relations or [],
-            session_id="__interim_pending_sessions__",
-            log_label="extra (pending-session) relations",
-            resolve_contradictions=resolve_contradictions_extra,
+        _extra_needs_guard = (
+            getattr(self, "model", None) is not None and resolve_contradictions_extra
         )
+        if _extra_needs_guard:
+            self._disable_gradient_checkpointing()
+        try:
+            self.merger.merge_relations(
+                extra_relations or [],
+                session_id="__interim_pending_sessions__",
+                log_label="extra (pending-session) relations",
+                resolve_contradictions=resolve_contradictions_extra,
+            )
+        finally:
+            if _extra_needs_guard:
+                self._enable_gradient_checkpointing()
 
         # --- Re-merge dedup_target_keys (interim recital dedup) LAST ---
         # Unconditional feature: the interim fresh-derivation caller always
@@ -6700,10 +5629,12 @@ class ConsolidationLoop:
         # a session fact contradicting a main-tier dedup target cannot retire
         # that main-tier edge via Case-2 REPLACE.  resolve_contradictions is
         # hardcoded False (not config-driven): this merge must never run
-        # cardinality resolution over main-tier facts.
+        # cardinality resolution over main-tier facts.  No gradient-checkpointing
+        # guard is needed here — resolve_contradictions=False never fires
+        # model.generate().
         if dedup_target_keys is not None:
             dedup_relations = self._build_registry_true_relations(keys=dedup_target_keys)
-            self._merge_registry_relations(
+            self.merger.merge_relations(
                 dedup_relations,
                 session_id="__interim_maintier_dedup__",
                 log_label="main-tier recital dedup",
@@ -6729,26 +5660,35 @@ class ConsolidationLoop:
 
         This is the *Refine* stage of the fold pipeline:
 
-        1. Optionally run the whole-graph local-model normalization pass via
-           :meth:`_run_graph_normalization` (predicate alignment + entity merge +
-           predicate-synonym normalization).  Runs when ``normalize`` is ``True``.
-           Local model; no cloud dependency.
-        2. Optionally run SOTA graph enrichment via :meth:`_run_graph_enrichment`
-           (additive second-order discovery).  Runs when ``enrich`` is ``True``.
-           Cloud dependency.
-        3. Emit a debug snapshot ("enriched") after the refine step (or immediately
-           when both stages are skipped).
-        4. Two INDEPENDENTLY-guarded recurrence-bump blocks (never unioned under
-           one relaxed guard — each dict is consumed by its own loop with its own
-           guard, so the recital-dedup credit adds a bump without changing the
-           pre-existing ``reinforcements`` bump contract):
+        1. Construct a per-call :class:`~paramem.training.graph_tier.GraphTierRefiner`
+           bound to this loop's ``self.merger`` and the current ``self.model`` /
+           ``self.tokenizer``, and call
+           :meth:`~paramem.training.graph_tier.GraphTierRefiner.refine` with the
+           ``normalize`` / ``enrich`` flags.  ``refine()`` runs the whole-graph
+           local-model normalization pass (predicate alignment + entity merge +
+           predicate-synonym normalization) when ``normalize`` is ``True``, then
+           SOTA graph enrichment (additive second-order discovery) when
+           ``enrich`` is ``True`` — normalization first, so enrichment sees the
+           already-normalized graph. Constructed fresh on every call, never
+           cached: ``self.model`` is re-wrapped by adapter operations elsewhere
+           in the fold, so a cached refiner would risk pinning a stale handle.
+        2. Emit a debug snapshot ("enriched") after the refine step (or
+           immediately when both stages are skipped). Stays on the loop rather
+           than the refiner — this is what lets the refiner's normalization
+           sink stay a one-method protocol instead of the whole debug writer.
+        3. Two INDEPENDENTLY-guarded recurrence-bump blocks, reading the
+           reinforcement maps off the returned
+           :class:`~paramem.training.graph_tier.RefineResult` (never unioned
+           under one relaxed guard — each dict is consumed by its own loop with
+           its own guard, so the recital-dedup credit adds a bump without
+           changing the pre-existing ``reinforcements`` bump contract):
 
-           - If ``recon_relations`` is non-empty, scan ``merger.reinforcements``
+           - If ``recon_relations`` is non-empty, scan ``result.reinforcements``
              for Case-1 duplicate-SPO collapses and call
              :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
              surviving key.  This guard is byte-identical to the original
              contract: a re-merge must actually have run for this bump to fire.
-           - If ``merger.adopt_reinforcements`` is non-empty, call
+           - If ``result.adopt_reinforcements`` is non-empty, call
              :meth:`~paramem.memory.store.MemoryStore.bump_recurrence` for each
              main-tier key credited by the interim recital-dedup merge's
              Case-1-adopt.  This guard is independent of ``recon_relations`` —
@@ -6760,53 +5700,33 @@ class ConsolidationLoop:
         Args:
             recon_relations: The list of registry-true :class:`Relation` objects
                 produced by :meth:`_materialize_consolidation_graph`.  Used as
-                the guard for the ``merger.reinforcements`` bump block only (see
-                point 4) — when empty, that block is skipped (no re-merge was
-                performed so ``merger.reinforcements`` will be empty too).  Does
+                the guard for the ``result.reinforcements`` bump block only (see
+                point 3) — when empty, that block is skipped (no re-merge was
+                performed so ``result.reinforcements`` will be empty too).  Does
                 NOT gate the independent ``adopt_reinforcements`` bump block.
-            normalize: When ``True``, run :meth:`_run_graph_normalization`
-                (local-model predicate alignment + entity merge +
-                predicate-synonym normalization).
+            normalize: When ``True``, run the local-model predicate-synonym
+                normalization pass.
                 Callers pass ``normalize=scope.normalize``.
                 Default ``False``.
-            enrich: When ``True``, run :meth:`_run_graph_enrichment` (cloud-SOTA
-                additive discovery).  Callers pass ``enrich=scope.enrich`` (the
+            enrich: When ``True``, run cloud-SOTA graph enrichment (additive
+                discovery).  Callers pass ``enrich=scope.enrich`` (the
                 scope field is set at construction to
                 ``refinement_enrichment=="on" and sota_enabled``).
                 Default ``False``.
         """
-        # --- Whole-graph local-model normalization (predicate synonym collapse) ---
-        # Runs at level light+ for full-fold only (interim scopes set normalize=False).
-        # The local model sees the full merged graph and collapses synonym predicates.
-        # Removals flow into merger.removal_ledger and are consumed by
-        # _apply_subtractive_removals_to_store after this method returns.
-        if normalize:
-            norm_result = self._run_graph_normalization()
-            if not norm_result.get("skipped"):
-                logger.info(
-                    "graph_normalization complete: chunks=%d groups_collapsed=%d edges_retired=%d",
-                    norm_result.get("chunks", 0),
-                    norm_result.get("groups_collapsed", 0),
-                    norm_result.get("edges_retired", 0),
-                )
-
-        # --- Graph-level SOTA enrichment (additive, cloud, HELD) ---
-        # Runs AFTER normalization so enrichment operates on the already-normalized
-        # graph.  The external/SOTA boundary is handled inside _run_graph_enrichment
-        # (per-chunk except catches network errors and continues), so a network
-        # failure degrades gracefully there.  A programming error here propagates
-        # and aborts the fold (sessions stay pending/retriable) — correct behaviour.
-        # Enrichment-added edges are keyless and are picked up by the pre-pass that
-        # runs after inline-promotion.
-        if enrich:
-            enrichment_result = self._run_graph_enrichment()
-            if not enrichment_result.get("skipped"):
-                logger.info(
-                    "graph_enrichment complete: chunks=%d new_edges=%d same_as_merges=%d",
-                    enrichment_result.get("chunks", 0),
-                    enrichment_result.get("new_edges", 0),
-                    enrichment_result.get("same_as_merges", 0),
-                )
+        refiner = graph_tier.GraphTierRefiner(
+            self.merger,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            extraction_config_provider=self._current_extraction_config,
+            sota_enabled=self.config.sota_enabled,
+            neighborhood_hops=self.graph_enrichment_neighborhood_hops,
+            max_entities_per_pass=self.graph_enrichment_max_entities_per_pass,
+            gc_disable=self._disable_gradient_checkpointing,
+            gc_enable=self._enable_gradient_checkpointing,
+            normalization_sink=self._debug_writer,
+        )
+        result = refiner.refine(normalize=normalize, enrich=enrich)
 
         # Debug: snapshot the refined graph (after normalization + enrichment, or
         # immediately when both are skipped at level off).
@@ -6815,20 +5735,19 @@ class ConsolidationLoop:
 
         if recon_relations:
             # --- Reinforcement bump: Case-1 duplicate-SPO collapses ---
-            # merger.reinforcements contains the surviving ik_key for every Case-1
+            # result.reinforcements contains the surviving ik_key for every Case-1
             # collision fired during the re-merge.  A collision means two active keys
             # shared the same (s,p,o) — the incoming key drifts and the existing
             # edge's key is the survivor.  The survivor's reinforcement_count
             # represents how many times this fact was independently extracted
             # (and re-keyed) across sessions before this fold collapsed the duplicates.
-            # merger.reinforcements is now dict[ik_key, (last_seen, first_seen)] —
+            # result.reinforcements is dict[ik_key, (last_seen, first_seen)] —
             # the freshest last_seen and earliest first_seen are carried directly
             # from the edge so bump_recurrence can advance bookkeeping without
             # fabricating now().  This guard (recon_relations non-empty) is the
             # original, unchanged contract — the recital-dedup credit does not
             # relax it; it only adds the independent adopt-credit block below.
-            _reinforcements: dict[str, tuple[str, str]] = getattr(self.merger, "reinforcements", {})
-            for _rein_key, (_rein_ls, _rein_fs) in _reinforcements.items():
+            for _rein_key, (_rein_ls, _rein_fs) in result.reinforcements.items():
                 if _rein_key:
                     self.store.bump_recurrence(
                         _rein_key,
@@ -6843,7 +5762,7 @@ class ConsolidationLoop:
                     )
 
         # --- Reinforcement bump: interim recital-dedup Case-1-adopt credits ---
-        # merger.adopt_reinforcements contains the main-tier ik_key credited by the
+        # result.adopt_reinforcements contains the main-tier ik_key credited by the
         # interim recital-dedup merge's Case-1-adopt (a recited pending fact adopts
         # a main key onto its keyless edge).  Independently guarded from the block
         # above — NOT unioned under one relaxed guard — so this credit is additive
@@ -6855,11 +5774,8 @@ class ConsolidationLoop:
         # keyed; adopt_reinforcements records the MAIN key from the Case-1-adopt
         # branch — existing edge keyless), so no key is ever double-bumped across
         # the two blocks.
-        _adopt_reinforcements: dict[str, tuple[str, str]] = getattr(
-            self.merger, "adopt_reinforcements", {}
-        )
-        if _adopt_reinforcements:
-            for _rein_key, (_rein_ls, _rein_fs) in _adopt_reinforcements.items():
+        if result.adopt_reinforcements:
+            for _rein_key, (_rein_ls, _rein_fs) in result.adopt_reinforcements.items():
                 if _rein_key:
                     self.store.bump_recurrence(
                         _rein_key,
@@ -7412,99 +6328,3 @@ class ConsolidationLoop:
             retain_scratch_until_external_commit=retain_scratch_until_external_commit,
         )
         return metrics, recall_state
-
-
-def _mentions_any(text: str, terms: set[str]) -> bool:
-    """Check if text mentions any of the given terms."""
-    text_lower = text.lower()
-    return any(term in text_lower for term in terms)
-
-
-_SAME_AS_HONORIFICS = {
-    "mr",
-    "mrs",
-    "ms",
-    "dr",
-    "prof",
-    "professor",
-    "sir",
-    "madam",
-    "mister",
-}
-
-
-def _strip_honorifics(name: str) -> list[str]:
-    """Return lowercased tokens of ``name`` with trailing-dot honorifics removed."""
-    toks = []
-    for raw in name.lower().split():
-        t = raw.rstrip(".,")
-        if t and t not in _SAME_AS_HONORIFICS:
-            toks.append(t)
-    return toks
-
-
-def _safe_to_merge_surface(a: str, b: str) -> bool:
-    """Heuristic gate: is it safe to merge two surface forms as the same entity?
-
-    Two-stage check:
-
-    1. Token-subset after honorific strip. "Mr. Yang" → {"yang"} is a
-       subset of "Yang Ming" → {"yang", "ming"}. Safe.
-    2. Single-token diff + Jaro-Winkler on the distinct tokens only.
-       "Catherine Holmes" / "Katherine Holmes" share "holmes"; JW on
-       "catherine" vs "katherine" ≈ 0.95 → accept. "Zhang Min" /
-       "Wang Min" share "min"; JW on "zhang" vs "wang" ≈ 0.50 →
-       reject. Multi-token symmetric difference always rejects.
-
-    Returns ``False`` on empty or all-honorific inputs.
-    """
-    a_toks = _strip_honorifics(a)
-    b_toks = _strip_honorifics(b)
-    if not a_toks or not b_toks:
-        return False
-    a_set = set(a_toks)
-    b_set = set(b_toks)
-    if a_set <= b_set or b_set <= a_set:
-        return True
-    only_a = a_set - b_set
-    only_b = b_set - a_set
-    if len(only_a) != 1 or len(only_b) != 1:
-        return False
-    from rapidfuzz.distance import JaroWinkler
-
-    jw = JaroWinkler.normalized_similarity(next(iter(only_a)), next(iter(only_b)))
-    return jw >= 0.85
-
-
-def serialize_subgraph_triples(subgraph) -> list[dict]:
-    """Serialize a NetworkX subgraph into a list of triple dicts.
-
-    Iterates ``subgraph.edges(data=True)`` and produces one dict per edge with
-    keys ``subject``, ``predicate``, ``object``, ``relation_type``, and
-    ``speaker_id``.  The ``predicate`` field is taken directly from the edge
-    ``"predicate"`` attribute; ``relation_type`` defaults to ``"factual"`` when
-    absent; ``speaker_id`` defaults to ``""`` when absent.
-
-    The ``speaker_id`` field allows the SOTA enrichment prompt to identify speaker
-    endpoints and apply the speaker↔speaker exception (emit BOTH directions of a
-    symmetric relation when both endpoints are speakers).
-
-    Args:
-        subgraph: A NetworkX (Multi)DiGraph subgraph view or instance.
-
-    Returns:
-        List of ``{"subject": str, "predicate": str, "object": str,
-        "relation_type": str, "speaker_id": str}`` dicts, one per directed edge.
-    """
-    triples = []
-    for src, tgt, data in subgraph.edges(data=True):
-        triples.append(
-            {
-                "subject": str(src),
-                "predicate": str(data.get("predicate", "")),
-                "object": str(tgt),
-                "relation_type": str(data.get("relation_type", "factual")),
-                "speaker_id": str(data.get("speaker_id", "")),
-            }
-        )
-    return triples

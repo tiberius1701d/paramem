@@ -799,9 +799,9 @@ class TestCloudModePolicy:
         agent.is_available.return_value = True
         return agent
 
-    def _config(self, cloud_mode: str):
+    def _config(self, cloud_mode: str, *, mode: str = "off"):
         config = MagicMock()
-        config.sanitization.mode = "off"
+        config.sanitization.mode = mode
         config.sanitization.cloud_mode = cloud_mode
         config.voice.load_prompt.return_value = "You are a helper."
         return config
@@ -826,7 +826,7 @@ class TestCloudModePolicy:
         router._speaker_key_index = {}
         return router
 
-    def _run(self, *, router, config, cloud_agent, ha_client=None):
+    def _run(self, *, router, config, cloud_agent, ha_client=None, history=None):
         """Drive handle_chat with HA missing/None so SOTA is the next stop.
 
         Patches ``_base_model_answer`` so tests that get blocked at SOTA
@@ -852,7 +852,7 @@ class TestCloudModePolicy:
                 conversation_id="cloud-mode-test",
                 speaker=None,
                 speaker_id="spk-test",
-                history=None,
+                history=history,
                 model=model,
                 tokenizer=tokenizer,
                 config=config,
@@ -887,18 +887,60 @@ class TestCloudModePolicy:
         sent = cloud_agent.call.call_args.kwargs["query"]
         assert sent == "What's the population of Berlin?"
 
+    def test_block_mode_general_query_threads_speaker_id_to_history_sanitizer(self):
+        """The ``cloud_mode=block`` + non-PERSONAL branch of
+        ``_escalate_via_cloud_policy`` must pass ``speaker_id`` through to
+        ``_sanitize_history`` — without it the first-person detector is dead
+        on this channel, unlike the other three ``_sanitize_history`` call
+        sites (the anonymizing branch here, and both ``app.py`` sites).
+        """
+        cloud_agent = self._make_cloud_agent()
+        cloud_agent.call.return_value = CloudResponse(text="Berlin has 3.7M people.")
+        with patch("paramem.server.inference._sanitize_history", return_value=[]) as mock_sanitize:
+            self._run(
+                router=self._general_router(),
+                config=self._config("block"),
+                cloud_agent=cloud_agent,
+                history=[{"role": "user", "text": "hi"}],
+            )
+        mock_sanitize.assert_called_once()
+        assert mock_sanitize.call_args.kwargs["speaker_id"] == "spk-test"
+
     # ---- anonymize mode ----
+
+    @staticmethod
+    def _payload(*, status: str, anon_transcript: str = "", forward=None, reverse=None):
+        from paramem.graph.cloud_egress import AnonymizedPayload
+
+        reverse = reverse or {}
+        return AnonymizedPayload(
+            status=status,
+            forward=forward or {},
+            reverse=reverse,
+            anon_transcript=anon_transcript,
+            anon_facts=[],
+            declared=frozenset(reverse.keys()),
+            norm_stats={"inverted": 0, "dropped": 0},
+            rekey_dropped=0,
+            raw="",
+        )
 
     def test_anonymize_mode_round_trips_via_anonymizer(self):
         cloud_agent = self._make_cloud_agent()
         cloud_agent.call.return_value = CloudResponse(text="Person_1 is a useful placeholder here.")
+        payload = self._payload(
+            status="ok",
+            anon_transcript="Person_1 query",
+            forward={"Alex": "Person_1"},
+            reverse={"Person_1": "Alex"},
+        )
         with (
             patch(
                 "paramem.graph.extractor.extract_and_anonymize_for_cloud",
-                return_value=("Person_1 query", {"Alex": "Person_1"}, {"Person_1": "Alex"}),
+                return_value=payload,
             ) as mock_anon,
             patch(
-                "paramem.graph.placeholders.deanonymize_text",
+                "paramem.graph.cloud_egress.deanonymize_response_text",
                 return_value="Alex is a useful placeholder here.",
             ) as mock_deanon,
         ):
@@ -916,12 +958,12 @@ class TestCloudModePolicy:
         assert result.text == "Alex is a useful placeholder here."
 
     def test_anonymize_mode_leak_guard_blocks_query(self):
-        """Empty mapping from anonymize_outbound = leak guard or model
-        failure → per-query block, SOTA never called."""
+        """A ``status="failed"`` payload (leak guard or model failure) =
+        per-query block, SOTA never called."""
         cloud_agent = self._make_cloud_agent()
         with patch(
             "paramem.graph.extractor.extract_and_anonymize_for_cloud",
-            return_value=("", {}, {}),  # leak guard tripped
+            return_value=self._payload(status="failed"),
         ):
             self._run(
                 router=self._personal_router(),
@@ -945,13 +987,19 @@ class TestCloudModePolicy:
         # non-PERSONAL anonymized + sent.
         cloud_agent_g = self._make_cloud_agent()
         cloud_agent_g.call.return_value = CloudResponse(text="<answer>")
+        payload = self._payload(
+            status="ok",
+            anon_transcript="anon q",
+            forward={"Berlin": "City_1"},
+            reverse={"City_1": "Berlin"},
+        )
         with (
             patch(
                 "paramem.graph.extractor.extract_and_anonymize_for_cloud",
-                return_value=("anon q", {"Berlin": "City_1"}, {"City_1": "Berlin"}),
+                return_value=payload,
             ),
             patch(
-                "paramem.graph.placeholders.deanonymize_text",
+                "paramem.graph.cloud_egress.deanonymize_response_text",
                 return_value="<answer>",
             ),
         ):
@@ -963,3 +1011,97 @@ class TestCloudModePolicy:
         cloud_agent_g.call.assert_called_once()
         sent = cloud_agent_g.call.call_args.kwargs["query"]
         assert sent == "anon q"
+
+    # ---- dual-scope closure (history alongside the anonymized transcript) ----
+
+    def test_history_names_are_anonymized_under_anonymize_mode_even_at_sanitization_mode_warn(
+        self,
+    ):
+        """With ``cloud_mode="anonymize"`` and ``sanitization.mode="warn"``,
+        no history turn reaches ``sota_agent.call`` carrying a name present
+        in ``payload.forward`` — the history channel is no longer governed
+        by ``sanitization.mode`` (which would let it through verbatim at
+        ``mode="warn"``) once the current turn is being placeholdered.
+        """
+        cloud_agent = self._make_cloud_agent()
+        cloud_agent.call.return_value = CloudResponse(text="<answer>")
+        payload = self._payload(
+            status="ok",
+            anon_transcript="Person_1 query",
+            forward={"Alex": "Person_1"},
+            reverse={"Person_1": "Alex"},
+        )
+        # No first-person markers and "Alex" is not a known_entity in this
+        # test's setup, so the mode="block" drop-gate lets the turn
+        # through unchanged — proving any absence of "Alex" downstream is
+        # the forward-map substitution, not the drop gate.
+        history = [{"role": "user", "text": "Did Alex call?"}]
+        with (
+            patch(
+                "paramem.graph.extractor.extract_and_anonymize_for_cloud",
+                return_value=payload,
+            ),
+            patch(
+                "paramem.graph.cloud_egress.deanonymize_response_text",
+                return_value="<answer>",
+            ),
+        ):
+            self._run(
+                router=self._personal_router(),
+                config=self._config("anonymize", mode="warn"),
+                cloud_agent=cloud_agent,
+                history=history,
+            )
+
+        cloud_agent.call.assert_called_once()
+        sent_history = cloud_agent.call.call_args.kwargs["history"]
+        assert sent_history, "expected the history turn to survive the drop gate"
+        for turn in sent_history:
+            assert "Alex" not in turn["text"], (
+                f"History turn carried the real name verbatim: {turn!r}"
+            )
+        assert any("Person_1" in turn["text"] for turn in sent_history), (
+            f"Expected the forward-map substitution to apply to history: {sent_history!r}"
+        )
+
+
+class TestCloudOnlyRouteSpeakerId:
+    """``_cloud_only_route``'s ``speaker_id`` parameter
+    must reach ``_sanitize_history`` — consistent with the other three
+    ``_sanitize_history`` call sites (both branches of
+    ``inference._escalate_via_cloud_policy`` and the forced-routing debug
+    path in ``app.py``).
+    """
+
+    def test_speaker_id_reaches_history_sanitizer(self):
+        from paramem.server.app import _cloud_only_route
+        from paramem.server.inference import ChatResult
+
+        config = MagicMock()
+        config.sanitization.mode = "off"
+        sota_agent = MagicMock()
+        sota_agent.is_available.return_value = True
+
+        with (
+            patch(
+                "paramem.server.sanitizer.sanitize_for_cloud",
+                return_value=("What's the population of Berlin?", set()),
+            ),
+            patch("paramem.server.app._sanitize_history", return_value=[]) as mock_sanitize,
+            patch(
+                "paramem.server.app._escalate_to_sota",
+                return_value=ChatResult(text="Berlin has 3.7M people."),
+            ),
+        ):
+            _cloud_only_route(
+                text="What's the population of Berlin?",
+                speaker="Alex",
+                history=[{"role": "user", "text": "hi"}],
+                config=config,
+                ha_client=None,
+                sota_agent=sota_agent,
+                speaker_id="spk-test",
+            )
+
+        mock_sanitize.assert_called_once()
+        assert mock_sanitize.call_args.kwargs["speaker_id"] == "spk-test"

@@ -338,12 +338,12 @@ class TestSubmitSerialises:
 
 
 # ---------------------------------------------------------------------------
-# Test 11 — persistent callable worker (C2 fix)
+# Test 11 — persistent callable worker
 # ---------------------------------------------------------------------------
 
 
 class TestPersistentCallableWorker:
-    """C2 fix: callable worker is persistent and never strands a job.
+    """Callable worker is persistent and never strands a job.
 
     Before the fix, the worker exited as soon as the queue was empty.  A
     concurrent submit() that observed is_alive()==True (thread in its exit

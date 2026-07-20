@@ -224,8 +224,8 @@ def test_cloud_anonymizer_contract(loaded_model):
     personal markers must succeed.  No-personal-markers queries pass
     through (mapping may be empty) and contribute neutrally to the rate.
     """
+    from paramem.graph.cloud_egress import CloudScope, deanonymize_response_text
     from paramem.graph.extractor import extract_and_anonymize_for_cloud
-    from paramem.graph.placeholders import deanonymize_text
 
     model, tokenizer = loaded_model
 
@@ -240,7 +240,7 @@ def test_cloud_anonymizer_contract(loaded_model):
         if expected_names:
             expected_personal += 1
 
-        anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
+        payload = extract_and_anonymize_for_cloud(
             transcript,
             model,
             tokenizer,
@@ -249,19 +249,20 @@ def test_cloud_anonymizer_contract(loaded_model):
             scrub=_DEFAULT_SCRUB,
         )
 
-        # A genuinely blocked call is ``anon_text == ""`` (extraction
-        # failure, empty input, or the anonymizer's own parse failure —
-        # ``mapping is None``, fail-closed).  ``mapping == {}`` no longer
-        # means "block": it PROCEEDS —
-        # the anonymizer ran and found nothing in scope, trusted as a
-        # legitimate verdict rather than treated as a safe block.  That
-        # verdict is itself exercised by the leak-guard assertions below
-        # rather than skipped: if ``expected_names`` really are present
-        # in the transcript, an unscrubbed ``anon_text`` trips them.
-        if not anon_text:
+        # A genuinely blocked call is ``status == "failed"`` (extraction
+        # failure, empty input, or the anonymizer's own parse failure,
+        # fail-closed).  An empty ``forward`` mapping (``status == "ok"``)
+        # no longer means "block": it PROCEEDS — the anonymizer ran and
+        # found nothing in scope, trusted as a legitimate verdict rather
+        # than treated as a safe block.  That verdict is itself exercised
+        # by the leak-guard assertions below rather than skipped: if
+        # ``expected_names`` really are present in the transcript, an
+        # unscrubbed ``anon_transcript`` trips them.
+        if payload.status == "failed":
             if expected_names:
                 blocks += 1
             continue
+        anon_text = payload.anon_transcript
 
         # Forward leak-guard contract: every real name in the mapping
         # AND every expected_name from the fixture must be absent from
@@ -271,7 +272,7 @@ def test_cloud_anonymizer_contract(loaded_model):
         # never in the mapping), if it appears verbatim in the cloud
         # payload that's a leak.  Hard-asserted: a name visible in
         # anon_text is a privacy breach, not a coverage shortfall.
-        for name in mapping:
+        for name in payload.forward:
             assert name not in anon_text, (
                 f"[{entry['id']}] Leak guard breach: real name {name!r} "
                 f"present in anon_text {anon_text!r}"
@@ -282,10 +283,13 @@ def test_cloud_anonymizer_contract(loaded_model):
                 f"present in anon_text {anon_text!r} (extraction missed it)"
             )
 
-        # Round-trip contract: deanonymize_text restores the original
-        # transcript (modulo whitespace, which the anonymizer LLM may reflow).
-        round_trip = deanonymize_text(anon_text, reverse)
-        if _normalise(round_trip) != _normalise(transcript):
+        # Round-trip contract: the production exit gate
+        # (deanonymize_response_text, observed-scoped against the exact
+        # text sent) restores the original transcript (modulo whitespace,
+        # which the anonymizer LLM may reflow).
+        scope = CloudScope.for_response(payload, sota_bindings=None, sent=(anon_text,))
+        round_trip = deanonymize_response_text(scope, anon_text)
+        if round_trip is None or _normalise(round_trip) != _normalise(transcript):
             failures.append(
                 f"[{entry['id']}] Round-trip mismatch:\n"
                 f"  original: {transcript!r}\n"
@@ -327,15 +331,15 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
     Operators picking the stricter posture (privacy over cloud-utility
     on places) need this guarantee to hold.
     """
+    from paramem.graph.cloud_egress import CloudScope, deanonymize_response_text
     from paramem.graph.extractor import extract_and_anonymize_for_cloud
-    from paramem.graph.placeholders import deanonymize_text
 
     model, tokenizer = loaded_model
 
     entry = next(e for e in _FIXTURE if e["id"] == "person_and_place")
     transcript = entry["transcript"]
 
-    anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
+    payload = extract_and_anonymize_for_cloud(
         transcript,
         model,
         tokenizer,
@@ -343,14 +347,18 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
         speaker_name=entry["speaker_name"],
         scrub={"person name", "city"},
     )
+    anon_text = payload.anon_transcript
 
-    if not mapping:
-        # An empty mapping here is a compliance miss regardless of the
-        # proceed-on-empty decision (mapping == {} no longer means
-        # "block" — see extract_and_anonymize_for_cloud): this test
-        # specifically verifies the wider scrub set actually widens what
-        # the model classifies in scope, and it did not.
-        reason = "anon_text empty (block)" if not anon_text else "nothing anonymized"
+    if not payload.forward:
+        # An empty forward mapping here is a compliance miss regardless
+        # of the proceed-on-empty decision (an empty mapping with
+        # status == "ok" no longer means "block" — see
+        # extract_and_anonymize_for_cloud): this test specifically
+        # verifies the wider scrub set actually widens what the model
+        # classifies in scope, and it did not.
+        reason = (
+            "status == 'failed' (block)" if payload.status == "failed" else "nothing anonymized"
+        )
         pytest.fail(
             f"Strict scope produced empty mapping ({reason}) on {entry['id']}; "
             f"expected both Alex and Berlin to be anonymized."
@@ -365,12 +373,14 @@ def test_cloud_anonymizer_contract_strict_scope_anonymizes_places(loaded_model):
             f"present in anon_text {anon_text!r}"
         )
 
-    # Round-trip: deanonymize_text restores the original (modulo
-    # whitespace, which the anonymizer LLM may reflow).  Catches a
-    # mapping/transcript inconsistency that would silently leave the
+    # Round-trip: the production exit gate (deanonymize_response_text,
+    # observed-scoped against the exact text sent) restores the original
+    # (modulo whitespace, which the anonymizer LLM may reflow).  Catches
+    # a mapping/transcript inconsistency that would silently leave the
     # cloud's response with placeholders the user sees.
-    round_trip = deanonymize_text(anon_text, reverse)
-    assert _normalise(round_trip) == _normalise(transcript), (
+    scope = CloudScope.for_response(payload, sota_bindings=None, sent=(anon_text,))
+    round_trip = deanonymize_response_text(scope, anon_text)
+    assert round_trip is not None and _normalise(round_trip) == _normalise(transcript), (
         f"[{entry['id']}, scrub=person_name+city] Round-trip mismatch:\n"
         f"  original:   {transcript!r}\n"
         f"  round-trip: {round_trip!r}"

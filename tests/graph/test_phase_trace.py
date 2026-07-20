@@ -14,6 +14,8 @@ Covers:
 - decoupling: trace survives graph rebinding inside the scope
 - prompt-recording contract: record_prompt appends to the active phase
   scope, no-ops outside one, and round-trips through to_dict/get_phases/records
+- stop_at/chain_stopped: nesting, reset on exit, None is a no-op, invalid
+  name raises, a failed outcome does not stop the chain
 """
 
 from __future__ import annotations
@@ -25,10 +27,12 @@ import pytest
 from paramem.graph.phase_trace import (
     PHASE_NAMES,
     PhaseRecord,
+    chain_stopped,
     extraction_trace,
     get_phases,
     phase_trace,
     record_prompt,
+    stop_at,
 )
 from paramem.graph.schema import SessionGraph
 
@@ -396,13 +400,13 @@ class TestGraphRebindingDecoupling:
 
 
 class TestExtractGraphStopPhase:
-    """Integration: ``extract_graph(..., stop_phase=NAME)`` returns
-    immediately after the named phase records, and the phases beyond it
-    do not fire.
+    """Integration: wrapping ``extract_graph(...)`` in ``with
+    stop_at(NAME):`` returns immediately after the named phase records,
+    and the phases beyond it do not fire.
 
     Mocks ``_generate_extraction`` so no real model is required.  The
-    contract under test is the wiring: pipeline checks ``stop_phase``
-    after each phase block and short-circuits.
+    contract under test is the wiring: the pipeline checks
+    ``chain_stopped()`` after each phase block and short-circuits.
     """
 
     def test_stop_phase_local_extract_skips_everything_after(self, monkeypatch):
@@ -422,39 +426,126 @@ class TestExtractGraphStopPhase:
         )
 
         # Tokenizer / model stubs — extraction prompt formatting paths.
-        graph = extract_graph(
-            model=MagicMock(),
-            tokenizer=MagicMock(),
-            transcript="Alex lives in Berlin.",
-            session_id="test-stop-phase",
-            speaker_id="speaker0",
-            speaker_name="Alex",
-            validate=False,  # don't try the SOTA pipeline
-            ha_validation=False,
-            stop_phase="local_extract",
-            scrub={"person name"},
-        )
+        with stop_at("local_extract"):
+            graph = extract_graph(
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+                transcript="Alex lives in Berlin.",
+                session_id="test-stop-phase",
+                speaker_id="speaker0",
+                speaker_name="Alex",
+                validate=False,  # don't try the SOTA pipeline
+                ha_validation=False,
+                scrub={"person name"},
+            )
 
         phase_names = [p["name"] for p in graph.diagnostics.get("phases", [])]
         assert phase_names == ["local_extract"]
 
     def test_stop_phase_invalid_name_raises(self):
-        from unittest.mock import MagicMock
+        with pytest.raises(ValueError, match="not a valid phase name"):
+            with stop_at("anonymise"):  # British spelling — should fail
+                pass
 
-        import pytest
+    def test_stop_phase_local_extract_returns_populated_graph_not_empty_stub(self, monkeypatch):
+        """Regression pin (one of two named in the flag-vs-exception design
+        review): an exception/sentinel-based stop would raise from INSIDE
+        ``_run_local_extraction``'s own ``phase_trace`` scope, before its
+        ``return graph`` (after the ``with phase_trace(...)`` block)
+        executes — leaving ``extract_graph``'s ``graph`` bound to the EMPTY
+        stub it was initialised to before ``_run_local_extraction`` was
+        even called (``extractor.py``: the stub binds at trace-open, is
+        rebound by the ``_run_local_extraction`` call).  The flag design
+        checks ``chain_stopped()`` only AFTER that assignment lands, so the
+        returned graph must carry the real parsed entities/relations, not
+        the stub."""
+        from unittest.mock import MagicMock
 
         from paramem.graph.extractor import extract_graph
 
-        with pytest.raises(ValueError, match="not a valid phase name"):
-            extract_graph(
+        monkeypatch.setattr(
+            "paramem.graph.extractor._generate_extraction",
+            lambda *a, **kw: (
+                '{"entities": [{"name": "Alex", "entity_type": "person"}], '
+                '"relations": [{"subject": "Alex", "predicate": "lives_in", '
+                '"object": "Berlin", "relation_type": "factual", "confidence": 1.0}], '
+                '"summary": "Alex lives in Berlin."}'
+            ),
+        )
+
+        with stop_at("local_extract"):
+            graph = extract_graph(
                 model=MagicMock(),
                 tokenizer=MagicMock(),
-                transcript="x",
-                session_id="t",
+                transcript="Alex lives in Berlin.",
+                session_id="test-stop-phase-populated",
                 speaker_id="speaker0",
-                stop_phase="anonymise",  # British spelling — should fail
+                speaker_name="Alex",
+                validate=False,
+                ha_validation=False,
                 scrub={"person name"},
             )
+
+        assert graph.relations, "must be the parsed graph, not the empty stub"
+        assert graph.relations[0].subject == "Alex"
+        assert graph.relations[0].object == "Berlin"
+
+    def test_stop_phase_second_order_extract_retains_union(self, monkeypatch):
+        """Regression pin (the second of the two): an exception/sentinel-
+        based stop would raise from inside the second-order pass's own
+        nested ``phase_trace`` scope, skipping the
+        ``graph.relations.extend(second_order_graph.relations)`` /
+        ``.entities.extend(...)`` calls that sit BETWEEN the second-order
+        ``_run_local_extraction`` call and the stop check.  The flag
+        design's check runs strictly after those two ``.extend()`` calls,
+        so the pass-1 kinship edge and the recovered second-order fact
+        must BOTH survive in the returned graph."""
+        from unittest.mock import MagicMock
+
+        from paramem.graph.extractor import extract_graph
+
+        def _pass1(*a, **kw):
+            return (
+                '{"entities": [{"name": "speaker0", "entity_type": "person"}, '
+                '{"name": "Nadeem", "entity_type": "person"}], '
+                '"relations": [{"subject": "speaker0", "predicate": "has_brother", '
+                '"object": "Nadeem", "relation_type": "social", "confidence": 1.0}]}'
+            )
+
+        def _second_order(*a, **kw):
+            return (
+                '{"entities": [{"name": "Nadeem", "entity_type": "person"}], '
+                '"relations": [{"subject": "Nadeem", "predicate": "lives_in", '
+                '"object": "Porto", "relation_type": "factual", "confidence": 1.0}]}'
+            )
+
+        def _fake_generate(*args, **kwargs):
+            if kwargs.get("user_prompt_filename") == "extraction_second_order.txt":
+                return _second_order()
+            return _pass1()
+
+        monkeypatch.setattr("paramem.graph.extractor._generate_extraction", _fake_generate)
+
+        with stop_at("second_order_extract"):
+            graph = extract_graph(
+                model=MagicMock(),
+                tokenizer=MagicMock(),
+                transcript="My brother Nadeem lives in Porto.",
+                session_id="test-stop-phase-union",
+                speaker_id="speaker0",
+                validate=False,
+                ha_validation=False,
+                scrub={"person name"},
+            )
+
+        phase_names = [p["name"] for p in graph.diagnostics.get("phases", [])]
+        assert phase_names == ["local_extract", "second_order_extract"]
+        assert any(r.subject == "speaker0" and r.object == "Nadeem" for r in graph.relations), (
+            "pass-1 kinship edge must survive the union"
+        )
+        assert any(r.subject == "Nadeem" and r.object == "Porto" for r in graph.relations), (
+            "second-order recovered fact must survive the union"
+        )
 
 
 class TestGetPhases:
@@ -473,3 +564,104 @@ class TestGetPhases:
         ]
         phases = get_phases(graph)
         assert [p.name for p in phases] == ["local_extract", "anonymize"]
+
+
+class TestStopAt:
+    """Unit tests for :func:`stop_at`/:func:`chain_stopped` — the
+    low-level chain-stop mechanics, independent of ``extract_graph``.
+    Exactly mirrors :func:`paramem.graph.prompts.prompt_overrides`:
+    opened by the caller, never threaded as a parameter."""
+
+    def test_default_chain_stopped_is_false(self):
+        assert chain_stopped() is False
+
+    def test_none_phase_is_a_no_op(self):
+        with stop_at(None):
+            with phase_trace("local_extract"):
+                pass
+            assert chain_stopped() is False
+
+    def test_invalid_phase_name_raises(self):
+        with pytest.raises(ValueError, match="not a valid phase name"):
+            with stop_at("anonymise"):  # British spelling — should fail
+                pass
+
+    def test_matching_phase_sets_chain_stopped_true(self):
+        with stop_at("anonymize"):
+            with phase_trace("local_extract"):
+                pass
+            assert chain_stopped() is False
+            with phase_trace("anonymize"):
+                pass
+            assert chain_stopped() is True
+
+    def test_non_matching_phase_leaves_chain_stopped_false(self):
+        with stop_at("deanon"):
+            with phase_trace("local_extract"):
+                pass
+            with phase_trace("anonymize"):
+                pass
+            assert chain_stopped() is False
+
+    def test_no_stop_at_scope_never_sets_chain_stopped(self):
+        with extraction_trace():
+            for name in PHASE_NAMES:
+                with phase_trace(name):
+                    pass
+            assert chain_stopped() is False
+
+    def test_soft_failed_outcome_does_not_set_chain_stopped(self):
+        """A phase that finishes normally (no exception) but calls
+        ``t.set_outcome("failed", ...)`` — e.g. a SOTA call returning
+        ``None`` — must NOT be mistaken for the requested stop point."""
+        with stop_at("anon_plausibility"):
+            with phase_trace("anon_plausibility") as t:
+                t.set_outcome("failed", reason="plausibility call returned None")
+            assert chain_stopped() is False
+
+    def test_raised_exception_does_not_set_chain_stopped(self):
+        """A phase whose body raises never reaches the success branch at
+        all, so it can never set the stopped flag — the ``except`` branch
+        is a structurally separate code path."""
+        with stop_at("anonymize"):
+            with pytest.raises(RuntimeError, match="boom"):
+                with phase_trace("anonymize"):
+                    raise RuntimeError("boom")
+            assert chain_stopped() is False
+
+    def test_chain_stopped_stays_true_once_set(self):
+        """Once set, the stopped flag is not cleared by subsequent phases
+        (there is no path back to ``False`` within a single scope)."""
+        with stop_at("local_extract"):
+            with phase_trace("local_extract"):
+                pass
+            assert chain_stopped() is True
+            with phase_trace("anonymize"):
+                pass
+            assert chain_stopped() is True
+
+    def test_nested_stop_at_replaces_outer_value_and_restores_on_exit(self):
+        """Mirrors ``prompt_overrides``: an inner ``stop_at`` call fully
+        replaces the outer requested phase for its duration (no merge),
+        and both the requested phase and the stopped flag are restored to
+        the outer scope's state on exit."""
+        with stop_at("local_extract"):
+            with phase_trace("local_extract"):
+                pass
+            assert chain_stopped() is True
+            with stop_at("anonymize"):
+                # Inner scope gets its own fresh stopped=False, even
+                # though the outer scope had already stopped.
+                assert chain_stopped() is False
+                with phase_trace("anonymize"):
+                    pass
+                assert chain_stopped() is True
+            # Outer scope's own already-satisfied request is restored.
+            assert chain_stopped() is True
+
+    def test_reset_on_exit_leaves_no_active_request(self):
+        with stop_at("local_extract"):
+            with phase_trace("local_extract"):
+                pass
+            assert chain_stopped() is True
+        assert chain_stopped() is False

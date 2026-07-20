@@ -38,8 +38,8 @@ class TestCaseFolding:
     def test_ligature_fi(self):
         """str.casefold() folds ﬁ → fi on CPython 3.11+.
 
-        CORRECTION per plan CONCERN-7: casefold DOES fold the fi ligature
-        (U+FB01), so assert equality, not inequality.
+        casefold() DOES fold the fi ligature (U+FB01), so assert equality,
+        not inequality.
         """
         assert canonical("ﬁle") == "file"
 
@@ -137,7 +137,7 @@ class TestNegatives:
 
 
 # ---------------------------------------------------------------------------
-# Speaker-identity primitive tests (P1 / P2 — §0 invariant)
+# Speaker-identity primitive tests (§0 invariant)
 # ---------------------------------------------------------------------------
 
 

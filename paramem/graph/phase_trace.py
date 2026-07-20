@@ -43,6 +43,24 @@ Usage
 scope it raises :class:`RuntimeError` immediately rather than silently
 dropping records.
 
+Chain-stop signal
+------------------
+
+:func:`stop_at` — opened by the CALLER, exactly mirroring
+:func:`paramem.graph.prompts.prompt_overrides` — names a phase from
+:data:`PHASE_NAMES` after which the pipeline should stop.
+:func:`phase_trace` flips the internal "stopped" contextvar to ``True``
+the moment that phase finishes with a non-``"failed"`` outcome; the
+pipeline (:func:`paramem.graph.extractor.extract_graph` /
+:func:`~paramem.graph.extractor._sota_pipeline`) checks
+:func:`chain_stopped` — never a phase-name string — after each phase
+block and returns early when it is set.  Because the flag lives in a
+:class:`contextvars.ContextVar` rather than being threaded as a
+parameter, it is reachable from arbitrarily nested helpers with no
+signature changes down the call chain.  Production opens no
+:func:`stop_at` scope, so nothing ever stops the chain — this is
+calibration-only.
+
 Prompt provenance
 -----------------
 
@@ -300,6 +318,10 @@ class ExtractionTrace:
     :class:`SessionGraph` instance — the pipeline freely rebinds
     ``graph = ...`` and the trace survives.  Call :meth:`attach_to` once
     when a final graph is in hand.
+
+    Records what happened, never what was asked — the chain-stop request
+    (see :func:`stop_at`) is a separate, independent contextvar and has
+    no representation here.
     """
 
     __slots__ = ("_records",)
@@ -353,6 +375,77 @@ _ACTIVE_TRACE: ContextVar[ExtractionTrace | None] = ContextVar(
 # NO-OPS rather than raising — see "Prompt provenance" in the module
 # docstring for why this differs from :func:`phase_trace`'s own contract.
 _ACTIVE_SCOPE: ContextVar[_PhaseScope | None] = ContextVar("paramem_phase_scope", default=None)
+
+# ContextVar holding the phase name (from PHASE_NAMES) after which the chain
+# should stop, or ``None`` for the full pipeline (production default).  Set
+# by :func:`stop_at`; read by :func:`phase_trace`.  Mirrors
+# ``paramem.graph.prompts._PROMPT_OVERRIDES`` — opened by the CALLER, never
+# threaded as a parameter down the pipeline.
+_STOP_AT: ContextVar[str | None] = ContextVar("paramem_stop_at", default=None)
+
+# ContextVar tracking whether the requested stop phase has fired.  ``False``
+# until :func:`phase_trace` records a phase whose name matches ``_STOP_AT``
+# with a non-``"failed"`` outcome, then ``True`` for the rest of the
+# :func:`stop_at` scope's lifetime.  Read via :func:`chain_stopped`.
+_STOPPED: ContextVar[bool] = ContextVar("paramem_stopped", default=False)
+
+
+@contextmanager
+def stop_at(phase: str | None) -> Iterator[None]:
+    """Request the extraction chain stop after ``phase`` completes.
+
+    Mirrors :func:`paramem.graph.prompts.prompt_overrides`: opened by the
+    CALLER (calibration), never threaded as a parameter through
+    :class:`~paramem.graph.extraction_pipeline.ExtractionPipeline`,
+    :func:`paramem.graph.extractor.extract_graph`, or
+    :func:`~paramem.graph.extractor._sota_pipeline`.  Every
+    :func:`phase_trace` call anywhere inside the ``with`` body sees the
+    same requested phase via the contextvar, however deeply nested.
+
+    Args:
+        phase: A name from :data:`PHASE_NAMES` after which the pipeline
+            should stop, or ``None`` to run the full pipeline (the
+            production default — production opens no :func:`stop_at`
+            scope at all, so this is effectively always ``None`` outside
+            calibration).
+
+    Raises:
+        ValueError: When ``phase`` is not ``None`` and not in
+            :data:`PHASE_NAMES`.  Validated once here, before any work
+            happens, rather than running the full pipeline and silently
+            never matching.
+
+    Nesting: like :func:`~paramem.graph.prompts.prompt_overrides`, an
+    inner call fully replaces the outer value for its duration (no
+    merge); both the requested phase and the stopped flag are restored
+    to the outer state on exit via ``ContextVar.reset``.
+    """
+    if phase is not None and phase not in PHASE_NAMES:
+        raise ValueError(
+            f"stop_phase {phase!r} is not a valid phase name. Valid: {list(PHASE_NAMES)}"
+        )
+    token_phase = _STOP_AT.set(phase)
+    token_stopped = _STOPPED.set(False)
+    try:
+        yield
+    finally:
+        _STOP_AT.reset(token_phase)
+        _STOPPED.reset(token_stopped)
+
+
+def chain_stopped() -> bool:
+    """Whether the active :func:`stop_at` request has been satisfied.
+
+    ``False`` when no :func:`stop_at` scope is open, or when the
+    requested phase has not yet completed.  Set permanently ``True`` for
+    the rest of the scope's lifetime by :func:`phase_trace`'s success
+    branch the moment the requested phase records with a
+    non-``"failed"`` outcome.  Pipeline functions check this (never a
+    phase-name string comparison) after each phase block to decide
+    whether to return early — see :func:`paramem.graph.extractor.
+    extract_graph` and :func:`paramem.graph.extractor._sota_pipeline`.
+    """
+    return _STOPPED.get()
 
 
 @contextmanager
@@ -447,6 +540,18 @@ def phase_trace(name: str) -> Iterator[_PhaseScope]:
                     extra=dict(scope._extra),
                 ).to_dict()
             )
+            # Chain-stop signal — set AFTER the record above is appended,
+            # so the phase's own output (raw/parsed/prompts) is never
+            # lost.  Only a phase that finished normally can stop the
+            # chain: a phase this block marked ``outcome="failed"`` (a
+            # soft failure the caller handles without raising, e.g. a
+            # SOTA call returning ``None``) must NOT be mistaken for the
+            # requested stop point, since the caller's own downstream
+            # fallback/rejection logic still needs to run.  A phase that
+            # raised never reaches this branch at all (see the ``except``
+            # branch above), so a hard failure can never set this either.
+            if name == _STOP_AT.get() and scope._outcome != "failed":
+                _STOPPED.set(True)
     finally:
         _ACTIVE_SCOPE.reset(token)
 
@@ -472,17 +577,14 @@ def record_prompt(*, path: str | None, content: str) -> None:
     which raises in the analogous situation.  This is intentional, not an
     oversight to "fix" into a raise:
 
-    * ``_load_prompt`` is called at MODULE IMPORT TIME to build
-      module-level prompt constants — e.g.
-      ``paramem.graph.extractor._SOTA_ENRICHMENT_SYSTEM_PROMPT``
-      (``extractor.py:2994``), ``_SOTA_PLAUSIBILITY_SYSTEM_PROMPT``
-      (``extractor.py:2995``), and
-      ``_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT`` (``extractor.py:3334``) —
-      long before any :func:`extraction_trace`/:func:`phase_trace` scope
-      can exist.  A raise here would break ``import
-      paramem.graph.extractor`` outright; this is the decisive reason a
-      raise is not an option, independent of any call-time scoping
-      question.
+    * ``_load_prompt`` (transitively, via :func:`paramem.graph.prompts.
+      _load_speaker_directive_section`) is called at MODULE IMPORT TIME to
+      build ``paramem.server.inference.THIRD_PARTY_DESCRIPTOR``
+      (``inference.py:52``) — long before any :func:`extraction_trace`/
+      :func:`phase_trace` scope can exist.  A raise here would break
+      ``import paramem.server.inference`` outright; this is the decisive
+      reason a raise is not an option, independent of any call-time
+      scoping question.
     * Two real production call paths also run it with no phase scope
       open at CALL time — ``anonymize_with_local_model`` from
       ``extract_and_anonymize_for_cloud`` (reached from the live chat

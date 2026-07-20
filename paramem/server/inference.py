@@ -291,10 +291,11 @@ def handle_chat(
                 known_entities = _entity_names
             # M3: ensure the speaker's display name is always a personal-referent
             # signal regardless of what subjects appear in the registry.  Under
-            # id-as-subject (step 8+) the display name leaves the registry
+            # the id-as-subject convention the display name leaves the registry
             # subjects; sourcing it here from the resolved ``speaker`` argument
-            # (P3-produced display name, None for anonymous) keeps the sanitizer
-            # coverage intact without coupling inference.py to SpeakerStore.
+            # (the caller-resolved display name, None for anonymous) keeps the
+            # sanitizer coverage intact without coupling inference.py to
+            # SpeakerStore.
             if speaker and len(speaker) > 1:
                 if known_entities is None:
                     known_entities = set()
@@ -538,17 +539,35 @@ def _sanitize_history(
     history: list[dict] | None,
     mode: str,
     known_entities: set[str] | None = None,
+    *,
+    speaker_id: str | None = None,
 ) -> list[dict]:
     """Sanitize conversation history for cloud, dropping blocked turns.
 
     Args:
         history: Conversation turns to sanitize.
-        mode: Sanitization mode (``"block"``, ``"anonymize"``, ``"both"``).
+        mode: ``SanitizationConfig.mode``'s closed vocabulary — ``"off"``
+            (skip), ``"warn"`` (log + pass through), ``"block"`` (drop
+            personal-content turns).  NOT ``cloud_mode``'s vocabulary
+            (``"block"`` / ``"anonymize"`` / ``"both"``) — a different
+            config field entirely; see :func:`~paramem.server.sanitizer.
+            sanitize_for_cloud`.  Under an anonymizing ``cloud_mode``
+            (see :func:`_escalate_via_cloud_policy`), the caller passes
+            ``mode="block"`` unconditionally regardless of
+            ``sanitization.mode`` — a personal-content history turn is
+            always dropped, never merely warned-and-passed, when the
+            current turn is being placeholdered for privacy.
         known_entities: Optional set of lowercased entity/speaker names to
             treat as personal referents.  When provided, household display
             names are recognised as personal content and stripped/replaced
             so they never egress to the cloud.  ``None`` → same behaviour
             as before (back-compat).
+        speaker_id: Resolved speaker store ID, threaded to
+            :func:`~paramem.server.sanitizer.sanitize_for_cloud`'s
+            first-person detector (:func:`~paramem.server.sanitizer.
+            _is_about_speaker`) — without it, "I" / "my" in a history
+            turn never resolves to a concrete speaker and the detector
+            is dead on this channel.
     """
     if not history:
         return []
@@ -558,7 +577,9 @@ def _sanitize_history(
         text = turn.get("text", "")
         if not text:
             continue
-        clean, _ = sanitize_for_cloud(text, mode=mode, known_entities=known_entities)
+        clean, _ = sanitize_for_cloud(
+            text, mode=mode, speaker_id=speaker_id, known_entities=known_entities
+        )
         if clean is not None:
             sanitized.append({"role": role, "text": clean})
     return sanitized
@@ -627,16 +648,13 @@ def _escalate_via_cloud_policy(
                 "cloud_mode=%s requires model/tokenizer for anonymization; blocking", cloud_mode
             )
             return None
+        from paramem.graph.cloud_egress import CloudScope, deanonymize_response_text
         from paramem.graph.extractor import extract_and_anonymize_for_cloud
-        from paramem.graph.placeholders import deanonymize_text
+        from paramem.graph.placeholders import _substitute_whole_words
 
-        # Anonymize ONLY the current-turn text.  History reaches the cloud
-        # via the separate ``_sanitize_history`` channel inside
-        # ``_escalate_to_sota`` — bundling history+current-turn into a
-        # single anonymized transcript here is redundant (cloud sees the
-        # history twice) and forces multi-turn text reproduction on the
-        # local 7B model, which it doesn't do reliably.
-        anon_text, _mapping, reverse = extract_and_anonymize_for_cloud(
+        # Anonymize ONLY the current-turn text — the model-facing
+        # anonymized transcript comes back on ``payload.anon_transcript``.
+        payload = extract_and_anonymize_for_cloud(
             text,
             model,
             tokenizer,
@@ -644,37 +662,77 @@ def _escalate_via_cloud_policy(
             speaker_name=speaker,
             scrub=set(config.sanitization.scrub),
         )
-        if not anon_text:
+        if payload.status == "failed":
             # Per-query block: extraction error, anonymizer parse failure or
-            # a missing/empty model-authored transcript (fail-closed),
-            # or an operator-configured empty scrub with no in-scope
-            # content.  Privacy-safe — cloud call
-            # is suppressed.  Distinct from the ``(verbatim, {}, {})`` shape
-            # returned when ``scrub`` is empty (operator opt-out).
+            # a missing/empty model-authored transcript (fail-closed), or
+            # an empty model-authored transcript after the marker strip.
+            # Privacy-safe — cloud call is suppressed.  Distinct from
+            # ``status == "opted_out"``, which proceeds with the verbatim
+            # transcript below.
             return None
+
+        # History: under an anonymizing cloud_mode, history is
+        # NOT bundled into a single anonymized transcript with the current
+        # turn (that would show the cloud the history twice and forces
+        # multi-turn text reproduction on the local 7B model, which it
+        # doesn't do reliably).  Instead: (i) drop-gate each turn with
+        # ``mode="block"`` UNCONDITIONALLY (never merely warn-and-pass
+        # while the current turn is being placeholdered for privacy),
+        # speaker_id threaded so the first-person detector actually fires
+        # on this channel, then (ii) substitute through ``payload.forward``
+        # — no second LLM call.  Accepted residual: ``payload.forward``
+        # only covers entities the anonymizer named in the CURRENT turn,
+        # so a personal entity appearing ONLY in history is dropped by the
+        # block gate but not placeholdered — strictly better than the old
+        # verbatim-at-mode="warn" behaviour, strictly no worse than
+        # mode="block".  See benchmarking.md.
+        drop_gated_history = _sanitize_history(
+            history, mode="block", known_entities=known_entities, speaker_id=speaker_id
+        )
+        sanitized_history = [
+            {**turn, "text": _substitute_whole_words(turn["text"], payload.forward)}
+            for turn in drop_gated_history
+        ]
+
         result = _escalate_to_sota(
-            anon_text,
+            payload.anon_transcript,
             sota_agent,
             config,
             speaker=speaker,
-            history=history,
+            sanitized_history=sanitized_history,
             language=language,
-            known_entities=known_entities,
         )
-        # deanonymize_text is a no-op on an empty reverse map, so the
-        # empty-scope opt-out path flows through unchanged.
-        result.text = deanonymize_text(result.text, reverse)
+        # ``sent`` is the current-turn text only at this step — history
+        # turns are anonymized via ``payload.forward`` above, not via a
+        # SOTA round trip, so they carry no NEW placeholder tokens to
+        # scope; a scoped-observed deanon of the cloud's response.
+        scope = CloudScope.for_response(
+            payload, sota_bindings=None, sent=(payload.anon_transcript,)
+        )
+        deanon_text = deanonymize_response_text(scope, result.text)
+        if deanon_text is None:
+            # Fail-closed: a declared-but-unobserved placeholder (or
+            # otherwise unresolved token) survived in the cloud's
+            # response — never forward it with a residual placeholder.
+            logger.warning("Cloud response carried an unresolved placeholder — blocking")
+            return None
+        result.text = deanon_text
         return result
 
     # cloud_mode=block + non-PERSONAL: send verbatim (today's behaviour).
+    # No table exists to apply to history here — the two channels no
+    # longer conflict because neither channel is placeholdered; today's
+    # ``sanitization.mode`` gate governs history unchanged.
+    sanitized_history = _sanitize_history(
+        history, mode=config.sanitization.mode, known_entities=known_entities, speaker_id=speaker_id
+    )
     return _escalate_to_sota(
         text,
         sota_agent,
         config,
         speaker=speaker,
-        history=history,
+        sanitized_history=sanitized_history,
         language=language,
-        known_entities=known_entities,
     )
 
 
@@ -683,31 +741,31 @@ def _escalate_to_sota(
     sota_agent: CloudAgent,
     config: ServerConfig,
     speaker: str | None = None,
-    history: list[dict] | None = None,
+    sanitized_history: list[dict] | None = None,
     language: str | None = None,
-    known_entities: set[str] | None = None,
 ) -> ChatResult:
     """Route to SOTA cloud model for reasoning-heavy queries.
 
-    Passes sanitized conversation history so the SOTA model can derive
-    persona, tone, and style from the conversation context. Personal
-    details are stripped by the sanitizer — only the conversational
-    pattern survives.
+    Passes conversation history so the SOTA model can derive persona,
+    tone, and style from the conversation context.
 
     Args:
-        text: The query text (already sanitized by the caller).
+        text: The query text (already sanitized/anonymized by the caller).
         sota_agent: Cloud agent to delegate to.
         config: Server config.
         speaker: Display name of the resolved speaker, or ``None``.
-        history: Conversation history turns.
+        sanitized_history: Conversation history turns, ALREADY sanitized
+            by the caller — this function does not sanitize.  Lifted out
+            of this function (was previously computed here via
+            :func:`_sanitize_history`) so the caller — the one place that
+            knows the egress policy (``sanitization.mode`` vs
+            ``cloud_mode``-driven anonymization) — controls what actually
+            reaches the cloud. See :func:`_escalate_via_cloud_policy` and
+            ``paramem.server.app._cloud_only_route`` for the two
+            production sanitization channels.
         language: BCP-47 language code.
-        known_entities: Lowercased set of household display names / personal
-            entity names to treat as personal referents when sanitizing
-            history.  Prevents household names from egressing to the cloud.
     """
-    sanitized_history = _sanitize_history(
-        history, mode=config.sanitization.mode, known_entities=known_entities
-    )
+    sanitized_history = sanitized_history or []
 
     prefix = _build_speaker_prefix(speaker, language, config)
     prompt = (prefix + " " + SOTA_PROMPT) if prefix else SOTA_PROMPT

@@ -16,13 +16,11 @@ import re
 
 import pytest
 
-from paramem.graph.extractor import (
-    build_speaker_context,
-    load_anonymization_prompt,
-)
+from paramem.graph.cloud_egress import load_anonymization_prompt
+from paramem.graph.extractor import build_speaker_context
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.placeholders import PLACEHOLDER_TOKEN_RE
-from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt
+from paramem.graph.prompts import _DEFAULT_PROMPT_DIR, _load_prompt, prompt_overrides
 
 
 class TestLoadPromptPerModelResolution:
@@ -230,6 +228,108 @@ class TestLoadPromptPhaseTraceRecording:
                 "template": "fallback-default",
             }
         ]
+
+
+class TestPromptOverrides:
+    """``prompt_overrides`` (paramem/graph/prompts.py) substitutes
+    ``_load_prompt``'s content for the duration of the ``with`` block —
+    the calibration prompt-injection mechanism.  Consulted as the FIRST
+    act of ``_load_prompt``, before the ``prompts_dir``/``model`` search
+    loop runs at all.
+    """
+
+    def test_override_applied_when_basename_matches(self, tmp_path):
+        (tmp_path / "extraction.txt").write_text("on-disk content")
+        with prompt_overrides({"extraction.txt": "overridden content"}):
+            result = _load_prompt("extraction.txt", prompts_dir=tmp_path)
+        assert result == "overridden content"
+
+    def test_override_ignored_when_basename_does_not_match(self, tmp_path):
+        """An override mapping that names a DIFFERENT file never touches
+        an unrelated ``_load_prompt`` call — normal resolution proceeds."""
+        (tmp_path / "extraction.txt").write_text("on-disk content")
+        with prompt_overrides({"some_other_file.txt": "overridden content"}):
+            result = _load_prompt("extraction.txt", prompts_dir=tmp_path)
+        assert result == "on-disk content"
+
+    def test_override_satisfies_required_even_when_file_absent_everywhere(self, tmp_path):
+        """``required=True`` is satisfied by a matching override the same
+        as by a found file — the loader never reaches its "search every
+        directory, then raise" branch when an override matched."""
+        with prompt_overrides({"nonexistent_prompt.txt": "override content"}):
+            result = _load_prompt("nonexistent_prompt.txt", prompts_dir=tmp_path, required=True)
+        assert result == "override content"
+
+    def test_prompts_dir_and_model_resolution_unchanged_when_inactive(self, tmp_path):
+        """No override active (the common/production case): ``prompts_dir``/
+        ``model`` resolution behaves exactly as it did before this feature
+        — same per-model precedence covered in ``TestLoadPromptPerModelResolution``."""
+        (tmp_path / "qwen3-4b").mkdir()
+        (tmp_path / "qwen3-4b" / "extraction.txt").write_text("qwen-specific")
+        (tmp_path / "extraction.txt").write_text("base")
+        assert _load_prompt("extraction.txt", "default", tmp_path, model="qwen3-4b") == (
+            "qwen-specific"
+        )
+        assert _load_prompt("extraction.txt", "default", tmp_path, model=None) == "base"
+
+    def test_override_recorded_in_provenance_with_synthetic_path(self):
+        """A matched override is recorded via ``record_prompt`` exactly
+        like a file resolution, but with a synthetic ``<override:...>``
+        path so provenance clearly marks it as substituted rather than
+        read from disk."""
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                with prompt_overrides({"extraction.txt": "overridden content"}):
+                    _load_prompt("extraction.txt")
+            record = trace.records[-1]
+
+        assert record.prompts == [
+            {
+                "path": "<override:extraction.txt>",
+                "sha": hashlib.sha256(b"overridden content").hexdigest()[:12],
+                "template": "overridden content",
+            }
+        ]
+
+    def test_no_override_still_records_normal_resolution(self):
+        """When the mapping doesn't match, provenance reports the NORMAL
+        resolution (not a synthetic override path) — the miss is silent
+        to the loader's normal search, not to provenance."""
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                with prompt_overrides({"some_other_file.txt": "x"}):
+                    _load_prompt("extraction.txt", required=True)
+            record = trace.records[-1]
+
+        assert record.prompts[0]["path"] == str(_DEFAULT_PROMPT_DIR / "extraction.txt")
+
+    def test_nested_override_replaces_outer_for_its_duration(self):
+        """An inner ``prompt_overrides`` call fully replaces the outer
+        mapping for its duration (no merge); the outer mapping is
+        restored once the inner block exits."""
+        with prompt_overrides({"extraction.txt": "outer"}):
+            assert _load_prompt("extraction.txt") == "outer"
+            with prompt_overrides({"extraction.txt": "inner"}):
+                assert _load_prompt("extraction.txt") == "inner"
+            assert _load_prompt("extraction.txt") == "outer"
+
+    def test_override_reset_after_block_exits(self, tmp_path):
+        """The override never outlives its own ``with`` block."""
+        (tmp_path / "extraction.txt").write_text("on-disk content")
+        with prompt_overrides({"extraction.txt": "overridden content"}):
+            pass
+        result = _load_prompt("extraction.txt", prompts_dir=tmp_path)
+        assert result == "on-disk content"
+
+    def test_override_reset_even_when_body_raises(self, tmp_path):
+        """The ``ContextVar.reset`` runs in a ``finally`` — an exception
+        inside the ``with`` block must not leak the override past it."""
+        (tmp_path / "extraction.txt").write_text("on-disk content")
+        with pytest.raises(RuntimeError, match="boom"):
+            with prompt_overrides({"extraction.txt": "overridden content"}):
+                raise RuntimeError("boom")
+        result = _load_prompt("extraction.txt", prompts_dir=tmp_path)
+        assert result == "on-disk content"
 
 
 def _render(template: str, **values) -> str:
@@ -1480,8 +1580,8 @@ class TestSpeakerDirectiveFile:
         Speaker endpoints are NEVER tokenised at either tier — same as the
         session-tier anonymizer prompt, where the bare ``speaker{N}``
         anchor is left untouched (it is already anonymous and carries no
-        identifying information; see ``consolidation.py``'s
-        ``_run_graph_enrichment`` docstring and ``SECURITY.md``). Nodes
+        identifying information; see ``graph_enrich.py``'s
+        ``run_graph_enrichment`` docstring and ``SECURITY.md``). Nodes
         outside the operator's ``scrub`` categories (e.g. organizations,
         which are not part of the default ``scrub`` — a load-bearing set
         of name / phone / address / online-identity sub-terms) also
@@ -1511,7 +1611,7 @@ class TestSpeakerDirectiveFile:
         but they must be organization/place/thing names, not person names:
         under the shipped ``{"person"}`` scope persons are always tokens
         by the time this pass runs, so a person-name example there would
-        illustrate an unreachable task (F5). See
+        illustrate an unreachable task. See
         ``TestSpeakerDirectiveFile::test_sota_graph_enrichment_part2_examples_are_not_person_names``.
         """
         tmpl = _load_prompt("sota_graph_enrichment.txt", "")
@@ -1530,7 +1630,7 @@ class TestSpeakerDirectiveFile:
         as real-name surfaces. A person-name example there would coach
         the model on a task it structurally cannot perform, while line 2
         of the prompt simultaneously forbids guessing the identity behind
-        a token — a self-contradiction (F5).
+        a token — a self-contradiction.
 
         Mutation: reintroduce a person-name SAME_AS example (e.g. ``"Yang
         Ming"`` / ``"Mr. Yang"``) in Part 2 -> this test fails.

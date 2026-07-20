@@ -244,6 +244,69 @@ class TestPostStageAuth:
         )
 
 
+class TestAnonymizeStageSpeakerName:
+    """``--speaker`` must reach the
+    ``/calibrate/anonymize`` request payload, not just
+    ``/calibrate/extract`` — production's ``anonymize_for_cloud`` always
+    threads the runtime-known speaker name into speaker-name seeding;
+    omitting it here silently diverges calibration fidelity from
+    production and can leave the speaker's real name un-scrubbed before
+    a real ``/calibrate/enrich`` cloud call.
+    """
+
+    _REAL_PROMPTS_DIR = Path(__file__).resolve().parents[1] / "configs" / "prompts"
+
+    def test_speaker_name_reaches_anonymize_payload(self, tmp_path: Path):
+        input_path = tmp_path / "input.txt"
+        input_path.write_text("Alex works as an engineer at Acme Corp.")
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+
+        calls: list[tuple[str, dict]] = []
+
+        def _fake_post_stage(server, stage, payload):
+            calls.append((stage, payload))
+            if stage == "extract":
+                return {
+                    "stage": "extract",
+                    "raw_output": "{}",
+                    "parsed": {
+                        "session_id": "calib-chunk-0",
+                        "timestamp": "2026-07-14T00:00:00Z",
+                        "entities": [],
+                        "relations": [],
+                    },
+                    "parse_error": None,
+                }
+            return {"stage": stage, "raw_output": "{}", "parsed": {}, "parse_error": None}
+
+        argv = [
+            "--input",
+            str(input_path),
+            "--source-type",
+            "transcript",
+            "--chunk",
+            "0",
+            "--stages",
+            "extract,anonymize",
+            "--speaker",
+            "Alex",
+            "--dump-dir",
+            str(dump_dir),
+            "--prompts-dir",
+            str(self._REAL_PROMPTS_DIR),
+            "--baseline",
+            "none",
+        ]
+        with patch.object(calibrate_prompts, "_post_stage", side_effect=_fake_post_stage):
+            rc = calibrate_prompts.main(argv)
+
+        assert rc == 0
+        anonymize_calls = [payload for stage, payload in calls if stage == "anonymize"]
+        assert anonymize_calls, "expected an anonymize stage call"
+        assert anonymize_calls[0]["speaker_name"] == "Alex"
+
+
 class TestSeedFromEnrichLoading:
     """``--seed-from --stages enrich`` reads prior-stage dumps off disk
     instead of re-running ``extract``/``anonymize``.  All three regression
@@ -328,22 +391,35 @@ class TestSeedFromEnrichLoading:
             rc = calibrate_prompts.main(argv)
         return rc, fake_post_stage
 
-    def test_extract_wrapper_is_unwrapped_into_a_populated_graph(self, tmp_path: Path):
-        """The seeded ``01_extract_chunk_0.json`` wrapper's real graph
-        (1 relation) must reach the enrich stage's fact-building step —
-        not collapse to an empty graph.
+    def test_anon_facts_pass_through_to_enrich_payload(self, tmp_path: Path):
+        """``/calibrate/anonymize``'s ``anon_facts`` — now fully assembled
+        SERVER-side by ``anonymize_for_cloud`` — is fed STRAIGHT THROUGH
+        to ``/calibrate/enrich``; there is no client-side re-derivation
+        from ``01_extract_chunk_0.json``'s graph any more (that whole
+        primitive-import + table-build + fact-build block was deleted).
 
-        Mutation: revert to reading the wrapper blob directly as
-        ``prior_extract`` -> ``/calibrate/enrich`` is posted with
-        ``facts=[]`` (or the call raises ``pydantic.ValidationError``
-        before it ever happens) -> this test fails.
+        Mutation: reintroduce client-side fact building from
+        ``prior_extract``'s graph -> this test fails (the facts payload
+        would differ from — or ignore — ``anon_facts``).
         """
         rc, fake_post_stage = self._run(
             tmp_path,
             anonymize_blob={
                 "parsed": {
-                    "mapping": {"Alex": "speaker0"},
+                    "status": "ok",
                     "anonymized_transcript": "[user] Person_1 works as an engineer.",
+                    "forward": {"Alex": "Person_1"},
+                    "reverse": {"Person_1": "Alex"},
+                    "anon_facts": [
+                        {
+                            "subject": "speaker0",
+                            "predicate": "works_at",
+                            "object": "Acme Corp",
+                            "relation_type": "factual",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "norm_stats": {"inverted": 0, "dropped": 0},
                 }
             },
         )
@@ -352,10 +428,16 @@ class TestSeedFromEnrichLoading:
         args, _kwargs = fake_post_stage.call_args
         assert args[1] == "enrich"
         payload = args[2]
-        facts = payload["facts"]
-        assert len(facts) == 1
-        assert facts[0]["subject"] == "speaker0"
-        assert facts[0]["object"] == "Acme Corp"
+        assert payload["facts"] == [
+            {
+                "subject": "speaker0",
+                "predicate": "works_at",
+                "object": "Acme Corp",
+                "relation_type": "factual",
+                "confidence": 0.9,
+            }
+        ]
+        assert payload["transcript"] == "[user] Person_1 works as an engineer."
 
     def test_missing_extract_dump_does_not_crash(self, tmp_path: Path):
         """A seed dir with ``02_anonymize_chunk_0.json`` but no
@@ -370,7 +452,7 @@ class TestSeedFromEnrichLoading:
             tmp_path,
             anonymize_blob={
                 "parsed": {
-                    "mapping": {"Alex": "speaker0"},
+                    "forward": {"Alex": "speaker0"},
                     "anonymized_transcript": "[user] Person_1 works as an engineer.",
                 }
             },
@@ -379,39 +461,39 @@ class TestSeedFromEnrichLoading:
         assert rc == 0
         fake_post_stage.assert_not_called()
 
-    def test_none_mapping_parse_failure_aborts_without_a_cloud_call(self, tmp_path: Path):
-        """``anon_parsed.get("mapping")`` returning ``None`` (anonymizer
-        parse failure) must abort the chunk's enrich stage — no cloud
-        call — matching production's fail-closed abort-on-``None`` in
-        ``_sota_pipeline``.
+    def test_status_failed_aborts_without_a_cloud_call(self, tmp_path: Path):
+        """``status == "failed"`` (anonymizer parse failure) must abort
+        the chunk's enrich stage — no cloud call — matching production's
+        fail-closed abort-on-``"failed"`` in ``_sota_pipeline``.
 
-        Mutation: revert to ``anon_parsed.get("mapping") or {}`` -> the
-        parse failure is silently treated as "found nothing" and
-        ``/calibrate/enrich`` (the cloud call) is posted to anyway ->
-        this test fails.
+        Mutation: drop the ``status == "failed"`` gate -> the failure is
+        silently treated as "proceed" and ``/calibrate/enrich`` (the
+        cloud call) is posted to anyway -> this test fails.
         """
         rc, fake_post_stage = self._run(
             tmp_path,
-            anonymize_blob={"parsed": {}},  # no "mapping" key -> None
+            anonymize_blob={
+                "parsed": {"status": "failed", "anon_facts": [], "anonymized_transcript": ""}
+            },
         )
         assert rc == 0
         fake_post_stage.assert_not_called()
 
     def test_missing_anonymized_transcript_aborts_without_a_cloud_call(self, tmp_path: Path):
-        """A non-``None`` ``mapping`` with a missing/empty
-        ``anonymized_transcript`` is ALSO fail-closed — the model
-        never authored a safe transcript to send to the cloud, so the
-        chunk's enrich stage must abort with no cloud call, exactly like
-        the ``mapping is None`` case.
+        """A ``status="ok"`` response with a missing/empty
+        ``anonymized_transcript`` is ALSO fail-closed — the model never
+        authored a safe transcript to send to the cloud, so the chunk's
+        enrich stage must abort with no cloud call, exactly like the
+        ``status == "failed"`` case.
 
-        Mutation: gate only on ``raw_mapping is None`` (drop the
+        Mutation: gate only on ``status == "failed"`` (drop the
         ``anonymized_transcript`` check) -> ``/calibrate/enrich`` is
         posted to anyway -> this test fails.
         """
         rc, fake_post_stage = self._run(
             tmp_path,
             anonymize_blob={
-                "parsed": {"mapping": {"Alex": "speaker0"}}
+                "parsed": {"status": "ok", "anon_facts": []}
             },  # no anonymized_transcript
         )
         assert rc == 0

@@ -2412,7 +2412,7 @@ class TestSessionIdsProvenanceUnion:
         """Case-3 new-edge insertion: Relation.session_ids are unioned into edge['sessions'].
 
         The scalar session_id param may be a synthetic sentinel (as in
-        _merge_registry_relations); the real ids must still appear on the edge.
+        GraphMerger.merge_relations); the real ids must still appear on the edge.
 
         Speaker entities are keyed by speaker_id in the graph ("speaker0"), not
         by the display name ("Alex"); non-speaker entities are keyed by canonical

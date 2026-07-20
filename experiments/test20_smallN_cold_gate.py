@@ -63,9 +63,8 @@ Hard assertions (all written into results.json; fail loud if violated)
 3. LoRA-B Frobenius norm is ZERO immediately before training (cold arm —
    proves cold init) or NON-ZERO immediately before training (warm arm —
    proves the donor copy landed), and NON-ZERO after training in both
-   arms (proves the adapter actually moved). Norm computation mirrors
-   ``.agent/archive/test19_neardup_procedural.py``
-   (``_assert_nonzero_lora_b`` / ``_assert_zero_lora_b``, ~lines 619-676).
+   arms (proves the adapter actually moved). Norm computation is
+   ``_lora_b_frobenius_norm`` below.
 4. (Warm arm only) The donor adapter's LoRA-B Frobenius norm is
    bit-identical immediately before and immediately after each seed's
    ``train_adapter`` call (donor immutability), and the trainable
@@ -115,8 +114,7 @@ Warm start (``--warm-from``)
 ``--warm-from ADAPTER_DIR`` warm-starts the trainable adapter from a donor
 adapter's LoRA weights instead of LoRA-zero, testing whether prior
 knowledge (e.g. the owner's live 140-key episodic adapter) rescues the
-small-N recall failure. Mechanism (validated in
-``.agent/archive/test19_neardup_procedural.py``'s ``warmstart`` arm):
+small-N recall failure. Mechanism (this script's ``warmstart`` arm):
 create a fresh ``donor``-named adapter loaded from *ADAPTER_DIR*, create
 the trainable adapter fresh (LoRA-zero), ``copy_adapter_weights(model,
 src="donor", dst=<trainable>)`` BEFORE ``train_adapter`` so the
@@ -174,8 +172,7 @@ like the bare base model.
 
 Infrastructure
 ---------------
-Template: ``.agent/archive/test19_neardup_procedural.py``. Reuses
-``experiments/utils/test_harness.py`` (``BENCHMARK_MODELS``,
+Reuses ``experiments/utils/test_harness.py`` (``BENCHMARK_MODELS``,
 ``model_output_dir``, ``load_model_and_config``, ``IndexedDataset``,
 ``save_results``, ``setup_logging``) and
 ``experiments/utils/gpu_guard.py::acquire_gpu``.
@@ -594,9 +591,7 @@ def _lora_b_frobenius_norm(model: PeftModel, adapter_name: str) -> float:
     LoRA-B is zero-initialised by PEFT at adapter creation (identity
     residual), so a zero norm immediately after ``create_adapter`` and a
     non-zero norm after training together prove cold init actually ran end
-    to end (Hard Assertion #3). Mirrors the norm computation in
-    ``.agent/archive/test19_neardup_procedural.py``
-    (``_assert_nonzero_lora_b`` / ``_assert_zero_lora_b``, ~lines 619-676).
+    to end (Hard Assertion #3).
 
     Args:
         model: PeftModel carrying *adapter_name*.

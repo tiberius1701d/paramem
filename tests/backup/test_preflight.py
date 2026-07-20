@@ -47,7 +47,7 @@ def _make_config(tmp_path: Path, max_total_disk_gb: float = 1.0) -> ServerConfig
 def _make_loop(graph_bytes: bytes, tmp_path: Path) -> MagicMock:
     """Return a mock ConsolidationLoop with output_dir set and episodic/graph.json on disk.
 
-    W2.3: preflight reads the on-disk ``output_dir/episodic/graph.json`` via
+    Preflight reads the on-disk ``output_dir/episodic/graph.json`` via
     ``read_maybe_encrypted`` rather than calling ``loop.merger.save_bytes()``
     (which serialises an empty in-memory graph after the cycle's finally-block reset).
     The test fixture writes ``graph_bytes`` to the file so the preflight
@@ -239,7 +239,7 @@ class TestPreFlightSwallowsReadErrors:
     def test_preflight_swallows_graph_read_error(self, tmp_path: Path) -> None:
         """read_maybe_encrypted on graph.json raising → graph counted as 0 bytes; no crash.
 
-        W2.3: preflight reads graph bytes from output_dir/episodic/graph.json via
+        Preflight reads graph bytes from output_dir/episodic/graph.json via
         read_maybe_encrypted instead of loop.merger.save_bytes().  When that read
         fails (e.g. PermissionError), the graph contribution must be 0 and the
         function must not raise.

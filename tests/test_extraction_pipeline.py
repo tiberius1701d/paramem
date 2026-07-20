@@ -756,6 +756,24 @@ class TestEnrichmentDelta:
         assert transcript.count("{Event_1}") == 2
         assert "Event " not in transcript or transcript.count("Event ") == 0
 
+    def test_reconstruct_transcript_word_boundary_not_substring(self):
+        """``_reconstruct_updated_transcript`` routes through the shared
+        ``_substitute_whole_words`` primitive — a binding span never
+        matches inside a longer word.  ``{"Person_1": "Bill"}`` against
+        ``"Billing department"`` must not substitute inside ``"Billing"``.
+
+        Mutation: revert to the hand-rolled ``str.replace`` -> "Bill"
+        matches the "Bill" prefix of "Billing" -> the transcript comes
+        back corrupted as ``"{Person_1}ing department"`` -> this test
+        fails.
+        """
+        from paramem.graph.extractor import _reconstruct_updated_transcript
+
+        anon_transcript = "Please pay the Billing department, not Bill."
+        bindings = {"Person_1": "Bill"}
+        out = _reconstruct_updated_transcript(anon_transcript, bindings)
+        assert out == "Please pay the Billing department, not {Person_1}."
+
     def test_code_fenced_envelope_unwrapped(self):
         """Markdown fences handled by the shared envelope finder."""
         from paramem.graph.extractor import _apply_enrichment_delta
@@ -862,7 +880,7 @@ class TestEnrichmentDelta:
         assert out[1]["subject"] == "X"
 
     def test_add_entry_strips_non_fact_fields(self):
-        """F1 — an ``add`` entry carrying a non-fact key (``evidence``)
+        """An ``add`` entry carrying a non-fact key (``evidence``)
         alongside the fact proper has that key stripped at the parse
         boundary, so it never enters ``enriched_anon`` (and therefore
         can never sink a valid fact at the residual sweep downstream).
@@ -882,7 +900,7 @@ class TestEnrichmentDelta:
         assert out[0]["object"] == "Org_1"
 
     def test_modify_fields_strips_non_fact_fields(self):
-        """F1 companion — a ``modify`` entry's ``fields`` dict is
+        """A ``modify`` entry's ``fields`` dict is
         restricted the same way: ``relation_type``/``confidence``
         updates apply normally, a stray ``evidence`` key does not."""
         from paramem.graph.extractor import _apply_enrichment_delta
@@ -978,6 +996,60 @@ class TestPipelineMaxTokensThreading:
         sig = inspect.signature(_fallback_plausibility_on_raw)
         assert "max_tokens" in sig.parameters
 
+    def test_extract_and_anonymize_for_cloud_pins_anonymizer_default(self):
+        """``extract_and_anonymize_for_cloud`` (chat
+        egress) must call ``anonymize_for_cloud`` with the anonymizer's
+        own default budget (``_DEFAULT_ANONYMIZER_MAX_TOKENS`` = 2048), not
+        silently inherit ``anonymize_for_cloud``'s own default — which is
+        ``_DEFAULT_FILTER_MAX_TOKENS`` (8192), sized for the graph-tier
+        enrichment filter call. Chat egress is user-facing: a pathological
+        non-terminating generation must not run 4x longer before the cap
+        stops it.
+        """
+        from paramem.graph.extractor import (
+            _DEFAULT_ANONYMIZER_MAX_TOKENS,
+            extract_and_anonymize_for_cloud,
+        )
+
+        graph = _make_graph([("Alex", "lives_in", "Millfield")])
+        captured = {}
+
+        def fake_anonymize_for_cloud(*args, **kwargs):
+            captured.update(kwargs)
+            from paramem.graph.cloud_egress import AnonymizedPayload
+
+            return AnonymizedPayload(
+                status="ok",
+                forward={},
+                reverse={},
+                anon_transcript="anon",
+                anon_facts=[],
+                declared=frozenset(),
+                norm_stats={"inverted": 0, "dropped": 0},
+                rekey_dropped=0,
+                raw="",
+            )
+
+        model = MagicMock()
+        model.is_gradient_checkpointing = False
+        tokenizer = MagicMock()
+
+        with (
+            patch("paramem.graph.extractor.extract_graph", return_value=graph),
+            patch(
+                "paramem.graph.extractor.anonymize_for_cloud",
+                side_effect=fake_anonymize_for_cloud,
+            ),
+        ):
+            extract_and_anonymize_for_cloud(
+                "Alex lives in Millfield.",
+                model,
+                tokenizer,
+                scrub={"person name"},
+            )
+
+        assert captured.get("max_tokens") == _DEFAULT_ANONYMIZER_MAX_TOKENS
+
 
 class TestPipelinePromptsDirThreading:
     """A ``prompts_dir`` override passed to ``extract_graph`` must reach
@@ -1012,7 +1084,7 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 side_effect=fake_anonymize,
             ),
             patch(
@@ -1059,7 +1131,7 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -1105,7 +1177,7 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -1158,7 +1230,7 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -1220,7 +1292,7 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 side_effect=fake_anonymize,
             ),
             patch(
@@ -1281,7 +1353,7 @@ class TestPipelinePromptsDirThreading:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 side_effect=fake_anonymize,
             ),
             patch(
@@ -1482,7 +1554,7 @@ class TestSOTANoiseFilter:
             assert len(result.relations) == 1
 
     def test_anonymize_graceful_on_bad_output(self):
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1528,7 +1600,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(None, "", ""),
             ),
             # Pass model=None/tokenizer=None → local_plausibility_filter skipped inside fallback
@@ -1576,7 +1648,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -1616,7 +1688,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -1665,7 +1737,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -1847,7 +1919,7 @@ class TestSOTANoiseFilter:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -1894,7 +1966,7 @@ class TestAnonymizerMappingOnlyContract:
         -> the call returns more than ``(mapping, anonymized_transcript,
         raw)`` -> this test fails.
         """
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -1921,8 +1993,8 @@ class TestAnonymizerMappingOnlyContract:
             }
         )
         with (
-            patch("paramem.graph.extractor.generate_answer", return_value=raw),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
+            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
         ):
             result = anonymize_with_local_model(graph, model, tokenizer, scrub={"person name"})
 
@@ -1977,8 +2049,8 @@ class TestAnonymizerMappingOnlyContract:
 
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
-            patch("paramem.graph.extractor.generate_answer", return_value=raw),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
+            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
         ):
             _sota_pipeline(
@@ -2026,7 +2098,7 @@ class TestAnonymizerMappingOnlyContract:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
@@ -2054,7 +2126,7 @@ class TestAnonymizerMappingOnlyContract:
         or gate on ``not mapping`` instead of ``mapping is None``) ->
         this test fails.
         """
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -2068,8 +2140,8 @@ class TestAnonymizerMappingOnlyContract:
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
 
         with (
-            patch("paramem.graph.extractor.generate_answer", return_value="not json"),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.cloud_egress.generate_answer", return_value="not json"),
+            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
         ):
             parse_failure_mapping, _parse_failure_transcript, _ = anonymize_with_local_model(
                 graph, model, tokenizer, scrub={"person name"}
@@ -2077,10 +2149,10 @@ class TestAnonymizerMappingOnlyContract:
 
         with (
             patch(
-                "paramem.graph.extractor.generate_answer",
+                "paramem.graph.cloud_egress.generate_answer",
                 return_value='{"mapping": {}, "anonymized_transcript": "nothing to scrub here"}',
             ),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
         ):
             empty_mapping, empty_mapping_transcript, _ = anonymize_with_local_model(
                 graph, model, tokenizer, scrub={"person name"}
@@ -2116,7 +2188,7 @@ class TestAnonymizerTranscriptArrayContract:
         )
 
     def test_array_of_turn_strings_is_joined_with_newline(self):
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
 
         model = MagicMock()
         tokenizer = MagicMock()
@@ -2132,8 +2204,8 @@ class TestAnonymizerTranscriptArrayContract:
             }
         )
         with (
-            patch("paramem.graph.extractor.generate_answer", return_value=raw),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
+            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, _raw = anonymize_with_local_model(
                 self._graph(), model, tokenizer, scrub={"person name"}
@@ -2147,7 +2219,7 @@ class TestAnonymizerTranscriptArrayContract:
         )
 
     def test_plain_string_transcript_still_accepted_unchanged(self):
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
 
         model = MagicMock()
         tokenizer = MagicMock()
@@ -2159,8 +2231,8 @@ class TestAnonymizerTranscriptArrayContract:
             }
         )
         with (
-            patch("paramem.graph.extractor.generate_answer", return_value=raw),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
+            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, _raw = anonymize_with_local_model(
                 self._graph(), model, tokenizer, scrub={"person name"}
@@ -2170,15 +2242,15 @@ class TestAnonymizerTranscriptArrayContract:
         assert anon_transcript == "[user] Person_1 lives in Millfield."
 
     def test_empty_array_fails_closed(self):
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
 
         model = MagicMock()
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         raw = json.dumps({"mapping": {"Alex": "Person_1"}, "anonymized_transcript": []})
         with (
-            patch("paramem.graph.extractor.generate_answer", return_value=raw),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
+            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, raw_output = anonymize_with_local_model(
                 self._graph(), model, tokenizer, scrub={"person name"}
@@ -2189,7 +2261,7 @@ class TestAnonymizerTranscriptArrayContract:
         assert raw_output == raw
 
     def test_array_with_non_string_element_fails_closed(self):
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
 
         model = MagicMock()
         tokenizer = MagicMock()
@@ -2201,8 +2273,8 @@ class TestAnonymizerTranscriptArrayContract:
             }
         )
         with (
-            patch("paramem.graph.extractor.generate_answer", return_value=raw),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
+            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, raw_output = anonymize_with_local_model(
                 self._graph(), model, tokenizer, scrub={"person name"}
@@ -2213,15 +2285,15 @@ class TestAnonymizerTranscriptArrayContract:
         assert raw_output == raw
 
     def test_missing_anonymized_transcript_key_fails_closed(self):
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
 
         model = MagicMock()
         tokenizer = MagicMock()
         tokenizer.apply_chat_template = MagicMock(return_value="formatted")
         raw = json.dumps({"mapping": {"Alex": "Person_1"}})
         with (
-            patch("paramem.graph.extractor.generate_answer", return_value=raw),
-            patch("paramem.graph.extractor.adapt_messages", return_value=[]),
+            patch("paramem.graph.cloud_egress.generate_answer", return_value=raw),
+            patch("paramem.graph.cloud_egress.adapt_messages", return_value=[]),
         ):
             mapping, anon_transcript, raw_output = anonymize_with_local_model(
                 self._graph(), model, tokenizer, scrub={"person name"}
@@ -2246,7 +2318,7 @@ class TestScrubCategoriesReachPrompt:
     """
 
     def test_distinctive_scrub_set_appears_sorted_in_rendered_prompt(self):
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
 
         graph = _make_graph(
             [("Alex", "lives_in", "Millfield")],
@@ -2272,9 +2344,9 @@ class TestScrubCategoriesReachPrompt:
             return json.dumps({"mapping": {}, "anonymized_transcript": "nothing to scrub here"})
 
         with (
-            patch("paramem.graph.extractor.generate_answer", side_effect=_fake_generate_answer),
+            patch("paramem.graph.cloud_egress.generate_answer", side_effect=_fake_generate_answer),
             patch(
-                "paramem.graph.extractor.adapt_messages",
+                "paramem.graph.cloud_egress.adapt_messages",
                 side_effect=lambda messages, tok: messages,
             ),
         ):
@@ -2332,7 +2404,7 @@ class TestNoPostHocLeakGuardCaseSensitivity:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch("paramem.graph.extractor._filter_with_sota", side_effect=fake_sota),
@@ -2413,7 +2485,7 @@ class TestDeanonStagePredicateInvariantEndToEnd:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -2804,7 +2876,7 @@ class TestApplyBindings:
         assert len(dropped) == 1
 
     def test_non_fact_field_with_declared_token_does_not_shed_the_fact(self):
-        """F1 — a field outside :data:`_FACT_FIELDS` (e.g. an ``evidence``
+        """A field outside :data:`_FACT_FIELDS` (e.g. an ``evidence``
         key an LLM appended alongside the fact proper) that still
         contains a declared placeholder token must NOT sink the whole
         otherwise-valid fact: the residual sweep only tests the fields
@@ -3010,6 +3082,126 @@ class TestPlausibilityFilterWithSotaPromptsDir:
         assert "SENTINEL" not in captured_prompts[0]
 
 
+class TestSotaSystemPromptCallTimeOverride:
+    """``sota_enrichment_system.txt`` / ``sota_plausibility_system.txt``
+    used to bind ONCE at module-import time (``extractor.py`` module-level
+    constants ``_SOTA_ENRICHMENT_SYSTEM_PROMPT`` / ``_SOTA_PLAUSIBILITY_SYSTEM_PROMPT``)
+    — long before any :func:`~paramem.graph.phase_trace.extraction_trace`
+    scope or :func:`~paramem.graph.prompts.prompt_overrides` context could
+    exist, so a calibration override could never reach them and
+    ``record_prompt`` always no-opped for them.  They now load at CALL
+    TIME inside each consuming function.  These tests pin BOTH halves of
+    that fix: an import-time binding would make the override never reach
+    ``_sota_call``/``generate_answer`` (first two assertions per test) AND
+    would leave ``record.prompts`` without the override entry (the
+    provenance assertion) — a plain "does ``_load_prompt`` honour an
+    override" unit test cannot tell these apart from the old broken state.
+    """
+
+    def test_sota_enrichment_system_prompt_overridable_and_recorded(self):
+        from paramem.graph.extractor import _filter_with_sota
+        from paramem.graph.phase_trace import extraction_trace, phase_trace
+        from paramem.graph.prompts import prompt_overrides
+
+        captured = []
+
+        def fake_sota_call(prompt, *args, **kwargs):
+            captured.append(kwargs.get("system_prompt"))
+            return '{"add": [], "modify": [], "drop": [], "bindings": {}}'
+
+        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
+            with extraction_trace() as trace:
+                with phase_trace("sota_enrich"):
+                    with prompt_overrides({"sota_enrichment_system.txt": "SENTINEL-ENRICH-SYSTEM"}):
+                        _filter_with_sota(
+                            [{"subject": "A", "predicate": "knows", "object": "B"}],
+                            api_key="k",
+                            provider="anthropic",
+                            anon_transcript="A knows B.",
+                        )
+                record = trace.records[-1]
+
+        assert captured == ["SENTINEL-ENRICH-SYSTEM"], (
+            "the override must reach _sota_call's system_prompt kwarg"
+        )
+        paths = [p["path"] for p in (record.prompts or [])]
+        assert "<override:sota_enrichment_system.txt>" in paths, (
+            f"override must be recorded in phase-trace provenance, got paths={paths!r}"
+        )
+
+    def test_sota_plausibility_system_prompt_overridable_and_recorded(self):
+        from paramem.graph.extractor import _plausibility_filter_with_sota
+        from paramem.graph.phase_trace import extraction_trace, phase_trace
+        from paramem.graph.prompts import prompt_overrides
+
+        captured = []
+
+        def fake_sota_call(prompt, *args, **kwargs):
+            captured.append(kwargs.get("system_prompt"))
+            return '{"drop": []}'
+
+        with patch("paramem.graph.extractor._sota_call", side_effect=fake_sota_call):
+            with extraction_trace() as trace:
+                with phase_trace("anon_plausibility"):
+                    with prompt_overrides(
+                        {"sota_plausibility_system.txt": "SENTINEL-PLAUS-SYSTEM"}
+                    ):
+                        _plausibility_filter_with_sota(
+                            [{"subject": "A", "predicate": "knows", "object": "B"}],
+                            api_key="k",
+                            provider="anthropic",
+                            anon_transcript="A knows B.",
+                        )
+                record = trace.records[-1]
+
+        assert captured == ["SENTINEL-PLAUS-SYSTEM"], (
+            "the override must reach _sota_call's system_prompt kwarg"
+        )
+        paths = [p["path"] for p in (record.prompts or [])]
+        assert "<override:sota_plausibility_system.txt>" in paths, (
+            f"override must be recorded in phase-trace provenance, got paths={paths!r}"
+        )
+
+    def test_local_plausibility_filter_system_prompt_overridable_and_recorded(self):
+        """``local_plausibility_filter`` reuses ``sota_plausibility_system.txt``
+        as the LOCAL model's system message — it builds the chat
+        ``messages`` list directly rather than calling ``_sota_call``."""
+        from paramem.graph.extractor import local_plausibility_filter
+        from paramem.graph.phase_trace import extraction_trace, phase_trace
+        from paramem.graph.prompts import prompt_overrides
+
+        facts = [{"subject": "Alex", "predicate": "lives_in", "object": "Millfield"}]
+        tokenizer = MagicMock()
+        tokenizer.apply_chat_template = MagicMock(return_value="formatted")
+        with (
+            patch("paramem.graph.extractor.generate_answer", return_value='{"drop": []}'),
+            # Identity passthrough so the real messages list (carrying the
+            # override) reaches apply_chat_template unchanged — see the
+            # companion note on TestFilterWithSotaPromptsDir-style tests.
+            patch(
+                "paramem.graph.extractor.adapt_messages",
+                side_effect=lambda messages, tok: messages,
+            ),
+        ):
+            with extraction_trace() as trace:
+                with phase_trace("deanon_plausibility"):
+                    with prompt_overrides(
+                        {"sota_plausibility_system.txt": "SENTINEL-LOCAL-PLAUS-SYSTEM"}
+                    ):
+                        local_plausibility_filter(facts, "transcript", MagicMock(), tokenizer)
+                record = trace.records[-1]
+
+        called_messages = tokenizer.apply_chat_template.call_args.args[0]
+        system_contents = [m["content"] for m in called_messages if m["role"] == "system"]
+        assert system_contents == ["SENTINEL-LOCAL-PLAUS-SYSTEM"], (
+            "the override must reach the local model's system message"
+        )
+        paths = [p["path"] for p in (record.prompts or [])]
+        assert "<override:sota_plausibility_system.txt>" in paths, (
+            f"override must be recorded in phase-trace provenance, got paths={paths!r}"
+        )
+
+
 class TestSpeakerContextInjection:
     def test_build_speaker_context_empty_when_no_id(self):
         """build_speaker_context returns empty string when speaker_id is absent."""
@@ -3047,6 +3239,33 @@ class TestSpeakerContextInjection:
         assert "speaker0" in out
         assert "{speaker_id}" not in out
         assert "{speaker_name}" not in out
+
+    def test_extraction_directive_overridable_and_recorded_in_provenance(self):
+        """``speaker_directive.txt`` used to be read via a bare
+        ``Path.read_text()`` inside ``_load_speaker_directive_section`` —
+        unreachable by a calibration override and never recorded via
+        ``record_prompt``.  It now routes through ``_load_prompt``, so
+        both become possible.  ``build_speaker_context`` feeds this
+        section into the ``{speaker_context}`` slot of the extraction
+        user template — it is part of the prompt under test."""
+        from paramem.graph.extractor import build_speaker_context
+        from paramem.graph.phase_trace import extraction_trace, phase_trace
+        from paramem.graph.prompts import prompt_overrides
+
+        override_content = (
+            "=== EXTRACTION-DIRECTIVE ===\nSENTINEL-DIRECTIVE {speaker_id} {speaker_name}\n"
+        )
+        with extraction_trace() as trace:
+            with phase_trace("local_extract"):
+                with prompt_overrides({"speaker_directive.txt": override_content}):
+                    out = build_speaker_context("speaker0", "Alice")
+            record = trace.records[-1]
+
+        assert "SENTINEL-DIRECTIVE speaker0 Alice" in out
+        paths = [p["path"] for p in (record.prompts or [])]
+        assert "<override:speaker_directive.txt>" in paths, (
+            f"override must be recorded in phase-trace provenance, got paths={paths!r}"
+        )
 
 
 # --- Background Trainer ---
@@ -3250,7 +3469,7 @@ class TestPlausibilityAnon:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3316,7 +3535,7 @@ class TestPlausibilityAnon:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3389,7 +3608,7 @@ class TestPlausibilityDeanon:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3456,7 +3675,7 @@ class TestAnonFailureFallback:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(None, "", ""),
             ),
             patch(
@@ -3508,7 +3727,7 @@ class TestSotaEnrichmentFailureRaises:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3581,7 +3800,7 @@ class TestAllDroppedSafetyNet:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3643,7 +3862,7 @@ class TestEntityTypePreservation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3686,7 +3905,7 @@ class TestEntityTypePreservation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3742,7 +3961,7 @@ class TestEntityTypePreservation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3805,7 +4024,7 @@ class TestSotaMintedEntityTypeDerivation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3850,7 +4069,7 @@ class TestSotaMintedEntityTypeDerivation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -3883,7 +4102,7 @@ class TestFallbackPlausibilityOnRawHelper:
     """
 
     def test_helper_does_not_sweep_shape_like_real_names(self):
-        """F4 — the residual-placeholder sweep this helper used to run
+        """The residual-placeholder sweep this helper used to run
         (``_strip_residual_placeholders``) is retired: this path
         operates on real-name ``graph.relations`` where no placeholder
         vocabulary exists, so a real name that merely happens to be
@@ -4072,7 +4291,7 @@ class TestDiagnosticsKeys:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -4118,7 +4337,7 @@ class TestDiagnosticsKeys:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -4138,6 +4357,59 @@ class TestDiagnosticsKeys:
             )
 
         assert result.diagnostics.get("anonymize") == "ok"
+
+    def test_mapping_ambiguous_dropped_is_live_and_reaches_diagnostics(self):
+        """``payload.norm_stats["dropped"]`` is a LIVE signal now — the
+        ONE normalize call in the chain (inside ``anonymize_for_cloud``)
+        — reaching ``graph.diagnostics["mapping_ambiguous_dropped"]``.
+
+        Before this unification, ``_sota_pipeline`` ran a SECOND,
+        redundant outer normalize on an already-canonical table (the
+        internal normalize inside ``anonymize_with_local_model`` had
+        already dropped every ambiguous pair), so
+        ``mapping_ambiguous_dropped`` could structurally never be
+        non-zero — this test would have failed against that code.
+
+        Mutation: reintroduce a second (now-dead) normalize call before
+        the diagnostic is set -> ``dropped`` reads 0 -> this test fails.
+        """
+        from paramem.graph.extractor import _sota_pipeline
+
+        graph = _make_graph(
+            [("Alex", "lives_in", "Millfield")],
+            entities=[
+                Entity(name="Alex", entity_type="person"),
+                Entity(name="Millfield", entity_type="place"),
+            ],
+        )
+        anon_facts = [{"subject": "Person_1", "predicate": "lives_in", "object": "City_1"}]
+        # "foo": "bar" is a both-sides-ambiguous pair: NEITHER side
+        # matches the placeholder shape, so the normalizer drops it.
+        mapping = {"Alex": "Person_1", "foo": "bar"}
+
+        with (
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
+            patch(
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
+                return_value=(mapping, "anonymized transcript", ""),
+            ),
+            patch(
+                "paramem.graph.extractor._filter_with_sota",
+                return_value=(anon_facts, None, {}, None, {}),
+            ),
+        ):
+            result = _sota_pipeline(
+                graph,
+                "Alex lives in Millfield.",
+                None,
+                None,
+                speaker_id="speaker0",
+                plausibility_judge="off",
+                correction_entity_types=set(),
+                scrub={"person name"},
+            )
+
+        assert result.diagnostics.get("mapping_ambiguous_dropped") == 1
 
 
 class TestConsolidationScheduleConfigPrivacyGuard:
@@ -4398,13 +4670,12 @@ class TestCheckMappingTotality:
                 reverse_mapping,
                 sota_bindings=sota_bindings,
                 diagnostic_key="sota_pending_orphans",
-                stage="sota_enrichment",
             )
         finally:
             placeholders_logger.removeHandler(caplog.handler)
             placeholders_logger.setLevel(prior_level)
         assert graph.diagnostics.get("sota_pending_orphans") == ["Org_9"]
-        assert any("sota enrichment" in r.getMessage().lower() for r in caplog.records)
+        assert any("binding-totality violation" in r.getMessage().lower() for r in caplog.records)
         kept, predicate_dropped, residual_dropped = _apply_bindings(
             anon_facts, reverse_mapping, sota_bindings
         )
@@ -4430,7 +4701,6 @@ class TestCheckMappingTotality:
             reverse_mapping,
             sota_bindings=sota_bindings,
             diagnostic_key="sota_pending_orphans",
-            stage="sota_enrichment",
         )
         assert "Org_9" in graph.diagnostics.get("sota_pending_orphans", [])
 
@@ -4465,7 +4735,6 @@ class TestCheckMappingTotality:
                 reverse_mapping,
                 sota_bindings=sota_bindings,
                 diagnostic_key="sota_pending_orphans",
-                stage="sota_enrichment",
             )
         finally:
             placeholders_logger.removeHandler(caplog.handler)
@@ -4548,10 +4817,42 @@ class TestCheckMappingTotality:
             sota_bindings=sota_bindings,
             observed=observed,
             diagnostic_key="sota_pending_orphans",
-            stage="sota_enrichment",
         )
         assert verdict == ["Person_1"]
         assert graph.diagnostics.get("sota_binding_collisions") == ["Person_1"]
+
+    def test_collision_verdict_written_to_diagnostic_even_with_empty_anon_facts(self):
+        """A non-empty verdict from the collision scan
+        ALONE — ``anon_facts`` is empty, so there is nothing for the
+        per-fact scan to find — must still be written to
+        ``graph.diagnostics[diagnostic_key]``.  This is the exact shape
+        ``graph_enrich.run_graph_enrichment``'s ``totality_rejected_chunks`` counter
+        reads back (``_chunk_session_graph.diagnostics.get(
+        "sota_pending_orphans")``) to detect a rejected chunk; a verdict
+        that is non-empty but never written is silently under-counted as
+        "no rejection" — worse than no gate at all.
+
+        Mutation: return the collision-only verdict via an early
+        ``return`` that bypasses the diagnostic write (the shape this
+        function had before the fix) -> ``graph.diagnostics`` stays empty
+        even though ``verdict`` is non-empty -> this test fails.
+        """
+        from paramem.graph.placeholders import _check_mapping_totality
+
+        graph = self._graph()
+        reverse_mapping = {"Person_1": "Alex"}
+        sota_bindings = {"Person_1": "someone else entirely"}
+        observed = {"Person_1"}
+        verdict = _check_mapping_totality(
+            graph,
+            [],  # no facts -- the early-return path the bug lived in
+            reverse_mapping,
+            sota_bindings=sota_bindings,
+            observed=observed,
+            diagnostic_key="sota_pending_orphans",
+        )
+        assert verdict == ["Person_1"]
+        assert graph.diagnostics.get("sota_pending_orphans") == ["Person_1"]
 
 
 class TestResolutionMap:
@@ -4699,7 +5000,7 @@ class TestBindingTotalityRejection:
                 with (
                     patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
                     patch(
-                        "paramem.graph.extractor.anonymize_with_local_model",
+                        "paramem.graph.cloud_egress.anonymize_with_local_model",
                         return_value=(mapping, "anonymized transcript", ""),
                     ),
                     patch(
@@ -4760,7 +5061,7 @@ class TestBindingTotalityRejection:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -4804,7 +5105,7 @@ class TestBindingTotalityRejection:
             with (
                 patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
                 patch(
-                    "paramem.graph.extractor.anonymize_with_local_model",
+                    "paramem.graph.cloud_egress.anonymize_with_local_model",
                     return_value=(mapping, "anonymized transcript", ""),
                 ),
                 patch(
@@ -4839,7 +5140,7 @@ class TestBindingTotalityRejection:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -4881,7 +5182,7 @@ class TestBindingTotalityRejection:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -4955,7 +5256,7 @@ class TestBindingTotalityRejection:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -5025,7 +5326,7 @@ class TestSpeakerAnchorPipeline:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -5068,7 +5369,7 @@ class TestSpeakerAnchorPipeline:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
             patch(
@@ -5123,9 +5424,9 @@ class TestObservedDerivation:
         mapping = {"Alex": "Person_1", "Millfield": "City_1"}
 
         captured: list = []
-        from paramem.graph import extractor as _extractor
+        from paramem.graph import cloud_egress as _cloud_egress
 
-        real_totality = _extractor._check_mapping_totality
+        real_totality = _cloud_egress._check_mapping_totality
 
         def _spy(*args, **kwargs):
             if "observed" in kwargs:
@@ -5135,10 +5436,10 @@ class TestObservedDerivation:
         with (
             patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test"}),
             patch(
-                "paramem.graph.extractor.anonymize_with_local_model",
+                "paramem.graph.cloud_egress.anonymize_with_local_model",
                 return_value=(mapping, "anonymized transcript", ""),
             ),
-            patch("paramem.graph.extractor._check_mapping_totality", side_effect=_spy),
+            patch("paramem.graph.cloud_egress._check_mapping_totality", side_effect=_spy),
             patch(
                 "paramem.graph.extractor._filter_with_sota",
                 return_value=(list(anon_facts), None, {}, None, {}),

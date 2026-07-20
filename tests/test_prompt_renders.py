@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import re
 
+from paramem.graph.cloud_egress import load_anonymization_prompt
 from paramem.graph.extractor import (
     DEFAULT_PROCEDURAL_USER_PROMPT_FILENAME,
-    load_anonymization_prompt,
     load_extraction_prompts,
 )
 from paramem.graph.schema_config import (

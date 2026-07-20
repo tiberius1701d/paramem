@@ -195,7 +195,7 @@ class TestExtractProceduralGraph:
 class TestSOTAFullFlow:
     def test_anonymize_with_local_model(self, model_and_tokenizer):
         """Test that local model can anonymize extracted facts."""
-        from paramem.graph.extractor import anonymize_with_local_model
+        from paramem.graph.cloud_egress import anonymize_with_local_model
         from paramem.graph.schema import Entity, Relation, SessionGraph
 
         model, tokenizer = model_and_tokenizer

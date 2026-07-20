@@ -107,7 +107,7 @@ class TestPrefixToEntityType:
 
 
 class TestPlaceholderEntityType:
-    """F5 — the ONE site deriving an entity type from a placeholder TOKEN
+    """The ONE site deriving an entity type from a placeholder TOKEN
     (brace-tolerant), collapsing the three previously-duplicated inline
     ``prefix_to_entity_type(placeholder.split("_")[0])`` derivations in
     ``consolidation.py``/``extractor.py``/``entity_correction.py``.
@@ -309,7 +309,7 @@ class TestSubstituteWholeWordsEdgeAwareBoundaries:
 
 
 class TestSubstituteWholeWordsExactMatchRegression:
-    """F1 — matching in :func:`_substitute_whole_words` is exact (raw
+    """Matching in :func:`_substitute_whole_words` is exact (raw
     ``==``), never routed through
     :func:`~paramem.graph.name_match.canonical`. Canonical (case-/
     separator-/diacritic-folded) matching would let a mapped person name
@@ -610,19 +610,25 @@ class TestSpeakerNameSeeding:
 
 
 class TestReverseMapInversionAgreement:
-    """The session tier (:func:`_build_anonymization_mapping`) and the
-    graph tier (:func:`~paramem.graph.extractor._graph_enrich_with_sota`)
-    each invert the forward ``{real_name: placeholder}`` map to build their
-    reverse table. Before the fix the two sites disagreed on the tie-break
-    for a many-to-one forward map (two real names scrubbed onto the SAME
+    """The session tier and the graph tier
+    (:func:`~paramem.graph.extractor._graph_enrich_with_sota`) both reach
+    their reverse ``{placeholder: real_name}`` table through the SAME
+    :func:`_build_anonymization_mapping` — the graph tier no longer
+    inverts a forward map itself at all; it receives
+    ``AnonymizedPayload.reverse`` (built by
+    :func:`~paramem.graph.cloud_egress.anonymize_for_cloud`'s call to
+    :func:`_build_anonymization_mapping`) directly as a caller-supplied
+    argument. Before the fix the two sites disagreed on the tie-break for
+    a many-to-one forward map (two real names scrubbed onto the SAME
     placeholder): the session tier was first-wins
     (``reverse.setdefault(v, k)``), the graph tier was last-wins (a plain
     dict comprehension) — so de-anonymizing the identical placeholder
     restored a DIFFERENT real name depending on which tier ran the deanon.
-    Both now go through the single :func:`invert_forward_mapping`.
 
-    Mutation: revert either call site to its own ad hoc inversion (or flip
-    one site's tie-break) -> one of these tests fails.
+    Mutation: reintroduce a graph-tier-local inversion (raw
+    ``invert_forward_mapping(mapping)`` or a hand-rolled dict comprehension
+    inside ``_graph_enrich_with_sota``) instead of taking
+    ``payload.reverse`` as-is -> these tests fail.
     """
 
     _MANY_TO_ONE = {"Alice": "Person_1", "Bob": "Person_1"}
@@ -635,29 +641,85 @@ class TestReverseMapInversionAgreement:
         assert reverse == invert_forward_mapping(self._MANY_TO_ONE) == {"Person_1": "Alice"}
 
     def test_graph_tier_uses_the_same_shared_helper(self):
-        """Spies on ``invert_forward_mapping`` (wrapped, not stubbed, so
-        the real first-wins behaviour still runs) to prove the graph tier
-        calls the identical shared function on the identical many-to-one
-        map — not a second, independent inversion."""
+        """The graph tier's SOTA round trip uses EXACTLY the reverse table
+        :func:`_build_anonymization_mapping` produced — not a
+        re-derivation — proven by round-tripping a placeholder through
+        ``_graph_enrich_with_sota`` and confirming it resolves to the
+        SAME first-wins real name the shared helper picked.
+        """
         from unittest.mock import patch
 
+        from paramem.graph.cloud_egress import AnonymizedPayload
         from paramem.graph.extractor import _graph_enrich_with_sota
+        from paramem.graph.schema import SessionGraph
 
-        with (
-            patch(
-                "paramem.graph.extractor._sota_call",
-                return_value='{"relations": [], "same_as": []}',
-            ),
-            patch(
-                "paramem.graph.extractor.invert_forward_mapping",
-                side_effect=invert_forward_mapping,
-            ) as spy,
-        ):
+        forward, reverse = _build_anonymization_mapping(dict(self._MANY_TO_ONE), speaker_name=None)
+        assert reverse == {"Person_1": "Alice"}
+        # Realistic shape: SOTA can only propose a relation naming a
+        # placeholder it was actually SHOWN in the rendered triples_json —
+        # ``anon_facts`` must line up 1:1 with ``triples`` (strict zip).
+        triples = [
+            {
+                "subject": "Alice",
+                "predicate": "knows",
+                "object": "acme",
+                "relation_type": "factual",
+                "speaker_id": "",
+            }
+        ]
+        anon_facts = [
+            {
+                "subject": "Person_1",
+                "predicate": "knows",
+                "object": "acme",
+                "relation_type": "factual",
+                "confidence": 1.0,
+            }
+        ]
+        payload = AnonymizedPayload(
+            status="ok",
+            forward=forward,
+            reverse=reverse,
+            anon_transcript="",
+            anon_facts=anon_facts,
+            declared=frozenset(reverse.keys()),
+            norm_stats={"inverted": 0, "dropped": 0},
+            rekey_dropped=0,
+            raw="",
+        )
+        graph = SessionGraph(session_id="t", timestamp="", entities=[], relations=[])
+        canned_raw = (
+            '{"relations": [{"subject": "Person_1", "predicate": "knows", '
+            '"object": "Person_1", "relation_type": "social", "confidence": 0.9}], '
+            '"same_as": []}'
+        )
+        with patch("paramem.graph.extractor._sota_call", return_value=canned_raw):
             result = _graph_enrich_with_sota(
-                triples=[],
-                mapping=dict(self._MANY_TO_ONE),
+                triples=triples,
+                payload=payload,
+                graph=graph,
                 api_key="test-key",
+                provider="anthropic",
+                filter_model="claude-sonnet-4-6",
             )
 
         assert result is not None
-        spy.assert_called_once_with(self._MANY_TO_ONE)
+        new_rels, _same_as, _raw = result
+        assert len(new_rels) == 1
+        assert new_rels[0]["subject"] == "Alice"
+        assert new_rels[0]["object"] == "Alice"
+
+    def test_graph_tier_hostile_speaker_value_hint_never_reaches_reverse(self):
+        """The graph-tier twin of :class:`TestSpeakerAnchorReverseSkip` (above) —
+        a hostile LLM hint scrubbing a real name onto the speaker anchor
+        must never produce a ``speaker0``-keyed reverse entry reachable
+        from the graph tier.  Since the graph tier's ONLY route to a
+        reverse map is the caller-supplied ``payload.reverse`` (built by
+        :func:`_build_anonymization_mapping`, whose speaker-value guard
+        already dropped ``speaker0`` — see :class:`TestSpeakerAnchorReverseSkip`),
+        there is no code path left in ``_graph_enrich_with_sota`` that
+        could reintroduce it.
+        """
+        forward, reverse = _build_anonymization_mapping({"RealName": "speaker0"}, speaker_name=None)
+        assert "speaker0" not in reverse
+        assert forward.get("RealName") == "speaker0"

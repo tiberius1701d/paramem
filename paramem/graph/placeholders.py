@@ -170,8 +170,8 @@ def _substitute_whole_words(
     ever sees the token. Identity reconciliation — matching a mapping key
     to the fold graph's own canonical node-key text — is a separate step
     performed by the one caller that needs it, before this function ever
-    sees the mapping — see :meth:`~paramem.training.consolidation.
-    ConsolidationLoop._run_graph_enrichment`.
+    sees the mapping — see
+    :func:`~paramem.training.graph_enrich.run_graph_enrichment`.
     """
     if not mapping or not text:
         return text
@@ -229,11 +229,15 @@ def _build_anon_facts(relations: Iterable[Relation], mapping: dict[str, str]) ->
     reworded, or dropped by the anonymizer, because the anonymizer never
     returns one.
 
-    Every caller that builds an anonymizer-facing fact array goes through
-    this ONE function: :func:`~paramem.graph.extractor._sota_pipeline`,
-    :func:`~paramem.graph.extractor.extract_and_anonymize_for_cloud`, and
-    ``scripts/dev/calibrate_prompts.py``'s client-side enrichment-stage
-    driver. ``mapping`` must already be the COMPLETE forward map (i.e.
+    The SOLE caller is :func:`~paramem.graph.cloud_egress.anonymize_for_cloud`
+    (A) step 8 — every one of the five migrated paths (session-tier
+    extraction, graph-tier enrichment, chat egress, and their calibration
+    harnesses) reaches this function exclusively through that one chain,
+    never directly.  ``_graph_enrich_with_sota`` does NOT call this
+    function — its anonymized triples come from
+    ``payload.anon_facts`` (already built by (A)), zipped positionally
+    onto the chunk's ``triples`` (see that function's docstring).
+    ``mapping`` must already be the COMPLETE forward map (i.e.
     :func:`_build_anonymization_mapping`'s output) — a partial/HINT-only
     map here reproduces the exact leak this function exists to prevent.
     """
@@ -381,6 +385,23 @@ def _normalize_anonymization_mapping(
     a normalizer and the SOTA ``bindings`` table had none at all (an
     inverted binding like ``{"Acme": "Org_9"}`` passed straight through
     into the substitution map).
+
+    THE CORE table (``placeholder_side="value"``, the default) has
+    exactly ONE caller —
+    :func:`~paramem.graph.cloud_egress.anonymize_for_cloud`'s step 4 —
+    and that caller's ``stats`` is a LIVE signal: it flows into
+    ``AnonymizedPayload.norm_stats`` and, for the session tier, into
+    ``graph.diagnostics["mapping_ambiguous_dropped"]``.  Before the
+    anon/deanon unification, every migrated caller ran a SECOND,
+    redundant normalize on an already-canonical table (the internal call
+    that is now this function's ONE call site had already dropped every
+    ambiguous pair), so the outer ``stats["dropped"]`` could only ever be
+    ``0`` — a structurally-dead diagnostic.  The ``bindings`` table
+    variant (``placeholder_side="key"``) still has more than one caller
+    (:meth:`~paramem.graph.cloud_egress.CloudScope.for_response`, and the
+    unrelated legacy per-session delta parser
+    :func:`~paramem.graph.extractor._parse_enrichment_delta`) and its
+    ``stats`` is not currently surfaced to a diagnostic by either.
     """
     if not mapping:
         return mapping, {"inverted": 0, "dropped": 0}
@@ -507,7 +528,6 @@ def _check_mapping_totality(
     sota_bindings: dict | None = None,
     observed: set[str] | None = None,
     diagnostic_key: str = "totality_orphans",
-    stage: str = "anonymizer",
 ) -> list[str]:
     """Diagnostic check: every placeholder in any anonymized fact must
     resolve against :func:`_resolution_map` (``reverse_mapping`` plus
@@ -521,24 +541,35 @@ def _check_mapping_totality(
 
     Returns the sorted list of offending tokens (orphans, plus conflicts
     when ``observed`` is given — see below); ``[]`` when the mapping is
-    total.  Two exits are intentionally explicit rather than falling
-    through to an implicit ``None`` — the empty-``anon_facts`` early
-    return and the empty-orphans path both ``return []`` so callers can
-    do a plain truthiness test on the result without a
-    falsy-``None``-vs-falsy-``[]`` trap.
+    total.  ONE exit point for a non-empty verdict — whether the orphans
+    came from the collision scan (``sota_bindings`` vs. ``observed``/
+    ``reverse_mapping``) or the per-fact placeholder scan — so
+    ``graph.diagnostics[diagnostic_key]`` is written on every non-empty
+    verdict, never silently dropped because ``anon_facts`` happened to be
+    empty (a real regression this function's caller-side counter,
+    ``totality_rejected_chunks``, depends on to be observable at all: an
+    empty-``anon_facts`` chunk whose SOTA response still collided would
+    otherwise be silently under-counted as "no rejection").  Every other
+    exit (no orphans at all) also ``return []``, so callers can do a
+    plain truthiness test on the result without a falsy-``None``-vs-falsy-
+    ``[]`` trap.
 
-    Only ONE production caller remains: the post-SOTA check
-    (:func:`~paramem.graph.extractor._sota_pipeline`, ``sota_bindings=
-    sota_bindings, observed=<rendered tokens>,
-    diagnostic_key="sota_pending_orphans", stage="sota_enrichment"``),
-    which REJECTS THE WHOLE DELTA on a non-empty verdict and falls back to
-    the pre-enrichment local-extract facts.  The anonymizer-stage shape
-    (``sota_bindings=None``, ``observed=None``, default
-    ``diagnostic_key``/``stage`` — kept as this function's default
-    parameters for direct/unit-test use) no longer has a production
-    caller: anonymized facts are built by the script directly from
+    Only ONE production caller remains:
+    :func:`~paramem.graph.cloud_egress.deanonymize_facts`, which runs
+    this check UNCONDITIONALLY as step 1 (the primitive cannot be skipped
+    from any of the three fact-deanonymizing paths — session-tier
+    extraction, graph-tier enrichment, or their calibration harnesses —
+    since none of them can reach ``_apply_bindings`` any other way) and
+    REJECTS THE WHOLE DELTA on a non-empty verdict, returning
+    ``DeanonResult(facts=[], verdict=verdict, ...)`` without substituting
+    anything — the caller decides the fallback (e.g. the pre-enrichment
+    local-extract facts).  The ``sota_bindings=None``, ``observed=None``,
+    default ``diagnostic_key`` shape (kept as this function's default
+    parameters for direct/unit-test use) has no production caller:
+    anonymized facts are built by
+    :func:`~paramem.graph.cloud_egress.anonymize_for_cloud` directly from
     ``graph.relations`` and the CORE map, so an orphan placeholder in a
-    local fact is now structurally impossible, not merely diagnosed and
+    local fact is structurally impossible, not merely diagnosed and
     logged.  Matches both braced (``{Event_1}``) and bare (``Event_1``)
     placeholder forms via :data:`PLACEHOLDER_TOKEN_RE`.
 
@@ -576,45 +607,45 @@ def _check_mapping_totality(
             graph.diagnostics["sota_binding_collisions"] = collisions
             if observed is not None:
                 orphans |= set(collisions)
-    if not anon_facts:
-        return sorted(orphans) if orphans else []
-    resolvable = set(_resolution_map(reverse_mapping, sota_bindings or {}, observed))
-    for f in anon_facts:
-        if not isinstance(f, dict):
-            continue
-        for field in ("subject", "object"):
-            for t in PLACEHOLDER_TOKEN_RE.findall(str(f.get(field, ""))):
+    # Per-fact placeholder scan — skipped (not an early RETURN) when
+    # there is nothing to scan, so a non-empty ``orphans`` set from the
+    # collision branch above still reaches the single diagnostic-writing
+    # exit point below rather than escaping unwritten.
+    if anon_facts:
+        resolvable = set(_resolution_map(reverse_mapping, sota_bindings or {}, observed))
+        for f in anon_facts:
+            if not isinstance(f, dict):
+                continue
+            for field in ("subject", "object"):
+                for t in PLACEHOLDER_TOKEN_RE.findall(str(f.get(field, ""))):
+                    name = t[0] or t[1]
+                    if name not in resolvable:
+                        orphans.add(name)
+        # Q3 completeness: a binding value may itself contain a bare
+        # placeholder (e.g. "Senior Engineer at Org_9") that never
+        # resolves — the braced pass exposes it but nothing substitutes
+        # it, so it drops silently.
+        for value in (sota_bindings or {}).values():
+            if not isinstance(value, str):
+                continue
+            for t in PLACEHOLDER_TOKEN_RE.findall(value):
                 name = t[0] or t[1]
                 if name not in resolvable:
                     orphans.add(name)
-    # Q3 completeness: a binding value may itself contain a bare placeholder
-    # (e.g. "Senior Engineer at Org_9") that never resolves — the braced
-    # pass exposes it but nothing substitutes it, so it drops silently.
-    for value in (sota_bindings or {}).values():
-        if not isinstance(value, str):
-            continue
-        for t in PLACEHOLDER_TOKEN_RE.findall(value):
-            name = t[0] or t[1]
-            if name not in resolvable:
-                orphans.add(name)
     if orphans:
         ordered = sorted(orphans)
-        if stage == "sota_enrichment":
-            logger.warning(
-                "SOTA enrichment binding-totality violation: %d orphan/conflict "
-                "placeholder(s) in anon_facts not resolvable: %s. The enrichment "
-                "delta will be rejected; local-extract facts are kept instead.",
-                len(ordered),
-                ordered[:5],
-            )
-        else:
-            logger.warning(
-                "Anonymization mapping-totality violation: %d orphan placeholder(s) "
-                "in anon_facts not resolvable: %s. Affected fact(s) will be "
-                "dropped at the residual placeholder sweep post-deanon.",
-                len(ordered),
-                ordered[:5],
-            )
+        # A single message: the only production caller
+        # (``deanonymize_facts``) always rejects the WHOLE delta on a
+        # non-empty verdict, so "the enrichment delta will be rejected"
+        # is accurate for every caller that reaches this branch in
+        # practice; a direct/unit-test caller exercising the
+        # ``sota_bindings=None`` default shape gets the same message.
+        logger.warning(
+            "Binding-totality violation: %d orphan/conflict placeholder(s) in "
+            "anon_facts not resolvable: %s. The delta will be rejected.",
+            len(ordered),
+            ordered[:5],
+        )
         graph.diagnostics[diagnostic_key] = ordered
         return ordered
     return []
@@ -676,15 +707,30 @@ def invert_forward_mapping(mapping: dict) -> dict[str, str]:
     FIRST key encountered in ``mapping``'s iteration order wins; later
     duplicates are silently dropped via ``setdefault``.
 
-    THE only forward -> reverse inversion in this module. Previously two
-    call sites each inverted independently with OPPOSITE tie-breaks: the
-    session tier (:func:`_build_anonymization_mapping`) used first-wins
-    (``reverse.setdefault(v, k)``) while the graph tier
-    (:func:`~paramem.graph.extractor._graph_enrich_with_sota`) used
+    THE only forward -> reverse inversion of the CORE anonymization table
+    in this module — scoped precisely: a caller elsewhere inverting a
+    DIFFERENT map for a DIFFERENT purpose (e.g.
+    :func:`~paramem.graph.extractor._sota_pipeline` inverting
+    ``scope.resolution`` — a placeholder -> real map, already the
+    OUTPUT of :func:`~paramem.graph.cloud_egress.CloudScope.for_response`,
+    not a raw forward table — for its own entity-type lookup) is not a
+    second forward -> reverse inversion of THIS table and does not
+    conflict with this claim.
+
+    THE single caller for the CORE table is
+    :func:`_build_anonymization_mapping`. Previously two call sites each
+    inverted the CORE table independently with OPPOSITE tie-breaks: the
+    session tier used first-wins (``reverse.setdefault(v, k)``) while the
+    graph tier (the pre-unification ``_graph_enrich_with_sota``) used
     LAST-wins (a plain dict comprehension, where a later ``k`` for the
-    same ``v`` silently overwrites an earlier one) — so a many-to-one
+    same ``v`` silently overwrote an earlier one) — so a many-to-one
     forward map restored a DIFFERENT real name at each tier for the
-    identical placeholder. Both now call this one function.
+    identical placeholder. Post-unification, the graph tier no longer
+    inverts anything itself — it receives an already-built
+    ``AnonymizedPayload.reverse`` from
+    :func:`~paramem.graph.cloud_egress.anonymize_for_cloud`, which reaches
+    this function through :func:`_build_anonymization_mapping` exactly
+    like every other migrated path.
     """
     out: dict[str, str] = {}
     for k, v in mapping.items():
@@ -850,13 +896,20 @@ def _apply_bindings(
          its enriched facts (new entities SOTA minted, e.g.
          ``Event_1``).
        * **``observed``** (trailing, defaulted ``None``) — ``None``
-         means CORE UNSCOPED (every ``reverse`` entry is legal; this is
-         what makes the five pre-existing positional-only call sites in
-         ``test_extraction_pipeline.py`` keep passing unchanged as the
-         CORE-unscoped regression net).  A ``set`` means CORE SCOPED to
-         it — see :func:`_resolution_map`.  ``reverse`` wins on any key
-         collision in EITHER mode (CORE PRECEDENCE) — deterministic
-         entity names over SOTA-sourced values, never the reverse.
+         means CORE UNSCOPED (every ``reverse`` entry is legal).  This
+         default is a UNIT-TEST-ONLY sentinel: every production caller
+         reaches this function exclusively through
+         :func:`~paramem.graph.cloud_egress.deanonymize_facts`, which
+         always passes ``scope.observed`` — a ``frozenset``, never
+         ``None`` — on every cloud path.  The ``None`` default exists so
+         the five pre-existing positional-only call sites in
+         ``test_extraction_pipeline.py`` (and any other direct unit test
+         of this primitive) keep passing unchanged as the CORE-unscoped
+         regression net for the primitive itself.  A ``set``/``frozenset``
+         means CORE SCOPED to it — see :func:`_resolution_map`.
+         ``reverse`` wins on any key collision in EITHER mode (CORE
+         PRECEDENCE) — deterministic entity names over SOTA-sourced
+         values, never the reverse.
 
        The union round-trips a placeholder regardless of which form
        (braced or bare) it was actually emitted in: SOTA's contract asks
@@ -967,24 +1020,24 @@ def _apply_bindings(
     return kept, predicate_dropped, residual_dropped
 
 
-def deanonymize_text(text: str, reverse: dict[str, str]) -> str:
-    """Restore real names in cloud-returned text via the reverse mapping.
+def deanonymize_text(text: str, resolution: dict[str, str]) -> str:
+    """Restore real names in cloud-returned text via a resolution map.
 
-    ``reverse`` is the ``{placeholder: real_name}`` map produced
-    alongside the forward map by :func:`_build_anonymization_mapping`
-    (used by both :func:`~paramem.graph.extractor.extract_and_anonymize_for_cloud`
-    and the session-tier :func:`~paramem.graph.extractor._sota_pipeline`),
-    or by the graph tier's own inversion in
-    :func:`~paramem.graph.extractor._graph_enrich_with_sota` — both now
-    go through the single :func:`invert_forward_mapping`.  This
-    function never inverts a forward map itself — that inversion was
-    lossy when the forward map folded PII attribute values onto the
-    entity placeholder, and the asymmetry now lives in the producer.
+    ``resolution`` is a ``{placeholder: real_name}`` map — in production,
+    always :meth:`~paramem.graph.cloud_egress.CloudScope.resolution` (the
+    ``observed``-scoped output of :func:`_resolution_map`), never a raw
+    ``reverse`` table.  The parameter is named ``resolution``, not
+    ``reverse``, because that is genuinely what every production caller
+    feeds it — the ONE caller is
+    :func:`~paramem.graph.cloud_egress.deanonymize_response_text`. This
+    function never inverts a forward map itself — that inversion is the
+    producer's job (:func:`invert_forward_mapping`, inside
+    :func:`_build_anonymization_mapping`).
 
     Word-boundary anchored, so a placeholder embedded in unrelated
     text doesn't match.  Idempotent on text without placeholders or
-    with an empty reverse map.
+    with an empty resolution map.
     """
-    if not text or not reverse:
+    if not text or not resolution:
         return text
-    return _substitute_whole_words(text, reverse)
+    return _substitute_whole_words(text, resolution)

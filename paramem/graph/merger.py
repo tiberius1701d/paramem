@@ -137,6 +137,56 @@ def check_predicate_coexistence(
     return "COEXIST"
 
 
+def _synth_speaker_entities(relations: "list[Relation]") -> "list[Entity]":
+    """Synthesise :class:`Entity` objects for speaker-attributed subjects.
+
+    For each :class:`Relation` in *relations* whose ``speaker_id`` is non-empty
+    and whose ``subject == speaker_id`` (plain equality — both are lowercase
+    ``speaker{N}`` under the lowercase-uniform design), emit one :class:`Entity`
+    with ``entity_type="person"`` and the matching ``speaker_id``.  Deduplicates
+    by ``speaker_id`` so exactly one entity is produced per unique speaker.
+
+    Non-speaker subjects (``speaker_id == ""`` OR ``subject != speaker_id``)
+    are skipped; their nodes retain no ``speaker_id`` attribute, which resolves
+    to ``""`` in the keyed-walk (the correct default for non-person nodes).
+
+    Used by :meth:`GraphMerger.merge_relations` so that
+    :meth:`GraphMerger._upsert_entity` stamps ``speaker_id`` onto the subject
+    node before the edge walk in
+    :meth:`~paramem.training.consolidation.ConsolidationLoop._build_all_edge_entries_into`
+    reads it.  Without the entity the node would lack ``speaker_id``, causing
+    minted keys to fall back to ``speaker_id=""`` (dcf4189 regression).
+
+    Args:
+        relations: The list of :class:`Relation` objects from which speaker
+            entities are derived.
+
+    Returns:
+        A :class:`list` of :class:`Entity` objects, one per unique speaker
+        subject found in *relations*.  May be empty when no relation carries a
+        non-empty ``speaker_id`` whose subject equals the speaker ID.
+    """
+    _seen_speaker_ids: set[str] = set()
+    entities: list[Entity] = []
+    for _r in relations:
+        if _r.speaker_id and _r.speaker_id not in _seen_speaker_ids:
+            # Both subject and speaker_id are lowercase speaker{N} — plain ==
+            # is sufficient.  Non-speaker subjects are skipped.
+            if _r.subject == _r.speaker_id:
+                entities.append(
+                    Entity(
+                        # Use _r.subject (== _r.speaker_id) as the entity name.
+                        # This refreshes attributes["name"] to the lowercase
+                        # speaker_id on the existing speaker node.
+                        name=_r.subject,
+                        entity_type="person",
+                        speaker_id=_r.speaker_id,
+                    )
+                )
+                _seen_speaker_ids.add(_r.speaker_id)
+    return entities
+
+
 class GraphMerger:
     """Merges per-session graphs into a cumulative knowledge graph.
 
@@ -357,6 +407,98 @@ class GraphMerger:
             self.graph.number_of_edges(),
         )
         return self.graph
+
+    def merge_relations(
+        self,
+        relations: "list[Relation]",
+        *,
+        session_id: str,
+        log_label: str,
+        timestamp: str = "",
+        resolve_contradictions: bool = False,
+        credit_adopt_reinforcement: bool = False,
+    ) -> None:
+        """Build a synthetic :class:`SessionGraph` from *relations* and merge it.
+
+        Shared builder for turning a ``list[Relation]`` into an entitied,
+        merged :class:`SessionGraph`.  Callers today: the recon path
+        (``session_id="__full_consolidation_recon__"``), the extra-relations
+        (pending-session) path (``session_id="__interim_pending_sessions__"``),
+        the interim main-tier recital-dedup path
+        (``session_id="__interim_maintier_dedup__"``), the simulate full-fold
+        path (``session_id="__simulate_consolidation_merge__"``), and the
+        graph-enrichment path (``session_id="__graph_enrichment__"``).
+        Graph enrichment separately constructs its own ``SessionGraph`` for a
+        different purpose earlier in its pipeline; this is not the only place
+        a ``SessionGraph`` is built.
+
+        The entity list is synthesised from *relations* via
+        :func:`_synth_speaker_entities`, which stamps ``speaker_id`` onto
+        speaker subject nodes.  This ensures the edge walk in
+        :meth:`~paramem.training.consolidation.ConsolidationLoop._build_all_edge_entries_into`
+        reads the correct ``speaker_id`` from each node (dcf4189 invariant).
+        Without this, reconstructed/synthesised person nodes would be stored
+        as ``entity_type="concept"`` with no ``speaker_id``, and
+        graph-enrichment would root facts at unattributed nodes.
+
+        This method does not manage the gradient-checkpointing guard around
+        ``model.generate()`` calls made by cardinality resolution when
+        ``resolve_contradictions=True`` — that is the caller's responsibility,
+        since only the caller knows whether a model is present.
+
+        Returns early without side effects when *relations* is empty.
+
+        Args:
+            relations: The :class:`Relation` objects to merge.  May be the
+                registry-true recon set, the pending extra-relations set,
+                the interim main-tier dedup set, the simulate fold's
+                collected interim-slot relations, or accumulated
+                graph-enrichment relations.
+            session_id: Synthetic session identifier passed to
+                :class:`~paramem.graph.schema.SessionGraph`.  Used only for
+                logging/debugging.
+            log_label: Human-readable label for the count log line, e.g.
+                ``"reconstructed triples"`` or ``"extra (pending-session) relations"``.
+            timestamp: The session timestamp passed to :class:`SessionGraph`.
+                Default ``""`` (empty string) for all HISTORICAL callers
+                (recon/registry-true/simulate-disk/enrichment), which ensures
+                the merger's ``relation.last_seen or timestamp`` fallback
+                yields ``""`` for legacy relations instead of fabricating a
+                NOW recency value.  A legacy ``""`` relation coexists with its
+                rivals only when every rival is also undated; a genuinely
+                dated rival always outranks it (dated wins over undated) and
+                the legacy relation is retired.  Pass ``datetime.now()`` only
+                for genuinely FRESH sessions where an empty ``last_seen``
+                should resolve to the current wall-clock time.  Currently all
+                callers are historical and omit this parameter (receive the
+                ``""`` default).
+            resolve_contradictions: Forwarded to :meth:`merge`.  Default
+                ``False`` (no cardinality resolution).  Set ``True`` when the
+                config ``refinement_contradiction == "on"``.
+            credit_adopt_reinforcement: Forwarded to :meth:`merge`.  Default
+                ``False`` for every caller except the interim recital-dedup
+                merge, where ``True`` credits a recited fact's Case-1-adopt
+                onto a main-tier key to that key's reinforcement.
+        """
+        if not relations:
+            return
+        entities = _synth_speaker_entities(relations)
+        _session = SessionGraph(
+            session_id=session_id,
+            timestamp=timestamp,
+            entities=entities,
+            relations=relations,
+        )
+        self.merge(
+            _session,
+            resolve_contradictions=resolve_contradictions,
+            credit_adopt_reinforcement=credit_adopt_reinforcement,
+        )
+        logger.info(
+            "merge_relations: merged %d %s into cumulative graph",
+            len(relations),
+            log_label,
+        )
 
     def _resolve_entity(self, entity: Entity) -> str:
         """Resolve an entity to its canonical NetworkX node key.

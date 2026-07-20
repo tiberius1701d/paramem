@@ -79,7 +79,7 @@ def canonical(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Speaker-identity primitives (P1 / P2) — §0 invariant
+# Speaker-identity primitives — §0 invariant
 # ---------------------------------------------------------------------------
 
 

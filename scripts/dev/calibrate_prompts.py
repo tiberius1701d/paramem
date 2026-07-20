@@ -35,7 +35,7 @@ Usage::
         --input ingest/resume.pdf --chunk 0 --stages enrich \\
         --seed-from data/ha/debug/calibration/<prior-ts>/
 
-Out of scope: merger, QA generator, adapter training, recall/chat.  The
+Out of scope: merger, keyed-entry assembly, adapter training, recall/chat.  The
 tool stops at "what did the LLM emit for this stage given this prompt
 and these params."
 """
@@ -763,6 +763,12 @@ def main(argv: list[str] | None = None) -> int:
                     "graph": prior_extract.get("parsed", {}),
                     "transcript": chunk["text"],
                     "session_id": f"calib-chunk-{chunk_idx}",
+                    # Same runtime-known speaker name every production
+                    # caller of anonymize_for_cloud threads through — a
+                    # calibration run that never speaker-seeds diverges
+                    # from production fidelity (see
+                    # CalibrateAnonymizeRequest.speaker_name docstring).
+                    "speaker_name": args.speaker,
                     "prompts_dir": args.prompts_dir,
                     "anonymization_prompt_filename": anon_override,
                     "params": {k: v for k, v in params_base.items() if v is not None},
@@ -774,58 +780,30 @@ def main(argv: list[str] | None = None) -> int:
             prior_anonymize = anon
 
         if "enrich" in stages and prior_extract is not None and prior_anonymize is not None:
-            # The anonymize stage returns the model's two artifacts —
-            # `mapping` AND `anonymized_transcript` (the model authors the
-            # transcript rewrite in-context; it is the SOLE scope
-            # authority) — plus `status` (opted_out / failed / ok).
-            # Facts are still built here through the SAME production
-            # primitives `_sota_pipeline` uses — never a hand-rolled scrub:
-            #   1. `_build_anonymization_mapping` — the model's mapping IS
-            #      the scope decision (no code-side entity walk, no
-            #      entity-type scope gate, no re-mint downstream of it);
-            #      this builder only maintains the speaker-anchor
-            #      invariants and seeds `speaker_name`.
-            #   2. `_build_anon_facts` — one fact per LOCAL relation,
-            #      subject/object substituted through the forward map,
-            #      predicate/relation_type/confidence VERBATIM.
-            # The anonymized TRANSCRIPT is taken directly from the model's
-            # own `anonymized_transcript` — never mechanically rebuilt via a
-            # code-side forward-on-prose substitution (deleted; the
-            # transcript is model-authored).
-            from paramem.graph.placeholders import (
-                _build_anon_facts,
-                _build_anonymization_mapping,
-                _normalize_anonymization_mapping,
-            )
-            from paramem.graph.schema import SessionGraph
-
+            # /calibrate/anonymize now returns the FULLY-ASSEMBLED
+            # artifacts from THE one anonymize chain
+            # (paramem.graph.cloud_egress.anonymize_for_cloud) —
+            # status / mapping / anonymized_transcript / forward /
+            # reverse / anon_facts / norm_stats.  Fed straight through to
+            # /calibrate/enrich; no client-side re-derivation.
             anon_parsed = prior_anonymize.get("parsed") or {}
-            # `mapping is None` OR a missing/empty `anonymized_transcript`
-            # is fail-closed — matches production's abort-on-None
-            # (`extractor.py`'s `_sota_pipeline`: `if mapping is None:`
-            # falls back without ever calling the cloud).  `or {}` on
-            # `mapping` here would collapse a parse failure into "found
-            # nothing", building the SOTA payload from zero scrubbing
-            # instead of skipping the call — never a truthiness check on a
-            # mapping per CLAUDE.md.
-            raw_mapping = anon_parsed.get("mapping")
-            model_anon_transcript = anon_parsed.get("anonymized_transcript")
-            if raw_mapping is None or not model_anon_transcript:
+            # status == "failed" OR a missing/empty `anonymized_transcript`
+            # is fail-closed — matches production's abort-on-failure
+            # (`_sota_pipeline`'s `status == "failed"` branch falls back
+            # without ever calling the cloud).  `status == "opted_out"`
+            # still proceeds to enrich (verbatim facts/transcript), same
+            # as production.  Never a truthiness check on a mapping per
+            # CLAUDE.md.
+            status = anon_parsed.get("status")
+            anon_facts = anon_parsed.get("anon_facts")
+            anon_transcript = anon_parsed.get("anonymized_transcript")
+            if status == "failed" or not anon_transcript:
                 print(
-                    f"Chunk {chunk_idx}: anonymizer mapping is None or "
+                    f"Chunk {chunk_idx}: anonymize stage status={status!r} or "
                     f"anonymized_transcript missing/empty (fail-closed) "
                     f"— skipping enrich stage, no cloud call made."
                 )
                 continue
-            llm_mapping, _norm_stats = _normalize_anonymization_mapping(raw_mapping)
-            local_graph = SessionGraph.model_validate(prior_extract.get("parsed") or {})
-
-            mapping, _reverse = _build_anonymization_mapping(
-                llm_mapping,
-                speaker_name=args.speaker,
-            )
-            anon_transcript = model_anon_transcript
-            anon_facts = _build_anon_facts(local_graph.relations, mapping)
 
             enrich_calib = f"{args.prompt_prefix}{_STAGE_FILENAME['enrich']}"
             enrich_override = enrich_calib if (prompts_dir / enrich_calib).exists() else None

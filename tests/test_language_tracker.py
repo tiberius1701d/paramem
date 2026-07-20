@@ -1,4 +1,4 @@
-"""Tests for `paramem/server/language_tracker.py` (F5.7)."""
+"""Tests for `paramem/server/language_tracker.py`."""
 
 from __future__ import annotations
 

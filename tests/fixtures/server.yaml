@@ -137,7 +137,7 @@ adapters:
     learning_rate: 1.0e-5
     target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]   # attention-only (same as episodic) — consolidated knowledge routing
   procedural:
-    enabled: true       # behavioral patterns, routines, preferences (F5.6)
+    enabled: true       # behavioral patterns, routines, preferences
     rank: 8
     alpha: 16
     learning_rate: 5.0e-5

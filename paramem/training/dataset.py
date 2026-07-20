@@ -1,27 +1,9 @@
 """Dataset utilities for personal memory training."""
 
-import json
-from pathlib import Path
-
 SYSTEM_PROMPT = (
     "You are a personal assistant with memory of your user's life. "
     "Answer questions about the user based on what you know about them."
 )
-
-
-def _build_training_messages(fact: str, question: str, answer: str) -> list[dict]:
-    """Build chat messages for a training example.
-
-    Returns a messages list suitable for tokenizer.apply_chat_template().
-    The fact is NOT included in the prompt — the model must encode the
-    knowledge into its parameters rather than learning to copy from context.
-    Training and inference formats are identical (question only).
-    """
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-        {"role": "assistant", "content": answer},
-    ]
 
 
 def format_inference_prompt(question: str, tokenizer) -> str:
@@ -83,31 +65,3 @@ def _tokenize_with_prompt_masking(messages: list[dict], tokenizer, max_length: i
         "attention_mask": attention_mask,
         "labels": labels,
     }
-
-
-def load_eval_pairs(
-    data_path: str | Path,
-    tokenizer,
-    fact_ids: list[str] | None = None,
-) -> list[dict]:
-    """Load evaluation pairs (question + expected answer)."""
-    with open(data_path) as f:
-        all_facts = json.load(f)
-
-    if fact_ids is not None:
-        all_facts = [f for f in all_facts if f["id"] in fact_ids]
-
-    pairs = []
-    for fact_entry in all_facts:
-        for qa in fact_entry["qa_pairs"]:
-            pairs.append(
-                {
-                    "fact_id": fact_entry["id"],
-                    "category": fact_entry["category"],
-                    "question": qa["question"],
-                    "expected_answer": qa["answer"],
-                    "prompt": format_inference_prompt(qa["question"], tokenizer),
-                }
-            )
-
-    return pairs

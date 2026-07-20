@@ -255,7 +255,6 @@ class ExtractionPipeline:
             speaker_id=_require_speaker_id(overrides),
             system_prompt_filename=pick("system_prompt_filename", system_prompt_filename),
             user_prompt_filename=pick("user_prompt_filename", user_prompt_filename),
-            stop_phase=overrides.get("stop_phase"),
             seed=overrides.get("seed"),
             timestamp=overrides.get("timestamp"),
             source_type=source_type,
@@ -300,7 +299,10 @@ class ExtractionPipeline:
 
         See class docstring for invariants.  ``overrides`` accepts every
         kwarg :meth:`kwargs` returns plus the chokepoint-only fields
-        ``speaker_id``, ``speaker_name``, ``ha_context``, ``stop_phase``.
+        ``speaker_id``, ``speaker_name``, ``ha_context``.  A calibration
+        caller wraps this call in
+        :func:`paramem.graph.phase_trace.stop_at` to request an early
+        return — that mechanism is independent of this method's kwargs.
         """
         kwargs = self.kwargs(source_type=source_type, **overrides)
         return self._run_extractor(extract_graph, session_transcript, session_id, kwargs)
@@ -339,9 +341,7 @@ class ExtractionPipeline:
         :meth:`run` (via :meth:`kwargs`): each defaults to ``None``, which
         preserves the pre-existing production behaviour (``self.prompts_dir``,
         no seed, the two ``DEFAULT_*`` prompt filenames) unchanged for every
-        existing caller. ``stop_phase`` is intentionally NOT exposed here —
-        procedural extraction is a single-phase call, so a stop point is
-        inapplicable.
+        existing caller.
         """
         if not speaker_id:
             raise ValueError(

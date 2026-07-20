@@ -563,8 +563,8 @@ class TestCalibrateAnonymize:
 
         valid_json = '{"mapping": {}, "anonymized_transcript": "[user] hello there"}'
         with (
-            _mock.patch("paramem.graph.extractor.adapt_messages", side_effect=lambda m, t: m),
-            _mock.patch("paramem.graph.extractor.generate_answer", return_value=valid_json),
+            _mock.patch("paramem.graph.cloud_egress.adapt_messages", side_effect=lambda m, t: m),
+            _mock.patch("paramem.graph.cloud_egress.generate_answer", return_value=valid_json),
         ):
             result = calibrate_anonymize(state, req)
 
@@ -592,7 +592,7 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.extractor.anonymize_with_local_model",
+            "paramem.graph.cloud_egress.anonymize_with_local_model",
             return_value=({}, "[user] hello", "raw"),
         ) as helper:
             result = calibrate_anonymize(state, req)
@@ -605,7 +605,7 @@ class TestCalibrateAnonymize:
 
     def test_calibrate_anonymize_returns_mapping_and_transcript(self):
         """The ``parsed`` payload carries the model's two artifacts —
-        ``mapping`` AND ``anonymized_transcript`` — plus a ``status``
+        ``forward`` AND ``anonymized_transcript`` — plus a ``status``
         (current 3-tuple ``anonymize_with_local_model`` contract; facts
         are still never part of the anonymizer's response).
 
@@ -621,21 +621,24 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.extractor.anonymize_with_local_model",
+            "paramem.graph.cloud_egress.anonymize_with_local_model",
             return_value=({"Alex": "Person_1"}, "[user] Person_1 said hi", "raw"),
         ):
             result = calibrate_anonymize(state, req)
 
         assert result["parsed"] == {
             "status": "ok",
-            "mapping": {"Alex": "Person_1"},
             "anonymized_transcript": "[user] Person_1 said hi",
+            "forward": {"Alex": "Person_1"},
+            "reverse": {"Person_1": "Alex"},
+            "anon_facts": [],
+            "norm_stats": {"inverted": 0, "dropped": 0},
         }
 
     def test_fail_closed_when_mapping_is_none(self):
         """Fail-closed: a parse failure (``mapping is None``) is
-        reported as ``status: "failed"`` with an empty mapping and an
-        empty ``anonymized_transcript`` — never a fallback to the
+        reported as ``status: "failed"`` with an empty ``forward`` table
+        and an empty ``anonymized_transcript`` — never a fallback to the
         real-name transcript.
         """
         import unittest.mock as _mock
@@ -647,15 +650,18 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.extractor.anonymize_with_local_model",
+            "paramem.graph.cloud_egress.anonymize_with_local_model",
             return_value=(None, "", "raw"),
         ):
             result = calibrate_anonymize(state, req)
 
         assert result["parsed"] == {
             "status": "failed",
-            "mapping": {},
             "anonymized_transcript": "",
+            "forward": {},
+            "reverse": {},
+            "anon_facts": [],
+            "norm_stats": {"inverted": 0, "dropped": 0},
         }
 
     def test_empty_scrub_opts_out_without_model_call(self):
@@ -675,15 +681,18 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.extractor.anonymize_with_local_model",
+            "paramem.graph.cloud_egress.anonymize_with_local_model",
         ) as helper:
             result = calibrate_anonymize(state, req)
 
         assert not helper.called
         assert result["parsed"] == {
             "status": "opted_out",
-            "mapping": {},
             "anonymized_transcript": "[user] My friend Alex moved to Berlin.",
+            "forward": {},
+            "reverse": {},
+            "anon_facts": [],
+            "norm_stats": {"inverted": 0, "dropped": 0},
         }
 
     def test_scrub_sourced_from_config(self):
@@ -704,12 +713,43 @@ class TestCalibrateAnonymize:
         )
 
         with _mock.patch(
-            "paramem.graph.extractor.anonymize_with_local_model",
+            "paramem.graph.cloud_egress.anonymize_with_local_model",
             return_value=({}, "[user] hello", "raw"),
         ) as helper:
             calibrate_anonymize(state, req)
 
         assert helper.call_args.kwargs["scrub"] == {"person name", "phone number"}
+
+    def test_speaker_name_reaches_speaker_seeding(self):
+        """``req.speaker_name`` reaches
+        ``anonymize_for_cloud``'s speaker-name seeding — the same
+        runtime-known speaker name every production caller threads
+        through.  A transcript the model itself never named (empty
+        mapping) still gets the speaker minted into ``forward``/``reverse``
+        via seeding — proving ``speaker_name`` actually reached the
+        builder, not merely accepted and dropped.
+
+        Mutation: drop the ``speaker_name=req.speaker_name`` kwarg from
+        the ``anonymize_for_cloud`` call -> ``forward`` comes back empty
+        -> this test fails.
+        """
+        import unittest.mock as _mock
+
+        state = _state_enabled()
+        req = CalibrateAnonymizeRequest(
+            graph={"session_id": "x", "timestamp": "x", "entities": [], "relations": []},
+            transcript="[user] hello",
+            speaker_name="Alex",
+        )
+
+        with _mock.patch(
+            "paramem.graph.cloud_egress.anonymize_with_local_model",
+            return_value=({}, "[user] hello", "raw"),
+        ):
+            result = calibrate_anonymize(state, req)
+
+        assert result["parsed"]["forward"] == {"Alex": "Person_1"}
+        assert result["parsed"]["reverse"] == {"Person_1": "Alex"}
 
     def test_unmarked_transcript_raises_400(self):
         """Mutation: remove the gate call from ``calibrate_anonymize`` ->
@@ -722,7 +762,7 @@ class TestCalibrateAnonymize:
             transcript="My friend Alex moved to Berlin.",
         )
         with (
-            _mock.patch("paramem.graph.extractor.anonymize_with_local_model") as helper,
+            _mock.patch("paramem.graph.cloud_egress.anonymize_with_local_model") as helper,
             pytest.raises(HTTPException) as exc,
         ):
             calibrate_anonymize(state, req)
@@ -741,7 +781,7 @@ class TestCalibrateAnonymize:
             transcript="[user] My friend Alex moved to Berlin.",
         )
         with _mock.patch(
-            "paramem.graph.extractor.anonymize_with_local_model",
+            "paramem.graph.cloud_egress.anonymize_with_local_model",
             return_value=({}, "[user] My friend Person_1 moved to City_1.", "raw"),
         ) as helper:
             result = calibrate_anonymize(state, req)
@@ -811,9 +851,19 @@ class TestCalibratePlausibility:
 
         expected = _load_prompt("my_plaus.txt", prompts_dir=prompts_dir, required=True)
         expected_sha = hashlib.sha256(expected.encode("utf-8")).hexdigest()[:12]
-        assert len(result["prompts"]) == 1
+        # ``local_plausibility_filter`` now also loads its SYSTEM prompt
+        # (``sota_plausibility_system.txt``) at call time — no longer a
+        # module-import-time constant unreachable by provenance — so this
+        # phase records TWO prompts: the (overridden) user template, then
+        # the system prompt.  ``req`` carries no system-prompt override
+        # here, so the second entry resolves the shipped default.
+        expected_system = _load_prompt("sota_plausibility_system.txt", required=True)
+        expected_system_sha = hashlib.sha256(expected_system.encode("utf-8")).hexdigest()[:12]
+        assert len(result["prompts"]) == 2
         assert result["prompts"][0]["sha"] == expected_sha
         assert result["prompts"][0]["template"] == expected
+        assert result["prompts"][1]["sha"] == expected_system_sha
+        assert result["prompts"][1]["template"] == expected_system
 
     def test_runs_on_base_weights(self):
         """calibrate_plausibility disables the active adapter around the model call.

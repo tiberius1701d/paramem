@@ -61,8 +61,10 @@ _SAFETY_MARGIN_BYTES: int = 256 * 1024 * 1024  # 256 MiB
 # extraction phase with empty_cache between phases (paramem/graph/extractor.py
 # and paramem/training/consolidation.py), so the reservation covers what the
 # largest single phase holds at once, not the cumulative peak across phases.
-# The plausibility-filter's ~1.9 GiB allocator pool is released before QA-gen
-# begins. Tunable via vram.vram_cache_headroom_gib.
+# The plausibility-filter's ~1.9 GiB allocator pool is released before the
+# next extraction phase (procedural extraction in
+# consolidation.extract_session) begins. Tunable via
+# vram.vram_cache_headroom_gib.
 _DEFAULT_HEADROOM_GIB: float = 1.0
 
 # PEFT per-adapter overhead is config-driven (vram.peft_overhead_per_adapter_mib)

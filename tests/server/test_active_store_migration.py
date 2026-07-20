@@ -1424,8 +1424,39 @@ class TestNegativeCouplingGuard:
     def test_no_partition_relations_import(self):
         assert "partition_relations" not in self._module_source()
 
-    def test_no_run_graph_enrichment_import(self):
-        assert "_run_graph_enrichment" not in self._module_source()
+    def test_no_graph_tier_refiner_import(self):
+        """Migration must never reach into the consolidation fold's tier refiner.
+
+        The enrichment/normalization surfaces used to be reachable as a
+        SHIM method directly on ``ConsolidationLoop`` (since deleted). They
+        now live in ``paramem.training.graph_tier`` (``GraphTierRefiner``)
+        and ``paramem.training.graph_enrich`` (its dispatch target), both
+        owned by the consolidation fold
+        (``ConsolidationLoop._refine_consolidation_graph``). The
+        predecessor of this test asserted on the deleted SHIM method's old
+        name as a substring, which no longer appears anywhere in the repo,
+        so it passed unconditionally and enforced nothing — migration
+        could import ``graph_tier.GraphTierRefiner`` directly and this
+        guard would still pass.
+
+        Checked as a substring scan (like its sibling
+        ``test_no_partition_relations_import``), not an ``ast`` import scan
+        (like ``test_no_fold_entry_call`` below): the banned names here are
+        two module names and one free-function name, and all three appear
+        literally in any import statement that would violate the invariant
+        — including an aliased import
+        (``from paramem.training import graph_tier as gt`` still contains
+        the substring ``"graph_tier"``) — so a substring check is
+        sufficient. An ``ast`` scan is reserved for guarding *call sites*
+        on an ambiguous bare word (``.consolidate(...)`` collides with this
+        module's own vocabulary), which is not the situation here.
+        """
+        src = self._module_source()
+        for banned in ("graph_tier", "graph_enrich", "run_graph_enrichment"):
+            assert banned not in src, (
+                f"{banned!r} must not appear in active_store_migration.py — "
+                "migration must not reach into the consolidation fold's tier refiner"
+            )
 
     def test_no_fold_entry_call(self):
         """Migration must never reach into the consolidation fold.

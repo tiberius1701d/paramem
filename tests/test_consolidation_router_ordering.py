@@ -165,25 +165,25 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
     loop.wandb_config = None
     loop.output_dir = tmp_path
     loop.merger = MagicMock()
-    # Stage 2 (re-merge) calls merger.merge(synthetic_session); stage 5 walks
-    # merger.graph.edges(data=True) to rebuild the per-tier keyed lists.  Use a
-    # real MultiDiGraph and a merge side_effect that inserts one edge per relation
-    # (carrying predicate + relation_type), mirroring the real GraphMerger so the
-    # reconstructed triples flow through dedup/tiering/training instead of all
-    # registering as graph drift.
+    # Stage 2 (re-merge) reaches the merger through TWO entry points: the
+    # session-graph path ``merger.merge(session_graph)`` (disk/simulate) and the
+    # relation-list path ``merger.merge_relations(relations, ...)`` (recon,
+    # extra-relations, interim recital dedup).  Real ``GraphMerger.merge_relations``
+    # synthesises a SessionGraph and delegates to ``merge`` (merger.py:492), so both
+    # spies share one edge-inserting core here.  Stage 5 walks
+    # merger.graph.edges(data=True) to rebuild the per-tier keyed lists, so these
+    # side_effects are load-bearing: without an edge insert the fold reconstructs
+    # zero entries and skips per-tier training entirely.  Use a real MultiDiGraph
+    # and insert one edge per relation (carrying predicate + relation_type),
+    # mirroring the real GraphMerger so the reconstructed triples flow through
+    # dedup/tiering/training instead of all registering as graph drift.
     _merger_graph = nx.MultiDiGraph()
     loop.merger.graph = _merger_graph
 
     from paramem.memory.persistence import _IK_KEY_ATTR as _IK_ATTR
 
-    def _merge_into_graph(
-        session_graph,
-        *,
-        resolve_contradictions: bool = True,
-        align_predicates: bool = False,
-        credit_adopt_reinforcement: bool = False,
-    ):
-        for _rel in getattr(session_graph, "relations", []):
+    def _insert_relations(relations):
+        for _rel in relations:
             eid = _merger_graph.add_edge(
                 _rel.subject,
                 _rel.object,
@@ -195,7 +195,30 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
                 _merger_graph[_rel.subject][_rel.object][eid][_IK_ATTR] = _ik
         return _merger_graph
 
+    def _merge_into_graph(
+        session_graph,
+        *,
+        resolve_contradictions: bool = True,
+        align_predicates: bool = False,
+        credit_adopt_reinforcement: bool = False,
+    ):
+        return _insert_relations(getattr(session_graph, "relations", []))
+
+    def _merge_relations_into_graph(
+        relations,
+        *,
+        session_id: str,
+        log_label: str,
+        timestamp: str = "",
+        resolve_contradictions: bool = False,
+        credit_adopt_reinforcement: bool = False,
+    ):
+        # Real merge_relations returns None and no-ops on an empty list.
+        _insert_relations(relations or [])
+        return None
+
     loop.merger.merge.side_effect = _merge_into_graph
+    loop.merger.merge_relations.side_effect = _merge_relations_into_graph
     loop.store = MemoryStore(replay_enabled=True)
     reg_dict = registry if registry is not None else _make_empty_registry_dict()
     for tier_name, reg in reg_dict.items():
@@ -205,10 +228,16 @@ def _make_loop(model, tmp_path: Path, *, registry=None, indexed_key_cache=None):
         loop.store.put("episodic", k, entry, register=False)
     loop.snapshot_dir = None
     loop.save_cycle_snapshots = False
+    # Enrichment sizing scalars.  A GraphTierRefiner is constructed for BOTH
+    # tier passes, so its enrichment sizing is supplied even on a normalize-only
+    # run.  ConsolidationLoop.__init__ always sets these
+    # (consolidation.py:501-502) and release() never nulls them.
+    loop.graph_enrichment_neighborhood_hops = 2
+    loop.graph_enrichment_max_entities_per_pass = 50
     loop._thermal_policy = None
     # _bg_trainer is wired by the server lifespan; None in tests (experiment path).
     loop._bg_trainer = None
-    # consolidate calls _run_graph_enrichment() via _refine_consolidation_graph
+    # consolidate calls GraphTierRefiner.run_enrichment() via _refine_consolidation_graph
     # when scope.enrich is True.  The config default (refinement_enrichment="off",
     # sota_enabled=False) yields enrich=False — no enrichment runs in these ordering tests.
     # Admit-all probe stub for the registration fail-safe: when no recall verdict is
@@ -351,10 +380,8 @@ class TestTrainingFlagBracketing:
             "procedural_backup",
         )
 
-        qa = {
+        ik_entries = {
             "graph1": {
-                "question": "Q1?",
-                "answer": "A1.",
                 "subject": "Alice",
                 "predicate": "likes",
                 "object": "cats",
@@ -368,7 +395,7 @@ class TestTrainingFlagBracketing:
         registry_dict = _make_empty_registry_dict()
         registry_dict["episodic"].add("graph1")
 
-        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=ik_entries)
 
         # Create a stub trainer to record _set_is_training calls.
         stub_trainer = MagicMock()
@@ -455,10 +482,8 @@ class TestTrainingFlagBracketing:
         # Three keys — one per tier.  partition_relations determines tier; we
         # mock it to return one key per tier in the order the loop visits them
         # (episodic → semantic → procedural) by returning the correct lists.
-        qa = {
+        ik_entries = {
             "ep_key": {
-                "question": "Ep?",
-                "answer": "A.",
                 "subject": "Alice",
                 "predicate": "likes",
                 "object": "cats",
@@ -467,8 +492,6 @@ class TestTrainingFlagBracketing:
                 "source_object": "cats",
             },
             "sem_key": {
-                "question": "Sem?",
-                "answer": "B.",
                 "subject": "Bob",
                 "predicate": "knows",
                 "object": "Carol",
@@ -477,8 +500,6 @@ class TestTrainingFlagBracketing:
                 "source_object": "Carol",
             },
             "proc_key": {
-                "question": "Proc?",
-                "answer": "C.",
                 "subject": "Dave",
                 "predicate": "prefers",
                 "object": "morning",
@@ -494,7 +515,7 @@ class TestTrainingFlagBracketing:
         registry_dict["semantic"].add("sem_key")
         registry_dict["procedural"].add("proc_key")
         # Enable procedural processing.
-        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=ik_entries)
         loop.procedural_config = _minimal_adapter_config()
 
         stub_trainer = MagicMock()
@@ -612,10 +633,8 @@ class TestPerTierInferenceFallbackAdapter:
         )
 
         # Three keys — one per tier.
-        qa = {
+        ik_entries = {
             "ep_key": {
-                "question": "Ep?",
-                "answer": "A.",
                 "subject": "Alice",
                 "predicate": "likes",
                 "object": "cats",
@@ -624,8 +643,6 @@ class TestPerTierInferenceFallbackAdapter:
                 "source_object": "cats",
             },
             "sem_key": {
-                "question": "Sem?",
-                "answer": "B.",
                 "subject": "Bob",
                 "predicate": "knows",
                 "object": "Carol",
@@ -634,8 +651,6 @@ class TestPerTierInferenceFallbackAdapter:
                 "source_object": "Carol",
             },
             "proc_key": {
-                "question": "Proc?",
-                "answer": "C.",
                 "subject": "Dave",
                 "predicate": "prefers",
                 "object": "morning",
@@ -651,7 +666,7 @@ class TestPerTierInferenceFallbackAdapter:
         registry_dict["semantic"].add("sem_key")
         registry_dict["procedural"].add("proc_key")
 
-        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=ik_entries)
         loop.procedural_config = _minimal_adapter_config()
 
         # Stub trainer with real attribute tracking.
@@ -755,10 +770,8 @@ class TestPerTierInferenceFallbackAdapter:
             "procedural_backup",
         )
 
-        qa = {
+        ik_entries = {
             "ep_key": {
-                "question": "Ep?",
-                "answer": "A.",
                 "subject": "Alice",
                 "predicate": "likes",
                 "object": "cats",
@@ -767,8 +780,6 @@ class TestPerTierInferenceFallbackAdapter:
                 "source_object": "cats",
             },
             "sem_key": {
-                "question": "Sem?",
-                "answer": "B.",
                 "subject": "Bob",
                 "predicate": "knows",
                 "object": "Carol",
@@ -783,7 +794,7 @@ class TestPerTierInferenceFallbackAdapter:
         registry_dict["episodic"].add("ep_key")
         registry_dict["semantic"].add("sem_key")
 
-        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=ik_entries)
 
         # Set a sentinel as the "outer" _current_job so we can detect restoration.
         sentinel_job = TrainingJob(
@@ -854,19 +865,19 @@ class TestPerTierInferenceFallbackAdapter:
 
         jobs = {
             "episodic": TrainingJob(
-                entries=[{"key": "graph1", "question": "Q?", "answer": "A."}],
+                entries=[{"key": "graph1"}],
                 adapter_name="episodic",
                 adapter_config=ep_cfg,
                 inference_fallback_adapter="episodic_backup",
             ),
             "semantic": TrainingJob(
-                entries=[{"key": "graph2", "question": "Q2?", "answer": "A2."}],
+                entries=[{"key": "graph2"}],
                 adapter_name="semantic",
                 adapter_config=sem_cfg,
                 inference_fallback_adapter="semantic_backup",
             ),
             "procedural": TrainingJob(
-                entries=[{"key": "proc1", "question": "Q3?", "answer": "A3."}],
+                entries=[{"key": "proc1"}],
                 adapter_name="procedural",
                 adapter_config=proc_cfg,
                 inference_fallback_adapter="procedural_backup",
@@ -915,10 +926,8 @@ class TestCapacityCeilingRollback:
             "procedural_backup",
         )
 
-        qa = {
+        ik_entries = {
             "graph1": {
-                "question": "Q?",
-                "answer": "A.",
                 "subject": "X",
                 "predicate": "y",
                 "object": "Z",
@@ -929,7 +938,7 @@ class TestCapacityCeilingRollback:
         }
         registry_dict = _make_empty_registry_dict()
         registry_dict["episodic"].add("graph1")
-        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=ik_entries)
 
         _gpu_thread_lock.acquire()
         try:
@@ -991,10 +1000,8 @@ class TestCapacityCeilingRollback:
             "procedural_backup",
         )
 
-        qa = {
+        ik_entries = {
             "graph1": {
-                "question": "Q?",
-                "answer": "A.",
                 "subject": "X",
                 "predicate": "y",
                 "object": "Z",
@@ -1005,7 +1012,7 @@ class TestCapacityCeilingRollback:
         }
         registry_dict = _make_empty_registry_dict()
         registry_dict["episodic"].add("graph1")
-        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=ik_entries)
 
         _gpu_thread_lock.acquire()
         try:
@@ -1076,10 +1083,8 @@ class TestAtomicFinalizeOrdering:
             "procedural_backup",
         )
 
-        qa = {
+        ik_entries = {
             "graph1": {
-                "question": "Q?",
-                "answer": "A.",
                 "subject": "X",
                 "predicate": "y",
                 "object": "Z",
@@ -1092,7 +1097,7 @@ class TestAtomicFinalizeOrdering:
         registry_dict = _make_empty_registry_dict()
         registry_dict["episodic"].add("graph1")
 
-        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=ik_entries)
 
         call_order: list[str] = []
 
@@ -1203,10 +1208,8 @@ class TestAtomicFinalizeOrdering:
             "episodic_interim_20260418T0000",
         )
 
-        qa = {
+        ik_entries = {
             "graph1": {
-                "question": "Q?",
-                "answer": "A.",
                 "subject": "X",
                 "predicate": "y",
                 "object": "Z",
@@ -1221,7 +1224,7 @@ class TestAtomicFinalizeOrdering:
         interim_reg.add("graph1")
         registry_dict["episodic_interim_20260418T0000"] = interim_reg
 
-        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=qa)
+        loop = _make_loop(model, tmp_path, registry=registry_dict, indexed_key_cache=ik_entries)
 
         _gpu_thread_lock.acquire()
         try:
@@ -1277,7 +1280,7 @@ class TestAtomicFinalizeOrdering:
 
 
 # ---------------------------------------------------------------------------
-# Test 5b — Durable main-weight persist before interim purge (GAP 1 crash window)
+# Test 5b — Durable main-weight persist before interim purge
 # ---------------------------------------------------------------------------
 
 
@@ -1311,11 +1314,9 @@ class TestMainWeightsSavedBeforeInterimPurge:
             "procedural_backup",
         )
 
-    def _qa(self) -> dict:
+    def _ik_entries(self) -> dict:
         return {
             "graph1": {
-                "question": "Q?",
-                "answer": "A.",
                 "subject": "X",
                 "predicate": "y",
                 "object": "Z",
@@ -1391,7 +1392,7 @@ class TestMainWeightsSavedBeforeInterimPurge:
             self._make_finalize_model(),
             tmp_path,
             registry=registry_dict,
-            indexed_key_cache=self._qa(),
+            indexed_key_cache=self._ik_entries(),
         )
 
         call_order: list[str] = []
@@ -1430,7 +1431,7 @@ class TestMainWeightsSavedBeforeInterimPurge:
             self._make_finalize_model(),
             tmp_path,
             registry=registry_dict,
-            indexed_key_cache=self._qa(),
+            indexed_key_cache=self._ik_entries(),
         )
 
         # An on-disk interim slot that must survive a failed save.

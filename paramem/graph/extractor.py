@@ -1,6 +1,7 @@
 """LLM-based knowledge graph extraction — generate once, parse once."""
 
 import contextlib
+import dataclasses
 import json
 import logging
 import time
@@ -8,24 +9,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.evaluation.recall import generate_answer
+from paramem.graph.cloud_egress import (
+    _DEFAULT_ANONYMIZER_MAX_TOKENS,
+    _DEFAULT_FILTER_MAX_TOKENS,
+    _DEFAULT_FILTER_TEMPERATURE,
+    _DEFAULT_FILTER_TIMEOUT_SECONDS,
+    AnonymizedPayload,
+    CloudScope,
+    _extract_json_block,
+    anonymize_for_cloud,
+    deanonymize_facts,
+    deanonymize_response_text,
+)
 from paramem.graph.entity_correction import correct_entity_surfaces
 from paramem.graph.name_match import canonical, is_speaker_id
-from paramem.graph.phase_trace import extraction_trace, phase_trace
+from paramem.graph.phase_trace import chain_stopped, extraction_trace, phase_trace
 from paramem.graph.placeholders import (
     _FACT_FIELDS,
-    PLACEHOLDER_TOKEN_RE,
-    _apply_bindings,
-    _build_anon_facts,
-    _build_anonymization_mapping,
-    _check_mapping_totality,
-    _contains_declared_token,
-    _declared_placeholder_tokens,
     _normalize_anonymization_mapping,
-    _resolution_map,
     _substitute_whole_words,
     braced,
-    deanonymize_text,
-    invert_forward_mapping,
     placeholder_entity_type,
 )
 from paramem.graph.prompts import _load_prompt
@@ -91,16 +94,12 @@ class ExtractionFailed(RuntimeError):
 # pressure must be mitigated upstream (STT/TTS eviction, gc.collect
 # before empty_cache, per-phase vram_scope wraps), not by truncating
 # correctness-bearing output.
-_DEFAULT_FILTER_MAX_TOKENS = 8192
-# Validator temperature: deterministic by default. Threaded all the way to the
-# provider call so Anthropic and OpenAI-compatible filters match exactly.
-_DEFAULT_FILTER_TEMPERATURE = 0.0
-# Per-call timeout for SOTA enrichment / plausibility. 30s was hit by Mistral 7B
-# resume content at max_tokens=8192 (response generation took >30s, ReadTimeout,
-# pipeline fell back to local-only and lost SOTA's contribution silently). 90s
-# matches CloudAgentConfig.timeout_seconds default. Operator can override via
-# the timeout_seconds parameter on the relevant call site.
-_DEFAULT_FILTER_TIMEOUT_SECONDS = 90.0
+# _DEFAULT_FILTER_MAX_TOKENS / _DEFAULT_FILTER_TEMPERATURE /
+# _DEFAULT_FILTER_TIMEOUT_SECONDS now live in paramem.graph.cloud_egress
+# (imported above) — the anonymizer's own default and this module's
+# SOTA-call defaults share the one source of truth; see that module's
+# docstring for why the constant lives there rather than here (avoiding
+# the extractor<->cloud_egress import cycle).
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +633,6 @@ def extract_graph(
     correction_entity_types: set[str] | frozenset[str] | None = None,
     system_prompt_filename: str = DEFAULT_SYSTEM_PROMPT_FILENAME,
     user_prompt_filename: str = DEFAULT_USER_PROMPT_FILENAME,
-    stop_phase: str | None = None,
     model_alias: str | None = None,
     seed: int | None = None,
     timestamp: str | None = None,
@@ -656,14 +654,15 @@ def extract_graph(
 
     All filters fail gracefully — extraction result is preserved on any failure.
 
-    ``stop_phase`` (calibration only): when set to a name from
-    :data:`paramem.graph.phase_trace.PHASE_NAMES`, the pipeline returns
-    immediately after that phase completes — saves compute when the
-    operator only needs to inspect the early phases of the trace.  Phases
-    that don't fire under the current configuration (e.g. ``anon_plausibility``
-    when ``plausibility_stage != "anon"``) cannot serve as stop points; the
-    pipeline continues until a firing phase matches.  Default ``None`` runs
-    the full pipeline (production behaviour unchanged).
+    A calibration caller may wrap this call in
+    :func:`paramem.graph.phase_trace.stop_at` to return immediately after
+    a named phase completes with a non-``"failed"`` outcome — saves
+    compute when the operator only needs to inspect the early phases of
+    the trace.  See :func:`~paramem.graph.phase_trace.stop_at`'s
+    docstring for the mechanism; this function checks
+    :func:`~paramem.graph.phase_trace.chain_stopped` after each phase
+    block and returns early when it is set.  No scope open (the
+    production default) means the full pipeline always runs.
 
     Args:
         temperature: Sampling temperature for extraction (default 0.0 for determinism).
@@ -724,22 +723,13 @@ def extract_graph(
             the Guard B gate for the document-only exact-full-name rewrite
             of third-person speaker mentions onto ``speaker_id``.
     """
-    # Validate stop_phase against the canonical whitelist before any
-    # work happens.  Catches typos early ("anonymise" vs "anonymize")
-    # rather than running the full pipeline and silently never matching.
-    if stop_phase is not None:
-        from paramem.graph.phase_trace import PHASE_NAMES as _PHASE_NAMES
-
-        if stop_phase not in _PHASE_NAMES:
-            raise ValueError(
-                f"stop_phase {stop_phase!r} is not a valid phase name. Valid: {list(_PHASE_NAMES)}"
-            )
-
     # Open the extraction trace.  phase_trace() calls reachable from
     # any helper in this scope append to the same trace via contextvar;
     # the trace survives every `graph = ...` rebinding inside.  At the
     # end (any return path), trace.attach_to(graph) materialises the
-    # records on the final graph's diagnostics.
+    # records on the final graph's diagnostics.  A calibration caller may
+    # additionally wrap this whole call in `with stop_at(phase):` (see
+    # that function's docstring) to request an early return.
     with extraction_trace() as trace:
         graph = SessionGraph(
             session_id=session_id,
@@ -769,7 +759,7 @@ def extract_graph(
                 source_type,
                 phase_name="local_extract",
             )
-            if stop_phase == "local_extract":
+            if chain_stopped():
                 return graph
 
             if not graph.relations:
@@ -821,7 +811,7 @@ def extract_graph(
                 # distinct same-(s,o) facts (e.g. born_in + lives_in).
                 graph.relations.extend(second_order_graph.relations)
                 graph.entities.extend(second_order_graph.entities)
-                if stop_phase == "second_order_extract":
+                if chain_stopped():
                     return graph
 
             # HA validation (pure-Python; no LLM call).
@@ -831,14 +821,16 @@ def extract_graph(
                     graph = _validate_with_ha_context(graph, ha_context)
                     after = _summarise_graph(graph)
                     t.set_parsed({"before": before, "after": after})
-                if stop_phase == "ha_validation":
+                if chain_stopped():
                     return graph
 
             # SOTA pipeline.  Each sub-phase (anonymize, entity_correction,
             # sota_enrich, anon_plausibility, deanon, deanon_plausibility)
             # records its own block via phase_trace from inside
-            # _sota_pipeline.  ``stop_phase`` is forwarded so
-            # _sota_pipeline can short-circuit at any sub-phase boundary.
+            # _sota_pipeline.  ``_sota_pipeline`` reads ``chain_stopped()``
+            # off the same contextvar this scope's (optional) ``stop_at``
+            # caller set, so it can short-circuit at any sub-phase boundary
+            # with no parameter threaded into it.
             # ``sota_enabled`` is the master gate; ``noise_filter`` is the
             # provider identity.  Both must be set for the SOTA pipeline.
             if validate and sota_enabled and noise_filter and graph.relations:
@@ -860,7 +852,6 @@ def extract_graph(
                     model_alias=model_alias,
                     max_tokens=max_tokens,
                     plausibility_max_tokens=plausibility_max_tokens,
-                    stop_phase=stop_phase,
                     seed=seed,
                 )
 
@@ -881,10 +872,10 @@ def extract_and_anonymize_for_cloud(
     speaker_name: str | None = None,
     prompts_dir: str | Path | None = None,
     scrub: set[str] | frozenset[str],
-) -> tuple[str, dict[str, str], dict[str, str]]:
+) -> AnonymizedPayload:
     """Local extract + local anonymize for cloud egress.
 
-    Composition over existing primitives — same anonymization sequence
+    Composition over existing primitives — same anonymization chain
     ``_sota_pipeline`` runs every consolidation cycle, minus the SOTA
     enrichment call:
 
@@ -896,35 +887,25 @@ def extract_and_anonymize_for_cloud(
        anonymization few-shot is calibrated on) into
        ``model_facing_transcript``.  Only the two LLM calls below see the
        turn-marked copy — the marker exists solely to keep the model
-       in-distribution while it authors the anonymized transcript (step
-       4). A bare sentence was observed to glue a possessive into a
-       single anonymization token (``"Pat's dog"`` minted as one
-       placeholder instead of splitting ``"Pat"`` + ``"dog"``) because it
-       is off-distribution from every few-shot example.
+       in-distribution while it authors the anonymized transcript. A bare
+       sentence was observed to glue a possessive into a single
+       anonymization token (``"Pat's dog"`` minted as one placeholder
+       instead of splitting ``"Pat"`` + ``"dog"``) because it is
+       off-distribution from every few-shot example.
     1. ``extract_graph(validate=False)`` — local extraction only,
        produces a SessionGraph the anonymizer can anchor on.
-    2. ``anonymize_with_local_model(graph, transcript=model_facing_transcript,
-       scrub=scrub)`` — the model is the SOLE scope authority: it
-       classifies which real values are in scope against ``scrub`` and
-       returns BOTH the ``real_name -> placeholder`` mapping AND its own
-       rewrite of the transcript with those values placeholdered
-       (``anonymized_transcript``).  Fail-closed: a parse failure or
-       a missing/empty ``anonymized_transcript`` yields ``mapping is
-       None``, and this helper never falls back to the original
-       real-name transcript on that signal.
-    3. ``_normalize_anonymization_mapping`` — canonicalize direction.
-    4. ``_build_anonymization_mapping`` — THE single table builder (the
-       same one both SOTA tiers use), assembled straight from the local
-       model's ``mapping`` (the SOLE scope decision) plus
-       ``speaker_name`` seeding — no code-side entity walk, no
-       completeness floor over the graph.  The returned TRANSCRIPT is the
-       model's own ``anonymized_transcript`` (step 2) — never mechanically
-       rebuilt from ``mapping`` — with the single synthetic ``[user] ``
-       marker (step 0) stripped back off, restoring the bare-text
-       contract this helper's one caller expects.  This helper
-       anonymizes a TRANSCRIPT for cloud egress — it never builds or
-       returns facts, so :func:`_build_anon_facts` (used by the two SOTA
-       tiers) does not apply here.
+    2. :func:`~paramem.graph.cloud_egress.anonymize_for_cloud` — THE one
+       anonymize chain, shared with every other cloud-egress path
+       (identical to what :func:`_sota_pipeline` and
+       :func:`~paramem.training.graph_enrich.run_graph_enrichment` call).
+       ``identity_domain`` is not passed —
+       this path has no closed node-key domain to reconcile against
+       (free-text chat, not a fold graph).
+
+    This helper anonymizes a TRANSCRIPT for cloud egress — it never
+    builds or returns facts (the returned ``AnonymizedPayload.anon_facts``
+    is always ``[]`` here, since ``graph.relations`` is discarded after
+    anchoring the anonymizer — see step 1).
 
     ``scrub`` is the operator's PII-vocabulary hint list
     (``SanitizationConfig.scrub``), rendered verbatim into the
@@ -933,9 +914,11 @@ def extract_and_anonymize_for_cloud(
     Required — an omitted ``scrub`` would silently anonymize against a
     hidden default on a security-critical egress path.  An EMPTY
     ``scrub`` is the meaningful operator opt-out: it short-circuits
-    before any LLM call, and the helper returns ``(transcript, {}, {})``
-    — the caller sends the original text to the cloud verbatim, sourced
-    from the passed-in transcript, never a model artifact.
+    before any LLM call (before even the local extraction pass — no
+    compute is wasted anchoring an anonymizer that will never run), and
+    the helper returns ``status="opted_out"`` with ``anon_transcript``
+    sourced from the passed-in ``transcript`` verbatim, never a model
+    artifact.
 
     ``speaker_id`` is the resolved speaker store ID, threaded to
     :func:`extract_graph` (which requires it) and stamped on the
@@ -945,47 +928,65 @@ def extract_and_anonymize_for_cloud(
     speaker pass ``None``; the helper falls back to the
     ``"cloud_egress"`` sentinel rather than failing extraction.
 
-    Return shapes:
+    ``AnonymizedPayload.status``:
 
-    * ``(anon_transcript, forward, reverse)`` — anonymization ran;
-      ``anon_transcript`` is the MODEL's own rewrite (see step 4 above);
-      ``forward`` and ``reverse`` come from
-      :func:`~paramem.graph.placeholders._build_anonymization_mapping`.
-      ``forward`` is ``{real → placeholder}``; ``reverse`` is the
-      one-to-one ``{placeholder: entity_name}`` map.  Caller
-      deanonymizes the cloud's response with
-      :func:`~paramem.graph.placeholders.deanonymize_text` using
-      ``reverse``.
-    * ``(transcript, {}, {})`` — operator opted out (``scrub=set()``).
-      This is the ONLY verbatim-forward return sourced from the raw
-      input transcript; it never fires for any other reason.
-    * ``(anon_transcript, mapping, reverse)`` with ``mapping == {}`` —
-      the anonymizer ran and classified NOTHING in scope against
-      ``scrub`` (a legitimate verdict, not a failure). Egress PROCEEDS:
-      ``mapping``/``reverse`` may still be non-empty if speaker-name
-      seeding populated them.
-    * ``("", {}, {})`` — block.  Every other early exit lands here:
+    * ``"ok"`` — anonymization ran; ``anon_transcript`` is the MODEL's
+      own rewrite (the single synthetic turn marker from step 0 stripped
+      back off, restoring the bare-text contract this helper's callers
+      expect).  ``forward``/``reverse`` may still be empty — a
+      legitimate "ran, found nothing in scope" verdict, not a failure;
+      egress PROCEEDS.
+    * ``"opted_out"`` — operator opted out (``scrub`` empty).
+    * ``"failed"`` — block.  Every other early exit lands here:
       empty/whitespace-only input, local extraction raising, zero
       relations extracted (``not graph.relations``), the anonymizer
-      raising or returning ``mapping is None`` (parse failure OR a
-      missing/empty ``anonymized_transcript``), or the model's
-      rewritten transcript coming back empty (``not anon_transcript``).
-      "The input had no in-scope content" (an empty ``mapping``) is NOT
-      one of these — only ``mapping is None`` and an empty
-      ``anon_transcript`` fail closed and block the cloud call.
+      raising, an anonymizer parse failure, or the model's rewritten
+      transcript coming back empty after the marker strip.  Callers must
+      NEVER fall back to the original real-name transcript on this
+      status.
 
-    The companion :func:`~paramem.graph.placeholders.deanonymize_text` is
-    a no-op on an empty reverse map, so callers can apply it
-    unconditionally.
+    The companion :func:`~paramem.graph.cloud_egress.deanonymize_response_text`
+    is the caller's exit gate for the cloud's response text.
     """
+    # ``failure`` left unset (``None``) on this sentinel: it belongs to
+    # ``anonymize_for_cloud``'s own "parse"/"guard" vocabulary (see
+    # :class:`~paramem.graph.cloud_egress.AnonymizedPayload`), and none of
+    # this helper's own early exits below (extraction exception, zero
+    # relations, anonymizer exception) are that call's parse/guard
+    # distinction — they're this helper's own failure modes, and no
+    # caller here branches on cause.
+    _failed = AnonymizedPayload(
+        status="failed",
+        forward={},
+        reverse={},
+        anon_transcript="",
+        anon_facts=[],
+        declared=frozenset(),
+        norm_stats={"inverted": 0, "dropped": 0},
+        rekey_dropped=0,
+        raw="",
+        failure=None,
+    )
     if not transcript or not transcript.strip():
-        return "", {}, {}
+        return _failed
 
     # Empty scrub = operator opt-out.  Skip the entire LLM-driven
-    # anonymization path and let the caller forward the transcript
-    # verbatim.  Distinguished from ``("", {}, {})`` block by non-empty text.
+    # anonymization path (and the local extraction pass that would only
+    # exist to anchor it) — the caller forwards the transcript verbatim.
+    # Distinguished from the "failed" block status by non-empty text.
     if not scrub:
-        return transcript, {}, {}
+        return AnonymizedPayload(
+            status="opted_out",
+            forward={},
+            reverse={},
+            anon_transcript=transcript,
+            anon_facts=[],
+            declared=frozenset(),
+            norm_stats={"inverted": 0, "dropped": 0},
+            rekey_dropped=0,
+            raw="",
+            failure=None,
+        )
 
     # The local_extract and anonymization few-shots (configs/prompts/
     # extraction.txt, configs/prompts/anonymization.txt) are calibrated
@@ -1038,56 +1039,44 @@ def extract_and_anonymize_for_cloud(
             )
         except Exception:
             logger.exception("Cloud egress: local extraction failed; treating as block")
-            return "", {}, {}
+            return _failed
 
         if not graph.relations:
-            return "", {}, {}
+            return _failed
 
         try:
-            mapping, model_anon_transcript, _raw = anonymize_with_local_model(
+            payload = anonymize_for_cloud(
                 graph,
                 model,
                 tokenizer,
                 transcript=model_facing_transcript,
                 scrub=scrub,
+                speaker_name=speaker_name,
                 prompts_dir=prompts_dir,
+                max_tokens=_DEFAULT_ANONYMIZER_MAX_TOKENS,
             )
         except Exception:
             logger.exception("Cloud egress: anonymization raised; treating as block")
-            return "", {}, {}
+            return _failed
 
-    if mapping is None:
-        return "", {}, {}
-
-    mapping, _norm_stats = _normalize_anonymization_mapping(mapping)
-
-    # THE single table builder — the same one both SOTA tiers use.  The
-    # model's (normalized) mapping is the SOLE scope decision; the
-    # builder only maintains the speaker-anchor invariants and seeds the
-    # runtime-known speaker name — no entity walk, no completeness floor.
-    mapping, reverse = _build_anonymization_mapping(mapping, speaker_name=speaker_name)
+    if payload.status == "failed":
+        return payload
 
     # The returned transcript is the MODEL's own rewrite — never
-    # mechanically rebuilt from ``mapping``.  Strip the single synthetic
+    # mechanically rebuilt from the mapping.  Strip the single synthetic
     # turn marker (step 0) back off so the bare-text contract this
-    # helper's one caller (conversational cloud-egress escalation) relies
-    # on is preserved; best-effort (the model is instructed to preserve
-    # everything outside the substitutions verbatim, including the
-    # marker, but a strip that finds nothing to strip is a no-op).
-    anon_transcript = model_anon_transcript
+    # helper's callers rely on is preserved; best-effort (the model is
+    # instructed to preserve everything outside the substitutions
+    # verbatim, including the marker, but a strip that finds nothing to
+    # strip is a no-op).
+    anon_transcript = payload.anon_transcript
     if _turn_marker_prefix and anon_transcript.startswith(_turn_marker_prefix):
         anon_transcript = anon_transcript[len(_turn_marker_prefix) :]
 
     if not anon_transcript:
-        return "", {}, {}
+        return _failed
 
-    # An EMPTY (but non-None) ``mapping`` means the anonymizer ran and
-    # found nothing in scope against ``scrub`` — a legitimate verdict,
-    # not a failure. Egress PROCEEDS with
-    # ``mapping``/``reverse`` as-is (both possibly ``{}``, unless speaker-
-    # name seeding populated them); only ``mapping is None`` (checked
-    # above) fails closed.
-    return anon_transcript, mapping, reverse
+    return dataclasses.replace(payload, anon_transcript=anon_transcript)
 
 
 def _generate_extraction(
@@ -1156,10 +1145,11 @@ def _generate_extraction(
 
     # vram_scope: main extraction generate is the longest prefill of the
     # extraction chain. Without an empty_cache between this phase and the
-    # downstream anonymization / plausibility / qa-gen prefills, the
-    # ``past_key_values`` from this generate stay pinned and compound into
-    # the next phase's allocation. Symmetric with the plausibility and
-    # qa-gen wraps elsewhere in the chain.
+    # downstream anonymization / entity_correction / plausibility prefills,
+    # the ``past_key_values`` from this generate stay pinned and compound
+    # into the next phase's allocation. Symmetric with the
+    # ``vram_scope("entity_correction")`` and ``vram_scope("plaus_filter")``
+    # wraps elsewhere in the chain.
     with vram_scope(vram_label):
         return generate_answer(
             model,
@@ -1404,197 +1394,9 @@ def _stamp_speaker_entity(
     return graph
 
 
-_JSON_ENVELOPE_KEYS = frozenset(
-    (
-        # Local extractor / SOTA enrichment / procedural envelopes
-        "facts",
-        "entities",
-        "relations",
-        "new_entity_bindings",
-        "summary",
-        # Anonymizer envelope — `{"mapping": {...}}`
-        "mapping",
-        # Plausibility drop-set envelope — `{"drop": [<idx>...]}` plus
-        # tolerated aliases the parser accepts.
-        "drop",
-        "drop_indices",
-        "indices",
-        # SOTA enrichment delta envelope — `{"add": [...], "modify": [...],
-        # "drop": [...], "bindings": {...}}`. ``drop`` is shared with
-        # plausibility above. ``bindings`` overlaps `new_entity_bindings`
-        # in role only — kept distinct because the new contract uses the
-        # shorter name.
-        "add",
-        "modify",
-        "bindings",
-        # Predicate-normalization envelope (normalize_predicates):
-        # single-stage output `{"clusters": [["predA", "predB"], ...]}`.
-        "clusters",
-    )
-)
-
-
-def _extract_json_block(text: str) -> str:
-    """Extract a JSON object/array envelope from model output.
-
-    Handles three real-world failure modes the model produces:
-
-    1. **Code-fenced output**: ``\\`\\`\\`json\\n{...}\\n\\`\\`\\``` — the
-       fence is stripped before scanning.
-    2. **Prose preamble with brace-quoted placeholder names**: SOTA
-       sometimes narrates "I'll introduce ``{Topic_1}`` for the degree
-       field" *before* emitting the JSON envelope.  The literal
-       ``{Topic_1}`` is not parseable JSON (unquoted key) — a naive
-       "first ``{``" parser would fail there and miss the real envelope
-       further down.
-    3. **Truncated outer envelope**: a model cut at ``max_tokens`` mid-
-       string emits a valid *inner* sub-object ``{"name": "x", ...}``
-       even though the outer envelope never closed.  Returning that
-       inner object would silently produce an empty graph downstream.
-
-    Algorithm: walk every ``{`` / ``[`` position in the text and try
-    ``raw_decode`` from each.  Accept the first candidate that yields
-    either a non-empty list, or a dict with at least one envelope key
-    (``facts`` / ``entities`` / ``relations`` / ``new_entity_bindings``
-    / ``summary``).  Inner sub-objects without envelope keys are
-    skipped so truncation surfaces as a parse failure rather than a
-    silently empty graph.  Preamble noise (``{Topic_1}``) is skipped
-    automatically because it raises ``JSONDecodeError`` immediately.
-
-    Error messages distinguish three fail modes:
-    a. ``saw_decode_success_no_envelope=True`` → JSON parsed but no
-       envelope keys → outer-envelope truncation if ``src`` does not end
-       on a closing brace/bracket, otherwise (response looks complete)
-       invalid JSON inside a string value — e.g. an unescaped control
-       character (illegal per RFC 8259) — is reported as the likely
-       cause instead.
-    b. ``last_exc is not None`` → some ``{`` / ``[`` candidates existed
-       but none parsed → likely all garbage / prose / corruption.
-    c. No candidates at all → no JSON in the response.
-    """
-    # Strip markdown code-fence wrappers if present.
-    src = text
-    for marker in ("```json", "```"):
-        if marker in src:
-            start = src.index(marker) + len(marker)
-            closing = src.find("```", start)
-            if closing != -1:
-                src = src[start:closing].strip()
-                break
-
-    decoder = json.JSONDecoder()
-    last_exc: json.JSONDecodeError | None = None
-    last_offset = -1
-    saw_decode_success_no_envelope = False
-    src_len = len(src)
-    pos = 0
-    while pos < src_len:
-        next_brace = src.find("{", pos)
-        next_bracket = src.find("[", pos)
-        if next_brace < 0 and next_bracket < 0:
-            break
-        if next_brace < 0:
-            candidate = next_bracket
-        elif next_bracket < 0:
-            candidate = next_brace
-        else:
-            candidate = min(next_brace, next_bracket)
-        last_offset = candidate
-        try:
-            value, end = decoder.raw_decode(src, candidate)
-        except json.JSONDecodeError as exc:
-            last_exc = exc
-            # Skip past the failing opener and keep looking.
-            pos = candidate + 1
-            continue
-        # raw_decode succeeded — check whether this is the envelope or
-        # narrative noise / a truncated inner sub-object.
-        # Acceptance rules — both designed to surface truncation rather
-        # than silently consume a sub-structure of a truncated envelope:
-        #   • dict: must carry an envelope key (entities / relations /
-        #     facts / new_entity_bindings / summary). Rejects naked
-        #     entity / relation dicts that survive a truncated outer
-        #     envelope.
-        #   • list: must be empty (plausibility's "all dropped" output)
-        #     OR have first element shaped like a fact (subject /
-        #     predicate / object key present). Rejects an entity list
-        #     that survives a truncated outer envelope — its elements
-        #     have ``name`` / ``entity_type``, not ``subject``.
-        if isinstance(value, dict):
-            # Empty dict is unambiguously "no items" (drop-set-style
-            # no-op delta), symmetric to the empty-list envelope below.
-            # A truncated outer envelope cannot produce `{}` because the
-            # model always emits at least one key before EOF or never
-            # closes the outer brace at all.
-            is_envelope = not value or bool(set(value.keys()) & _JSON_ENVELOPE_KEYS)
-        elif isinstance(value, list):
-            if not value:
-                is_envelope = True
-            else:
-                first = value[0]
-                if isinstance(first, dict):
-                    is_envelope = "subject" in first or "predicate" in first or "object" in first
-                elif isinstance(first, int) and not isinstance(first, bool):
-                    # Bare integer array — plausibility's tolerated drop-set
-                    # form (`[0, 2, 5]`).  Accepting any int-first list as
-                    # an envelope is safe: extractor / enrichment / anon
-                    # outputs that survive a truncated outer envelope have
-                    # dict-shaped first elements (entity / relation / fact),
-                    # not bare ints.
-                    is_envelope = True
-                else:
-                    is_envelope = False
-        else:
-            is_envelope = False
-        if is_envelope:
-            return src[candidate:end]
-        saw_decode_success_no_envelope = True
-        pos = end
-
-    if saw_decode_success_no_envelope:
-        # Some JSON parsed cleanly but none had envelope keys.  Two
-        # distinct root causes land here and must not be conflated:
-        # (a) the outer envelope was truncated at ``max_tokens`` and
-        # only inner sub-objects survived — ``src`` will not end on a
-        # closing brace/bracket; (b) the response was complete (``src``
-        # DOES end on a closing brace/bracket) but the outer envelope
-        # still failed ``raw_decode`` for another reason — e.g. an
-        # unescaped control character inside a string value (illegal
-        # per RFC 8259) — and only an inner sub-object parsed cleanly.
-        # Asserting truncation unconditionally misdiagnoses (b).
-        truncated_looking = not src.rstrip().endswith(("}", "]"))
-        if truncated_looking:
-            likely_cause = f"outer envelope truncated at max_tokens (response length {src_len})"
-        else:
-            likely_cause = (
-                "response looks complete (ends on a closing brace/bracket) but the "
-                "outer envelope still failed to parse — check for an unescaped "
-                "control character or other invalid JSON inside a string value"
-            )
-        last_error_note = (
-            f" Last parse error before the accepted candidate: {last_exc.msg} "
-            f"(offset {last_offset})."
-            if last_exc is not None
-            else ""
-        )
-        raise ValueError(
-            "Parsed JSON values found in model output but none have "
-            "envelope keys (entities/relations/facts/new_entity_bindings/"
-            f"summary; non-empty list also accepted). Likely cause: {likely_cause}."
-            f"{last_error_note} Bump extraction_max_tokens or reduce input chunk "
-            "size if truncated."
-        )
-    if last_exc is not None:
-        # Candidates existed but none parsed — could be prose-only output,
-        # severely malformed JSON, or a single oversized envelope that hit
-        # max_tokens before its first ``{`` even closed.
-        raise ValueError(
-            f"No parseable JSON in model output (last error at offset "
-            f"{last_offset}: {last_exc.msg}; response length {src_len}). "
-            f"Possible causes: max_tokens hit before envelope closed, "
-            f"or model emitted prose without a JSON envelope."
-        )
-    raise ValueError("No JSON found in model output")
+# _JSON_ENVELOPE_KEYS / _extract_json_block now live in
+# paramem.graph.cloud_egress (imported above) — every SOTA-response
+# parser in this module still routes through the one shared parser.
 
 
 # Fallbacks resolved per-call via schema_config.
@@ -1916,7 +1718,6 @@ def _sota_pipeline(
     model_alias: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     plausibility_max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
-    stop_phase: str | None = None,
     seed: int | None = None,
 ) -> SessionGraph:
     """Enrich extraction via local anonymization → SOTA enrichment → plausibility → de-anonymize.
@@ -1943,7 +1744,9 @@ def _sota_pipeline(
        original real-name transcript.
     1c. Local entity-surface correction (:func:`paramem.graph.entity_correction.
         correct_entity_surfaces`) — corrects misspelled real place/org/concept
-        surfaces in the reverse map only; forward map + transcript are untouched.
+        surfaces in the reverse map AND, when configured, ``graph.entities[*].
+        attributes`` values; forward map + transcript are untouched (see
+        ``entity_correction.py`` for the full two-locus contract).
     2. SOTA enrichment    → coreference resolution + compound splitting + symmetric dedup
     3a. Plausibility on anonymized data (plausibility_stage="anon", SOTA judge)
     3b. De-anonymize + preserve pre-sweep snapshot
@@ -1961,6 +1764,12 @@ def _sota_pipeline(
     - any SOTA provider name (e.g. "claude") → cloud judge at anon stage
     - "anthropic", "openai", "google", etc. → cloud judge at anon stage
       (must be combined with plausibility_stage="anon" to avoid PII exfiltration)
+
+    A calibration :func:`~paramem.graph.phase_trace.stop_at` request is
+    read off :func:`~paramem.graph.phase_trace.chain_stopped` — a
+    contextvar set by whichever caller (if any) opened a ``stop_at``
+    scope around this call, rather than a parameter threaded into this
+    function.
     """
     import os
 
@@ -1989,42 +1798,49 @@ def _sota_pipeline(
 
     _vram_snapshot(f"sota_pipeline_entry session={graph.session_id}")
     if not scrub:
-        # Operator opt-out: no anonymizer call; the transcript
-        # egresses verbatim, sourced from the passed-in transcript —
-        # never a model artifact.  Facts follow via the (empty-mapping,
-        # identity) ``_build_anon_facts`` call below.
-        mapping: dict[str, str] = {}
-        reverse_mapping: dict[str, str] = {}
-        anon_transcript = transcript
+        # Operator opt-out: no anonymizer call, no phase trace (mirrors
+        # the pre-unification structure exactly — including that a
+        # ``stop_at("anonymize")`` request does NOT short-circuit here,
+        # since there is nothing to stop after: the "anonymize" phase
+        # never fires, so ``chain_stopped()`` can never become true from
+        # it on this branch).  The transcript egresses verbatim, sourced
+        # from the passed-in transcript — never a model artifact.  Facts
+        # follow via the (empty-mapping, identity) ``_build_anon_facts``
+        # call below.
+        payload = anonymize_for_cloud(
+            graph, model, tokenizer, transcript=transcript, scrub=scrub, speaker_name=speaker_name
+        )
         graph.diagnostics["anonymize"] = "opted_out"
     else:
-        # Anonymization step.  The local model is the SOLE scope
-        # authority: it classifies real values against ``scrub``
+        # Anonymization step — THE one anonymize chain (A), shared with
+        # every other cloud-egress path.  The local model is the SOLE
+        # scope authority: it classifies real values against ``scrub``
         # and returns BOTH the real_name -> placeholder mapping AND its
         # own rewrite of the transcript with those values placeholdered.
         # Phase trace captures the raw model JSON so calibration can diff
         # prompt variants on the anonymizer in isolation.
         with phase_trace("anonymize") as t:
-            mapping, model_anon_transcript, anon_raw = anonymize_with_local_model(
+            payload = anonymize_for_cloud(
                 graph,
                 model,
                 tokenizer,
                 transcript=transcript,
                 scrub=scrub,
+                speaker_name=speaker_name,
                 max_tokens=max_tokens,
                 seed=seed,
                 prompts_dir=prompts_dir,
             )
-            t.set_raw(anon_raw)
+            t.set_raw(payload.raw)
             t.set_parsed(
                 {
-                    "mapping": dict(mapping) if mapping else {},
-                    "mapping_size": len(mapping) if mapping else 0,
-                    "parse_ok": mapping is not None,
-                    "anonymized_transcript_len": len(model_anon_transcript or ""),
+                    "mapping": dict(payload.forward),
+                    "mapping_size": len(payload.forward),
+                    "parse_ok": payload.status != "failed",
+                    "anonymized_transcript_len": len(payload.anon_transcript or ""),
                 }
             )
-            if mapping is None:
+            if payload.status == "failed":
                 t.set_outcome(
                     "failed",
                     reason="anonymization parse failed or missing/empty anonymized_transcript",
@@ -2032,7 +1848,7 @@ def _sota_pipeline(
             elif not graph.relations:
                 t.set_outcome("no_input", reason="graph has 0 relations")
         _vram_snapshot(f"after_anonymize session={graph.session_id}")
-        if mapping is None:
+        if payload.status == "failed":
             # Fail-closed: parse failure OR a missing/empty
             # anonymized_transcript.  Never fall back to raw plausibility
             # on the ORIGINAL real-name transcript — fall back to local
@@ -2052,41 +1868,38 @@ def _sota_pipeline(
                 plausibility_max_tokens=plausibility_max_tokens,
                 seed=seed,
             )
-        if stop_phase == "anonymize":
+        if chain_stopped():
             # Calibration short-circuit: anonymize completed; downstream
             # phases (sota_enrich, anon_plausibility, deanon, …) are skipped.  graph.relations
             # remains the local-extract output; the anonymize result lives in
             # graph.diagnostics["phases"][anonymize].parsed.
             return graph
-        # Canonicalize mapping direction before any downstream use.
-        mapping, norm_stats = _normalize_anonymization_mapping(mapping)
-        if norm_stats["dropped"]:
-            graph.diagnostics["mapping_ambiguous_dropped"] = norm_stats["dropped"]
+        # ``payload.norm_stats`` is the LIVE signal — reaches
+        # ``mapping_ambiguous_dropped`` unconditionally now (this is the
+        # only normalize call in the chain; see cloud_egress.py).
+        if payload.norm_stats["dropped"]:
+            graph.diagnostics["mapping_ambiguous_dropped"] = payload.norm_stats["dropped"]
 
-        # Single source of truth for real → placeholder.  The model's
-        # mapping is the SOLE scope decision (no second detector) —
-        # the builder only maintains the speaker-anchor invariants and
-        # seeds ``speaker_name`` so the runtime-known speaker is always
-        # covered.
-        mapping, reverse_mapping = _build_anonymization_mapping(
-            mapping,
-            speaker_name=speaker_name,
-        )
         # CORE-map diagnostic.  The CORE map is never otherwise
         # persisted — ``anonymize.parsed.mapping`` above is the LLM HINT map,
-        # recorded before this deterministic build runs, not CORE.  Keys and
-        # COUNTS only — never the real names: ``graph_snapshot.json`` (debug
-        # dumps under ``data/ha/debug/``) serializes ``graph.diagnostics``
-        # wholesale, and the placeholder keyset is non-identifying while the
-        # values are the PII.
+        # recorded before ``anonymize_for_cloud``'s table build runs, not
+        # CORE.  Keys and COUNTS only — never the real names:
+        # ``graph_snapshot.json`` (debug dumps under ``data/ha/debug/``)
+        # serializes ``graph.diagnostics`` wholesale, and the placeholder
+        # keyset is non-identifying while the values are the PII.
         graph.diagnostics["core_placeholders"] = {
-            "keys": sorted(reverse_mapping.keys()),
-            "count": len(reverse_mapping),
+            "keys": sorted(payload.reverse.keys()),
+            "count": len(payload.reverse),
         }
-        # The returned transcript is the MODEL's own rewrite — never
-        # mechanically rebuilt from ``mapping``.
-        anon_transcript = model_anon_transcript
         graph.diagnostics["anonymize"] = "ok"
+
+    # ``reverse_mapping`` / ``anon_transcript`` are the chain's outputs
+    # regardless of which branch above ran — THE speaker-value guard in
+    # ``_build_anonymization_mapping`` (paramem/graph/placeholders.py) now
+    # applies on every path by construction (payload.reverse is produced
+    # exclusively by that function inside ``anonymize_for_cloud``).
+    reverse_mapping = payload.reverse
+    anon_transcript = payload.anon_transcript
 
     # Phase — entity_correction.  Local model corrects misspelled real
     # place/organization/concept surfaces at two loci: the reverse map
@@ -2095,7 +1908,8 @@ def _sota_pipeline(
     # placeholders, are unaffected) and, when the "attributes" knob member
     # is set, graph.entities[*].attributes values in place (e.g.
     # current_location) — the same graph object this function returns, so
-    # the mutation reaches QA generation downstream. Correction is
+    # the mutation reaches keyed-entry assembly (indexed-key distillation)
+    # downstream. Correction is
     # independent of cloud enrichment and safely precedes the
     # fact-construction block below (placeholder keys are untouched). See
     # paramem.graph.entity_correction for the full contract.
@@ -2118,7 +1932,7 @@ def _sota_pipeline(
         t.set_parsed(
             {"applied_count": len(applied), "rejected_count": len(verdicts) - len(applied)}
         )
-    if stop_phase == "entity_correction":
+    if chain_stopped():
         # Calibration short-circuit: entity_correction completed; downstream
         # phases (sota_enrich, anon_plausibility, deanon, …) are skipped.  graph.relations
         # remains the local-extract output; the correction result lives in
@@ -2127,48 +1941,41 @@ def _sota_pipeline(
         # target) / phases[entity_correction].
         return graph
 
-    # Build the fact array from `graph.relations` using the now-complete
-    # mapping, via :func:`_build_anon_facts` (THE one construction, shared
-    # with `extract_and_anonymize_for_cloud` — not reimplemented).  Facts
-    # are never taken from the model's response — the model's job
-    # is the TRANSCRIPT (``anon_transcript``, already built above); the
-    # fact array is always deterministic.  A fact can therefore never be
-    # lost, reworded, or dropped by the anonymizer, and a placeholder
-    # cannot be glued into a predicate at this stage — the motivating bug
+    # The fact array — ``payload.anon_facts``, built inside
+    # ``anonymize_for_cloud`` (THE one construction, shared with the graph
+    # and chat-egress tiers — not reimplemented).  Facts are never taken
+    # from the model's response — the model's job is the TRANSCRIPT
+    # (``anon_transcript``, already built above); the fact array is
+    # always deterministic.  A fact can therefore never be lost, reworded,
+    # or dropped by the anonymizer, and a placeholder cannot be glued into
+    # a predicate at this stage — the motivating bug
     # (``language_proficiency_Language_3``) cannot occur here.  It can
     # still occur in SOTA's *returned* facts, which is why the
     # deanon-stage predicate invariant (:func:`_apply_bindings`) stays.
     # An orphan placeholder in a fact is likewise impossible: every
-    # placeholder a fact can carry comes from this same `mapping`.  With
-    # an empty ``mapping`` (opt-out), substitution is a no-op and facts
-    # egress verbatim.
-    anon_facts = _build_anon_facts(graph.relations, mapping)
+    # placeholder a fact can carry comes from this same forward map.
+    # Correct to reuse here even though ``entity_correction`` ran between
+    # this payload's construction and this line — correction mutates only
+    # the REVERSE map's values, never the forward map ``anon_facts`` was
+    # built from.  With an empty ``mapping`` (opt-out), substitution is a
+    # no-op and facts egress verbatim.
+    anon_facts = payload.anon_facts
 
     # Phase — sota_enrich.  Cloud (Anthropic by default) runs the
     # enrichment prompt; emits enriched facts + new_entity_bindings +
     # updated_anon_transcript.
     #
-    # ``observed`` = every placeholder token SOTA is actually shown — the
-    # rendered facts_json (subject/predicate/object; a placeholder in a
-    # predicate is still visible to SOTA) and the anonymized
-    # transcript.  This is CORE's legality domain for this SOTA cycle:
-    # only tokens SOTA actually saw may be treated as legitimately bound.
+    # ``observed`` (computed inside ``CloudScope.for_response`` below) =
+    # every placeholder token SOTA is actually shown — the rendered
+    # facts_json (subject/predicate/object; a placeholder in a predicate
+    # is still visible to SOTA) and the anonymized transcript.  This is
+    # CORE's legality domain for this SOTA cycle: only tokens SOTA
+    # actually saw may be treated as legitimately bound.
     with phase_trace("sota_enrich") as t:
         # :func:`_sota_facing_payload` is the SAME render
         # :func:`_filter_with_sota` uses for its prompt, so the two cannot
         # drift.
         _facts_text, _transcript_text = _sota_facing_payload(anon_facts, anon_transcript)
-        # Derive from the DECLARED vocabulary (the table we built) and the
-        # payload we actually rendered — a declared token is "observed" iff
-        # it literally occurs in that payload.  Substring membership, no
-        # regex: a shape scrape reads whatever token surface the text
-        # happens to carry, which is not necessarily the surface the table
-        # declares, and any divergence between the two silently scopes CORE
-        # to nothing (every token reads as an orphan → every delta
-        # rejected → SOTA enrichment dead, while the cycle still "succeeds"
-        # on local facts).
-        _declared = _declared_placeholder_tokens(reverse_mapping)
-        observed = {tok for tok in _declared if tok in _facts_text or tok in _transcript_text}
         # Send anon facts and transcript to SOTA as the SCRIPT built them
         # (the anonymizer LLM returns the mapping and its own anonymized
         # transcript, but it never produces facts). The SOTA prompt's convention
@@ -2224,30 +2031,35 @@ def _sota_pipeline(
                 "sota_enrich",
                 "cloud enrichment call failed or response unparseable",
             )
-        # Binding-totality gate.  Compute the verdict against the SAME
-        # ``observed``-scoped legality domain :func:`_apply_bindings`
-        # will substitute with at deanon — a non-empty verdict means an
-        # orphan mint or a CORE/SOTA conflict, and the delta is REJECTED
-        # AS A WHOLE (not partially applied) so a bad mint can never
-        # shed the local facts its ``drop`` action replaced.
-        verdict = _check_mapping_totality(
-            graph,
-            enriched_anon,
-            reverse_mapping,
-            sota_bindings=sota_bindings,
-            observed=observed,
-            diagnostic_key="sota_pending_orphans",
-            stage="sota_enrichment",
+        # Binding-totality gate — the ONE anonymize/deanonymize round-trip
+        # scope for this response.  ``CloudScope.for_response`` computes
+        # ``observed`` from the DECLARED vocabulary and the rendered
+        # payload (never a shape scrape — see its docstring); a non-empty
+        # verdict means an orphan mint or a CORE/SOTA conflict, and the
+        # delta is REJECTED AS A WHOLE (not partially applied) so a bad
+        # mint can never shed the local facts its ``drop`` action
+        # replaced.  ``deanonymize_facts`` runs the gate unconditionally
+        # as step 1 — it cannot be skipped from this call site.  This
+        # call's ``.facts`` is intentionally NOT the final substituted
+        # output: the anon-stage plausibility filter below may still
+        # shrink ``enriched_anon`` before the "deanon" phase performs the
+        # actual substitution (mirroring the pre-unification two-call
+        # structure — check here, substitute later, exactly as
+        # ``_check_mapping_totality`` then ``_apply_bindings`` used to be
+        # two separate call sites).
+        scope = CloudScope.for_response(
+            payload, sota_bindings=sota_bindings, sent=(_facts_text, _transcript_text)
         )
-        if verdict:
+        gate = deanonymize_facts(scope, enriched_anon, graph)
+        if gate.verdict:
             discarded_count = len(enriched_anon)
             retained_count = len(anon_facts)
             logger.error(
                 "SOTA enrichment binding-totality breach: %d offending token(s) %s — "
                 "rejecting the whole delta (%d enriched fact(s) discarded), falling "
                 "back to %d local-extract fact(s).",
-                len(verdict),
-                verdict[:5],
+                len(gate.verdict),
+                gate.verdict[:5],
                 discarded_count,
                 retained_count,
             )
@@ -2259,8 +2071,8 @@ def _sota_pipeline(
             enriched_anon = anon_facts
             sota_bindings = {}
             updated_anon_transcript = None
-            graph.diagnostics["sota_enrichment_rejected"] = verdict
-            t.set_outcome("rejected", reason=f"binding-totality breach: {verdict[:5]}")
+            graph.diagnostics["sota_enrichment_rejected"] = gate.verdict
+            t.set_outcome("rejected", reason=f"binding-totality breach: {gate.verdict[:5]}")
             t.set_parsed(
                 {
                     "input_count": len(anon_facts),
@@ -2268,9 +2080,14 @@ def _sota_pipeline(
                     "new_bindings_count": 0,
                     "new_bindings": {},
                     "updated_anon_transcript_len": 0,
-                    "observed_count": len(observed),
-                    "mapped_count": len(_resolution_map(reverse_mapping, {}, observed)),
+                    "observed_count": len(scope.observed),
+                    "mapped_count": len(scope.core_resolution),
                 }
+            )
+            # The scope for the "deanon" phase below must reflect the
+            # reset ``sota_bindings`` — never apply a rejected mint.
+            scope = CloudScope.for_response(
+                payload, sota_bindings={}, sent=(_facts_text, _transcript_text)
             )
         else:
             t.set_parsed(
@@ -2280,13 +2097,13 @@ def _sota_pipeline(
                     "new_bindings_count": len(sota_bindings or {}),
                     "new_bindings": dict(sota_bindings) if sota_bindings else {},
                     "updated_anon_transcript_len": len(updated_anon_transcript or ""),
-                    "observed_count": len(observed),
-                    "mapped_count": len(_resolution_map(reverse_mapping, sota_bindings, observed)),
+                    "observed_count": len(scope.observed),
+                    "mapped_count": len(scope.resolution),
                 }
             )
             if not enriched_anon:
                 logger.info("SOTA enrichment removed all relations")
-    if stop_phase == "sota_enrich":
+    if chain_stopped():
         # Calibration short-circuit: SOTA enrichment block recorded,
         # downstream (anon_plausibility, deanon, deanon_plausibility) skipped.
         # graph.relations stays at the local-extract output; enrichment result
@@ -2365,7 +2182,7 @@ def _sota_pipeline(
                         }
                     )
                     logger.warning("Anon-stage plausibility call failed — keeping enriched facts")
-        if stop_phase == "anon_plausibility":
+        if chain_stopped():
             # Calibration short-circuit after the optional anon-stage judge.
             return graph
 
@@ -2396,23 +2213,24 @@ def _sota_pipeline(
     # (those with residual unresolved placeholders) land in parsed for
     # calibration inspection.
     #
-    # No totality check here — the ``sota_enrich`` phase's binding-totality
-    # check above is the ONLY one, since it can ACT (reject the delta)
-    # where a check at this site could only detect and log.  Anon_facts
-    # built at the anonymize step are constructed directly from
-    # ``graph.relations`` and this ``mapping``, so an orphan
-    # placeholder in a LOCAL fact is structurally impossible, not merely
-    # checked-and-diagnosed.  The only remaining source of an unresolved
-    # placeholder here is SOTA's *returned* delta.  ``observed`` is the
-    # SAME set computed in the ``sota_enrich`` phase above — exactly what
-    # SOTA was shown for THIS ``enriched_anon`` (guaranteed superset, since
-    # the rejection-path fallback reuses the same ``anon_facts`` that
-    # ``observed`` was computed from).
+    # This is the SUBSTITUTION half of the two-call structure — the
+    # ``sota_enrich`` phase's ``deanonymize_facts`` call above was the
+    # GATE (accept/reject decision, run before any plausibility filter
+    # could shrink ``enriched_anon``); this call substitutes whatever
+    # ``enriched_anon`` survived to this point (post accept/reject AND
+    # post anon-stage plausibility, if it ran).  Re-running the
+    # unconditional totality gate here is a structurally guaranteed
+    # no-op on an already-accepted (and possibly further-filtered, never
+    # further-expanded) subset — dropping facts can only shrink the
+    # placeholder surface, never introduce a new orphan — it is not a
+    # second privacy gap; it exists only because ``deanonymize_facts`` is
+    # the ONE way to reach ``_apply_bindings`` (the structural guard).
     with phase_trace("deanon") as t:
         deanon_input_count = len(enriched_anon)
-        deanon_facts, predicate_dropped, residual_dropped = _apply_bindings(
-            enriched_anon, reverse_mapping, sota_bindings, observed
-        )
+        deanon_result = deanonymize_facts(scope, enriched_anon, graph)
+        deanon_facts = deanon_result.facts
+        predicate_dropped = deanon_result.predicate_dropped
+        residual_dropped = deanon_result.residual_dropped
         # predicate_dropped: facts SOTA returned with a placeholder glued
         # into the predicate field (_apply_bindings' step 1, pre-
         # substitution).  residual_dropped: facts still carrying an
@@ -2456,7 +2274,7 @@ def _sota_pipeline(
                 "dropped_facts": dropped_facts,
             }
         )
-    if stop_phase == "deanon":
+    if chain_stopped():
         # Calibration short-circuit: deanon recorded.  graph.relations
         # remains the local-extract output; deanonymized facts list is
         # in phases[deanon].parsed.
@@ -2468,8 +2286,9 @@ def _sota_pipeline(
     # identifiers that flow through to plausibility and downstream filters
     # without modification.  Routing them to attributes mirrors the
     # email/phone/linkedin path the local extractor already populates and
-    # which the QA generator's _flatten_entity_attributes mints into keyed
-    # pairs.  The projection is applied after the entity rebuild step below
+    # which ``relation_prep._flatten_entity_attributes`` mints into keyed
+    # pairs for indexed-key distillation.  The projection is applied after
+    # the entity rebuild step below
     # so the subject entity survives pruning.
     scalar_facts, deanon_facts = _partition_scalar_facts(deanon_facts, graph.entities)
     if scalar_facts:
@@ -2543,7 +2362,7 @@ def _sota_pipeline(
                     }
                 )
                 logger.warning("Deanon-stage plausibility call failed — keeping deanon facts")
-        if stop_phase == "deanon_plausibility":
+        if chain_stopped():
             # Calibration short-circuit: skip the kept_relations rebuild.
             # graph.relations stays at the local-extract output; the
             # plausibility-filtered deanon facts are in phases[deanon_plausibility].
@@ -2617,13 +2436,12 @@ def _sota_pipeline(
     # ``name`` here is a de-anonymized real name (a ``kept_relations``
     # subject/object), so it must be looked up in the INVERTED resolution
     # map (real name -> placeholder) — ``reverse_mapping`` itself is keyed
-    # by placeholder and would never match. The resolution map is the
-    # SAME one :func:`_apply_bindings` just substituted with
-    # (``reverse_mapping`` + ``sota_bindings``, scoped to ``observed``),
-    # so inverting it preserves CORE-LAST precedence with no new
-    # tie-break rule: a real name that collides across a core and a SOTA
-    # entry resolves to whichever placeholder the resolution map itself
-    # holds for that key.
+    # by placeholder and would never match. ``scope.resolution`` is the
+    # SAME map :func:`deanonymize_facts` just substituted with, so
+    # inverting it preserves CORE-LAST precedence with no new tie-break
+    # rule: a real name that collides across a core and a SOTA entry
+    # resolves to whichever placeholder the resolution map itself holds
+    # for that key.
     kept_names = (
         {r.subject for r in kept_relations}
         | {r.object for r in kept_relations}
@@ -2631,10 +2449,7 @@ def _sota_pipeline(
     )
     existing_names = {e.name for e in graph.entities}
     graph.entities = [e for e in graph.entities if e.name in kept_names]
-    name_to_placeholder = {
-        real: token
-        for token, real in _resolution_map(reverse_mapping, sota_bindings, observed).items()
-    }
+    name_to_placeholder = {real: token for token, real in scope.resolution.items()}
     for name in kept_names - existing_names:
         entity_type = "concept"
         placeholder = name_to_placeholder.get(name)
@@ -2662,9 +2477,10 @@ def _is_scalar_value(value: str) -> bool:
     """True iff ``value`` is a verbatim identifier rather than a content phrase.
 
     Scalars belong on ``Entity.attributes`` (alongside email/phone/linkedin
-    extracted by the local extractor), where the QA generator's
-    :func:`_flatten_entity_attributes` mints keyed pairs without additional
-    filtering.  Routing them through plausibility as relations is wrong: a
+    extracted by the local extractor), where
+    :func:`~paramem.graph.relation_prep._flatten_entity_attributes` mints
+    keyed pairs for indexed-key distillation without additional filtering.
+    Routing them through plausibility as relations is wrong: a
     plausibility judge may reject values whose alpha portion lives
     concatenated with digits in the source transcript
     (``username1234``, ``ROS2``, ``H100``), even though the scalar is
@@ -2771,10 +2587,11 @@ def _project_scalar_facts_to_attributes(graph: SessionGraph, scalar_facts: list[
     Mutates ``graph.entities`` in place: ensures every scalar-fact subject
     has an ``Entity`` record (creating one with type ``"concept"`` when
     missing), then sets ``entity.attributes[<key>] = object``.  ``<key>``
-    is the relation predicate with a leading ``has_`` stripped so the QA
-    generator's :func:`_flatten_entity_attributes` (which re-prefixes
-    attribute keys with ``has_`` when minting projected relations) does
-    not produce ``has_has_<key>``.
+    is the relation predicate with a leading ``has_`` stripped so
+    :func:`~paramem.graph.relation_prep._flatten_entity_attributes` (which
+    re-prefixes attribute keys with ``has_`` when minting projected
+    relations for indexed-key distillation) does not produce
+    ``has_has_<key>``.
     """
     if not scalar_facts:
         return
@@ -2794,179 +2611,11 @@ def _project_scalar_facts_to_attributes(graph: SessionGraph, scalar_facts: list[
         ent.attributes[attr_key] = obj
 
 
-_DEFAULT_ANONYMIZER_MAX_TOKENS = 2048
-_DEFAULT_ANONYMIZER_TEMPERATURE = 0.0
-
-
-def load_anonymization_prompt(
-    prompts_dir: str | Path | None = None,
-    filename: str = "anonymization.txt",
-) -> str:
-    """Single source of truth for the anonymization prompt.
-
-    Both the local-model and cloud-extractor anonymization paths read through
-    this helper so a `configs/prompts/anonymization.txt` override applies to
-    both — no silent divergence.
-
-    ``prompts_dir`` overrides the search directory (forwarded to
-    :func:`_load_prompt`); ``filename`` overrides the template name so a
-    calibration operator can point at an alternate prompt file.  Both default
-    to the production values, so production callers are unaffected.
-
-    The prompt this function loads is external config — edit
-    ``configs/prompts/anonymization.txt`` to tune; no code changes are
-    needed.
-    """
-    return _load_prompt(filename, prompts_dir=prompts_dir, required=True)
-
-
-def anonymize_with_local_model(
-    graph: SessionGraph,
-    model,
-    tokenizer,
-    *,
-    scrub: set[str] | frozenset[str],
-    transcript: str = "",
-    max_tokens: int = _DEFAULT_ANONYMIZER_MAX_TOKENS,
-    temperature: float = _DEFAULT_ANONYMIZER_TEMPERATURE,
-    seed: int | None = None,
-    prompts_dir: str | Path | None = None,
-    prompt_filename: str = "anonymization.txt",
-) -> tuple[dict | None, str, str]:
-    """Identify the ``real_name -> placeholder`` mapping AND the
-    model-authored anonymized transcript using the local model.
-
-    Returns ``(mapping, anonymized_transcript, raw_output)``.  The model
-    is shown ``graph.relations`` (rendered as facts), ``transcript``, and
-    ``scrub`` (the operator's PII-vocabulary hints, rendered into the
-    prompt's ``{scrub_categories}`` slot) and is the SOLE scope authority
-    (no code-side entity-type gate): it decides which real values —
-    names AND structured values (phone, email, …), regardless of owning
-    entity type — are in scope, and returns BOTH the mapping AND its own
-    rewrite of ``transcript`` with those values placeholdered
-    (``anonymized_transcript``).  The SCRIPT still builds the anonymized
-    FACT array deterministically from ``graph.relations`` and ``mapping``
-    (see :func:`_sota_pipeline` / :func:`extract_and_anonymize_for_cloud`)
-    — facts are never taken from the model's response — so a fact can
-    never be lost, reworded, or dropped by the anonymizer, and a
-    placeholder can never be glued into a predicate at this stage.
-
-    ``mapping`` is ``None`` — the fail-closed signal — on PARSE
-    FAILURE (the response was not a well-formed ``{"mapping": {...},
-    "anonymized_transcript": [...]}`` envelope) OR when
-    ``anonymized_transcript`` is missing/empty/whitespace-only.  Callers
-    MUST never fall back to the original real-name transcript on this
-    signal.  ``mapping`` is ``{}`` (with a non-empty
-    ``anonymized_transcript``) when the model found nothing in scope to
-    anonymize — a legitimate empty result, distinguishable from
-    fail-closed.
-
-    ``anonymized_transcript`` in the model's response is a JSON array of
-    turn strings (one element per turn) per the ``configs/prompts/
-    anonymization.txt`` contract — this keeps every turn on its own line
-    so a multi-turn rewrite can never contain a literal newline inside a
-    JSON string value (illegal per RFC 8259, the root cause of an
-    observed multi-turn parse failure).  The array is joined with
-    ``"\\n"`` back into a single transcript string before being returned.
-    A plain ``str`` value is also still accepted and returned unchanged,
-    since the model may emit the pre-contract shape; either way an empty
-    result, a non-list/non-str value, or a list containing a non-``str``
-    element is fail-closed.
-
-    The raw model output is the third element so the calibration phase
-    trace can record it without re-running the call.  ``anonymized_transcript``
-    is ``""`` whenever ``mapping`` is ``None`` (the two fail-closed
-    together).
-
-    ``scrub`` is required — no implicit default.  An omitting caller would
-    silently anonymize against a hidden default on a security-critical
-    egress path; the single declared default is
-    ``SanitizationConfig.scrub`` (``paramem/server/config.py``), which
-    every caller of this function threads down explicitly.
-
-    ``seed`` is forwarded verbatim to :func:`generate_answer`.  At the
-    default ``temperature=0.0`` (greedy decoding) it is a strict no-op.
-
-    ``prompts_dir`` and ``prompt_filename`` are forwarded to
-    :func:`load_anonymization_prompt` so a calibration override actually
-    reaches the model; both default to the production template.
-    """
-    facts = [
-        {
-            "subject": r.subject,
-            "predicate": r.predicate,
-            "object": r.object,
-            "relation_type": r.relation_type,
-            "confidence": r.confidence,
-        }
-        for r in graph.relations
-    ]
-
-    anon_prompt = load_anonymization_prompt(prompts_dir=prompts_dir, filename=prompt_filename)
-    anon_system = _load_prompt("anonymization_system.txt", prompts_dir=prompts_dir, required=True)
-    # Sorted so prompt rendering is deterministic regardless of the
-    # iteration order of the ``scrub`` set/frozenset the caller passed
-    # (Python set order is not stable across processes) — load-bearing at
-    # temperature=0.0, which is otherwise a strict determinism contract.
-    prompt = anon_prompt.format(
-        scrub_categories=", ".join(sorted(scrub)),
-        facts_json=json.dumps(facts, indent=2),
-        transcript=transcript or "(no transcript provided)",
-    )
-    messages = [
-        {"role": "system", "content": anon_system},
-        {"role": "user", "content": prompt},
-    ]
-    formatted = tokenizer.apply_chat_template(
-        adapt_messages(messages, tokenizer),
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    # vram_scope: anonymization is the second-largest local generate after
-    # main extraction and immediately precedes the plausibility filter.
-    # Empty cache between this and the next phase so the filter's prefill
-    # does not stack on top of anonymization's KV cache. Symmetric with
-    # the other wraps.
-    with vram_scope("anonymize"):
-        raw = generate_answer(
-            model,
-            tokenizer,
-            formatted,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            seed=seed,
-        )
-    logger.debug("Anonymization raw: %s", raw[:500])
-
-    try:
-        json_str = _extract_json_block(raw)
-        data = json.loads(json_str)
-        if not isinstance(data, dict) or "mapping" not in data:
-            logger.warning("Anonymization returned unexpected format")
-            return None, "", raw
-        anon_transcript = data.get("anonymized_transcript")
-        if isinstance(anon_transcript, list):
-            # Contract shape: one turn string per element (see
-            # configs/prompts/anonymization.txt) — join back into a
-            # single transcript.  Any non-str element makes the whole
-            # response untrustworthy, not just that element.
-            if not anon_transcript or not all(isinstance(t, str) for t in anon_transcript):
-                logger.warning("Anonymization returned a malformed anonymized_transcript array")
-                return None, "", raw
-            anon_transcript = "\n".join(anon_transcript)
-        if not isinstance(anon_transcript, str) or not anon_transcript.strip():
-            # Fail-closed: a mapping with no accompanying transcript
-            # rewrite is not a safe egress artifact — never fall back to
-            # the original real-name transcript.
-            logger.warning("Anonymization returned missing/empty anonymized_transcript")
-            return None, "", raw
-        normalized, _ = _normalize_anonymization_mapping(data["mapping"])
-        return normalized, anon_transcript, raw
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.warning("Anonymization parse failed: %s", e)
-        return None, "", raw
-
+# load_anonymization_prompt / anonymize_with_local_model now live in
+# paramem.graph.cloud_egress (imported above) — the local-model
+# anonymizer call is reached exclusively through
+# cloud_egress.anonymize_for_cloud; nothing in this module calls it
+# directly any more.
 
 # Public provider metadata — single source of truth, reused by the
 # production server so callers dispatch by provider consistently with
@@ -3012,8 +2661,21 @@ def _resolve_sota_api_key(provider: str) -> str | None:
     return os.environ.get(key_env_name) or None
 
 
-_SOTA_ENRICHMENT_SYSTEM_PROMPT = _load_prompt("sota_enrichment_system.txt", required=True)
-_SOTA_PLAUSIBILITY_SYSTEM_PROMPT = _load_prompt("sota_plausibility_system.txt", required=True)
+# The three SOTA system prompts below (``sota_enrichment_system.txt``,
+# ``sota_plausibility_system.txt``, ``sota_graph_enrichment_system.txt``)
+# are loaded at CALL TIME inside each consuming function (``_filter_with_sota``,
+# ``_graph_enrich_with_sota``, ``_plausibility_filter_with_sota``,
+# ``local_plausibility_filter``) — never as module-level constants.  A
+# module-level ``_load_prompt(...)`` call runs at import time, before any
+# :func:`~paramem.graph.phase_trace.extraction_trace`/``phase_trace`` scope
+# can exist and before :func:`~paramem.graph.prompts.prompt_overrides` can
+# be active, so it is permanently unreachable by both prompt provenance and
+# calibration overrides.  ``_filter_anthropic`` / ``_filter_openai_compat`` /
+# ``_sota_call`` still default their own ``system_prompt`` parameter to the
+# enrichment prompt for callers that omit it (resolved lazily, in the body,
+# never as a default-expression — a default expression is itself evaluated
+# at function-definition time, i.e. import time, so it has the exact same
+# unreachability problem as a module-level constant).
 
 
 # _DEFAULT_FILTER_MAX_TOKENS / _DEFAULT_FILTER_TEMPERATURE /
@@ -3025,7 +2687,7 @@ def _filter_anthropic(
     prompt: str,
     api_key: str,
     filter_model: str,
-    system_prompt: str = _SOTA_ENRICHMENT_SYSTEM_PROMPT,
+    system_prompt: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
@@ -3042,7 +2704,16 @@ def _filter_anthropic(
     ``params_effective.seed=null`` for SOTA stages so the operator knows
     it was dropped.  Both default to ``None`` — production paths
     preserve current temperature-only sampling behaviour.
+
+    ``system_prompt`` defaults to ``None``, resolved here (never as a
+    default-expression, which would evaluate at import time) to the
+    ``sota_enrichment.txt`` system prompt — production callers
+    (:func:`_sota_call`, forwarded from :func:`_filter_with_sota`) always
+    pass their own resolved prompt explicitly; the fallback here only
+    serves a direct caller (e.g. a test) that omits it.
     """
+    if system_prompt is None:
+        system_prompt = _load_prompt("sota_enrichment_system.txt", required=True)
     try:
         import anthropic
     except ImportError:
@@ -3079,11 +2750,21 @@ def _filter_openai_compat(
     filter_model: str,
     provider: str,
     endpoint: str | None = None,
-    system_prompt: str = _SOTA_ENRICHMENT_SYSTEM_PROMPT,
+    system_prompt: str | None = None,
     max_tokens: int = _DEFAULT_FILTER_MAX_TOKENS,
     temperature: float = _DEFAULT_FILTER_TEMPERATURE,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
 ) -> str | None:
+    """Call an OpenAI-compatible chat-completions endpoint; return raw
+    text or ``None`` on transport / SDK failure.
+
+    ``system_prompt`` defaults to ``None``, resolved here (never as a
+    default-expression, which would evaluate at import time) to the
+    ``sota_enrichment.txt`` system prompt — see :func:`_filter_anthropic`
+    for why.
+    """
+    if system_prompt is None:
+        system_prompt = _load_prompt("sota_enrichment_system.txt", required=True)
     try:
         import httpx
     except ImportError:
@@ -3134,10 +2815,19 @@ def _sota_call(
     endpoint: str | None,
     max_tokens: int,
     temperature: float,
-    system_prompt: str = _SOTA_ENRICHMENT_SYSTEM_PROMPT,
+    system_prompt: str | None = None,
     timeout_seconds: float = _DEFAULT_FILTER_TIMEOUT_SECONDS,
 ) -> str | None:
-    """Generic SOTA dispatch (anthropic native or any OpenAI-compatible host)."""
+    """Generic SOTA dispatch (anthropic native or any OpenAI-compatible host).
+
+    ``system_prompt`` defaults to ``None`` and is forwarded as-is to
+    ``_filter_anthropic``/``_filter_openai_compat`` — each resolves its own
+    ``None`` there (never here as a default-expression, which would
+    evaluate at import time); production callers
+    (:func:`_filter_with_sota`, :func:`_graph_enrich_with_sota`,
+    :func:`_plausibility_filter_with_sota`) always pass their own resolved
+    prompt explicitly.
+    """
     if provider == "anthropic":
         return _filter_anthropic(
             prompt,
@@ -3322,6 +3012,7 @@ def _filter_with_sota(
     :func:`local_plausibility_filter`.
     """
     enrichment_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
+    system_prompt = _load_prompt("sota_enrichment_system.txt", required=True)
     facts_json, transcript_text = _sota_facing_payload(anon_facts, anon_transcript)
     prompt = enrichment_prompt.format(facts_json=facts_json, transcript=transcript_text)
     raw = _sota_call(
@@ -3332,7 +3023,7 @@ def _filter_with_sota(
         endpoint,
         max_tokens,
         temperature,
-        system_prompt=_SOTA_ENRICHMENT_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         timeout_seconds=timeout_seconds,
     )
     if raw is None:
@@ -3357,14 +3048,11 @@ def _filter_with_sota(
 # Graph-level SOTA enrichment (Task #10)
 # ---------------------------------------------------------------------------
 
-_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT = _load_prompt(
-    "sota_graph_enrichment_system.txt", required=True
-)
-
 
 def _graph_enrich_with_sota(
     triples: list[dict],
-    mapping: dict[str, str],
+    payload: AnonymizedPayload,
+    graph: SessionGraph,
     api_key: str,
     provider: str = "anthropic",
     filter_model: str = "claude-sonnet-4-6",
@@ -3381,45 +3069,71 @@ def _graph_enrich_with_sota(
     - ``same_as`` pairs identifying duplicate nodes under different surface forms.
 
     Runs the SAME anonymize -> SOTA -> de-anonymize contract as the
-    session-tier :func:`_sota_pipeline`, via the SAME primitives in
-    :mod:`paramem.graph.placeholders` — this is the second call site of
-    that contract. ``mapping`` is the CORE real-name -> placeholder
-    forward table — the anonymizer model's own ``scrub``-scoped decision
-    (no second detector), already reconciled onto this chunk's node
-    keys by the caller — passed straight through, never re-derived
-    or re-walked here. ``reverse_mapping`` is its inversion. ``subject``,
-    ``object``, AND ``speaker_id`` fields of every triple are substituted
-    through ``mapping`` before the prompt is built, so no real value the
-    model classified in scope reaches the payload handed to
-    :func:`_sota_call`. Scoping is entirely the model's decision, made at
-    the caller's ``anonymize_with_local_model(scrub=...)`` call (see
-    :meth:`~paramem.training.consolidation.ConsolidationLoop.
-    _run_graph_enrichment`) — this function applies no gate of its own.
+    session-tier :func:`_sota_pipeline`, via the SAME chain in
+    :mod:`paramem.graph.cloud_egress` — this is the second call site of
+    that contract. ``payload`` is (A)'s output for this chunk — the
+    caller (:func:`~paramem.training.graph_enrich.run_graph_enrichment`)
+    already ran
+    :func:`~paramem.graph.cloud_egress.anonymize_for_cloud` (with
+    ``identity_domain`` reconciliation and the domain-scoped fail-closed
+    guard) before calling this function; this function applies no scope
+    gate of its own — it only substitutes and de-anonymizes.
 
-    The production caller derives ``mapping`` from a per-chunk local-model
-    anonymization pass (the fold graph carries no reliable entity types of
-    its own — see that method's docstring), whose prompt instructs the
-    model to leave ``speaker{N}`` ids verbatim and never mint a placeholder
-    for one. A speaker anchor therefore never appears as a ``mapping`` key
-    in practice: it reaches the SOTA payload bare by design, with no
-    mint/restore round trip needed.
+    ``payload.reverse`` is produced exclusively by
+    :func:`~paramem.graph.placeholders._build_anonymization_mapping`
+    inside (A) — the speaker-value guard applies here by construction; no
+    code path in this function inverts an unfiltered forward map.
+
+    The chunk's anonymized ``subject``/``object`` fields come from
+    ``payload.anon_facts`` (built by (A) step 8, in the SAME order as
+    ``triples`` — the chunk graph consolidation.py builds is derived from
+    ``triples`` in order); ``predicate``, ``relation_type``, and
+    ``speaker_id`` are copied VERBATIM from ``triples`` — a speaker id can
+    never be a mapping key (the anonymization prompt instructs the model
+    to leave ``speaker{N}`` ids verbatim), so no substitution was ever
+    needed there.
 
     After the SOTA call, the response's ``relations`` are de-anonymized via
-    :func:`~paramem.graph.placeholders._apply_bindings` (the single exit
-    gate: predicate invariant, then substitute, then residual sweep,
-    fail-closed) — returning real node names and bare ``speaker{N}`` ids,
-    exactly what :meth:`_run_graph_enrichment`'s existing consumption logic
-    (including the speaker-pair guard that rejects a same_as pair where
-    both surfaces are speaker ids) already expects. Any
-    ``bindings`` the response carries (SOTA-minted placeholders — normally
-    empty, since the prompt forbids inventing new nodes) are normalized via
-    :func:`~paramem.graph.placeholders._normalize_anonymization_mapping`
-    (placeholder on the key side) before being folded into that
-    substitution, mirroring the session tier. ``same_as`` pairs are
-    restored via the free-text primitive
-    :func:`~paramem.graph.placeholders.deanonymize_text` plus the same
-    fail-closed drop: a pair naming a token in neither table is dropped
-    rather than forwarded with a residual placeholder.
+    :func:`~paramem.graph.cloud_egress.deanonymize_facts` (the single exit
+    gate: totality gate, THEN predicate invariant, substitute, residual
+    sweep, fail-closed) — returning real node names and bare ``speaker{N}``
+    ids, exactly what
+    :func:`~paramem.training.graph_enrich.run_graph_enrichment`'s existing
+    consumption logic (including the speaker-pair guard that rejects a same_as pair
+    where both surfaces are speaker ids) already expects. A non-empty
+    totality verdict REJECTS THE WHOLE CHUNK DELTA (relations AND
+    ``same_as`` both discarded) — the caller detects this via
+    ``graph.diagnostics`` and counts it in ``totality_rejected_chunks``.
+    Any ``bindings`` the response carries (SOTA-minted placeholders —
+    normally empty, since the prompt forbids inventing new nodes) are
+    normalized inside :meth:`~paramem.graph.cloud_egress.CloudScope.
+    for_response` (placeholder on the key side) before being folded into
+    that substitution, mirroring the session tier. ``same_as`` pairs are
+    restored per-member via
+    :func:`~paramem.graph.cloud_egress.deanonymize_response_text` — a pair
+    with either member unresolved (``None``) is dropped.
+
+    ``deanonymize_response_text`` deliberately does NOT run the
+    undeclared-orphan SHAPE backstop (:data:`~paramem.graph.placeholders.
+    PLACEHOLDER_TOKEN_RE`) that :func:`~paramem.graph.placeholders.
+    _apply_bindings` runs for fact fields — see that function's docstring
+    for why (free conversational prose is a wide false-positive surface
+    for a bare shape match, e.g. ``GPT_4``, ``COVID_19``). That rationale
+    does NOT apply to a ``same_as`` member — it is a structured node-name
+    field, not prose — but the omission is still safe HERE specifically,
+    for a different reason: an undeclared placeholder-shaped token that
+    survives ``deanonymize_response_text`` unresolved (e.g. a stray
+    ``"Person_99"`` SOTA invented) is never itself a real node in this
+    process's graph, so
+    :func:`~paramem.training.graph_enrich.run_graph_enrichment`'s own
+    downstream guard (``keep_canon not in graph or drop_canon not in
+    graph`` — every ``same_as`` member must resolve to an EXISTING graph
+    node) drops the pair unconditionally before any contraction happens.
+    This is a real, load-bearing safety property of THIS call site, not a
+    silently-absorbed gap — if a future consumer of ``same_as`` pairs
+    ever accepts an unknown node name (e.g. to synthesize one), this
+    argument no longer holds and the shape backstop must be restored
+    here explicitly.
 
     Under the production default (``scrub`` includes ``"person name"``, so
     the model's ``mapping`` is dominated by person nodes), person nodes —
@@ -3438,14 +3152,15 @@ def _graph_enrich_with_sota(
     Args:
         triples: List of ``{"subject", "predicate", "object", "relation_type",
             "speaker_id"}`` dicts representing the chunk subgraph, from
-            :func:`~paramem.training.consolidation.serialize_subgraph_triples`
+            :func:`~paramem.training.graph_enrich.serialize_subgraph_triples`
             (unchanged — anonymization happens on its output here, not
             inside it).
-        mapping: ``{real_name: placeholder}`` — the anonymizer model's own
-            ``scrub``-scoped decision for this chunk, already reconciled
-            onto the chunk's node-key surfaces by the caller. Every
-            entry is trusted and substituted unconditionally — this
-            function applies no scope gate of its own.
+        payload: :class:`~paramem.graph.cloud_egress.AnonymizedPayload` —
+            the caller's already-completed (A) result for this chunk.
+        graph: The caller's throwaway per-chunk ``SessionGraph`` — passed
+            through to :func:`~paramem.graph.cloud_egress.deanonymize_facts`
+            so its totality diagnostics land where the caller can read
+            them back.
         api_key: Provider API key.
         provider: SOTA provider name (e.g. ``"anthropic"``).
         filter_model: Model identifier for the provider.
@@ -3458,35 +3173,29 @@ def _graph_enrich_with_sota(
         ``None`` when the SOTA call fails or the response cannot be parsed.
         ``new_relations`` is a list of relation dicts with real node names;
         ``same_as_pairs`` is a list of ``[canonical, variant]`` pairs with
-        real node names / bare speaker ids.
+        real node names / bare speaker ids.  A rejected totality verdict is
+        NOT ``None`` — it is ``([], [], raw_response)``, distinguishable
+        from a genuinely empty SOTA response only via
+        ``graph.diagnostics`` (see above); the caller relies on this to
+        tell "delta discarded" apart from "delta legitimately empty".
 
     The prompt this function loads is external config — edit
     ``configs/prompts/sota_graph_enrichment.txt`` to tune; no code changes
     are needed.
     """
-    # ONE inversion, first-wins — see
-    # :func:`~paramem.graph.placeholders.invert_forward_mapping`. This
-    # site previously inverted with a plain dict comprehension (LAST-wins
-    # on a many-to-one forward map), which restored a DIFFERENT real name
-    # than the session tier's first-wins :func:`_build_anonymization_mapping`
-    # for the identical placeholder.
-    reverse_mapping = invert_forward_mapping(mapping)
     anon_triples = [
-        {
-            **t,
-            "subject": _substitute_whole_words(str(t.get("subject", "")), mapping),
-            "object": _substitute_whole_words(str(t.get("object", "")), mapping),
-            "speaker_id": _substitute_whole_words(str(t.get("speaker_id", "")), mapping),
-        }
-        for t in triples
+        {**t, "subject": f["subject"], "object": f["object"]}
+        for t, f in zip(triples, payload.anon_facts, strict=True)
     ]
 
     enrichment_prompt = _load_prompt("sota_graph_enrichment.txt", required=True)
+    system_prompt = _load_prompt("sota_graph_enrichment_system.txt", required=True)
     # No try/except: a KeyError here means the prompt template has an
     # un-doubled literal brace (a template bug, not a runtime condition).
     # Swallowing it turned a missed brace-doubling into a permanent,
     # silent outage of graph enrichment — it must kill the fold loudly.
-    prompt = enrichment_prompt.format(triples_json=json.dumps(anon_triples, indent=2))
+    triples_json = json.dumps(anon_triples, indent=2)
+    prompt = enrichment_prompt.format(triples_json=triples_json)
 
     raw = _sota_call(
         prompt,
@@ -3496,7 +3205,7 @@ def _graph_enrich_with_sota(
         endpoint,
         max_tokens,
         temperature,
-        system_prompt=_SOTA_GRAPH_ENRICHMENT_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         timeout_seconds=timeout_seconds,
     )
     if raw is None:
@@ -3544,40 +3253,41 @@ def _graph_enrich_with_sota(
         else:
             logger.debug("Graph enrichment: malformed same_as entry skipped: %r", pair)
 
-    # De-anonymize — the SAME exit gate the session tier uses.  ``bindings``
-    # is normally empty (the prompt forbids inventing new nodes) but is
-    # still normalized/applied rather than skipped as a special case.
-    sota_bindings, _bindings_stats = _normalize_anonymization_mapping(
-        raw_bindings, placeholder_side="key"
-    )
+    # THE one scope for this response — observed derived from the EXACT
+    # triples_json string sent to SOTA (never a shape scrape).
+    scope = CloudScope.for_response(payload, sota_bindings=raw_bindings, sent=(triples_json,))
 
-    deanon_relations, predicate_dropped, residual_dropped = _apply_bindings(
-        new_relations, reverse_mapping, sota_bindings
-    )
-    if predicate_dropped or residual_dropped:
+    # De-anonymize relations — the SAME exit gate the session tier uses,
+    # gated by the totality check as step 1 (unconditional — the graph
+    # tier's binding-totality gate).  A non-empty verdict rejects the
+    # WHOLE chunk delta.
+    deanon = deanonymize_facts(scope, new_relations, graph)
+    if deanon.verdict:
+        logger.warning(
+            "graph_enrichment: binding-totality breach: %d offending token(s) %s — "
+            "rejecting the whole chunk delta (%d relation(s) discarded).",
+            len(deanon.verdict),
+            deanon.verdict[:5],
+            len(new_relations),
+        )
+        return [], [], raw
+    if deanon.predicate_dropped or deanon.residual_dropped:
         logger.warning(
             "graph_enrichment: dropped %d relation(s) post-substitution "
             "(%d predicate-invariant, %d residual placeholder sweep).",
-            len(predicate_dropped) + len(residual_dropped),
-            len(predicate_dropped),
-            len(residual_dropped),
+            len(deanon.predicate_dropped) + len(deanon.residual_dropped),
+            len(deanon.predicate_dropped),
+            len(deanon.residual_dropped),
         )
 
-    # same_as pairs: free-text deanon plus the same fail-closed drop — a
-    # pair naming a token in neither table is dropped rather than forwarded
-    # with a residual placeholder.
-    resolve = _resolution_map(reverse_mapping, sota_bindings, None)
-    declared = _declared_placeholder_tokens(reverse_mapping, sota_bindings)
+    # same_as pairs: per-member free-text deanon — a pair with either
+    # member unresolved (declared-but-unobserved, or otherwise fail-closed)
+    # is dropped rather than forwarded with a residual placeholder.
     deanon_same_as: list[list[str]] = []
     for canon, variant in same_as_pairs:
-        d_canon = deanonymize_text(canon, resolve)
-        d_variant = deanonymize_text(variant, resolve)
-        if (
-            PLACEHOLDER_TOKEN_RE.search(d_canon)
-            or PLACEHOLDER_TOKEN_RE.search(d_variant)
-            or _contains_declared_token(d_canon, declared)
-            or _contains_declared_token(d_variant, declared)
-        ):
+        d_canon = deanonymize_response_text(scope, canon)
+        d_variant = deanonymize_response_text(scope, variant)
+        if d_canon is None or d_variant is None:
             logger.warning(
                 "graph_enrichment: dropping same_as pair with unresolved token: %r",
                 [canon, variant],
@@ -3585,7 +3295,7 @@ def _graph_enrich_with_sota(
             continue
         deanon_same_as.append([d_canon, d_variant])
 
-    return deanon_relations, deanon_same_as, raw
+    return deanon.facts, deanon_same_as, raw
 
 
 def _render_indexed_facts(facts: list[dict]) -> str:
@@ -3889,12 +3599,14 @@ def _reconstruct_updated_transcript(
 ) -> str | None:
     """Substitute SOTA-introduced bindings into the anonymized transcript.
 
-    Replaces each binding's span with ``{{<placeholder>}}``. Spans are
-    processed longest-first so a longer span (``"Senior Software
-    Engineer"``) wins over a shorter one (``"Software Engineer"``) that
-    might otherwise consume part of it. All occurrences of each span are
-    replaced — entities mentioned more than once in the transcript get
-    one placeholder consistently.
+    Replaces each binding's span with ``{{<placeholder>}}``, via
+    :func:`~paramem.graph.placeholders._substitute_whole_words` — longest
+    span first (so ``"Senior Software Engineer"`` wins over
+    ``"Software Engineer"`` rather than being partially consumed by it)
+    and edge-aware word-boundary matching, so ``"Bill"`` never matches
+    inside ``"Billing"``.  All occurrences of each span are replaced —
+    entities mentioned more than once in the transcript get one
+    placeholder consistently.
 
     Returns the substituted transcript, the input unchanged when there
     are no bindings, or ``None`` when ``anon_transcript`` is ``None``.
@@ -3903,15 +3615,12 @@ def _reconstruct_updated_transcript(
         return None
     if not bindings:
         return anon_transcript
-    out = anon_transcript
     # Single-brace `{Prefix_N}` matches the convention SOTA used to echo
     # in the previous protocol's `updated_transcript` (saved snapshots
     # under `data/ha/debug/`) and the literal that `_apply_bindings`
     # already substitutes in fact subject / object.
-    for placeholder, span in sorted(bindings.items(), key=lambda kv: -len(kv[1])):
-        if span and span in out:
-            out = out.replace(span, braced(placeholder))
-    return out
+    span_to_braced = {span: braced(placeholder) for placeholder, span in bindings.items()}
+    return _substitute_whole_words(anon_transcript, span_to_braced)
 
 
 def _apply_enrichment_delta(
@@ -4006,6 +3715,7 @@ def _plausibility_filter_with_sota(
     judge; it defaults to the production template.
     """
     plaus_prompt = _load_prompt("sota_plausibility.txt", prompts_dir=prompts_dir, required=True)
+    system_prompt = _load_prompt("sota_plausibility_system.txt", required=True)
     facts_json, transcript_text = _sota_facing_payload(enriched_anon_facts, anon_transcript)
     prompt = plaus_prompt.format(facts_json=facts_json, transcript=transcript_text)
     raw = _sota_call(
@@ -4016,7 +3726,7 @@ def _plausibility_filter_with_sota(
         endpoint,
         max_tokens,
         temperature,
-        system_prompt=_SOTA_PLAUSIBILITY_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         timeout_seconds=timeout_seconds,
     )
     return _apply_drop_set(enriched_anon_facts, raw), raw
@@ -4058,12 +3768,13 @@ def local_plausibility_filter(
     """
     _vram_snapshot(f"plaus_filter_entry n_facts={len(facts)}")
     plaus_prompt = _load_prompt(prompt_filename, prompts_dir=prompts_dir, required=True)
+    system_prompt = _load_prompt("sota_plausibility_system.txt", required=True)
     prompt = plaus_prompt.format(
         facts_json=_render_indexed_facts(facts),
         transcript=transcript or "(not available)",
     )
     messages = [
-        {"role": "system", "content": _SOTA_PLAUSIBILITY_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
     formatted = tokenizer.apply_chat_template(
@@ -4085,8 +3796,8 @@ def local_plausibility_filter(
     _vram_snapshot("plaus_filter_pre_generate")
     # vram_scope: the plausibility prompt drives a long generate (≥6 K
     # token prompt + up to 8 K new tokens of KV cache). Without this wrap,
-    # the cached pool stays held when the next phase (QA generation in
-    # consolidation.extract_session) starts its own prefill, and on an
+    # the cached pool stays held when the next phase (procedural extraction
+    # in consolidation.extract_session) starts its own prefill, and on an
     # 8 GiB device with STT/TTS resident the device exhausts. The scope's
     # finally clause runs torch.cuda.empty_cache() so the cached pool is
     # returned before control passes back to the caller.

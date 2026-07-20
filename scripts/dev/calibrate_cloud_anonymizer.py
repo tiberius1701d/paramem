@@ -133,20 +133,27 @@ def _run_one(
     speaker_name: str,
     scrub: set[str],
 ) -> tuple[str, dict, str]:
+    from paramem.graph.cloud_egress import CloudScope, deanonymize_response_text
     from paramem.graph.extractor import extract_and_anonymize_for_cloud
-    from paramem.graph.placeholders import deanonymize_text
 
-    anon_text, mapping, reverse = extract_and_anonymize_for_cloud(
+    payload = extract_and_anonymize_for_cloud(
         transcript,
         model,
         tokenizer,
         speaker_name=speaker_name,
         scrub=scrub,
     )
-    if not mapping or not anon_text:
-        return anon_text or "", mapping or {}, ""
-    round_trip = deanonymize_text(anon_text, reverse)
-    return anon_text, mapping, round_trip
+    if payload.status != "ok":
+        # Covers both "failed" (fail-closed) and "opted_out" (scrub=set())
+        # — neither has anything to round-trip.  Note this also fixes a
+        # latent truthiness bug the old ``if not mapping or not anon_text``
+        # check had: a legitimate "ran, found nothing in scope" verdict
+        # (status == "ok", forward == {}) is no longer misclassified as a
+        # failure — CLAUDE.md forbids truthiness checks on registries.
+        return payload.anon_transcript or "", dict(payload.forward), ""
+    scope = CloudScope.for_response(payload, sota_bindings=None, sent=(payload.anon_transcript,))
+    round_trip = deanonymize_response_text(scope, payload.anon_transcript)
+    return payload.anon_transcript, dict(payload.forward), round_trip or ""
 
 
 def _print_summary(results: list[QueryResult], total_personal: int) -> tuple[int, float]:

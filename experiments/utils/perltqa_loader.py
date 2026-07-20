@@ -10,7 +10,7 @@ Expected local layout (clone to data/external/PerLTQA/):
 
 Two main use cases:
   1. load_character_dialogues() — raw dialogue transcripts for pipeline input
-     (graph extraction → QA generation → indexed key training)
+     (graph extraction → keyed-entry assembly → indexed key training)
   2. load_character_eval_qa() — ground-truth QA pairs for evaluation
 
 Falls back to synthetic data if PerLTQA is not available locally.
@@ -337,7 +337,8 @@ def load_qa(
 
     This is the legacy interface for backwards compatibility with tests that
     pass pre-made QA pairs directly to training. For the full pipeline
-    (dialogue → graph extraction → QA gen), use load_character_dialogues().
+    (dialogue → graph extraction → keyed-entry assembly), use
+    load_character_dialogues().
 
     Returns:
         (qa_pairs, source_label) where source_label is "perltqa:<name>"

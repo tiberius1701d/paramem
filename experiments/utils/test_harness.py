@@ -51,7 +51,8 @@ from paramem.utils.config import ModelConfig  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# Benchmark models — each owns the full pipeline (extraction → QA gen → training → eval)
+# Benchmark models — each owns the full pipeline (extraction → keyed-entry
+# assembly → training → eval)
 BENCHMARK_MODELS = {
     "gemma": ModelConfig(
         model_id="google/gemma-2-9b-it",

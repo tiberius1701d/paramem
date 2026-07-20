@@ -3,9 +3,7 @@
 All model calls are mocked (patch ``generate_answer``) — this is a pure
 gate/scope/parse unit test suite exercising the two gather loci
 (reverse-mapping placeholders, entity attributes) against the ONE
-``_verdict`` primitive's uniform apply gate. See
-``.agent/design-place-correction-20260704.md`` ("EXTENSION (s38)" +
-"DECOMPOSITION") for the live-model evidence trail this stage is built on.
+``_verdict`` primitive's uniform apply gate.
 """
 
 from __future__ import annotations

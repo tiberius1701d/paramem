@@ -31,6 +31,7 @@ from paramem.memory.persistence import _IK_KEY_ATTR, save_memory_to_disk
 from paramem.memory.source import DiskMemorySource
 from paramem.memory.store import MemoryStore
 from paramem.training.consolidation import ConsolidationLoop
+from paramem.training.graph_tier import GraphTierRefiner
 from paramem.training.key_registry import KeyRegistry
 from paramem.utils.config import AdapterConfig, ConsolidationConfig, TrainingConfig
 
@@ -142,6 +143,11 @@ def _build_loop(tmp_path: Path, *, procedural_enabled: bool = True) -> Consolida
     loop._debug_base = None
     loop._thermal_policy = None
     loop.shutdown_requested = False
+    # Enrichment sizing scalars — see _make_bare_loop.  Always set by
+    # ConsolidationLoop.__init__ (consolidation.py:501-502), never nulled by
+    # release(), and read when the graph tier's refiner is constructed.
+    loop.graph_enrichment_neighborhood_hops = 2
+    loop.graph_enrichment_max_entities_per_pass = 50
     loop.merger = MagicMock()
 
     # _build_all_edge_entries_into reads merger.graph.edges(data=True).
@@ -574,7 +580,6 @@ class TestSimulateTrainParity:
 
 # ---------------------------------------------------------------------------
 # Interim recital dedup: simulate==train parity
-# (.agent/plan-interim-recital-dedup.md v2 amendment #6)
 # ---------------------------------------------------------------------------
 
 
@@ -588,8 +593,7 @@ class TestInterimRecitalDedupSimulateTrainParity:
 
     The interim fresh-derivation materialize call never passes ``source=``
     (always defaults to the "weights" body regardless of venue — see
-    ``_materialize_consolidation_graph``'s docstring and
-    ``.agent/plan-interim-recital-dedup.md`` section 7), so the dedup merge
+    ``_materialize_consolidation_graph``'s docstring), so the dedup merge
     added at the end of that body runs identically for both the "simulate"
     and "train" venues of ``run_consolidation_cycle``.
     """
@@ -645,6 +649,11 @@ class TestInterimRecitalDedupSimulateTrainParity:
         loop._debug_base = None
         loop._thermal_policy = None
         loop.shutdown_requested = False
+        # Always set by __init__ in a real loop; needed unconditionally because
+        # _refine_consolidation_graph constructs a GraphTierRefiner on every
+        # call regardless of the normalize/enrich flags.
+        loop.graph_enrichment_neighborhood_hops = 2
+        loop.graph_enrichment_max_entities_per_pass = 50
 
         loop.merger = GraphMerger(model=None)
 
@@ -976,6 +985,13 @@ def _make_bare_loop(tmp_path: Path) -> ConsolidationLoop:
     loop.tokenizer = None
     loop.save_cycle_snapshots = False
     loop._debug_base = None
+    # Enrichment sizing scalars.  A GraphTierRefiner is constructed for BOTH
+    # tier passes, so its enrichment sizing is supplied even on a normalize-only
+    # run that skips on model-is-None.  ConsolidationLoop.__init__ always sets
+    # these (consolidation.py:501-502) and release() never nulls them, so no
+    # production path reaches the tier without them.
+    loop.graph_enrichment_neighborhood_hops = 2
+    loop.graph_enrichment_max_entities_per_pass = 50
     loop.config = ConsolidationConfig()
     return loop
 
@@ -1300,8 +1316,9 @@ class TestConsolidateSimulateFold:
         enrichment runs on the freshly-merged graph and the sentinel coexists with the
         merged interim edges in the persisted output.
 
-        Strategy: monkeypatch _run_graph_enrichment to add a sentinel edge to
-        self.merger.graph and return new_edges=1.  After the simulate fold, assert:
+        Strategy: monkeypatch GraphTierRefiner.run_enrichment to add a sentinel
+        edge to loop.merger.graph and return new_edges=1.  After the simulate
+        fold, assert:
         (a) the sentinel edge is present in the persisted graph.json, and
         (b) the merged interim edge is also present (sentinel coexists with merged content),
         (c) tier_delta["episodic"]["minted"] == 1 (sourced from enrichment new_edges).
@@ -1310,7 +1327,7 @@ class TestConsolidateSimulateFold:
 
         loop = _make_bare_loop(tmp_path)
         # refinement_enrichment="on" + sota_enabled=True so consolidate
-        # calls _run_graph_enrichment; base defaults (off/False) would skip it.
+        # calls GraphTierRefiner.run_enrichment; base defaults (off/False) would skip it.
         loop.config = ConsolidationConfig(refinement_enrichment="on", sota_enabled=True)
 
         # Seed one interim slot so there is merged content to coexist with.
@@ -1325,8 +1342,8 @@ class TestConsolidateSimulateFold:
         SENTINEL_OBJECT = "__enr_sentinel_obj__"
         SENTINEL_KEY = "__enr_sentinel_key__"
 
-        def _fake_enrichment(self_loop=None):
-            """Add a sentinel edge to self.merger.graph and return new_edges=1.
+        def _fake_enrichment(refiner_self=None):
+            """Add a sentinel edge to loop.merger.graph and return new_edges=1.
 
             Must run on the populated merged graph (after reset+merge), otherwise
             the merger's graph is empty and the sentinel is wiped by reset_graph().
@@ -1352,7 +1369,9 @@ class TestConsolidateSimulateFold:
 
         from unittest.mock import patch
 
-        with patch.object(loop, "_run_graph_enrichment", side_effect=_fake_enrichment):
+        from paramem.training.graph_tier import GraphTierRefiner
+
+        with patch.object(GraphTierRefiner, "run_enrichment", side_effect=_fake_enrichment):
             result = loop.consolidate(mode="simulate")
 
         # (a) Sentinel edge must be present in the persisted graph.json.
@@ -1382,17 +1401,17 @@ class TestConsolidateSimulateFold:
         )
 
     def test_simulate_merge_produces_person_node_with_speaker_id(self, tmp_path):
-        """Simulate path via _merge_registry_relations stamps entity_type='person' + speaker_id.
+        """Simulate path via GraphMerger.merge_relations stamps entity_type='person' + speaker_id.
 
         Regression guard: before routing consolidate through
-        _merge_registry_relations, the simulate path used entities=[] directly
-        (same latent bug as the recon path fixed by _merge_registry_relations
+        GraphMerger.merge_relations, the simulate path used entities=[] directly
+        (same latent bug as the recon path fixed by GraphMerger.merge_relations
         unification).  A relation whose subject == speaker_id (i.e. a speaker
         node) would be stored as entity_type='concept' with no speaker_id
         attribute, causing keyless-edge attribution to fall back to speaker_id="".
 
-        After the fix, the simulate path calls _merge_registry_relations which
-        calls _synth_speaker_entities; the subject node receives
+        After the fix, the simulate path calls GraphMerger.merge_relations which
+        calls the module-level _synth_speaker_entities; the subject node receives
         entity_type='person' and speaker_id from the synthesised Entity.
 
         Uses the session_id="__simulate_consolidation_merge__" path, which is
@@ -1401,7 +1420,7 @@ class TestConsolidateSimulateFold:
         loop = _make_bare_loop(tmp_path)
 
         # Write an interim slot whose triple has subject == speaker_id.
-        # _synth_speaker_entities fires when _r.speaker_id != "" AND
+        # paramem.graph.merger._synth_speaker_entities fires when _r.speaker_id != "" AND
         # _r.subject == _r.speaker_id.  We use "speaker0" for both.
         _write_interim_graph(
             tmp_path,
@@ -1437,13 +1456,14 @@ class TestConsolidateSimulateFold:
         assert node_data.get("entity_type") == "person", (
             f"Simulate path: expected entity_type='person' on speaker subject node; "
             f"got entity_type={node_data.get('entity_type')!r}. "
-            "Regression: before _merge_registry_relations routing, simulate used "
+            "Regression: before GraphMerger.merge_relations routing, simulate used "
             "entities=[] so speaker nodes received entity_type='concept' with no speaker_id."
         )
         assert node_data.get("speaker_id") == "speaker0", (
             f"Simulate path: expected speaker_id='speaker0' (cased, in node attribute); "
             f"got speaker_id={node_data.get('speaker_id')!r}. "
-            "Regression: _synth_speaker_entities was not applied to the simulate path."
+            "Regression: paramem.graph.merger._synth_speaker_entities was not applied "
+            "to the simulate path."
         )
 
 
@@ -1890,6 +1910,101 @@ class TestConsolidationLoopRelease:
 
         loop.release()
         loop.release()  # must not raise
+
+
+class TestGraphTierSkipsAfterRelease:
+    """Both graph-tier passes SKIP on a released loop instead of raising.
+
+    ``release()`` nulls ``model`` AND ``extraction`` together, so the
+    cloud-only server routinely holds a loop whose ``extraction`` is ``None``.
+    Both passes own a ``model is None`` early-skip, and that skip must stay
+    reachable WITHOUT any read of ``self.extraction``.
+
+    Regression: the graph tier once took the extraction config as a resolved
+    constructor argument, so ``self.extraction.config`` was evaluated by the
+    caller before any guard in the tier could run — a released loop raised
+    ``AttributeError`` on ``None.config`` where it had previously skipped.
+    The config is now handed over as a deferred read
+    (``_current_extraction_config``) that only the post-guard paths invoke.
+    These tests fail with ``AttributeError`` if that read is ever hoisted back
+    above the guard.
+    """
+
+    @staticmethod
+    def _released_loop(tmp_path: Path) -> ConsolidationLoop:
+        """A loop in exactly the post-``release()`` state, with nothing re-added."""
+        from paramem.graph.merger import GraphMerger
+
+        loop = ConsolidationLoop.__new__(ConsolidationLoop)
+        loop.output_dir = tmp_path
+        loop.config = ConsolidationConfig(sota_enabled=True)
+        loop.save_cycle_snapshots = False
+        loop._debug_base = None
+        loop.graph_enrichment_neighborhood_hops = 2
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.merger = GraphMerger(model=None)
+        # Post-release state: release() nulls these four together.
+        loop.model = None
+        loop.tokenizer = None
+        loop._bg_trainer = None
+        loop.extraction = None
+        return loop
+
+    @staticmethod
+    def _refiner(loop: ConsolidationLoop) -> GraphTierRefiner:
+        """Build a :class:`GraphTierRefiner` exactly as ``_refine_consolidation_graph``
+        does, off a released loop's current (post-``release()``) state."""
+        return GraphTierRefiner(
+            loop.merger,
+            model=loop.model,
+            tokenizer=loop.tokenizer,
+            extraction_config_provider=loop._current_extraction_config,
+            sota_enabled=loop.config.sota_enabled,
+            neighborhood_hops=loop.graph_enrichment_neighborhood_hops,
+            max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
+            gc_disable=loop._disable_gradient_checkpointing,
+            gc_enable=loop._enable_gradient_checkpointing,
+            normalization_sink=loop._debug_writer,
+        )
+
+    def test_normalization_skips_on_released_loop(self, tmp_path):
+        """Normalization returns the no_model skip, never touching extraction.
+
+        ``sota_enabled=True`` is deliberate: it is the only branch in the
+        normalization pass that reads the extraction config, so a hoisted read
+        cannot hide behind a False gate here.
+        """
+        loop = self._released_loop(tmp_path)
+
+        result = self._refiner(loop).run_normalization()
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == "no_model"
+        assert loop.extraction is None, "the skip path must not repopulate extraction"
+
+    def test_enrichment_skips_on_released_loop(self, tmp_path):
+        """Enrichment returns the no_model skip, never touching extraction."""
+        loop = self._released_loop(tmp_path)
+
+        result = self._refiner(loop).run_enrichment()
+
+        assert result["skipped"] is True
+        assert result["skip_reason"] == "no_model"
+        assert loop.extraction is None, "the skip path must not repopulate extraction"
+
+    def test_refine_stage_skips_both_passes_on_released_loop(self, tmp_path):
+        """The Refine stage runs both passes on a released loop without raising.
+
+        Covers the caller as well as the passes: ``_refine_consolidation_graph``
+        is the production entry point and must not evaluate tier arguments the
+        released loop can no longer supply.
+        """
+        loop = self._released_loop(tmp_path)
+        loop.store = MemoryStore(replay_enabled=True)
+
+        loop._refine_consolidation_graph([], normalize=True, enrich=True)
+
+        assert loop.extraction is None
 
 
 # ---------------------------------------------------------------------------

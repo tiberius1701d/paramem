@@ -74,7 +74,7 @@ def _make_loop(speaker_id: str, keys: list[str]) -> MagicMock:
     """
     loop = MagicMock()
 
-    # W2: iter_bookkeeping returns bookkeeping records keyed by speaker_id.
+    # iter_bookkeeping returns bookkeeping records keyed by speaker_id.
     # The handler iterates all records and filters by record.get("speaker_id").
     bk_records = [(k, {"speaker_id": speaker_id, "relation_type": "episodic"}) for k in keys]
     loop.store.iter_bookkeeping.return_value = iter(bk_records)
@@ -172,7 +172,7 @@ class TestMarkStaleKeys:
         # Response lists stale keys (sorted).
         assert sorted(body["stale_keys"]) == sorted(keys)
 
-        # W2: iter_bookkeeping was called (not keys_for_speaker which used merger.graph).
+        # iter_bookkeeping was called (not keys_for_speaker which used merger.graph).
         loop.store.iter_bookkeeping.assert_called_once_with()
 
         # store.discard_keys must be called with mode="erase" (hard erasure, not soft-stale).
@@ -209,7 +209,7 @@ class TestMarkStaleKeys:
             {"key": key, "subject": "Alice", "predicate": "lives_in", "object": "Berlin"},
             simhash=fingerprint,
         )
-        # W2: seed bookkeeping so iter_bookkeeping() resolves the key for this speaker.
+        # seed bookkeeping so iter_bookkeeping() resolves the key for this speaker.
         real_store.set_bookkeeping(
             key,
             speaker_id=speaker_id,
@@ -543,7 +543,7 @@ class TestLiveSlotManifestReStamp:
             simhash=fingerprint,
         )
 
-        # W2: seed bookkeeping so iter_bookkeeping() resolves key_to_forget for speaker_id.
+        # seed bookkeeping so iter_bookkeeping() resolves key_to_forget for speaker_id.
         # Bookkeeping is separate from save_bytes() (KeyRegistry only), so this
         # does NOT affect H_old — the computation below remains correct.
         real_store.set_bookkeeping(
@@ -625,7 +625,7 @@ class TestLiveSlotManifestReStamp:
         ep_reg = real_store.registry(tier_name)
         ep_reg.add(key_to_forget)
 
-        # W2: seed bookkeeping so iter_bookkeeping() resolves key_to_forget for speaker_id.
+        # seed bookkeeping so iter_bookkeeping() resolves key_to_forget for speaker_id.
         real_store.set_bookkeeping(
             key_to_forget,
             speaker_id=speaker_id,

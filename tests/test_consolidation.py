@@ -10,21 +10,36 @@ from unittest.mock import MagicMock
 import pytest
 
 from paramem.memory.store import MemoryStore as _MS  # noqa: F401
-from paramem.training.consolidation import ConsolidationLoop, _mentions_any
+from paramem.training.consolidation import ConsolidationLoop
+from paramem.training.graph_tier import GraphTierRefiner
 
 
-class TestMentionsAny:
-    def test_finds_mention(self):
-        assert _mentions_any("Alex lives in Heilbronn", {"alex"})
+def _refiner_for(loop: ConsolidationLoop) -> GraphTierRefiner:
+    """Build a :class:`GraphTierRefiner` off a loop's current live state.
 
-    def test_no_mention(self):
-        assert not _mentions_any("The weather is nice", {"alex"})
-
-    def test_case_insensitive(self):
-        assert _mentions_any("ALEX is here", {"alex"})
-
-    def test_empty_terms(self):
-        assert not _mentions_any("some text", set())
+    Mirrors exactly what ``ConsolidationLoop._refine_consolidation_graph``
+    constructs on every call — the enrichment and normalization surfaces
+    moved off ``ConsolidationLoop`` onto ``GraphTierRefiner`` (the deleted
+    enrichment/normalization SHIM methods that used to live directly on
+    ``ConsolidationLoop``), so tests exercise ``run_enrichment()`` /
+    ``run_normalization()`` on a
+    refiner built from the loop rather than calling a loop method directly.
+    Called fresh at each use site so a test that mutates ``loop.model`` (or
+    other loop state) between calls sees the update, matching production's
+    read-fresh-per-call semantics.
+    """
+    return GraphTierRefiner(
+        loop.merger,
+        model=loop.model,
+        tokenizer=loop.tokenizer,
+        extraction_config_provider=loop._current_extraction_config,
+        sota_enabled=loop.config.sota_enabled,
+        neighborhood_hops=loop.graph_enrichment_neighborhood_hops,
+        max_entities_per_pass=loop.graph_enrichment_max_entities_per_pass,
+        gc_disable=loop._disable_gradient_checkpointing,
+        gc_enable=loop._enable_gradient_checkpointing,
+        normalization_sink=loop._debug_writer,
+    )
 
 
 class TestExtractionPathParity:
@@ -3229,6 +3244,8 @@ class TestAbortSkipsCommit:
         loop._indexed_next_index = 0
         loop._indexed_ep_interim = {}
         loop._telemetry_dir = None
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.graph_enrichment_neighborhood_hops = 2
         return loop
 
     @staticmethod
@@ -3536,9 +3553,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
-            patch.object(
-                ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
             # reconstruct_graph is a GPU operation; stub with an empty result
             # so the abort-path test does not require a real model.
             patch(
@@ -3632,9 +3647,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
-            patch.object(
-                ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
             patch(
                 "paramem.training.consolidation.reconstruct_graph",
                 return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
@@ -3722,9 +3735,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
-            patch.object(
-                ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
             patch(
                 "paramem.training.consolidation.reconstruct_graph",
                 return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
@@ -3814,9 +3825,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
-            patch.object(
-                ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
             patch(
                 "paramem.training.consolidation.reconstruct_graph",
                 return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
@@ -3925,9 +3934,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
-            patch.object(
-                ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
             patch(
                 "paramem.training.consolidation.reconstruct_graph",
                 return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
@@ -4012,9 +4019,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
-            patch.object(
-                ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
             patch(
                 "paramem.training.consolidation.reconstruct_graph",
                 return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
@@ -4096,9 +4101,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
-            patch.object(
-                ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
             patch(
                 "paramem.training.consolidation.reconstruct_graph",
                 return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
@@ -4191,9 +4194,7 @@ class TestAbortSkipsCommit:
             patch.object(
                 ConsolidationLoop, "_maybe_make_recall_callback", return_value=(None, None)
             ),
-            patch.object(
-                ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-            ),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
             patch(
                 "paramem.training.consolidation.reconstruct_graph",
                 return_value=ReconstructionResult(graph=_nx.MultiDiGraph()),
@@ -4664,12 +4665,20 @@ class TestConsolidateInterimAdaptersFullFlow:
 
     @staticmethod
     def _install_provenance_merge_spy(loop):
-        """Install a side_effect on loop.merger.merge that stamps ik_keys.
+        """Install a side_effect on loop.merger.merge_relations that stamps ik_keys.
 
         The real _upsert_relation stamps ``ik_key`` from ``Relation.indexed_key``
         onto the merged edge at new-edge insertion.  Since ``loop.merger`` is a
         MagicMock, we install a side_effect that mirrors this behaviour so
         The edge-walk stage reads back the correct ik_key.
+
+        Spies on ``merge_relations`` (not the lower-level ``merge``) because
+        ``ConsolidationLoop`` now calls ``self.merger.merge_relations(...)``
+        directly with a plain relations list — the ``SessionGraph``
+        construction that used to happen in ``ConsolidationLoop`` moved onto
+        :meth:`~paramem.graph.merger.GraphMerger.merge_relations` itself, so a
+        fully-mocked ``loop.merger`` must be spied at that boundary to see any
+        calls at all.
 
         Call this on the loop BEFORE calling ``_run_with_mocks`` in tests that
         supply a recon graph with stamped edges.
@@ -4677,14 +4686,18 @@ class TestConsolidateInterimAdaptersFullFlow:
         from paramem.graph.name_match import canonical as _canonical
         from paramem.memory.persistence import _IK_KEY_ATTR
 
-        def _spy_merge(
-            session_graph,
+        def _spy_merge_relations(
+            relations,
             *,
-            resolve_contradictions=True,
-            align_predicates=False,
+            session_id,
+            log_label,
+            timestamp="",
+            resolve_contradictions=False,
             credit_adopt_reinforcement=False,
         ):
-            for rel in session_graph.relations:
+            if not relations:
+                return
+            for rel in relations:
                 if rel.indexed_key:
                     _subj = rel.subject
                     _obj = rel.object
@@ -4706,7 +4719,7 @@ class TestConsolidateInterimAdaptersFullFlow:
                     loop.merger.graph[_subj][_obj][_eid][_IK_KEY_ATTR] = rel.indexed_key
             return loop.merger.graph
 
-        loop.merger.merge.side_effect = _spy_merge
+        loop.merger.merge_relations.side_effect = _spy_merge_relations
 
     @staticmethod
     def _run_with_mocks(loop, tmp_path, reconstruct_return):
@@ -4729,8 +4742,8 @@ class TestConsolidateInterimAdaptersFullFlow:
                     return_value=reconstruct_return,
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -4928,12 +4941,13 @@ class TestConsolidateInterimAdaptersFullFlow:
 
     def test_relation_type_injected_from_bookkeeping_before_remerge(self, tmp_path):
         """The re-merge stage injects the bookkeeping relation_type onto each
-        reconstructed triple before calling merger.merge().
+        reconstructed triple before calling merger.merge_relations().
 
         reconstruct_graph returns a graph with one edge (SPO only, no
         relation_type in edge data).  The bookkeeping entry for that key has
-        relation_type='preference'.  We assert that merger.merge() is called
-        with a SessionGraph whose Relation carries relation_type='preference'.
+        relation_type='preference'.  We assert that merger.merge_relations()
+        is called with a relations list whose Relation carries
+        relation_type='preference'.
         """
         import networkx as nx
 
@@ -4968,22 +4982,24 @@ class TestConsolidateInterimAdaptersFullFlow:
             "proc1", speaker_id="speaker0", relation_type="preference", first_seen=""
         )
 
-        # Capture merger.merge() call args.
+        # Capture merger.merge_relations() call args.
         merge_calls: list = []
 
-        def _spy_merge(
-            session_graph,
+        def _spy_merge_relations(
+            relations,
             *,
-            resolve_contradictions=True,
-            align_predicates=False,
+            session_id,
+            log_label,
+            timestamp="",
+            resolve_contradictions=False,
             credit_adopt_reinforcement=False,
         ):
-            merge_calls.append(session_graph)
+            merge_calls.append(relations)
             # Stamp the ik_key from the Relation onto the merged graph edge so
             # the edge-walk stage can read it back (mirrors real _upsert_relation behaviour).
             from paramem.memory.persistence import _IK_KEY_ATTR
 
-            for rel in session_graph.relations:
+            for rel in relations:
                 if rel.indexed_key:
                     _subj = rel.subject
                     _obj = rel.object
@@ -5007,16 +5023,18 @@ class TestConsolidateInterimAdaptersFullFlow:
                     merged_g[_subj][_obj][_eid][_IK_KEY_ATTR] = rel.indexed_key
             return merged_g
 
-        loop.merger.merge.side_effect = _spy_merge
+        loop.merger.merge_relations.side_effect = _spy_merge_relations
 
         self._run_with_mocks(loop, tmp_path, ReconstructionResult(graph=recon_g))
 
-        assert merge_calls, "merger.merge() must have been called for the reconstructed triple"
-        session = merge_calls[0]
-        assert len(session.relations) == 1, (
-            f"Expected 1 relation in synthetic SessionGraph; got {len(session.relations)}"
+        assert merge_calls, (
+            "merger.merge_relations() must have been called for the reconstructed triple"
         )
-        rel = session.relations[0]
+        relations = merge_calls[0]
+        assert len(relations) == 1, (
+            f"Expected 1 relation in synthetic relations list; got {len(relations)}"
+        )
+        rel = relations[0]
         assert rel.relation_type == "preference", (
             f"Expected relation_type='preference' from bookkeeping; got {rel.relation_type!r}"
         )
@@ -6109,8 +6127,8 @@ class TestDriftIntendedRemoval:
     """Tests for the drift_intended_removal bucket (merger ledger consumer).
 
     These tests seed loop.merger.removal_ledger directly because
-    _run_graph_enrichment is mocked in _run_with_mocks — the ledger entries
-    that enrichment would write are supplied manually.
+    GraphTierRefiner.run_enrichment is mocked in _run_with_mocks — the
+    ledger entries that enrichment would write are supplied manually.
     """
 
     @staticmethod
@@ -6130,8 +6148,9 @@ class TestDriftIntendedRemoval:
         in drift_intended_removal, NOT drift_genuine_loss.
 
         Setup: one surviving key (key_ok, present in recon graph) and one key
-        (key_enrichment) that has content but no recon edge.  _run_graph_enrichment
-        is replaced with a side_effect that populates removal_ledger at call time
+        (key_enrichment) that has content but no recon edge.
+        ``GraphTierRefiner.run_enrichment`` is replaced with a side_effect
+        that populates removal_ledger at call time
         (i.e. AFTER reset_graph() clears it) to faithfully replicate the real
         enrichment code path.
         """
@@ -6146,8 +6165,9 @@ class TestDriftIntendedRemoval:
         recon_g["Dave"]["London"][eid_ok][_IK_KEY_ATTR] = "key_ok"
 
         loop = self._make_loop(tmp_path, merger_graph=nx.MultiDiGraph())
-        # refinement_enrichment="on" + sota_enabled=True required for _run_graph_enrichment
-        # to be called; base defaults (off/False) skip enrichment.
+        # refinement_enrichment="on" + sota_enabled=True required for
+        # GraphTierRefiner.run_enrichment to be called; base defaults
+        # (off/False) skip enrichment.
         loop.config = loop.config.__class__(
             min_tier_key_floor=0,
             tier_fast_start=False,
@@ -6206,7 +6226,8 @@ class TestDriftIntendedRemoval:
             for u, v, k in edges_to_remove:
                 if v == "alicia":
                     g.remove_edge(u, v, key=k)
-            # Write the ledger entry exactly as real _run_graph_enrichment does.
+            # Write the ledger entry exactly as the real
+            # GraphTierRefiner.run_enrichment does.
             loop.merger.removal_ledger["key_enrichment"] = {
                 "reason": "enrichment_same_as",
                 "merged_into": "alice",
@@ -6226,8 +6247,8 @@ class TestDriftIntendedRemoval:
                     return_value=ReconstructionResult(graph=recon_g),
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     side_effect=_enrichment_side_effect,
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -6900,6 +6921,8 @@ class TestLastSeenFlowThroughMint:
         loop._debug_base = None
         loop.save_cycle_snapshots = False
         loop.snapshot_dir = None
+        loop.graph_enrichment_neighborhood_hops = 2
+        loop.graph_enrichment_max_entities_per_pass = 50
         merger = MagicMock()
         merger.graph = nx.MultiDiGraph()
         loop.merger = merger
@@ -7096,7 +7119,6 @@ class TestLastSeenFlowThroughMint:
             speaker_id="speaker0",
         )
         # _refine_consolidation_graph with enrich=False to avoid model calls.
-        loop._run_graph_enrichment = MagicMock(return_value={"skipped": True})
         loop._refine_consolidation_graph([recon_rel], enrich=False)
 
         bk = loop.store.bookkeeping_for_key("graph10")
@@ -7426,13 +7448,13 @@ class TestTierFloor:
                     ).ReconstructionResult(graph=__import__("networkx").MultiDiGraph()),
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_normalization",
+                    GraphTierRefiner,
+                    "run_normalization",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -7686,8 +7708,8 @@ class TestTierFloor:
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -7902,8 +7924,8 @@ class TestTierFloor:
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -8036,8 +8058,8 @@ class TestTierFloor:
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -8149,8 +8171,8 @@ class TestTierFloor:
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -8239,8 +8261,8 @@ class TestTierFloor:
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -8404,9 +8426,7 @@ class TestTierFloor:
                         "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
-                patch.object(
-                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-                ),
+                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
                 patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
                 patch.object(
@@ -8588,9 +8608,7 @@ class TestTierFloor:
                         "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
-                patch.object(
-                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-                ),
+                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
                 patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
                 patch.object(
@@ -8718,9 +8736,7 @@ class TestTierFloor:
                         "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
-                patch.object(
-                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-                ),
+                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
                 patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
                 patch.object(
@@ -8894,9 +8910,7 @@ class TestTierFloor:
                         "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
-                patch.object(
-                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-                ),
+                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
                 patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
                 patch.object(
@@ -9027,9 +9041,7 @@ class TestTierFloor:
                         "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
-                patch.object(
-                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-                ),
+                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
                 patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
                 patch.object(
@@ -9160,9 +9172,7 @@ class TestTierFloor:
                         "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
-                patch.object(
-                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-                ),
+                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
                 patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
                 patch.object(
@@ -9285,9 +9295,7 @@ class TestTierFloor:
                         "paramem.graph.reconstruct", fromlist=["ReconstructionResult"]
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
-                patch.object(
-                    ConsolidationLoop, "_run_graph_enrichment", return_value={"skipped": True}
-                ),
+                patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
                 patch.object(ConsolidationLoop, "_disable_gradient_checkpointing"),
                 patch.object(
@@ -10178,6 +10186,8 @@ class TestMaterializeInterimExtraRelations:
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
         loop.full_consolidation_period_string = ""
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.graph_enrichment_neighborhood_hops = 2
 
         # Real GraphMerger (no model) so merge/reset_graph run correctly.
         loop.merger = GraphMerger(model=None)
@@ -10631,6 +10641,8 @@ class TestInterimRecitalDedup:
         loop._indexed_ep_interim = {}
         loop.promoted_keys = set()
         loop.full_consolidation_period_string = ""
+        loop.graph_enrichment_max_entities_per_pass = 50
+        loop.graph_enrichment_neighborhood_hops = 2
 
         loop.merger = GraphMerger(model=None)
 
@@ -10864,8 +10876,8 @@ class TestInterimRecitalDedup:
         # Interpose a NON-EMPTY registry-relations merge -- the same shape as a
         # real interim graph-enrichment pass, which runs between the dedup
         # merge and the refine bump loop in production
-        # (_refine_consolidation_graph calls _run_graph_enrichment before the
-        # bump loop when enrich=True).  GraphMerger.merge() unconditionally
+        # (_refine_consolidation_graph calls GraphTierRefiner.run_enrichment
+        # before the bump loop when enrich=True).  GraphMerger.merge() unconditionally
         # resets self.reinforcements/self.collapsed at entry whenever it is
         # invoked with a non-empty relation set -- this call reproduces that
         # reset without depending on the SOTA enrichment path.
@@ -10879,7 +10891,7 @@ class TestInterimRecitalDedup:
                 speaker_id="spk-b",
             )
         ]
-        loop._merge_registry_relations(
+        loop.merger.merge_relations(
             enrichment_relation,
             session_id="__test_enrichment__",
             log_label="test enrichment relations",
@@ -10989,7 +11001,7 @@ class TestInterimRecitalDedup:
         )
 
         registry_relations = loop._build_registry_true_relations(keys=["graph1"])
-        loop._merge_registry_relations(
+        loop.merger.merge_relations(
             registry_relations, session_id="__test_seed__", log_label="seed"
         )
         assert loop.merger.graph.number_of_edges() == 1
@@ -11978,13 +11990,14 @@ class TestInterimKeyedWalk:
 
 
 class TestMergeRegistryRelationsUnification:
-    """Regression tests for the _merge_registry_relations unification.
+    """Regression tests for the GraphMerger.merge_relations unification.
 
     Before unification (4508-4530 in the pre-commit tree), the recon path built
     SessionGraph(entities=[], ...) which caused reconstructed speaker-subject nodes
     to receive entity_type="concept" with no speaker_id attribute.  The unified
-    _merge_registry_relations helper applies _synth_speaker_entities to both paths,
-    so speaker subjects now receive entity_type="person" + speaker_id from
+    GraphMerger.merge_relations helper applies the module-level
+    _synth_speaker_entities to both paths, so speaker subjects now receive
+    entity_type="person" + speaker_id from
     bookkeeping regardless of whether the relation came from the recon path or the
     extra-relations (pending-session) path.
 
@@ -12077,7 +12090,7 @@ class TestMergeRegistryRelationsUnification:
         entity_type='person' and speaker_id onto the subject node when
         subject == speaker_id (i.e. the subject is a speaker node).
 
-        Regression: before _merge_registry_relations unification, the recon
+        Regression: before GraphMerger.merge_relations unification, the recon
         path used entities=[] which caused subject nodes to receive
         entity_type='concept' and no speaker_id attribute.  Graph-enrichment
         then rooted enrichment facts at unattributed concept nodes (speaker0
@@ -12135,7 +12148,7 @@ class TestMergeRegistryRelationsUnification:
         assert node_data.get("entity_type") == "person", (
             f"Recon path: expected entity_type='person' on speaker subject node; "
             f"got entity_type={node_data.get('entity_type')!r}. "
-            "Regression: before _merge_registry_relations unification the recon path "
+            "Regression: before GraphMerger.merge_relations unification the recon path "
             "used entities=[], causing entity_type='concept' with no speaker_id."
         )
         assert node_data.get("speaker_id") == "speaker0", (
@@ -12152,7 +12165,7 @@ class TestMergeRegistryRelationsUnification:
         """extra_relations (pending-session) path continues to produce person nodes.
 
         Verifies that the dcf4189 fix (speaker_id on extra_relations nodes) is
-        preserved through the _merge_registry_relations unification.  Passes
+        preserved through the GraphMerger.merge_relations unification.  Passes
         extra_relations with speaker subjects and no registered keys so the recon
         path is a no-op; only the extra path runs.
         """
@@ -12265,13 +12278,8 @@ class TestSynthSpeakerEntitiesB1Regression:
 
     def test_matching_lowercase_subject_and_speaker_id(self):
         """Relation with subject == speaker_id (both lowercase) emits exactly one Entity."""
-        import unittest.mock as mock
-
+        from paramem.graph.merger import _synth_speaker_entities
         from paramem.graph.schema import Relation
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = object.__new__(ConsolidationLoop)
-        loop.__dict__["config"] = mock.MagicMock()
 
         # Both subject and speaker_id are lowercase speaker{N} (canonical form).
         relations = [
@@ -12285,7 +12293,7 @@ class TestSynthSpeakerEntitiesB1Regression:
             ),
         ]
 
-        entities = ConsolidationLoop._synth_speaker_entities(loop, relations)
+        entities = _synth_speaker_entities(relations)
 
         assert len(entities) == 1, (
             f"Expected 1 speaker Entity, got {len(entities)}: {entities!r}. "
@@ -12306,13 +12314,8 @@ class TestSynthSpeakerEntitiesB1Regression:
         """A subject that is a DIFFERENT speaker must not produce an entity for
         speaker_id — the comparison must be identity, not just 'is a speaker'.
         """
-        import unittest.mock as mock
-
+        from paramem.graph.merger import _synth_speaker_entities
         from paramem.graph.schema import Relation
-        from paramem.training.consolidation import ConsolidationLoop
-
-        loop = object.__new__(ConsolidationLoop)
-        loop.__dict__["config"] = mock.MagicMock()
 
         relations = [
             Relation(
@@ -12325,7 +12328,7 @@ class TestSynthSpeakerEntitiesB1Regression:
             ),
         ]
 
-        entities = ConsolidationLoop._synth_speaker_entities(loop, relations)
+        entities = _synth_speaker_entities(relations)
         assert len(entities) == 0, (
             f"Expected 0 entities for mismatched subject/speaker_id, got {entities!r}."
         )
@@ -12336,12 +12339,12 @@ class TestSynthSpeakerEntitiesB1Regression:
 # ---------------------------------------------------------------------------
 
 
-class TestResolveToNodeKeyP5:
-    """Unit tests for the module-level ``resolve_to_node_key`` function (P5)."""
+class TestResolveToNodeKey:
+    """Unit tests for the module-level ``resolve_to_node_key`` function."""
 
     def test_membership_shortcut(self):
         """When ``in_graph(name)`` is True the name IS returned unchanged."""
-        from paramem.training.consolidation import resolve_to_node_key
+        from paramem.training.graph_enrich import resolve_to_node_key
 
         graph_keys = {"alice", "berlin", "acme corp"}
         in_graph = lambda n: n in graph_keys  # noqa: E731
@@ -12351,7 +12354,7 @@ class TestResolveToNodeKeyP5:
 
     def test_canonical_fallback(self):
         """When name is NOT in graph, canonical(name) is returned."""
-        from paramem.training.consolidation import resolve_to_node_key
+        from paramem.training.graph_enrich import resolve_to_node_key
 
         in_graph = lambda n: False  # noqa: E731
 
@@ -12362,7 +12365,7 @@ class TestResolveToNodeKeyP5:
 
     def test_coref_chain_follow(self):
         """With a coref_map, the resolved key is followed through the chain."""
-        from paramem.training.consolidation import resolve_to_node_key
+        from paramem.training.graph_enrich import resolve_to_node_key
 
         in_graph = lambda n: False  # noqa: E731
         coref_map = {"speaker1": "speaker0"}  # speaker1 merged into speaker0
@@ -12373,7 +12376,7 @@ class TestResolveToNodeKeyP5:
 
     def test_coref_chain_cycle_guarded(self):
         """A cyclic coref_map must not loop forever."""
-        from paramem.training.consolidation import resolve_to_node_key
+        from paramem.training.graph_enrich import resolve_to_node_key
 
         in_graph = lambda n: False  # noqa: E731
         coref_map = {"a": "b", "b": "a"}  # cycle
@@ -12384,7 +12387,7 @@ class TestResolveToNodeKeyP5:
 
     def test_no_coref_map(self):
         """Without a coref_map, only membership+canonical resolution applies."""
-        from paramem.training.consolidation import resolve_to_node_key
+        from paramem.training.graph_enrich import resolve_to_node_key
 
         in_graph = lambda n: n == "existing"  # noqa: E731
 
@@ -12392,7 +12395,54 @@ class TestResolveToNodeKeyP5:
         assert resolve_to_node_key("Missing", in_graph) == "missing"
 
 
-class TestW1SameAsGuard:
+class TestGraphTierSymbolsNotReexported:
+    """Structural guard: the enrichment and normalization surfaces live in
+    ``paramem.training.graph_enrich`` and ``paramem.training.graph_tier``.
+
+    A patch target under ``paramem.training.consolidation`` for one of these
+    names is stale.  Asserting the names are absent makes a resurrected stale
+    patch fail loudly (``AttributeError`` from ``unittest.mock.patch``) instead
+    of silently patching a dead re-export while production code — reached via
+    ``ConsolidationLoop._refine_consolidation_graph`` constructing a per-call
+    ``paramem.training.graph_tier.GraphTierRefiner`` and calling
+    ``refiner.refine()``, which dispatches into
+    ``paramem.training.graph_enrich.run_graph_enrichment`` for enrichment and
+    ``GraphTierRefiner.run_normalization`` for normalization — runs unmocked.
+
+    The last two names in the parametrize list below are on this list too:
+    both SHIM delegator methods on ``ConsolidationLoop`` were deleted, so a
+    ``patch.object`` targeting either of their old names on a live
+    ``ConsolidationLoop`` instance now raises ``AttributeError`` at patch
+    time instead of silently installing a mock that production never
+    calls.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "_graph_enrich_with_sota",
+            "_safe_to_merge_surface",
+            "_strip_honorifics",
+            "serialize_subgraph_triples",
+            "resolve_to_node_key",
+            "normalize_predicates",
+            "_run_graph_enrichment",
+            "_run_graph_normalization",
+        ],
+    )
+    def test_tier_symbols_not_reexported_from_consolidation(self, name):
+        import paramem.training.consolidation as c
+
+        # The first six names were module-level functions that moved out of
+        # this module entirely; the last two were SHIM methods on
+        # ``ConsolidationLoop`` and were never module-level attributes, so the
+        # class is checked too — a resurrected shim method would be invisible
+        # to a module-only ``hasattr`` check.
+        assert not hasattr(c, name)
+        assert not hasattr(c.ConsolidationLoop, name)
+
+
+class TestSameAsSpeakerPairGuard:
     """Speaker-pair guard: any same_as pair where BOTH surfaces are speaker ids must be
     skipped unconditionally.
 
@@ -12408,10 +12458,11 @@ class TestW1SameAsGuard:
     def _stub_local_anonymize(self, monkeypatch):
         """Stub ``anonymize_with_local_model`` for every test in this class.
 
-        ``_run_graph_enrichment`` now runs the local anonymizer (the SAME
-        primitive session-tier extraction uses) over each chunk BEFORE the
-        SOTA call, to derive real-name entity types the fold graph itself
-        cannot supply (see that method's docstring). ``_make_w1_loop``'s
+        ``graph_enrich.run_graph_enrichment`` now runs the local anonymizer
+        (the SAME primitive session-tier extraction uses) over each chunk
+        BEFORE the SOTA call, to derive real-name entity types the fold
+        graph itself cannot supply (see that function's docstring).
+        ``_make_speaker_pair_guard_loop``'s
         model/tokenizer are ``MagicMock()``s, so a real call always fails to
         parse (no JSON in a ``MagicMock``'s generated output), which would
         fail every chunk closed (skip the SOTA call entirely) before the
@@ -12421,8 +12472,8 @@ class TestW1SameAsGuard:
         The stub lands on the SAFE side rather than the unsafe one: it
         types every non-speaker name found in the chunk's relations as
         ``"person"`` (masked). An EMPTY mapping (``{}``) is deliberately
-        NOT used here — ``_run_graph_enrichment``'s own fail-closed guard
-        (a local mapping that names zero entities for a chunk with real
+        NOT used here — ``graph_enrich.run_graph_enrichment``'s own
+        fail-closed guard (a local mapping that names zero entities for a chunk with real
         content is treated as a classification failure) would otherwise
         skip the SOTA call entirely for every test in this class before
         the mocked ``_graph_enrich_with_sota`` is ever reached, the same
@@ -12443,13 +12494,16 @@ class TestW1SameAsGuard:
             return mapping, "stub-anon-transcript", "stub-raw"
 
         monkeypatch.setattr(
-            "paramem.training.consolidation.anonymize_with_local_model",
+            "paramem.graph.cloud_egress.anonymize_with_local_model",
             _stub,
         )
 
     @staticmethod
-    def _make_w1_loop(tmp_path):
-        """Minimal ConsolidationLoop for W1 tests (≥10-node graph, real merger)."""
+    def _make_speaker_pair_guard_loop(tmp_path):
+        """Minimal ConsolidationLoop for the speaker-pair guard tests.
+
+        (>=10-node graph, real merger.)
+        """
         from unittest.mock import MagicMock  # noqa: F811
 
         from peft import PeftModel
@@ -12533,8 +12587,9 @@ class TestW1SameAsGuard:
     def test_speaker_id_casing_pair_is_skipped(self, tmp_path, monkeypatch):
         """SOTA same_as ['speaker0', 'speaker0'] must not contract the speaker node.
 
-        Drives the real _run_graph_enrichment production path with a mocked SOTA
-        response.  Asserts that after processing the casing-variant pair:
+        Drives the real ``GraphTierRefiner.run_enrichment`` production path
+        with a mocked SOTA response.  Asserts that after processing the
+        casing-variant pair:
         - result["same_as_merges"] == 0  (no contraction counted)
         - "speaker0" still exists as a distinct node in the graph
         - no node was removed by a self-contraction
@@ -12545,16 +12600,16 @@ class TestW1SameAsGuard:
         """
         from unittest.mock import patch
 
-        loop = self._make_w1_loop(tmp_path)
+        loop = self._make_speaker_pair_guard_loop(tmp_path)
 
         node_count_before = loop.merger.graph.number_of_nodes()
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.consolidation._graph_enrich_with_sota",
+            "paramem.training.graph_enrich._graph_enrich_with_sota",
             return_value=([], [["speaker0", "speaker0"]], "raw"),
         ):
-            result = loop._run_graph_enrichment()
+            result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
         assert result["same_as_merges"] == 0, (
@@ -12574,8 +12629,9 @@ class TestW1SameAsGuard:
     def test_distinct_speaker_ids_are_not_merged(self, tmp_path, monkeypatch):
         """SOTA same_as ['speaker0', 'speaker1'] must NOT merge distinct speakers.
 
-        Drives the real _run_graph_enrichment production path.  speaker0 and
-        speaker1 are distinct enrollments; a SOTA same_as proposal must be
+        Drives the real ``GraphTierRefiner.run_enrichment`` production
+        path.  speaker0 and speaker1 are distinct enrollments; a SOTA
+        same_as proposal must be
         blocked by the generalized speaker-pair guard (both surfaces are speaker ids).
 
         This test is load-bearing: without the guard,
@@ -12590,7 +12646,7 @@ class TestW1SameAsGuard:
         """
         from unittest.mock import patch
 
-        loop = self._make_w1_loop(tmp_path)
+        loop = self._make_speaker_pair_guard_loop(tmp_path)
         # Seed a second speaker node so both endpoints are in the graph.
         from paramem.graph.schema import Entity, SessionGraph
 
@@ -12609,10 +12665,10 @@ class TestW1SameAsGuard:
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
         with patch(
-            "paramem.training.consolidation._graph_enrich_with_sota",
+            "paramem.training.graph_enrich._graph_enrich_with_sota",
             return_value=([], [["speaker0", "speaker1"]], "raw"),
         ):
-            result = loop._run_graph_enrichment()
+            result = _refiner_for(loop).run_enrichment()
 
         assert result["same_as_merges"] == 0, (
             "The speaker-pair guard must block distinct speaker ids from merging; "
@@ -12632,15 +12688,16 @@ class TestW1SameAsGuard:
     def test_non_speaker_pairs_are_not_guarded(self, tmp_path, monkeypatch):
         """Non-speaker same_as pairs (e.g. name variants) must pass through the guard.
 
-        Drives the real _run_graph_enrichment path.  A pair of ordinary non-speaker
-        names must NOT be intercepted by the speaker-pair guard; they continue to the normal
-        resolution and surface-gate checks.
+        Drives the real ``GraphTierRefiner.run_enrichment`` path.  A pair
+        of ordinary non-speaker names must NOT be intercepted by the
+        speaker-pair guard; they continue to the normal resolution and
+        surface-gate checks.
         """
         from unittest.mock import patch
 
         from paramem.graph.name_match import is_speaker_id
 
-        loop = self._make_w1_loop(tmp_path)
+        loop = self._make_speaker_pair_guard_loop(tmp_path)
         graph = loop.merger.graph
         # Add two non-speaker nodes for the same_as pair.
         for name in ("alexander", "alex"):
@@ -12662,10 +12719,10 @@ class TestW1SameAsGuard:
         # "Alexander"/"Alex" pass _safe_to_merge_surface (token subset), so the merge
         # is allowed and same_as_merges == 1.
         with patch(
-            "paramem.training.consolidation._graph_enrich_with_sota",
+            "paramem.training.graph_enrich._graph_enrich_with_sota",
             return_value=([], [["Alexander", "Alex"]], "raw"),
         ):
-            result = loop._run_graph_enrichment()
+            result = _refiner_for(loop).run_enrichment()
 
         # Non-speaker pair was not guarded — the merge proceeded normally.
         assert result["same_as_merges"] >= 1, (
@@ -13142,14 +13199,14 @@ class TestSubtractiveRemovalsHelperFold:
 
 
 # ---------------------------------------------------------------------------
-# _merge_registry_relations: regression guard — timestamp="" prevents now() fabrication
+# GraphMerger.merge_relations: regression guard — timestamp="" prevents now() fabrication
 # ---------------------------------------------------------------------------
 
 
 class TestMergeRegistryRelationsTimestamp:
-    """_merge_registry_relations passes timestamp="" to the merger's SessionGraph.
+    """GraphMerger.merge_relations passes timestamp="" to the merger's SessionGraph.
 
-    Regression guard: before the fix, _merge_registry_relations always built the
+    Regression guard: before the fix, GraphMerger.merge_relations always built the
     SessionGraph with timestamp=datetime.now(...), so a recon relation with
     last_seen="" resolved to incoming_ls = "" or now() = now() — making the legacy key
     appear as the unique freshest and wrongly retiring a genuinely-dated rival.
@@ -13164,7 +13221,7 @@ class TestMergeRegistryRelationsTimestamp:
 
     @staticmethod
     def _make_loop_for_recon_merge(tmp_path) -> "ConsolidationLoop":
-        """Minimal ConsolidationLoop with a mock-model GraphMerger for _merge_registry_relations."""
+        """Minimal ConsolidationLoop with a mock-model GraphMerger for merge_relations."""
         from unittest.mock import MagicMock
 
         from paramem.graph.merger import GraphMerger
@@ -13225,7 +13282,7 @@ class TestMergeRegistryRelationsTimestamp:
     def test_mixed_dated_legacy_recon_dated_wins(self, tmp_path):
         """Dated-wins-over-undated: mixed registry (dated key, legacy "") through recon merge.
 
-        Simulates a fold _merge_registry_relations call with:
+        Simulates a fold GraphMerger.merge_relations call with:
           - Relation A (lives in → munich), last_seen="2026-01-01T00:00:00Z" (dated)
           - Relation B (lives in → berlin), last_seen="" (legacy — no timestamp in bookkeeping)
 
@@ -13268,7 +13325,7 @@ class TestMergeRegistryRelationsTimestamp:
         ]
 
         # Call with resolve_contradictions=True (config is "on") and default timestamp="".
-        loop._merge_registry_relations(
+        loop.merger.merge_relations(
             relations,
             session_id="__full_consolidation_recon__",
             log_label="test recon triples",
@@ -13357,7 +13414,7 @@ class TestMergeRegistryRelationsTimestamp:
                 last_seen="2026-01-01T00:00:00Z",
             )
         ]
-        loop._merge_registry_relations(
+        loop.merger.merge_relations(
             recon_relations,
             session_id="__full_consolidation_recon__",
             log_label="recon triples (test)",
@@ -13384,7 +13441,7 @@ class TestMergeRegistryRelationsTimestamp:
                 last_seen="2026-01-02T00:00:00Z",  # NEWER — as propagated from edge
             )
         ]
-        loop._merge_registry_relations(
+        loop.merger.merge_relations(
             pending_relations,
             session_id="__interim_pending_sessions__",
             log_label="pending relations (test)",
@@ -13435,7 +13492,7 @@ class TestMergeRegistryRelationsTimestamp:
                 last_seen="",  # legacy: no timestamp in bookkeeping
             )
         ]
-        loop._merge_registry_relations(
+        loop.merger.merge_relations(
             recon_relations,
             session_id="__full_consolidation_recon__",
             log_label="recon triples (test)",
@@ -13461,7 +13518,7 @@ class TestMergeRegistryRelationsTimestamp:
                 last_seen="2026-01-02T00:00:00Z",  # dated pending
             )
         ]
-        loop._merge_registry_relations(
+        loop.merger.merge_relations(
             pending_relations,
             session_id="__interim_pending_sessions__",
             log_label="pending relations (test)",
@@ -13554,7 +13611,7 @@ class TestExtractJsonBlockRelationsEnvelope:
 
 
 # ---------------------------------------------------------------------------
-# _run_graph_normalization — apply path: relations-envelope + same-(s,o) collapse
+# GraphTierRefiner.run_normalization — apply path: relations-envelope + same-(s,o) collapse
 # ---------------------------------------------------------------------------
 
 
@@ -13744,7 +13801,7 @@ class TestRunGraphNormalizationApply:
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            result = loop._run_graph_normalization()
+            result = _refiner_for(loop).run_normalization()
 
         all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
         assert "graph42" not in all_keys, "graph42 (lower-rec) must be removed"
@@ -13783,7 +13840,7 @@ class TestRunGraphNormalizationApply:
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            result = loop._run_graph_normalization()
+            result = _refiner_for(loop).run_normalization()
 
         remaining_preds = {
             edata["predicate"] for _, _, edata in graph.edges(data=True) if edata.get("predicate")
@@ -13829,7 +13886,7 @@ class TestRunGraphNormalizationApply:
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            result = loop._run_graph_normalization()
+            result = _refiner_for(loop).run_normalization()
 
         assert "graph12" in loop.merger.removal_ledger
         assert loop.merger.removal_ledger["graph12"]["reason"] == "predicate_synonym_collapse"
@@ -13879,7 +13936,7 @@ class TestRunGraphNormalizationApply:
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            loop._run_graph_normalization()
+            _refiner_for(loop).run_normalization()
 
         # graph34 (birthplace, newer last_seen) survives.
         survivor = [
@@ -13923,7 +13980,7 @@ class TestRunGraphNormalizationApply:
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            loop._run_graph_normalization()
+            _refiner_for(loop).run_normalization()
 
         survivor = [
             edata for _, _, edata in graph.edges(data=True) if edata.get(_IK_KEY_ATTR) == "graph34"
@@ -13962,7 +14019,7 @@ class TestRunGraphNormalizationApply:
             ),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            result = loop._run_graph_normalization()
+            result = _refiner_for(loop).run_normalization()
 
         all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
         assert "graph12" in all_keys, "graph12 must survive (not a multi-predicate group)"
@@ -13995,7 +14052,7 @@ class TestRunGraphNormalizationApply:
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            result = loop._run_graph_normalization()
+            result = _refiner_for(loop).run_normalization()
 
         all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
         assert "graph42" in all_keys, "graph42 must survive"
@@ -14010,7 +14067,7 @@ class TestRunGraphNormalizationApply:
         loop.model = None
 
         initial_nodes = loop.merger.graph.number_of_nodes()
-        result = loop._run_graph_normalization()
+        result = _refiner_for(loop).run_normalization()
 
         assert result["skipped"] is True
         assert result["skip_reason"] == "no_model"
@@ -14020,7 +14077,7 @@ class TestRunGraphNormalizationApply:
         """NDA-7: graph < 10 nodes → pass skipped (below floor)."""
         loop = self._make_loop(tmp_path, node_count=5)
 
-        result = loop._run_graph_normalization()
+        result = _refiner_for(loop).run_normalization()
 
         assert result["skipped"] is True
         assert result["skip_reason"] == "floor"
@@ -14058,7 +14115,7 @@ class TestRunGraphNormalizationApply:
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            result = loop._run_graph_normalization()
+            result = _refiner_for(loop).run_normalization()
 
         all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
         assert "graph87" not in all_keys, "graph87 (keyed) must be removed"
@@ -14096,7 +14153,7 @@ class TestRunGraphNormalizationApply:
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            result = loop._run_graph_normalization()
+            result = _refiner_for(loop).run_normalization()
 
         all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
         assert "graph99" in all_keys, "single-predicate (s,o) must not be touched"
@@ -14133,7 +14190,7 @@ class TestRunGraphNormalizationApply:
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            result = loop._run_graph_normalization()
+            result = _refiner_for(loop).run_normalization()
 
         all_keys = [edata.get(_IK_KEY_ATTR) for _, _, edata in graph.edges(data=True)]
         assert "graph12" not in all_keys, "graph12 (lower-rec born_in) must be retired"
@@ -14146,12 +14203,12 @@ class TestRunGraphNormalizationApply:
 
 
 # ---------------------------------------------------------------------------
-# SOTA engine wiring in _run_graph_normalization
+# SOTA engine wiring in GraphTierRefiner.run_normalization
 # ---------------------------------------------------------------------------
 
 
 class TestRunGraphNormalizationSotaEngine:
-    """_run_graph_normalization SOTA wiring and fail-loud tests.
+    """``GraphTierRefiner.run_normalization`` SOTA wiring and fail-loud tests.
 
     Tests:
     - SOTA-1: sota_enabled=True + provider + api_key in env → normalize_predicates
@@ -14285,12 +14342,12 @@ class TestRunGraphNormalizationSotaEngine:
 
         with (
             patch(
-                "paramem.training.consolidation.normalize_predicates",
+                "paramem.training.graph_tier.normalize_predicates",
                 side_effect=_fake_dedup,
             ),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            loop._run_graph_normalization()
+            _refiner_for(loop).run_normalization()
 
         assert "sota" in captured, (
             "normalize_predicates must receive sota= kwarg "
@@ -14326,12 +14383,12 @@ class TestRunGraphNormalizationSotaEngine:
 
         with (
             patch(
-                "paramem.training.consolidation.normalize_predicates",
+                "paramem.training.graph_tier.normalize_predicates",
                 side_effect=_fake_dedup,
             ),
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
         ):
-            loop._run_graph_normalization()
+            _refiner_for(loop).run_normalization()
 
         assert "model" in captured, (
             "normalize_predicates must receive model= kwarg when api_key is absent"
@@ -14369,7 +14426,7 @@ class TestRunGraphNormalizationSotaEngine:
             patch("paramem.graph.extractor._load_prompt", return_value=self._PROMPT_STUB),
             patch.object(loop._debug_writer, "on_normalization", side_effect=_spy_on_normalization),
         ):
-            loop._run_graph_normalization()
+            _refiner_for(loop).run_normalization()
 
         assert on_norm_calls, "on_normalization must be called"
         call = on_norm_calls[0]
@@ -14401,7 +14458,7 @@ class TestRunGraphNormalizationSotaEngine:
             ),
             pytest.raises(FileNotFoundError, match="predicate_normalization.txt"),
         ):
-            loop._run_graph_normalization()
+            _refiner_for(loop).run_normalization()
 
 
 # ---------------------------------------------------------------------------
@@ -14587,7 +14644,7 @@ class TestSafePathComponent:
 
 
 class TestNormalizationLevelGating:
-    """_refine_consolidation_graph gates _run_graph_normalization/enrichment on bool flags.
+    """_refine_consolidation_graph gates GraphTierRefiner normalization/enrichment on bool flags.
 
     Tests:
     - LG-1: normalize=False → normalization NOT called.
@@ -14669,9 +14726,9 @@ class TestNormalizationLevelGating:
         loop = self._make_loop_for_refine(tmp_path, refinement_normalization="off")
         with (
             patch.object(
-                loop, "_run_graph_normalization", return_value={"skipped": True}
+                GraphTierRefiner, "run_normalization", return_value={"skipped": True}
             ) as mock_norm,
-            patch.object(loop, "_run_graph_enrichment", return_value={"skipped": True}),
+            patch.object(GraphTierRefiner, "run_enrichment", return_value={"skipped": True}),
         ):
             loop._refine_consolidation_graph(
                 [],
@@ -14687,12 +14744,12 @@ class TestNormalizationLevelGating:
         loop = self._make_loop_for_refine(tmp_path, refinement_normalization="on")
         with (
             patch.object(
-                loop,
-                "_run_graph_normalization",
+                GraphTierRefiner,
+                "run_normalization",
                 return_value=self._NORM_RETURN,
             ) as mock_norm,
             patch.object(
-                loop, "_run_graph_enrichment", return_value={"skipped": True}
+                GraphTierRefiner, "run_enrichment", return_value={"skipped": True}
             ) as mock_enrich,
         ):
             loop._refine_consolidation_graph(
@@ -14715,13 +14772,13 @@ class TestNormalizationLevelGating:
         )
         with (
             patch.object(
-                loop,
-                "_run_graph_normalization",
+                GraphTierRefiner,
+                "run_normalization",
                 return_value=self._NORM_RETURN,
             ) as mock_norm,
             patch.object(
-                loop,
-                "_run_graph_enrichment",
+                GraphTierRefiner,
+                "run_enrichment",
                 return_value={
                     "skipped": False,
                     "chunks": 0,
@@ -16109,13 +16166,13 @@ class TestFoldResumeHelpers:
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_normalization",
+                    GraphTierRefiner,
+                    "run_normalization",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -16258,8 +16315,8 @@ class TestFoldResumeHelpers:
                 ),
                 patch.object(ConsolidationLoop, "_save_adapters"),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_normalization",
+                    GraphTierRefiner,
+                    "run_normalization",
                     return_value={"skipped": True},
                 ),
                 patch("paramem.models.loader.create_adapter", side_effect=lambda m, c, n: m),
@@ -16342,13 +16399,13 @@ class TestFoldResumeHelpers:
                     ).ReconstructionResult(graph=nx.MultiDiGraph()),
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_normalization",
+                    GraphTierRefiner,
+                    "run_normalization",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),
@@ -16697,8 +16754,8 @@ class TestConsumePendingFullFold:
                     _spy_materialize,
                 ),
                 patch.object(
-                    ConsolidationLoop,
-                    "_run_graph_enrichment",
+                    GraphTierRefiner,
+                    "run_enrichment",
                     return_value={"skipped": True},
                 ),
                 patch.object(ConsolidationLoop, "_enable_gradient_checkpointing"),

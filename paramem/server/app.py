@@ -73,6 +73,7 @@ from paramem.server.incidents import (
 from paramem.server.inference import (
     ChatResult,
     _escalate_to_sota,
+    _sanitize_history,
     handle_chat,
 )
 from paramem.server.router import QueryRouter
@@ -2776,6 +2777,15 @@ async def chat(request: ChatRequest, http_request: Request):
                 else _state.get("sota_agent")
             )
             if agent is not None:
+                # Direct provider testing — no anonymization/policy
+                # branching, matching the pre-lift behaviour: history is
+                # sanitized (never anonymized) via the operator-configured
+                # ``sanitization.mode`` gate.
+                sanitized_history = _sanitize_history(
+                    request.history,
+                    mode=_state["config"].sanitization.mode,
+                    speaker_id=_speaker_id,
+                )
                 result = await loop.run_in_executor(
                     None,
                     lambda: _escalate_to_sota(
@@ -2783,7 +2793,7 @@ async def chat(request: ChatRequest, http_request: Request):
                         agent,
                         _state["config"],
                         speaker=speaker,
-                        history=request.history,
+                        sanitized_history=sanitized_history,
                     ),
                 )
         if result and result.text:
@@ -3170,6 +3180,7 @@ async def _run_chat_turn(
             sota_agent=_state.get("sota_agent"),
             language=language,
             known_entities=_cloud_known_entities,
+            speaker_id=speaker_id,
         )
         buffer.append(
             conversation_id,
@@ -5880,6 +5891,14 @@ def _release_base_model_in_process() -> None:
     ``ConsolidationLoop.release()``, and ``GraphMerger.release()`` for the
     ownership contract.
 
+    NOTE: ``paramem.training.graph_tier.GraphTierRefiner`` also carries a
+    ``# BASE-MODEL HOLDER`` tag (per the CLAUDE.md grep-registry
+    convention) but is NOT a sixth holder above —
+    ``ConsolidationLoop._refine_consolidation_graph`` constructs a fresh
+    instance as a local variable on every call and drops it (no reference
+    retained anywhere) when the method returns, so it needs no release
+    reach from this function.
+
     NOTE: this function CANNOT reach references held in the **lifespan
     async-generator frame** (it stays suspended at ``yield`` for the app's
     lifetime). Those — the ``WeightMemorySource`` boot-preload local and the
@@ -6952,6 +6971,7 @@ async def debug_probe(request: DebugProbeRequest):
             sota_agent=_state.get("sota_agent"),
             language=detected_language,
             known_entities=_cloud_known_entities2,
+            speaker_id=request.speaker_id,
         )
         return ChatResponse(text=cloud_result.text, escalated=True, speaker=speaker_name)
 
@@ -11783,6 +11803,7 @@ def _cloud_only_route(
     sota_agent=None,
     language: str | None = None,
     known_entities: "set[str] | None" = None,
+    speaker_id: str | None = None,
 ) -> ChatResult:
     """Route queries when the local model is unavailable (cloud-only mode).
 
@@ -11793,6 +11814,13 @@ def _cloud_only_route(
     Passed to ``sanitize_for_cloud`` and ``_escalate_to_sota`` so that a
     household name typed directly by the user (e.g. "Where does Alex live?")
     is recognised as personal content and redacted under ``cloud_mode=anonymize``.
+
+    ``speaker_id`` is the resolved canonical speaker ID (or ``None`` for
+    anonymous turns), threaded through to ``_sanitize_history`` so the
+    first-person detector fires on this channel — consistent with the other
+    three ``_sanitize_history`` call sites (``app.py``'s forced-routing
+    debug path and both branches of ``inference.py``'s
+    ``_escalate_via_cloud_policy``).
     """
     from paramem.server.sanitizer import sanitize_for_cloud
 
@@ -11822,14 +11850,19 @@ def _cloud_only_route(
         )
         if sanitized is not None:
             logger.info("Cloud-only route: escalating to SOTA")
+            sanitized_history = _sanitize_history(
+                history,
+                mode=config.sanitization.mode,
+                known_entities=known_entities,
+                speaker_id=speaker_id,
+            )
             result = _escalate_to_sota(
                 sanitized,
                 sota_agent,
                 config,
                 speaker=speaker,
-                history=history,
+                sanitized_history=sanitized_history,
                 language=language,
-                known_entities=known_entities,
             )
             if result.text:
                 logger.info("Cloud-only route: SOTA responded")
@@ -13127,12 +13160,12 @@ def _run_extraction_phase(
                 event_time=session["started_at"],
             )
 
-        for qa in episodic_rels:
-            qa["speaker_id"] = session_speaker_id
+        for rel in episodic_rels:
+            rel["speaker_id"] = session_speaker_id
             # Stamp the real session id for uniform provenance plumbing.
             # Retention machinery (keep-pending) is NOT wired here — the trial
             # path runs mark_sessions=False so sessions cannot be lost regardless.
-            qa["session_id"] = session_id
+            rel["session_id"] = session_id
         for rel in procedural_rels:
             rel["speaker_id"] = session_speaker_id
             rel["session_id"] = session_id
@@ -13795,12 +13828,12 @@ def _extract_pending_sessions(loop, *, lock_held: bool) -> _PendingExtraction:
                 result.aborted = exc
                 return result
 
-            for qa in episodic_rels:
-                qa["speaker_id"] = session_speaker_id
+            for rel in episodic_rels:
+                rel["speaker_id"] = session_speaker_id
                 # Stamp the real session id so provenance survives the
                 # GraphMerger union into edge["sessions"].  Co-located with
                 # the speaker_id stamp.
-                qa["session_id"] = session_id
+                rel["session_id"] = session_id
             for rel in procedural_rels:
                 rel["speaker_id"] = session_speaker_id
                 rel["session_id"] = session_id

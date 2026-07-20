@@ -144,7 +144,8 @@ class ConsolidationConfig:
     # Ship-safe posture: base defaults OFF (no SOTA, no refinement). Operator
     # YAMLs (fixture/local) opt in explicitly.
     sota_enabled: bool = False  # master gate for ALL SOTA (transcript pipeline + graph enrichment)
-    refinement_enrichment: str = "off"  # graph-stage _run_graph_enrichment (SOTA-only). off|on
+    # graph-stage GraphTierRefiner.run_enrichment (SOTA-only). off|on
+    refinement_enrichment: str = "off"
     refinement_normalization: str = "on"  # full-fold predicate-synonym collapse. off|on
     # Whether the merger resolves same-predicate/different-object cardinality
     # conflicts (Case-2 COEXIST/REPLACE) at ingest, interim, and fold.

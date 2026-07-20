@@ -303,12 +303,12 @@ def test_get_name(store, sample_embedding):
 
 
 # ---------------------------------------------------------------------------
-# P3 — resolve_speaker_name (anonymous-suppressed name resolver)
+# resolve_speaker_name (anonymous-suppressed name resolver)
 # ---------------------------------------------------------------------------
 
 
 class TestResolveSpeakerName:
-    """P3: ``resolve_speaker_name`` returns the display name or ``None``.
+    """``resolve_speaker_name`` returns the display name or ``None``.
 
     Miss cases:
     - Unknown speaker_id → ``None`` (no such profile).
@@ -338,7 +338,7 @@ class TestResolveSpeakerName:
         sid = store.register_anonymous(sample_embedding)
         # Verify the profile was created with anonymous_voice method.
         assert store.is_anonymous(sid)
-        # P3 must suppress the anonymous token.
+        # resolve_speaker_name must suppress the anonymous token.
         assert store.resolve_speaker_name(sid) is None
 
     def test_no_exception_on_unknown(self, tmp_path):
