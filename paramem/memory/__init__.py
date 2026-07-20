@@ -41,7 +41,6 @@ from paramem.memory.persistence import (
     commit_tier_slot,
     entry_by_key,
     iter_entries,
-    keys_for_entity,
     load_memory_from_disk,
     save_memory_to_disk,
 )
@@ -73,7 +72,6 @@ __all__ = [
     "get_simhash",
     "iter_entries",
     "iter_interim_dirs",
-    "keys_for_entity",
     "load_memory_from_disk",
     "load_registry",
     "parse_recalled_entry",

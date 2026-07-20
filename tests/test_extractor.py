@@ -307,6 +307,40 @@ class TestNormalizeExtraction:
         result = _normalize_extraction(data)
         assert result["relations"][0]["relation_type"] == "factual"
 
+    def _self_loop_relations(self, subject: str, obj: str) -> list[dict]:
+        """Run one relation through _normalize_extraction and return the survivors."""
+        data = {
+            "entities": [],
+            "relations": [{"subject": subject, "predicate": "studied_at", "object": obj}],
+        }
+        return _normalize_extraction(data)["relations"]
+
+    def test_self_loop_exact_dropped(self):
+        assert self._self_loop_relations("KIT", "KIT") == []
+
+    def test_self_loop_case_variant_dropped(self):
+        assert self._self_loop_relations("KIT", "kit") == []
+
+    def test_self_loop_diacritic_variant_dropped(self):
+        """canonical() folds diacritics, so these land on ONE node key."""
+        assert self._self_loop_relations("José", "Jose") == []
+
+    def test_self_loop_blank_run_variant_dropped(self):
+        """Blank runs fold to ``_``: both endpoints are node key ``new_york``."""
+        assert self._self_loop_relations("New York", "New_York") == []
+
+    def test_self_loop_full_casefold_variant_dropped(self):
+        """ß casefolds to ss — .lower() did not catch this."""
+        assert self._self_loop_relations("Straße", "Strasse") == []
+
+    def test_hyphen_variant_is_not_a_self_loop(self):
+        """``-`` is not a blank: ``anna-maria`` and ``anna_maria`` are DISTINCT
+        node keys, so the relation survives."""
+        assert len(self._self_loop_relations("Anna-Maria", "Anna Maria")) == 1
+
+    def test_distinct_endpoints_survive(self):
+        assert len(self._self_loop_relations("Alex", "KIT")) == 1
+
     def test_captures_extra_fields_as_attributes(self):
         data = {
             "entities": [{"entity": "Alex", "type": "person", "age": "29"}],

@@ -1,11 +1,14 @@
-"""Unit tests for :func:`paramem.graph.name_match.canonical` and the
-speaker-identity primitive :func:`~paramem.graph.name_match.is_speaker_id`.
+"""Unit tests for :func:`paramem.utils.identity.canonical` and the
+speaker-identity primitive :func:`~paramem.utils.identity.is_speaker_id`.
+
+One surface form, project-wide: lower-case, blank runs → single ``_``,
+``-`` and ``_`` preserved verbatim.
 
 Verifies the GUARANTEED-identical-only contract: only Unicode canonical
 form, case (incl. ligatures covered by str.casefold), diacritics, and
-``_``/``-``/whitespace-run folding are collapsed.  NFKC compatibility
-forms (superscript digits, full-width), typos, and substrings are NOT
-folded.
+whitespace runs are collapsed.  ``-`` is NOT folded into ``_`` (nor either
+into a space).  NFKC compatibility forms (superscript digits, full-width),
+typos, and substrings are NOT folded.
 
 Speaker-identity: ONE canonical lowercase form ``speaker{N}`` everywhere.
 :func:`is_speaker_id` accepts both wire casings (``Speaker0`` from legacy
@@ -15,7 +18,7 @@ detect and coerce either form.  The coercion OUTPUT is always lowercase.
 lowercase-uniform refactor — speaker equality is plain ``==``.
 """
 
-from paramem.graph.name_match import (
+from paramem.utils.identity import (
     canonical,
     is_speaker_id,
 )
@@ -29,7 +32,7 @@ class TestCaseFolding:
         assert canonical("alex") == "alex"
 
     def test_mixed_case(self):
-        assert canonical("HELLO World") == "hello world"
+        assert canonical("HELLO World") == "hello_world"
 
     def test_sharp_s(self):
         """German ß casefolds to ss (Unicode full-case folding, not lower())."""
@@ -59,17 +62,34 @@ class TestDiacriticFolding:
 
 
 class TestSeparatorFolding:
-    def test_underscore_to_space(self):
-        assert canonical("works_at") == "works at"
+    """Blanks fold to ``_``; ``-`` and ``_`` survive verbatim."""
 
-    def test_hyphen_to_space(self):
-        assert canonical("sister-in-law") == "sister in law"
+    def test_underscore_preserved(self):
+        assert canonical("works_at") == "works_at"
+
+    def test_space_becomes_underscore(self):
+        assert canonical("works at") == "works_at"
+
+    def test_space_and_underscore_are_one_value(self):
+        """The multiplicity fix: extraction's ``has_hobby`` and prose's
+        ``has hobby`` are a single stored/rendered surface."""
+        assert canonical("has hobby") == canonical("has_hobby") == "has_hobby"
+
+    def test_hyphen_preserved(self):
+        assert canonical("sister-in-law") == "sister-in-law"
+
+    def test_hyphen_not_folded_into_underscore(self):
+        """``-`` is a distinguishing character, not a separator variant."""
+        assert canonical("sister-in-law") != canonical("sister_in_law")
+
+    def test_hyphen_distinct_from_space(self):
+        assert canonical("Anna-Maria") != canonical("Anna Maria")
 
     def test_whitespace_run_collapse(self):
-        assert canonical("  hello   world  ") == "hello world"
+        assert canonical("  hello   world  ") == "hello_world"
 
     def test_mixed_separators(self):
-        assert canonical("phone_number-ext") == "phone number ext"
+        assert canonical("phone_number-ext") == "phone_number-ext"
 
 
 class TestEdgeCases:
@@ -87,7 +107,17 @@ class TestEdgeCases:
 class TestIdempotence:
     def test_idempotent_basic(self):
         """f(f(x)) == f(x) for basic inputs."""
-        for s in ("Alex", "José", "works_at", "Hello World", "ﬁle"):
+        for s in (
+            "Alex",
+            "José",
+            "works_at",
+            "has hobby",
+            "Hello World",
+            "sister-in-law",
+            "phone_number-ext",
+            "Straße",
+            "ﬁle",
+        ):
             once = canonical(s)
             twice = canonical(once)
             assert once == twice, f"Not idempotent for {s!r}: {once!r} → {twice!r}"

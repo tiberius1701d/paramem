@@ -4683,8 +4683,8 @@ class TestConsolidateInterimAdaptersFullFlow:
         Call this on the loop BEFORE calling ``_run_with_mocks`` in tests that
         supply a recon graph with stamped edges.
         """
-        from paramem.graph.name_match import canonical as _canonical
         from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.utils.identity import canonical as _canonical
 
         def _spy_merge_relations(
             relations,
@@ -5007,7 +5007,7 @@ class TestConsolidateInterimAdaptersFullFlow:
                         merged_g.add_node(_subj)
                     if not merged_g.has_node(_obj):
                         merged_g.add_node(_obj)
-                    from paramem.graph.name_match import canonical as _canonical
+                    from paramem.utils.identity import canonical as _canonical
 
                     _eid = merged_g.add_edge(
                         _subj,
@@ -5468,7 +5468,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         existing_eid = m.graph.add_edge(
             "Alice",
             "Berlin",
-            predicate="lives in",
+            predicate="lives_in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",
@@ -5480,8 +5480,8 @@ class TestConsolidateInterimAdaptersFullFlow:
         assert m.graph["Alice"]["Berlin"][existing_eid].get(_IK_KEY_ATTR) is None
 
         # Upsert the same triple with indexed_key set — should adopt via Case-1.
-        # Incoming predicate "lives_in" canonicalizes to "lives in" (space form),
-        # matching the pre-seeded edge predicate.
+        # Incoming predicate "lives_in" is already canonical, matching the
+        # pre-seeded edge predicate byte-for-byte (one surface form).
         incoming = Relation(
             subject="Alice",
             predicate="lives_in",
@@ -5500,7 +5500,7 @@ class TestConsolidateInterimAdaptersFullFlow:
         )
         # No duplicate edge should have been inserted (still one edge for this (s,p,o)).
         same_pred_edges = [
-            k for k, d in m.graph["Alice"]["Berlin"].items() if d.get("predicate") == "lives in"
+            k for k, d in m.graph["Alice"]["Berlin"].items() if d.get("predicate") == "lives_in"
         ]
         assert len(same_pred_edges) == 1, (
             f"Expected exactly 1 edge after Case-1-adopt; got {len(same_pred_edges)}"
@@ -9630,7 +9630,7 @@ class TestMintedFingerprintMatchesEntryDisplaySurface:
 
         # Sanity: canonical() actually folds these names (otherwise the test
         # would not exercise the divergence at all).
-        from paramem.graph.name_match import canonical
+        from paramem.utils.identity import canonical
 
         assert canonical("Jean-Luc Picard") != "Jean-Luc Picard"
         assert canonical("Saint-Étienne") != "Saint-Étienne"
@@ -12244,7 +12244,7 @@ class TestMergeRegistryRelationsUnification:
         ):
             loop._materialize_consolidation_graph(extra_relations=extra_relations)
 
-        from paramem.graph.name_match import canonical
+        from paramem.utils.identity import canonical
 
         node_key = canonical("Mara")
         # Node must exist (the edge was merged), but must NOT have entity_type="person"
@@ -12695,7 +12695,7 @@ class TestSameAsSpeakerPairGuard:
         """
         from unittest.mock import patch
 
-        from paramem.graph.name_match import is_speaker_id
+        from paramem.utils.identity import is_speaker_id
 
         loop = self._make_speaker_pair_guard_loop(tmp_path)
         graph = loop.merger.graph
@@ -13269,8 +13269,8 @@ class TestMergeRegistryRelationsTimestamp:
 
         # GraphMerger with a mock model so Case-2 fires.
         merger = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
-        # Pre-cache "lives in" as single-valued (REPLACE) to skip the model call.
-        merger._predicate_cardinality["lives in"] = False
+        # Pre-cache "lives_in" as single-valued (REPLACE) to skip the model call.
+        merger._predicate_cardinality["lives_in"] = False
         loop.merger = merger
 
         store = MemoryStore(replay_enabled=True)
@@ -13336,7 +13336,7 @@ class TestMergeRegistryRelationsTimestamp:
             obj
             for obj in loop.merger.graph.successors("alex")
             for _, d in loop.merger.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
         assert "munich" in lives_in_objects, (
             "Dated munich key must survive: a dated candidate always outranks an undated rival"
@@ -13452,7 +13452,7 @@ class TestMergeRegistryRelationsTimestamp:
             obj
             for obj in loop.merger.graph.successors("alex")
             for _, d in loop.merger.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
         assert "berlin" in lives_in_objects, (
             "Newer pending Berlin must be inserted (supersedes older Munich)"
@@ -13529,7 +13529,7 @@ class TestMergeRegistryRelationsTimestamp:
             obj
             for obj in loop.merger.graph.successors("alex")
             for _, d in loop.merger.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
         assert "berlin" in lives_in_objects, "Dated pending Berlin must be inserted"
         assert "munich" not in lives_in_objects, (
@@ -13720,8 +13720,8 @@ class TestRunGraphNormalizationApply:
     @staticmethod
     def _add_keyed_edge(graph, subj, obj, predicate, ik_key, *, sessions=None, recurrence=1):
         """Add a directed edge with standard attributes and a keyed ik_key."""
-        from paramem.graph.name_match import canonical as _can
         from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.utils.identity import canonical as _can
 
         subj = _can(subj)
         obj = _can(obj)
@@ -13741,7 +13741,7 @@ class TestRunGraphNormalizationApply:
     @staticmethod
     def _add_keyless_edge(graph, subj, obj, predicate, *, sessions=None, recurrence=1):
         """Add a directed edge WITHOUT an ik_key (simulates a fresh-ingested fact)."""
-        from paramem.graph.name_match import canonical as _can
+        from paramem.utils.identity import canonical as _can
 
         subj = _can(subj)
         obj = _can(obj)
@@ -13795,7 +13795,7 @@ class TestRunGraphNormalizationApply:
         )
 
         # Cluster: both predicates are synonyms; MAX rec (graph87, rec=2) survives.
-        cluster_response = self._cluster_response([["works for", "employed by"]])
+        cluster_response = self._cluster_response([["works_for", "employed_by"]])
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
@@ -13834,7 +13834,7 @@ class TestRunGraphNormalizationApply:
             graph, "jordan", "techcorp", "employed_by", sessions=["s2"], recurrence=3
         )
 
-        cluster_response = self._cluster_response([["works for", "employed by"]])
+        cluster_response = self._cluster_response([["works_for", "employed_by"]])
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
@@ -13845,9 +13845,9 @@ class TestRunGraphNormalizationApply:
         remaining_preds = {
             edata["predicate"] for _, _, edata in graph.edges(data=True) if edata.get("predicate")
         }
-        # canonical() folds underscores to spaces.  employed_by (rec=3) survives.
-        assert "works for" not in remaining_preds, "lower-rec edge must be removed"
-        assert "employed by" in remaining_preds, "MAX-rec survivor must remain"
+        # One surface form: the stored predicate IS "employed_by" (rec=3 survives).
+        assert "works_for" not in remaining_preds, "lower-rec edge must be removed"
+        assert "employed_by" in remaining_preds, "MAX-rec survivor must remain"
         assert not loop.merger.removal_ledger, "no ledger entry for keyless retirements"
 
         assert result["edges_retired"] == 1
@@ -14147,7 +14147,7 @@ class TestRunGraphNormalizationApply:
         self._add_keyed_edge(graph, "jordan", "techcorp", "employed_by", "graph87", sessions=["s3"])
 
         # Cluster for the jordan/techcorp group; 'works for' first -> graph42 survives.
-        cluster_response = self._cluster_response([["works for", "employed by"]])
+        cluster_response = self._cluster_response([["works_for", "employed_by"]])
 
         with (
             patch("paramem.graph.extractor.generate_answer", return_value=cluster_response),
@@ -14295,8 +14295,8 @@ class TestRunGraphNormalizationSotaEngine:
 
     @staticmethod
     def _add_keyed_edge(graph, subj, obj, predicate, ik_key, *, sessions=None, recurrence=1):
-        from paramem.graph.name_match import canonical as _can
         from paramem.memory.persistence import _IK_KEY_ATTR
+        from paramem.utils.identity import canonical as _can
 
         subj = _can(subj)
         obj = _can(obj)

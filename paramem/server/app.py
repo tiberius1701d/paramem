@@ -44,7 +44,6 @@ from paramem.backup.backup import write as backup_write
 from paramem.backup.backup import write_bundle
 from paramem.backup.types import ArtifactKind
 from paramem.graph.extractor import ExtractionFailed
-from paramem.graph.name_match import is_speaker_id as _is_speaker_id
 from paramem.models.loader import (
     active_adapter_name,
     load_base_model,
@@ -106,6 +105,8 @@ from paramem.server.vram_validator import (
 )
 from paramem.training.consolidation import AbortedDuringConsolidation
 from paramem.training.thermal_throttle import ThermalPolicy, wait_for_cooldown
+from paramem.utils.identity import canonical as _canonical
+from paramem.utils.identity import is_speaker_id as _is_speaker_id
 from paramem.utils.notify import SERVER_CLOUD_ONLY, notify_server
 from paramem.utils.paths import find_project_root
 
@@ -3169,7 +3170,9 @@ async def _run_chat_turn(
         if _cloud_speaker_store is not None:
             _names = _cloud_speaker_store.household_display_names()
             if _names:
-                _cloud_known_entities = {n.lower().strip() for n in _names if n}
+                # Real case preserved: the sanitizer's known-entity scrub is
+                # exact-case, whole-word (person "Bill" vs invoice "bill").
+                _cloud_known_entities = {n.strip() for n in _names if n}
         result = _cloud_only_route(
             text=text,
             speaker=display_speaker,
@@ -6758,14 +6761,14 @@ async def speaker_forget(request: SpeakerForgetRequest):
         )
 
     config = _state["config"]
-    # Normalize the incoming speaker_id to lowercase so external cased input
+    # Canonicalize the incoming speaker_id so external cased input
     # (e.g. "Speaker0") matches the internally stored canonical form ("speaker0")
     # produced by set_bookkeeping's is_speaker_id gate.  Single normalization
     # here covers all three comparisons below (bookkeeping, speaker_store.remove,
     # session_meta match).
     speaker_id = request.speaker_id
     if _is_speaker_id(speaker_id):
-        speaker_id = speaker_id.lower()
+        speaker_id = _canonical(speaker_id)
 
     # Locate keys for this speaker via the registry bookkeeping (source of
     # truth) rather than the resident merger.graph (which is cleared at
@@ -6960,7 +6963,9 @@ async def debug_probe(request: DebugProbeRequest):
         if _cloud_speaker_store2 is not None:
             _names2 = _cloud_speaker_store2.household_display_names()
             if _names2:
-                _cloud_known_entities2 = {n.lower().strip() for n in _names2 if n}
+                # Real case preserved: the sanitizer's known-entity scrub is
+                # exact-case, whole-word (person "Bill" vs invoice "bill").
+                _cloud_known_entities2 = {n.strip() for n in _names2 if n}
         cloud_result = _cloud_only_route(
             text=request.text,
             speaker=speaker_name,
@@ -11810,7 +11815,8 @@ def _cloud_only_route(
     HA first (has tools for weather, time, devices), SOTA as fallback
     for reasoning. Mutual fallback: if one fails, try the other.
 
-    ``known_entities`` is the set of lowercased household display names.
+    ``known_entities`` is the set of household display names in their stored
+    (real) case — the sanitizer's known-entity scrub matches exact-case.
     Passed to ``sanitize_for_cloud`` and ``_escalate_to_sota`` so that a
     household name typed directly by the user (e.g. "Where does Alex live?")
     is recognised as personal content and redacted under ``cloud_mode=anonymize``.

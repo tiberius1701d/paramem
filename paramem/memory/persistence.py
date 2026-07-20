@@ -12,8 +12,6 @@ Public API
 - :func:`load_memory_from_disk` — decryption-aware read; empty graph on miss.
 - :func:`iter_entries` — yield entry dicts for every edge carrying an indexed key.
 - :func:`entry_by_key` — look up a single key; ``None`` on miss.
-- :func:`keys_for_entity` — edge keys where lower(subject) or lower(object)
-  matches the query.
 - :func:`build_tier_graph_from_store` — project a :class:`MemoryStore` tier
   to a fresh ``MultiDiGraph`` for persistence.
 - :func:`commit_tier_slot` — atomic write of one interim tier slot (registry written last
@@ -26,9 +24,8 @@ NetworkX's ``node_link_data`` serialisation format uses ``"key"`` as the
 reserved field name for the multigraph edge-key integer in the JSON output.
 To avoid collision, the indexed-memory key string is stored as the internal
 edge-data attribute ``"ik_key"``.  All public API functions
-(:func:`iter_entries`, :func:`entry_by_key`, :func:`keys_for_entity`)
-map ``"ik_key"`` to ``"key"`` in the dict they return so callers see the
-canonical entry shape.
+(:func:`iter_entries`, :func:`entry_by_key`) map ``"ik_key"`` to ``"key"``
+in the dict they return so callers see the canonical entry shape.
 
 The public entry schema is:
 
@@ -203,27 +200,6 @@ def entry_by_key(graph: nx.MultiDiGraph, key: str) -> dict | None:
         if entry["key"] == key:
             return entry
     return None
-
-
-def keys_for_entity(graph: nx.MultiDiGraph, entity_lower: str) -> set[str]:
-    """Return every indexed-memory key whose subject or object matches *entity_lower*.
-
-    Case-insensitive: ``entity_lower`` must already be lowercased by the
-    caller; the function lowercases the subject/object read from each edge.
-
-    Args:
-        graph: Source ``MultiDiGraph``.
-        entity_lower: Lowercase entity name to match (e.g. ``"alice"``).
-
-    Returns:
-        Set of key strings where the edge subject or object matches; may be
-        empty.
-    """
-    matched: set[str] = set()
-    for entry in iter_entries(graph):
-        if entry["subject"].lower() == entity_lower or entry["object"].lower() == entity_lower:
-            matched.add(entry["key"])
-    return matched
 
 
 def _add_keyed_edge(

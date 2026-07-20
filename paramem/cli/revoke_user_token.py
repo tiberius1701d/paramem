@@ -148,8 +148,8 @@ def run(args: argparse.Namespace) -> int:
         0 on success or ``--list``; 1 on error (config not found, no match,
         I/O error, store write failure).
     """
-    from paramem.graph.name_match import is_speaker_id
     from paramem.server.user_tokens import UserTokenStore
+    from paramem.utils.identity import canonical, is_speaker_id
 
     data_dir = _resolve_data_dir(args)
     if data_dir is None:
@@ -176,7 +176,7 @@ def run(args: argparse.Namespace) -> int:
         # to the canonical lowercase form so the preview match below (and the
         # revoke_speaker() call) agree with the canonical form store.list()
         # returns for entries minted via the same coercion.
-        speaker = args.speaker.lower() if is_speaker_id(args.speaker) else args.speaker
+        speaker = canonical(args.speaker) if is_speaker_id(args.speaker) else args.speaker
 
         # Preview what will be revoked.
         entries = store.list()

@@ -19,6 +19,7 @@ from pathlib import Path
 
 import yaml
 
+from paramem.utils.identity import canonical
 from paramem.utils.paths import find_project_root
 
 logger = logging.getLogger(__name__)
@@ -176,12 +177,15 @@ def fallback_relation_type(path: str | None = None) -> str:
 
 
 def anonymizer_prefix_to_type(path: str | None = None) -> dict[str, str]:
-    """Return ``{prefix_lower: entity_type}`` — reverse map for de-anonymization.
+    """Return ``{canonical_prefix: entity_type}`` — reverse map for de-anonymization.
 
-    Keys are lowercased because callers (e.g.
-    :func:`~paramem.graph.placeholders.prefix_to_entity_type`, reached via
+    Keys are canonicalized via :func:`~paramem.utils.identity.canonical`
+    because the sole lookup site
+    (:func:`~paramem.graph.placeholders.prefix_to_entity_type`, reached via
     :func:`~paramem.graph.placeholders.placeholder_entity_type` for a full
-    placeholder token) look up a placeholder's prefix case-insensitively.
+    placeholder token) canonicalizes the placeholder's prefix before
+    querying.  Both sides of the map contract use the one identity routine,
+    so a cased or spaced YAML prefix can never silently miss.
 
     Args:
         path: Optional override path for the schema YAML.
@@ -192,17 +196,22 @@ def anonymizer_prefix_to_type(path: str | None = None) -> dict[str, str]:
     """
     cfg = load_schema_config(path)
     return {
-        entry["prefix"].lower(): entry["entity_type"] for entry in cfg["anonymizer"]["prefixes"]
+        canonical(entry["prefix"]): entry["entity_type"] for entry in cfg["anonymizer"]["prefixes"]
     }
 
 
 def anonymizer_type_to_prefix(path: str | None = None) -> dict[str, str]:
-    """Return ``{entity_type: prefix}`` for entries marked ``primary_for_type=True``.
+    """Return ``{canonical_entity_type: prefix}`` for entries marked ``primary_for_type=True``.
 
     Used by :func:`~paramem.graph.placeholders.entity_type_to_prefix` — the
     closed-vocabulary lookup consulted first when minting a placeholder
     prefix for an entity type. Only types with a primary prefix are
     eligible; others fall through to the open-vocabulary PascalCase path.
+
+    Keys are canonicalized via :func:`~paramem.utils.identity.canonical`
+    to match the canonicalization the lookup site applies to its query.
+    Both sides of the map contract use the one identity routine, so a cased
+    or spaced YAML ``entity_type`` can never silently miss.
 
     Args:
         path: Optional override path for the schema YAML.
@@ -213,7 +222,7 @@ def anonymizer_type_to_prefix(path: str | None = None) -> dict[str, str]:
     """
     cfg = load_schema_config(path)
     return {
-        entry["entity_type"]: entry["prefix"]
+        canonical(entry["entity_type"]): entry["prefix"]
         for entry in cfg["anonymizer"]["prefixes"]
         if entry.get("primary_for_type", False)
     }

@@ -7,7 +7,7 @@ indexed-key distillation path (``ConsolidationLoop._entries_from_graph``).
 
 from typing import TYPE_CHECKING
 
-from paramem.graph.name_match import canonical
+from paramem.utils.identity import canonical
 
 if TYPE_CHECKING:
     from paramem.graph.schema import Entity
@@ -15,8 +15,12 @@ if TYPE_CHECKING:
 # Supplementary predicate set for procedural filtering.
 # Primary gate is relation_type == "preference"; this catches cases where
 # the extractor used a preference predicate but tagged the relation as factual.
+# Both this set and the incoming predicate go through canonical(), so the set
+# and the comparison share one surface-form contract — a predicate the model
+# emits as "has hobby" and one it emits as "has_hobby" are the same member.
 _PROCEDURAL_PREDICATES = frozenset(
-    {
+    canonical(p)
+    for p in (
         "prefers",
         "likes",
         "dislikes",
@@ -27,7 +31,7 @@ _PROCEDURAL_PREDICATES = frozenset(
         "listens_to",
         "avoids",
         "favorite",
-    }
+    )
 )
 
 
@@ -36,12 +40,16 @@ def filter_procedural_relations(relations: list[dict]) -> list[dict]:
 
     Primary gate: relation_type == "preference" (catches model-coined predicates).
     Secondary: predicate in supplementary set (catches mis-tagged preferences).
+
+    The secondary gate compares canonical surface forms on both sides, so
+    ``"has_hobby"``, ``"has hobby"`` and ``"Has Hobby"`` all match the same
+    member.
     """
     result = []
     for rel in relations:
         if rel.get("relation_type") == "preference":
             result.append(rel)
-        elif rel.get("predicate", "").lower() in _PROCEDURAL_PREDICATES:
+        elif canonical(rel.get("predicate", "")) in _PROCEDURAL_PREDICATES:
             result.append(rel)
     return result
 
@@ -91,9 +99,9 @@ def _flatten_entity_attributes(
         }
 
     Predicate normalisation: attribute keys are passed through
-    :func:`paramem.graph.name_match.canonical` (case-fold, diacritic-fold,
-    separator-fold) and prefixed with ``"has_"``
-    (``"phone number"`` → ``"has_phone number"``).
+    :func:`paramem.utils.identity.canonical` (case-fold, diacritic-fold,
+    blank runs → ``_``) and prefixed with ``"has_"``
+    (``"phone number"`` → ``"has_phone_number"``).
 
     Pairs whose ``(subject, predicate)`` already appears in ``exclude_pairs``
     are skipped — prevents duplicate keying when an explicit ``has_<key>``
@@ -113,8 +121,9 @@ def _flatten_entity_attributes(
             if not val_str:
                 continue
             # Normalise predicate via canonical identity function.
-            # canonical() folds case/separators; the "has_" prefix is a stable
-            # compound that canonical_id() will normalize at merger time.
+            # canonical() emits the one project-wide surface form; the "has_"
+            # prefix keeps that form (underscores survive canonical()), so the
+            # merger's re-canonicalization at node-identity time is a no-op.
             predicate = f"has_{canonical(raw_key)}"
             pair = (entity.name, predicate)
             if pair in _exclude:

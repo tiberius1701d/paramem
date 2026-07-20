@@ -131,8 +131,8 @@ import threading
 from collections.abc import Iterator
 
 from paramem.graph.merger import min_nonempty
-from paramem.graph.name_match import is_speaker_id
 from paramem.training.key_registry import KeyRegistry
+from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +350,8 @@ class MemoryStore:
         Does NOT touch ``_entries`` — bookkeeping presence MUST NOT
         manufacture a content cache hit.
 
-        ``speaker_id`` is normalized to lowercase when it matches the
+        ``speaker_id`` is canonicalized via
+        :func:`~paramem.utils.identity.canonical` when it matches the
         ``speaker{N}`` pattern (``is_speaker_id``).  This makes the probe
         speaker-filter casing invariant hold for BOTH legacy-loaded and
         runtime-set data: legacy cased ``Speaker0`` from ``key_metadata.json``
@@ -359,7 +360,7 @@ class MemoryStore:
         self-healing on the next save.  Empty strings and non-speaker values
         pass through unchanged."""
         if is_speaker_id(speaker_id):
-            speaker_id = speaker_id.lower()
+            speaker_id = canonical(speaker_id)
         if not speaker_id and not allow_empty_speaker:
             raise ValueError(
                 f"set_bookkeeping: empty speaker_id for key {key!r} without "

@@ -32,10 +32,10 @@ from pathlib import Path
 import networkx as nx
 from rapidfuzz import fuzz
 
-from paramem.graph.name_match import canonical as canonical_id
-from paramem.graph.name_match import is_speaker_id
 from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import Entity, Relation, SessionGraph
+from paramem.utils.identity import canonical as canonical_id
+from paramem.utils.identity import is_speaker_id
 
 logger = logging.getLogger(__name__)
 

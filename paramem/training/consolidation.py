@@ -20,7 +20,6 @@ from torch.utils.data import Dataset
 
 from paramem.graph.extraction_pipeline import ExtractionConfig, ExtractionPipeline
 from paramem.graph.merger import GraphMerger
-from paramem.graph.name_match import canonical
 from paramem.graph.phase_trace import extraction_trace, phase_trace
 from paramem.graph.reconstruct import reconstruct_graph
 from paramem.graph.relation_prep import (
@@ -48,6 +47,7 @@ from paramem.utils.config import (
     TrainingConfig,
     WandbConfig,
 )
+from paramem.utils.identity import canonical
 
 logger = logging.getLogger(__name__)
 

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import inspect
 
-from paramem.graph.name_match import is_speaker_id
 from paramem.graph.placeholders import (
     PLACEHOLDER_SHAPE_RE,
     PLACEHOLDER_TOKEN_RE,
@@ -29,6 +28,7 @@ from paramem.graph.placeholders import (
     placeholder_entity_type,
     prefix_to_entity_type,
 )
+from paramem.utils.identity import is_speaker_id
 
 
 class TestMintPlaceholder:
@@ -311,7 +311,7 @@ class TestSubstituteWholeWordsEdgeAwareBoundaries:
 class TestSubstituteWholeWordsExactMatchRegression:
     """Matching in :func:`_substitute_whole_words` is exact (raw
     ``==``), never routed through
-    :func:`~paramem.graph.name_match.canonical`. Canonical (case-/
+    :func:`~paramem.utils.identity.canonical`. Canonical (case-/
     separator-/diacritic-folded) matching would let a mapped person name
     (e.g. ``"Bill"``) silently consume its lowercase common-noun homograph
     (``"bill"``) in free transcript text, and would defeat the fail-closed

@@ -22,8 +22,8 @@ from typing import TYPE_CHECKING, Callable, Protocol
 
 from paramem.graph.extractor import _resolve_sota_api_key, normalize_predicates
 from paramem.graph.merger import GraphMerger, min_nonempty
-from paramem.graph.name_match import canonical
 from paramem.training import graph_enrich
+from paramem.utils.identity import canonical
 
 if TYPE_CHECKING:
     from paramem.graph.extraction_pipeline import ExtractionConfig

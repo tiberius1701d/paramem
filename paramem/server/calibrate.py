@@ -1195,8 +1195,8 @@ def calibrate_normalize(state: dict, req: CalibrateNormalizeRequest) -> dict[str
     is applied locally to produce ``surviving_relations`` for inspection.
     """
     from paramem.graph.extractor import normalize_predicates
-    from paramem.graph.name_match import canonical as _can
     from paramem.models.loader import base_model_inference
+    from paramem.utils.identity import canonical as _can
 
     model = state.get("model")
     tokenizer = state.get("tokenizer")

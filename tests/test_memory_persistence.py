@@ -25,7 +25,6 @@ from paramem.memory.persistence import (
     build_tier_graph_from_store,
     entry_by_key,
     iter_entries,
-    keys_for_entity,
     load_memory_from_disk,
     save_memory_to_disk,
 )
@@ -373,86 +372,6 @@ class TestEntryByKey:
         result = entry_by_key(g, "graph1")
         assert result is not None
         assert result["key"] == "graph1"
-
-
-# ---------------------------------------------------------------------------
-# 6. keys_for_entity: case-insensitive on subject and object
-# ---------------------------------------------------------------------------
-
-
-class TestKeysForEntity:
-    def test_matches_subject_case_insensitively(self):
-        """keys_for_entity matches subject regardless of case in the graph."""
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g,
-            "Alice",
-            "Berlin",
-            indexed_key="graph1",
-            predicate="lives_in",
-            speaker_id="S0",
-        )
-        # Lowercase query should match capitalised "Alice".
-        result = keys_for_entity(g, "alice")
-        assert "graph1" in result
-
-    def test_matches_object_case_insensitively(self):
-        """keys_for_entity matches the object node regardless of case."""
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g,
-            "Charlie",
-            "alice",
-            indexed_key="graph2",
-            predicate="knows",
-            speaker_id="S0",
-        )
-        # The object "alice" should match the query "alice".
-        result = keys_for_entity(g, "alice")
-        assert "graph2" in result
-
-    def test_no_match_returns_empty_set(self):
-        """keys_for_entity returns an empty set when no edge matches."""
-        g = _make_simple_graph()
-        result = keys_for_entity(g, "charlie")
-        assert result == set()
-
-    def test_multiple_matches_returns_all_keys(self):
-        """All matching keys are returned, not just the first one."""
-        g = nx.MultiDiGraph()
-        _add_keyed_edge(
-            g,
-            "Alice",
-            "Berlin",
-            indexed_key="graph1",
-            predicate="lives_in",
-            speaker_id="S0",
-        )
-        _add_keyed_edge(
-            g,
-            "Alice",
-            "Engineer",
-            indexed_key="graph2",
-            predicate="has_job",
-            speaker_id="S0",
-        )
-        _add_keyed_edge(
-            g,
-            "Bob",
-            "Alice",
-            indexed_key="graph3",
-            predicate="knows",
-            speaker_id="S0",
-        )
-        result = keys_for_entity(g, "alice")
-        assert result == {"graph1", "graph2", "graph3"}
-
-    def test_skips_keyless_edges(self):
-        """Keyless edges are ignored (iter_entries skips them)."""
-        g = nx.MultiDiGraph()
-        g.add_edge("Alice", "Berlin")  # no "key" attribute in data
-        result = keys_for_entity(g, "alice")
-        assert result == set()
 
 
 # ---------------------------------------------------------------------------

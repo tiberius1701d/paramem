@@ -33,7 +33,6 @@ import logging
 from dataclasses import dataclass, field
 
 from paramem.evaluation.recall import generate_answer
-from paramem.graph.name_match import is_speaker_id
 from paramem.graph.prompts import _load_speaker_directive_section
 from paramem.models.loader import adapt_messages, grad_checkpointing_disabled
 from paramem.server.cloud.base import CloudAgent
@@ -43,6 +42,7 @@ from paramem.server.router import Intent, RoutingPlan
 from paramem.server.sanitizer import sanitize_for_cloud
 from paramem.server.tools.ha_client import HAClient
 from paramem.training.thermal_throttle import wait_for_cooldown as _wait_for_cooldown
+from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -281,13 +281,18 @@ def handle_chat(
             # ground truth the extraction-path anonymizer uses, no static
             # keyword list.  The set is rebuilt per /chat call; cost is O(N)
             # over active keys (~hundreds in production).
+            #
+            # Names are stripped but NOT case-folded: the sanitizer's
+            # known-entity scrub matches exact-case, whole-word (case is the
+            # only signal separating the person "Bill" from an electricity
+            # "bill"), so it needs the display surface as stored.
             if known_entities is None and memory_store is not None:
                 _entity_names: set[str] = set()
                 for _tier, _key, _entry in memory_store.iter_entries():
                     for _field in ("subject", "object"):
                         _name = _entry.get(_field, "")
                         if _name and len(_name) > 1:
-                            _entity_names.add(_name.lower().strip())
+                            _entity_names.add(_name.strip())
                 known_entities = _entity_names
             # M3: ensure the speaker's display name is always a personal-referent
             # signal regardless of what subjects appear in the registry.  Under
@@ -299,7 +304,7 @@ def handle_chat(
             if speaker and len(speaker) > 1:
                 if known_entities is None:
                     known_entities = set()
-                known_entities = known_entities | {speaker.lower().strip()}
+                known_entities = known_entities | {speaker.strip()}
             # Extend known_entities with non-anonymous household display names so
             # the sanitizer covers all enrolled speakers, not just the active one.
             # household_display_names() filters out anonymous profiles
@@ -311,19 +316,18 @@ def handle_chat(
                 if _household_names:
                     if known_entities is None:
                         known_entities = set()
-                    known_entities = known_entities | {
-                        n.lower().strip() for n in _household_names if n
-                    }
+                    known_entities = known_entities | {n.strip() for n in _household_names if n}
 
             # Build the speaker resolver closure once per request.  Passed into
             # memory_store.probe so raw speaker{N} tokens in recalled facts are
             # replaced with display names at the render boundary.
-            # read-tolerance: .lower() before lookup so pre-migration cased tokens
-            # (e.g. "Speaker0") still resolve during the forward-only transition.
+            # read-tolerance: canonicalize before lookup so pre-migration cased
+            # tokens (e.g. "Speaker0") still resolve during the forward-only
+            # transition.
             def _speaker_resolver(tok: str) -> str:
                 if not is_speaker_id(tok):
                     return tok
-                name = speaker_store.resolve_speaker_name(tok.lower()) if speaker_store else None
+                name = speaker_store.resolve_speaker_name(canonical(tok)) if speaker_store else None
                 return name if name else THIRD_PARTY_DESCRIPTOR
 
             sanitized_text, sanitization_findings = sanitize_for_cloud(
@@ -557,7 +561,7 @@ def _sanitize_history(
             ``sanitization.mode`` — a personal-content history turn is
             always dropped, never merely warned-and-passed, when the
             current turn is being placeholdered for privacy.
-        known_entities: Optional set of lowercased entity/speaker names to
+        known_entities: Optional set of **real-case** entity/speaker names to
             treat as personal referents.  When provided, household display
             names are recognised as personal content and stripped/replaced
             so they never egress to the cloud.  ``None`` → same behaviour

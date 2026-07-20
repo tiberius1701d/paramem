@@ -45,7 +45,7 @@ from gpu_guard import (  # noqa: F401 — re-exported for legacy imports
     set_default_notifier,
 )
 
-from paramem.gpu_consumer import adapter as _paramem_env_stamp_adapter
+from paramem.utils.gpu_consumer import adapter as _paramem_env_stamp_adapter
 from paramem.utils.notify import (  # noqa: F401
     ML_FINISHED,
     ML_PAUSED,

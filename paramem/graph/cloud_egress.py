@@ -49,7 +49,6 @@ from pathlib import Path
 from typing import Literal
 
 from paramem.evaluation.recall import generate_answer
-from paramem.graph.name_match import canonical, is_speaker_id
 from paramem.graph.placeholders import (
     _apply_bindings,
     _build_anon_facts,
@@ -65,6 +64,7 @@ from paramem.graph.prompts import _load_prompt
 from paramem.graph.schema import SessionGraph
 from paramem.models.loader import adapt_messages
 from paramem.server.vram_guard import vram_scope
+from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -586,7 +586,7 @@ def anonymize_for_cloud(
        persist (``{"inverted": N, "dropped": N}``).
     5. **Identity reconciliation** (only when ``identity_domain is not
        None`` — the graph tier's pre-step, generalized as data).  Every
-       mapping key is folded through :func:`~paramem.graph.name_match.
+       mapping key is folded through :func:`~paramem.utils.identity.
        canonical` and matched against the (also-canonicalized) entries of
        ``identity_domain``.  A unique match is re-keyed onto the domain
        surface with the model's placeholder preserved verbatim; a miss or

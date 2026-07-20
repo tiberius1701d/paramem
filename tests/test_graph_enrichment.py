@@ -262,11 +262,11 @@ class TestEnrichmentAddsEdgesWithSourceTag:
 
         # Verify the added edge carries source="graph_enrichment".
         # Nodes are canonical-keyed; predicate is stored in canonical form too
-        # ("colleague_of" → "colleague of" after canonical() separator-fold).
+        # ("colleague of" → "colleague_of" after the canonical() blank-fold).
         found = False
         for _, _, data in graph.out_edges("person0", data=True):
             if (
-                data.get("predicate") == "colleague of"
+                data.get("predicate") == "colleague_of"
                 and data.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
             ):
                 found = True
@@ -323,7 +323,7 @@ class TestEnrichmentInheritsSourceWindow:
         found = None
         for _, _, data in graph.out_edges("person0", data=True):
             if (
-                data.get("predicate") == "colleague of"
+                data.get("predicate") == "colleague_of"
                 and data.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
             ):
                 found = data
@@ -378,15 +378,15 @@ class TestLowConfidenceDropped:
         assert result["new_edges"] == 1, "Only the 0.9-confidence edge should land"
 
         # Nodes are canonical-keyed; predicates stored in canonical form
-        # ("friend_of" → "friend of", "colleague_of" → "colleague of").
+        # ("friend of" → "friend_of", "colleague of" → "colleague_of").
         edges_from_p0 = list(graph.out_edges("person0", data=True))
         predicates = {
             d.get("predicate")
             for _, _, d in edges_from_p0
             if d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
         }
-        assert "friend of" in predicates
-        assert "colleague of" not in predicates
+        assert "friend_of" in predicates
+        assert "colleague_of" not in predicates
 
 
 class TestSameAsContractsNodes:
@@ -514,17 +514,157 @@ class TestSameAsSurnameMismatchRejected:
         assert "Wang Min" in graph.nodes
 
 
+def _same_as_per_chunk(*per_chunk: list[list[str]]):
+    """Build a ``_graph_enrich_with_sota`` side_effect yielding one result per chunk.
+
+    Chunk *i* receives ``per_chunk[i]`` as its ``same_as`` pair list; every chunk
+    beyond the supplied sequence receives an empty list.  Used by the tests that
+    need DIFFERENT chunks to propose the same entity pair under different surface
+    forms, which a single ``return_value`` (identical for every chunk) cannot
+    express.  Returns the callable; the caller reads ``call_count`` off the patch
+    to assert the multi-chunk path was genuinely exercised.
+    """
+    calls = {"n": 0}
+
+    def _side_effect(*_args, **_kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        pairs = list(per_chunk[i]) if i < len(per_chunk) else []
+        return ([], pairs, "raw")
+
+    return _side_effect
+
+
 class TestSameAsDedupAcrossChunks:
-    """Duplicate same_as pairs (same pair, any order) must apply exactly once."""
+    """Cross-chunk same_as proposal handling.
+
+    Two properties, and they pull in opposite directions:
+
+    * A pair already contracted must not contract again (rule 1 — the dropped
+      node is gone from the live graph).
+    * A pair REJECTED by the surface gate on one chunk's surfaces must still be
+      re-evaluated on another chunk's surfaces, because the gate reads the
+      surfaces and overlapping ego-graph chunks supply different ones.
+    """
+
+    def test_gate_reevaluated_per_chunk_surfaces(self, tmp_path, monkeypatch):
+        """A gate rejection on one chunk must not suppress a later chunk's proposal.
+
+        Both chunks propose the same canonical pair (``yang_ming`` / ``zhang_min``)
+        but under different surface forms.  ``_safe_to_merge_surface`` tokenizes on
+        whitespace, so the two forms land on OPPOSITE sides of the gate:
+
+        * ``("Yang Ming", "Zhang Min")`` — two-token symmetric difference, rejected.
+        * ``("Yang-Ming", "Zhang-Min")`` — one token each, Jaro-Winkler ≥ 0.85,
+          accepted.
+
+        The rejecting form is proposed FIRST.  Any proposal memo keyed on node
+        identity (or on a casefolded surface) is coarser than the gate and would
+        make chunk 1's rejection permanent, so the contraction would never happen.
+        """
+        loop = _make_loop(tmp_path, graph_enrichment_max_entities_per_pass=3)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        for key, display in (("yang_ming", "Yang Ming"), ("zhang_min", "Zhang Min")):
+            graph.add_node(
+                key,
+                entity_type="person",
+                attributes={"name": display},
+                reinforcement_count=3,
+                sessions=["s040"],
+                first_seen="s040",
+                last_seen="s040",
+            )
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            side_effect=_same_as_per_chunk(
+                [["Yang Ming", "Zhang Min"]],  # chunk 1 — gate REJECTS
+                [["Yang_Ming", "Zhang_Min"]],  # chunk 2 — gate ACCEPTS
+            ),
+        ) as mock_sota:
+            result = _refiner_for(loop).run_enrichment()
+
+        assert not result["skipped"]
+        # Guard against a vacuous pass: the second chunk must actually have run.
+        assert mock_sota.call_count >= 2
+        # Chunk 2's accepted proposal must contract despite chunk 1's rejection.
+        assert result["same_as_merges"] == 1
+        assert "zhang_min" not in graph.nodes
+        assert "yang_ming" in graph.nodes
+
+    def test_identical_proposal_across_chunks_contracts_once(self, tmp_path, monkeypatch):
+        """The same proposal repeated across chunks contracts exactly once.
+
+        Removing the proposal memo must not introduce double-counting: the second
+        chunk's identical proposal is stopped by the live-graph check, because the
+        first contraction already removed the dropped node.  Asserts both the
+        ``same_as_merges`` counter and the removal ledger stay at one application.
+        """
+        from paramem.memory.persistence import _IK_KEY_ATTR
+
+        loop = _make_loop(tmp_path, graph_enrichment_max_entities_per_pass=3)
+        graph = loop.merger.graph
+        _populate_graph(graph, n_persons=10)
+
+        for key, display in (("yang_ming", "Yang Ming"), ("mr._yang", "Mr. Yang")):
+            graph.add_node(
+                key,
+                entity_type="person",
+                attributes={"name": display},
+                reinforcement_count=3,
+                sessions=["s050"],
+                first_seen="s050",
+                last_seen="s050",
+            )
+        # Keyed edge between the pair: contraction drops it as a self-loop and
+        # records its ik_key, giving the ledger observable content to assert on.
+        eid = graph.add_edge(
+            "yang_ming",
+            "mr._yang",
+            predicate="same as",
+            relation_type="factual",
+            confidence=1.0,
+            source="extraction",
+            sessions=["s050"],
+        )
+        graph["yang_ming"]["mr._yang"][eid][_IK_KEY_ATTR] = "key_yang_victim"
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        with patch(
+            "paramem.training.graph_enrich._graph_enrich_with_sota",
+            side_effect=_same_as_per_chunk(
+                [["Yang Ming", "Mr. Yang"]],  # chunk 1 — gate accepts, contracts
+                [["Yang Ming", "Mr. Yang"]],  # chunk 2 — identical, must be inert
+            ),
+        ) as mock_sota:
+            result = _refiner_for(loop).run_enrichment()
+
+        assert not result["skipped"]
+        assert mock_sota.call_count >= 2
+        assert result["same_as_merges"] == 1
+        assert "mr._yang" not in graph.nodes
+        assert "yang_ming" in graph.nodes
+        # The repeated proposal must not inflate the ledger: exactly one
+        # same_as removal, pointing at the keep node.
+        same_as_keys = [
+            k
+            for k, e in loop.merger.removal_ledger.items()
+            if e.get("reason") == "enrichment_same_as"
+        ]
+        assert same_as_keys == ["key_yang_victim"]
+        assert loop.merger.removal_ledger["key_yang_victim"]["merged_into"] == "yang_ming"
 
     def test_duplicate_pair_applied_once(self, tmp_path, monkeypatch):
         loop = _make_loop(tmp_path)
         graph = loop.merger.graph
         _populate_graph(graph, n_persons=10)
 
-        # Nodes are canonical-keyed; "Yang Ming" → "yang ming", "Mr. Yang" → "mr. yang".
+        # Nodes are canonical-keyed; "Yang Ming" → "yang_ming", "Mr. Yang" → "mr._yang".
         graph.add_node(
-            "yang ming",
+            "yang_ming",
             entity_type="person",
             attributes={"name": "Yang Ming"},
             reinforcement_count=3,
@@ -533,7 +673,7 @@ class TestSameAsDedupAcrossChunks:
             last_seen="s030",
         )
         graph.add_node(
-            "mr. yang",
+            "mr._yang",
             entity_type="person",
             attributes={"name": "Mr. Yang"},
             reinforcement_count=2,
@@ -620,7 +760,7 @@ class TestSymmetricPredicateCanonicalized:
             for u, v, d in graph.edges(data=True)
             if d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
         ]
-        colleague_edges = [(u, v) for u, v, d in enriched if d.get("predicate") == "colleague of"]
+        colleague_edges = [(u, v) for u, v, d in enriched if d.get("predicate") == "colleague_of"]
         assert len(colleague_edges) == 1, (
             f"Expected 1 collapsed symmetric edge; got {colleague_edges}"
         )
@@ -672,12 +812,12 @@ class TestSymmetricPredicateCanonicalized:
             result = _refiner_for(loop).run_enrichment()
 
         assert not result["skipped"]
-        # Predicate stored as canonical("mentored_by") == "mentored by".
+        # Predicate stored as canonical("mentored_by") == "mentored_by".
         mentored_edges = [
             (u, v)
             for u, v, d in graph.edges(data=True)
             if d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
-            and d.get("predicate") == "mentored by"
+            and d.get("predicate") == "mentored_by"
         ]
         assert set(mentored_edges) == {("ming", "xinxin"), ("xinxin", "ming")}, (
             f"Expected both directions for asymmetric predicate; got {mentored_edges}"
@@ -747,13 +887,13 @@ class TestCorefRemapBeforeEdgeInsert:
         assert result["same_as_merges"] >= 1
         assert "alex" not in graph.nodes  # contracted away
         # The enriched edge must land on "alexander" (canonical keep node).
-        # Predicate stored as canonical("works_at") == "works at".
+        # Predicate stored as canonical("works_at") == "works_at".
         alexander_edges = [
             (u, v, d)
             for u, v, d in graph.edges(data=True)
             if u == "alexander"
             and v == "acme"
-            and d.get("predicate") == "works at"
+            and d.get("predicate") == "works_at"
             and d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
         ]
         assert len(alexander_edges) == 1
@@ -3068,7 +3208,7 @@ class TestEnrichmentThroughMergerComposition:
         loop.merger.graph.add_edge(
             "alpha",
             "beta",
-            predicate="colleague of",
+            predicate="colleague_of",
             relation_type="social",
             confidence=0.9,
             first_seen="s001",
@@ -3271,10 +3411,10 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         enrichment_entries = [
             e
             for e in tier_keyed["episodic"] + tier_keyed["semantic"] + tier_keyed["procedural"]
-            if e.get("predicate") == "interested in"
+            if e.get("predicate") == "interested_in"
         ]
         assert len(enrichment_entries) == 1, (
-            f"Expected 1 minted entry for 'interested in'; got {enrichment_entries}"
+            f"Expected 1 minted entry for 'interested_in'; got {enrichment_entries}"
         )
         minted_subject = enrichment_entries[0]["subject"]
         assert minted_subject == "speaker0", (
@@ -3336,7 +3476,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
             (u, v)
             for u, v, d in loop.merger.graph.edges(data=True)
             if d.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
-            and d.get("predicate") == "colleague of"
+            and d.get("predicate") == "colleague_of"
         ]
         assert set(colleague_edges) == {("speaker0", "speaker1"), ("speaker1", "speaker0")}, (
             f"Both directed speaker↔speaker edges must survive; got {colleague_edges}"
@@ -3346,7 +3486,7 @@ class TestEnrichmentVerbatimSpeakerKeyResolution:
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         loop._build_all_edge_entries_into(tier_keyed)
 
-        minted = [e for e in tier_keyed["episodic"] if e["predicate"] == "colleague of"]
+        minted = [e for e in tier_keyed["episodic"] if e["predicate"] == "colleague_of"]
         assert len(minted) == 2, f"Expected 2 minted colleague_of keys; got {minted}"
         sids = {e["speaker_id"] for e in minted}
         assert sids == {"speaker0", "speaker1"}, (
@@ -3561,23 +3701,23 @@ class TestSpeakerPredecessorInheritance:
         assert not result["skipped"]
 
         # Confirm the role concept node has no own speaker_id (pre-condition for fallback).
-        role_node = loop.merger.graph.nodes.get("senior pm", {})
+        role_node = loop.merger.graph.nodes.get("senior_pm", {})
         assert not role_node.get("speaker_id"), (
             "Role concept node must NOT carry a direct speaker_id before fallback"
         )
 
-        # Confirm the speaker node is a predecessor of "senior pm" (bridge edge present).
+        # Confirm the speaker node is a predecessor of "senior_pm" (bridge edge present).
         # §0: speaker node key is casefolded ("speaker0"), not "speaker0".
-        preds = list(loop.merger.graph.predecessors("senior pm"))
+        preds = list(loop.merger.graph.predecessors("senior_pm"))
         assert "speaker0" in preds, (
-            f"Bridge edge speaker0 →held_role→ 'senior pm' must be in graph; predecessors={preds}"
+            f"Bridge edge speaker0 →held_role→ 'senior_pm' must be in graph; predecessors={preds}"
         )
 
         # Mint keys via the unified builder (fold discipline).
         tier_keyed: dict = {"episodic": [], "semantic": [], "procedural": []}
         loop._build_all_edge_entries_into(tier_keyed)
 
-        # Find the minted key for the 'achievement' edge (subject = "senior pm").
+        # Find the minted key for the 'achievement' edge (subject = "senior_pm").
         achievement_keys = [
             e
             for tier in ("episodic", "procedural")
@@ -3831,7 +3971,7 @@ class TestSpeakerPredecessorInheritance:
             e
             for tier in ("episodic", "procedural")
             for e in tier_keyed[tier]
-            if e.get("predicate") == "has property"
+            if e.get("predicate") == "has_property"
         ]
         assert prop_keys, "No minted key found for the 'has_property' edge"
         assert prop_keys[0]["speaker_id"] == "", (
@@ -4215,8 +4355,8 @@ class TestGraphTierAnonymizationContract:
         """
         from paramem.graph.cloud_egress import AnonymizedPayload
         from paramem.graph.extractor import _graph_enrich_with_sota
-        from paramem.graph.name_match import is_speaker_id
         from paramem.graph.schema import SessionGraph
+        from paramem.utils.identity import is_speaker_id
 
         # Hand-built payload (bypassing _build_anonymization_mapping's
         # speaker-key-drop guard on purpose — see docstring: a legal input
@@ -4569,7 +4709,7 @@ class TestGraphTierLocalModelTypeDerivation:
         found = False
         for _, _, data in graph.out_edges("person0", data=True):
             if (
-                data.get("predicate") == "colleague of"
+                data.get("predicate") == "colleague_of"
                 and data.get(_EDGE_SOURCE_ATTR) == "graph_enrichment"
             ):
                 found = True

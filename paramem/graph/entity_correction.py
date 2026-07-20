@@ -37,6 +37,7 @@ from paramem.graph.placeholders import placeholder_entity_type
 from paramem.graph.prompts import _load_prompt
 from paramem.models.loader import adapt_messages
 from paramem.server.vram_guard import vram_scope
+from paramem.utils.identity import canonical
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,8 @@ def _normalize_kind(raw_kind: object) -> str:
     """
     if not isinstance(raw_kind, str):
         return "other"
-    kind = _KIND_ALIASES.get(raw_kind.strip().lower(), raw_kind.strip().lower())
+    canon = canonical(raw_kind)
+    kind = _KIND_ALIASES.get(canon, canon)
     return kind if kind in _VALID_KINDS else "other"
 
 

@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from paramem.graph.merger import GraphMerger
-from paramem.graph.name_match import canonical
 from paramem.graph.schema import Entity, Relation, SessionGraph
+from paramem.utils.identity import canonical
 
 
 @pytest.fixture
@@ -70,23 +70,23 @@ class TestNormalization:
         """canonical() provides the single identity function for all string types."""
         assert canonical("Alex") == "alex"
         assert canonical("  Alex  ") == "alex"
-        assert canonical("Dr. Smith") == "dr. smith"
+        assert canonical("Dr. Smith") == "dr._smith"
 
 
 class TestPredicateNormalization:
-    def test_lowercase_and_space_form(self):
-        """canonical() folds case and separator to space; underscores are folded too."""
-        assert canonical("Works At") == "works at"
-        assert canonical("LIVES IN") == "lives in"
+    def test_lowercase_and_underscore_form(self):
+        """canonical() folds case and blanks to ``_``; underscores pass through."""
+        assert canonical("Works At") == "works_at"
+        assert canonical("LIVES IN") == "lives_in"
 
     def test_strip_whitespace(self):
-        assert canonical("  works_at  ") == "works at"
+        assert canonical("  works_at  ") == "works_at"
 
     def test_passthrough_preserves_content(self):
         assert canonical("invented") == "invented"
-        assert canonical("custom pred") == "custom pred"
-        # underscore folds to space
-        assert canonical("works_at") == "works at"
+        assert canonical("custom pred") == "custom_pred"
+        # underscore is already the canonical blank — no-op
+        assert canonical("works_at") == "works_at"
 
     def test_deduplicates_edges_across_variants(self, merger):
         """'works_at' and 'works at' should merge into one edge."""
@@ -128,8 +128,8 @@ class TestPredicateNormalization:
         merger.merge(g2)
         edges = list(merger.graph["a"]["b"].values())
         assert len(edges) == 1
-        # canonical() folds underscore → space; predicate stored in canonical form
-        assert edges[0]["predicate"] == "works at"
+        # canonical() folds the blank → "_"; predicate stored in canonical form
+        assert edges[0]["predicate"] == "works_at"
         assert edges[0]["reinforcement_count"] == 2
 
 
@@ -856,7 +856,7 @@ class TestModelContradictionAndRelease:
             (obj, data)
             for obj in alex_successors
             for _, data in m.graph["alex"][obj].items()
-            if data.get("predicate") == "lives in"
+            if data.get("predicate") == "lives_in"
         ]
         objects_with_lives_in = [obj for obj, _ in lives_in_edges]
         assert "munich" not in objects_with_lives_in, (
@@ -915,7 +915,7 @@ class TestModelContradictionAndRelease:
             obj
             for obj in alex_successors
             for _, data in m.graph["alex"][obj].items()
-            if data.get("predicate") == "lives in"
+            if data.get("predicate") == "lives_in"
         ]
         assert "munich" in lives_in_objects, (
             "Without a model, old edge must NOT be removed (coexist-all)"
@@ -1097,7 +1097,7 @@ class TestIkKeyProvenance:
         eid_old = m.graph.add_edge(
             "alex",
             "cat",
-            predicate="has pet",
+            predicate="has_pet",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1106,7 +1106,7 @@ class TestIkKeyProvenance:
             sessions=["s1"],
         )
         m.graph["alex"]["cat"][eid_old][_IK_KEY_ATTR] = "g1"
-        m._predicate_cardinality["has pet"] = True  # multi-valued; canonical form
+        m._predicate_cardinality["has_pet"] = True  # multi-valued; canonical form
 
         session = SessionGraph(
             session_id="s2",
@@ -1137,7 +1137,7 @@ class TestIkKeyProvenance:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "has pet"
+            if d.get("predicate") == "has_pet"
         ]
         assert "cat" in pets and "dog" in pets, (
             "Disjoint multi-valued pair must COEXIST — both keys kept"
@@ -1358,7 +1358,7 @@ class TestReinforcementTracking:
         existing_eid = m.graph.add_edge(
             "alice",
             "berlin",
-            predicate="lives in",
+            predicate="lives_in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",
@@ -1408,7 +1408,7 @@ class TestReinforcementTracking:
         eid_old = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives in",
+            predicate="lives_in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1448,7 +1448,7 @@ class TestReinforcementTracking:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
         assert "munich" in lives_in_objects, (
             "Old edge (Munich) must NOT be removed when resolve_contradictions=False"
@@ -1460,12 +1460,12 @@ class TestReinforcementTracking:
         munich_key = next(
             d.get(_IK_KEY_ATTR)
             for _, d in m.graph["alex"]["munich"].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         )
         berlin_key = next(
             d.get(_IK_KEY_ATTR)
             for _, d in m.graph["alex"]["berlin"].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         )
         assert munich_key == "key_munich", f"Expected key_munich on old edge; got {munich_key!r}"
         assert berlin_key == "key_berlin", f"Expected key_berlin on new edge; got {berlin_key!r}"
@@ -1494,7 +1494,7 @@ class TestReinforcementTracking:
         eid_old = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives in",
+            predicate="lives_in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1503,7 +1503,7 @@ class TestReinforcementTracking:
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
-        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
+        m._predicate_cardinality["lives_in"] = False  # pre-cache as single-valued
 
         incoming = Relation(
             subject="alex",
@@ -1534,7 +1534,7 @@ class TestReinforcementTracking:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
         assert "munich" not in lives_in_objects, (
             "Staler Munich edge must be retired when incoming is uniquely freshest"
@@ -1572,7 +1572,7 @@ class TestReinforcementTracking:
         eid_old = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives in",
+            predicate="lives_in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1581,7 +1581,7 @@ class TestReinforcementTracking:
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
-        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
+        m._predicate_cardinality["lives_in"] = False  # pre-cache as single-valued
 
         incoming = Relation(
             subject="alex",
@@ -1612,7 +1612,7 @@ class TestReinforcementTracking:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
         assert "munich" in lives_in_objects, "Munich edge must survive (tied timestamp → coexist)"
         assert "berlin" in lives_in_objects, (
@@ -1741,7 +1741,7 @@ class TestRemovalLedger:
         # Stamp an ik_key onto the Munich edge so the ledger capture fires.
         # After merge(), node keys are canonical: "alex", "munich"
         for _eid, _edata in m.graph["alex"]["munich"].items():
-            if _edata.get("predicate") == "lives in":
+            if _edata.get("predicate") == "lives_in":
                 _edata[_IK_KEY_ATTR] = "key_munich_old"
                 break
 
@@ -1804,7 +1804,7 @@ class TestRemovalLedger:
         eid_old = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives in",
+            predicate="lives_in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -1813,7 +1813,7 @@ class TestRemovalLedger:
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid_old][_IK_KEY_ATTR] = "key_munich"
-        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
+        m._predicate_cardinality["lives_in"] = False  # pre-cache as single-valued
 
         # Incoming (Berlin) has an OLDER last_seen → loses to Munich.
         incoming = Relation(
@@ -1849,7 +1849,7 @@ class TestRemovalLedger:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
         assert "munich" in lives_in_objects, "Fresher rival Munich must survive"
         assert "berlin" not in lives_in_objects, "Older incoming Berlin must NOT be inserted"
@@ -1957,9 +1957,10 @@ class TestRemovalLedger:
         """Ledger pre_surfaces records the raw incoming and stored surviving predicate
         surfaces when a byte-identical duplicate is collapsed by dedup.
 
-        Relations use ``"lives_in"`` (raw) but the merger stores predicates in
-        space-form (``"lives in"``).  pre_surfaces captures the raw incoming form
-        and the space-normalized surviving form so readers can inspect the mismatch.
+        Under the one-surface-form rule the raw incoming predicate
+        (``"lives_in"``) and the form the merger stores are the SAME string —
+        pre_surfaces records both, and they agree.  There is no raw-vs-stored
+        mismatch left to inspect for a predicate already in canonical form.
         """
         from paramem.graph.merger import GraphMerger
         from paramem.graph.schema import Relation, SessionGraph
@@ -2010,9 +2011,10 @@ class TestRemovalLedger:
             f"incoming predicate must be the raw 'lives_in' form; got "
             f"{pre.get('incoming', {}).get('predicate')!r}"
         )
-        # surviving predicate is the space-normalized form stored by the merger.
-        assert pre.get("surviving", {}).get("predicate") == "lives in", (
-            f"surviving predicate must be the space-normalized 'lives in'; got "
+        # surviving predicate is the canonical form stored by the merger — the
+        # same string, because there is only one surface form.
+        assert pre.get("surviving", {}).get("predicate") == "lives_in", (
+            f"surviving predicate must be the canonical 'lives_in'; got "
             f"{pre.get('surviving', {}).get('predicate')!r}"
         )
 
@@ -2050,7 +2052,7 @@ class TestRecencyAnyEmpty:
         eid = m.graph.add_edge(
             "alex",
             "munich",
-            predicate="lives in",
+            predicate="lives_in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s1",
@@ -2059,7 +2061,7 @@ class TestRecencyAnyEmpty:
             sessions=["s1"],
         )
         m.graph["alex"]["munich"][eid][_IK_KEY_ATTR] = "key_munich"
-        m._predicate_cardinality["lives in"] = False  # pre-cache as single-valued
+        m._predicate_cardinality["lives_in"] = False  # pre-cache as single-valued
         return m
 
     @staticmethod
@@ -2098,7 +2100,7 @@ class TestRecencyAnyEmpty:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
 
     def test_incoming_empty_rival_dated_replace_rival_wins(self):
@@ -2164,7 +2166,7 @@ class TestRecencyAnyEmpty:
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         m = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
-        m._predicate_cardinality["lives in"] = False
+        m._predicate_cardinality["lives_in"] = False
         for city, ts, key in [
             ("vienna", "2026-01-01T00:00:00Z", "key_vienna"),
             ("paris", "2026-01-02T00:00:00Z", "key_paris"),
@@ -2174,7 +2176,7 @@ class TestRecencyAnyEmpty:
             eid = m.graph.add_edge(
                 "alex",
                 city,
-                predicate="lives in",
+                predicate="lives_in",
                 relation_type="factual",
                 confidence=1.0,
                 first_seen="s0",
@@ -2201,7 +2203,7 @@ class TestRecencyAnyEmpty:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
         assert "berlin" in objects, "Incoming (uniquely freshest) must survive"
         assert "vienna" not in objects, "Strictly-older vienna must be retired"
@@ -2225,7 +2227,7 @@ class TestRecencyAnyEmpty:
         from paramem.memory.persistence import _IK_KEY_ATTR
 
         m = GraphMerger(model=MagicMock(), tokenizer=MagicMock())
-        m._predicate_cardinality["lives in"] = False
+        m._predicate_cardinality["lives_in"] = False
         for city, ts, key in [
             ("vienna", "2026-01-01T00:00:00Z", "key_vienna"),
             ("paris", "2026-01-02T00:00:00Z", "key_paris"),
@@ -2235,7 +2237,7 @@ class TestRecencyAnyEmpty:
             eid = m.graph.add_edge(
                 "alex",
                 city,
-                predicate="lives in",
+                predicate="lives_in",
                 relation_type="factual",
                 confidence=1.0,
                 first_seen="s0",
@@ -2264,7 +2266,7 @@ class TestRecencyAnyEmpty:
             obj
             for obj in m.graph.successors("alex")
             for _, d in m.graph["alex"][obj].items()
-            if d.get("predicate") == "lives in"
+            if d.get("predicate") == "lives_in"
         ]
         assert result is None, "Incoming (older than tied max) must NOT be inserted"
         assert "berlin" not in objects, "Strictly-older incoming Berlin must not be inserted"
@@ -2283,7 +2285,7 @@ class TestObjectVariantDedup:
     Regression guard: under predicate ``values``,
     ``"Execution Speed"`` / ``"execution_speed"`` / ``"execution speed"`` were three
     distinct nodes → three edges → three keys.  With canonical node keys all three
-    collapse to the single canonical form ``"execution speed"`` → one edge, one
+    collapse to the single canonical form ``"execution_speed"`` → one edge, one
     surviving key.
     """
 
@@ -2329,15 +2331,15 @@ class TestObjectVariantDedup:
         m.merge(s1)
         m.merge(s2)
 
-        # canonical("Execution Speed") == canonical("execution_speed") == "execution speed"
+        # canonical("Execution Speed") == canonical("execution_speed") == "execution_speed"
         # → only ONE node and ONE edge for the values predicate.
-        assert "execution speed" in m.graph.nodes, (
-            "Canonical object node key must be 'execution speed'"
+        assert "execution_speed" in m.graph.nodes, (
+            "Canonical object node key must be 'execution_speed'"
         )
         assert m.graph.number_of_edges() == 1, (
             f"Object variants must collapse to one edge; got {m.graph.number_of_edges()}"
         )
-        edges = list(m.graph["paramem"]["execution speed"].values())
+        edges = list(m.graph["paramem"]["execution_speed"].values())
         assert len(edges) == 1
         assert edges[0]["reinforcement_count"] == 2, (
             "Collapsed edge must have reinforcement_count=2 (one per session)"
@@ -2369,7 +2371,7 @@ class TestObjectVariantDedup:
         m.merge(s1)
 
         # The display name is stored in attributes["name"], not the node key.
-        node_data = m.graph.nodes["execution speed"]
+        node_data = m.graph.nodes["execution_speed"]
         assert node_data["attributes"]["name"] == "Execution Speed", (
             "First-seen surface form must be preserved in attributes['name']; "
             f"got {node_data['attributes'].get('name')!r}"
@@ -2607,7 +2609,7 @@ class TestMergerEdgeStamps:
         eid = m.graph.add_edge(
             "alice",
             "berlin",
-            predicate="lives in",
+            predicate="lives_in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",
@@ -2644,7 +2646,7 @@ class TestMergerEdgeStamps:
         eid = m.graph.add_edge(
             "alice",
             "berlin",
-            predicate="lives in",
+            predicate="lives_in",
             relation_type="factual",
             confidence=1.0,
             first_seen="s0",

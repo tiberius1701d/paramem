@@ -1234,7 +1234,9 @@ class TestHouseholdNamesInKnownEntities:
                 pass  # We only care that known_entities was set
 
         entities = captured.get("known_entities") or set()
-        assert "alice" in entities  # household name lowercased
+        # Real case preserved — the sanitizer's known-entity scrub matches
+        # exact-case, whole-word (person "Bill" vs invoice "bill").
+        assert "Alice" in entities
 
 
 class TestSanitizeHistoryKnownEntities:

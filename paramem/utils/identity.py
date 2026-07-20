@@ -1,14 +1,27 @@
 """String-identity canonicalization for entity names, objects, and predicates.
 
-Used by :class:`paramem.graph.merger.GraphMerger` to produce deterministic node
-keys.  Stateless, deterministic, no I/O.  Thread-safe by construction.
+The project-wide identity primitives.  :class:`paramem.graph.merger.GraphMerger`
+applies :func:`canonical` at the node-identity boundary to produce deterministic
+node keys; the server, training, memory, evaluation and cli packages route every
+identity/dedup comparison through the same two functions.  Name *matching*
+(fuzzy/surface tiers) is a separate concern and lives in the merger, not here.
+Stateless, deterministic, no I/O.  Thread-safe by construction.
+
+One surface form, project-wide: lower-case, blank runs collapsed to a single
+``_``, ``-`` and ``_`` preserved verbatim.  This is the identity form — the
+node key, the stored predicate, the SimHash and dedup key.  It is NOT the
+display surface: rendering to prose happens at
+:func:`paramem.memory.entry.entry_fact_text`, which turns ``_`` back into a
+space (``has_hobby`` → ``"has hobby"``).  Matching names against free prose is
+a separate contract that does not call this function at all.
 
 Over-collapse boundary (GUARANTEED-identical-only):
   Folded: Unicode canonical form, case (incl. ligatures `str.casefold` covers,
-  e.g. ``ﬁ``→``fi``), diacritics, ``_``/``-``/whitespace runs.
-  NOT folded: typos (HR3 ≠ HS3), substrings, NFKC compatibility forms
-  (superscript ``²``, full-width), honorifics, token subsets.  Those are
-  layer-2 LLM SAME_AS coreference, out of scope here.
+  e.g. ``ﬁ``→``fi``), diacritics, whitespace runs (→ ``_``).
+  NOT folded: ``-`` vs ``_`` (``sister-in-law`` ≠ ``sister_in_law``), typos
+  (HR3 ≠ HS3), substrings, NFKC compatibility forms (superscript ``²``,
+  full-width), honorifics, token subsets.  Those are layer-2 LLM SAME_AS
+  coreference, out of scope here.
 
 Speaker-identity
 ----------------
@@ -27,10 +40,6 @@ exception to the "extraction only `.strip()`s" rule for display entities).
 import re
 import unicodedata
 
-# Built once at module load.  ``_``/``-`` → space; space-run collapse happens
-# in the ``str.split()`` call so no special entry for multiple spaces is needed.
-_SEP = str.maketrans({"_": " ", "-": " "})
-
 # Compiled once: matches the system speaker-id format "speaker{N}" (the
 # canonical lowercase form) where N is one or more decimal digits.
 # Case-insensitive so a residual cased form like "Speaker0" also passes the
@@ -40,33 +49,51 @@ _SPEAKER_ID_RE = re.compile(r"^[Ss]peaker\d+$")
 
 
 def canonical(s: str) -> str:
-    """Deterministic identity key for entity names, objects, and predicates.
+    """The single surface form for entity names, objects, and predicates.
 
-    Unicode-standard canonical caseless matching (Unicode §3.13), diacritic-
-    insensitive, separator- and whitespace-normalized.  Drives matching/dedup
-    ONLY; never overwrites the stored/displayed surface form.
+    Lower-cases (Unicode full case folding, §3.13), folds diacritics, and
+    collapses whitespace runs to a single ``_``.  ``-`` and ``_`` are preserved
+    verbatim — they are NOT interchangeable.  ``"has hobby"`` and
+    ``"has_hobby"`` are one value, ``has_hobby``.
+
+    The output is the **identity key** — what is stored, compared, keyed and
+    trained.  It is NOT the display surface: rendering back to prose happens at
+    :func:`~paramem.memory.entry.entry_fact_text`, which emits ``_`` as a space
+    (``"Alex has sister-in-law Mia"``).  Matching entity names against free
+    prose is a separate contract that does not use this function at all.
 
     GUARANTEED-identical-only.  Folds: Unicode canonical form, case (incl. the
     few ligatures ``str.casefold`` covers, e.g. ``ﬁ``→``fi``), diacritics,
-    ``_``/``-``/whitespace runs.  Does NOT fold: typos (HR3 ≠ HS3), substrings
-    (autonomous_systems ≠ autonomous_systems_research), NFKC compatibility forms
-    (superscript ``²``, full-width), honorifics, token subsets — those are
-    layer-2 LLM SAME_AS coreference, out of scope.
+    whitespace runs.  Does NOT fold: ``-`` against ``_`` (``sister-in-law`` ≠
+    ``sister_in_law``), typos (HR3 ≠ HS3), substrings (autonomous_systems ≠
+    autonomous_systems_research), NFKC compatibility forms (superscript ``²``,
+    full-width), honorifics, token subsets — those are layer-2 LLM SAME_AS
+    coreference, out of scope.
 
     Args:
         s: Raw string to canonicalize.  May be a name, predicate, or object.
 
     Returns:
-        Canonical form as a lower-case, NFC-normalized string with separators
-        and diacritics folded.  Returns ``""`` for empty or whitespace-only input.
+        Lower-case, NFC-normalized string with diacritics folded and blank runs
+        replaced by single underscores.  ``""`` for empty or whitespace-only
+        input.
+
+    Examples::
+
+        >>> canonical("has hobby") == canonical("has_hobby")
+        True
+        >>> canonical("sister-in-law")
+        'sister-in-law'
+        >>> canonical("HELLO World")
+        'hello_world'
 
     Order rationale (Unicode §3.13): NFC before casefold handles the U+0345
     family that casefolds correctly only after decomposition; re-NFC after
     casefold + combining-strip restores a stable form so ``f(f(x)) == f(x)``.
-    Separator/whitespace folding is last — it only touches ASCII
-    space/``_``/``-``, which no normalization step reintroduces, so it does not
-    disturb the Unicode invariants and re-running is a no-op.  Idempotent and
-    stable across runs for a fixed CPython build.
+    Whitespace folding is last — it only consumes ASCII/Unicode blanks and
+    emits ``_``, which ``str.split()`` does not treat as a separator, so
+    re-running is a no-op.  Idempotent and stable across runs for a fixed
+    CPython build.
     """
     if not s:
         return ""
@@ -74,8 +101,7 @@ def canonical(s: str) -> str:
     s = s.casefold()
     s = "".join(ch for ch in unicodedata.normalize("NFD", s) if not unicodedata.combining(ch))
     s = unicodedata.normalize("NFC", s)
-    s = s.translate(_SEP)
-    return " ".join(s.split())
+    return "_".join(s.split())
 
 
 # ---------------------------------------------------------------------------

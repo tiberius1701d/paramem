@@ -283,7 +283,7 @@ class TestEntrySimhash:
         canonical()-folded graph node key instead of the entry's own display
         subject/object) must desync from what verify_confidence reconstructs
         from the entry — this is the exact bug entry_simhash closes."""
-        from paramem.graph.name_match import canonical
+        from paramem.utils.identity import canonical
 
         entry = {
             "key": "graph1",

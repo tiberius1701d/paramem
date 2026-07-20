@@ -1,7 +1,8 @@
 """Tests for entry_fact_text and probe abort cooperative behaviour.
 
 Covers:
-- entry_fact_text: basic conversion, predicate de-underscoring.
+- entry_fact_text: SPO assembly at the render boundary — the stored predicate
+  identity form is rendered as prose ('_' becomes a space, '-' survives).
 - probe_keys_grouped_by_adapter: should_abort stops the loop early and
   returns partial results without raising.
 - WeightMemorySource.probe: forwards should_abort to the underlying function.
@@ -60,27 +61,46 @@ def _make_tokenizer() -> MagicMock:
 
 
 class TestEntryFactText:
-    def test_basic_conversion(self) -> None:
+    def test_basic_assembly(self) -> None:
+        """The stored identity predicate is rendered as prose: '_' becomes a space."""
         result = entry_fact_text(
             {"subject": "Alex", "predicate": "lives_in", "object": "Heilbronn"}
         )
         assert result == "Alex lives in Heilbronn"
 
-    def test_no_underscores(self) -> None:
+    def test_single_word_predicate(self) -> None:
         result = entry_fact_text({"subject": "Alex", "predicate": "knows", "object": "Bob"})
         assert result == "Alex knows Bob"
 
-    def test_multi_underscore_predicate(self) -> None:
+    def test_multi_underscore_predicate_respaced(self) -> None:
+        """Every '_' in the identity form renders as a space, not just the first."""
         result = entry_fact_text(
             {"subject": "Alice", "predicate": "works_at_company", "object": "Acme"}
         )
         assert result == "Alice works at company Acme"
 
-    def test_extra_whitespace_collapsed(self) -> None:
-        # split() + join() collapses internal multi-space from multiple underscores
-        result = entry_fact_text({"subject": "S", "predicate": "a__b", "object": "O"})
-        # "_" → " ", " " → collapsed to one space
-        assert "  " not in result
+    def test_hyphenated_predicate_preserved(self) -> None:
+        """``-`` is not a blank in the identity form, so it survives the render."""
+        result = entry_fact_text(
+            {"subject": "Alex", "predicate": "has_sister-in-law", "object": "Mia"}
+        )
+        assert result == "Alex has sister-in-law Mia"
+
+    def test_non_ascii_object_rendered(self) -> None:
+        """Non-ASCII object surfaces pass through the render untouched."""
+        result = entry_fact_text(
+            {"subject": "Alex", "predicate": "has_key_achievement", "object": "€4.5B sales"}
+        )
+        assert result == "Alex has key achievement €4.5B sales"
+
+    def test_render_is_prose_not_canonical(self) -> None:
+        """The render boundary is a distinct layer from the identity form."""
+        from paramem.utils.identity import canonical
+
+        pred = canonical("has hobby")
+        assert pred == "has_hobby"
+        result = entry_fact_text({"subject": "Alex", "predicate": pred, "object": "chess"})
+        assert result == "Alex has hobby chess"
 
     # --- Phase B: resolve callback ---
 
@@ -128,7 +148,7 @@ class TestEntryFactText:
 
     def test_resolve_non_speaker_passthrough(self) -> None:
         """Non-speaker tokens are returned unchanged by a speaker-only resolver."""
-        from paramem.graph.name_match import is_speaker_id
+        from paramem.utils.identity import is_speaker_id
 
         resolve = lambda t: "RESOLVED" if is_speaker_id(t) else t  # noqa: E731
         result = entry_fact_text(

@@ -40,7 +40,7 @@ class TestParamemHoldEnvVarClearedOnRelease:
             m.returncode = 0
             return m
 
-        from paramem.gpu_consumer import ParamemEnvStampAdapter
+        from paramem.utils.gpu_consumer import ParamemEnvStampAdapter
 
         consumer = ParamemEnvStampAdapter()
 
@@ -50,7 +50,7 @@ class TestParamemHoldEnvVarClearedOnRelease:
             patch.object(_core_module, "write_holder"),
             patch.object(_core_module, "remove_holder"),
             # Patch subprocess.run inside gpu_consumer so we capture its calls.
-            patch("paramem.gpu_consumer.subprocess.run", side_effect=recording_run),
+            patch("paramem.utils.gpu_consumer.subprocess.run", side_effect=recording_run),
         ):
             from gpu_guard._core import acquire_gpu
             from gpu_guard.inhibitor import NullInhibitor
@@ -89,7 +89,7 @@ class TestParamemHoldEnvVarClearedOnRelease:
             m.returncode = 0
             return m
 
-        from paramem.gpu_consumer import ParamemEnvStampAdapter
+        from paramem.utils.gpu_consumer import ParamemEnvStampAdapter
 
         consumer = ParamemEnvStampAdapter()
 
@@ -98,7 +98,7 @@ class TestParamemHoldEnvVarClearedOnRelease:
             patch.object(_core_module, "read_all_live", return_value=[]),
             patch.object(_core_module, "write_holder"),
             patch.object(_core_module, "remove_holder"),
-            patch("paramem.gpu_consumer.subprocess.run", side_effect=recording_run),
+            patch("paramem.utils.gpu_consumer.subprocess.run", side_effect=recording_run),
         ):
             from gpu_guard._core import acquire_gpu
             from gpu_guard.inhibitor import NullInhibitor

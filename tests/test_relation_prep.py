@@ -16,6 +16,7 @@ from paramem.graph.relation_prep import (
     partition_relations,
 )
 from paramem.graph.schema import Entity
+from paramem.utils.identity import canonical
 
 
 class TestFilterProceduralRelations:
@@ -112,6 +113,55 @@ class TestFilterProceduralRelations:
     def test_procedural_predicates_is_frozenset(self):
         assert isinstance(_PROCEDURAL_PREDICATES, frozenset)
         assert "prefers" in _PROCEDURAL_PREDICATES
+
+    def test_predicate_set_members_are_canonical(self):
+        """The set literals share the comparison's surface-form contract."""
+        assert all(canonical(p) == p for p in _PROCEDURAL_PREDICATES)
+
+    def test_space_and_underscore_predicate_are_equivalent(self):
+        """The multiplicity fix: extraction may emit either surface, and both
+        must route to the procedural adapter."""
+
+        def _rel(pred: str) -> dict:
+            return {
+                "subject": "Alex",
+                "predicate": pred,
+                "object": "chess",
+                "relation_type": "factual",
+            }
+
+        underscore = filter_procedural_relations([_rel("has_hobby")])
+        spaced = filter_procedural_relations([_rel("has hobby")])
+        assert len(underscore) == 1
+        assert len(spaced) == 1
+
+    def test_cased_and_diacritic_predicate_matched(self):
+        """canonical() folds case on both sides of the membership test."""
+        rels = [
+            {
+                "subject": "Alex",
+                "predicate": "Listens To",
+                "object": "jazz",
+                "relation_type": "factual",
+            },
+        ]
+        assert len(filter_procedural_relations(rels)) == 1
+
+    def test_hyphen_variant_not_matched(self):
+        """``-`` is not a separator: ``has-hobby`` is a DIFFERENT predicate."""
+        rels = [
+            {
+                "subject": "Alex",
+                "predicate": "has-hobby",
+                "object": "chess",
+                "relation_type": "factual",
+            },
+        ]
+        assert len(filter_procedural_relations(rels)) == 0
+
+    def test_missing_predicate_key_does_not_raise(self):
+        """A relation dict with no predicate falls through the gate cleanly."""
+        assert filter_procedural_relations([{"subject": "A", "object": "B"}]) == []
 
 
 class TestPartitionRelations:
@@ -251,24 +301,24 @@ class TestFlattenEntityAttributes:
         assert result[0]["predicate"] == "has_phone"
 
     def test_key_with_spaces_normalised_to_canonical(self):
-        """Attribute keys with spaces are canonicalized (space-separated) in the predicate."""
+        """Attribute keys with spaces canonicalize to underscore form."""
         entity = Entity(
             name="Alex",
             entity_type="person",
             attributes={"phone number": "+49123456"},
         )
         result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has_phone number"
+        assert result[0]["predicate"] == "has_phone_number"
 
-    def test_key_with_dashes_normalised_to_canonical(self):
-        """Attribute keys with dashes are canonicalized (separator-folded to spaces)."""
+    def test_key_with_dashes_preserves_dash(self):
+        """Dashes are NOT separators — they survive canonicalization verbatim."""
         entity = Entity(
             name="Alex",
             entity_type="person",
             attributes={"linked-in": "linkedin.com/in/alex"},
         )
         result = _flatten_entity_attributes([entity])
-        assert result[0]["predicate"] == "has_linked in"
+        assert result[0]["predicate"] == "has_linked-in"
 
     def test_key_with_uppercase_lowercased(self):
         """Attribute keys are lowercased before formatting the predicate."""

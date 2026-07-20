@@ -57,7 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from paramem.backup.encryption import read_maybe_encrypted, write_infra_bytes
-from paramem.graph.name_match import is_speaker_id
+from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +278,7 @@ class UserTokenStore:
         # caller passes to the canonical lowercase form, mirroring
         # ``_normalize_extraction``'s is_speaker_id-gated coercion.
         if is_speaker_id(speaker_id):
-            speaker_id = speaker_id.lower()
+            speaker_id = canonical(speaker_id)
         token = secrets.token_urlsafe(32)
         key = _sha256hex(token)
         entry: dict = {
@@ -440,7 +440,7 @@ class UserTokenStore:
         # Ingest safety-net: coerce any residual cased form (e.g. "Speaker0")
         # so it matches the canonical lowercase form stored by mint().
         if is_speaker_id(speaker_id):
-            speaker_id = speaker_id.lower()
+            speaker_id = canonical(speaker_id)
         count = 0
         with self._lock:
             for entry in self._tokens.values():

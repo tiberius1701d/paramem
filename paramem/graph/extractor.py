@@ -22,7 +22,6 @@ from paramem.graph.cloud_egress import (
     deanonymize_response_text,
 )
 from paramem.graph.entity_correction import correct_entity_surfaces
-from paramem.graph.name_match import canonical, is_speaker_id
 from paramem.graph.phase_trace import chain_stopped, extraction_trace, phase_trace
 from paramem.graph.placeholders import (
     _FACT_FIELDS,
@@ -41,6 +40,7 @@ from paramem.graph.schema_config import (
 from paramem.models.loader import adapt_messages, base_model_inference
 from paramem.server.session_buffer import SessionBuffer
 from paramem.server.vram_guard import vram_scope
+from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -1259,13 +1259,16 @@ def _stamp_speaker_entity(
        speaker by literal name rather than self-reference, so the model has
        no ``speaker{N}`` token to emit for the subject.  When both guards
        below hold, every entity/relation field that matches the speaker's
-       full name via :func:`~paramem.graph.name_match.canonical` (exact
+       full name via :func:`~paramem.utils.identity.canonical` (exact
        match only — no substrings, no first-name subsets, no honorifics) is
-       rewritten to ``speaker_id.lower()`` *before* the stamping loop below
-       runs, so the rewritten entities are also stamped.
+       rewritten to ``canonical(speaker_id)`` *before* the stamping loop
+       below runs, so the rewritten entities are also stamped.
 
        * **Guard A (full-name only)** — fires only when
-         ``len(canonical(speaker_name).split()) >= 2``. A single-token
+         ``len(canonical(speaker_name).split("_")) >= 2``.  ``canonical``
+         emits ``_`` as the blank, so the name parts are the ``_``-separated
+         tokens of the canonical form; ``-`` is not a blank, so a hyphenated
+         single given name ("Anna-Maria") counts as ONE part. A single-token
          display name (``resolve_speaker_name`` routinely returns a bare
          first name) fails closed: no rewrite. This is what prevents a
          first-person transcript mention like "My friend Alex came over"
@@ -1286,17 +1289,17 @@ def _stamp_speaker_entity(
        would both re-expose it to downstream anonymization and produce a
        bogus fact.
 
-       The rewrite can also produce two entities named ``speaker_id.lower()``
+       The rewrite can also produce two entities named ``canonical(speaker_id)``
        in one graph (a pre-existing speaker entity plus one renamed by the
        rewrite); those are collapsed into one, unioning ``attributes``.
 
     2. **Existing ``is_speaker_id`` stamping loop** (unchanged in shape) sets
        ``entity.speaker_id`` on every entity whose (possibly just-rewritten)
-       name passes :func:`~paramem.graph.name_match.is_speaker_id`:
+       name passes :func:`~paramem.utils.identity.is_speaker_id`:
 
-       * **Session speaker** — when ``ent.name == speaker_id.lower()`` the
+       * **Session speaker** — when ``ent.name == canonical(speaker_id)`` the
          entity IS the session speaker.  Its ``speaker_id`` field is set to
-         ``speaker_id.lower()`` (the authoritative lowercase id from the
+         ``canonical(speaker_id)`` (the authoritative lowercase id from the
          caller), preserving the authoritative-id pin.  This guards against
          the model emitting the wrong digit (e.g. ``speaker1`` in a
          ``speaker0`` session).
@@ -1325,23 +1328,32 @@ def _stamp_speaker_entity(
     Returns:
         Updated ``SessionGraph`` with ``speaker_id`` set on all speaker-id
         entities, and (for document sources with a full display name) the
-        speaker's literal full name rewritten to ``speaker_id.lower()``
+        speaker's literal full name rewritten to ``canonical(speaker_id)``
         wherever it appears verbatim as an entity name or relation
         subject/object. Entities/relations that don't match are unmodified.
     """
     if not graph.entities:
         return graph
 
+    # Multi-part-name gate: the rewrite only fires for a full name (given +
+    # family), never a bare given name.  ``canonical`` emits ``_`` as the blank,
+    # so the name parts are the ``_``-separated tokens of the canonical form.
+    # ``-`` is not a blank, so a hyphenated single given name ("Anna-Maria")
+    # counts as ONE part and does not open the rewrite.
     do_rewrite = (
         source_type == "document"
         and speaker_name
         and not is_speaker_id(speaker_name)
-        and len(canonical(speaker_name).split()) >= 2
+        and len(canonical(speaker_name).split("_")) >= 2
     )
+
+    # The authoritative speaker id in its canonical form.  Computed once and
+    # shared by the rewrite block and the stamping loop below — both need the
+    # identical value, and identity strings route through ``canonical``.
+    sid = canonical(speaker_id)
 
     if do_rewrite:
         target = canonical(speaker_name)
-        sid = speaker_id.lower()
 
         for ent in graph.entities:
             if canonical(ent.name) == target:
@@ -1381,11 +1393,11 @@ def _stamp_speaker_entity(
     for ent in graph.entities:
         if not is_speaker_id(ent.name):
             continue
-        if ent.name == speaker_id.lower():
+        if ent.name == sid:
             # This entity IS the session speaker — stamp the authoritative id.
-            # Both values are lowercase; the explicit pin preserves the
+            # Both values are canonical; the explicit pin preserves the
             # authoritative-id guard (model may emit wrong digit).
-            ent.speaker_id = speaker_id.lower()
+            ent.speaker_id = sid
         else:
             # A different registered speaker referenced in this session.
             # ent.name is already lowercase via the ingest safety-net.
@@ -1418,13 +1430,13 @@ def _normalize_extraction(data: dict) -> dict:
             if isinstance(raw_name, list):
                 raw_name = raw_name[0] if raw_name else "unknown"
             norm["name"] = str(raw_name).strip()
-            # Ingest safety-net: lowercase any speaker-id token at the single
+            # Ingest safety-net: canonicalize any speaker-id token at the single
             # normalization boundary.  Extraction prompts instruct the model to
             # emit lowercase speaker{N} directly; this coerces any residual cased
             # form (e.g. "Speaker0") a model emits despite the instruction.
-            # ONLY speaker-id tokens are lowercased — display names are untouched.
+            # ONLY speaker-id tokens are coerced — display names are untouched.
             if is_speaker_id(norm["name"]):
-                norm["name"] = norm["name"].lower()
+                norm["name"] = canonical(norm["name"])
             raw_type = ent.get("entity_type") or ent.get("type", "concept")
             if isinstance(raw_type, list):
                 raw_type = raw_type[0] if raw_type else "concept"
@@ -1434,7 +1446,7 @@ def _normalize_extraction(data: dict) -> dict:
             # "product", "certification", "program", "paper", etc.
             # The schema YAML's entity_types list is a soft prior for
             # prompt examples; it does not gate the value here.
-            type_str = str(raw_type).strip().lower() if raw_type else ""
+            type_str = canonical(str(raw_type)) if raw_type else ""
             norm["entity_type"] = type_str if type_str else fb_etype
             raw_attrs = ent.get("attributes", {})
             if not isinstance(raw_attrs, dict):
@@ -1475,14 +1487,22 @@ def _normalize_extraction(data: dict) -> dict:
                 raw_obj = raw_obj[0] if raw_obj else "unknown"
             subject = str(raw_subj).strip()
             obj = str(raw_obj).strip()
-            # Ingest safety-net: lowercase any speaker-id token at this boundary.
+            # Ingest safety-net: canonicalize any speaker-id token at this boundary.
             if is_speaker_id(subject):
-                subject = subject.lower()
+                subject = canonical(subject)
             if is_speaker_id(obj):
-                obj = obj.lower()
+                obj = canonical(obj)
 
-            # Filter self-loops (e.g. "KIT studied at KIT")
-            if subject.lower() == obj.lower():
+            # Filter self-loops (e.g. "KIT studied at KIT").  This is the sole
+            # self-loop guard; the merger has none.  Comparing canonical forms
+            # makes the guard agree exactly with the merger's node-key function,
+            # so any pair that WOULD land on one node key is rejected here
+            # instead of becoming a self-edge: it additionally catches
+            # diacritic ("José"/"Jose"), full-case-fold ("Straße"/"Strasse") and
+            # blank-run ("New York"/"New_York") variants that .lower() missed.
+            # "-" is not a blank, so "Anna-Maria" and "Anna Maria" stay distinct
+            # endpoints and are NOT filtered.
+            if canonical(subject) == canonical(obj):
                 logger.debug("Filtered self-loop: %s -> %s", subject, obj)
                 continue
 
@@ -1540,16 +1560,22 @@ def _validate_with_ha_context(graph: SessionGraph, ha_context: dict) -> SessionG
     if not all_known:
         return graph
 
+    # Canonical on both sides: the set literals and the extracted predicate
+    # share one surface-form contract, so a model emitting "lives in" matches
+    # the "lives_in" member.
     location_predicates = {
-        "lives_in",
-        "lives_near",
-        "born_in",
-        "located_in",
-        "home_location",
+        canonical(p)
+        for p in (
+            "lives_in",
+            "lives_near",
+            "born_in",
+            "located_in",
+            "home_location",
+        )
     }
 
     for relation in graph.relations:
-        if relation.predicate not in location_predicates:
+        if canonical(relation.predicate) not in location_predicates:
             continue
 
         obj_lower = relation.object.lower()
@@ -3899,7 +3925,7 @@ def normalize_predicates(
             ``candidate_groups``, ``groups_with_clusters``, ``model_calls``,
             ``raw_outputs`` (list of per-group raw model strings), ``discards``.
     """
-    from paramem.graph.name_match import canonical
+    from paramem.utils.identity import canonical
 
     clusters_by_so: dict[tuple[str, str], list[list[str]]] = {}
 

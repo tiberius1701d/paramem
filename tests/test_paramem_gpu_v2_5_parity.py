@@ -218,7 +218,7 @@ class TestParamemHoldEnvVarsStampedAndCleared:
 
     def test_paramem_hold_env_vars_stamped_and_cleared(self) -> None:
         """on_acquired issues set-environment; on_released issues unset-environment."""
-        from paramem.gpu_consumer import ParamemEnvStampAdapter
+        from paramem.utils.gpu_consumer import ParamemEnvStampAdapter
 
         adapter = ParamemEnvStampAdapter()
 
@@ -230,7 +230,7 @@ class TestParamemHoldEnvVarsStampedAndCleared:
             m.returncode = 0
             return m
 
-        with patch("paramem.gpu_consumer.subprocess.run", side_effect=recording_run):
+        with patch("paramem.utils.gpu_consumer.subprocess.run", side_effect=recording_run):
             import sys
 
             adapter.on_acquired(own_pid=12345, argv=sys.argv)
@@ -321,7 +321,7 @@ class TestReleaseServerGpuRaisesOnMissingConfig:
             # Restore the env-stamp adapter so other tests are not disturbed.
             from gpu_guard import add_default_consumer
 
-            from paramem.gpu_consumer import adapter
+            from paramem.utils.gpu_consumer import adapter
 
             add_default_consumer(adapter)
             _reset_autoload_for_tests()

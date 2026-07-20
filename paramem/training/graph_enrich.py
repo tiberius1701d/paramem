@@ -23,11 +23,11 @@ import networkx as nx
 from paramem.graph.cloud_egress import anonymize_for_cloud
 from paramem.graph.extractor import _graph_enrich_with_sota, _resolve_sota_api_key
 from paramem.graph.merger import GraphMerger, min_nonempty
-from paramem.graph.name_match import canonical, is_speaker_id
 from paramem.graph.schema import Relation, SessionGraph
 from paramem.graph.schema_config import fallback_relation_type, relation_types
 from paramem.memory.persistence import _IK_KEY_ATTR
 from paramem.server.vram_guard import VramExhausted
+from paramem.utils.identity import canonical, is_speaker_id
 
 if TYPE_CHECKING:
     from paramem.graph.extraction_pipeline import ExtractionConfig
@@ -245,7 +245,7 @@ def run_graph_enrichment(
     reconciles that mismatch itself, per chunk, before building
     ``chunk_mapping`` (identity reconciliation, not
     classification): every ``_llm_mapping`` key is run through
-    :func:`~paramem.graph.name_match.canonical` and matched against
+    :func:`~paramem.utils.identity.canonical` and matched against
     the (also-canonicalized) node keys of ``chunk_nodes``; on a match
     the entry is re-keyed onto the actual node-key surface with the
     MODEL's own placeholder preserved verbatim, and on no match (or an
@@ -452,7 +452,6 @@ def run_graph_enrichment(
     privacy_skipped_chunks = 0
     mapping_rekey_dropped = 0
     totality_rejected_chunks = 0
-    seen_merge_keys: set[frozenset] = set()
     # Accumulates ik_keys from edges dropped by successful same_as contractions.
     # Keys are written to merger.removal_ledger after the loop completes
     # so the classifier can distinguish intended enrichment-driven removals from
@@ -648,8 +647,20 @@ def run_graph_enrichment(
         # Apply same_as contractions FIRST so subsequent edge inserts
         # reference canonical nodes. Gate on:
         #   1. Both endpoints exist in the live graph.
-        #   2. Unordered-pair dedup across the whole enrichment pass.
-        #   3. Surface-form safety gate (token-subset + Jaro-Winkler).
+        #   2. Surface-form safety gate (token-subset + Jaro-Winkler).
+        #
+        # There is deliberately NO cross-chunk proposal memo here.  Chunks are
+        # overlapping ego-graphs, so the same entity pair is genuinely proposed
+        # repeatedly, but each proposal carries its OWN surface strings and the
+        # gate below is a function of those surfaces (it tokenizes on
+        # whitespace, so "Yang-Ming" and "Yang Ming" are NOT interchangeable
+        # inputs).  Any memo keyed on node identity — or on any casefolded
+        # surface form — is strictly coarser than the gate, so it would let the
+        # first-visited chunk's verdict silently decide the pair for every later
+        # chunk, making the outcome depend on focal-entity iteration order.
+        # Re-running the gate is a cheap pure call; the repeat-proposal case is
+        # already absorbed by rule 1, since a successful contraction removes the
+        # dropped node from the graph.
         coref_map: dict[str, str] = {}
 
         # _in_graph closure passed to resolve_to_node_key.
@@ -694,15 +705,6 @@ def run_graph_enrichment(
                     drop_canon,
                 )
                 continue
-            merge_key = frozenset({keep_canon, drop_canon})
-            if merge_key in seen_merge_keys:
-                logger.debug(
-                    "graph_enrichment: same_as dedup — %r / %r already seen",
-                    keep_canon,
-                    drop_canon,
-                )
-                continue
-            seen_merge_keys.add(merge_key)
             if not _safe_to_merge_surface(keep, drop):
                 logger.info(
                     "graph_enrichment: same_as rejected by surface gate — %r / %r",

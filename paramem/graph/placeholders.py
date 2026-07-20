@@ -36,9 +36,9 @@ import logging
 import re
 from collections.abc import Iterable
 
-from paramem.graph.name_match import is_speaker_id
 from paramem.graph.schema import Relation, SessionGraph
 from paramem.graph.schema_config import anonymizer_prefix_to_type, anonymizer_type_to_prefix
+from paramem.utils.identity import canonical, is_speaker_id
 
 logger = logging.getLogger(__name__)
 
@@ -280,7 +280,7 @@ def entity_type_to_prefix(entity_type: str) -> str:
     """
     if not entity_type:
         return "Entity"
-    e = entity_type.strip().lower()
+    e = canonical(entity_type)
     if not e:
         return "Entity"
     closed = anonymizer_type_to_prefix().get(e)
@@ -312,7 +312,7 @@ def prefix_to_entity_type(prefix: str) -> str:
     (closed vocabulary). The open policy wins, matching the
     entity-rebuild loop's existing behaviour.
     """
-    p = (prefix or "").strip().lower()
+    p = canonical(prefix or "")
     return anonymizer_prefix_to_type().get(p) or p or "concept"
 
 
@@ -762,7 +762,7 @@ def _build_anonymization_mapping(
        handle by construction (CLAUDE.md's "ONE lowercase ``speaker{N}``
        everywhere"), never a real name to be re-mapped.  A ``llm_mapping``
        KEY that is speaker-id-shaped
-       (:func:`~paramem.graph.name_match.is_speaker_id`) — e.g. a
+       (:func:`~paramem.utils.identity.is_speaker_id`) — e.g. a
        hallucinated ``{"speaker0": "Person_1"}`` — is dropped outright,
        forward AND reverse.  A ``llm_mapping`` VALUE that is
        speaker-id-shaped — e.g. ``{"RealName": "speaker0"}``, the model

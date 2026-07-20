@@ -109,7 +109,7 @@ class TestSynonymClusters:
         raw = json.dumps({"clusters": [["works_for", "employed_by"]]})
         clusters_by_so, diag = _run(relations, [raw])
 
-        from paramem.graph.name_match import canonical
+        from paramem.utils.identity import canonical
 
         key = (canonical("Alex"), canonical("Acme"))
         assert key in clusters_by_so, "Candidate group must appear in clusters_by_so"
@@ -173,7 +173,7 @@ class TestGroundingGuard:
         raw = json.dumps({"clusters": [["works_for", "employed_by", "is_staff_at"]]})
         clusters_by_so, diag = _run(relations, [raw])
 
-        from paramem.graph.name_match import canonical
+        from paramem.utils.identity import canonical
 
         key = (canonical("Jordan"), canonical("TechCo"))
         # Grounded cluster has 2 members (hallucinated "is_staff_at" dropped).
@@ -276,7 +276,7 @@ class TestSotaBranch:
         assert "[INST]" not in actual_prompt
         assert "<|user|>" not in actual_prompt
         # Verify the cluster is parsed correctly.
-        from paramem.graph.name_match import canonical
+        from paramem.utils.identity import canonical
 
         key = (canonical("Jordan"), canonical("TechCo"))
         assert key in clusters_by_so

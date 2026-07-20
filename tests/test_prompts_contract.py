@@ -543,7 +543,7 @@ class TestExtractionPromptThirdPartySubjectContract:
     def test_no_generic_noun_subject_anywhere(self, model):
         """Node identity is a graph-global string fold — ``canonical_id``
         on ``entity.name`` (``paramem/graph/merger.py``) with NO owner or
-        speaker scoping (``canonical()`` in ``paramem/graph/name_match.py``
+        speaker scoping (``canonical()`` in ``paramem/utils/identity.py``
         is a pure Unicode-NFC / casefold / diacritic fold). A generic role
         noun (``sister``, ``dog``, ``kids``) placed in SUBJECT position
         becomes ONE node shared across the entire household graph, so

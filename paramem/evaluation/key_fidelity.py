@@ -8,7 +8,7 @@ reconstruction.
 
 import logging
 
-from paramem.graph.name_match import canonical
+from paramem.utils.identity import canonical
 
 logger = logging.getLogger(__name__)
 

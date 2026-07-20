@@ -56,7 +56,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from experiments.utils.gpu_guard import acquire_gpu  # noqa: E402
 from experiments.utils.test_harness import BENCHMARK_MODELS, setup_logging  # noqa: E402
 from paramem.backup.encryption import read_maybe_encrypted  # noqa: E402
-from paramem.graph.name_match import is_speaker_id  # noqa: E402
 from paramem.graph.prompts import _load_speaker_directive_section  # noqa: E402
 from paramem.memory.entry import entry_fact_text  # noqa: E402
 from paramem.memory.store import MemoryStore  # noqa: E402
@@ -70,6 +69,7 @@ from paramem.utils.config import (  # noqa: E402
     ConsolidationConfig,
     TrainingConfig,
 )
+from paramem.utils.identity import is_speaker_id  # noqa: E402
 
 logger = logging.getLogger("probe_speaker_identity_live")
 

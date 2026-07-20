@@ -455,11 +455,25 @@ def entry_fact_text(
     entry: dict,
     resolve: Callable[[str], str] | None = None,
 ) -> str:
-    """Render a recalled entry as a human-readable fact string.
+    """Render a recalled entry as prose — the identity → display boundary.
 
-    Converts the predicate from snake_case to space-separated words (predicates
-    are normalized to lowercase-underscore at extraction time per project
-    convention) and joins the three triple components into a natural sentence.
+    This is THE render boundary: it turns the *stored identity form* of a
+    triple into human- and model-facing text.  Identity form and rendered form
+    are different layers.  Identity is what gets stored, keyed, compared and
+    trained; rendering is where a fact becomes prose.  Output reaches inference
+    context, SOTA prompts and TTS, so it must read as language.
+
+    The two sides are treated differently because they are stored differently:
+
+    * ``subject`` / ``object`` are **display surfaces already** — they are not
+      canonicalized (the graph keeps the first-seen surface in the node's
+      ``attributes["name"]``), so they are emitted as-is (after the optional
+      ``resolve`` hook).
+    * ``predicate`` is stored in **identity form** — blanks folded to ``_`` by
+      :func:`paramem.utils.identity.canonical` — and is rendered here: each
+      ``_`` becomes a single space.  ``-`` is NOT a blank in the identity form
+      and therefore survives the render verbatim, so
+      ``"has_sister-in-law"`` renders as ``"has sister-in-law"``.
 
     Used by inference consumers so string construction stays in the probe
     layer — callers read ``result["fact_text"]``.
@@ -478,7 +492,8 @@ def entry_fact_text(
             fact-render boundary (household-wide name injection).
 
     Returns:
-        Human-readable fact string, e.g. ``"Alex lives in Heilbronn"``.
+        Human-readable fact string, e.g. ``"Alex lives in Heilbronn"`` (from
+        the stored predicate ``lives_in``).
     """
     subject = resolve(entry["subject"]) if resolve is not None else entry["subject"]
     obj = resolve(entry["object"]) if resolve is not None else entry["object"]

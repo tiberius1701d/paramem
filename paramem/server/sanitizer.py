@@ -236,7 +236,9 @@ def check_personal_content(
     * **Known-entity scrub** — the speaker's known entities (the router's
       entity index plus enrolled speaker names) are substituted via
       :func:`~paramem.graph.placeholders._substitute_whole_words`.
-      Substitution anywhere → personal.  Already language-agnostic (entity
+      Substitution anywhere → personal.  Exact-case, whole-word: the
+      producers hand real-case display surfaces and the raw query text is
+      matched against them unmodified.  Already language-agnostic (entity
       names are surface forms).
     * **Self-reference gate** — :func:`_is_about_speaker` decides whether
       the query refers to the speaker.  Production path uses the
@@ -251,20 +253,32 @@ def check_personal_content(
     """
     findings: list[str] = []
 
+    # Lowercased text is computed for the PARAPHRASE arm only (see below):
+    # that arm matches lowercased entity content tokens as substrings.  The
+    # known-entity scrub below deliberately does NOT use it.
     text_lower = text.lower() if text else ""
     mapping = _build_known_entity_mapping(known_entities)
     if mapping:
-        # Case-insensitive comparison: production stores lowercased entity
-        # names (assembled by handle_chat from ``memory_store.iter_entries()``
-        # subject/object fields, plus the resolved speaker display name — M3
-        # coverage so the real name is flagged even when it is no longer a
-        # registry subject under id-as-subject extraction), but the user's
-        # query is mixed-case.  Lowercase both sides and run
-        # _substitute_whole_words with the same edge-aware, case-sensitive
-        # substitution the cloud-egress anonymizer uses; the original text
-        # is preserved for the return value.
-        anonymized = _substitute_whole_words(text_lower, mapping)
-        if anonymized != text_lower:
+        # Exact-case, whole-word matching on the RAW text.  Case is the only
+        # signal that separates a person named "Bill" from an electricity
+        # "bill", a person "Rose" from the flower, "Mark" from a mark — no
+        # mechanical rule can do it otherwise.  Detection therefore matches
+        # substitution: _substitute_whole_words is case-sensitive by design
+        # (see its docstring — folding would let a mapped person name consume
+        # its lowercase common-noun homograph), and the producers hand this
+        # function real-case display surfaces.  Entry subject/object come from
+        # the graph node's ``attributes["name"]``, which stores the
+        # case-preserved first-seen surface; speaker and household names come
+        # from the profile's display name.  Lowercasing either side here would
+        # make every household with a "Bill" lose cloud escalation on ordinary
+        # invoice queries.
+        #
+        # Accepted consequence: a user who types "bill meyer" when the stored
+        # display surface is "Bill Meyer" is not flagged.  That is inherent to
+        # the case-sensitivity decision, not a defect — do not add a
+        # case-insensitive fallback or a second matching pass.
+        anonymized = _substitute_whole_words(text, mapping)
+        if anonymized != text:
             findings.append("personal_entity")
 
     # Paraphrase-aware second pass.  Word-boundary substitution misses
@@ -274,7 +288,10 @@ def check_personal_content(
     # without firing on single generic words.  Only runs when the
     # surface scrub did not already flag, so callers see exactly one
     # ``personal_entity`` finding per query regardless of which arm
-    # matched.
+    # matched.  This arm IS case-insensitive (both sides lowercased) and
+    # stays that way: it only fires on entities with >= min_overlap content
+    # tokens, so a single-token common-noun homograph ("bill") can never
+    # reach it and the Bill/bill hazard does not apply.
     if "personal_entity" not in findings and _query_paraphrases_entity(text_lower, known_entities):
         findings.append("personal_entity")
 
@@ -303,11 +320,15 @@ def sanitize_for_cloud(
             speaker has not been resolved.  Used to gate first-person
             interpretation — without an identified speaker there is no one
             for "I" / "my" to refer to.
-        known_entities: lowercased set of entity / speaker names that count
+        known_entities: set of **real-case** entity / speaker names that count
             as personal references.  Assembled by ``handle_chat`` from
             ``memory_store.iter_entries()`` subject/object fields plus the
             resolved speaker display name (M3 — plumbed directly from the
-            ``speaker`` argument, not from ``SpeakerStore.speaker_names()``).
+            ``speaker`` argument, not from ``SpeakerStore.speaker_names()``)
+            plus the household display names.  Names are passed through
+            ``.strip()`` only: the known-entity scrub matches them
+            exact-case and whole-word, so a folded name would not match the
+            user's query surface.
         personal_referent_config: optional
             :class:`paramem.server.config.PersonalReferentConfig`.  When
             supplied (production), the encoder-based classifier is used

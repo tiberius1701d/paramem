@@ -3,13 +3,16 @@
 The sanitizer detects personal content using ground truth that already
 exists in the running system:
 
-* ``known_entities`` — caller-supplied set of lowercased entity / speaker
+* ``known_entities`` — caller-supplied set of **real-case** entity / speaker
   names.  Assembled by ``handle_chat`` from ``memory_store.iter_entries()``
   subject/object fields plus the resolved speaker display name (M3 — plumbed
   directly from the ``speaker`` argument so the real name is covered even when
   it is no longer a registry subject under id-as-subject extraction).
   Reuses the placeholder module's ``_substitute_whole_words`` primitive to
-  decide whether the query references any of them.
+  decide whether the query references any of them.  That primitive is
+  case-sensitive by design, and the known-entity scrub matches the raw query
+  text against the real-case names: case is the only signal separating a
+  person named "Bill" from an electricity "bill".
 * ``speaker_id`` + first-person pronouns from a fixed token set — covers
   cold-start before the graph has facts.
 
@@ -36,7 +39,7 @@ class TestPersonalEntityDetection:
     def test_named_entity_in_known_set_flags_personal(self):
         findings = check_personal_content(
             "Did Pat call?",
-            known_entities={"pat"},
+            known_entities={"Pat"},
         )
         assert "personal_entity" in findings
 
@@ -63,11 +66,12 @@ class TestPersonalEntityDetection:
         assert "first_person_personal" in findings
 
     def test_word_boundary_prevents_substring_false_positives(self):
-        # "Pat" must not match inside "patron" — _substitute_whole_words
-        # uses word-boundary matching.
+        # "Pat" must not match inside "Patron" — _substitute_whole_words
+        # uses word-boundary matching.  Both sides share the same case here
+        # so word boundary, not case, is the only reason there is no match.
         findings = check_personal_content(
-            "Where is the nearest patron saint?",
-            known_entities={"pat"},
+            "Where is the nearest Patron saint?",
+            known_entities={"Pat"},
         )
         assert findings == []
 
@@ -123,14 +127,14 @@ class TestPersonalEntityParaphraseDetection:
         # mentions of "Alice".
         findings_direct = check_personal_content(
             "Did Alice call?",
-            known_entities={"alice"},
+            known_entities={"Alice"},
         )
         assert "personal_entity" in findings_direct
-        # And substring false positive still rejected: "patron" ≠ "pat"
-        # (handled by surface-form word-boundary).
+        # And substring false positive still rejected: "Patron" ≠ "Pat"
+        # (handled by surface-form word-boundary, same case on both sides).
         findings_fp = check_personal_content(
-            "I want a patron saint.",
-            known_entities={"pat"},
+            "I want a Patron saint.",
+            known_entities={"Pat"},
         )
         assert "personal_entity" not in findings_fp
 
@@ -149,7 +153,7 @@ class TestPersonalEntityParaphraseDetection:
         # paraphrase pass must not add a second copy of the finding.
         findings = check_personal_content(
             "tell me about ADAS platform",
-            known_entities={"adas platform"},
+            known_entities={"ADAS platform"},
         )
         assert findings.count("personal_entity") == 1
 
@@ -159,6 +163,94 @@ class TestPersonalEntityParaphraseDetection:
             known_entities=set(),
         )
         assert findings == []
+
+    def test_paraphrase_arm_unaffected_by_real_case_entities(self):
+        """The paraphrase arm still fires when ``known_entities`` carry real case.
+
+        Arm 2 lowercases entity names internally via
+        ``_entity_content_tokens`` and matches against the lowercased query,
+        so making the producers hand real-case names (the fix for the
+        Bill/bill known-entity bug) leaves this arm's behaviour unchanged.
+        Mirrors ``test_paraphrase_two_token_overlap_flags_personal`` with the
+        production-shaped, case-preserved entity name.
+        """
+        findings = check_personal_content(
+            "Tell me about the ADAS compute platforms project",
+            known_entities={"Critical Multi-OEM ADAS Platform Turnaround"},
+        )
+        assert "personal_entity" in findings
+
+
+# ---------------------------------------------------------------------------
+# Case sensitivity of the known-entity scrub (person "Bill" vs invoice "bill")
+# ---------------------------------------------------------------------------
+
+
+class TestKnownEntityScrubIsCaseSensitive:
+    """The known-entity scrub matches exact-case, whole-word, on raw text.
+
+    No mechanical rule separates ``Bill`` the person from ``bill`` the
+    invoice except case, so detection matches substitution:
+    ``_substitute_whole_words`` is case-sensitive by design and the
+    producers (``handle_chat``, ``_cloud_only_route``'s callers) hand the
+    sanitizer the stored display surface with its original case.
+
+    Before this was fixed, both sides were lowercased, so any household with
+    a member named Bill / Mark / Will / Rose / Grace silently lost cloud
+    escalation on ordinary queries containing the common noun:
+    ``sanitize_for_cloud(mode="block")`` returned ``None`` →
+    ``fallthrough_reason="sanitizer_blocked"`` → abstention.
+    """
+
+    def test_common_noun_homograph_of_a_household_name_is_not_personal(self):
+        """Regression: "electricity bill" must not match the person "Bill"."""
+        findings = check_personal_content(
+            "I need to pay the electricity bill",
+            known_entities={"Bill"},
+        )
+        assert "personal_entity" not in findings
+
+    def test_household_name_in_its_own_case_is_still_detected(self):
+        """The fix must not cost detection: "Bill" the person still fires."""
+        findings = check_personal_content(
+            "Is Bill coming to dinner?",
+            known_entities={"Bill"},
+        )
+        assert "personal_entity" in findings
+
+    def test_lowercased_user_typing_of_a_single_token_name_is_an_accepted_miss(self):
+        """PINNED ACCEPTED CONSEQUENCE — not a bug, do not "fix" this.
+
+        A user who types a name in the wrong case ("meyer" when the stored
+        display surface is "Meyer") is not flagged by the known-entity
+        scrub.  That is inherent to the case-sensitivity decision: the only
+        way to recover this match is case-insensitive matching, which is
+        exactly what reintroduces the ``Bill``/``bill`` false positive that
+        blocks cloud escalation for ordinary queries.
+
+        Do not add a case-insensitive fallback, a second matching pass, or a
+        fuzzy tier to make this assertion flip.
+        """
+        findings = check_personal_content(
+            "is meyer coming",
+            known_entities={"Meyer"},
+        )
+        assert "personal_entity" not in findings
+
+    def test_lowercased_multi_token_name_is_still_caught_by_the_paraphrase_arm(self):
+        """The accepted miss is bounded to single-content-token names.
+
+        A multi-token name ("Bill Meyer") has >= ``min_overlap`` content
+        tokens, so the paraphrase arm — which is case-insensitive by design
+        and deliberately unchanged — still flags a lowercased typing of it.
+        Pinned so the boundary of the accepted miss is explicit rather than
+        assumed.
+        """
+        findings = check_personal_content(
+            "is bill meyer coming",
+            known_entities={"Bill Meyer"},
+        )
+        assert "personal_entity" in findings
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +408,7 @@ class TestSanitizeForCloud:
         query, findings = sanitize_for_cloud(
             "Did Pat call?",
             mode="block",
-            known_entities={"pat"},
+            known_entities={"Pat"},
         )
         assert query is None
         assert "personal_entity" in findings
@@ -450,7 +542,7 @@ class TestM3SpeakerDisplayNameCoverage:
         """Querying the speaker by their display name is caught as personal."""
         findings = check_personal_content(
             "What does Alex do for work?",
-            known_entities={"alex"},
+            known_entities={"Alex"},
         )
         assert "personal_entity" in findings
 
@@ -526,7 +618,8 @@ class TestM3SpeakerDisplayNameCoverage:
 
         assert "known_entities" in captured
         assert captured["known_entities"] is not None
-        assert "alex" in captured["known_entities"]
+        # Real case preserved — the sanitizer scrub matches exact-case.
+        assert "Alex" in captured["known_entities"]
 
     def test_handle_chat_anonymous_speaker_not_added_to_known_entities(self):
         """Anonymous display-name suppression: None speaker must not pollute known_entities.

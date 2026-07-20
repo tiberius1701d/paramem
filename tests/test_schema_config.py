@@ -267,6 +267,74 @@ class TestAnonymizerConfig:
             )
 
     # ------------------------------------------------------------------ #
+    # Map-key identity contract (both maps keyed by canonical())           #
+    # ------------------------------------------------------------------ #
+
+    def test_prefix_to_type_keys_are_canonical(self):
+        """Keys of the prefix map are produced by canonical(), not a local fold.
+
+        The sole lookup site (placeholders.prefix_to_entity_type) canonicalizes
+        its query, so a key built by any other routine could silently miss.
+        """
+        from paramem.utils.identity import canonical
+
+        for key in anonymizer_prefix_to_type():
+            assert canonical(key) == key, (
+                f"prefix-map key {key!r} is not canonical — the lookup side "
+                f"canonicalizes its query, so this key would silently miss."
+            )
+
+    def test_type_to_prefix_keys_are_canonical(self):
+        """Keys of the entity_type map are produced by canonical(), not a local fold.
+
+        Regression guard for the one-sided contract this map previously had:
+        keys came straight from the YAML while the lookup site
+        (placeholders.entity_type_to_prefix) folded its query.
+        """
+        from paramem.utils.identity import canonical
+
+        for key in anonymizer_type_to_prefix():
+            assert canonical(key) == key, (
+                f"type-map key {key!r} is not canonical — the lookup side "
+                f"canonicalizes its query, so this key would silently miss."
+            )
+
+    def test_type_to_prefix_survives_cased_and_spaced_yaml(self, tmp_path):
+        """A cased/spaced YAML entity_type still resolves via the canonical lookup.
+
+        This is what the one-sided contract could not do: the raw key
+        ``"Work Of Art"`` never matched the folded query.
+        """
+        from paramem.graph.schema_config import reset_cache
+        from paramem.utils.identity import canonical
+
+        schema = tmp_path / "schema.yaml"
+        schema.write_text(
+            "entity_types:\n"
+            "  concept:\n"
+            "    anchor: schema:Thing\n"
+            "fallback_entity_type: concept\n"
+            "relation_types: [factual]\n"
+            "fallback_relation_type: factual\n"
+            "anonymizer:\n"
+            "  prefixes:\n"
+            "    - prefix: WorkOfArt\n"
+            "      entity_type: Work Of Art\n"
+            "      description: art\n"
+            "      primary_for_type: true\n"
+        )
+        reset_cache()
+        try:
+            built = anonymizer_type_to_prefix(str(schema))
+            assert built == {"work_of_art": "WorkOfArt"}
+            # The lookup side canonicalizes its query identically, so every
+            # surface variant of the same type lands on the one built key.
+            for variant in ("Work Of Art", "work of art", "WORK  OF  ART", "work_of_art"):
+                assert built[canonical(variant)] == "WorkOfArt"
+        finally:
+            reset_cache()
+
+    # ------------------------------------------------------------------ #
     # Fallback behaviour                                                   #
     # ------------------------------------------------------------------ #
 

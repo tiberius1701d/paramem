@@ -94,7 +94,7 @@ class TestShimPublicAPI:
             # state are not disturbed.
             from gpu_guard import add_default_consumer
 
-            from paramem.gpu_consumer import adapter
+            from paramem.utils.gpu_consumer import adapter
 
             add_default_consumer(adapter)
             _reset_autoload_for_tests()

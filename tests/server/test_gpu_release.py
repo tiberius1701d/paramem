@@ -2,7 +2,7 @@
 
 The endpoint is the canonical local→cloud-only release path used by
 external GPU consumers (gpu_guard ConfigConsumer / V1
-paramem.gpu_consumer / lerobot). It replaces the old SIGUSR1 protocol,
+paramem.utils.gpu_consumer / lerobot). It replaces the old SIGUSR1 protocol,
 which the V1 ``ParamemServerConsumer.request_release`` documented as
 "switch to cloud-only" but ``app.py``'s SIGUSR1 handler implemented as
 "save snapshot and exit" — protocol mismatch surfaced under V2 testing.
